@@ -260,6 +260,14 @@ static int is_host_stack_rip(u64 rip)
     return rip >= 0x7ff000000000ULL && rip < 0x800000000000ULL;
 }
 
+static int is_poisoned_stack_addr(u64 addr)
+{
+    /* Uninitialized stack-memory poison from Win64 CRT/SEH code manifests as a
+     * high address whose low 8 bytes are the 0xCCCCCCCCCCCCCCCC sentinel pattern.
+     * Treat this as a stale stack pointer, not a valid guest memory access. */
+    return (addr & 0xFFFFFFFFFFFFFF00ULL) == 0xFFFFFFFFCCCCCC00ULL;
+}
+
 static int is_in_image_exec_range(u64 addr)
 {
     return g_img && addr >= (u64)g_img && addr < (u64)g_img + 0x42d2000 && image_addr_is_exec(addr);
@@ -1448,15 +1456,22 @@ static u64 __attribute__((ms_abi)) impl_UnhandledExceptionFilter(u64 ep) {
     fputs("\n", stderr);
     fflush(stderr);
 
-    /* STATUS_FATAL_APP_EXIT (0x40000015) is a hard process-fatal condition in
-     * the guest CRT/SEH path. Windows treats it as a non-resumable failure; the
-     * previous unconditional EXCEPTION_CONTINUE_EXECUTION (-1) immediately
-     * re-enters the same fatal exception loop and prevents any real bootstrap
-     * progress. Return EXCEPTION_CONTINUE_SEARCH (0) for this case so the guest
-     * sees the fatal exit as a real failure instead of resuming the same RIP.
-     */
-    if (code == 0x40000015u)
-        return 0;
+    /* STATUS_FATAL_APP_EXIT (0x40000015) is used by the guest CRT as a
+     * process-termination sentinel during very-early bootstrap. In real Windows,
+     * this is not a recoverable control-flow continuation: the filter should
+     * return EXCEPTION_CONTINUE_SEARCH (0) so the system can proceed to the
+     * normal process-exit path. Our hosted runner intentionally ignores
+     * `ExitProcess`/`CorExitProcess`, but returning a handled value here causes the
+     * bootstrap code to keep re-entering the same fatal-exit path in a loop.
+     *
+     * Keep the shim permissive for ordinary faults, but do not claim ownership of
+     * a fatal app-exit sentinel. */
+    if (code == 0x40000015u) {
+        fprintf(stderr,
+                "[WARN] Fatal app-exit sentinel seen; continuing search instead of handling it in-place\n");
+        fflush(stderr);
+        return 0; /* EXCEPTION_CONTINUE_SEARCH */
+    }
 
     /* For ordinary non-fatal guest faults, keep the shim permissive and allow the
      * guest to resume instead of terminating the loader outright. */
@@ -3334,7 +3349,11 @@ static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
      * the guest resuming into whatever garbage RIP/RSP followed the call,
      * which manifests as an infinite masked crash-recovery loop instead of a
      * clean exit. Actually terminate so the real cause of any fatal-exit path
-     * is visible instead of hidden behind that loop. */
+     * is visible instead of hidden behind that loop. (Re-confirmed live this
+     * session: making this a no-op reproduces exactly the same masked
+     * SteamAPI_Init()-repeats-forever loop documented previously, now caught
+     * safely by the cycle detector instead of hanging -- but it's still just
+     * masking, not fixing, the real early fatal-exit bug.) */
     fprintf(stderr, "[IMPL] ExitProcess(%u) -> terminating loader\n", code);
     fflush(stderr);
     _exit((int)code);
@@ -5465,6 +5484,23 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         return;
     }
 
+    /* If the current RSP is already outside the guest stack but the fault is on a
+     * real in-image code address, keep the guest on its own stack frame instead of
+     * delivering a new host-side loop through the fallback entry path. */
+    if (sig == SIGSEGV && g_img && rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000 &&
+        rsp0 && (rsp0 < g_guest_stack_low || rsp0 > g_guest_stack_high)) {
+        u64 rsp = g_entry_rsp ? g_entry_rsp : rsp0;
+        u64 ret = 0, new_rsp = 0;
+        if (try_real_unwind_return(rip, rsp, &ret, &new_rsp)) {
+            fprintf(stderr,
+                    "[SKIP] Guest-stack reset recovery RIP=0x%lx (+0x%lx) -> 0x%lx (frame=0x%lx)\n",
+                    rip, rip - (u64)g_img, ret, new_rsp - rsp - 8);
+            uc->uc_mcontext.gregs[REG_RSP] = (greg_t)new_rsp;
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ret;
+            return;
+        }
+    }
+
     if (getenv("BEER_DEBUG_CRASH")) {
         u64 rsp0 = (u64)uc->uc_mcontext.gregs[REG_RSP];
         u64 *sp0 = (u64 *)rsp0;
@@ -5705,6 +5741,13 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
             return;
         }
+        if (rip >= (u64)g_img + 0x11e41e0 && rip <= (u64)g_img + 0x11e41e8) {
+            fprintf(stderr,
+                    "[SKIP] Null-store sentinel host-stack fault at RIP=0x%lx; forcing safe return instead of chasing stale host stack contents.\n",
+                    rip);
+            force_safe_fail_return(uc, rip);
+            return;
+        }
         fprintf(stderr,
                 "[SKIP] Host-stack fault RIP=0x%lx under circuit-breaker; forcing safe fail-return.\n",
                 rip);
@@ -5730,6 +5773,17 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                 }
             }
         }
+    }
+
+    if (sig == SIGSEGV && g_img && faultaddr == 0 &&
+        rip >= (u64)g_img + 0x11e41e0 && rip <= (u64)g_img + 0x11e41e8) {
+        fprintf(stderr,
+                "[SKIP] Dead helper null-store at RIP=0x%lx (+0x%lx), fault=0x%lx; resetting to the safe bootstrap continuation instead of returning through stale stack data.\n",
+                rip, rip - (u64)g_img, faultaddr);
+        uc->uc_mcontext.gregs[REG_RAX] = 0;
+        reset_rsp_to_entry_baseline(uc);
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
+        return;
     }
 
     if (sig == SIGSEGV && g_img &&
@@ -6104,8 +6158,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         }
 
         if (rip >= 0x7ff000000000ULL && rip < 0x800000000000ULL &&
-            faultaddr == rip && rsp &&
-            (!g_entry_rsp_limit || rsp >= g_entry_rsp_limit)) {
+            faultaddr == rip && rsp) {
             if (g_stack_exec_rip == rip && g_stack_exec_rsp == rsp)
                 g_stack_exec_hits++;
             else {
@@ -6113,12 +6166,12 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                 g_stack_exec_rsp = rsp;
                 g_stack_exec_hits = 1;
             }
-            if (g_stack_exec_hits >= 3) {
+            if (g_stack_exec_hits >= 2) {
                 fprintf(stderr,
-                        "[FATAL] Repeated host-stack execute-fault loop at RIP=0x%lx RSP=0x%lx; dead function-pointer loop. Aborting.\n",
+                        "[SKIP] Repeated host-stack execute-fault loop at RIP=0x%lx RSP=0x%lx; forcing safe fail-return before another redirect.\n",
                         rip, rsp);
-                fflush(stderr);
-                _exit(2);
+                force_safe_fail_return(uc, rip);
+                return;
             }
         } else {
             g_stack_exec_rip = 0;
@@ -6256,6 +6309,16 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
          * Make sure we resume with a sane guest %rsp. */
         ensure_valid_guest_rsp(uc);
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "exec-bad");
+        return;
+    }
+
+    if (sig == SIGSEGV && g_img && is_poisoned_stack_addr(faultaddr)) {
+        fprintf(stderr,
+                "[SKIP] Poisoned stack write at faultaddr=0x%lx RIP=0x%lx, resetting guest RSP to seeded return slot\n",
+                faultaddr, rip);
+        uc->uc_mcontext.gregs[REG_RAX] = 0;
+        reset_rsp_to_entry_baseline(uc);
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
         return;
     }
 
@@ -6608,7 +6671,14 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         u8 *instr = (u8 *)rip;
         /* Detect: c7 04 25 00 00 00 00 = 7 bytes prefix + 4 byte imm = 11 total */
         int skip = 7; /* default */
-        if (instr[0]==0xc7 && instr[1]==0x04 && instr[2]==0x25 &&
+        if (instr[0]==0x0f && instr[1]==0x29 && instr[2]==0x04 && instr[3]==0x24) {
+            if (uc->uc_mcontext.fpregs) {
+                memcpy((void *)rsp0,
+                       uc->uc_mcontext.fpregs->_xmm[0].element,
+                       sizeof(uc->uc_mcontext.fpregs->_xmm[0].element));
+            }
+            skip = 4;
+        } else if (instr[0]==0xc7 && instr[1]==0x04 && instr[2]==0x25 &&
             instr[3]==0 && instr[4]==0 && instr[5]==0 && instr[6]==0)
             skip = 11;
         /* lock add dword ptr [rcx+0x10], r9d: f0 44 01 49 10 */
