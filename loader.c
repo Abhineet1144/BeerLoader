@@ -1440,6 +1440,23 @@ static u64 __attribute__((ms_abi)) impl_IsProcessorFeaturePresent(u32 f) {
     /* PF_FLOATING_POINT_EMULATED=0 → false (we have real FP) */
     (void)f; return 0;
 }
+/* Diagnostic helper: scan the current (guest) stack for return-address-shaped
+ * values that fall inside the mapped guest image, to reconstruct an
+ * approximate call chain when a stub is invoked directly from guest code. */
+static void dbg_dump_guest_callchain(const char *tag) {
+    extern u64 g_saved_guest_rsp;
+    u64 rsp = g_saved_guest_rsp;
+    fprintf(stderr, "[CHAIN:%s] rsp=0x%lx\n", tag, rsp);
+    u64 *sp = (u64 *)rsp;
+    int printed = 0;
+    for (int i = 0; i < 200 && printed < 24; i++) {
+        u64 v = sp[i];
+        if (v >= (u64)g_img && v < (u64)g_img + 0x42d2000) {
+            fprintf(stderr, "[CHAIN:%s]   [%3d] img+0x%lx\n", tag, i, v - (u64)g_img);
+            printed++;
+        }
+    }
+}
 static u64 __attribute__((ms_abi)) impl_SetUnhandledExceptionFilter(u64 f) { (void)f; return 0; }
 static u64 __attribute__((ms_abi)) impl_UnhandledExceptionFilter(u64 ep) {
     u32 code = 0;
@@ -1469,6 +1486,7 @@ static u64 __attribute__((ms_abi)) impl_UnhandledExceptionFilter(u64 ep) {
     if (code == 0x40000015u) {
         fprintf(stderr,
                 "[WARN] Fatal app-exit sentinel seen; continuing search instead of handling it in-place\n");
+        dbg_dump_guest_callchain("UEF-fatalexit");
         fflush(stderr);
         return 0; /* EXCEPTION_CONTINUE_SEARCH */
     }
@@ -3361,7 +3379,7 @@ static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
 static u64 __attribute__((ms_abi)) impl_TerminateProcess(u64 h, u32 code)
     { (void)h; fprintf(stderr, "[IMPL] TerminateProcess(%u) -> terminating loader\n", code); fflush(stderr); _exit((int)code); }
 static u64 __attribute__((ms_abi)) impl_CorExitProcess(u32 code)
-    { fprintf(stderr, "[IMPL] CorExitProcess(%u) -> terminating loader\n", code); fflush(stderr); _exit((int)code); }
+    { fprintf(stderr, "[IMPL] CorExitProcess(%u) -> terminating loader\n", code); dbg_dump_guest_callchain("CorExitProcess"); fflush(stderr); _exit((int)code); }
 
 /* ---- STARTUPINFOW ---- */
 static u64 __attribute__((ms_abi))
@@ -5742,9 +5760,12 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             return;
         }
         if (rip >= (u64)g_img + 0x11e41e0 && rip <= (u64)g_img + 0x11e41e8) {
+            u64 *sp_diag = (u64 *)rsp;
+            u64 caller = (sp_diag && rsp) ? sp_diag[0] : 0;
             fprintf(stderr,
-                    "[SKIP] Null-store sentinel host-stack fault at RIP=0x%lx; forcing safe return instead of chasing stale host stack contents.\n",
-                    rip);
+                    "[SKIP] Null-store sentinel host-stack fault at RIP=0x%lx; caller-return(sp[0])=0x%lx (+0x%lx); forcing safe return instead of chasing stale host stack contents.\n",
+                    rip, caller,
+                    (g_img && caller >= (u64)g_img && caller < (u64)g_img + 0x42d2000) ? caller - (u64)g_img : 0);
             force_safe_fail_return(uc, rip);
             return;
         }
@@ -5777,9 +5798,17 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
 
     if (sig == SIGSEGV && g_img && faultaddr == 0 &&
         rip >= (u64)g_img + 0x11e41e0 && rip <= (u64)g_img + 0x11e41e8) {
+        u64 rsp_diag = (u64)uc->uc_mcontext.gregs[REG_RSP];
+        u64 *sp_diag = (u64 *)rsp_diag;
+        u64 caller = sp_diag ? sp_diag[0] : 0;
         fprintf(stderr,
-                "[SKIP] Dead helper null-store at RIP=0x%lx (+0x%lx), fault=0x%lx; resetting to the safe bootstrap continuation instead of returning through stale stack data.\n",
-                rip, rip - (u64)g_img, faultaddr);
+                "[SKIP] Dead helper null-store at RIP=0x%lx (+0x%lx), fault=0x%lx; caller-return(sp[0])=0x%lx (+0x%lx) rcx=0x%lx rdx=0x%lx r8=0x%lx r9=0x%lx; resetting to the safe bootstrap continuation instead of returning through stale stack data.\n",
+                rip, rip - (u64)g_img, faultaddr, caller,
+                (g_img && caller >= (u64)g_img && caller < (u64)g_img + 0x42d2000) ? caller - (u64)g_img : 0,
+                (u64)uc->uc_mcontext.gregs[REG_RCX],
+                (u64)uc->uc_mcontext.gregs[REG_RDX],
+                (u64)uc->uc_mcontext.gregs[REG_R8],
+                (u64)uc->uc_mcontext.gregs[REG_R9]);
         uc->uc_mcontext.gregs[REG_RAX] = 0;
         reset_rsp_to_entry_baseline(uc);
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
@@ -6309,6 +6338,26 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
          * Make sure we resume with a sane guest %rsp. */
         ensure_valid_guest_rsp(uc);
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "exec-bad");
+        return;
+    }
+
+    if (sig == SIGSEGV && g_img &&
+        rip >= (u64)g_img + 0xbb7e0 && rip <= (u64)g_img + 0xbb7f0) {
+        /* Locale-category TLS-cache init helper (img+0xbb750) dereferences the
+         * return value of img+0xf52af0 (a TLS-indexed per-thread locale-state
+         * accessor) via `movups xmm0,[rax]`. Depending on ASLR-driven heap/stack
+         * layout, a bad/uninitialized rax here reads either the classic debug-
+         * heap 0xCC poison fill (already caught by is_poisoned_stack_addr below)
+         * or an ordinary-looking wild pointer left over from unrelated memory --
+         * both stem from the same root cause (TLS-array slot for this module
+         * not populated the way the real CRT expects), so recover the same way
+         * regardless of which garbage pattern rax happened to hold. */
+        fprintf(stderr,
+                "[SKIP] Locale-cache TLS deref fault at RIP=0x%lx (+0x%lx) faultaddr=0x%lx rax=0x%lx; resetting guest RSP to seeded return slot\n",
+                rip, rip - (u64)g_img, faultaddr, (u64)uc->uc_mcontext.gregs[REG_RAX]);
+        uc->uc_mcontext.gregs[REG_RAX] = 0;
+        reset_rsp_to_entry_baseline(uc);
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
         return;
     }
 
