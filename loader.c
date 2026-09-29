@@ -494,9 +494,23 @@ static size_t      g_trampsz = 0;
 static u8  g_host_call_stack[HOST_CALL_STACK_SIZE] __attribute__((aligned(16)));
 _Static_assert(HOST_CALL_STACK_SIZE == 1048576,
                "HOST_CALL_STACK_SIZE_STR must match HOST_CALL_STACK_SIZE");
-static u64 g_host_call_stack_top;
-static u64 g_saved_guest_rsp;
+/* Per-thread host call stack state (accessed from the trampoline asm via
+ * %fs:sym@tpoff). Every thread that runs guest code must call
+ * host_stack_init_thread() first. The main thread uses g_host_call_stack. */
+__thread u64 g_host_call_stack_base;
+__thread u64 g_host_call_stack_top;
+__thread u64 g_saved_guest_rsp;
 static u64 g_impl_targets[MAX_STUBS];
+
+static void host_stack_init_thread(void)
+{
+    if (g_host_call_stack_base) return;
+    void *m = mmap(NULL, HOST_CALL_STACK_SIZE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) { perror("mmap(host_call_stack)"); _exit(2); }
+    g_host_call_stack_base = (u64)m;
+    g_host_call_stack_top = ((u64)m + HOST_CALL_STACK_SIZE - 256) & ~0xFULL;
+}
 
 /*
  * Reentrancy note: an impl_* function can itself call back into guest
@@ -526,13 +540,12 @@ __asm__(
     ".text\n"
     ".global beer_dispatch_trampoline\n"
     "beer_dispatch_trampoline:\n"
-    "    lea g_host_call_stack(%rip), %r11\n"
     "    mov %rsp, %rax\n"
-    "    sub %r11, %rax\n"
+    "    sub %fs:g_host_call_stack_base@tpoff, %rax\n"
     "    cmp $" HOST_CALL_STACK_SIZE_STR ", %rax\n"
     "    jb 1f\n"                         /* (rsp - base) < SIZE => already on it */
-    "    mov %rsp, g_saved_guest_rsp(%rip)\n"
-    "    mov g_host_call_stack_top(%rip), %rsp\n"
+    "    mov %rsp, %fs:g_saved_guest_rsp@tpoff\n"
+    "    mov %fs:g_host_call_stack_top@tpoff, %rsp\n"
     "    lea g_impl_targets(%rip), %r11\n"
     "    mov (%r11,%r10,8), %rax\n"
     /* Windows x64 ABI requires the CALLER to reserve 32 bytes of "shadow
@@ -549,7 +562,7 @@ __asm__(
      * qwords (over-copying is harmless). rax/r11 are scratch; the target is
      * parked in r10 (index already consumed). */
     "    mov %rax, %r10\n"
-    "    mov g_saved_guest_rsp(%rip), %r11\n"
+    "    mov %fs:g_saved_guest_rsp@tpoff, %r11\n"
     "    sub $0x80, %rsp\n"
     ".irp off,0,8,16,24,32,40,48,56,64,72,80,88\n"
     "    mov 0x28+\\off(%r11), %rax\n"
@@ -557,7 +570,7 @@ __asm__(
     ".endr\n"
     "    call *%r10\n"
     "    add $0x80, %rsp\n"
-    "    mov g_saved_guest_rsp(%rip), %rsp\n"
+    "    mov %fs:g_saved_guest_rsp@tpoff, %rsp\n"
     "    ret\n"
     "1:\n"                                /* nested: keep using the current (already-switched) rsp */
     "    lea g_impl_targets(%rip), %r11\n"
@@ -1460,7 +1473,7 @@ static u64 __attribute__((ms_abi)) impl_IsProcessorFeaturePresent(u32 f) {
  * values that fall inside the mapped guest image, to reconstruct an
  * approximate call chain when a stub is invoked directly from guest code. */
 static void dbg_dump_guest_callchain(const char *tag) {
-    extern u64 g_saved_guest_rsp;
+    extern __thread u64 g_saved_guest_rsp;
     u64 rsp = g_saved_guest_rsp;
     fprintf(stderr, "[CHAIN:%s] rsp=0x%lx\n", tag, rsp);
     u64 *sp = (u64 *)rsp;
@@ -4441,6 +4454,7 @@ typedef struct {
  */
 static void *alloc_teb_for_thread(void)
 {
+    host_stack_init_thread();
     WinTEB *teb = mmap(NULL, sizeof(WinTEB), PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (teb == MAP_FAILED) die("mmap(worker TEB): %s", strerror(errno));
@@ -7108,6 +7122,7 @@ int main(int argc, char **argv)
      * At entry to the called function (after CALL pushes return address),
      * rsp will be misaligned by 8, as per convention. Functions that need
      * 16-byte alignment for movaps must re-align in their prologue. */
+    g_host_call_stack_base = (u64)g_host_call_stack;
     g_host_call_stack_top =
         ((u64)g_host_call_stack + HOST_CALL_STACK_SIZE - 256) & ~0xFULL;
 
@@ -7138,6 +7153,10 @@ int main(int argc, char **argv)
     u64 guest_rsp = (guest_stack_high - 0x20000) & ~0xF;
     /* Entry RSP must be 8 mod 16, as after a real `call` on Windows x64. */
     u64 guest_frame_base = guest_rsp - 0x600;
+    /* Entry RSP must be 8 mod 16 (as after a real `call`). BEER_ALIGN_OLD=1
+     * restores the legacy 0 mod 16 entry for A/B comparison. */
+    if (!getenv("BEER_ALIGN_OLD"))
+        guest_frame_base = ((guest_rsp - 0x600) & ~0xFULL) + 8;
     u64 guest_ret_slot = guest_frame_base + 0x5c8;
     u64 guest_rbp_slot = guest_frame_base + 0x5c0;
     u64 guest_frame_ptr_slot = guest_frame_base + 0x5d0;
