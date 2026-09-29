@@ -544,9 +544,19 @@ __asm__(
      * mandatory gap. Without it, the callee's shadow-space writes land
      * directly on whatever is sitting above our just-pushed return
      * address on the shared host call stack. */
-    "    sub $0x20, %rsp\n"
-    "    call *%rax\n"
-    "    add $0x20, %rsp\n"
+    /* Stack-passed args (5th and later) live at guest_rsp+0x28...; the
+     * callee expects them at its own rsp+0x28. Forward a fixed window of 12
+     * qwords (over-copying is harmless). rax/r11 are scratch; the target is
+     * parked in r10 (index already consumed). */
+    "    mov %rax, %r10\n"
+    "    mov g_saved_guest_rsp(%rip), %r11\n"
+    "    sub $0x80, %rsp\n"
+    ".irp off,0,8,16,24,32,40,48,56,64,72,80,88\n"
+    "    mov 0x28+\\off(%r11), %rax\n"
+    "    mov %rax, 0x20+\\off(%rsp)\n"
+    ".endr\n"
+    "    call *%r10\n"
+    "    add $0x80, %rsp\n"
     "    mov g_saved_guest_rsp(%rip), %rsp\n"
     "    ret\n"
     "1:\n"                                /* nested: keep using the current (already-switched) rsp */
@@ -561,11 +571,17 @@ __asm__(
      * so the final `ret` still pops the real return address that was
      * already sitting there untouched -- we only ever write into the
      * newly carved-out region strictly below it. */
-    "    mov %rsp, %r10\n"
+    "    mov %rax, %r10\n"
+    "    mov %rsp, %r11\n"
     "    and $-16, %rsp\n"
-    "    sub $0x20, %rsp\n"
-    "    call *%rax\n"
-    "    mov %r10, %rsp\n"
+    "    sub $0x90, %rsp\n"
+    "    mov %r11, 0x80(%rsp)\n"            /* exact incoming rsp, above the arg window */
+    ".irp off,0,8,16,24,32,40,48,56,64,72,80,88\n"
+    "    mov 0x28+\\off(%r11), %rax\n"
+    "    mov %rax, 0x20+\\off(%rsp)\n"
+    ".endr\n"
+    "    call *%r10\n"
+    "    mov 0x80(%rsp), %rsp\n"
     "    ret\n"
 );
 extern void beer_dispatch_trampoline(void);
@@ -7120,6 +7136,7 @@ int main(int argc, char **argv)
     u64 guest_stack_low  = (u64)guest_stack;
     u64 guest_stack_high = (u64)guest_stack + guest_stack_size;
     u64 guest_rsp = (guest_stack_high - 0x20000) & ~0xF;
+    /* Entry RSP must be 8 mod 16, as after a real `call` on Windows x64. */
     u64 guest_frame_base = guest_rsp - 0x600;
     u64 guest_ret_slot = guest_frame_base + 0x5c8;
     u64 guest_rbp_slot = guest_frame_base + 0x5c0;
