@@ -973,7 +973,7 @@ impl_DeleteCriticalSection(WIN_CS *cs)
     if (!cs_ptr_is_valid(cs)) return 0;
     if (cs->Magic == WIN_CS_MAGIC && cs->Mutex) {
         pthread_mutex_destroy(cs->Mutex);
-        free(cs->Mutex);
+        host_free(cs->Mutex, sizeof(pthread_mutex_t)); /* allocated via mmap, not malloc */
         cs->Mutex = NULL;
         cs->Magic = 0;
     }
