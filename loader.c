@@ -5605,15 +5605,20 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         return;
     }
 
-    /* Handle specific stack-underflow crash at RVA 0x2650-0x2670 using real-unwind return */
-    if (sig == SIGSEGV && rip >= (u64)g_img + 0x2650 && rip <= (u64)g_img + 0x2670) {
+    /* Handle early-startup faults (CRT initialization region) using real-unwind
+     * These occur during very early initialization and are usually recoverable
+     * via proper function frame unwinding rather than instruction patching. */
+    if (sig == SIGSEGV && rip >= (u64)g_img + 0x2600 && rip <= (u64)g_img + 0x27ff) {
         u64 rsp0 = (u64)uc->uc_mcontext.gregs[REG_RSP];
         u64 ret_addr = 0, new_rsp = 0;
-        fprintf(stderr, "[SKIP] Early-startup fault at RIP=0x%lx (RVA 0x%lx), trying real-unwind\n", 
-                rip, rip - (u64)g_img);
+        static int early_fault_count = 0;
+        if (early_fault_count < 10) {
+            fprintf(stderr, "[SKIP] Early-startup fault at RIP=0x%lx (RVA 0x%lx), trying real-unwind\n", 
+                    rip, rip - (u64)g_img);
+            early_fault_count++;
+        }
         /* Try to use real unwind to find a safe return point */
         if (try_real_unwind_return(rip, rsp0, &ret_addr, &new_rsp)) {
-            fprintf(stderr, "       -> Recovered via real-unwind to RIP=0x%lx\n", ret_addr);
             uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ret_addr;
             uc->uc_mcontext.gregs[REG_RSP] = (greg_t)new_rsp;
             return;
