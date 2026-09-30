@@ -5720,19 +5720,28 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     /* Cycle detection for 0x237cff0-0x237d01d: This tight loop has code that crashes repeatedly
      * and creates an unbreakable recovery cycle. Count faults here and exit after threshold to avoid
      * spinning CPU and cycle detector timeout. */
-    if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cff0 && rip <= (u64)g_img + 0x237d020) {
+    if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cde0 && rip <= (u64)g_img + 0x237d100) {
         static u32 sekiro_cycle_faults = 0;
         sekiro_cycle_faults++;
-        if (sekiro_cycle_faults > 5) {
-            fprintf(stderr, "[FATAL] Sekiro 0x237cff0-0x237d01d unbreakable cycle detected (%d faults), exiting to avoid spin\n",
+        if (sekiro_cycle_faults > 10) {
+            fprintf(stderr, "[FATAL] Sekiro game-init region unbreakable cycle detected (%d faults), exiting to avoid spin\n",
                     sekiro_cycle_faults);
+            fprintf(stderr, "        Last fault at RIP=0x%lx RCX=0x%lx RDX=0x%lx R8=0x%lx R14=0x%lx RSP=0x%lx\n",
+                    rip, uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
+                    uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R14],
+                    uc->uc_mcontext.gregs[REG_RSP]);
             exit(97);
         }
         
-        fprintf(stderr, "[SKIP] Sekiro game-init cycle RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/5]\n",
-                rip, rip - (u64)g_img, faultaddr, sekiro_cycle_faults);
+        fprintf(stderr, "[SKIP] Sekiro game-init region RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/10] R14=0x%lx\n",
+                rip, rip - (u64)g_img, faultaddr, sekiro_cycle_faults,
+                uc->uc_mcontext.gregs[REG_R14]);
+        /* Initialize key registers to prevent address overflows and invalid accesses.
+         * R14 is constantly corrupted by game code, causing address calculations to overflow to 0.
+         * RCX and R14 = 0 makes memory accesses use RCX as base address. */
         uc->uc_mcontext.gregs[REG_RAX] = 0;
-        uc->uc_mcontext.gregs[REG_RCX] = 0;
+        uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;  /* Ensure image base */
+        uc->uc_mcontext.gregs[REG_R14] = 0;              /* Clear index to prevent overflow */
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "game-init-escape");
         return;
     }
