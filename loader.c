@@ -5605,7 +5605,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         return;
     }
 
-    /* Handle early-startup faults (CRT initialization region) using real-unwind
+    /* Handle early-startup faults (CRT initialization region RVA 0x2600-0x27ff) using real-unwind.
      * These occur during very early initialization and are usually recoverable
      * via proper function frame unwinding rather than instruction patching. */
     if (sig == SIGSEGV && rip >= (u64)g_img + 0x2600 && rip <= (u64)g_img + 0x27ff) {
@@ -5613,7 +5613,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         u64 ret_addr = 0, new_rsp = 0;
         static int early_fault_count = 0;
         if (early_fault_count < 10) {
-            fprintf(stderr, "[SKIP] Early-startup fault at RIP=0x%lx (RVA 0x%lx), trying real-unwind\n", 
+            fprintf(stderr, "[SKIP] Early CRT fault at RIP=0x%lx (RVA 0x%lx)\n", 
                     rip, rip - (u64)g_img);
             early_fault_count++;
         }
