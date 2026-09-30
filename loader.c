@@ -156,6 +156,10 @@ static u64 g_cycle_total_calls = 0;
 /* Persistent ret-stub cycle breaker: track total resets to baseline, give up after 2 */
 static u32 g_ret_stub_baseline_resets = 0;
 
+/* Middle-init fault limit: give up if too many faults in the init range */
+static u32 g_mid_init_fault_count = 0;
+static const u32 MID_INIT_FAULT_LIMIT = 50;  /* Abort if we see >50 faults without escaping the range */
+
 /* RSP observed just before handing off to the PE entry point — the
  * shallowest legitimate stack depth for the whole run. Any "recovered"
  * RSP produced by speculative stack-popping that ends up ABOVE this
@@ -5669,33 +5673,47 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     }
 
     /* Handle stack-underflow in middle initialization (e.g., RVA 0x99ce-0x9a63 region) */
-    if (sig == SIGSEGV && rip >= (u64)g_img + 0x9900 && rip <= (u64)g_img + 0x9a80 &&
+    if (sig == SIGSEGV && rip >= (u64)g_img + 0x9900 && rip <= (u64)g_img + 0x9b00 &&
         g_guest_stack_low && g_guest_stack_high && rsp0 >= g_guest_stack_low && rsp0 <= g_guest_stack_high) {
-        u64 ret_addr = 0, new_rsp = 0;
         static int mid_fault_count = 0;
-        if (mid_fault_count < 5) {
-            fprintf(stderr, "[SKIP] Middle-init fault at RIP=0x%lx (RVA 0x%lx)\n", 
-                    rip, rip - (u64)g_img);
+        
+        /* Increment global limit counter */
+        g_mid_init_fault_count++;
+        if (g_mid_init_fault_count > MID_INIT_FAULT_LIMIT) {
+            fprintf(stderr, "[FATAL] Middle-init SIGSEGV limit exceeded (%d faults), exiting to avoid infinite loop\n",
+                    g_mid_init_fault_count);
+            exit(98);
+        }
+        
+        if (mid_fault_count < 10) {
+            fprintf(stderr, "[SKIP] Middle-init SIGSEGV at RIP=0x%lx (RVA 0x%lx), skipping 2 bytes [fault %d]\n", 
+                    rip, rip - (u64)g_img, g_mid_init_fault_count);
             mid_fault_count++;
         }
-        /* Try to use real unwind to find a safe return point */
-        if (try_real_unwind_return(rip, rsp0, &ret_addr, &new_rsp)) {
-            /* Sanity check: if real-unwind returns to a ret-stub location (0x235a694-0x235a697 or nearby),
-             * don't use it - instead reset to entry baseline to avoid ret-stub deadlock cycles */
-            if (ret_addr >= (u64)g_img + 0x235a690 && ret_addr <= (u64)g_img + 0x235a6a0) {
-                if (mid_fault_count <= 5) {
-                    fprintf(stderr, "[SKIP]   -> real-unwind returned to ret-stub 0x%lx, using entry baseline instead\n", ret_addr);
-                }
-                reset_rsp_to_entry_baseline(uc);
-                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
-                return;
-            }
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ret_addr;
-            uc->uc_mcontext.gregs[REG_RSP] = (greg_t)new_rsp;
-            return;
+        /* For middle-init faults, skip 2 bytes to get past problematic instruction sequences */
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 2);
+        return;
+    }
+
+    /* Handle SIGILL in middle initialization range (often follows SIGSEGV at 0x99cf) */
+    if (sig == SIGILL && rip >= (u64)g_img + 0x9900 && rip <= (u64)g_img + 0x9b00) {
+        static int mid_sigill_count = 0;
+        
+        /* Increment global limit counter */
+        g_mid_init_fault_count++;
+        if (g_mid_init_fault_count > MID_INIT_FAULT_LIMIT) {
+            fprintf(stderr, "[FATAL] Middle-init SIGILL limit exceeded (%d faults), exiting to avoid infinite loop\n",
+                    g_mid_init_fault_count);
+            exit(98);
         }
-        /* If real unwind fails, skip 1 byte and retry */
-        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 1);
+        
+        if (mid_sigill_count < 10) {
+            fprintf(stderr, "[SKIP] Middle-init SIGILL at RIP=0x%lx (RVA 0x%lx), skipping 2 bytes [fault %d]\n",
+                    rip, rip - (u64)g_img, g_mid_init_fault_count);
+            mid_sigill_count++;
+        }
+        /* Skip 2 bytes and continue - don't use crash_pick_fallback_rip to avoid ret-stub redirect */
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 2);
         return;
     }
 
