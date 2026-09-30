@@ -5605,11 +5605,21 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         return;
     }
 
-    /* Handle specific stack-underflow crash at RVA 0x2659 by skipping instruction */
-    if (sig == SIGSEGV && rip == (u64)g_img + 0x2659 && faultaddr < g_guest_stack_low) {
-        /* Stack underflow at add [rdx+0x8],-1 (4 bytes) - skip it */
-        fprintf(stderr, "[SKIP] Stack underflow at RIP=0x%lx (RVA 0x2659), skipping 4-byte instruction\n", rip);
-        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 4);
+    /* Handle specific stack-underflow crash at RVA 0x2650-0x2670 using real-unwind return */
+    if (sig == SIGSEGV && rip >= (u64)g_img + 0x2650 && rip <= (u64)g_img + 0x2670) {
+        u64 rsp0 = (u64)uc->uc_mcontext.gregs[REG_RSP];
+        u64 ret_addr = 0, new_rsp = 0;
+        fprintf(stderr, "[SKIP] Early-startup fault at RIP=0x%lx (RVA 0x%lx), trying real-unwind\n", 
+                rip, rip - (u64)g_img);
+        /* Try to use real unwind to find a safe return point */
+        if (try_real_unwind_return(rip, rsp0, &ret_addr, &new_rsp)) {
+            fprintf(stderr, "       -> Recovered via real-unwind to RIP=0x%lx\n", ret_addr);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ret_addr;
+            uc->uc_mcontext.gregs[REG_RSP] = (greg_t)new_rsp;
+            return;
+        }
+        /* If real unwind fails, skip 1 byte and retry */
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 1);
         return;
     }
 
