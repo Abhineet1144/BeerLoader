@@ -4936,6 +4936,24 @@ static void patch_known_bad_targets(void)
         }
     }
 
+    /* Sekiro game-init bad-return at RVA 0x237ce59: a function epilogue tries to
+     * return via a NULL stack slot (NULL return address). This creates an infinite
+     * loop as the fault handler can't break out. Patch the `ret` to jump to a safe
+     * stub (xor eax,eax; ret) that allows the function chain to complete. */
+    {
+        u64 target = (u64)g_img + 0x237ce59;
+        u64 page   = target & ~(u64)0xFFF;
+        if (mprotect((void *)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            u8 *p = (u8 *)target;
+            p[0] = 0x31; p[1] = 0xC0; /* xor eax,eax */
+            p[2] = 0xC3;              /* ret */
+            fprintf(stderr, "[PATCH] Sekiro bad-return stub at RVA 0x237ce59 patched to safe return\n");
+        } else {
+            fprintf(stderr, "[WARN] Failed to patch Sekiro bad-return at RVA 0x237ce59: %s\n",
+                    strerror(errno));
+        }
+    }
+
     if (aggressive) {
         /* Entry bootstrap helper ... */
         {
@@ -5747,13 +5765,34 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         return;
     }
 
-    /* Cycle detection for 0x237cff0-0x237d01d: This tight loop has code that crashes repeatedly
-     * and creates an unbreakable recovery cycle. Count faults here and exit after threshold to avoid
-     * spinning CPU and cycle detector timeout. */
-    if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cde0 && rip <= (u64)g_img + 0x237d100) {
+    /* Cycle detection for 0x237cde0-0x23b1400: Game-init and graphics-setup region.
+     * This wide range contains multiple initialization sequences with complex control flow.
+     * After multiple attempts to fix register state and return addresses, the code still loops.
+     * When stuck in the tight 0x237ce59-0x237ce5b loop with NULL return addresses, jump past
+     * the entire problematic region instead of trying internal recovery. */
+    if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cde0 && rip <= (u64)g_img + 0x23b1400) {
         static u32 sekiro_cycle_faults = 0;
+        static u32 ce5x_attempts = 0;  /* Count attempts at the tight 0x237ce59-0x237ce5b loop */
+        
         sekiro_cycle_faults++;
-        if (sekiro_cycle_faults > 10) {
+        
+        /* Detect if we're looping at 0x237ce59-0x237ce5b with NULL fault addresses */
+        if (rip >= (u64)g_img + 0x237ce59 && rip <= (u64)g_img + 0x237ce5b && faultaddr == 0) {
+            ce5x_attempts++;
+            if (ce5x_attempts >= 3) {
+                /* We're definitely stuck in the bad-return loop. Jump past the entire region. */
+                fprintf(stderr, "[SKIP] Sekiro tight loop at 0x237ce59-0x237ce5b [attempt %d] - jumping past region to 0x237d140\n",
+                        ce5x_attempts);
+                uc->uc_mcontext.gregs[REG_RAX] = 0;
+                uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)((u64)g_img + 0x237d140);
+                return;
+            }
+        } else {
+            ce5x_attempts = 0;  /* Reset counter if we leave the tight loop region */
+        }
+        
+        if (sekiro_cycle_faults > 20) {
             fprintf(stderr, "[FATAL] Sekiro game-init region unbreakable cycle detected (%d faults), exiting to avoid spin\n",
                     sekiro_cycle_faults);
             fprintf(stderr, "        Last fault at RIP=0x%lx RCX=0x%lx RDX=0x%lx R8=0x%lx R14=0x%lx RSP=0x%lx\n",
@@ -5764,7 +5803,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             exit(97);
         }
         
-        fprintf(stderr, "[SKIP] Sekiro game-init region RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/10] R14=0x%lx\n",
+        fprintf(stderr, "[SKIP] Sekiro game-init region RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/20] R14=0x%lx\n",
                 rip, rip - (u64)g_img, faultaddr, sekiro_cycle_faults,
                 uc->uc_mcontext.gregs[REG_R14]);
         /* Initialize key registers to prevent address overflows and invalid accesses.
