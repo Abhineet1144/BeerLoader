@@ -160,6 +160,13 @@ static u32 g_ret_stub_baseline_resets = 0;
 static u32 g_mid_init_fault_count = 0;
 static const u32 MID_INIT_FAULT_LIMIT = 50;  /* Abort if we see >50 faults without escaping the range */
 
+/* Progress tracking: APIs called on the path to window creation */
+static u32 g_api_registerclass = 0;
+static u32 g_api_createwindow = 0;
+static u32 g_api_createfactory = 0;
+static u32 g_api_createdevice = 0;
+static u32 g_api_first_api_call = 0;
+
 /* RSP observed just before handing off to the PE entry point — the
  * shallowest legitimate stack depth for the whole run. Any "recovered"
  * RSP produced by speculative stack-popping that ends up ABOVE this
@@ -1972,6 +1979,7 @@ impl_CreateDXGIFactory(u64 riid, u64 **ppFactory)
 {
     sync_saved_guest_rsp_from_teb();
     (void)riid;
+    if (!g_api_createfactory) { g_api_createfactory=1; fprintf(stderr, "[PROGRESS] CreateDXGIFactory called - graphics factory created\n"); }
     if (ppFactory) *ppFactory = g_dxgi_factory;
     return S_OK;
 }
@@ -2157,6 +2165,7 @@ impl_D3D11CreateDevice(u64 adapter, u32 driver_type, u64 software,
 {
     (void)adapter;(void)driver_type;(void)software;(void)flags;
     (void)feature_levels;(void)n_levels;(void)sdk_ver;
+    if (!g_api_createdevice) { g_api_createdevice=1; fprintf(stderr, "[PROGRESS] D3D11CreateDevice called - graphics device created\n"); }
     fprintf(stderr, "[D3D11] CreateDevice -> fake device\n");
     if (ppDevice)      *ppDevice  = g_d3d11_device;
     if (pFeatureLevel) *pFeatureLevel = D3D_FEATURE_LEVEL_11_0;
@@ -2687,9 +2696,9 @@ static volatile int g_win_quit = 0;
 static u32 g_win_quit_code = 0;
 
 static u64 __attribute__((ms_abi))
-impl_RegisterClassExA(u64 wndclass) { (void)wndclass; return 1; }
+impl_RegisterClassExA(u64 wndclass) { (void)wndclass; if (!g_api_registerclass) { g_api_registerclass=1; fprintf(stderr, "[PROGRESS] RegisterClassExA called - window registration started\n"); } return 1; }
 static u64 __attribute__((ms_abi))
-impl_RegisterClassExW(u64 wndclass) { (void)wndclass; return 1; }
+impl_RegisterClassExW(u64 wndclass) { (void)wndclass; if (!g_api_registerclass) { g_api_registerclass=1; fprintf(stderr, "[PROGRESS] RegisterClassExW called - window registration started\n"); } return 1; }
 static u64 __attribute__((ms_abi))
 impl_GetDesktopWindow(void) { return FAKE_HWND; }
 static u64 __attribute__((ms_abi))
@@ -3228,6 +3237,7 @@ impl_CreateWindowExW(u32 exstyle, u64 classname, u64 title, u32 style,
 {
     (void)exstyle;(void)classname;(void)title;(void)style;
     (void)x;(void)y;(void)w;(void)h;(void)parent;(void)menu;(void)inst;(void)param;
+    if (!g_api_createwindow) { g_api_createwindow=1; fprintf(stderr, "[PROGRESS] CreateWindowExW called - window created\n"); }
     fprintf(stderr, "[WIN] CreateWindowExW(%dx%d) -> HWND\n", w, h);
     return FAKE_HWND;
 }
@@ -3237,6 +3247,7 @@ impl_CreateWindowExA(u32 exstyle, u64 classname, u64 title, u32 style,
 {
     (void)exstyle;(void)classname;(void)title;(void)style;
     (void)x;(void)y;(void)w;(void)h;(void)parent;(void)menu;(void)inst;(void)param;
+    if (!g_api_createwindow) { g_api_createwindow=1; fprintf(stderr, "[PROGRESS] CreateWindowExA called - window created\n"); }
     fprintf(stderr, "[WIN] CreateWindowExA(%dx%d) -> HWND\n", w, h);
     return FAKE_HWND;
 }
@@ -5577,6 +5588,22 @@ static u64 crash_pick_fallback_rip(u64 rip, const char *tag)
     return primary;
 }
 
+/* Report progress toward window creation based on which APIs have been called */
+static void report_window_progress(void)
+{
+    int progress = 0;
+    fprintf(stderr, "\n[PROGRESS SUMMARY]\n");
+    if (g_api_registerclass) { fprintf(stderr, "  [✓] RegisterClass\n"); progress += 25; }
+    if (g_api_createwindow) { fprintf(stderr, "  [✓] CreateWindow\n"); progress += 25; }
+    if (g_api_createfactory) { fprintf(stderr, "  [✓] CreateDXGIFactory\n"); progress += 25; }
+    if (g_api_createdevice) { fprintf(stderr, "  [✓] D3D11CreateDevice\n"); progress += 25; }
+    fprintf(stderr, "  Percentage to get window: %d%% (%d/4 major milestones)\n", progress, 
+            (g_api_registerclass ? 1 : 0) + (g_api_createwindow ? 1 : 0) + 
+            (g_api_createfactory ? 1 : 0) + (g_api_createdevice ? 1 : 0));
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
 {
     ucontext_t *uc = (ucontext_t *)uctx;
@@ -5627,6 +5654,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             fprintf(stderr,
                     "[FATAL] Aborting instead of spinning forever; these RVAs "
                     "need a real fix (not another fallback redirect).\n");
+            report_window_progress();
             fflush(stderr);
             _exit(2);
         }
@@ -5682,6 +5710,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         if (g_mid_init_fault_count > MID_INIT_FAULT_LIMIT) {
             fprintf(stderr, "[FATAL] Middle-init SIGSEGV limit exceeded (%d faults), exiting to avoid infinite loop\n",
                     g_mid_init_fault_count);
+            report_window_progress();
             exit(98);
         }
         
@@ -5704,6 +5733,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         if (g_mid_init_fault_count > MID_INIT_FAULT_LIMIT) {
             fprintf(stderr, "[FATAL] Middle-init SIGILL limit exceeded (%d faults), exiting to avoid infinite loop\n",
                     g_mid_init_fault_count);
+            report_window_progress();
             exit(98);
         }
         
@@ -5730,6 +5760,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                     rip, uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
                     uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R14],
                     uc->uc_mcontext.gregs[REG_RSP]);
+            report_window_progress();
             exit(97);
         }
         
@@ -6339,6 +6370,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                 fprintf(stderr,
                         "[FATAL] 235a694 ret-stub: Already reset %d times, cannot escape cycle. Exiting.\n",
                         g_ret_stub_baseline_resets);
+                report_window_progress();
                 exit(99);  /* Exit with special code to distinguish from normal exit */
             }
             fprintf(stderr,
