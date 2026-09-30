@@ -5639,14 +5639,35 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     /* Handle early-startup faults (CRT initialization region RVA 0x2600-0x27ff) using real-unwind.
      * These occur during very early initialization and are usually recoverable
      * via proper function frame unwinding rather than instruction patching. */
-    if (sig == SIGSEGV && rip >= (u64)g_img + 0x2600 && rip <= (u64)g_img + 0x27ff) {
-        u64 rsp0 = (u64)uc->uc_mcontext.gregs[REG_RSP];
+    if (sig == SIGSEGV && rip >= (u64)g_img + 0x2600 && rip <= (u64)g_img + 0x27ff &&
+        g_guest_stack_low && g_guest_stack_high && rsp0 >= g_guest_stack_low && rsp0 <= g_guest_stack_high) {
         u64 ret_addr = 0, new_rsp = 0;
         static int early_fault_count = 0;
         if (early_fault_count < 10) {
             fprintf(stderr, "[SKIP] Early CRT fault at RIP=0x%lx (RVA 0x%lx)\n", 
                     rip, rip - (u64)g_img);
             early_fault_count++;
+        }
+        /* Try to use real unwind to find a safe return point */
+        if (try_real_unwind_return(rip, rsp0, &ret_addr, &new_rsp)) {
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ret_addr;
+            uc->uc_mcontext.gregs[REG_RSP] = (greg_t)new_rsp;
+            return;
+        }
+        /* If real unwind fails, skip 1 byte and retry */
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 1);
+        return;
+    }
+
+    /* Handle stack-underflow in middle initialization (e.g., RVA 0x99ce-0x9a63 region) */
+    if (sig == SIGSEGV && rip >= (u64)g_img + 0x9900 && rip <= (u64)g_img + 0x9a80 &&
+        g_guest_stack_low && g_guest_stack_high && rsp0 >= g_guest_stack_low && rsp0 <= g_guest_stack_high) {
+        u64 ret_addr = 0, new_rsp = 0;
+        static int mid_fault_count = 0;
+        if (mid_fault_count < 5) {
+            fprintf(stderr, "[SKIP] Middle-init fault at RIP=0x%lx (RVA 0x%lx)\n", 
+                    rip, rip - (u64)g_img);
+            mid_fault_count++;
         }
         /* Try to use real unwind to find a safe return point */
         if (try_real_unwind_return(rip, rsp0, &ret_addr, &new_rsp)) {
