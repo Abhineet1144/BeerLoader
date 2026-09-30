@@ -1161,11 +1161,33 @@ static int wcscmp_ascii(const u16 *w, const char *s) {
     return (int)lw - (int)ls;
 }
 
+/* Simple DLL handle cache for fake/unimplemented DLLs */
+static struct {
+    char name[64];
+    u64 handle;
+} g_fake_dll_cache[32];
+static int g_fake_dll_count = 0;
+
 static u64 dll_name_to_handle(const char *lname) {
     if (!strcmp(lname,"kernel32.dll")||!strcmp(lname,"kernelbase.dll")) return HMOD_K32;
     if (!strcmp(lname,"user32.dll"))   return HMOD_USER32;
     if (!strcmp(lname,"ntdll.dll"))    return HMOD_NTDLL;
     if (!strcmp(lname,"advapi32.dll")) return HMOD_ADVAPI;
+    
+    /* For unknown DLLs, generate or return a cached fake handle */
+    for (int i=0; i<g_fake_dll_count; i++) {
+        if (!strcmp(g_fake_dll_cache[i].name, lname))
+            return g_fake_dll_cache[i].handle;
+    }
+    
+    /* Create a new fake handle: use 0x140000000 + (index * 0x100000) */
+    if (g_fake_dll_count < 32) {
+        u64 fake_h = 0x140000000ULL + ((u64)g_fake_dll_count << 20);
+        strncpy(g_fake_dll_cache[g_fake_dll_count].name, lname, 63);
+        g_fake_dll_cache[g_fake_dll_count].handle = fake_h;
+        g_fake_dll_count++;
+        return fake_h;
+    }
     return 0;
 }
 
@@ -1725,8 +1747,12 @@ impl_LoadLibraryA(const char *name)
     }
     lname[i]=0;
     u64 h = dll_name_to_handle(lname);
-    if (h) return h;
-    fprintf(stderr, "[IMPL] LoadLibraryA(\"%s\") -> NULL\n", name);
+    if (h) {
+        if (lname[0] != 'k' && lname[0] != 'u' && lname[0] != 'n' && lname[0] != 'a') {
+            fprintf(stderr, "[IMPL] LoadLibraryA(\"%s\") -> 0x%lx (fake)\n", name, h);
+        }
+        return h;
+    }
     g_last_error = 126; return 0;
 }
 static u64 __attribute__((ms_abi))
@@ -1739,7 +1765,12 @@ impl_LoadLibraryW(const u16 *name)
     }
     lname[i]=0;
     u64 h = dll_name_to_handle(lname);
-    if (h) return h;
+    if (h) {
+        if (lname[0] != 'k' && lname[0] != 'u' && lname[0] != 'n' && lname[0] != 'a') {
+            fprintf(stderr, "[IMPL] LoadLibraryW(%S) -> 0x%lx (fake)\n", name, h);
+        }
+        return h;
+    }
     g_last_error = 126; return 0;
 }
 static u64 __attribute__((ms_abi))
