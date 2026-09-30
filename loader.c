@@ -170,6 +170,18 @@ static u32 g_api_createfactory = 0;
 static u32 g_api_createdevice = 0;
 static u32 g_api_first_api_call = 0;
 
+/* Sync memory infrastructure: Track allocated lock/sync structures for game-init.
+ * Game code uses XCHG instructions on arrays/tables of locks. We allocate real
+ * memory at those addresses on-demand when the game tries to use them. */
+#define MAX_SYNC_REGIONS 16
+typedef struct {
+    u64 base_addr;       /* Base address where we allocated */
+    u64 size;            /* Size allocated */
+    int mapped;          /* Whether successfully mmap'd */
+} SyncRegion;
+static SyncRegion g_sync_regions[MAX_SYNC_REGIONS];
+static int g_sync_region_count = 0;
+
 /* RSP observed just before handing off to the PE entry point — the
  * shallowest legitimate stack depth for the whole run. Any "recovered"
  * RSP produced by speculative stack-popping that ends up ABOVE this
@@ -5761,6 +5773,120 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         return;
     }
 
+    /* ============================================================================
+     * Sync Memory Infrastructure: Handle XCHG crashes in game-init
+     * ============================================================================
+     * The game-init code tries to use synchronization primitives (XCHG locks)
+     * on unallocated memory at specific RVAs. Strategy:
+     * 1. Allocate real memory at the faultaddr
+     * 2. Skip the XCHG instruction (treat as lock acquire with immediate success)
+     * 3. Initialize result register to 0 (lock was free, acquire succeeded)
+     */
+    
+    /* Specific XCHG crash points that need sync memory + skip */
+    int is_xchg_crash = (rip == (u64)g_img + 0x237cff0 || rip == (u64)g_img + 0x23b1318);
+    
+    if (is_xchg_crash && faultaddr >= 0x1000 && faultaddr < 0x7f0000000000ULL) {
+        u64 page_aligned = faultaddr & ~0xFFF;
+        u64 alloc_size = 0x100000;  /* 1MB chunks */
+        int should_skip_instr = 0;
+        
+        /* Check if we've already allocated this region */
+        int already_allocated = 0;
+        for (int i = 0; i < g_sync_region_count; i++) {
+            if (g_sync_regions[i].base_addr == page_aligned) {
+                already_allocated = 1;
+                should_skip_instr = 1;
+                break;
+            }
+        }
+        
+        if (!already_allocated && g_sync_region_count < MAX_SYNC_REGIONS) {
+            /* Try to map memory at this address with MAP_FIXED */
+            void *result = mmap((void*)page_aligned, alloc_size,
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                               -1, 0);
+            
+            if (result != MAP_FAILED) {
+                /* Initialize with a pattern of zeros (SRWLOCK/CRITICAL_SECTION friendly) */
+                memset((void*)page_aligned, 0, alloc_size);
+                
+                /* Fill with repeating pattern of unacquired lock values (8-byte stride) */
+                u64 *lock_table = (u64 *)page_aligned;
+                for (size_t i = 0; i < (alloc_size / sizeof(u64)); i++) {
+                    lock_table[i] = 0;  /* 0 = unacquired lock */
+                }
+                
+                /* Register the allocation */
+                g_sync_regions[g_sync_region_count].base_addr = page_aligned;
+                g_sync_regions[g_sync_region_count].size = alloc_size;
+                g_sync_regions[g_sync_region_count].mapped = 1;
+                g_sync_region_count++;
+                
+                fprintf(stderr, "[SYNC] Allocated at 0x%lx-0x%lx (%luKB) [region %d/%d] for RIP=0x%lx\n",
+                        page_aligned, page_aligned + alloc_size, alloc_size / 1024,
+                        g_sync_region_count, MAX_SYNC_REGIONS, rip);
+                
+                should_skip_instr = 1;
+            }
+        }
+        
+        if (should_skip_instr) {
+            /* Memory is now allocated/mapped. Skip the XCHG instruction and pretend we acquired the lock. */
+            /* XCHG is typically 3 bytes: F0 48 87 /r (REX F0 XCHG variant) */
+            u64 next_rip = rip + 3;  /* Skip the XCHG instruction */
+            
+            /* Set up register state as if XCHG succeeded:
+             * For a lock acquire XCHG, the exchanged-out value (result in RAX/RDX/etc)
+             * should be 0 (meaning lock was free and we acquired it) */
+            uc->uc_mcontext.gregs[REG_RAX] = 0;    /* Common result register */
+            uc->uc_mcontext.gregs[REG_RDX] = 0;    /* Also used in XCHG patterns */
+            uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;  /* Base address validity */
+            
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)next_rip;
+            
+            fprintf(stderr, "[SYNC] Skipped XCHG at RIP=0x%lx, continuing from 0x%lx\n", rip, next_rip);
+            return;
+        }
+    }
+
+    /* ============================================================================
+     * Fallback: Generic sync memory allocation for other addresses
+     * ============================================================================
+     */
+    if (faultaddr >= 0x1000 && faultaddr < 0x7f0000000000ULL && !is_xchg_crash) {
+        u64 page_aligned = faultaddr & ~0xFFF;
+        u64 alloc_size = 0x100000;
+        
+        int already_allocated = 0;
+        for (int i = 0; i < g_sync_region_count; i++) {
+            if (g_sync_regions[i].base_addr == page_aligned) {
+                already_allocated = 1;
+                break;
+            }
+        }
+        
+        if (!already_allocated && g_sync_region_count < MAX_SYNC_REGIONS) {
+            void *result = mmap((void*)page_aligned, alloc_size,
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                               -1, 0);
+            
+            if (result != MAP_FAILED) {
+                memset((void*)page_aligned, 0, alloc_size);
+                g_sync_regions[g_sync_region_count].base_addr = page_aligned;
+                g_sync_regions[g_sync_region_count].size = alloc_size;
+                g_sync_regions[g_sync_region_count].mapped = 1;
+                g_sync_region_count++;
+                
+                fprintf(stderr, "[SYNC] Generic alloc: 0x%lx-0x%lx (%luKB)\n",
+                        page_aligned, page_aligned + alloc_size, alloc_size / 1024);
+                return;
+            }
+        }
+    }
+
     /* Cycle detection for 0x237cde0-0x23b1400: Game-init and graphics-setup region.
      * This wide range contains multiple initialization sequences with complex control flow.
      * After multiple attempts to fix register state and return addresses, the code still loops.
@@ -5769,8 +5895,33 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cde0 && rip <= (u64)g_img + 0x23b1400) {
         static u32 sekiro_cycle_faults = 0;
         static u32 ce5x_attempts = 0;  /* Count attempts at the tight 0x237ce59-0x237ce5b loop */
+        static u64 last_rip = 0;  /* CHANGED FROM u32 to u64 */
+        static u32 same_rip_count = 0;
         
         sekiro_cycle_faults++;
+        
+        /* Track if we're looping on the exact same RIP */
+        if (last_rip == rip) {
+            same_rip_count++;
+        } else {
+            same_rip_count = 1;
+            last_rip = rip;
+        }
+        
+        /* Detect problematic RIPs and jump far after 2+ repeats */
+        u64 check_addr_ce28 = (u64)g_img + 0x237ce28;
+        u64 check_addr_ce59 = (u64)g_img + 0x237ce59;
+        
+        if ((rip == check_addr_ce28 || rip == check_addr_ce59) && same_rip_count >= 2) {
+            fprintf(stderr, "[SKIP] Sekiro stuck at RIP=0x%lx [repeat %d] - jumping to safe return\n",
+                    rip, same_rip_count);
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
+            uc->uc_mcontext.gregs[REG_R14] = 0;
+            reset_rsp_to_entry_baseline(uc);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
+            return;
+        }
         
         /* Detect if we're looping at 0x237ce59-0x237ce5b with NULL fault addresses */
         if (rip >= (u64)g_img + 0x237ce59 && rip <= (u64)g_img + 0x237ce5b && faultaddr == 0) {
