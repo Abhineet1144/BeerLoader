@@ -1,0 +1,92 @@
+warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+Reading symbols from ./loader...
+Breakpoint 1 at 0x1a25a: file loader.c, line 6917.
+Starting program: /home/abhineet/Desktop/Abhi/Beer/loader '/run/media/abhineet/56A4064AA4062CD5/Games/Sekiro - Shadows Die Twice/sekiro.exe'
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, main (argc=2, argv=0x7fffffffda88) at loader.c:6917
+6917	    init_d3d11_fake();
+Breakpoint 2 at 0x14235a28c
+Continuing.
+
+Breakpoint 2, 0x000000014235a28c in ?? ()
+Signal        Stop	Print	Pass to program	Description
+SIGSEGV       Yes	Yes	No		Segmentation fault
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000142345c8d in ?? ()
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000142345c8d in ?? ()
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000142345c8d in ?? ()
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000142345c8d in ?? ()
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000142345c8d in ?? ()
+rax            0x7ffff72e6ff0      140737340403696
+rbx            0x0                 0
+rcx            0x5361d38d82370000  6008315982617444352
+rdx            0x142c56204         5415199236
+rsi            0x7ffff72effd0      140737340440528
+rdi            0x7ffff71eaff1      140737339371505
+rbp            0x7ffff7bdf488      0x7ffff7bdf488
+rsp            0x7ffff7bdf318      0x7ffff7bdf318
+r8             0x5                 5
+r9             0x7ffff7bdf2d8      140737349808856
+r10            0x140               320
+r11            0x7ffff7bdf2e8      140737349808872
+r12            0x0                 0
+r13            0x1                 1
+r14            0x0                 0
+r15            0x7ffff71f9f60      140737339432800
+rip            0x142345c8d         0x142345c8d
+eflags         0x10246             [ PF ZF IF RF ]
+cs             0x33                51
+ss             0x2b                43
+ds             0x0                 0
+es             0x0                 0
+fs             0x0                 0
+gs             0x0                 0
+pl3_ssp        <unavailable>
+fs_base        0x7ffff7f95780      140737353701248
+gs_base        0x7ffff7fb1000      140737353814016
+0x7ffff7bdf318:	0x00007ffff7e20000	0x0000000000000000
+0x7ffff7bdf328:	0x00007ffff7bdf488	0x0000000000000000
+0x7ffff7bdf338:	0x00007ffff7bdf450	0x00000001423b164a
+0x7ffff7bdf348:	0x00000000000000ff	0x000000014237fccc
+0x7ffff7bdf358:	0x00007ffff72effd0	0x00000001423a6e04
+0x7ffff7bdf368:	0x00000001000004e4	0x0000000000000000
+0x7ffff7bdf378:	0x0000000000000000	0x0000000000000000
+0x7ffff7bdf388:	0x0000000000000000	0x0000000100000000
+0x7ffff7bdf398:	0xfffffffffffffffe	0x00000001000004e4
+0x7ffff7bdf3a8:	0x0000000000000000	0x0000000000000000
+0x7ffff7bdf3b8:	0x0000000000000000	0x0000000000000000
+0x7ffff7bdf3c8:	0x0000000000000000	0x00002c9e2430712f
+0x7ffff7bdf3d8:	0x000000000000003f	0x0000000000000000
+0x7ffff7bdf3e8:	0x0000000000000002	0x00007ffff7bdf578
+0x7ffff7bdf3f8:	0x0000000000000000	0x0000000142346c49
+0x7ffff7bdf408:	0x00007fff00000000	0x00007ffff7e28fc0
+#0  0x0000000142345c8d in ?? ()
+#1  0x00007ffff7e20000 in resbuf () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x0000000000000000 in ?? ()
+A debugging session is active.
+
+	Inferior 1 [process 55503] will be killed.
+
+Quit anyway? (y or n) [answered Y; input not from terminal]

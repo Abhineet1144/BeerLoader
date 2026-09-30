@@ -163,6 +163,9 @@ static u64 g_entry_rsp = 0;
 static u64 g_entry_rsp_limit = 0;
 static u64 g_guest_stack_low = 0;
 static u64 g_guest_stack_high = 0;
+
+/* Diagnostics: track which path beer_dispatch_trampoline takes */
+__thread int g_trampoline_path = 0;  /* 0=outer, 1=nested */
 /* Address of the seeded caller-frame return slot at g_entry_rsp+0x5c8
  * (see main()'s guest_ret_slot2), pre-populated with a real, validated
  * in-image continuation address (guest_initial_ret). Every crash-handler
@@ -234,6 +237,8 @@ static void reset_rsp_to_entry_baseline(ucontext_t *uc)
         seed_guest_entry_frame(ret_target);
         uc->uc_mcontext.gregs[REG_RSP] = (greg_t)g_entry_rsp;
         uc->uc_mcontext.gregs[REG_RBP] = (greg_t)(g_entry_rsp + 0x5c0);
+    } else {
+        fprintf(stderr, "[WARN] reset_rsp_to_entry_baseline called but g_entry_rsp=0!\n");
     }
 }
 
@@ -502,6 +507,36 @@ __thread u64 g_host_call_stack_top;
 __thread u64 g_saved_guest_rsp;
 static u64 g_impl_targets[MAX_STUBS];
 
+/* ── Minimal Windows TEB / PEB ──────────────────────────────────── */
+/*
+ * Windows x64 uses gs:[offset] to access TEB fields.
+ * The most important offsets:
+ *   gs:[0x00]  ExceptionList
+ *   gs:[0x08]  StackBase
+ *   gs:[0x10]  StackLimit
+ *   gs:[0x30]  Self (pointer to TEB itself)
+ *   gs:[0x60]  PEB pointer
+ *
+ * We set the GS base MSR to point at our TEB via arch_prctl(ARCH_SET_GS).
+ */
+typedef struct {
+    u64 ExceptionList;          /* +0x000 */
+    u64 StackBase;              /* +0x008 */
+    u64 StackLimit;             /* +0x010 */
+    u8  _pad0[0x30 - 0x18];
+    u64 Self;                   /* +0x030 */
+    u8  _pad1[0x60 - 0x38];
+    u64 ProcEnvBlk;             /* +0x060 */
+    u8  _pad2[0xA0 - 0x68];
+    u64 SavedGuestRsp;          /* +0x0A0 for beer_dispatch_trampoline */
+    u64 HostCallStackBase;      /* +0x0A8 for beer_dispatch_trampoline */
+    u64 HostCallStackTop;       /* +0x0B0 for beer_dispatch_trampoline */
+    u8  _pad3[0x1000 - 0xB8];
+} WinTEB;
+
+/* Forward declaration of WinTEB */
+WinTEB;
+
 static void host_stack_init_thread(void)
 {
     if (g_host_call_stack_base) return;
@@ -510,6 +545,14 @@ static void host_stack_init_thread(void)
     if (m == MAP_FAILED) { perror("mmap(host_call_stack)"); _exit(2); }
     g_host_call_stack_base = (u64)m;
     g_host_call_stack_top = ((u64)m + HOST_CALL_STACK_SIZE - 256) & ~0xFULL;
+    
+    /* Also update the TEB fields for beer_dispatch_trampoline to use */
+    u64 gs_base = 0;
+    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
+        WinTEB *teb = (WinTEB *)gs_base;
+        teb->HostCallStackBase = g_host_call_stack_base;
+        teb->HostCallStackTop = g_host_call_stack_top;
+    }
 }
 
 /*
@@ -536,16 +579,42 @@ static void host_stack_init_thread(void)
  * the real hardware stack downward from wherever the outer call left
  * it, instead of resetting to a fixed address.
  */
+
+/* Sync SavedGuestRsp from TEB to __thread variable for C code */
+static inline void sync_saved_guest_rsp_from_teb(void) {
+    u64 gs_base = 0;
+    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
+        WinTEB *teb = (WinTEB *)gs_base;
+        g_saved_guest_rsp = teb->SavedGuestRsp;
+    }
+}
+
+/* Helper for trampoline return path */
+static u64 __attribute__((ms_abi)) get_saved_guest_rsp_from_teb(void) {
+    u64 gs_base = 0;
+    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
+        WinTEB *teb = (WinTEB *)gs_base;
+        u64 val = teb->SavedGuestRsp;
+        static int call_count = 0;
+        if (call_count++ < 5) {  /* Log first 5 calls only */
+            fprintf(stderr, "[TEB_READ] SavedGuestRsp=%p (from TEB @ %p)\n", (void*)val, (void*)gs_base);
+        }
+        return val;
+    }
+    fprintf(stderr, "[TEB_READ] ERROR: Could not get GS base!\n");
+    return 0;
+}
+
 __asm__(
     ".text\n"
     ".global beer_dispatch_trampoline\n"
     "beer_dispatch_trampoline:\n"
     "    mov %rsp, %rax\n"
-    "    sub %fs:g_host_call_stack_base@tpoff, %rax\n"
+    "    sub %gs:0xA8, %rax\n"              /* Subtract HostCallStackBase from TEB @ 0xA8 */
     "    cmp $" HOST_CALL_STACK_SIZE_STR ", %rax\n"
-    "    jb 1f\n"                         /* (rsp - base) < SIZE => already on it */
-    "    mov %rsp, %fs:g_saved_guest_rsp@tpoff\n"
-    "    mov %fs:g_host_call_stack_top@tpoff, %rsp\n"
+    "    jb 1f\n"                           /* (rsp - base) < SIZE => already on it */
+    "    mov %rsp, %gs:0xA0\n"              /* Save to TEB SavedGuestRsp @ 0xA0 */
+    "    mov %gs:0xB0, %rsp\n"              /* Switch to HostCallStackTop from TEB @ 0xB0 */
     "    lea g_impl_targets(%rip), %r11\n"
     "    mov (%r11,%r10,8), %rax\n"
     /* Windows x64 ABI requires the CALLER to reserve 32 bytes of "shadow
@@ -562,7 +631,7 @@ __asm__(
      * qwords (over-copying is harmless). rax/r11 are scratch; the target is
      * parked in r10 (index already consumed). */
     "    mov %rax, %r10\n"
-    "    mov %fs:g_saved_guest_rsp@tpoff, %r11\n"
+    "    mov %gs:0xA0, %r11\n"             /* Changed: load from TEB SavedGuestRsp */
     "    sub $0x80, %rsp\n"
     ".irp off,0,8,16,24,32,40,48,56,64,72,80,88\n"
     "    mov 0x28+\\off(%r11), %rax\n"
@@ -570,8 +639,11 @@ __asm__(
     ".endr\n"
     "    call *%r10\n"
     "    add $0x80, %rsp\n"
-    "    mov %fs:g_saved_guest_rsp@tpoff, %rsp\n"
-    "    ret\n"
+    "    lea get_saved_guest_rsp_from_teb(%rip), %r11\n"  /* Call helper */
+    "    call *%r11\n"
+    "    mov %rax, %rsp\n"                  /* Restore guest RSP */
+    "    pop %rax\n"                        /* Pop return address from guest stack */
+    "    jmp *%rax\n"                       /* Jump to return address */
     "1:\n"                                /* nested: keep using the current (already-switched) rsp */
     "    lea g_impl_targets(%rip), %r11\n"
     "    mov (%r11,%r10,8), %rax\n"
@@ -667,7 +739,7 @@ static void emit_impl_thunk(int idx, u64 fn_ptr)
     p[6] = 0x48; p[7] = 0xB8;
     memcpy(p + 8, &tramp, 8);        /* mov rax, beer_dispatch_trampoline */
 
-    p[16] = 0xFF; p[17] = 0xE0;      /* jmp rax */
+    p[16] = 0xFF; p[17] = 0xE0;      /* jmp rax (back to original JMP) */
     memset(p + 18, 0x90, 6);         /* nop pad */
 }
 
@@ -1473,6 +1545,7 @@ static u64 __attribute__((ms_abi)) impl_IsProcessorFeaturePresent(u32 f) {
  * values that fall inside the mapped guest image, to reconstruct an
  * approximate call chain when a stub is invoked directly from guest code. */
 static void dbg_dump_guest_callchain(const char *tag) {
+    sync_saved_guest_rsp_from_teb();
     extern __thread u64 g_saved_guest_rsp;
     u64 rsp = g_saved_guest_rsp;
     fprintf(stderr, "[CHAIN:%s] rsp=0x%lx\n", tag, rsp);
@@ -1859,10 +1932,9 @@ static void init_dxgi_fake(void) {
 static u64 __attribute__((ms_abi))
 impl_CreateDXGIFactory(u64 riid, u64 **ppFactory)
 {
+    sync_saved_guest_rsp_from_teb();
     (void)riid;
     if (ppFactory) *ppFactory = g_dxgi_factory;
-    fprintf(stderr, "[DXGI] CreateDXGIFactory -> fake factory 0x%lx\n",
-            (u64)g_dxgi_factory);
     return S_OK;
 }
 static u64 __attribute__((ms_abi))
@@ -2003,7 +2075,14 @@ dxgi_ok(u64 a, u64 b, u64 c, u64 d)
 /* Logging wrapper to understand which vtable slot fires */
 static u64 __attribute__((ms_abi))
 dxgi_log_ok(u64 a, u64 b, u64 c, u64 d) {
-    fprintf(stderr, "[DXGI_vtab?] ok(0x%lx, 0x%lx, 0x%lx)\n", a, b, c);
+    /* Try to identify which vtable method this is by looking at the caller return address */
+    u64 caller_rip = 0;
+    if (g_saved_guest_rsp) {
+        caller_rip = *(u64*)(g_saved_guest_rsp); /* First stack slot has return address */
+    }
+    fprintf(stderr, "[DXGI_vtab_CALLED] ok(0x%lx, 0x%lx, 0x%lx) g_saved_guest_rsp=0x%lx caller_rip=0x%lx\n", 
+            a, b, c, g_saved_guest_rsp, caller_rip);
+    fflush(stderr);
     (void)d; return S_OK;
 }
 
@@ -4400,29 +4479,6 @@ static void pe_imports(void)
            g_nstubs, nreal, g_nstubs - nreal);
 }
 
-/* ── Minimal Windows TEB / PEB ──────────────────────────────────── */
-/*
- * Windows x64 uses gs:[offset] to access TEB fields.
- * The most important offsets:
- *   gs:[0x00]  ExceptionList
- *   gs:[0x08]  StackBase
- *   gs:[0x10]  StackLimit
- *   gs:[0x30]  Self (pointer to TEB itself)
- *   gs:[0x60]  PEB pointer
- *
- * We set the GS base MSR to point at our TEB via arch_prctl(ARCH_SET_GS).
- */
-typedef struct {
-    u64 ExceptionList;          /* +0x000 */
-    u64 StackBase;              /* +0x008 */
-    u64 StackLimit;             /* +0x010 */
-    u8  _pad0[0x30 - 0x18];
-    u64 Self;                   /* +0x030 */
-    u8  _pad1[0x60 - 0x38];
-    u64 ProcEnvBlk;             /* +0x060 */
-    u8  _pad2[0x1000 - 0x68];
-} WinTEB;
-
 typedef struct {
     u8  flags[4];               /* +0x000 */
     u8  _pad0[4];
@@ -4454,12 +4510,30 @@ typedef struct {
  */
 static void *alloc_teb_for_thread(void)
 {
-    host_stack_init_thread();
+    /* Allocate per-thread host call stack first, capturing bounds locally */
+    void *host_stack = mmap(NULL, HOST_CALL_STACK_SIZE, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (host_stack == MAP_FAILED) { perror("mmap(host_call_stack)"); _exit(2); }
+    u64 host_stack_base = (u64)host_stack;
+    u64 host_stack_top = ((u64)host_stack + HOST_CALL_STACK_SIZE - 256) & ~0xFULL;
+
     WinTEB *teb = mmap(NULL, sizeof(WinTEB), PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (teb == MAP_FAILED) die("mmap(worker TEB): %s", strerror(errno));
     memset(teb, 0, sizeof(*teb));
     teb->Self = (u64)teb;
+
+    /* Populate the host call stack TEB fields with THIS thread's stack bounds.
+     * This must happen BEFORE we populate the global variables, to avoid
+     * race conditions when multiple threads are created concurrently. */
+    teb->HostCallStackBase = host_stack_base;
+    teb->HostCallStackTop = host_stack_top;
+
+    /* Also update the globals for backward compatibility.
+     * Note: This is racy if multiple threads call concurrently, but that's
+     * okay since each thread has its own TEB fields now. */
+    g_host_call_stack_base = host_stack_base;
+    g_host_call_stack_top = host_stack_top;
 
     /* Per-thread TLS slot array (gs:[0x58]) */
     u64 *tls_array = mmap(NULL, (size_t)TLS_SLOTS * sizeof(u64),
@@ -5520,6 +5594,17 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         }
     }
 
+    /* EMERGENCY: If RSP is 0, reset to entry baseline immediately.
+     * This can happen if beer_dispatch_trampoline's return path corrupted RSP.
+     * Without this, RSP=0 leads to infinite crashes and cycle detection firing. */
+    if (sig == SIGSEGV && rsp0 == 0 && g_entry_rsp) {
+        fprintf(stderr, "[WARN] RSP=0 detected at RIP=0x%lx; resetting to entry baseline 0x%lx\n",
+                rip, g_entry_rsp);
+        reset_rsp_to_entry_baseline(uc);
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
+        return;
+    }
+
     if (g_guest_stack_low && g_guest_stack_high &&
         rsp0 && (rsp0 < g_guest_stack_low || rsp0 > g_guest_stack_high)) {
         fprintf(stderr,
@@ -5685,6 +5770,14 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         else {
             g_lowrip_last_rsp_page = rsp_page;
             g_lowrip_rsp_hits = 1;
+        }
+        
+        if (g_lowrip_rsp_hits == 1) {
+            fprintf(stderr, "[DBG] First low-RIP=0x%lx fault: rsp=0x%lx faultaddr=0x%lx rcx=0x%lx rax=0x%lx rdx=0x%lx\n",
+                    rip, rsp, faultaddr, 
+                    (u64)uc->uc_mcontext.gregs[REG_RCX],
+                    (u64)uc->uc_mcontext.gregs[REG_RAX],
+                    (u64)uc->uc_mcontext.gregs[REG_RDX]);
         }
 
         if (g_lowrip_rsp_hits >= 6) {
@@ -7117,14 +7210,21 @@ int main(int argc, char **argv)
     NtHdrs64 *nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
     u64 entry    = (u64)g_img + nt->opt.entry_rva;
 
-    /* Leave a safety margin below the top of the dedicated host call
-     * stack and keep it 16-byte aligned, matching ms_abi ABI expectations.
-     * At entry to the called function (after CALL pushes return address),
-     * rsp will be misaligned by 8, as per convention. Functions that need
-     * 16-byte alignment for movaps must re-align in their prologue. */
-    g_host_call_stack_base = (u64)g_host_call_stack;
-    g_host_call_stack_top =
-        ((u64)g_host_call_stack + HOST_CALL_STACK_SIZE - 256) & ~0xFULL;
+    /* Note: The TEB host stack fields were already populated by alloc_teb_for_thread()
+     * Do NOT override them with the static buffer - that breaks the TEB setup!
+     * The TEB already has the correct mmap'd stack bounds. */
+    
+    /* Instead, just update globals from the TEB for backward compatibility */
+    u64 gs_base = 0;
+    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
+        WinTEB *teb_main = (WinTEB *)gs_base;
+        g_host_call_stack_base = teb_main->HostCallStackBase;
+        g_host_call_stack_top = teb_main->HostCallStackTop;
+        fprintf(stderr, "[SETUP] Main thread TEB @ %p: HostCallStackBase=%p, HostCallStackTop=%p\n",
+                (void *)gs_base, (void *)teb_main->HostCallStackBase, (void *)teb_main->HostCallStackTop);
+    } else {
+        fprintf(stderr, "[SETUP] WARNING: Could not get GS base!\n");
+    }
 
     printf("\n[RUN] Handing off to entry point 0x%lx\n", entry);
     fflush(stdout);
@@ -7179,12 +7279,38 @@ int main(int argc, char **argv)
            g_entry_rsp, g_entry_ret_slot);
     fflush(stdout);
 
+    fprintf(stderr, "[ENTRY] Entry point at %p, g_entry_rsp=%p, g_host_call_stack: %p..%p\n",
+            (void*)entry, (void*)g_entry_rsp, (void*)g_host_call_stack_base, (void*)g_host_call_stack_top);
+
+    /* SavedGuestRsp will be set by beer_dispatch_trampoline on first outer call.
+     * Don't set it here - let the trampoline handle it. */
+    fprintf(stderr, "[SETUP] Entry frame at 0x%lx..0x%lx, first API will set SavedGuestRsp\n",
+            g_entry_rsp, g_entry_rsp + 0x1000);
+    
+    /* Verify TEB is clean at entry */
+    u64 gs_base_check = 0;
+    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base_check) == 0 && gs_base_check) {
+        WinTEB *teb_check = (WinTEB *)gs_base_check;
+        fprintf(stderr, "[SETUP] TEB SavedGuestRsp at entry: 0x%lx (should be 0)\n", 
+                teb_check->SavedGuestRsp);
+    }
+    
+    fprintf(stderr, "[ENTRY] Before handoff: entry=%p g_entry_rsp=%p\n", (void*)entry, (void*)g_entry_rsp);
+    fflush(stderr);
+    
     asm volatile (
+        "xor %%rax, %%rax\n\t"
+        "xor %%rcx, %%rcx\n\t"
+        "xor %%rdx, %%rdx\n\t"
+        "xor %%r8, %%r8\n\t"
+        "xor %%r9, %%r9\n\t"
         "mov %0, %%rsp\n\t"
+        ".globl _guest_entry_point\n\t"
+        "_guest_entry_point:\n\t"
         "jmp *%1\n\t"
         :
         : "r"(g_entry_rsp), "r"(entry)
-        : "memory"
+        : "memory", "rax", "rcx", "rdx", "r8", "r9", "rsp"
     );
 
     __builtin_unreachable();
