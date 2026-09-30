@@ -5717,6 +5717,18 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         return;
     }
 
+    /* Handle SIGSEGV/other faults in the 0x237d000-0x237d100 range (game init garbage derefs).
+     * These occur in a problematic code sequence that involves null-writes and uninitialized derefs.
+     * Instead of trying to recover within this range, escape to a safe fallback location. */
+    if (sig == SIGSEGV && rip >= (u64)g_img + 0x237d000 && rip <= (u64)g_img + 0x237d100) {
+        fprintf(stderr, "[SKIP] Game-init garbage deref at RIP=0x%lx (+0x%lx), faultaddr=0x%lx, using GATE escape\n",
+                rip, rip - (u64)g_img, faultaddr);
+        uc->uc_mcontext.gregs[REG_RAX] = 0;
+        uc->uc_mcontext.gregs[REG_RCX] = 0;
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "game-init-escape");
+        return;
+    }
+
     if (g_guest_stack_low && g_guest_stack_high &&
         rsp0 && (rsp0 < g_guest_stack_low || rsp0 > g_guest_stack_high)) {
         fprintf(stderr,
@@ -7078,9 +7090,9 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         g_img && rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) {
         u8 *instr = (u8 *)rip;
 
-        if (rip >= (u64)g_img + 0x237cec0 && rip <= (u64)g_img + 0x237cf40) {
+        if (rip >= (u64)g_img + 0x237cec0 && rip <= (u64)g_img + 0x237d010) {
             fprintf(stderr,
-                    "[SKIP] Near-null 237ce block (fault=0x%lx) at RIP=0x%lx (+0x%lx), redirecting\n",
+                    "[SKIP] Near-null 237ce-237d0 block (fault=0x%lx) at RIP=0x%lx (+0x%lx), redirecting\n",
                     faultaddr, rip, rip - (u64)g_img);
             uc->uc_mcontext.gregs[REG_RAX] = 0;
             uc->uc_mcontext.gregs[REG_RCX] = 0;
