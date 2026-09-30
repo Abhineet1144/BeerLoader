@@ -5717,12 +5717,20 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         return;
     }
 
-    /* Handle SIGSEGV/other faults in the 0x237d000-0x237d100 range (game init garbage derefs).
-     * These occur in a problematic code sequence that involves null-writes and uninitialized derefs.
-     * Instead of trying to recover within this range, escape to a safe fallback location. */
-    if (sig == SIGSEGV && rip >= (u64)g_img + 0x237d000 && rip <= (u64)g_img + 0x237d100) {
-        fprintf(stderr, "[SKIP] Game-init garbage deref at RIP=0x%lx (+0x%lx), faultaddr=0x%lx, using GATE escape\n",
-                rip, rip - (u64)g_img, faultaddr);
+    /* Cycle detection for 0x237cff0-0x237d01d: This tight loop has code that crashes repeatedly
+     * and creates an unbreakable recovery cycle. Count faults here and exit after threshold to avoid
+     * spinning CPU and cycle detector timeout. */
+    if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cff0 && rip <= (u64)g_img + 0x237d020) {
+        static u32 sekiro_cycle_faults = 0;
+        sekiro_cycle_faults++;
+        if (sekiro_cycle_faults > 5) {
+            fprintf(stderr, "[FATAL] Sekiro 0x237cff0-0x237d01d unbreakable cycle detected (%d faults), exiting to avoid spin\n",
+                    sekiro_cycle_faults);
+            exit(97);
+        }
+        
+        fprintf(stderr, "[SKIP] Sekiro game-init cycle RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/5]\n",
+                rip, rip - (u64)g_img, faultaddr, sekiro_cycle_faults);
         uc->uc_mcontext.gregs[REG_RAX] = 0;
         uc->uc_mcontext.gregs[REG_RCX] = 0;
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "game-init-escape");
