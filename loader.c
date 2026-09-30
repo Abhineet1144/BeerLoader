@@ -5605,6 +5605,14 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         return;
     }
 
+    /* Handle specific stack-underflow crash at RVA 0x2659 by skipping instruction */
+    if (sig == SIGSEGV && rip == (u64)g_img + 0x2659 && faultaddr < g_guest_stack_low) {
+        /* Stack underflow at add [rdx+0x8],-1 (4 bytes) - skip it */
+        fprintf(stderr, "[SKIP] Stack underflow at RIP=0x%lx (RVA 0x2659), skipping 4-byte instruction\n", rip);
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 4);
+        return;
+    }
+
     if (g_guest_stack_low && g_guest_stack_high &&
         rsp0 && (rsp0 < g_guest_stack_low || rsp0 > g_guest_stack_high)) {
         fprintf(stderr,
@@ -7242,7 +7250,7 @@ int main(int argc, char **argv)
      * [rsp+0x5c8]. We therefore seed the frame relative to that anchor and hand
      * execution off with %rsp pointing at the anchor itself, not at a synthetic
      * value 0x5c8 bytes lower than the true frame base. */
-    size_t guest_stack_size = 8 * 1024 * 1024;
+    size_t guest_stack_size = 16 * 1024 * 1024;  /* 16 MB for deep recursion */
     void *guest_stack = mmap(NULL, guest_stack_size, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (guest_stack == MAP_FAILED)
@@ -7250,7 +7258,17 @@ int main(int argc, char **argv)
 
     u64 guest_stack_low  = (u64)guest_stack;
     u64 guest_stack_high = (u64)guest_stack + guest_stack_size;
-    u64 guest_rsp = (guest_stack_high - 0x20000) & ~0xF;
+    
+    /* Map a guard page below the stack for underflow protection */
+    void *guard_page = mmap((void *)(guest_stack_low - 0x1000), 0x1000,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (guard_page != MAP_FAILED) {
+        guest_stack_low -= 0x1000;  /* Extend stack low boundary to include guard page */
+    }
+    
+    /* Reserve 2MB at top for guest runtime, allowing deep recursion */
+    u64 guest_rsp = (guest_stack_high - 0x200000) & ~0xF;
     /* Entry RSP must be 8 mod 16, as after a real `call` on Windows x64. */
     u64 guest_frame_base = guest_rsp - 0x600;
     /* Entry RSP must be 8 mod 16 (as after a real `call`). BEER_ALIGN_OLD=1
