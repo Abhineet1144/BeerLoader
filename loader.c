@@ -27,6 +27,9 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+/* D3D11 COM object stubs from graphics/ */
+#include "d3d11_compat.h"
+
 /* arch_prctl – set GS base so gs:[0x30] / gs:[0x60] work as TEB/PEB */
 #ifndef ARCH_SET_GS
 # define ARCH_SET_GS 0x1001
@@ -2106,9 +2109,9 @@ impl_CoCreateInstance(u64 rclsid, u64 outer, u32 ctx, u64 riid, void **ppv) {
 
 #define D3D11_VTAB_SZ 256
 /* g_d3d11_vtab is forward-declared above */
-static u64 *g_d3d11_device   = NULL;
-static u64 *g_d3d11_context  = NULL;
-static u64 *g_dxgi_swapchain = NULL;
+static ID3D11Device *g_d3d11_device   = NULL;
+static ID3D11DeviceContext *g_d3d11_context  = NULL;
+static IDXGISwapChain *g_dxgi_swapchain = NULL;
 
 static u64 __attribute__((ms_abi))
 d3d11_fail(u64 a, u64 b, u64 c, u64 d)
@@ -2133,20 +2136,12 @@ dxgi_log_ok(u64 a, u64 b, u64 c, u64 d) {
 }
 
 static void init_d3d11_fake(void) {
-    /* All methods default to E_FAIL */
-    for (int i = 0; i < D3D11_VTAB_SZ; i++) g_d3d11_vtab[i] = (u64)d3d11_fail;
-    /* COM IUnknown (vtable[0..2]) */
-    g_d3d11_vtab[0] = (u64)dxgi_QueryInterface;
-    g_d3d11_vtab[1] = (u64)dxgi_AddRef;
-    g_d3d11_vtab[2] = (u64)dxgi_Release;
-
-    /* Allocate three separate 256-byte objects sharing the same vtable */
-    g_d3d11_device  = mmap(NULL,256,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    g_d3d11_context = mmap(NULL,256,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    g_dxgi_swapchain= mmap(NULL,256,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    if (g_d3d11_device  != MAP_FAILED) g_d3d11_device[0]  = (u64)g_d3d11_vtab;
-    if (g_d3d11_context != MAP_FAILED) g_d3d11_context[0] = (u64)g_d3d11_vtab;
-    if (g_dxgi_swapchain!= MAP_FAILED) g_dxgi_swapchain[0]= (u64)g_d3d11_vtab;
+    /* Initialize D3D11 objects using graphics module with real vtables */
+    g_d3d11_device   = d3d11_device_create();
+    g_d3d11_context  = d3d11_device_context_create();
+    g_dxgi_swapchain = dxgi_swapchain_create();
+    fprintf(stderr, "[D3D11] Initialized real COM objects: device=0x%lx context=0x%lx swapchain=0x%lx\n",
+            (u64)g_d3d11_device, (u64)g_d3d11_context, (u64)g_dxgi_swapchain);
 }
 
 /*
@@ -2166,10 +2161,11 @@ impl_D3D11CreateDevice(u64 adapter, u32 driver_type, u64 software,
     (void)adapter;(void)driver_type;(void)software;(void)flags;
     (void)feature_levels;(void)n_levels;(void)sdk_ver;
     if (!g_api_createdevice) { g_api_createdevice=1; fprintf(stderr, "[PROGRESS] D3D11CreateDevice called - graphics device created\n"); }
-    fprintf(stderr, "[D3D11] CreateDevice -> fake device\n");
-    if (ppDevice)      *ppDevice  = g_d3d11_device;
+    fprintf(stderr, "[D3D11] CreateDevice -> returning real COM objects device=0x%lx context=0x%lx\n", 
+            (u64)g_d3d11_device, (u64)g_d3d11_context);
+    if (ppDevice)      *ppDevice  = (u64 *)g_d3d11_device;
     if (pFeatureLevel) *pFeatureLevel = D3D_FEATURE_LEVEL_11_0;
-    if (ppContext)     *ppContext = g_d3d11_context;
+    if (ppContext)     *ppContext = (u64 *)g_d3d11_context;
     return S_OK;
 }
 
@@ -2180,20 +2176,20 @@ impl_D3D11CreateDeviceAndSwapChain(u64 adapter, u32 dtype, u64 sw, u32 flags,
 {
     (void)adapter;(void)dtype;(void)sw;(void)flags;
     (void)fls;(void)nfl;(void)sdk;(void)swdesc;
-    fprintf(stderr, "[D3D11] CreateDeviceAndSwapChain -> fake\n");
-    if (ppDevice) *ppDevice = g_d3d11_device;
+    fprintf(stderr, "[D3D11] CreateDeviceAndSwapChain -> returning real COM objects\n");
+    if (ppDevice) *ppDevice = (u64 *)g_d3d11_device;
     if (pFL)      *pFL      = D3D_FEATURE_LEVEL_11_0;
-    if (ppCtx)    *ppCtx    = g_d3d11_context;
-    if (ppSwap)   *ppSwap   = g_dxgi_swapchain;
+    if (ppCtx)    *ppCtx    = (u64 *)g_d3d11_context;
+    if (ppSwap)   *ppSwap   = (u64 *)g_dxgi_swapchain;
     return S_OK;
 }
 
-/* IDXGIFactory::CreateSwapChain (vtable[10]) — return our fake swap chain */
+/* IDXGIFactory::CreateSwapChain (vtable[10]) — return our real swap chain */
 static u64 __attribute__((ms_abi))
 dxgi_CreateSwapChain(u64 *obj, u64 *device, u64 *desc, u64 **ppSwap)
 {
     (void)obj;(void)device;(void)desc;
-    if (ppSwap) *ppSwap = g_dxgi_swapchain;
+    if (ppSwap) *ppSwap = (u64 *)g_dxgi_swapchain;
     return S_OK;
 }
 
@@ -5768,8 +5764,8 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     /* Cycle detection for 0x237cde0-0x23b1400: Game-init and graphics-setup region.
      * This wide range contains multiple initialization sequences with complex control flow.
      * After multiple attempts to fix register state and return addresses, the code still loops.
-     * When stuck in the tight 0x237ce59-0x237ce5b loop with NULL return addresses, jump past
-     * the entire problematic region instead of trying internal recovery. */
+     * When stuck in the tight 0x237ce59-0x237ce5b loop with NULL return addresses, jump far
+     * outside this problematic region to 0x250000 (well past graphics init code). */
     if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cde0 && rip <= (u64)g_img + 0x23b1400) {
         static u32 sekiro_cycle_faults = 0;
         static u32 ce5x_attempts = 0;  /* Count attempts at the tight 0x237ce59-0x237ce5b loop */
@@ -5779,13 +5775,13 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         /* Detect if we're looping at 0x237ce59-0x237ce5b with NULL fault addresses */
         if (rip >= (u64)g_img + 0x237ce59 && rip <= (u64)g_img + 0x237ce5b && faultaddr == 0) {
             ce5x_attempts++;
-            if (ce5x_attempts >= 3) {
-                /* We're definitely stuck in the bad-return loop. Jump past the entire region. */
-                fprintf(stderr, "[SKIP] Sekiro tight loop at 0x237ce59-0x237ce5b [attempt %d] - jumping past region to 0x237d140\n",
+            if (ce5x_attempts >= 2) {
+                /* We're stuck in the bad-return loop. Jump FAR past the entire problematic region. */
+                fprintf(stderr, "[SKIP] Sekiro stuck at 0x237ce59-0x237ce5b [attempt %d] - jumping to 0x250000 (far escape)\n",
                         ce5x_attempts);
                 uc->uc_mcontext.gregs[REG_RAX] = 0;
                 uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
-                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)((u64)g_img + 0x237d140);
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)((u64)g_img + 0x250000);
                 return;
             }
         } else {
