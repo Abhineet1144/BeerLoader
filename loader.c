@@ -153,6 +153,9 @@ static u64 g_cycle_hist[CYCLE_HIST_LEN];
 static u32 g_cycle_hist_n = 0;   /* number of entries recorded, saturating */
 static u64 g_cycle_total_calls = 0;
 
+/* Persistent ret-stub cycle breaker: track total resets to baseline, give up after 2 */
+static u32 g_ret_stub_baseline_resets = 0;
+
 /* RSP observed just before handing off to the PE entry point — the
  * shallowest legitimate stack depth for the whole run. Any "recovered"
  * RSP produced by speculative stack-popping that ends up ABOVE this
@@ -5650,6 +5653,12 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         }
         /* Try to use real unwind to find a safe return point */
         if (try_real_unwind_return(rip, rsp0, &ret_addr, &new_rsp)) {
+            /* Sanity check: if real-unwind returns to a ret-stub location, avoid it */
+            if (ret_addr >= (u64)g_img + 0x235a690 && ret_addr <= (u64)g_img + 0x235a6a0) {
+                /* For early CRT, just skip 1 byte and retry instead */
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 1);
+                return;
+            }
             uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ret_addr;
             uc->uc_mcontext.gregs[REG_RSP] = (greg_t)new_rsp;
             return;
@@ -5671,6 +5680,16 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         }
         /* Try to use real unwind to find a safe return point */
         if (try_real_unwind_return(rip, rsp0, &ret_addr, &new_rsp)) {
+            /* Sanity check: if real-unwind returns to a ret-stub location (0x235a694-0x235a697 or nearby),
+             * don't use it - instead reset to entry baseline to avoid ret-stub deadlock cycles */
+            if (ret_addr >= (u64)g_img + 0x235a690 && ret_addr <= (u64)g_img + 0x235a6a0) {
+                if (mid_fault_count <= 5) {
+                    fprintf(stderr, "[SKIP]   -> real-unwind returned to ret-stub 0x%lx, using entry baseline instead\n", ret_addr);
+                }
+                reset_rsp_to_entry_baseline(uc);
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
+                return;
+            }
             uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ret_addr;
             uc->uc_mcontext.gregs[REG_RSP] = (greg_t)new_rsp;
             return;
@@ -6260,6 +6279,31 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         rip >= (u64)g_img + 0x235a694 && rip <= (u64)g_img + 0x235a697) {
         u64 rsp = (u64)uc->uc_mcontext.gregs[REG_RSP];
         u64 *sp = (u64 *)rsp;
+        static int ret_stub_local_attempts = 0;
+        
+        /* Increment local attempt counter within this fault sequence */
+        ret_stub_local_attempts++;
+        
+        /* Limit retry attempts at this ret-stub to avoid infinite cycles.
+         * If we've already tried once without success, reset to baseline.
+         * But if we've already reset twice, give up entirely. */
+        if (ret_stub_local_attempts >= 2) {
+            if (g_ret_stub_baseline_resets >= 2) {
+                fprintf(stderr,
+                        "[FATAL] 235a694 ret-stub: Already reset %d times, cannot escape cycle. Exiting.\n",
+                        g_ret_stub_baseline_resets);
+                exit(99);  /* Exit with special code to distinguish from normal exit */
+            }
+            fprintf(stderr,
+                    "[SKIP] 235a694 ret-stub: Local attempt %d - resetting to entry baseline (reset #%d)\n",
+                    ret_stub_local_attempts, g_ret_stub_baseline_resets + 1);
+            g_ret_stub_baseline_resets++;
+            ret_stub_local_attempts = 0;
+            reset_rsp_to_entry_baseline(uc);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
+            return;
+        }
+        
         if (sp) {
             u64 ret = sp[0];
             int ok = 0;
@@ -6275,11 +6319,13 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                 uc->uc_mcontext.gregs[REG_RAX] = 0;
                 uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(rsp + 8);
                 uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ret;
+                ret_stub_local_attempts = 0;
+                g_ret_stub_baseline_resets = 0;  /* Reset global counter on successful recovery */
                 return;
             }
         }
         fprintf(stderr,
-                "[SKIP] 235a694 ret-stub fault at RIP=0x%lx (+0x%lx), redirecting\n",
+                "[SKIP] 235a694 ret-stub fault at RIP=0x%lx (+0x%lx), attempting fallback\n",
                 rip, rip - (u64)g_img);
         uc->uc_mcontext.gregs[REG_RAX] = 0;
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "ret-stub-235a694");
