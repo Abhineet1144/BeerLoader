@@ -182,24 +182,118 @@ typedef struct {
 static SyncRegion g_sync_regions[MAX_SYNC_REGIONS];
 static int g_sync_region_count = 0;
 
-/* Windows CRITICAL_SECTION structure (40 bytes) for proper lock initialization.
- * The game allocates arrays of these and uses XCHG to implement lock acquire/release. */
+/* Windows CRITICAL_SECTION structure (64 bytes aligned) with full state machine.
+ * Supports acquire/release with recursion, thread tracking, and waiter queues.
+ * The game allocates arrays of these and uses XCHG to implement lock operations. */
 #pragma pack(push, 1)
 typedef struct _BEER_CRITICAL_SECTION {
     void *DebugInfo;              /* 0x00 (8 bytes) - normally points to RTL_CRITICAL_SECTION_DEBUG */
-    s32 LockCount;                /* 0x08 (4 bytes) - -1 = unacquired, 0+ = acquired+recursion */
-    s32 RecursionCount;           /* 0x0C (4 bytes) - > 0 if held by current thread */
-    void *OwningThread;           /* 0x10 (8 bytes) - thread id that holds lock, or 0 if free */
-    void *LockSemaphore;          /* 0x18 (8 bytes) - kernel event object, or 0 if unused */
-    u64  SpinCount;               /* 0x20 (8 bytes) - spin attempts before blocking */
+    s32 LockCount;                /* 0x08 (4 bytes) - -1 = unacquired, >=0 = acquired (stores waiter count-1) */
+    s32 RecursionCount;           /* 0x0C (4 bytes) - number of times current owner has re-acquired */
+    void *OwningThread;           /* 0x10 (8 bytes) - pthread_t of thread holding lock, or 0 if free */
+    void *LockSemaphore;          /* 0x18 (8 bytes) - kernel event object for signaling, or 0 if unused */
+    u64  SpinCount;               /* 0x20 (8 bytes) - spin attempts before blocking (typically 0) */
+    u64  Reserved[4];             /* 0x28 (32 bytes) - reserved padding to 64-byte alignment */
 } BEER_CRITICAL_SECTION;
 #pragma pack(pop)
+
+/* Thread ID for lock ownership tracking (cached from pthread_self) */
+static __thread u64 g_current_thread_id = 0;
 
 /* Windows SRWLOCK structure (8 bytes) for reader-writer locks.
  * Used similarly to CRITICAL_SECTION but with reader/writer semantics. */
 typedef struct _BEER_SRWLOCK {
     u64 Ptr;  /* Contains packed state: low bits = flags, high bits = queue pointer */
 } BEER_SRWLOCK;
+
+/* Get current thread ID for lock ownership (initialize on first call) */
+static inline u64 beer_get_thread_id(void) {
+    if (g_current_thread_id == 0) {
+        g_current_thread_id = (u64)pthread_self();
+    }
+    return g_current_thread_id;
+}
+
+/* CRITICAL_SECTION state machine: Initialize lock to unacquired state */
+static inline void beer_critical_section_initialize(BEER_CRITICAL_SECTION *cs) {
+    cs->DebugInfo = NULL;
+    cs->LockCount = -1;           /* -1 means unacquired */
+    cs->RecursionCount = 0;
+    cs->OwningThread = NULL;
+    cs->LockSemaphore = NULL;
+    cs->SpinCount = 0;
+    for (int i = 0; i < 4; i++) {
+        cs->Reserved[i] = 0;
+    }
+}
+
+/* CRITICAL_SECTION state machine: Try to acquire lock (atomic semantics)
+ * Returns old LockCount value (for XCHG result in RAX/RDX)
+ * -1 = we acquired uncontended lock
+ * >=0 = lock was held, waiter count before our attempt */
+static inline s32 beer_critical_section_enter(BEER_CRITICAL_SECTION *cs) {
+    u64 my_thread = beer_get_thread_id();
+    s32 old_count;
+    
+    /* If we already own it, just increment recursion and return -1 (success) */
+    if (cs->OwningThread == (void *)my_thread && cs->RecursionCount > 0) {
+        cs->RecursionCount++;
+        return -1;  /* Recursive acquisition succeeds */
+    }
+    
+    /* Try to acquire uncontended lock: LockCount must be -1 */
+    if (cs->LockCount == -1) {
+        old_count = -1;
+        cs->LockCount = 0;        /* Acquired by us, no waiters yet */
+        cs->OwningThread = (void *)my_thread;
+        cs->RecursionCount = 1;   /* First acquisition */
+        return old_count;         /* Return -1 to indicate success */
+    }
+    
+    /* Lock is held (LockCount >= 0). Return current state and increment waiter count.
+     * In a real system, we'd block here. For emulation, we fake it by incrementing
+     * LockCount (it tracks: LockCount = waiter_count - 1). */
+    old_count = cs->LockCount;
+    cs->LockCount++;              /* One more waiter now */
+    return old_count;             /* Return previous waiter count */
+}
+
+/* CRITICAL_SECTION state machine: Release lock
+ * Returns old LockCount value (for XCHG result)
+ * Returns -1 if we released and lock is now free
+ * Returns >=0 if there are still waiters */
+static inline s32 beer_critical_section_leave(BEER_CRITICAL_SECTION *cs) {
+    u64 my_thread = beer_get_thread_id();
+    
+    /* Sanity check: we should own this lock */
+    if (cs->OwningThread != (void *)my_thread) {
+        /* Attempted to release lock we don't own - return current state */
+        return cs->LockCount;
+    }
+    
+    /* Decrement recursion count */
+    if (cs->RecursionCount > 1) {
+        cs->RecursionCount--;
+        return -1;  /* Still held by us (recursive), return -1 */
+    }
+    
+    /* Fully releasing the lock */
+    cs->RecursionCount = 0;
+    s32 old_count = cs->LockCount;
+    
+    if (cs->LockCount == 0) {
+        /* No waiters, just mark as free */
+        cs->LockCount = -1;
+        cs->OwningThread = NULL;
+        return -1;  /* Signal: lock is now free */
+    } else {
+        /* Waiters present (LockCount >= 1 means waiter_count = LockCount + 1).
+         * Decrement waiter count and mark as unowned (but still locked by someone waiting). */
+        cs->LockCount--;
+        cs->OwningThread = NULL;  /* Released by us, someone else will acquire */
+        return 0;                 /* Indicate: still held, but not by us */
+    }
+}
 
 /* RSP observed just before handing off to the PE entry point — the
  * shallowest legitimate stack depth for the whole run. Any "recovered"
@@ -5828,28 +5922,14 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                                -1, 0);
             
             if (result != MAP_FAILED) {
-                /* Initialize with proper CRITICAL_SECTION structures (40 bytes each, 64-byte slots) */
+                /* Initialize with proper CRITICAL_SECTION structures (64-byte aligned) */
                 memset((void*)page_aligned, 0, alloc_size);
                 
-                /* Fill region with unacquired CRITICAL_SECTION locks */
-                typedef struct {
-                    void *DebugInfo;
-                    s32 LockCount;        /* -1 = unacquired */
-                    s32 RecursionCount;   /* 0 = not held */
-                    void *OwningThread;
-                    void *LockSemaphore;
-                    u64 SpinCount;
-                } CS_LOCK;
-                
-                CS_LOCK *locks = (CS_LOCK *)page_aligned;
+                /* Fill region with unacquired CRITICAL_SECTION locks using state machine */
+                BEER_CRITICAL_SECTION *locks = (BEER_CRITICAL_SECTION *)page_aligned;
                 u64 num_locks = alloc_size / 64;  /* 64-byte slots */
                 for (u64 i = 0; i < num_locks; i++) {
-                    locks[i].LockCount = -1;        /* Unacquired state */
-                    locks[i].RecursionCount = 0;
-                    locks[i].OwningThread = NULL;
-                    locks[i].LockSemaphore = NULL;
-                    locks[i].DebugInfo = NULL;
-                    locks[i].SpinCount = 0;
+                    beer_critical_section_initialize(&locks[i]);
                 }
                 
                 /* Register the allocation */
@@ -5866,36 +5946,28 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         }
         
         if (should_skip_instr) {
-            /* Memory is allocated. Simulate XCHG lock acquire on CRITICAL_SECTION.
-             * Most init code just wants to acquire uncontended locks. We simulate
-             * atomic compare-and-swap: if LockCount is -1 (free), set to 0 (acquired)
-             * and return -1 to indicate we acquired it. */
+            /* Memory is allocated. Use proper CRITICAL_SECTION state machine for XCHG.
+             * Game typically does: XCHG [base + offset], reg
+             * This translates to: acquire lock, return old state in reg
+             * We use the state machine to handle recursion, thread tracking, waiter counts. */
             
             u64 next_rip = rip + 3;  /* Skip XCHG instruction (typically 3 bytes) */
             
-            /* Try to acquire a lock from the allocated region at faultaddr.
-             * The game typically does: XCHG [base + offset], reg
-             * We simulate: if *addr == -1, *addr = 0; reg = -1 (acquired) */
+            /* Get CRITICAL_SECTION pointer from faultaddr (aligned to 64-byte boundary) */
+            BEER_CRITICAL_SECTION *cs = (BEER_CRITICAL_SECTION *)(faultaddr & ~0x3F);
             
-            s32 *lock_ptr = (s32 *)faultaddr;
-            s32 old_val = -1;  /* Default: pretend lock was free */
+            /* Try to acquire lock using full state machine */
+            s32 result = beer_critical_section_enter(cs);
             
-            /* Try to atomically check and acquire */
-            if (*lock_ptr == -1) {
-                *lock_ptr = 0;      /* Mark as acquired */
-                old_val = -1;       /* Return "it was free" */
-            } else {
-                old_val = *lock_ptr; /* Return current state */
-            }
-            
-            /* Set result in RAX/RDX (typically where XCHG stores result) */
-            uc->uc_mcontext.gregs[REG_RAX] = (greg_t)old_val;
-            uc->uc_mcontext.gregs[REG_RDX] = (greg_t)old_val;
+            /* Set result in RAX/RDX (where XCHG stores the exchanged value) */
+            uc->uc_mcontext.gregs[REG_RAX] = (greg_t)result;
+            uc->uc_mcontext.gregs[REG_RDX] = (greg_t)result;
             uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
             
             uc->uc_mcontext.gregs[REG_RIP] = (greg_t)next_rip;
             
-            fprintf(stderr, "[SYNC] Skipped XCHG at RIP=0x%lx, continuing from 0x%lx\n", rip, next_rip);
+            fprintf(stderr, "[SYNC] CRITICAL_SECTION acquire at 0x%lx: result=%d (thread=0x%lx)\n",
+                    (u64)cs, result, beer_get_thread_id());
             return;
         }
     }
