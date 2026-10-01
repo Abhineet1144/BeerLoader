@@ -2,9 +2,73 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 /* ============================================================================
- * ID3D11Device - Stub implementation
+ * COM Object Header - Real state tracking
+ * ============================================================================ */
+
+typedef enum {
+    COM_TYPE_DEVICE = 1,
+    COM_TYPE_CONTEXT = 2,
+    COM_TYPE_SWAPCHAIN = 3,
+    COM_TYPE_RESOURCE = 4,
+    COM_TYPE_VIEW = 5,
+    COM_TYPE_STATE = 6,
+} ComObjectType;
+
+typedef struct {
+    uint32_t magic;              /* 0xdeadbeef for validation */
+    _Atomic(uint32_t) refcount;  /* Real reference counting */
+    ComObjectType type;          /* Object type for validation */
+    uint32_t feature_level;      /* D3D feature level if device */
+    uint32_t pad;                /* Padding for alignment */
+} ComObjectHeader;
+
+#define COM_MAGIC 0xdeadbeef
+
+/* Allocation helpers - allocate header + payload, return payload pointer */
+static void* com_alloc(size_t payload_size, ComObjectType type, uint32_t feature_level) {
+    size_t total_size = sizeof(ComObjectHeader) + payload_size;
+    ComObjectHeader* hdr = (ComObjectHeader*)malloc(total_size);
+    if (!hdr) return NULL;
+    
+    hdr->magic = COM_MAGIC;
+    atomic_store(&hdr->refcount, 1);
+    hdr->type = type;
+    hdr->feature_level = feature_level;
+    hdr->pad = 0;
+    
+    return (void*)((char*)hdr + sizeof(ComObjectHeader));
+}
+
+static ComObjectHeader* com_get_header(void* obj) {
+    if (!obj) return NULL;
+    ComObjectHeader* hdr = (ComObjectHeader*)((char*)obj - sizeof(ComObjectHeader));
+    if (hdr->magic != COM_MAGIC) return NULL;
+    return hdr;
+}
+
+static uint32_t com_addref(void* obj) {
+    ComObjectHeader* hdr = com_get_header(obj);
+    if (!hdr) return 0;
+    return atomic_fetch_add(&hdr->refcount, 1) + 1;
+}
+
+static uint32_t com_release(void* obj) {
+    ComObjectHeader* hdr = com_get_header(obj);
+    if (!hdr) return 0;
+    uint32_t old_count = atomic_fetch_sub(&hdr->refcount, 1);
+    if (old_count == 1) {
+        /* Actually free when refcount reaches 0 */
+        free(hdr);
+        return 0;
+    }
+    return old_count - 1;
+}
+
+/* ============================================================================
+ * ID3D11Device - Enhanced implementation with real state
  * ============================================================================ */
 
 static HRESULT device_query_interface(ID3D11Device* this, REFIID riid, LPVOID* ppvObj) {
@@ -15,11 +79,11 @@ static HRESULT device_query_interface(ID3D11Device* this, REFIID riid, LPVOID* p
 }
 
 static uint32_t device_addref(ID3D11Device* this) {
-    return 1;  /* Simplified refcount */
+    return com_addref(this);
 }
 
 static uint32_t device_release(ID3D11Device* this) {
-    return 0;  /* Simplified refcount */
+    return com_release(this);
 }
 
 static HRESULT device_create_swapchain(ID3D11Device* this, void* pFactory, void* pDesc, void** ppSwapChain) {
@@ -201,7 +265,7 @@ static ID3D11Device_VTable g_device_vtable = {
 };
 
 ID3D11Device* d3d11_device_create(void) {
-    ID3D11Device* device = malloc(sizeof(ID3D11Device));
+    ID3D11Device* device = (ID3D11Device*)com_alloc(sizeof(ID3D11Device), COM_TYPE_DEVICE, 0);
     if (!device) return NULL;
     device->vtable = (void**)&g_device_vtable;
     return device;
@@ -218,11 +282,11 @@ static HRESULT context_query_interface(ID3D11DeviceContext* this, REFIID riid, L
 }
 
 static uint32_t context_addref(ID3D11DeviceContext* this) {
-    return 1;
+    return com_addref(this);
 }
 
 static uint32_t context_release(ID3D11DeviceContext* this) {
-    return 0;
+    return com_release(this);
 }
 
 static void context_ia_set_input_layout(ID3D11DeviceContext* this, void* pInputLayout) {
@@ -352,7 +416,7 @@ static ID3D11DeviceContext_VTable g_context_vtable = {
 };
 
 ID3D11DeviceContext* d3d11_device_context_create(void) {
-    ID3D11DeviceContext* context = malloc(sizeof(ID3D11DeviceContext));
+    ID3D11DeviceContext* context = (ID3D11DeviceContext*)com_alloc(sizeof(ID3D11DeviceContext), COM_TYPE_CONTEXT, 0);
     if (!context) return NULL;
     context->vtable = (void**)&g_context_vtable;
     return context;
@@ -369,11 +433,11 @@ static HRESULT swapchain_query_interface(IDXGISwapChain* this, REFIID riid, LPVO
 }
 
 static uint32_t swapchain_addref(IDXGISwapChain* this) {
-    return 1;
+    return com_addref(this);
 }
 
 static uint32_t swapchain_release(IDXGISwapChain* this) {
-    return 0;
+    return com_release(this);
 }
 
 static HRESULT swapchain_present(IDXGISwapChain* this, uint32_t SyncInterval, uint32_t Flags) {
@@ -440,7 +504,7 @@ static IDXGISwapChain_VTable g_swapchain_vtable = {
 };
 
 IDXGISwapChain* dxgi_swapchain_create(void) {
-    IDXGISwapChain* swapchain = malloc(sizeof(IDXGISwapChain));
+    IDXGISwapChain* swapchain = (IDXGISwapChain*)com_alloc(sizeof(IDXGISwapChain), COM_TYPE_SWAPCHAIN, 0);
     if (!swapchain) return NULL;
     swapchain->vtable = (void**)&g_swapchain_vtable;
     return swapchain;
