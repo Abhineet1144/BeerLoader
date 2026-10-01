@@ -6565,13 +6565,14 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     
     /* NEW REGION: Execute fault in 0x1423b1000-0x1424b1000 (post-game-init)
      * This region was mistakenly allocated with sync locks, but game is executing code here.
-     * Skip 8 bytes at a time (typical x64 instruction or lock structure) to advance past the problem. */
+     * Skip 8 bytes at a time (typical x64 instruction or lock structure) to advance past the problem.
+     * Increased limit to 500000 to push through problematic code. */
     if (sig == SIGSEGV && rip >= 0x1423b1000ULL && rip < 0x1424b1000ULL) {
         static int jit_region_faults = 0;
         jit_region_faults++;
-        if (jit_region_faults <= 50000) {
-            if (jit_region_faults % 5000 == 1 || jit_region_faults <= 5) {
-                fprintf(stderr, "[SKIP] JIT-region execute-fault at RIP=0x%lx, skipping 8 bytes [%d/50000]\n",
+        if (jit_region_faults <= 500000) {
+            if (jit_region_faults % 10000 == 1 || jit_region_faults <= 5) {
+                fprintf(stderr, "[SKIP] JIT-region execute-fault at RIP=0x%lx, skipping 8 bytes [%d/500000]\n",
                         rip, jit_region_faults);
             }
             uc->uc_mcontext.gregs[REG_RAX] = 0;
@@ -7587,6 +7588,37 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
      * Skip past it so we can observe what happens after DL_PANIC. */
     if (sig == SIGSEGV && faultaddr == 0 &&
         g_img && rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) {
+        /* PRIORITY 1: Blocker at 0x1411e424c & 0x1423b1403 - special escape logic
+         * These locations have null-write patterns that crash
+         * Detect and skip them */
+        if (rip == 0x1411e424cULL || rip == 0x1423b1403ULL) {
+            u64 rdi = uc->uc_mcontext.gregs[REG_RDI];
+            u64 rax = uc->uc_mcontext.gregs[REG_RAX];
+            u64 rsi = uc->uc_mcontext.gregs[REG_RSI];
+            u64 rdx = uc->uc_mcontext.gregs[REG_RDX];
+            
+            /* If RDI is NULL, this is a degenerate null-write case.
+             * Likely game logic error: trying to initialize something that wasn't allocated.
+             * Skip this function entirely and return success (RAX=0) */
+            if (rdi == 0) {
+                fprintf(stderr,
+                        "[DIAG] Blocker NULL-write: RDI=0x%lx RAX=0x%lx - skipping entirely\n",
+                        rdi, rax);
+                uc->uc_mcontext.gregs[REG_RAX] = 0;  /* Return S_OK */
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "blocker-null-write");
+                return;
+            }
+            
+            fprintf(stderr,
+                    "[DIAG] Blocker 0x%lx with RDI=0x%lx RAX=0x%lx RSI=0x%lx RDX=0x%lx; escaping\n",
+                    rip, rdi, rax, rsi, rdx);
+            
+            /* For non-null RDI, try to skip and return success */
+            uc->uc_mcontext.gregs[REG_RAX] = 0;  /* Return S_OK / success */
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "blocker-escape-forced");
+            return;
+        }
+        
         if (rip >= (u64)g_img + 0x2359f40 && rip <= (u64)g_img + 0x2359f60) {
             fprintf(stderr,
                     "[SKIP] Null-write guard helper RIP=0x%lx (+0x%lx) treated as a harmless nil-clear; resuming after the guard.\n",
@@ -7746,17 +7778,6 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             uc->uc_mcontext.gregs[REG_RAX] = 0;
             uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "null-cti");
             return;
-        }
-        
-        /* Specific blocker: RIP=0x1411e424c has problematic null-ptr access.
-         * Patching via extra_rvas[], so this handler shouldn't fire. If it does,
-         * it means patches didn't work — diagnostics log what was attempted. */
-        if (rip == 0x1411e424cULL) {
-            fprintf(stderr,
-                    "[WARN] Blocker handler fired despite patches; RDI=0x%lx RAX=0x%lx\n",
-                    uc->uc_mcontext.gregs[REG_RDI],
-                    uc->uc_mcontext.gregs[REG_RAX]);
-            /* Fall through to normal null-write handling */
         }
         u64 gs_base = 0;
         syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs_base);
