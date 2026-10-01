@@ -5651,7 +5651,8 @@ static void patch_known_bad_targets(void)
                 0x2dc5960, 0x3ec7d60, 0x3ec7d68, 0x239c627, 0x3f08960, 0x3f08bc0,
                 0x3f08bc8, 0x3f31e30, 0x3f332a0, 0x3f332f0, 0x39ea11, 0x39ea1a,
                 0x237cee4, 0x237cef3, 0x237cf00, 0x237cf10, 0x237cf2e, 0x237cff0, 0x237d01d, 0x1130b2e,
-                0x1130b36, 0x1130b3d, 0x1130b44, 0x1130b4c, 0x30b5a90, 0x30b5ad0,
+                0x1130b36, 0x1130b3d, 0x1130b44, 0x1130b4c, 0x11e424c, 0x11e4250, 0x11e4255,
+                0x30b5a90, 0x30b5ad0,
                 0x30b5af8, 0x30b5b08, 0x30b5bb2, 0x30bea90, 0x30beaa8, 0x30beaaf,
                 0x2945090, 0x29450e0, 0x011ae01, 0x011ae80, 0x011ae95,
             };
@@ -6387,7 +6388,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         } else {
             ce5x_attempts = 0;  
         }
-        if (sekiro_cycle_faults > 200000) {
+        if (sekiro_cycle_faults > 500000) {
             fprintf(stderr, "[FATAL] Sekiro game-init region unbreakable cycle detected (%d faults), exiting to avoid spin\n",
                     sekiro_cycle_faults);
             fprintf(stderr, "        Last fault at RIP=0x%lx RCX=0x%lx RDX=0x%lx R8=0x%lx R14=0x%lx RSP=0x%lx\n",
@@ -6565,9 +6566,9 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     if (sig == SIGSEGV && rip >= 0x1423b1000ULL && rip < 0x1424b1000ULL) {
         static int jit_region_faults = 0;
         jit_region_faults++;
-        if (jit_region_faults <= 10000) {
-            if (jit_region_faults % 1000 == 1 || jit_region_faults <= 5) {
-                fprintf(stderr, "[SKIP] JIT-region execute-fault at RIP=0x%lx, skipping 8 bytes [%d/10000]\n",
+        if (jit_region_faults <= 50000) {
+            if (jit_region_faults % 5000 == 1 || jit_region_faults <= 5) {
+                fprintf(stderr, "[SKIP] JIT-region execute-fault at RIP=0x%lx, skipping 8 bytes [%d/50000]\n",
                         rip, jit_region_faults);
             }
             uc->uc_mcontext.gregs[REG_RAX] = 0;
