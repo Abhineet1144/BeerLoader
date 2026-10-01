@@ -7743,6 +7743,19 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "null-cti");
             return;
         }
+        
+        /* Specific blocker: RIP=0x1411e424c has 48 89 07 (mov [rdi], rax) 
+         * followed by ff 15 (indirect call). This pattern creates unbreakable
+         * cycles. Redirect aggressively. */
+        if (rip == 0x1411e424cULL) {
+            fprintf(stderr,
+                    "[SKIP] Blocker pattern mov+indirect-call at RIP=0x%lx, redirecting\n",
+                    rip);
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            uc->uc_mcontext.gregs[REG_RDI] = 0;  /* Clear bad pointer */
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "blocker-movindi");
+            return;
+        }
         u64 gs_base = 0;
         syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs_base);
         fprintf(stderr, "[SKIP] Null-write at RIP=0x%lx (+0x%lx), advancing %d bytes, gs_base=0x%lx\n",
