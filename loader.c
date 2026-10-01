@@ -5866,16 +5866,32 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         }
         
         if (should_skip_instr) {
-            /* Memory is now allocated/mapped. Skip the XCHG instruction and pretend we acquired the lock. */
-            /* XCHG is typically 3 bytes: F0 48 87 /r (REX F0 XCHG variant) */
-            u64 next_rip = rip + 3;  /* Skip the XCHG instruction */
+            /* Memory is allocated. Simulate XCHG lock acquire on CRITICAL_SECTION.
+             * Most init code just wants to acquire uncontended locks. We simulate
+             * atomic compare-and-swap: if LockCount is -1 (free), set to 0 (acquired)
+             * and return -1 to indicate we acquired it. */
             
-            /* Set up register state as if XCHG succeeded:
-             * For a lock acquire XCHG, the exchanged-out value (result in RAX/RDX/etc)
-             * should be 0 (meaning lock was free and we acquired it) */
-            uc->uc_mcontext.gregs[REG_RAX] = 0;    /* Common result register */
-            uc->uc_mcontext.gregs[REG_RDX] = 0;    /* Also used in XCHG patterns */
-            uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;  /* Base address validity */
+            u64 next_rip = rip + 3;  /* Skip XCHG instruction (typically 3 bytes) */
+            
+            /* Try to acquire a lock from the allocated region at faultaddr.
+             * The game typically does: XCHG [base + offset], reg
+             * We simulate: if *addr == -1, *addr = 0; reg = -1 (acquired) */
+            
+            s32 *lock_ptr = (s32 *)faultaddr;
+            s32 old_val = -1;  /* Default: pretend lock was free */
+            
+            /* Try to atomically check and acquire */
+            if (*lock_ptr == -1) {
+                *lock_ptr = 0;      /* Mark as acquired */
+                old_val = -1;       /* Return "it was free" */
+            } else {
+                old_val = *lock_ptr; /* Return current state */
+            }
+            
+            /* Set result in RAX/RDX (typically where XCHG stores result) */
+            uc->uc_mcontext.gregs[REG_RAX] = (greg_t)old_val;
+            uc->uc_mcontext.gregs[REG_RDX] = (greg_t)old_val;
+            uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
             
             uc->uc_mcontext.gregs[REG_RIP] = (greg_t)next_rip;
             
@@ -5938,19 +5954,14 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             last_rip = rip;
         }
         
-        /* AGGRESSIVE: If we're stuck at 0x237ce28, patch it with NOPs */
-        u64 addr_ce28 = (u64)g_img + 0x237ce28;
-        if (rip == addr_ce28 && same_rip_count >= 2) {
-            fprintf(stderr, "[PATCH] Runtime patching 0x%lx with NOPs (skip %d bytes)\n", rip, same_rip_count);
-            /* Replace next instruction with NOPs (0x90 is NOP, 0xcc is INT3) */
+        /* AGGRESSIVE: If we're stuck at any RIP after 3 repeats, try NOP patching */
+        if (same_rip_count >= 3) {
+            fprintf(stderr, "[PATCH] Runtime patching stuck RIP 0x%lx (%d repeats) with NOPs\n", rip, same_rip_count);
             u8 *patch_addr = (u8 *)rip;
-            /* Make writable, patch, restore protection */
             mprotect((void*)((u64)rip & ~0xFFF), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
-            for (int i = 0; i < 8; i++) patch_addr[i] = 0x90;  /* 8 bytes of NOPs */
+            for (int i = 0; i < 8; i++) patch_addr[i] = 0x90;  /* NOPs */
             mprotect((void*)((u64)rip & ~0xFFF), 0x2000, PROT_READ | PROT_EXEC);
-            
-            fprintf(stderr, "[PATCH] Patched 8 bytes to NOPs. Continuing from 0x%lx\n", rip);
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)rip;
             return;
         }
         
