@@ -133,6 +133,9 @@ static u64 g_stack_loop_last_rip = 0;
 static u32 g_stack_loop_hits = 0;
 static u64 g_stack_recovery_rip = 0;
 static u64 g_stack_recovery_rsp = 0;
+static u32 g_total_sigsegv_count = 0;  /* Total SIGSEGV crashes handled */
+static u32 g_total_sigill_count = 0;   /* Total SIGILL crashes handled */
+static u32 g_total_other_sig_count = 0; /* Other signals */
 static u32 g_stack_recovery_hits = 0;
 static u64 g_stale_guest_stack_rip = 0;
 static u32 g_stale_guest_stack_hits = 0;
@@ -5972,6 +5975,21 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     u64 rsp0 = (u64)uc->uc_mcontext.gregs[REG_RSP];
     u64 rcx0 = (u64)uc->uc_mcontext.gregs[REG_RCX];
 
+    /* Track signal counts for diagnostics */
+    if (sig == SIGSEGV) {
+        g_total_sigsegv_count++;
+        fprintf(stderr, "[CRASH] SIGSEGV #%u at RIP=0x%lx FA=0x%lx\n", 
+                g_total_sigsegv_count, rip, faultaddr);
+        fflush(stderr);
+        if (g_total_sigsegv_count % 100 == 0) {
+            fprintf(stderr, "[DIAG] Total SIGSEGV count: %u\n", g_total_sigsegv_count);
+        }
+    } else if (sig == SIGILL) {
+        g_total_sigill_count++;
+    } else {
+        g_total_other_sig_count++;
+    }
+
     /* Record + check for a dead recovery cycle FIRST, before any early-return
      * guard below gets a chance to bypass it. Every branch in this function
      * (including the "Invalid guest RSP" reset just below) must be covered by
@@ -6224,6 +6242,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     if (faultaddr >= 0x1000 && faultaddr < 0x7f0000000000ULL && !is_xchg_crash) {
         u64 page_aligned = faultaddr & ~0xFFF;
         u64 alloc_size = 0x100000;
+        static u32 generic_alloc_count = 0;  /* Track allocation attempts */
         
         int already_allocated = 0;
         for (int i = 0; i < g_sync_region_count; i++) {
@@ -6240,6 +6259,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                                -1, 0);
             
             if (result != MAP_FAILED) {
+                generic_alloc_count++;
                 /* PHASE 5 SIMPLIFIED: For freshly allocated MAP_ANONYMOUS memory,
                  * we can safely initialize it as all data (it's zero-init).
                  * Selective analysis is only needed if mmap'ing over existing content. */
@@ -6253,21 +6273,52 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                     sr->page_type[i] = 0;  /* 0 = data page */
                 }
                 
-                fprintf(stderr, "[SYNC] Generic alloc 0x%lx: all 256 pages marked as data (safe)\n",
-                        page_aligned);
+                fprintf(stderr, "[SYNC] Generic alloc [%u] at 0x%lx: all 256 pages marked as data (safe)\n",
+                        generic_alloc_count, page_aligned);
+                fflush(stderr);
                 
                 /* Initialize lock structures in all data pages */
                 BEER_CRITICAL_SECTION *locks = (BEER_CRITICAL_SECTION *)page_aligned;
                 u64 num_locks = alloc_size / 64;
                 
+                fprintf(stderr, "[SYNC] Initializing %lu locks (0x%lx to 0x%lx)\n", 
+                        num_locks, (u64)locks, (u64)&locks[num_locks-1]);
+                fflush(stderr);
+                
+                u64 crash_count_before = g_total_sigsegv_count;
                 for (u64 i = 0; i < num_locks; i++) {
+                    /* Log every 10 iterations starting from 14540 */
+                    if (i % 10 == 0 && i >= 14540) {
+                        fprintf(stderr, "[SYNC] Before i=%lu at 0x%lx\n", i, (u64)&locks[i]);
+                        fflush(stderr);
+                    }
+                    
                     beer_critical_section_initialize(&locks[i]);
+                    
+                    if (i % 10 == 0 && i >= 14540) {
+                        fprintf(stderr, "[SYNC] After i=%lu\n", i);
+                        fflush(stderr);
+                    }
+                    
+                    if (i % 2048 == 0 && i > 0) {
+                        fprintf(stderr, "[SYNC] Progress: %lu/%lu\n", i, num_locks);
+                        fflush(stderr);
+                    }
                 }
+                
+                fprintf(stderr, "[SYNC] *** LOOP EXITED SUCCESS ***\n");
+                fflush(stderr);
                 
                 g_sync_region_count++;
                 
-                fprintf(stderr, "[SYNC] Generic alloc: 0x%lx-0x%lx (%luKB) fully initialized\n",
-                        page_aligned, page_aligned + alloc_size, alloc_size / 1024);
+                fprintf(stderr, "[SYNC] Generic alloc [%u]: 0x%lx-0x%lx (%luKB) fully initialized with %lu locks\n",
+                        generic_alloc_count, page_aligned, page_aligned + alloc_size, alloc_size / 1024, num_locks);
+                
+                /* If we've done too many allocations, game might be in infinite loop */
+                if (generic_alloc_count > 10) {
+                    fprintf(stderr, "[WARN] Generic allocator called %u times - game may be stuck in loop\n",
+                            generic_alloc_count);
+                }
                 return;
             }
         }
