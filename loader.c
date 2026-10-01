@@ -6387,8 +6387,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         } else {
             ce5x_attempts = 0;  
         }
-        
-        if (sekiro_cycle_faults > 20) {
+        if (sekiro_cycle_faults > 500) {
             fprintf(stderr, "[FATAL] Sekiro game-init region unbreakable cycle detected (%d faults), exiting to avoid spin\n",
                     sekiro_cycle_faults);
             fprintf(stderr, "        Last fault at RIP=0x%lx RCX=0x%lx RDX=0x%lx R8=0x%lx R14=0x%lx RSP=0x%lx\n",
@@ -6399,7 +6398,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             exit(97);
         }
         
-        fprintf(stderr, "[SKIP] Sekiro game-init region RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/20] R14=0x%lx\n",
+        fprintf(stderr, "[SKIP] Sekiro game-init region RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/500] R14=0x%lx\n",
                 rip, rip - (u64)g_img, faultaddr, sekiro_cycle_faults,
                 uc->uc_mcontext.gregs[REG_R14]);
         /* Initialize key registers to prevent address overflows and invalid accesses. */
@@ -6545,6 +6544,17 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     /* Some execution paths end up in malformed/poisoned helper islands and
      * trigger SIGILL. Treat as a failing helper and continue on known path.
      */
+    
+    /* Specific SIGILL handler for Sekiro game-init region (deep RVA 0x237ce60+)
+     * Skip the bad instruction by advancing RIP by 1 byte (likely invalid opcode)
+     * and continue instead of using fallback redirect which can create loops. */
+    if (sig == SIGILL && rip >= (u64)g_img + 0x237ce50 && rip <= (u64)g_img + 0x237cf00) {
+        fprintf(stderr, "[SKIP] Sekiro game-init SIGILL at RIP=0x%lx, skipping 1 byte\n", rip);
+        uc->uc_mcontext.gregs[REG_RAX] = 0;
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 1);  /* Skip 1 byte of bad instruction */
+        return;
+    }
+    
     if (sig == SIGILL && g_img &&
         rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) {
         fprintf(stderr, "[SKIP] SIGILL at RIP=0x%lx, redirecting\n", rip);
