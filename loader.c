@@ -5651,7 +5651,10 @@ static void patch_known_bad_targets(void)
                 0x2dc5960, 0x3ec7d60, 0x3ec7d68, 0x239c627, 0x3f08960, 0x3f08bc0,
                 0x3f08bc8, 0x3f31e30, 0x3f332a0, 0x3f332f0, 0x39ea11, 0x39ea1a,
                 0x237cee4, 0x237cef3, 0x237cf00, 0x237cf10, 0x237cf2e, 0x237cff0, 0x237d01d, 0x1130b2e,
-                0x1130b36, 0x1130b3d, 0x1130b44, 0x1130b4c, 0x11e424c, 0x11e4250, 0x11e4255,
+                0x1130b36, 0x1130b3d, 0x1130b44, 0x1130b4c, 
+                /* Blocker function at 0x11e4200-0x11e43dc: patch densely */
+                0x11e424c, 0x11e4250, 0x11e4254, 0x11e4258, 0x11e425c, 0x11e4260, 0x11e4264, 0x11e4268, 
+                0x11e426c, 0x11e4270, 0x11e4274, 0x11e4278, 0x11e427c, 0x11e4280, 0x11e4284, 0x11e4288,
                 0x30b5a90, 0x30b5ad0,
                 0x30b5af8, 0x30b5b08, 0x30b5bb2, 0x30bea90, 0x30beaa8, 0x30beaaf,
                 0x2945090, 0x29450e0, 0x011ae01, 0x011ae80, 0x011ae95,
@@ -7745,17 +7748,15 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             return;
         }
         
-        /* Specific blocker: RIP=0x1411e424c has 48 89 07 (mov [rdi], rax) 
-         * followed by ff 15 (indirect call). This pattern creates unbreakable
-         * cycles. Redirect aggressively. */
+        /* Specific blocker: RIP=0x1411e424c has problematic null-ptr access.
+         * Patching via extra_rvas[], so this handler shouldn't fire. If it does,
+         * it means patches didn't work — diagnostics log what was attempted. */
         if (rip == 0x1411e424cULL) {
             fprintf(stderr,
-                    "[SKIP] Blocker pattern mov+indirect-call at RIP=0x%lx, redirecting\n",
-                    rip);
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
-            uc->uc_mcontext.gregs[REG_RDI] = 0;  /* Clear bad pointer */
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "blocker-movindi");
-            return;
+                    "[WARN] Blocker handler fired despite patches; RDI=0x%lx RAX=0x%lx\n",
+                    uc->uc_mcontext.gregs[REG_RDI],
+                    uc->uc_mcontext.gregs[REG_RAX]);
+            /* Fall through to normal null-write handling */
         }
         u64 gs_base = 0;
         syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs_base);
