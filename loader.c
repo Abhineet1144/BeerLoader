@@ -6287,16 +6287,16 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                 
                 u64 crash_count_before = g_total_sigsegv_count;
                 for (u64 i = 0; i < num_locks; i++) {
-                    /* Log every 10 iterations starting from 14540 */
-                    if (i % 10 == 0 && i >= 14540) {
-                        fprintf(stderr, "[SYNC] Before i=%lu at 0x%lx\n", i, (u64)&locks[i]);
+                    /* Log individually for problematic range */
+                    if (i >= 14561 && i <= 14570) {
+                        fprintf(stderr, "[SYNC] Init i=%lu\n", i);
                         fflush(stderr);
                     }
                     
                     beer_critical_section_initialize(&locks[i]);
                     
-                    if (i % 10 == 0 && i >= 14540) {
-                        fprintf(stderr, "[SYNC] After i=%lu\n", i);
+                    if (i >= 14561 && i <= 14570) {
+                        fprintf(stderr, "[SYNC] Done i=%lu\n", i);
                         fflush(stderr);
                     }
                     
