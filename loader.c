@@ -201,10 +201,139 @@ typedef struct _BEER_CRITICAL_SECTION {
 static __thread u64 g_current_thread_id = 0;
 
 /* Windows SRWLOCK structure (8 bytes) for reader-writer locks.
- * Used similarly to CRITICAL_SECTION but with reader/writer semantics. */
+ * Packed format: reader_count (bits 2-15) | writer_owned (bit 1) | writer_waiting (bit 0) */
+#pragma pack(push, 1)
 typedef struct _BEER_SRWLOCK {
-    u64 Ptr;  /* Contains packed state: low bits = flags, high bits = queue pointer */
+    u64 State;  /* Packed: reader_count (bits 2-15) | writer_owned (bit 1) | writer_waiting (bit 0) */
 } BEER_SRWLOCK;
+#pragma pack(pop)
+
+/* SRWLOCK state machine: Initialize to unlocked state */
+static inline void beer_srwlock_initialize(BEER_SRWLOCK *lock) {
+    lock->State = 0;  /* All zeros: no readers, no writer, no waiters */
+}
+
+/* SRWLOCK state machine: Acquire for reading (shared lock)
+ * Multiple readers can hold simultaneously. Returns old state. */
+static inline u64 beer_srwlock_acquire_shared(BEER_SRWLOCK *lock) {
+    u64 old_state = lock->State;
+    
+    /* Extract components */
+    u64 writer_waiting = (old_state >> 0) & 1;
+    u64 writer_owned = (old_state >> 1) & 1;
+    u64 reader_count = (old_state >> 2) & 0x3FFF;  /* 14-bit reader count */
+    
+    /* If writer is waiting or owns lock, we should wait (but we fake success) */
+    if (writer_owned || writer_waiting) {
+        /* Writer has priority; we'd normally block. For emulation, succeed anyway. */
+        return old_state;
+    }
+    
+    /* No writer contention; increment reader count */
+    reader_count++;
+    lock->State = (reader_count << 2) | (writer_owned << 1) | writer_waiting;
+    
+    return old_state;
+}
+
+/* SRWLOCK state machine: Release from reading */
+static inline u64 beer_srwlock_release_shared(BEER_SRWLOCK *lock) {
+    u64 old_state = lock->State;
+    
+    /* Extract components */
+    u64 writer_waiting = (old_state >> 0) & 1;
+    u64 writer_owned = (old_state >> 1) & 1;
+    u64 reader_count = (old_state >> 2) & 0x3FFF;
+    
+    /* Decrement reader count */
+    if (reader_count > 0) {
+        reader_count--;
+    }
+    lock->State = (reader_count << 2) | (writer_owned << 1) | writer_waiting;
+    
+    return old_state;
+}
+
+/* SRWLOCK state machine: Acquire for writing (exclusive lock)
+ * Only one writer at a time. Sets writer_owned = 1. */
+static inline u64 beer_srwlock_acquire_exclusive(BEER_SRWLOCK *lock) {
+    u64 old_state = lock->State;
+    
+    /* Extract components */
+    u64 writer_waiting = (old_state >> 0) & 1;
+    u64 writer_owned = (old_state >> 1) & 1;
+    u64 reader_count = (old_state >> 2) & 0x3FFF;
+    
+    /* If writer owns or readers exist, we can't acquire (but fake success for emulation) */
+    if (writer_owned || reader_count > 0) {
+        /* Mark that a writer is waiting */
+        lock->State = (reader_count << 2) | (writer_owned << 1) | 1;
+        return old_state;
+    }
+    
+    /* No contention; we acquire exclusive lock */
+    lock->State = (0 << 2) | (1 << 1) | 0;  /* writer_owned = 1, others = 0 */
+    
+    return old_state;
+}
+
+/* SRWLOCK state machine: Release from writing */
+static inline u64 beer_srwlock_release_exclusive(BEER_SRWLOCK *lock) {
+    u64 old_state = lock->State;
+    
+    /* Extract components (just to show work, not really needed for simple release) */
+    u64 writer_waiting = (old_state >> 0) & 1;
+    (void)writer_waiting;  /* Suppress unused warning */
+    
+    /* Clear everything on release */
+    lock->State = 0;
+    
+    return old_state;
+}
+
+/* Windows EVENT structure (24 bytes) for manual/auto-reset event signaling.
+ * Used to signal completion or availability of resources between threads. */
+#pragma pack(push, 1)
+typedef struct _BEER_EVENT {
+    u32 State;            /* 0x00 (4 bytes) - signaled (1) or unsignaled (0) */
+    u32 ManualReset;      /* 0x04 (4 bytes) - 1=manual, 0=auto reset after wait */
+    u32 WaiterCount;      /* 0x08 (4 bytes) - number of threads waiting on this event */
+    u64 Padding[2];       /* 0x0C (16 bytes) - padding to 32-byte alignment */
+} BEER_EVENT;
+#pragma pack(pop)
+
+/* EVENT state machine: Initialize event */
+static inline void beer_event_initialize(BEER_EVENT *event, u32 manual_reset, u32 initial_state) {
+    event->State = initial_state;
+    event->ManualReset = manual_reset;
+    event->WaiterCount = 0;
+    event->Padding[0] = 0;
+    event->Padding[1] = 0;
+}
+
+/* EVENT state machine: Set event to signaled state */
+static inline void beer_event_set(BEER_EVENT *event) {
+    event->State = 1;  /* Signal the event */
+    /* In real Windows, this wakes all auto-reset waiters or all manual-reset waiters */
+}
+
+/* EVENT state machine: Reset event to unsignaled state */
+static inline void beer_event_reset(BEER_EVENT *event) {
+    event->State = 0;  /* Unsignal the event */
+}
+
+/* EVENT state machine: Check if event is signaled (for fake WaitForSingleObject) */
+static inline u32 beer_event_is_signaled(BEER_EVENT *event) {
+    return event->State;
+}
+
+/* EVENT state machine: Pulse event (set, then reset for auto-reset events) */
+static inline void beer_event_pulse(BEER_EVENT *event) {
+    event->State = 1;  /* Temporarily signal */
+    if (!event->ManualReset) {
+        event->State = 0;  /* Auto-reset: immediately unsignal */
+    }
+}
 
 /* Get current thread ID for lock ownership (initialize on first call) */
 static inline u64 beer_get_thread_id(void) {
