@@ -6586,10 +6586,18 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             /* Dump 8 bytes of instruction at RIP */
             u8 *bytes = (u8*)rip;
             
+            /* DEBUG: Check what's at this address in the loaded image section */
+            u64 offset_in_image = rip - (u64)g_img;
+            u8 *section_bytes = (u8*)g_img + offset_in_image;
+            
             if (blocker_hit_count <= 3) {
                 fprintf(stderr, "\n[REVERSE_ENG] ========== BLOCKER HIT at 0x1423b1403 #%d ==========\n", blocker_hit_count);
+                fprintf(stderr, "[REVERSE_ENG] RIP=0x%lx (offset 0x%lx in .text section)\n", rip, offset_in_image);
                 fprintf(stderr, "[REVERSE_ENG] Instruction bytes at RIP: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
+                fprintf(stderr, "[REVERSE_ENG] Same via g_img:         %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        section_bytes[0], section_bytes[1], section_bytes[2], section_bytes[3],
+                        section_bytes[4], section_bytes[5], section_bytes[6], section_bytes[7]);
                 fprintf(stderr, "[REVERSE_ENG] Previous 8 bytes:        %02x %02x %02x %02x %02x %02x %02x %02x\n",
                         bytes[-8], bytes[-7], bytes[-6], bytes[-5], bytes[-4], bytes[-3], bytes[-2], bytes[-1]);
                 fprintf(stderr, "[REVERSE_ENG] REGS: RAX=0x%016lx RCX=0x%016lx RDX=0x%016lx\n", rax, rcx, rdx);
@@ -8165,20 +8173,128 @@ int main(int argc, char **argv)
 
     printf("=== Beer Loader ===\n");
     pe_load(exe);
+    
+    /* DIAGNOSTIC: Check if blocker address is loaded correctly right after PE load */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] Right after PE load, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
+    
     pe_imports();
+    
+    /* CHECK: After pe_imports */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After pe_imports, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
+    
     setup_teb_peb();
+    
+    /* CHECK: After setup_teb_peb */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After setup_teb_peb, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
 
     {
         int n = patch_transaction_assertions();
         printf("[PATCH] Disabled %d Transaction-failed assertion branches\n", n);
     }
+    
+    /* CHECK: After patch_transaction_assertions */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After patch_transaction_assertions, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
 
     apply_section_perms();
+    
+    /* CHECK: After apply_section_perms */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After apply_section_perms, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
+    
     patch_known_bad_targets();
+    
+    /* CHECK: After patch_known_bad_targets */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After patch_known_bad_targets, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
+    
     init_steam_fake();
+    
+    /* CHECK: After init_steam_fake */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After init_steam_fake, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
+    
     init_dxgi_fake();
+    
+    /* CHECK: After init_dxgi_fake */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After init_dxgi_fake, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
+    
     init_d3d11_fake();
+    
+    /* CHECK: After init_d3d11_fake */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After init_d3d11_fake, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
+    
     init_dxgi_adapter_fake();
+    
+    /* CHECK: After init_dxgi_adapter_fake */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After init_dxgi_adapter_fake, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
+    
     /* Patch dxgi factory vtable with real adapter + swapchain */
     g_dxgi_vtab[7]  = (u64)dxgi_EnumAdapters_with_fake;  /* EnumAdapters */
     g_dxgi_vtab[10] = (u64)dxgi_CreateSwapChain;          /* CreateSwapChain */
@@ -8186,6 +8302,17 @@ int main(int argc, char **argv)
     g_dxgi_vtab[8]  = (u64)dxgi_Present;       /* IDXGISwapChain::Present */
     g_dxgi_vtab[9]  = (u64)dxgi_GetBuffer;     /* IDXGISwapChain::GetBuffer */
     g_dxgi_vtab[13] = (u64)dxgi_ResizeBuffers; /* IDXGISwapChain::ResizeBuffers */
+    
+    /* CHECK: After vtable patching */
+    {
+        u64 blocker_addr = (u64)g_img + 0x23b1403;
+        u8 *test_bytes = (u8*)blocker_addr;
+        fprintf(stderr, "[DIAGNOSTIC] After vtable patching, bytes at blocker 0x23b1403:\n");
+        fprintf(stderr, "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                test_bytes[0], test_bytes[1], test_bytes[2], test_bytes[3],
+                test_bytes[4], test_bytes[5], test_bytes[6], test_bytes[7]);
+    }
+    
     /* vtable[10] also acts as engine allocator – set after CreateSwapChain */
     /* For objects that are NOT a factory, vtable[10] returns a real allocation */
     g_d3d11_vtab[10] = (u64)engine_alloc_vtab10;
