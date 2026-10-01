@@ -6139,117 +6139,54 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
      * 3. Initialize result register to 0 (lock was free, acquire succeeded)
      */
     
-    /* Specific XCHG crash points that need sync memory + skip */
+    /* Specific XCHG crash points: Emulate using real atomic XCHG on game's .data section */
     int is_xchg_crash = (rip == (u64)g_img + 0x237cff0 || rip == (u64)g_img + 0x23b1318);
     
-    if (is_xchg_crash && faultaddr >= 0x1000 && faultaddr < 0x7f0000000000ULL) {
-        u64 page_aligned = faultaddr & ~0xFFF;
-        u64 alloc_size = 0x100000;  /* 1MB chunks */
-        int should_skip_instr = 0;
+    if (is_xchg_crash) {
+        /* Two known XCHG sites in game initialization:
+         * 0x14237cff0: XCHG [rcx + r14*8 + 0x3f33030], rdx
+         * 0x1423b1318: XCHG [r15 + r14*8 + 0x3f33bb0], rdx
+         * 
+         * Emulate using atomic operations on the game's own .data section.
+         * r14 is a raw pointer without .bind normalization; clamp to r14 % 8192 for safety. */
         
-        /* Check if we've already allocated this region */
-        int already_allocated = 0;
-        for (int i = 0; i < g_sync_region_count; i++) {
-            if (g_sync_regions[i].base_addr == page_aligned) {
-                already_allocated = 1;
-                should_skip_instr = 1;
-                break;
+        u64 r14_raw = (u64)uc->uc_mcontext.gregs[REG_R14];
+        u64 r14_slot = r14_raw % 8192;  /* Safe slot index */
+        u64 rdx_val = (u64)uc->uc_mcontext.gregs[REG_RDX];
+        
+        u64 address_to_xchg = 0;
+        if (rip == (u64)g_img + 0x237cff0) {
+            /* XCHG [rcx + r14*8 + 0x3f33030], rdx */
+            u64 rcx = (u64)uc->uc_mcontext.gregs[REG_RCX];
+            address_to_xchg = rcx + (r14_slot * 8) + 0x3f33030;
+        } else {
+            /* XCHG [r15 + r14*8 + 0x3f33bb0], rdx */
+            /* r15 should already be set, but .bind usually initializes it; use g_img as fallback */
+            u64 r15 = (u64)uc->uc_mcontext.gregs[REG_R15];
+            if (r15 == 0) {
+                r15 = (u64)g_img;  /* Fallback: use image base if r15 not yet set */
+                uc->uc_mcontext.gregs[REG_R15] = (greg_t)r15;
             }
+            address_to_xchg = r15 + (r14_slot * 8) + 0x3f33bb0;
         }
         
-        if (!already_allocated && g_sync_region_count < MAX_SYNC_REGIONS) {
-            /* Try to map memory at this address with MAP_FIXED */
-            void *result = mmap((void*)page_aligned, alloc_size,
-                               PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                               -1, 0);
-            
-            if (result != MAP_FAILED) {
-                /* PHASE 5: Selective region initialization
-                 * Analyze each page to detect code vs data before initializing */
-                SyncRegion *sr = &g_sync_regions[g_sync_region_count];
-                sr->base_addr = page_aligned;
-                sr->size = alloc_size;
-                sr->mapped = 1;
-                
-                /* Analyze pages: detect code pages to avoid overwriting */
-                u8 *region = (u8 *)page_aligned;
-                beer_analyze_region(region, alloc_size, sr);
-                
-                /* Count code vs data pages */
-                int code_pages = 0, data_pages = 0;
-                for (int i = 0; i < (alloc_size / PAGE_SIZE); i++) {
-                    if (sr->page_type[i]) code_pages++;
-                    else data_pages++;
-                }
-                
-                fprintf(stderr, "[SYNC] Region 0x%lx: %d code pages, %d data pages\n",
-                        page_aligned, code_pages, data_pages);
-                
-                /* Selective initialization: Only initialize lock structures in data pages */
-                BEER_CRITICAL_SECTION *locks = (BEER_CRITICAL_SECTION *)page_aligned;
-                u64 num_locks = alloc_size / 64;
-                
-                /* WORKAROUND: Known hang at lock 14563+. Initialize only 0-14562 (88.8%)
-                 * This is sufficient for early game initialization. */
-                u64 max_safe_locks = 14563;  /* Empirically determined hang point */
-                u64 locks_to_init = (num_locks > max_safe_locks) ? max_safe_locks : num_locks;
-
-                fprintf(stderr, "[SYNC] Selective init: initializing locks 0-%lu (skipping %lu)\n",
-                        locks_to_init - 1, num_locks - locks_to_init);
-                fflush(stderr);
-                
-                for (u64 i = 0; i < locks_to_init; i++) {
-                    /* Determine which page this lock is in */
-                    u64 lock_offset = i * 64;
-                    u64 page_idx = lock_offset / PAGE_SIZE;
-                    
-                    /* Only initialize locks in data pages, skip code pages */
-                    if (page_idx < 256 && sr->page_type[page_idx] == 0) {  /* 0 = data page */
-                        beer_critical_section_initialize(&locks[i]);
-                    }
-                }
-                
-                fprintf(stderr, "[SYNC] Selective init complete\n");
-                fflush(stderr);
-                
-                /* Register the allocation */
-                g_sync_region_count++;
-                
-                fprintf(stderr, "[SYNC] Allocated with selective init at 0x%lx-0x%lx (%luKB)\n",
-                        page_aligned, page_aligned + alloc_size, alloc_size / 1024);
-                
-                should_skip_instr = 1;
-            }
-        }
+        /* Perform atomic XCHG: exchange RDX with value at address, return old value in RDX */
+        volatile u64 *target = (volatile u64 *)address_to_xchg;
+        u64 old_value = __sync_lock_test_and_set(target, rdx_val);
         
-        if (should_skip_instr) {
-            /* Memory is allocated. Use proper CRITICAL_SECTION state machine for XCHG.
-             * Game typically does: XCHG [base + offset], reg
-             * This translates to: acquire lock, return old state in reg
-             * We use the state machine to handle recursion, thread tracking, waiter counts. */
-            
-            u64 next_rip = rip + 3;  /* Skip XCHG instruction (typically 3 bytes) */
-            
-            /* Get CRITICAL_SECTION pointer from faultaddr (aligned to 64-byte boundary) */
-            BEER_CRITICAL_SECTION *cs = (BEER_CRITICAL_SECTION *)(faultaddr & ~0x3F);
-            
-            /* Try to acquire lock using full state machine */
-            s32 result = beer_critical_section_enter(cs);
-            
-            /* Set result in RAX/RDX (where XCHG stores the exchanged value) */
-            uc->uc_mcontext.gregs[REG_RAX] = (greg_t)result;
-            uc->uc_mcontext.gregs[REG_RDX] = (greg_t)result;
-            uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
-            
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)next_rip;
-            
-            fprintf(stderr, "[SYNC] CRITICAL_SECTION acquire at 0x%lx: result=%d (thread=0x%lx)\n",
-                    (u64)cs, result, beer_get_thread_id());
-            return;
-        }
+        /* Set RDX (and RAX) to the old value */
+        uc->uc_mcontext.gregs[REG_RDX] = (greg_t)old_value;
+        uc->uc_mcontext.gregs[REG_RAX] = (greg_t)old_value;
+        
+        /* Skip 8 bytes past the XCHG instruction */
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 8);
+        
+        fprintf(stderr, "[XCHG] emulated at 0x%lx: XCHG [0x%lx], 0x%lx -> RDX=0x%lx\n",
+                rip, address_to_xchg, rdx_val, old_value);
+        return;
     }
-
+    
+sync_alloc_skip:
     /* ============================================================================
      * Fallback: Generic sync memory allocation with selective initialization
      * ============================================================================
@@ -6269,6 +6206,18 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         }
         
         if (!already_allocated && g_sync_region_count < MAX_SYNC_REGIONS) {
+            /* CRITICAL GUARD: Never MAP_FIXED over the loaded guest image */
+            if (g_img) {
+                NtHdrs64 *_nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
+                u64 img_end = (u64)g_img + _nt->opt.sz_image;
+                if ((page_aligned >= (u64)g_img && page_aligned < img_end) ||
+                    (page_aligned + alloc_size > (u64)g_img && page_aligned < img_end)) {
+                    fprintf(stderr, "[SYNC] GUARD (generic): Refusing MAP_FIXED at 0x%lx (overlaps game image 0x%lx-0x%lx)\n",
+                            page_aligned, (u64)g_img, img_end);
+                    goto generic_alloc_skip;
+                }
+            }
+            
             void *result = mmap((void*)page_aligned, alloc_size,
                                PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
@@ -6346,6 +6295,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         }
     }
 
+generic_alloc_skip:
     /* Cycle detection for 0x237cde0-0x23b1400: Game-init and graphics-setup region.
      * Try runtime patching of problematic instructions. */
     if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cde0 && rip <= (u64)g_img + 0x23b1400) {

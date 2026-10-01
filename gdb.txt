@@ -90,3 +90,276 @@ A debugging session is active.
 	Inferior 1 [process 55503] will be killed.
 
 Quit anyway? (y or n) [answered Y; input not from terminal]
+warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+Breakpoint 1 at 0x1eb81
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Program received signal SIGPIPE, Broken pipe.
+__internal_syscall_cancel (a1=2, a2=93824992390984, a3=59, a4=0, a5=0, a6=0, nr=1) at ./nptl/cancellation.c:40
+warning: 40	./nptl/cancellation.c: No such file or directory
+"=== Stopped at guest entry point ===
+"rsp            0x7fffffffd450      0x7fffffffd450
+rip            0x7ffff7ca03e6      0x7ffff7ca03e6 <__syscall_cancel+166>
+rax            0xffffffffffffffe0  -32
+"Setting hardware write watchpoint on 0x1423b1403
+"Hardware access (read/write) watchpoint 2: *(long long*)0x1423b1403
+"=== Continuing to find what zeroes 0x1423b1403 ===
+"
+Program terminated with signal SIGPIPE, Broken pipe.
+The program no longer exists.
+"=== WATCHPOINT FIRED ===
+"/tmp/watch_blocker.gdb:46: Error in sourced command file:
+The program has no registers now.
+warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+Breakpoint 1 at 0x1eb81
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, 0x0000555555572b81 in main (argc=2, argv=0x7fffffffd8c8) at loader.c:8421
+warning: Source file is more recent than executable.
+8421	    asm volatile (
+"=== At _guest_entry_point. RSP/RIP:
+"rsp            0x7ffff77ffa08      0x7ffff77ffa08
+rip            0x555555572b81      0x555555572b81 <main+4554>
+"=== Bytes at 0x1423b1403 right now:
+"0x1423b1403:	0x48	0x8b	0xc8	0xff	0x15	0x6c	0x8d	0x57
+0x1423b140b:	0x00	0x48	0x8b	0x8c	0x24	0xa0	0x00	0x00
+"=== Setting hardware write watchpoint on 0x1423b1403 ===
+"Hardware watchpoint 2: *(long long*)0x1423b1403
+"=== Continuing to catch who zeroes 0x1423b1403 ===
+"
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0x000000014237cff4 in ?? ()
+"=== WRITE WATCHPOINT FIRED ===
+"rax            0xffffffffffffffff  -1
+rbx            0x0                 0
+rcx            0x140000000         5368709120
+rdx            0xffffffffffffffff  -1
+rsi            0x14237ce3b         5405920827
+rdi            0x0                 0
+rbp            0x1                 0x1
+rsp            0x7ffff77ff858      0x7ffff77ff858
+r8             0x2f4fd36d6c3e      52019896085566
+r9             0x143f33168         5434978664
+r10            0x0                 0
+r11            0x206               518
+r12            0x0                 0
+r13            0x14237dd98         5405924760
+r14            0x143f33168         5434978664
+r15            0x0                 0
+rip            0x14237cff4         0x14237cff4
+eflags         0x206               [ PF IF ]
+cs             0x33                51
+ss             0x2b                43
+ds             0x0                 0
+es             0x0                 0
+fs             0x0                 0
+gs             0x0                 0
+pl3_ssp        <unavailable>
+fs_base        0x7ffff7f95780      140737353701248
+gs_base        0x7ffff7fb1000      140737353814016
+"=== Backtrace ===
+"#0  0x000000014237cff4 in ?? ()
+#1  0x0000000000000000 in ?? ()
+"=== Bytes at 0x1423b1403 AFTER write ===
+"0x1423b1403:	0x48	0x8b	0xc8	0xff	0x15	0x6c	0x8d	0x57
+0x1423b140b:	0x00	0x48	0x8b	0x8c	0x24	0xa0	0x00	0x00
+"=== Stack at RSP ===
+"0x7ffff77ff858:	0x0000000000000000	0x0000000000000001
+0x7ffff77ff868:	0x000000014237ce3b	0x7ffafbffbfebfbff
+0x7ffff77ff878:	0x00000000239c27eb	0x239c27eb00000002
+0x7ffff77ff888:	0xfc1cc41098c027bc	0x0000000000000000
+0x7ffff77ff898:	0x00000001423596d3	0x0000000000000207
+0x7ffff77ff8a8:	0x0000000000000001	0x0000000143f33168
+0x7ffff77ff8b8:	0x000000014237cfc5	0x0000000000000fa0
+0x7ffff77ff8c8:	0x000000014235a134	0x0000000000000000
+"=== Continue (in case it fires again) ===
+"
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0x000000014237cff4 in ?? ()
+"=== SECOND WATCHPOINT FIRE ===
+"rax            0xffffffffffffffff  -1
+rbx            0x14237cfc5         5405921221
+rcx            0x140000000         5368709120
+rdx            0xffffffffffffffff  -1
+rsi            0x14237ce3b         5405920827
+rdi            0x14237da48         5405923912
+rbp            0x1                 0x1
+rsp            0x7ffff77ff650      0x7ffff77ff650
+r8             0x2f4fd36d6c3e      52019896085566
+r9             0x14237da48         5405923912
+r10            0x0                 0
+r11            0x206               518
+r12            0x0                 0
+r13            0x14237dd98         5405924760
+r14            0x14237da48         5405923912
+r15            0x0                 0
+rip            0x14237cff4         0x14237cff4
+eflags         0x206               [ PF IF ]
+cs             0x33                51
+ss             0x2b                43
+ds             0x0                 0
+es             0x0                 0
+fs             0x0                 0
+gs             0x0                 0
+pl3_ssp        <unavailable>
+fs_base        0x7ffff7f95780      140737353701248
+gs_base        0x7ffff7fb1000      140737353814016
+#0  0x000000014237cff4 in ?? ()
+#1  0x000000014237d085 in ?? ()
+#2  0x000000014237db4c in ?? ()
+#3  0x0000000000000001 in ?? ()
+#4  0x000000014237ce3b in ?? ()
+#5  0x0000000000000fa0 in ?? ()
+#6  0x0000000000000001 in ?? ()
+#7  0x000000014237db4c in ?? ()
+#8  0x000000014237db4c in ?? ()
+#9  0x000000014237da48 in ?? ()
+#10 0x000000014237dd98 in ?? ()
+#11 0x0000000000000000 in ?? ()
+0x1423b1403:	0x48	0x8b	0xc8	0xff	0x15	0x6c	0x8d	0x57
+0x1423b140b:	0x00	0x48	0x8b	0x8c	0x24	0xa0	0x00	0x00
+warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+Breakpoint 1 at 0x1eb81
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, 0x0000555555572b81 in main (argc=2, argv=0x7fffffffd8c8) at loader.c:8421
+warning: Source file is more recent than executable.
+8421	    asm volatile (
+"=== At guest entry point ===
+""Bytes at 0x1423b1403 right now:
+"0x1423b1403:	0x48	0x8b	0xc8	0xff	0x15	0x6c	0x8d	0x57
+0x1423b140b:	0x00	0x48	0x8b	0x8c	0x24	0xa0	0x00	0x00
+Hardware watchpoint 2: *(long long*)0x1423b1403
+Hardware watchpoint 3: *(long long*)0x1423b1400
+Hardware watchpoint 4: *(long long*)0x1423b1408
+"=== Watchpoints set. Continuing with more faults allowed ===
+"Warning:
+Could not insert hardware watchpoint 2.
+Could not insert hardware breakpoints:
+You may have requested too many hardware breakpoints/watchpoints.
+
+/tmp/watch_blocker3.gdb:65: Error in sourced command file:
+Command aborted.
+warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+Breakpoint 1 at 0x1eb81
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, 0x0000555555572b81 in main (argc=2, argv=0x7fffffffd8c8) at loader.c:8421
+warning: Source file is more recent than executable.
+8421	    asm volatile (
+"=== At guest entry point. Bytes now:
+"0x1423b1403:	0x48	0x8b	0xc8	0xff	0x15	0x6c	0x8d	0x57
+0x1423b140b:	0x00	0x48	0x8b	0x8c	0x24	0xa0	0x00	0x00
+Hardware watchpoint 2: *(long long*)0x1423b1403
+"=== Single watchpoint set, continuing ===
+"
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0x000000014237cff4 in ?? ()
+"=== Done ===
+"0x1423b1403:	0x48	0x8b	0xc8	0xff	0x15	0x6c	0x8d	0x57
+0x1423b140b:	0x00	0x48	0x8b	0x8c	0x24	0xa0	0x00	0x00
+warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+Breakpoint 1 at 0x1ec56
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, 0x0000555555572c56 in main (argc=2, argv=0x7fffffffd8c8) at loader.c:8475
+8475	    asm volatile (
+"=== At guest entry point ===
+""Bytes at lock-function 0x237cc34 (where r14=r9 is set):
+"   0x14237cc34:	mov    %r9,%r14
+   0x14237cc37:	mov    %r8,%rdi
+   0x14237cc3a:	mov    %rdx,%r13
+   0x14237cc3d:	call   0x14237da40
+"=== Setting breakpoint at 0x237cc34 (mov r14, r9) ===
+"Breakpoint 2 at 0x14237cc34
+"=== Continuing ===
+"warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+Breakpoint 1 at 0x1ec56
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, 0x0000555555572c56 in main (argc=2, argv=0x7fffffffd8c8) at loader.c:8475
+8475	    asm volatile (
+"=== At guest entry point ===
+""Bytes at lock-function 0x237cc34 (where r14=r9 is set):
+"   0x14237cc34:	mov    %r9,%r14
+   0x14237cc37:	mov    %r8,%rdi
+   0x14237cc3a:	mov    %rdx,%r13
+   0x14237cc3d:	call   0x14237da40
+"=== Setting breakpoint at 0x237cc34 (mov r14, r9) ===
+"Breakpoint 2 at 0x14237cc34
+"=== Continuing ===
+"[Inferior 1 (process 71490) exited with code 02]
+"=== Done ===
+"warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+Breakpoint 1 at 0x1ec56
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, 0x0000555555572c56 in main (argc=2, argv=0x7fffffffd8c8) at loader.c:8475
+8475	    asm volatile (
+"=== At guest entry point ===
+""Bytes at lock-function 0x237cc34 (where r14=r9 is set):
+"   0x14237cc34:	mov    %r9,%r14
+   0x14237cc37:	mov    %r8,%rdi
+   0x14237cc3a:	mov    %rdx,%r13
+   0x14237cc3d:	call   0x14237da40
+"=== Setting breakpoint at 0x237cc34 (mov r14, r9) ===
+"Breakpoint 2 at 0x14237cc34
+"=== Continuing ===
+"warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+Breakpoint 1 at 0x1ec56
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, 0x0000555555572c56 in main (argc=2, argv=0x7fffffffd8c8) at loader.c:8475
+8475	    asm volatile (
+Breakpoint 2 at 0x14237cc34
+
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0x00000001423597c1 in ?? ()

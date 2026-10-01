@@ -1,51 +1,53 @@
-BEER LOADER - SESSION 4 SUMMARY (2026-09-30 continuation)
-============================================================
+BEER LOADER - SESSION 12 SUMMARY (2026-10-02)
+==============================================
 
-MAJOR ACHIEVEMENTS:
-✅ Implemented robust real-unwind recovery strategy for CRT initialization faults
-✅ Added fake DLL handle generation system (32 unique unknown DLLs supported)
-✅ Extended handler coverage from early-only (0x2600-0x27ff) to include middle-init (0x9900-0x9a80)
-✅ Verified stability: cli-64.exe exits cleanly and deterministically
-✅ Made measurable progress on complex executables (gui-64.exe)
+MAJOR FINDING: The "zeros at 0x1423b1403" were caused by the loader itself,
+not by the game. The generic sync allocator used MAP_FIXED|MAP_ANONYMOUS
+without checking whether faultaddr was inside the guest image. When a fault
+occurred with a stale register pointing into .text, it zeroed the code page
+and removed execute permission. GDB watchpoint confirmed the bytes at
+0x1423b1403 never actually change (stay 48 8b c8 ff 15...).
 
-TECHNICAL IMPROVEMENTS:
-- Early CRT handler (RVA 0x2600-0x27ff): Stack underflow recovery via real-unwind
-- Middle-init handler (RVA 0x9900-0x9a80): Handles more complex initialization
-- Both handlers: RSP validation, graceful fallback, limited logging to reduce spam
-- Fake DLL caching: Non-zero handles for unknown DLLs to improve compatibility
+STATUS:
+- Latest commit: 727ab6c (Session 11)
+- Uncommitted changes: image-overwrite guard + XCHG emulator (~116 lines added)
+- loader.c: ~8446 lines
+- Build: make -j4 (clean)
 
-TEST RESULTS:
-- cli-64.exe:   ✅ STABLE (exit 255, deterministic)
-- gui-64.exe:   ⚠️  PROGRESSES (gets past more initialization but hits ret-stub deadlock)
+FIXES APPLIED (UNCOMMITTED):
+1. Image-overwrite guard: on_crash_impl now checks faultaddr against
+   [g_img, g_img+sz_image) before any MAP_FIXED and jumps to sync_alloc_skip:
+   if it would overlap.
 
-COMMITS THIS SESSION (5 total):
-1. 5df1f60 - Fix early-startup fault recovery using real-unwind mechanism
-2. e7f35e2 - Expand early-startup fault handler to RVA 0x2600-0x27ff range  
-3. 5ba0223 - Refine CRT fault handler to specific RVA range
-4. ce3c27c - Add fake DLL handle generation for unknown/unimplemented DLLs
-5. 104a5dd - Add middle-init fault handler for RVA 0x9900-0x9a80 region
+2. XCHG emulator: replaced old mmap-based sync allocator for both known
+   XCHG crash sites (0x237cff0 and 0x23b1318):
+   - Uses __sync_lock_test_and_set (real atomic XCHG) on game's own .data
+   - Clamps r14 to r14 % 8192 for safe slot index (r14 is a pointer without .bind)
+   - Fixes r15 = g_img for 0x23b1318 site
+   - Skips 8 bytes past each XCHG
+   - No mmap involved
 
-CURRENT BLOCKER:
-The ret-stub mechanism at 0x235a694 enters an infinite loop when complex executables
-land there after middle-init recovery. The existing GATE escape mechanism tries 7
-different paths but can't break out of the cycle.
+SECONDARY BUG (unfixed):
+- impl_TlsGetValue crashes on movaps %xmm6,(%rsp) — rsp=0x55555568f3a8 is
+  not 16-byte aligned. idx=1111168586 is also garbage (wrong register?).
+  Fix: force 16-byte RSP alignment in trampoline or use force_align_arg_pointer.
 
-KEY LESSON LEARNED:
-Narrow, targeted handlers are far more reliable than broad ranges. A broad range
-(0x2000-0xc000) caused cascading failures, while narrow ranges work well.
+NEXT SESSION PRIORITY:
+1. Commit current fixes:
+     git add loader.c && git commit -m "Session 12: Fix image-overwrite bug + XCHG emulator"
 
-ESTIMATED PROGRESS: 48-50% toward game window (up from 46-48% at session start)
+2. Fix impl_TlsGetValue SSE alignment:
+   - Add `and $-16, %rsp` before every `call *%rax` in beer_dispatch_trampoline
+   - OR add __attribute__((force_align_arg_pointer)) to all ms_abi impl_* functions
 
-RECOMMENDATIONS FOR NEXT SESSION:
-1. Investigate why middle-init recovery returns to 0x235a694
-2. Add special handling to detect and break ret-stub cycles
-3. Consider whether to refactor recovery strategy for middle-init vs early-init
-4. Test with real game executable if available
+3. Run the fixed loader and find new crash point:
+     make -j4 && timeout 60 ./loader 'sekiro.exe' 2>&1 | grep -E "^\[XCHG\]|GUARD|CRASH|fault" | head -80
 
-BASELINE FOR NEXT SESSION:
-cd /home/abhineet/Desktop/Abhi/Beer && make -j4
-# Test simple case:
-timeout 5 ./loader /path/to/cli-64.exe
-# Test complex case:
-timeout 10 ./loader /path/to/gui-64.exe
+4. Investigate .bind section (RVA +0x429f000, size 0x324d0) if still needed:
+   - Run .bind code before jumping to AddressOfEntryPoint
+   - This initialises r15 = image base and may decrypt/patch parts of .text
 
+STALE FILES (safe to delete):
+  OPTION_A_PHASE_1_4_COMPLETE.md
+  SYNC_INFRASTRUCTURE_SUMMARY.md
+  /home/abhineet/Desktop/Abhi/gdb.txt  (TlsGetValue crash, separate issue)
