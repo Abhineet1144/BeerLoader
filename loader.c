@@ -182,6 +182,59 @@ typedef struct {
 static SyncRegion g_sync_regions[MAX_SYNC_REGIONS];
 static int g_sync_region_count = 0;
 
+/* Handle table for tracking created sync objects (CreateEventW, CreateMutexW, etc.)
+ * Maps fake HANDLE values returned to game to real BEER_* structure pointers. */
+#define MAX_SYNC_HANDLES 256
+typedef struct {
+    void *handle;        /* Fake handle value returned to game (non-zero) */
+    void *object;        /* Pointer to real BEER_EVENT, BEER_CRITICAL_SECTION, etc. */
+    u32  type;           /* Object type: 1=EVENT, 2=CRITICAL_SECTION, 3=SRWLOCK, 4=SEMAPHORE */
+    u32  in_use;         /* 1 if valid, 0 if closed/free */
+} SyncHandle;
+static SyncHandle g_sync_handles[MAX_SYNC_HANDLES];
+static int g_sync_handle_count = 0;
+static u32 g_next_fake_handle = 0x10000000;  /* Start handles at 0x10000000 to avoid NULL */
+
+/* Allocate a fake handle for a sync object */
+static void *beer_alloc_sync_handle(void *object, u32 type) {
+    if (g_sync_handle_count >= MAX_SYNC_HANDLES) {
+        return NULL;  /* Handle table full */
+    }
+    
+    void *fake_handle = (void *)g_next_fake_handle;
+    g_next_fake_handle += 4;  /* Increment by 4 to look like HANDLE alignment */
+    
+    int idx = g_sync_handle_count++;
+    g_sync_handles[idx].handle = fake_handle;
+    g_sync_handles[idx].object = object;
+    g_sync_handles[idx].type = type;
+    g_sync_handles[idx].in_use = 1;
+    
+    return fake_handle;
+}
+
+/* Look up a sync object from a fake handle */
+static void *beer_get_sync_object(void *handle, u32 *out_type) {
+    for (int i = 0; i < g_sync_handle_count; i++) {
+        if (g_sync_handles[i].in_use && g_sync_handles[i].handle == handle) {
+            if (out_type) *out_type = g_sync_handles[i].type;
+            return g_sync_handles[i].object;
+        }
+    }
+    if (out_type) *out_type = 0;
+    return NULL;
+}
+
+/* Close a handle and free it for reuse */
+static void beer_close_sync_handle(void *handle) {
+    for (int i = 0; i < g_sync_handle_count; i++) {
+        if (g_sync_handles[i].in_use && g_sync_handles[i].handle == handle) {
+            g_sync_handles[i].in_use = 0;
+            return;
+        }
+    }
+}
+
 /* Windows CRITICAL_SECTION structure (64 bytes aligned) with full state machine.
  * Supports acquire/release with recursion, thread tracking, and waiter queues.
  * The game allocates arrays of these and uses XCHG to implement lock operations. */
