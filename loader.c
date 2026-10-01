@@ -6568,6 +6568,55 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
      * Skip 8 bytes at a time (typical x64 instruction or lock structure) to advance past the problem.
      * Increased limit to 500000 to push through problematic code. */
     if (sig == SIGSEGV && rip >= 0x1423b1000ULL && rip < 0x1424b1000ULL) {
+        /* BLOCKER PRIORITY: Check special blockers BEFORE generic JIT handling */
+        if (rip == 0x1423b1403ULL) {
+            static int blocker_hit_count = 0;
+            blocker_hit_count++;
+            
+            u64 rdi = uc->uc_mcontext.gregs[REG_RDI];
+            u64 rax = uc->uc_mcontext.gregs[REG_RAX];
+            u64 rsi = uc->uc_mcontext.gregs[REG_RSI];
+            u64 rdx = uc->uc_mcontext.gregs[REG_RDX];
+            u64 rcx = uc->uc_mcontext.gregs[REG_RCX];
+            u64 r8  = uc->uc_mcontext.gregs[REG_R8];
+            u64 r9  = uc->uc_mcontext.gregs[REG_R9];
+            u64 rsp = uc->uc_mcontext.gregs[REG_RSP];
+            u64 rbp = uc->uc_mcontext.gregs[REG_RBP];
+            
+            /* Dump 8 bytes of instruction at RIP */
+            u8 *bytes = (u8*)rip;
+            
+            if (blocker_hit_count <= 3) {
+                fprintf(stderr, "\n[REVERSE_ENG] ========== BLOCKER HIT at 0x1423b1403 #%d ==========\n", blocker_hit_count);
+                fprintf(stderr, "[REVERSE_ENG] Instruction bytes at RIP: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
+                fprintf(stderr, "[REVERSE_ENG] Previous 8 bytes:        %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        bytes[-8], bytes[-7], bytes[-6], bytes[-5], bytes[-4], bytes[-3], bytes[-2], bytes[-1]);
+                fprintf(stderr, "[REVERSE_ENG] REGS: RAX=0x%016lx RCX=0x%016lx RDX=0x%016lx\n", rax, rcx, rdx);
+                fprintf(stderr, "[REVERSE_ENG]      RDI=0x%016lx RSI=0x%016lx RBP=0x%016lx RSP=0x%016lx\n", rdi, rsi, rbp, rsp);
+                fprintf(stderr, "[REVERSE_ENG]      R8=0x%016lx R9=0x%016lx\n", r8, r9);
+                fprintf(stderr, "[REVERSE_ENG] STACK at RSP: 0x%016lx 0x%016lx 0x%016lx 0x%016lx\n",
+                        rsp < 0xffffffffffff ? ((u64*)rsp)[0] : 0,
+                        rsp < 0xffffffffffff ? ((u64*)rsp)[1] : 0,
+                        rsp < 0xffffffffffff ? ((u64*)rsp)[2] : 0,
+                        rsp < 0xffffffffffff ? ((u64*)rsp)[3] : 0);
+                fprintf(stderr, "[REVERSE_ENG] FaultAddr=0x%lx\n", faultaddr);
+                fprintf(stderr, "[REVERSE_ENG] ===============================================\n\n");
+            }
+            
+            if (rdi == 0) {
+                fprintf(stderr, "[DIAG] 0x1423b1403 NULL-write: RDI=0x%lx - escaping\n", rdi);
+                uc->uc_mcontext.gregs[REG_RAX] = 0;
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "jit-blocker-null");
+                return;
+            }
+            
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "jit-blocker");
+            return;
+        }
+        
+        /* Generic JIT region handling */
         static int jit_region_faults = 0;
         jit_region_faults++;
         if (jit_region_faults <= 500000) {
@@ -7592,10 +7641,39 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
          * These locations have null-write patterns that crash
          * Detect and skip them */
         if (rip == 0x1411e424cULL || rip == 0x1423b1403ULL) {
+            static int blocker_hit_count = 0;
+            blocker_hit_count++;
+            
             u64 rdi = uc->uc_mcontext.gregs[REG_RDI];
             u64 rax = uc->uc_mcontext.gregs[REG_RAX];
             u64 rsi = uc->uc_mcontext.gregs[REG_RSI];
             u64 rdx = uc->uc_mcontext.gregs[REG_RDX];
+            u64 rcx = uc->uc_mcontext.gregs[REG_RCX];
+            u64 r8  = uc->uc_mcontext.gregs[REG_R8];
+            u64 r9  = uc->uc_mcontext.gregs[REG_R9];
+            u64 rsp = uc->uc_mcontext.gregs[REG_RSP];
+            u64 rbp = uc->uc_mcontext.gregs[REG_RBP];
+            
+            /* Dump 8 bytes of instruction at RIP */
+            u8 *bytes = (u8*)rip;
+            
+            if (blocker_hit_count <= 3) {
+                fprintf(stderr, "\n[REVERSE_ENG] ========== BLOCKER HIT #%d at 0x%lx ==========\n", blocker_hit_count, rip);
+                fprintf(stderr, "[REVERSE_ENG] Instruction bytes at RIP: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
+                fprintf(stderr, "[REVERSE_ENG] Previous 8 bytes:        %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        bytes[-8], bytes[-7], bytes[-6], bytes[-5], bytes[-4], bytes[-3], bytes[-2], bytes[-1]);
+                fprintf(stderr, "[REVERSE_ENG] REGS: RAX=0x%016lx RBX=? RCX=0x%016lx RDX=0x%016lx\n", rax, rcx, rdx);
+                fprintf(stderr, "[REVERSE_ENG]      RDI=0x%016lx RSI=0x%016lx RBP=0x%016lx RSP=0x%016lx\n", rdi, rsi, rbp, rsp);
+                fprintf(stderr, "[REVERSE_ENG]      R8=0x%016lx R9=0x%016lx\n", r8, r9);
+                fprintf(stderr, "[REVERSE_ENG] STACK at RSP: 0x%016lx 0x%016lx 0x%016lx 0x%016lx\n",
+                        rsp < 0xffffffffffff ? ((u64*)rsp)[0] : 0,
+                        rsp < 0xffffffffffff ? ((u64*)rsp)[1] : 0,
+                        rsp < 0xffffffffffff ? ((u64*)rsp)[2] : 0,
+                        rsp < 0xffffffffffff ? ((u64*)rsp)[3] : 0);
+                fprintf(stderr, "[REVERSE_ENG] FaultAddr=0x%lx (trying to access NULL)\n", faultaddr);
+                fprintf(stderr, "[REVERSE_ENG] ===============================================\n\n");
+            }
             
             /* If RDI is NULL, this is a degenerate null-write case.
              * Likely game logic error: trying to initialize something that wasn't allocated.
