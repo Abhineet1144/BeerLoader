@@ -182,6 +182,25 @@ typedef struct {
 static SyncRegion g_sync_regions[MAX_SYNC_REGIONS];
 static int g_sync_region_count = 0;
 
+/* Windows CRITICAL_SECTION structure (40 bytes) for proper lock initialization.
+ * The game allocates arrays of these and uses XCHG to implement lock acquire/release. */
+#pragma pack(push, 1)
+typedef struct _BEER_CRITICAL_SECTION {
+    void *DebugInfo;              /* 0x00 (8 bytes) - normally points to RTL_CRITICAL_SECTION_DEBUG */
+    s32 LockCount;                /* 0x08 (4 bytes) - -1 = unacquired, 0+ = acquired+recursion */
+    s32 RecursionCount;           /* 0x0C (4 bytes) - > 0 if held by current thread */
+    void *OwningThread;           /* 0x10 (8 bytes) - thread id that holds lock, or 0 if free */
+    void *LockSemaphore;          /* 0x18 (8 bytes) - kernel event object, or 0 if unused */
+    u64  SpinCount;               /* 0x20 (8 bytes) - spin attempts before blocking */
+} BEER_CRITICAL_SECTION;
+#pragma pack(pop)
+
+/* Windows SRWLOCK structure (8 bytes) for reader-writer locks.
+ * Used similarly to CRITICAL_SECTION but with reader/writer semantics. */
+typedef struct _BEER_SRWLOCK {
+    u64 Ptr;  /* Contains packed state: low bits = flags, high bits = queue pointer */
+} BEER_SRWLOCK;
+
 /* RSP observed just before handing off to the PE entry point — the
  * shallowest legitimate stack depth for the whole run. Any "recovered"
  * RSP produced by speculative stack-popping that ends up ABOVE this
@@ -5809,13 +5828,28 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                                -1, 0);
             
             if (result != MAP_FAILED) {
-                /* Initialize with a pattern of zeros (SRWLOCK/CRITICAL_SECTION friendly) */
+                /* Initialize with proper CRITICAL_SECTION structures (40 bytes each, 64-byte slots) */
                 memset((void*)page_aligned, 0, alloc_size);
                 
-                /* Fill with repeating pattern of unacquired lock values (8-byte stride) */
-                u64 *lock_table = (u64 *)page_aligned;
-                for (size_t i = 0; i < (alloc_size / sizeof(u64)); i++) {
-                    lock_table[i] = 0;  /* 0 = unacquired lock */
+                /* Fill region with unacquired CRITICAL_SECTION locks */
+                typedef struct {
+                    void *DebugInfo;
+                    s32 LockCount;        /* -1 = unacquired */
+                    s32 RecursionCount;   /* 0 = not held */
+                    void *OwningThread;
+                    void *LockSemaphore;
+                    u64 SpinCount;
+                } CS_LOCK;
+                
+                CS_LOCK *locks = (CS_LOCK *)page_aligned;
+                u64 num_locks = alloc_size / 64;  /* 64-byte slots */
+                for (u64 i = 0; i < num_locks; i++) {
+                    locks[i].LockCount = -1;        /* Unacquired state */
+                    locks[i].RecursionCount = 0;
+                    locks[i].OwningThread = NULL;
+                    locks[i].LockSemaphore = NULL;
+                    locks[i].DebugInfo = NULL;
+                    locks[i].SpinCount = 0;
                 }
                 
                 /* Register the allocation */
@@ -5824,9 +5858,8 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                 g_sync_regions[g_sync_region_count].mapped = 1;
                 g_sync_region_count++;
                 
-                fprintf(stderr, "[SYNC] Allocated at 0x%lx-0x%lx (%luKB) [region %d/%d] for RIP=0x%lx\n",
-                        page_aligned, page_aligned + alloc_size, alloc_size / 1024,
-                        g_sync_region_count, MAX_SYNC_REGIONS, rip);
+                fprintf(stderr, "[SYNC] Allocated & initialized %lu lock slots at 0x%lx-0x%lx (%luKB)\n",
+                        alloc_size / 64, page_aligned, page_aligned + alloc_size, alloc_size / 1024);
                 
                 should_skip_instr = 1;
             }
@@ -5888,14 +5921,11 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     }
 
     /* Cycle detection for 0x237cde0-0x23b1400: Game-init and graphics-setup region.
-     * This wide range contains multiple initialization sequences with complex control flow.
-     * After multiple attempts to fix register state and return addresses, the code still loops.
-     * When stuck in the tight 0x237ce59-0x237ce5b loop with NULL return addresses, jump far
-     * outside this problematic region to 0x250000 (well past graphics init code). */
+     * Try runtime patching of problematic instructions. */
     if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cde0 && rip <= (u64)g_img + 0x23b1400) {
         static u32 sekiro_cycle_faults = 0;
-        static u32 ce5x_attempts = 0;  /* Count attempts at the tight 0x237ce59-0x237ce5b loop */
-        static u64 last_rip = 0;  /* CHANGED FROM u32 to u64 */
+        static u32 ce5x_attempts = 0;  
+        static u64 last_rip = 0;  
         static u32 same_rip_count = 0;
         
         sekiro_cycle_faults++;
@@ -5908,18 +5938,19 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             last_rip = rip;
         }
         
-        /* Detect problematic RIPs and jump far after 2+ repeats */
-        u64 check_addr_ce28 = (u64)g_img + 0x237ce28;
-        u64 check_addr_ce59 = (u64)g_img + 0x237ce59;
-        
-        if ((rip == check_addr_ce28 || rip == check_addr_ce59) && same_rip_count >= 2) {
-            fprintf(stderr, "[SKIP] Sekiro stuck at RIP=0x%lx [repeat %d] - jumping to safe return\n",
-                    rip, same_rip_count);
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
-            uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
-            uc->uc_mcontext.gregs[REG_R14] = 0;
-            reset_rsp_to_entry_baseline(uc);
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
+        /* AGGRESSIVE: If we're stuck at 0x237ce28, patch it with NOPs */
+        u64 addr_ce28 = (u64)g_img + 0x237ce28;
+        if (rip == addr_ce28 && same_rip_count >= 2) {
+            fprintf(stderr, "[PATCH] Runtime patching 0x%lx with NOPs (skip %d bytes)\n", rip, same_rip_count);
+            /* Replace next instruction with NOPs (0x90 is NOP, 0xcc is INT3) */
+            u8 *patch_addr = (u8 *)rip;
+            /* Make writable, patch, restore protection */
+            mprotect((void*)((u64)rip & ~0xFFF), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+            for (int i = 0; i < 8; i++) patch_addr[i] = 0x90;  /* 8 bytes of NOPs */
+            mprotect((void*)((u64)rip & ~0xFFF), 0x2000, PROT_READ | PROT_EXEC);
+            
+            fprintf(stderr, "[PATCH] Patched 8 bytes to NOPs. Continuing from 0x%lx\n", rip);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip);
             return;
         }
         
@@ -5927,16 +5958,17 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         if (rip >= (u64)g_img + 0x237ce59 && rip <= (u64)g_img + 0x237ce5b && faultaddr == 0) {
             ce5x_attempts++;
             if (ce5x_attempts >= 2) {
-                /* We're stuck in the bad-return loop. Jump FAR past the entire problematic region. */
-                fprintf(stderr, "[SKIP] Sekiro stuck at 0x237ce59-0x237ce5b [attempt %d] - jumping to 0x250000 (far escape)\n",
+                fprintf(stderr, "[SKIP] Sekiro stuck at 0x237ce59-0x237ce5b [attempt %d] - jumping to safe return\n",
                         ce5x_attempts);
                 uc->uc_mcontext.gregs[REG_RAX] = 0;
                 uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
-                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)((u64)g_img + 0x250000);
+                uc->uc_mcontext.gregs[REG_R14] = 0;
+                reset_rsp_to_entry_baseline(uc);
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
                 return;
             }
         } else {
-            ce5x_attempts = 0;  /* Reset counter if we leave the tight loop region */
+            ce5x_attempts = 0;  
         }
         
         if (sekiro_cycle_faults > 20) {
@@ -5953,12 +5985,10 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         fprintf(stderr, "[SKIP] Sekiro game-init region RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/20] R14=0x%lx\n",
                 rip, rip - (u64)g_img, faultaddr, sekiro_cycle_faults,
                 uc->uc_mcontext.gregs[REG_R14]);
-        /* Initialize key registers to prevent address overflows and invalid accesses.
-         * R14 is constantly corrupted by game code, causing address calculations to overflow to 0.
-         * RCX and R14 = 0 makes memory accesses use RCX as base address. */
+        /* Initialize key registers to prevent address overflows and invalid accesses. */
         uc->uc_mcontext.gregs[REG_RAX] = 0;
-        uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;  /* Ensure image base */
-        uc->uc_mcontext.gregs[REG_R14] = 0;              /* Clear index to prevent overflow */
+        uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;  
+        uc->uc_mcontext.gregs[REG_R14] = 0;              
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "game-init-escape");
         return;
     }
