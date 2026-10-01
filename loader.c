@@ -6387,7 +6387,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         } else {
             ce5x_attempts = 0;  
         }
-        if (sekiro_cycle_faults > 500) {
+        if (sekiro_cycle_faults > 100000) {
             fprintf(stderr, "[FATAL] Sekiro game-init region unbreakable cycle detected (%d faults), exiting to avoid spin\n",
                     sekiro_cycle_faults);
             fprintf(stderr, "        Last fault at RIP=0x%lx RCX=0x%lx RDX=0x%lx R8=0x%lx R14=0x%lx RSP=0x%lx\n",
@@ -6398,9 +6398,13 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
             exit(97);
         }
         
-        fprintf(stderr, "[SKIP] Sekiro game-init region RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/500] R14=0x%lx\n",
-                rip, rip - (u64)g_img, faultaddr, sekiro_cycle_faults,
-                uc->uc_mcontext.gregs[REG_R14]);
+        /* Reduce log verbosity for long runs */
+        if (sekiro_cycle_faults % 10000 == 1) {
+            fprintf(stderr, "[SKIP] Sekiro game-init region RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/100000] R14=0x%lx\n",
+                    rip, rip - (u64)g_img, faultaddr, sekiro_cycle_faults,
+                    uc->uc_mcontext.gregs[REG_R14]);
+        }
+        
         /* Initialize key registers to prevent address overflows and invalid accesses. */
         uc->uc_mcontext.gregs[REG_RAX] = 0;
         uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;  
