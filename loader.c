@@ -172,15 +172,47 @@ static u32 g_api_first_api_call = 0;
 
 /* Sync memory infrastructure: Track allocated lock/sync structures for game-init.
  * Game code uses XCHG instructions on arrays/tables of locks. We allocate real
- * memory at those addresses on-demand when the game tries to use them. */
+ * memory at those addresses on-demand when the game tries to use them.
+ * 
+ * PHASE 5 ENHANCEMENT: Selective initialization - distinguish code vs data pages.
+ * When allocating, analyze each 4KB page to detect if it contains code.
+ * Code pages: Dense non-zero content, skip initialization (leave executable).
+ * Data pages: Sparse/zero content, safe to fill with lock structures.
+ */
 #define MAX_SYNC_REGIONS 16
+#define PAGE_SIZE 4096
 typedef struct {
-    u64 base_addr;       /* Base address where we allocated */
-    u64 size;            /* Size allocated */
-    int mapped;          /* Whether successfully mmap'd */
+    u64 base_addr;              /* Base address where we allocated */
+    u64 size;                   /* Size allocated */
+    int mapped;                 /* Whether successfully mmap'd */
+    u8 page_type[256];          /* Type per 4KB page: 0=data, 1=code (supports 1MB regions) */
 } SyncRegion;
 static SyncRegion g_sync_regions[MAX_SYNC_REGIONS];
 static int g_sync_region_count = 0;
+
+/* Analyze a 4KB page to determine if it contains code or data.
+ * Heuristic: Code pages have dense non-zero content (>50% non-zero bytes).
+ * Data pages have sparse content (<10% non-zero bytes). */
+static int beer_page_is_code(const u8 *page) {
+    int non_zero_count = 0;
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        if (page[i] != 0) {
+            non_zero_count++;
+        }
+    }
+    /* If >50% of page is non-zero, likely code; if <10%, likely data */
+    int density_pct = (non_zero_count * 100) / PAGE_SIZE;
+    return density_pct > 50 ? 1 : 0;  /* 1=code, 0=data */
+}
+
+/* Analyze entire region to detect code vs data pages, fill page_type array */
+static void beer_analyze_region(u8 *region_base, u64 region_size, SyncRegion *sr) {
+    u64 num_pages = region_size / PAGE_SIZE;
+    for (u64 i = 0; i < num_pages && i < 256; i++) {
+        u8 *page = region_base + (i * PAGE_SIZE);
+        sr->page_type[i] = beer_page_is_code(page);
+    }
+}
 
 /* Handle table for tracking created sync objects (CreateEventW, CreateMutexW, etc.)
  * Maps fake HANDLE values returned to game to real BEER_* structure pointers. */
@@ -6104,24 +6136,47 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                                -1, 0);
             
             if (result != MAP_FAILED) {
-                /* Initialize with proper CRITICAL_SECTION structures (64-byte aligned) */
-                memset((void*)page_aligned, 0, alloc_size);
+                /* PHASE 5: Selective region initialization
+                 * Analyze each page to detect code vs data before initializing */
+                SyncRegion *sr = &g_sync_regions[g_sync_region_count];
+                sr->base_addr = page_aligned;
+                sr->size = alloc_size;
+                sr->mapped = 1;
                 
-                /* Fill region with unacquired CRITICAL_SECTION locks using state machine */
+                /* Analyze pages: detect code pages to avoid overwriting */
+                u8 *region = (u8 *)page_aligned;
+                beer_analyze_region(region, alloc_size, sr);
+                
+                /* Count code vs data pages */
+                int code_pages = 0, data_pages = 0;
+                for (int i = 0; i < (alloc_size / PAGE_SIZE); i++) {
+                    if (sr->page_type[i]) code_pages++;
+                    else data_pages++;
+                }
+                
+                fprintf(stderr, "[SYNC] Region 0x%lx: %d code pages, %d data pages\n",
+                        page_aligned, code_pages, data_pages);
+                
+                /* Selective initialization: Only initialize lock structures in data pages */
                 BEER_CRITICAL_SECTION *locks = (BEER_CRITICAL_SECTION *)page_aligned;
-                u64 num_locks = alloc_size / 64;  /* 64-byte slots */
+                u64 num_locks = alloc_size / 64;
+                
                 for (u64 i = 0; i < num_locks; i++) {
-                    beer_critical_section_initialize(&locks[i]);
+                    /* Determine which page this lock is in */
+                    u64 lock_offset = i * 64;
+                    u64 page_idx = lock_offset / PAGE_SIZE;
+                    
+                    /* Only initialize locks in data pages, skip code pages */
+                    if (page_idx < 256 && sr->page_type[page_idx] == 0) {  /* 0 = data page */
+                        beer_critical_section_initialize(&locks[i]);
+                    }
                 }
                 
                 /* Register the allocation */
-                g_sync_regions[g_sync_region_count].base_addr = page_aligned;
-                g_sync_regions[g_sync_region_count].size = alloc_size;
-                g_sync_regions[g_sync_region_count].mapped = 1;
                 g_sync_region_count++;
                 
-                fprintf(stderr, "[SYNC] Allocated & initialized %lu lock slots at 0x%lx-0x%lx (%luKB)\n",
-                        alloc_size / 64, page_aligned, page_aligned + alloc_size, alloc_size / 1024);
+                fprintf(stderr, "[SYNC] Allocated with selective init at 0x%lx-0x%lx (%luKB)\n",
+                        page_aligned, page_aligned + alloc_size, alloc_size / 1024);
                 
                 should_skip_instr = 1;
             }
@@ -6155,8 +6210,9 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     }
 
     /* ============================================================================
-     * Fallback: Generic sync memory allocation for other addresses
+     * Fallback: Generic sync memory allocation with selective initialization
      * ============================================================================
+     * PHASE 5: Only initialize locks in data pages, preserve code pages
      */
     if (faultaddr >= 0x1000 && faultaddr < 0x7f0000000000ULL && !is_xchg_crash) {
         u64 page_aligned = faultaddr & ~0xFFF;
@@ -6177,13 +6233,41 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                                -1, 0);
             
             if (result != MAP_FAILED) {
-                memset((void*)page_aligned, 0, alloc_size);
-                g_sync_regions[g_sync_region_count].base_addr = page_aligned;
-                g_sync_regions[g_sync_region_count].size = alloc_size;
-                g_sync_regions[g_sync_region_count].mapped = 1;
-                g_sync_region_count++;
+                /* Selective initialization using Phase 5 analysis */
+                SyncRegion *sr = &g_sync_regions[g_sync_region_count];
+                sr->base_addr = page_aligned;
+                sr->size = alloc_size;
+                sr->mapped = 1;
                 
-                fprintf(stderr, "[SYNC] Generic alloc: 0x%lx-0x%lx (%luKB)\n",
+                /* Analyze each page to detect code vs data */
+                u8 *region = (u8 *)page_aligned;
+                beer_analyze_region(region, alloc_size, sr);
+                
+                int code_pages = 0, data_pages = 0;
+                for (int i = 0; i < (alloc_size / PAGE_SIZE); i++) {
+                    if (sr->page_type[i]) code_pages++;
+                    else data_pages++;
+                }
+                
+                fprintf(stderr, "[SYNC] Generic alloc 0x%lx: %d code pages, %d data pages\n",
+                        page_aligned, code_pages, data_pages);
+                
+                /* Selectively initialize: Only locks in data pages */
+                BEER_CRITICAL_SECTION *locks = (BEER_CRITICAL_SECTION *)page_aligned;
+                u64 num_locks = alloc_size / 64;
+                
+                for (u64 i = 0; i < num_locks; i++) {
+                    u64 lock_offset = i * 64;
+                    u64 page_idx = lock_offset / PAGE_SIZE;
+                    
+                    /* Only initialize in data pages (0 = data, 1 = code) */
+                    if (page_idx < 256 && sr->page_type[page_idx] == 0) {
+                        beer_critical_section_initialize(&locks[i]);
+                    }
+                }
+                
+                g_sync_region_count++;
+                fprintf(stderr, "[SYNC] Generic alloc: 0x%lx-0x%lx (%luKB) with selective init\n",
                         page_aligned, page_aligned + alloc_size, alloc_size / 1024);
                 return;
             }
