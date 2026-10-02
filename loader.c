@@ -24,6 +24,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -52,6 +53,7 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int32_t  s32;
+typedef int64_t  s64;
 
 /* ── PE structures ──────────────────────────────────────────────── */
 #pragma pack(push, 1)
@@ -89,6 +91,12 @@ typedef struct {
 } SecHdr;
 
 typedef struct { u32 orig_ilt, timestamp, fwd, name_rva, iat_rva; } ImportDesc;
+typedef struct {
+    u32 characteristics, timestamp;
+    u16 major, minor;
+    u32 name_rva, ordinal_base, function_count, name_count;
+    u32 functions_rva, names_rva, ordinals_rva;
+} ExportDir;
 
 #pragma pack(pop)
 
@@ -106,6 +114,25 @@ typedef struct { u32 orig_ilt, timestamp, fwd, name_rva, iat_rva; } ImportDesc;
 /* ── Globals ────────────────────────────────────────────────────── */
 static u8    *g_img     = NULL;   /* image base in our VA space    */
 static u64    g_delta   = 0;      /* relocation delta              */
+
+typedef struct {
+    char name[64];
+    char path[PATH_MAX];
+    u8 *image;
+    size_t image_size;
+    u64 preferred_base;
+    u64 delta;
+    int entry_called;
+} GuestDll;
+
+#define MAX_GUEST_DLLS 8
+static GuestDll g_guest_dlls[MAX_GUEST_DLLS];
+static int g_guest_dll_count;
+static GuestDll *g_loading_guest_dll;
+
+static GuestDll *guest_dll_load(const char *name);
+static u64 guest_dll_export(GuestDll *dll, const char *name);
+static int resolve_windows_host_path(const char *name, char *output, size_t output_size);
 
 /* Forward declarations: these are fully declared later (g_tramp/g_trampsz
  * in the stub infrastructure section, image_addr_is_exec near the PE
@@ -535,6 +562,12 @@ static u64 g_entry_rsp = 0;
 static u64 g_entry_rsp_limit = 0;
 static u64 g_guest_stack_low = 0;
 static u64 g_guest_stack_high = 0;
+/* Fault recovery runs on both the synthetic main guest stack and native
+ * pthread stacks used by guest workers. Keep each thread's live bounds
+ * separately; comparing a worker RSP with the main stack caused valid worker
+ * faults to be reset into the main thread's startup frame. */
+static __thread u64 g_current_guest_stack_low;
+static __thread u64 g_current_guest_stack_high;
 static void __attribute__((noreturn)) guest_exit_stub(void);
 
 /* Diagnostics: track which path beer_dispatch_trampoline takes */
@@ -553,9 +586,11 @@ static u64 g_entry_ret_slot = 0;
 
 static int is_guest_stack_rsp(u64 rsp)
 {
-    if (!g_guest_stack_low || !g_guest_stack_high)
+    u64 low = g_current_guest_stack_low ? g_current_guest_stack_low : g_guest_stack_low;
+    u64 high = g_current_guest_stack_high ? g_current_guest_stack_high : g_guest_stack_high;
+    if (!low || !high)
         return 1; /* no guest stack window recorded yet: permissive until setup */
-    return rsp > g_guest_stack_low + 0x200 && rsp < g_guest_stack_high - 0x200;
+    return rsp > low + 0x200 && rsp < high - 0x200;
 }
 
 static void clamp_rsp_to_entry_baseline(ucontext_t *uc, u64 rsp)
@@ -1556,6 +1591,66 @@ static const char *configure_guest_process_path(const char *exe)
     return g_exe_path;
 }
 
+static void lowercase_dll_basename(const char *name, char *out, size_t out_size)
+{
+    if (!out_size) return;
+    const char *base = name ? name : "";
+    for (const char *p = base; *p; ++p)
+        if (*p == '/' || *p == '\\') base = p + 1;
+    size_t i = 0;
+    while (base[i] && i + 1 < out_size) {
+        char c = base[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+        out[i++] = c;
+    }
+    out[i] = 0;
+}
+
+static GuestDll *guest_dll_from_handle(u64 handle)
+{
+    for (int i = 0; i < g_guest_dll_count; ++i)
+        if ((u64)g_guest_dlls[i].image == handle)
+            return &g_guest_dlls[i];
+    return NULL;
+}
+
+static GuestDll *guest_dll_find(const char *name)
+{
+    char lower[64];
+    lowercase_dll_basename(name, lower, sizeof(lower));
+    for (int i = 0; i < g_guest_dll_count; ++i)
+        if (!strcmp(g_guest_dlls[i].name, lower))
+            return &g_guest_dlls[i];
+    return NULL;
+}
+
+static int build_guest_dll_path(const char *name, char *out, size_t out_size)
+{
+    if (!name || !*name || !out || out_size < 2) return 0;
+    if (strchr(name, '/') || strchr(name, '\\')) {
+        char normalized[PATH_MAX];
+        size_t n = strlen(name);
+        if (n >= sizeof(normalized)) return 0;
+        for (size_t i = 0; i <= n; ++i)
+            normalized[i] = name[i] == '\\' ? '/' : name[i];
+        if (realpath(normalized, out)) return 1;
+        return 0;
+    }
+    char candidate[PATH_MAX];
+    const char *slash = g_exe_path ? strrchr(g_exe_path, '/') : NULL;
+    size_t directory_length = slash ? (size_t)(slash - g_exe_path) : 1;
+    const char *directory = slash ? g_exe_path : ".";
+    if (directory_length + 1 + strlen(name) + 1 > sizeof(candidate)) return 0;
+    memcpy(candidate, directory, directory_length);
+    candidate[directory_length] = '/';
+    strcpy(candidate + directory_length + 1, name);
+    if (realpath(candidate, out)) return 1;
+
+    /* Windows DLL lookup is case-insensitive; reuse the component resolver used
+     * by CreateFile so a lower-cased import name can find the installed file. */
+    return resolve_windows_host_path(candidate, out, out_size);
+}
+
 /* Fake handles for Windows system DLLs we emulate */
 #define HMOD_EXE     ((u64)g_img)
 #define HMOD_K32     ((u64)0xFEED0001)
@@ -1584,7 +1679,10 @@ static u64 dll_name_to_handle(const char *lname) {
     if (!strcmp(lname,"user32.dll"))   return HMOD_USER32;
     if (!strcmp(lname,"ntdll.dll"))    return HMOD_NTDLL;
     if (!strcmp(lname,"advapi32.dll")) return HMOD_ADVAPI;
-    
+
+    GuestDll *guest = guest_dll_find(lname);
+    if (guest) return (u64)guest->image;
+
     /* For unknown DLLs, generate or return a cached fake handle */
     for (int i=0; i<g_fake_dll_count; i++) {
         if (!strcmp(g_fake_dll_cache[i].name, lname))
@@ -1645,8 +1743,14 @@ static __thread u32 g_last_error;
 static u64 __attribute__((ms_abi))
 impl_GetProcAddress(u64 hmod, const char *procname)
 {
-    (void)hmod;
     if (!procname) return 0;
+    GuestDll *guest = guest_dll_from_handle(hmod);
+    if (guest) {
+        u64 address = guest_dll_export(guest, procname);
+        if (address) return address;
+        g_last_error = 127;
+        return 0;
+    }
     /* Search existing stubs (IAT entries) */
     for (int i = 0; i < g_nstubs; i++) {
         const char *bang = strchr(g_snames[i], '!');
@@ -2175,11 +2279,11 @@ static u64 __attribute__((ms_abi))
 impl_LoadLibraryA(const char *name)
 {
     if (!name) { g_last_error = 126; return 0; }
-    char lname[64]; int i;
-    for (i=0; i<63 && name[i]; i++) {
-        char c=name[i]; if(c>='A'&&c<='Z')c+=32; lname[i]=c;
-    }
-    lname[i]=0;
+    char lname[64];
+    lowercase_dll_basename(name, lname, sizeof(lname));
+    GuestDll *guest = guest_dll_find(lname);
+    if (!guest) guest = guest_dll_load(name);
+    if (guest) return (u64)guest->image;
     u64 h = dll_name_to_handle(lname);
     if (h) {
         if (lname[0] != 'k' && lname[0] != 'u' && lname[0] != 'n' && lname[0] != 'a') {
@@ -2193,11 +2297,15 @@ static u64 __attribute__((ms_abi))
 impl_LoadLibraryW(const u16 *name)
 {
     if (!name) { g_last_error = 126; return 0; }
-    char lname[64]; int i;
-    for (i=0; i<63 && name[i]; i++) {
-        char c=(char)(name[i]&0x7f); if(c>='A'&&c<='Z')c+=32; lname[i]=c;
-    }
-    lname[i]=0;
+    char narrow[PATH_MAX]; size_t i;
+    for (i = 0; i + 1 < sizeof(narrow) && name[i]; ++i)
+        narrow[i] = (char)(name[i] & 0x7f);
+    narrow[i] = 0;
+    char lname[64];
+    lowercase_dll_basename(narrow, lname, sizeof(lname));
+    GuestDll *guest = guest_dll_find(lname);
+    if (!guest) guest = guest_dll_load(narrow);
+    if (guest) return (u64)guest->image;
     u64 h = dll_name_to_handle(lname);
     if (h) {
         if (lname[0] != 'k' && lname[0] != 'u' && lname[0] != 'n' && lname[0] != 'a') {
@@ -2262,13 +2370,17 @@ static u64 __attribute__((ms_abi))
 impl_SteamAPI_UnregisterCallback(u64 cb)          { (void)cb; return 0; }
 
 /*
- * Fake Steam interface objects.
- * Steam interfaces are C++ objects: the first field is a pointer to a vtable
- * (array of function pointers). We create one generic vtable where:
- *   - Most methods return 1 (true / "success")
- *   - Methods 4 and 5 of ISteamApps return "english"
- * All Steam interface accessors (SteamApps, SteamUtils, …) return
- * the same fake object, since we only care about not crashing.
+ * Minimal offline Steam interface objects.
+ *
+ * Steam interfaces are unrelated C++ interfaces and therefore cannot safely
+ * share one catch-all vtable. In particular, ISteamFriends slot 0 is
+ * GetPersonaName() and returns `const char *`; the old generic integer-success
+ * method returned address 1, which Sekiro correctly passed to its string
+ * constructor and then faulted while scanning it.
+ *
+ * Keep unsupported methods inert, but give observed interface methods their
+ * documented return types. This is a coherent offline compatibility object,
+ * not a claim that a real Steam client is connected.
  */
 #define STEAM_VTAB_SZ 256
 
@@ -2277,16 +2389,48 @@ steam_vfn_true(u64 a, u64 b, u64 c, u64 d) { (void)a;(void)b;(void)c;(void)d; re
 static u64 __attribute__((ms_abi))
 steam_vfn_english(u64 a, u64 b, u64 c, u64 d)
     { (void)a;(void)b;(void)c;(void)d; return (u64)"english"; }
+static u64 __attribute__((ms_abi))
+steam_friends_get_persona_name(u64 self)
+    { (void)self; return (u64)"Player"; }
+static u64 __attribute__((ms_abi))
+steam_user_get_steam_id(u64 self, u64 *steam_id)
+{
+    (void)self;
+    if (!steam_id) return 0;
+    /* CSteamID is an eight-byte value returned through the MSVC aggregate
+     * return pointer supplied in RDX. Account type Individual and universe
+     * Public make this a structurally valid offline identity. */
+    *steam_id = 0x0110000100000001ULL;
+    return (u64)steam_id;
+}
 
 static u64  g_steam_vtab[STEAM_VTAB_SZ];
-static u64 *g_steam_obj  = NULL;   /* fake interface: &vtable_ptr */
+static u64  g_steam_apps_vtab[STEAM_VTAB_SZ];
+static u64  g_steam_friends_vtab[STEAM_VTAB_SZ];
+static u64  g_steam_user_vtab[STEAM_VTAB_SZ];
+static u64 *g_steam_obj;
+static u64  g_steam_apps_obj;
+static u64  g_steam_friends_obj;
+static u64  g_steam_user_obj;
 
 static void init_steam_fake(void) {
-    for (int i = 0; i < STEAM_VTAB_SZ; i++)
+    for (int i = 0; i < STEAM_VTAB_SZ; i++) {
         g_steam_vtab[i] = (u64)steam_vfn_true;
-    /* ISteamApps vtable[4]=GetCurrentGameLanguage, [5]=GetAvailableGameLanguages */
-    g_steam_vtab[4] = (u64)steam_vfn_english;
-    g_steam_vtab[5] = (u64)steam_vfn_english;
+        g_steam_apps_vtab[i] = (u64)steam_vfn_true;
+        g_steam_friends_vtab[i] = (u64)steam_vfn_true;
+        g_steam_user_vtab[i] = (u64)steam_vfn_true;
+    }
+    /* ISteamApps vtable[4]=GetCurrentGameLanguage, [5]=GetAvailableGameLanguages. */
+    g_steam_apps_vtab[4] = (u64)steam_vfn_english;
+    g_steam_apps_vtab[5] = (u64)steam_vfn_english;
+    /* ISteamFriends vtable[0]=GetPersonaName. */
+    g_steam_friends_vtab[0] = (u64)steam_friends_get_persona_name;
+    /* ISteamUser vtable[2]=GetSteamID. The 64-bit aggregate is returned via
+     * the hidden output pointer used by this MSVC ABI call site. */
+    g_steam_user_vtab[2] = (u64)steam_user_get_steam_id;
+    g_steam_apps_obj = (u64)g_steam_apps_vtab;
+    g_steam_friends_obj = (u64)g_steam_friends_vtab;
+    g_steam_user_obj = (u64)g_steam_user_vtab;
 
     g_steam_obj = mmap(NULL, 4096, PROT_READ|PROT_WRITE,
                        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -2296,12 +2440,11 @@ static void init_steam_fake(void) {
         g_steam_obj = NULL;
 }
 
-/* All Steam interface accessors return the same fake object */
-static u64 __attribute__((ms_abi)) impl_SteamApps(void)     { return (u64)g_steam_obj; }
+static u64 __attribute__((ms_abi)) impl_SteamApps(void)     { return (u64)&g_steam_apps_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamClient(void)   { return (u64)g_steam_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamUtils(void)    { return (u64)g_steam_obj; }
-static u64 __attribute__((ms_abi)) impl_SteamUser(void)     { return (u64)g_steam_obj; }
-static u64 __attribute__((ms_abi)) impl_SteamFriends(void)  { return (u64)g_steam_obj; }
+static u64 __attribute__((ms_abi)) impl_SteamUser(void)     { return (u64)&g_steam_user_obj; }
+static u64 __attribute__((ms_abi)) impl_SteamFriends(void)  { return (u64)&g_steam_friends_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamUserStats(void){ return (u64)g_steam_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamUGC(void)      { return (u64)g_steam_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamRemoteStorage(void) { return (u64)g_steam_obj; }
@@ -2987,8 +3130,13 @@ static u64 __attribute__((ms_abi)) impl_InterlockedCompareExchange64(volatile u6
     { return __sync_val_compare_and_swap(p, cmp, exch); }
 
 /* ---- Synchronization events/semaphores ---- */
-#define MAX_EVENTS 512
-#define MAX_SEMS   512
+/* These tables model kernel handles, not a small fixed engine pool. Sekiro's
+ * worker scheduler can have more than 512 live condition events; imposing that
+ * artificial limit made CreateEvent fail and triggered an intentional
+ * DLPlainConditionSignal panic. Keep a bounded implementation, but size it well
+ * above the observed workload like a normal process handle table. */
+#define MAX_EVENTS 16384
+#define MAX_SEMS   4096
 
 typedef struct {
     int used;
@@ -4500,7 +4648,21 @@ static u64 __attribute__((ms_abi))
 impl_SetCursor(u64 hc) { (void)hc; return 0; }
 
 static u64 __attribute__((ms_abi))
-impl_ShowCursor(s32 show) { (void)show; return 1; }
+impl_ShowCursor(s32 show)
+{
+    /* Win32 maintains a process-wide signed display counter. The cursor is
+     * visible when the counter is nonnegative, and callers commonly loop
+     * until the returned value crosses zero. Return the updated count. */
+    static _Atomic(s32) display_count;
+    s32 value = show
+        ? atomic_fetch_add(&display_count, 1) + 1
+        : atomic_fetch_sub(&display_count, 1) - 1;
+    static _Atomic(u32) logs;
+    u32 log = atomic_fetch_add(&logs, 1);
+    if (log < 16)
+        fprintf(stderr, "[USER32] ShowCursor(%d) -> %d\n", show != 0, value);
+    return (u32)value;
+}
 static u64 __attribute__((ms_abi))
 impl_SetCapture(u64 hw) { (void)hw; return 0; }
 static u64 __attribute__((ms_abi))
@@ -4815,10 +4977,47 @@ impl_CompareStringA(u32 l, u32 f, const char *s1, int n1, const char *s2, int n2
     return n1==n2?2:(n1<n2?1:3);
 }
 
+extern char **environ;
+
 static u64 __attribute__((ms_abi))
-impl_GetEnvironmentStringsW(void) { return 0; }
+impl_GetEnvironmentStringsW(void)
+{
+    /* Windows returns a caller-owned sequence of NUL-terminated UTF-16
+     * NAME=VALUE strings followed by one additional NUL.  The bundled Oodle
+     * CRT walks this block during DLL_PROCESS_ATTACH and rejects attachment
+     * when the API returns NULL.  Host environment entries are UTF-8 in
+     * principle; the game-relevant variables are ASCII, so preserve ASCII and
+     * replace unsupported multibyte bytes rather than inventing invalid UTF-16. */
+    size_t units = 1;
+    for (char **entry = environ; entry && *entry; ++entry)
+        units += strlen(*entry) + 1;
+    u16 *block = calloc(units, sizeof(*block));
+    if (!block) {
+        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
+        return 0;
+    }
+    u16 *out = block;
+    for (char **entry = environ; entry && *entry; ++entry) {
+        const unsigned char *src = (const unsigned char *)*entry;
+        while (*src)
+            *out++ = *src < 0x80 ? *src++ : (src++, (u16)'?');
+        *out++ = 0;
+    }
+    *out = 0;
+    return (u64)block;
+}
+
 static u64 __attribute__((ms_abi))
-impl_FreeEnvironmentStringsW(u64 p) { (void)p; return 1; }
+impl_FreeEnvironmentStringsW(u64 p)
+{
+    if (!p) {
+        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+    free((void *)p);
+    return 1;
+}
+
 static u64 __attribute__((ms_abi))
 impl_GetEnvironmentVariableW(u64 n, u64 b, u32 sz) { (void)n;(void)b;(void)sz; return 0; }
 static u64 __attribute__((ms_abi))
@@ -5071,6 +5270,7 @@ typedef struct WinTPWait {
     u64             cb;
     u64             ctx;
     u64             handle;
+    u64             timeout_ms;
     volatile int    active;
     volatile int    cancel;
     pthread_t       thr;
@@ -5087,11 +5287,41 @@ static void *tp_wait_thread(void *arg)
         if (gs_rc != 0) fprintf(stderr, "[GS] TPWait: arch_prctl failed: %d\n", gs_rc);
     }
     typedef void __attribute__((ms_abi)) (*WaitCB)(u64,u64,u64,u32);
+    u64 handle;
+    u64 timeout_ms;
     pthread_mutex_lock(&w->mtx);
-    if (!w->cancel)
-        ((WaitCB)w->cb)(0, w->ctx, (u64)w, 0 /*WAIT_OBJECT_0*/);
-    w->active = 0;
+    handle = w->handle;
+    timeout_ms = w->timeout_ms;
     pthread_mutex_unlock(&w->mtx);
+
+    /* A Windows thread-pool wait fires only after the registered handle is
+     * signaled or the timeout expires. The old implementation invoked every
+     * callback immediately, before its producer event, which let dependent
+     * resource jobs run with incomplete inputs. */
+    u32 wait_ms = timeout_ms > UINT32_MAX ? 0xFFFFFFFFu : (u32)timeout_ms;
+    u64 result = 0x102u;
+    u32 elapsed = 0;
+    for (;;) {
+        pthread_mutex_lock(&w->mtx);
+        int stop = w->cancel;
+        pthread_mutex_unlock(&w->mtx);
+        if (stop) break;
+        u32 slice = wait_ms == 0xFFFFFFFFu ? 10u :
+            (wait_ms - elapsed < 10u ? wait_ms - elapsed : 10u);
+        result = impl_WaitForSingleObject(handle, slice);
+        if (result == 0 || result == 0xFFFFFFFFu) break;
+        elapsed += slice;
+        if (wait_ms != 0xFFFFFFFFu && elapsed >= wait_ms) break;
+    }
+
+    pthread_mutex_lock(&w->mtx);
+    int canceled = w->cancel;
+    w->active = 0;
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mtx);
+    if (!canceled && (result == 0 || result == 0x102u))
+        ((WaitCB)w->cb)(0, w->ctx, (u64)w,
+                        result == 0 ? 0u : 258u /* WAIT_TIMEOUT */);
     return NULL;
 }
 
@@ -5108,20 +5338,34 @@ impl_CreateThreadpoolWait(u64 cb, u64 ctx, u64 env)
 }
 
 static u64 __attribute__((ms_abi))
-impl_SetThreadpoolWait(WinTPWait *w, u64 handle, u64 *timeout)
+impl_SetThreadpoolWait(WinTPWait *w, u64 handle, s64 *timeout)
 {
     if (!w) return 0;
-    (void)timeout;
     pthread_mutex_lock(&w->mtx);
     if (!handle) {
-        w->cancel = 1; pthread_cond_broadcast(&w->cv);
+        w->cancel = 1;
+        pthread_cond_broadcast(&w->cv);
     } else {
-        w->handle = handle; w->cancel = 0;
+        w->handle = handle;
+        if (!timeout) {
+            w->timeout_ms = 0xFFFFFFFFu;
+        } else if (*timeout < 0) {
+            u64 relative_100ns = (u64)(-*timeout);
+            w->timeout_ms = (relative_100ns + 9999u) / 10000u;
+        } else {
+            u64 now = 0;
+            impl_GetSystemTimeAsFileTime(&now);
+            u64 remaining_100ns = (u64)*timeout > now ? (u64)*timeout - now : 0;
+            w->timeout_ms = (remaining_100ns + 9999u) / 10000u;
+        }
+        w->cancel = 0;
         if (!w->active) {
             w->active = 1;
-            pthread_create(&w->thr, NULL, tp_wait_thread, w);
-            pthread_detach(w->thr);
-        } else { pthread_cond_broadcast(&w->cv); }
+            if (pthread_create(&w->thr, NULL, tp_wait_thread, w) == 0)
+                pthread_detach(w->thr);
+            else
+                w->active = 0;
+        }
     }
     pthread_mutex_unlock(&w->mtx);
     return 0;
@@ -5131,10 +5375,10 @@ static u64 __attribute__((ms_abi))
 impl_WaitForThreadpoolWaitCallbacks(WinTPWait *w, u32 cancel)
 {
     if (!w) return 0;
-    if (cancel) { pthread_mutex_lock(&w->mtx); w->cancel=1;
-                  pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->mtx); }
-    struct timespec ts = {0, 1000000};
-    while (w->active) nanosleep(&ts, NULL);
+    pthread_mutex_lock(&w->mtx);
+    if (cancel) w->cancel = 1;
+    while (w->active) pthread_cond_wait(&w->cv, &w->mtx);
+    pthread_mutex_unlock(&w->mtx);
     return 0;
 }
 
@@ -5511,12 +5755,34 @@ beer_fmod_noop(BeerFmodObject *obj, u64 a, u64 b, u64 c)
     return BEER_FMOD_OK;
 }
 
+static u64 __attribute__((ms_abi))
+beer_fmod_project_zero_count(BeerFmodObject *obj, int *out)
+{
+    (void)obj;
+    if (!out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = 0;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_fmod_project_get_group_by_index(BeerFmodObject *obj, int index,
+                                     int cache_events, BeerFmodObject **out)
+{
+    (void)cache_events;
+    if (!obj || !out || index < 0) return BEER_FMOD_ERR_INVALID_PARAM;
+    /* The silent project contains no event groups. EventProject slot 3 is
+     * getGroupByIndex; returning FMOD_OK with an untouched output previously
+     * fed a stale pointer into the group's metadata walker. */
+    *out = NULL;
+    return BEER_FMOD_ERR_EVENT_NOTFOUND;
+}
+
 static void *g_fmod_project_vtable[16] = {
     (void *)beer_fmod_object_release,
     (void *)beer_fmod_project_describe,
     (void *)beer_fmod_noop,
-    (void *)beer_fmod_noop,
-    (void *)beer_fmod_noop,
+    (void *)beer_fmod_project_get_group_by_index,
+    (void *)beer_fmod_project_zero_count,
     (void *)beer_fmod_noop,
     (void *)beer_fmod_noop,
     (void *)beer_fmod_project_get_state,
@@ -5572,6 +5838,33 @@ static BeerFmodObject g_fmod_event         = { g_fmod_plain_vtable, 1 };
 static BeerFmodObject g_fmod_channel_group = { g_fmod_plain_vtable, 1 };
 static BeerFmodObject g_fmod_dsp           = { g_fmod_plain_vtable, 1 };
 static BeerFmodObject g_fmod_connection    = { g_fmod_plain_vtable, 1 };
+static BeerFmodObject g_fmod_sound         = { g_fmod_plain_vtable, 1 };
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_System_createSound(BeerFmodObject *self, const char *name_or_data,
+                             u32 mode, const void *create_info,
+                             BeerFmodObject **out)
+{
+    (void)mode;
+    (void)create_info;
+    if (!self || !name_or_data || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    /* The silent backend still has to return a valid Sound object.  FMOD_OK
+     * with an untouched output made preloadFSB hand a null/zero-vtable object
+     * to the guest's bank loader after the first rendered frame. */
+    *out = &g_fmod_sound;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_EventSystem_preloadFSB(BeerFmodObject *self, const char *name,
+                                 int stream_instance, BeerFmodObject *sound,
+                                 int load_into_memory)
+{
+    (void)stream_instance;
+    (void)load_into_memory;
+    if (!self || !name || !sound) return BEER_FMOD_ERR_INVALID_PARAM;
+    return BEER_FMOD_OK;
+}
 
 static u64 __attribute__((ms_abi)) impl_FMOD_EventSystem_Create(BeerFmodObject **out)
 {
@@ -6014,6 +6307,47 @@ static u64 __attribute__((ms_abi)) impl_agsDeInit(void *context)
     return AGS_NO_AMD_DRIVER_INSTALLED;
 }
 
+/* ---- Cryptographic random provider ---- */
+static u64 __attribute__((ms_abi))
+impl_CryptAcquireContextW(u64 *provider, const u16 *container,
+                          const u16 *provider_name, u32 provider_type, u32 flags)
+{
+    (void)container; (void)provider_name; (void)provider_type; (void)flags;
+    if (!provider) { g_last_error = 87; return 0; }
+    *provider = 0x4352595054424545ULL; /* stable opaque Beer crypto handle */
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CryptReleaseContext(u64 provider, u32 flags)
+{
+    (void)flags;
+    return provider == 0x4352595054424545ULL;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CryptGenRandom(u64 provider, u32 length, u8 *buffer)
+{
+    if (provider != 0x4352595054424545ULL || (!buffer && length)) {
+        g_last_error = 87;
+        return 0;
+    }
+    size_t done = 0;
+    while (done < length) {
+        ssize_t got = getrandom(buffer + done, (size_t)length - done, 0);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) { g_last_error = (u32)errno; return 0; }
+        done += (size_t)got;
+    }
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_SystemFunction036(u8 *buffer, u32 length)
+{
+    return impl_CryptGenRandom(0x4352595054424545ULL, length, buffer);
+}
+
 /* ---- Impl dispatch table ---- */
 typedef struct { const char *name; ImplFn fn; } ImplEntry;
 
@@ -6088,6 +6422,10 @@ static ImplEntry g_impls[] = {
     /* Security */
     {"InitializeSecurityDescriptor",          (ImplFn)impl_InitializeSecurityDescriptor},
     {"SetSecurityDescriptorDacl",             (ImplFn)impl_SetSecurityDescriptorDacl},
+    {"CryptAcquireContextW",                  (ImplFn)impl_CryptAcquireContextW},
+    {"CryptReleaseContext",                   (ImplFn)impl_CryptReleaseContext},
+    {"CryptGenRandom",                        (ImplFn)impl_CryptGenRandom},
+    {"SystemFunction036",                     (ImplFn)impl_SystemFunction036},
     /* Steam */
     {"SteamAPI_Init",                         (ImplFn)impl_SteamAPI_Init},
     {"SteamAPI_RestartAppIfNecessary",        (ImplFn)impl_SteamAPI_RestartAppIfNecessary},
@@ -6183,6 +6521,8 @@ static ImplEntry g_impls[] = {
     {"?setDSPBufferSize@System@FMOD@@QEAA?AW4FMOD_RESULT@@IH@Z", (ImplFn)impl_FMOD_ok},
     {"?setSpeakerMode@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_SPEAKERMODE@@@Z", (ImplFn)impl_FMOD_ok},
     {"?setDriver@System@FMOD@@QEAA?AW4FMOD_RESULT@@H@Z", (ImplFn)impl_FMOD_ok},
+    {"?createSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDIPEAUFMOD_CREATESOUNDEXINFO@@PEAPEAVSound@2@@Z", (ImplFn)impl_FMOD_System_createSound},
+    {"?preloadFSB@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDHPEAVSound@2@_N@Z", (ImplFn)impl_FMOD_EventSystem_preloadFSB},
     /* D3D11 / shader container helpers */
     {"D3D11CreateDevice",                     (ImplFn)impl_D3D11CreateDevice},
     {"D3D11CreateDeviceAndSwapChain",         (ImplFn)impl_D3D11CreateDeviceAndSwapChain},
@@ -6563,6 +6903,226 @@ static void pe_load(const char *path)
     }
 }
 
+static int guest_dll_rva_valid(const GuestDll *dll, u32 rva, size_t size)
+{
+    return dll && rva <= dll->image_size && size <= dll->image_size - rva;
+}
+
+static s64 (__attribute__((ms_abi)) *g_oodle_decompress)(
+    const void *, s64, void *, s64, u32, u32, u32,
+    void *, s64, void *, void *, void *, s64, u32);
+
+static s64 __attribute__((ms_abi))
+guest_oodle_decompress_trace(const void *compressed, s64 compressed_size,
+                             void *raw, s64 raw_size,
+                             u32 fuzz_safe, u32 check_crc, u32 verbosity,
+                             void *decode_buffer, s64 decode_buffer_size,
+                             void *callback, void *callback_user,
+                             void *decoder_memory, s64 decoder_memory_size,
+                             u32 thread_phase)
+{
+    if (!g_oodle_decompress) return 0;
+    static _Atomic(u32) calls;
+    u32 call = atomic_fetch_add(&calls, 1) + 1;
+    s64 result = g_oodle_decompress(
+        compressed, compressed_size, raw, raw_size,
+        fuzz_safe, check_crc, verbosity, decode_buffer, decode_buffer_size,
+        callback, callback_user, decoder_memory, decoder_memory_size,
+        thread_phase);
+    if (call <= 32 || result != raw_size) {
+        fprintf(stderr,
+                "[OODLE] Decompress #%u compressed=%lld raw=%lld -> %lld%s\n",
+                call, (long long)compressed_size, (long long)raw_size,
+                (long long)result, result == raw_size ? "" : " (incomplete)");
+    }
+    return result;
+}
+
+static u64 guest_dll_export(GuestDll *dll, const char *name)
+{
+    if (!dll || !dll->image || !name) return 0;
+    NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
+    DataDir *dir = &nt->opt.dirs[0];
+    if (!dir->size || !guest_dll_rva_valid(dll, dir->rva, sizeof(ExportDir))) return 0;
+    ExportDir *exports = (ExportDir *)(dll->image + dir->rva);
+    if (!guest_dll_rva_valid(dll, exports->names_rva,
+                             (size_t)exports->name_count * sizeof(u32)) ||
+        !guest_dll_rva_valid(dll, exports->ordinals_rva,
+                             (size_t)exports->name_count * sizeof(u16)) ||
+        !guest_dll_rva_valid(dll, exports->functions_rva,
+                             (size_t)exports->function_count * sizeof(u32)))
+        return 0;
+    u32 *names = (u32 *)(dll->image + exports->names_rva);
+    u16 *ordinals = (u16 *)(dll->image + exports->ordinals_rva);
+    u32 *functions = (u32 *)(dll->image + exports->functions_rva);
+    for (u32 i = 0; i < exports->name_count; ++i) {
+        if (!guest_dll_rva_valid(dll, names[i], 1)) continue;
+        const char *candidate = (const char *)(dll->image + names[i]);
+        if (strcmp(candidate, name) != 0) continue;
+        u16 ordinal = ordinals[i];
+        if (ordinal >= exports->function_count) return 0;
+        u32 rva = functions[ordinal];
+        /* Forwarded exports point back into the export directory. Oodle does
+         * not use them for the imported functions, so reject rather than
+         * pretending the forwarder string is executable code. */
+        if (rva >= dir->rva && rva < dir->rva + dir->size) return 0;
+        if (!guest_dll_rva_valid(dll, rva, 1)) return 0;
+        return (u64)(dll->image + rva);
+    }
+    return 0;
+}
+
+static void guest_dll_resolve_imports(GuestDll *dll)
+{
+    NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
+    DataDir *dir = &nt->opt.dirs[DIR_IMPORT];
+    if (!dir->size) return;
+    for (ImportDesc *desc = (ImportDesc *)(dll->image + dir->rva);
+         desc->name_rva; ++desc) {
+        if (!guest_dll_rva_valid(dll, desc->name_rva, 1))
+            die("invalid import name RVA in %s", dll->name);
+        const char *dependency = (const char *)(dll->image + desc->name_rva);
+        u64 *ilt = (u64 *)(dll->image + (desc->orig_ilt ? desc->orig_ilt : desc->iat_rva));
+        u64 *iat = (u64 *)(dll->image + desc->iat_rva);
+        for (int i = 0; ilt[i]; ++i) {
+            if (g_nstubs >= MAX_STUBS) die("DLL imports exceed MAX_STUBS");
+            const char *function = NULL;
+            char label[288];
+            if (!(ilt[i] & (1ULL << 63))) {
+                u32 name_rva = (u32)ilt[i];
+                if (!guest_dll_rva_valid(dll, name_rva, 3))
+                    die("invalid import function RVA in %s", dll->name);
+                function = (const char *)(dll->image + name_rva + 2);
+                snprintf(label, sizeof(label), "%s!%s", dependency, function);
+            } else {
+                snprintf(label, sizeof(label), "%s!#%u", dependency,
+                         (u16)(ilt[i] & 0xffff));
+            }
+            ImplFn implementation = function ? find_impl(function) : NULL;
+            g_snames[g_nstubs] = strdup(label);
+            if (implementation) emit_impl_thunk(g_nstubs, (u64)implementation);
+            else emit_thunk(g_nstubs);
+            iat[i] = (u64)(g_tramp + g_nstubs * THUNK_SZ);
+            ++g_nstubs;
+        }
+    }
+}
+
+static GuestDll *guest_dll_load(const char *name)
+{
+    GuestDll *existing = guest_dll_find(name);
+    if (existing) return existing;
+    if (g_guest_dll_count >= MAX_GUEST_DLLS || !g_tramp) return NULL;
+
+    char path[PATH_MAX];
+    if (!build_guest_dll_path(name, path, sizeof(path))) return NULL;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return NULL; }
+    u8 *file = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (file == MAP_FAILED) return NULL;
+    if ((size_t)st.st_size < sizeof(DosHdr) || ((DosHdr *)file)->magic != MZ_MAGIC) {
+        munmap(file, (size_t)st.st_size); return NULL;
+    }
+    DosHdr *dos = (DosHdr *)file;
+    if ((size_t)dos->lfanew + sizeof(NtHdrs64) > (size_t)st.st_size) {
+        munmap(file, (size_t)st.st_size); return NULL;
+    }
+    NtHdrs64 *nt = (NtHdrs64 *)(file + dos->lfanew);
+    if (nt->sig != PE_SIG || nt->opt.magic != PE32PLUS) {
+        munmap(file, (size_t)st.st_size); return NULL;
+    }
+
+    GuestDll *dll = &g_guest_dlls[g_guest_dll_count];
+    memset(dll, 0, sizeof(*dll));
+    lowercase_dll_basename(name, dll->name, sizeof(dll->name));
+    strncpy(dll->path, path, sizeof(dll->path) - 1);
+    dll->image_size = nt->opt.sz_image;
+    dll->preferred_base = nt->opt.imagebase;
+    dll->image = mmap((void *)dll->preferred_base, dll->image_size,
+                      PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (dll->image == MAP_FAILED)
+        dll->image = mmap(NULL, dll->image_size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (dll->image == MAP_FAILED) {
+        munmap(file, (size_t)st.st_size); return NULL;
+    }
+    dll->delta = (u64)dll->image - dll->preferred_base;
+    memcpy(dll->image, file, nt->opt.sz_headers);
+    SecHdr *sections = (SecHdr *)((u8 *)&nt->opt + nt->file.opthdr_sz);
+    for (u16 i = 0; i < nt->file.nsections; ++i) {
+        SecHdr *section = &sections[i];
+        if (!section->raw_sz || !section->raw_off) continue;
+        size_t copy = section->raw_sz < section->vsz ? section->raw_sz : section->vsz;
+        if ((size_t)section->raw_off + copy > (size_t)st.st_size ||
+            (size_t)section->vrva + copy > dll->image_size)
+            die("invalid section in %s", path);
+        memcpy(dll->image + section->vrva, file + section->raw_off, copy);
+    }
+    munmap(file, (size_t)st.st_size);
+    ++g_guest_dll_count; /* publish before resolving recursive dependencies */
+
+    NtHdrs64 *mapped_nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
+    if (dll->delta) {
+        DataDir *relocations = &mapped_nt->opt.dirs[DIR_RELOC];
+        if (!relocations->size)
+            die("%s could not load at preferred base and has no relocations", dll->name);
+        u8 *cursor = dll->image + relocations->rva;
+        u8 *end = cursor + relocations->size;
+        while (cursor + sizeof(RelocBlock) <= end) {
+            RelocBlock *block = (RelocBlock *)cursor;
+            if (block->block_sz < sizeof(RelocBlock) || cursor + block->block_sz > end) break;
+            u16 *entries = (u16 *)(block + 1);
+            int count = (int)((block->block_sz - sizeof(RelocBlock)) / sizeof(u16));
+            for (int i = 0; i < count; ++i)
+                if ((entries[i] >> 12) == 10)
+                    *(u64 *)(dll->image + block->page_rva + (entries[i] & 0xfff)) += dll->delta;
+            cursor += block->block_sz;
+        }
+    }
+
+    g_loading_guest_dll = dll;
+    guest_dll_resolve_imports(dll);
+    g_loading_guest_dll = NULL;
+    SecHdr *mapped_sections = (SecHdr *)((u8 *)&mapped_nt->opt + mapped_nt->file.opthdr_sz);
+    for (u16 i = 0; i < mapped_nt->file.nsections; ++i) {
+        SecHdr *section = &mapped_sections[i];
+        if (!section->vsz) continue;
+        int protection = 0;
+        if (section->chars & SCN_READ) protection |= PROT_READ;
+        if (section->chars & SCN_WRITE) protection |= PROT_WRITE;
+        if (section->chars & SCN_EXEC) protection |= PROT_EXEC;
+        u64 start = ((u64)dll->image + section->vrva) & ~(u64)0xfff;
+        u64 end = ((u64)dll->image + section->vrva + section->vsz + 0xfff) & ~(u64)0xfff;
+        if (mprotect((void *)start, (size_t)(end - start), protection) != 0)
+            die("mprotect(%s): %s", dll->name, strerror(errno));
+    }
+    fprintf(stderr, "[PE DLL] loaded %s at %p (delta=%#lx)\n",
+            dll->name, (void *)dll->image, dll->delta);
+    return dll;
+}
+
+static void guest_dll_initialize_all(void)
+{
+    for (int i = 0; i < g_guest_dll_count; ++i) {
+        GuestDll *dll = &g_guest_dlls[i];
+        if (dll->entry_called) continue;
+        NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
+        dll->entry_called = 1;
+        if (!nt->opt.entry_rva) continue;
+        typedef int __attribute__((ms_abi)) (*DllEntry)(void *, u32, void *);
+        DllEntry entry = (DllEntry)(dll->image + nt->opt.entry_rva);
+        int result = entry(dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
+        fprintf(stderr, "[PE DLL] %s process attach -> %d\n", dll->name, result);
+        if (!result)
+            fprintf(stderr, "[PE DLL] warning: %s rejected DLL_PROCESS_ATTACH; exports may be unavailable\n",
+                    dll->name);
+    }
+}
+
 /* ── Import resolution ──────────────────────────────────────────── */
 static void pe_imports(void)
 {
@@ -6578,11 +7138,24 @@ static void pe_imports(void)
     }
     printf("[IMP] %d imports total\n", total);
 
-    g_trampsz = (((size_t)(total + 64) * THUNK_SZ) + 0xFFFu) & ~(size_t)0xFFF;
+    /* Reserve additional thunks for imports of real guest DLLs and exports
+     * queried later through GetProcAddress. */
+    g_trampsz = (((size_t)(total + 512) * THUNK_SZ) + 0xFFFu) & ~(size_t)0xFFF;
     g_tramp = mmap(NULL, g_trampsz,
                    PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_tramp == MAP_FAILED) die("mmap(trampoline): %s", strerror(errno));
+
+    /* Load bundled native PE dependencies before resolving the executable's
+     * IAT. Unlike system DLLs, Oodle contains code the resource pipeline needs;
+     * routing its exports to a zero-return generic stub prevents decompression. */
+    for (ImportDesc *d = rva_ptr(dir->rva); d->name_rva; d++) {
+        const char *dll_name = rva_ptr(d->name_rva);
+        char lower[64];
+        lowercase_dll_basename(dll_name, lower, sizeof(lower));
+        if (!strcmp(lower, "oo2core_6_win64.dll") && !guest_dll_load(dll_name))
+            die("unable to load required guest DLL %s", dll_name);
+    }
 
     for (ImportDesc *d = rva_ptr(dir->rva); d->name_rva; d++) {
         const char *dll = rva_ptr(d->name_rva);
@@ -6612,15 +7185,27 @@ static void pe_imports(void)
                 snprintf(buf, sizeof(buf), "%s!%s", dll, fn_only);
             }
 
-            /* Use real implementation if available, else logging stub */
+            /* Use a Beer implementation first, then an export from a loaded
+             * bundled PE DLL, otherwise retain the explicit logging stub. */
             ImplFn real = fn_only ? find_impl(fn_only) : NULL;
+            GuestDll *guest = guest_dll_find(dll);
+            u64 guest_export = (guest && fn_only) ? guest_dll_export(guest, fn_only) : 0;
+            if (guest_export && fn_only && !strcmp(guest->name, "oo2core_6_win64.dll") &&
+                !strcmp(fn_only, "OodleLZ_Decompress")) {
+                g_oodle_decompress = (void *)guest_export;
+                guest_export = (u64)guest_oodle_decompress_trace;
+            }
+            g_snames[g_nstubs] = strdup(buf);
             if (real) {
-                g_snames[g_nstubs] = strdup(buf);
                 emit_impl_thunk(g_nstubs, (u64)real);
                 iat[i] = (u64)(g_tramp + g_nstubs * THUNK_SZ);
                 printf("  [REAL] %s\n", buf);
+            } else if (guest_export) {
+                iat[i] = guest_export;
+                printf("  [DLL ] %s -> 0x%lx\n", buf, guest_export);
+                /* Keep an index entry for diagnostics but do not emit a thunk;
+                 * calls enter the DLL directly with the original Windows ABI. */
             } else {
-                g_snames[g_nstubs] = strdup(buf);
                 emit_thunk(g_nstubs);
                 iat[i] = (u64)(g_tramp + g_nstubs * THUNK_SZ);
             }
@@ -6753,6 +7338,8 @@ static void *alloc_teb_for_thread(void)
         if (stackaddr && stacksize) {
             teb->StackBase  = (u64)stackaddr + (u64)stacksize; /* high addr */
             teb->StackLimit = (u64)stackaddr;                  /* low addr  */
+            g_current_guest_stack_low = (u64)stackaddr;
+            g_current_guest_stack_high = (u64)stackaddr + (u64)stacksize;
         }
     }
     return (void *)teb;
@@ -8214,23 +8801,27 @@ generic_alloc_skip:
         }
     }
 
-    if (g_guest_stack_low && g_guest_stack_high &&
-        rsp0 && (rsp0 < g_guest_stack_low || rsp0 > g_guest_stack_high)) {
+    if (rsp0 && !is_guest_stack_rsp(rsp0)) {
+        u64 low = g_current_guest_stack_low ? g_current_guest_stack_low : g_guest_stack_low;
+        u64 high = g_current_guest_stack_high ? g_current_guest_stack_high : g_guest_stack_high;
         fprintf(stderr,
-                "[SKIP] Invalid guest RSP=0x%lx outside guest stack window 0x%lx..0x%lx; resetting to the seeded baseline. "
+                "[FATAL] Invalid RSP=0x%lx outside current thread stack 0x%lx..0x%lx; "
                 "faulting RIP=0x%lx (RVA 0x%lx) faultaddr=0x%lx rcx=0x%lx\n",
-                rsp0, g_guest_stack_low, g_guest_stack_high, rip,
+                rsp0, low, high, rip,
                 (g_img && rip >= (u64)g_img) ? rip - (u64)g_img : rip, faultaddr, rcx0);
-        reset_rsp_to_entry_baseline(uc);
-        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
-        return;
+        /* Never transplant a worker onto the main thread's synthetic startup
+         * frame. That corrupts both call chains and turns one actionable fault
+         * into a cascade. Stop at the original invalid-stack source instead. */
+        report_window_progress();
+        fflush(stderr);
+        _exit(2);
     }
 
     /* If the current RSP is already outside the guest stack but the fault is on a
      * real in-image code address, keep the guest on its own stack frame instead of
      * delivering a new host-side loop through the fallback entry path. */
     if (sig == SIGSEGV && g_img && rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000 &&
-        rsp0 && (rsp0 < g_guest_stack_low || rsp0 > g_guest_stack_high)) {
+        rsp0 && !is_guest_stack_rsp(rsp0)) {
         u64 rsp = g_entry_rsp ? g_entry_rsp : rsp0;
         u64 ret = 0, new_rsp = 0;
         if (try_real_unwind_return(rip, rsp, &ret, &new_rsp)) {
@@ -9957,6 +10548,7 @@ int main(int argc, char **argv)
     }
     
     setup_teb_peb();
+    guest_dll_initialize_all();
     
     /* CHECK: After setup_teb_peb */
     {
@@ -10149,6 +10741,8 @@ int main(int argc, char **argv)
     seed_guest_entry_frame(guest_initial_ret);
     g_guest_stack_low = guest_stack_low;
     g_guest_stack_high = guest_stack_high;
+    g_current_guest_stack_low = guest_stack_low;
+    g_current_guest_stack_high = guest_stack_high;
     set_teb_stack_bounds(guest_stack_low, guest_stack_high);
 
     printf("[STACK] guest stack=0x%lx..0x%lx ret=0x%lx entry_rsp=0x%lx ret_slot=0x%lx\n",

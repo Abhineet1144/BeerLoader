@@ -1536,6 +1536,9 @@ static void __attribute__((ms_abi)) context_draw_indexed(ID3D11DeviceContext* th
     command.args.integers.a = IndexCount;
     command.args.integers.b = StartIndexLocation;
     command.args.integers.signed_value = BaseVertexLocation;
+    BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
+    if (context && context->type == 1)
+        command.draw_state = pipeline_state_clone(&context->state);
     if (context_record_command(this, &command)) return;
     static _Atomic(uint32_t) calls;
     uint32_t call = atomic_fetch_add(&calls, 1) + 1;
@@ -1859,6 +1862,9 @@ static void __attribute__((ms_abi)) context_draw_indexed_instanced(
     command.args.integers.c = start_index;
     command.args.integers.d = start_instance;
     command.args.integers.signed_value = base_vertex;
+    BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
+    if (context && context->type == 1)
+        command.draw_state = pipeline_state_clone(&context->state);
     if (context_record_command(this, &command)) return;
     static _Atomic(uint32_t) calls;
     uint32_t call = atomic_fetch_add(&calls, 1) + 1;
@@ -1877,6 +1883,9 @@ static void __attribute__((ms_abi)) context_draw_instanced(
     command.args.integers.b = instance_count;
     command.args.integers.c = start_vertex;
     command.args.integers.d = start_instance;
+    BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
+    if (context && context->type == 1)
+        command.draw_state = pipeline_state_clone(&context->state);
     if (context_record_command(this, &command)) return;
     static _Atomic(uint32_t) calls;
     uint32_t call = atomic_fetch_add(&calls, 1) + 1;
@@ -2147,14 +2156,86 @@ static void __attribute__((ms_abi)) context_resolve_subresource(
     context_copy_resource(this, destination, source);
 }
 
+static void trace_shader_stage(const char *stage, ID3D11DeviceContext *this,
+                               void *shader, uint32_t class_count)
+{
+    static _Atomic(uint32_t) calls;
+    uint32_t call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 32) {
+        uint32_t hash = 0;
+        BeerD3D11Shader *typed = shader;
+        if (typed && com_get_header(typed))
+            hash = fnv1a_bytes(typed->bytecode, typed->bytecode_size);
+        fprintf(stderr,
+                "[D3D11 STAGE] %s #%u context=%p type=%u shader=%p hash=%08x classes=%u\n",
+                stage, call, (void *)this,
+                this ? ((BeerD3D11DeviceContext *)this)->type : 0, shader, hash,
+                class_count);
+    }
+}
+
+static void __attribute__((ms_abi)) context_hs_set_shader(
+    ID3D11DeviceContext *this, void *shader, void *class_instances,
+    uint32_t class_count)
+{
+    (void)class_instances;
+    trace_shader_stage("HSSetShader", this, shader, class_count);
+}
+
+static void __attribute__((ms_abi)) context_ds_set_shader(
+    ID3D11DeviceContext *this, void *shader, void *class_instances,
+    uint32_t class_count)
+{
+    (void)class_instances;
+    trace_shader_stage("DSSetShader", this, shader, class_count);
+}
+
+static void __attribute__((ms_abi)) context_cs_set_shader_resources(
+    ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *views)
+{
+    trace_resource_binding("CSSetShaderResources", this, start_slot, count,
+                           (void *const *)views, NULL, NULL);
+}
+
+static void __attribute__((ms_abi)) context_cs_set_unordered_access_views(
+    ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *views,
+    const uint32_t *initial_counts)
+{
+    trace_resource_binding("CSSetUnorderedAccessViews", this, start_slot, count,
+                           (void *const *)views, initial_counts, NULL);
+}
+
+static void __attribute__((ms_abi)) context_cs_set_shader(
+    ID3D11DeviceContext *this, void *shader, void *class_instances,
+    uint32_t class_count)
+{
+    (void)class_instances;
+    trace_shader_stage("CSSetShader", this, shader, class_count);
+}
+
+static void __attribute__((ms_abi)) context_cs_set_samplers(
+    ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *samplers)
+{
+    trace_resource_binding("CSSetSamplers", this, start_slot, count,
+                           (void *const *)samplers, NULL, NULL);
+}
+
+static void __attribute__((ms_abi)) context_cs_set_constant_buffers(
+    ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *buffers)
+{
+    trace_resource_binding("CSSetConstantBuffers", this, start_slot, count,
+                           (void *const *)buffers, NULL, NULL);
+}
+
 static void __attribute__((ms_abi)) context_dispatch(
     ID3D11DeviceContext *this, uint32_t x, uint32_t y, uint32_t z)
 {
     static _Atomic(uint32_t) calls;
     uint32_t call = atomic_fetch_add(&calls, 1) + 1;
     if (call <= 16)
-        fprintf(stderr, "[D3D11 TRACE] Dispatch #%u groups=(%u,%u,%u)\n", call, x, y, z);
-    (void)this;
+        fprintf(stderr, "[D3D11 TRACE] Dispatch #%u context=%p type=%u groups=(%u,%u,%u)\n",
+                call, (void *)this,
+                this ? ((BeerD3D11DeviceContext *)this)->type : 0, x, y, z);
 }
 
 static void __attribute__((ms_abi)) context_dispatch_indirect(
@@ -2234,11 +2315,21 @@ static void __attribute__((ms_abi)) context_execute_command_list(
             context_gs_set_shader(this, command->object, NULL,
                                   command->args.integers.a);
             break;
-        case BEER_COMMAND_DRAW_INDEXED:
+        case BEER_COMMAND_DRAW_INDEXED: {
+            BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
+            BeerD3D11PipelineState saved;
+            int has_snapshot = command->draw_state != NULL;
+            if (has_snapshot) {
+                saved = context->state;
+                context->state = *command->draw_state;
+                trace_draw_snapshot(&context->state, command->args.integers.a, 0);
+            }
             context_draw_indexed(this, command->args.integers.a,
                                  command->args.integers.b,
                                  command->args.integers.signed_value);
+            if (has_snapshot) context->state = saved;
             break;
+        }
         case BEER_COMMAND_DRAW: {
             BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
             BeerD3D11PipelineState saved;
@@ -2252,17 +2343,38 @@ static void __attribute__((ms_abi)) context_execute_command_list(
             if (has_snapshot) context->state = saved;
             break;
         }
-        case BEER_COMMAND_DRAW_INDEXED_INSTANCED:
+        case BEER_COMMAND_DRAW_INDEXED_INSTANCED: {
+            BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
+            BeerD3D11PipelineState saved;
+            int has_snapshot = command->draw_state != NULL;
+            if (has_snapshot) {
+                saved = context->state;
+                context->state = *command->draw_state;
+                trace_draw_snapshot(&context->state, command->args.integers.a, 0);
+            }
             context_draw_indexed_instanced(
                 this, command->args.integers.a, command->args.integers.b,
                 command->args.integers.c, command->args.integers.signed_value,
                 command->args.integers.d);
+            if (has_snapshot) context->state = saved;
             break;
-        case BEER_COMMAND_DRAW_INSTANCED:
+        }
+        case BEER_COMMAND_DRAW_INSTANCED: {
+            BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
+            BeerD3D11PipelineState saved;
+            int has_snapshot = command->draw_state != NULL;
+            if (has_snapshot) {
+                saved = context->state;
+                context->state = *command->draw_state;
+                trace_draw_snapshot(&context->state, command->args.integers.a,
+                                    command->args.integers.c);
+            }
             context_draw_instanced(
                 this, command->args.integers.a, command->args.integers.b,
                 command->args.integers.c, command->args.integers.d);
+            if (has_snapshot) context->state = saved;
             break;
+        }
         case BEER_COMMAND_DRAW_AUTO:
             context_draw_auto(this);
             break;
@@ -2552,6 +2664,16 @@ static void init_context_vtable(void)
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_CLEAR_DEPTH_STENCIL_VIEW] = (void *)context_clear_depthstencil_view;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_RESOLVE_SUBRESOURCE] = (void *)context_resolve_subresource;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_EXECUTE_COMMAND_LIST] = (void *)context_execute_command_list;
+    /* Official D3D11 context slots after ExecuteCommandList: hull, domain and
+     * compute-stage setters. These were previously shared no-ops, hiding the
+     * producer pipeline that runs before the title post-processing passes. */
+    g_context_vtable.slots[60] = (void *)context_hs_set_shader;
+    g_context_vtable.slots[64] = (void *)context_ds_set_shader;
+    g_context_vtable.slots[67] = (void *)context_cs_set_shader_resources;
+    g_context_vtable.slots[68] = (void *)context_cs_set_unordered_access_views;
+    g_context_vtable.slots[69] = (void *)context_cs_set_shader;
+    g_context_vtable.slots[70] = (void *)context_cs_set_samplers;
+    g_context_vtable.slots[71] = (void *)context_cs_set_constant_buffers;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_MAP] = (void *)context_map;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_UNMAP] = (void *)context_unmap;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_CLEAR_STATE] = (void *)context_clear_state;
