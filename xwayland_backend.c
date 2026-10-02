@@ -33,6 +33,22 @@ typedef struct {
 } XClientMessageEvent;
 
 typedef struct {
+    int type;
+    unsigned long serial;
+    Bool send_event;
+    Display *display;
+    Window event;
+    Window window;
+    int x;
+    int y;
+    int width;
+    int height;
+    int border_width;
+    Window above;
+    Bool override_redirect;
+} XConfigureEvent;
+
+typedef struct {
     void *library;
     Display *display;
     Window window;
@@ -173,8 +189,12 @@ int xwayland_window_create(int x, int y, int width, int height,
     g_x11.wm_delete = g_x11.InternAtom(g_x11.display, "WM_DELETE_WINDOW", 0);
     if (g_x11.wm_delete)
         g_x11.SetWMProtocols(g_x11.display, g_x11.window, &g_x11.wm_delete, 1);
-    /* StructureNotifyMask: enough for lifecycle notifications without consuming input. */
-    g_x11.SelectInput(g_x11.display, g_x11.window, 1L << 17);
+    /* USER32 needs lifecycle, focus, configure and paint notifications. Keyboard
+     * and pointer events remain owned by the DirectInput/input compatibility path. */
+    g_x11.SelectInput(g_x11.display, g_x11.window,
+                      (1L << 17) | /* StructureNotifyMask */
+                      (1L << 21) | /* FocusChangeMask */
+                      (1L << 15)); /* ExposureMask */
     if (initially_visible) {
         g_x11.MapRaised(g_x11.display, g_x11.window);
         g_x11.visible = 1;
@@ -285,23 +305,51 @@ int xwayland_window_get_state(XwaylandWindowState *state)
     return ok;
 }
 
+int xwayland_window_poll_event(XwaylandEvent *out)
+{
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&g_x11.lock);
+    if (!g_x11.display || !g_x11.window || g_x11.Pending(g_x11.display) <= 0) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 0;
+    }
+    XEvent event;
+    memset(&event, 0, sizeof(event));
+    g_x11.NextEvent(g_x11.display, &event);
+    switch (event.type) {
+        case 9: out->type = XWAYLAND_EVENT_FOCUS_IN; break;
+        case 10: out->type = XWAYLAND_EVENT_FOCUS_OUT; break;
+        case 12: out->type = XWAYLAND_EVENT_EXPOSE; break;
+        case 18: g_x11.visible = 0; out->type = XWAYLAND_EVENT_HIDE; break;
+        case 19: g_x11.visible = 1; out->type = XWAYLAND_EVENT_SHOW; break;
+        case 22: {
+            XConfigureEvent *configure = (XConfigureEvent *)&event;
+            g_x11.x = configure->x; g_x11.y = configure->y;
+            g_x11.width = configure->width; g_x11.height = configure->height;
+            out->type = XWAYLAND_EVENT_CONFIGURE;
+            out->x = configure->x; out->y = configure->y;
+            out->width = configure->width; out->height = configure->height;
+            break;
+        }
+        case 33: {
+            XClientMessageEvent *client = (XClientMessageEvent *)&event;
+            if ((Atom)client->data.l[0] == g_x11.wm_delete)
+                out->type = XWAYLAND_EVENT_CLOSE;
+            break;
+        }
+        default: break;
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    return out->type != XWAYLAND_EVENT_NONE;
+}
+
 int xwayland_window_pump_events(void)
 {
     int close_requested = 0;
-    pthread_mutex_lock(&g_x11.lock);
-    if (g_x11.display && g_x11.window) {
-        while (g_x11.Pending(g_x11.display) > 0) {
-            XEvent event;
-            memset(&event, 0, sizeof(event));
-            g_x11.NextEvent(g_x11.display, &event);
-            if (event.type == 33) { /* ClientMessage */
-                XClientMessageEvent *client = (XClientMessageEvent *)&event;
-                if ((Atom)client->data.l[0] == g_x11.wm_delete)
-                    close_requested = 1;
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_x11.lock);
+    XwaylandEvent event;
+    while (xwayland_window_poll_event(&event))
+        close_requested |= event.type == XWAYLAND_EVENT_CLOSE;
     return close_requested;
 }
 

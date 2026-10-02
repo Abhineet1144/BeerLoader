@@ -2324,11 +2324,24 @@ impl_LoadLibraryExW(const u16 *name, u64 h, u32 flags)
 static u64 __attribute__((ms_abi)) impl_FreeLibrary(u64 h) { (void)h; return 1; }
 
 /* ---- Process affinity / CPU info ---- */
+static u32 win_processor_count(void)
+{
+    long count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (count < 1) count = 1;
+    if (count > 64) count = 64;
+    return (u32)count;
+}
+
+static u64 win_processor_mask(void)
+{
+    u32 count = win_processor_count();
+    return count == 64 ? UINT64_MAX : (((u64)1 << count) - 1);
+}
+
 static u64 __attribute__((ms_abi))
 impl_GetProcessAffinityMask(u64 h, u64 *proc_mask, u64 *sys_mask) {
     (void)h;
-    long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-    u64 mask = (ncpus >= 64) ? ~(u64)0 : ((u64)1 << ncpus) - 1;
+    u64 mask = win_processor_mask();
     if (proc_mask) *proc_mask = mask;
     if (sys_mask)  *sys_mask  = mask;
     return 1;
@@ -3030,11 +3043,9 @@ typedef struct {
 static u64 __attribute__((ms_abi))
 impl_GetLogicalProcessorInformation(SLPI *buf, u32 *retlen)
 {
-    long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (ncpus < 1) ncpus = 4;
-    if (ncpus > 64) ncpus = 64;
+    u32 ncpus = win_processor_count();
 
-    u32 needed = (u32)(ncpus + 1) * sizeof(SLPI); /* ncpus Core entries + 1 Package */
+    u32 needed = (ncpus + 1) * sizeof(SLPI); /* ncpus Core entries + 1 Package */
 
     if (!buf || !retlen || *retlen < needed) {
         if (retlen) *retlen = needed;
@@ -3048,7 +3059,7 @@ impl_GetLogicalProcessorInformation(SLPI *buf, u32 *retlen)
         buf[i].Relationship  = 0;        /* RelationProcessorCore */
         buf[i].Core.Flags    = 1;        /* HT enabled (hyper-threading) */
     }
-    buf[ncpus].ProcessorMask = ((u64)1 << ncpus) - 1;
+    buf[ncpus].ProcessorMask = win_processor_mask();
     buf[ncpus].Relationship  = 3; /* RelationProcessorPackage */
 
     *retlen = needed;
@@ -3066,14 +3077,35 @@ static u64 __attribute__((ms_abi)) impl_FlsFree(u32 i)
     { return impl_TlsFree(i); }
 
 /* ---- Misc ---- */
-static u64 __attribute__((ms_abi)) impl_GetSystemInfo(u64 *si) {
-    if (!si) return 0;
-    memset(si, 0, 36); /* SYSTEM_INFO is 36 bytes */
-    u8 *b = (u8 *)si;
-    *(u16*)(b + 0) = 9;    /* PROCESSOR_ARCHITECTURE_AMD64 */
-    *(u32*)(b + 4) = 4096; /* dwPageSize */
-    *(u32*)(b + 20) = 4;   /* dwNumberOfProcessors */
-    *(u32*)(b + 32) = 15;  /* dwProcessorLevel */
+typedef struct {
+    u16 processor_architecture;
+    u16 reserved;
+    u32 page_size;
+    u64 minimum_application_address;
+    u64 maximum_application_address;
+    u64 active_processor_mask;
+    u32 number_of_processors;
+    u32 processor_type;
+    u32 allocation_granularity;
+    u16 processor_level;
+    u16 processor_revision;
+} WIN_SYSTEM_INFO;
+
+_Static_assert(sizeof(WIN_SYSTEM_INFO) == 48, "Win64 SYSTEM_INFO layout must be 48 bytes");
+
+static u64 __attribute__((ms_abi)) impl_GetSystemInfo(WIN_SYSTEM_INFO *info) {
+    if (!info) return 0;
+    memset(info, 0, sizeof(*info));
+    info->processor_architecture = 9; /* PROCESSOR_ARCHITECTURE_AMD64 */
+    info->page_size = 4096;
+    info->minimum_application_address = 0x10000;
+    info->maximum_application_address = 0x00007ffffffeffffULL;
+    info->active_processor_mask = win_processor_mask();
+    info->number_of_processors = win_processor_count();
+    info->processor_type = 8664; /* PROCESSOR_AMD_X8664 */
+    info->allocation_granularity = 0x10000;
+    info->processor_level = 6;
+    info->processor_revision = 0;
     return 0;
 }
 
@@ -3495,11 +3527,50 @@ impl_FormatMessageW(u32 flags, u64 src, u32 msgid, u32 langid,
 
 static volatile int g_win_quit = 0;
 static u32 g_win_quit_code = 0;
+static u64 g_window_proc;
+static u64 g_window_userdata;
+static u64 g_window_style;
+static u64 g_window_exstyle;
+static u64 g_window_instance;
+static int g_window_focused;
+
+typedef struct {
+    u32 cbSize;
+    u32 style;
+    u64 lpfnWndProc;
+    s32 cbClsExtra;
+    s32 cbWndExtra;
+    u64 hInstance;
+    u64 hIcon;
+    u64 hCursor;
+    u64 hbrBackground;
+    u64 lpszMenuName;
+    u64 lpszClassName;
+    u64 hIconSm;
+} WIN_WNDCLASSEX;
+_Static_assert(sizeof(WIN_WNDCLASSEX) == 80, "WNDCLASSEX must be 80 bytes on Win64");
+
+static u64 register_window_class(const WIN_WNDCLASSEX *window_class, const char *api)
+{
+    if (!window_class || window_class->cbSize < 72 || !window_class->lpfnWndProc) {
+        g_last_error = 87;
+        return 0;
+    }
+    g_window_proc = window_class->lpfnWndProc;
+    g_window_instance = window_class->hInstance;
+    if (!g_api_registerclass) {
+        g_api_registerclass = 1;
+        fprintf(stderr, "[PROGRESS] %s retained WndProc=0x%lx\n", api, g_window_proc);
+    }
+    return 1; /* stable class atom */
+}
 
 static u64 __attribute__((ms_abi))
-impl_RegisterClassExA(u64 wndclass) { (void)wndclass; if (!g_api_registerclass) { g_api_registerclass=1; fprintf(stderr, "[PROGRESS] RegisterClassExA called - window registration started\n"); } return 1; }
+impl_RegisterClassExA(const WIN_WNDCLASSEX *window_class)
+    { return register_window_class(window_class, "RegisterClassExA"); }
 static u64 __attribute__((ms_abi))
-impl_RegisterClassExW(u64 wndclass) { (void)wndclass; if (!g_api_registerclass) { g_api_registerclass=1; fprintf(stderr, "[PROGRESS] RegisterClassExW called - window registration started\n"); } return 1; }
+impl_RegisterClassExW(const WIN_WNDCLASSEX *window_class)
+    { return register_window_class(window_class, "RegisterClassExW"); }
 static u64 __attribute__((ms_abi))
 impl_GetDesktopWindow(void) { return FAKE_HWND; }
 static u64 __attribute__((ms_abi))
@@ -3510,8 +3581,16 @@ impl_ShowWindow(u64 hw, u32 cmd) {
         g_last_error = 1400; /* ERROR_INVALID_WINDOW_HANDLE */
         return 0;
     }
+    XwaylandWindowState state;
+    int was_visible = xwayland_window_get_state(&state) && state.visible;
+    int visible = cmd != 0;
     fprintf(stderr, "[WIN] ShowWindow(hwnd=0x%lx, cmd=%u)\n", hw, cmd);
-    return xwayland_window_show(cmd != 0);
+    if (!xwayland_window_show(visible)) return 0;
+    if (was_visible != visible && g_window_proc) {
+        typedef u64 __attribute__((ms_abi)) (*WndProc)(u64, u32, u64, u64);
+        ((WndProc)(uintptr_t)g_window_proc)(FAKE_HWND, 0x0018, visible, 0);
+    }
+    return was_visible;
 }
 static u64 __attribute__((ms_abi))
 impl_UpdateWindow(u64 hw) {
@@ -4586,31 +4665,77 @@ static u64 create_native_window(s32 x, s32 y, s32 w, s32 h, const char *title)
     return FAKE_HWND;
 }
 
+typedef struct {
+    u64 lpCreateParams, hInstance, hMenu, hwndParent;
+    s32 cy, cx, y, x, style;
+    u32 padding;
+    u64 lpszName, lpszClass;
+    u32 dwExStyle, trailing_padding;
+} WIN_CREATESTRUCT;
+_Static_assert(sizeof(WIN_CREATESTRUCT) == 80, "CREATESTRUCT must be 80 bytes on Win64");
+
+typedef u64 __attribute__((ms_abi)) (*GuestWndProc)(u64, u32, u64, u64);
+static u64 call_guest_wndproc(u32 message, u64 wparam, u64 lparam)
+{
+    if (!g_window_proc) return message == 0x0081 ? 1 : 0;
+    return ((GuestWndProc)(uintptr_t)g_window_proc)(FAKE_HWND, message, wparam, lparam);
+}
+
+static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
+                               s32 x, s32 y, s32 w, s32 h, u64 parent,
+                               u64 menu, u64 inst, u64 param, const char *native_title)
+{
+    if (!g_window_proc) { g_last_error = 1407; return 0; }
+    g_window_style = style; g_window_exstyle = exstyle;
+    g_window_instance = inst ? inst : g_window_instance;
+    u64 hwnd = create_native_window(x, y, w, h, native_title);
+    if (!hwnd) return 0;
+    WIN_CREATESTRUCT create = {
+        .lpCreateParams = param, .hInstance = g_window_instance, .hMenu = menu,
+        .hwndParent = parent, .cy = h, .cx = w, .y = y, .x = x,
+        .style = (s32)style, .lpszName = title, .lpszClass = classname,
+        .dwExStyle = exstyle
+    };
+    if (!call_guest_wndproc(0x0081, 0, (u64)(uintptr_t)&create)) {
+        xwayland_window_destroy(); return 0;
+    }
+    if ((s64)call_guest_wndproc(0x0001, 0, (u64)(uintptr_t)&create) == -1) {
+        call_guest_wndproc(0x0082, 0, 0); xwayland_window_destroy(); return 0;
+    }
+    call_guest_wndproc(0x0003, 0, ((u64)(u16)y << 16) | (u16)x);
+    call_guest_wndproc(0x0005, 0, ((u64)(u16)h << 16) | (u16)w);
+    if (style & 0x10000000u) call_guest_wndproc(0x0018, 1, 0);
+    return hwnd;
+}
+
 static u64 __attribute__((ms_abi))
 impl_CreateWindowExW(u32 exstyle, u64 classname, u64 title, u32 style,
                       s32 x, s32 y, s32 w, s32 h, u64 parent, u64 menu, u64 inst, u64 param)
 {
-    (void)exstyle;(void)classname;(void)style;(void)parent;(void)menu;(void)inst;(void)param;
     char utf8_title[512];
     window_title_from_wide((const u16 *)(uintptr_t)title, utf8_title, sizeof(utf8_title));
     fprintf(stderr, "[WIN] CreateWindowExW(%dx%d, title=%s)\n", w, h,
             utf8_title[0] ? utf8_title : "(untitled)");
-    return create_native_window(x, y, w, h, utf8_title);
+    return create_guest_window(exstyle, classname, title, style, x, y, w, h,
+                               parent, menu, inst, param, utf8_title);
 }
 static u64 __attribute__((ms_abi))
 impl_CreateWindowExA(u32 exstyle, u64 classname, u64 title, u32 style,
                       s32 x, s32 y, s32 w, s32 h, u64 parent, u64 menu, u64 inst, u64 param)
 {
-    (void)exstyle;(void)classname;(void)style;(void)parent;(void)menu;(void)inst;(void)param;
     const char *ascii_title = (const char *)(uintptr_t)title;
     fprintf(stderr, "[WIN] CreateWindowExA(%dx%d, title=%s)\n", w, h,
             (ascii_title && *ascii_title) ? ascii_title : "(untitled)");
-    return create_native_window(x, y, w, h, ascii_title);
+    return create_guest_window(exstyle, classname, title, style, x, y, w, h,
+                               parent, menu, inst, param, ascii_title);
 }
 static u64 __attribute__((ms_abi))
 impl_DestroyWindow(u64 hw) {
     if (hw != FAKE_HWND || !xwayland_window_exists()) { g_last_error = 1400; return 0; }
+    call_guest_wndproc(0x0002, 0, 0);
+    call_guest_wndproc(0x0082, 0, 0);
     xwayland_window_destroy();
+    g_window_focused = 0;
     return 1;
 }
 static u64 __attribute__((ms_abi))
@@ -4663,101 +4788,395 @@ impl_ShowCursor(s32 show)
         fprintf(stderr, "[USER32] ShowCursor(%d) -> %d\n", show != 0, value);
     return (u32)value;
 }
+
+typedef struct { s32 x, y; } WIN_POINT;
+
 static u64 __attribute__((ms_abi))
-impl_SetCapture(u64 hw) { (void)hw; return 0; }
+impl_GetCursorPos(WIN_POINT *point)
+{
+    if (!point) { g_last_error = 87; return 0; }
+    XwaylandWindowState state;
+    if (xwayland_window_get_state(&state)) {
+        point->x = state.x + state.width / 2;
+        point->y = state.y + state.height / 2;
+    } else {
+        point->x = 0;
+        point->y = 0;
+    }
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_ScreenToClient(u64 hwnd, WIN_POINT *point)
+{
+    if (hwnd != FAKE_HWND || !point) { g_last_error = hwnd == FAKE_HWND ? 87 : 1400; return 0; }
+    XwaylandWindowState state;
+    if (!xwayland_window_get_state(&state)) { g_last_error = 1400; return 0; }
+    point->x -= state.x;
+    point->y -= state.y;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_ClipCursor(const WIN_RECT *rect)
+{
+    /* XWayland pointer confinement is not required for a quiet input backend,
+     * but Win32 reports success for both setting and releasing the clip. */
+    (void)rect;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetKeyboardState(u8 *state)
+{
+    if (!state) { g_last_error = 87; return 0; }
+    memset(state, 0, 256);
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetAsyncKeyState(s32 virtual_key)
+{
+    (void)virtual_key;
+    return 0; /* key is neither down nor newly pressed */
+}
+
+static u64 __attribute__((ms_abi))
+impl_XInputDisconnected(u32 user_index, void *state_or_vibration)
+{
+    (void)user_index;
+    (void)state_or_vibration;
+    return 1167; /* ERROR_DEVICE_NOT_CONNECTED */
+}
+
+static u64 __attribute__((ms_abi))
+impl_SetCapture(u64 hw) { return hw == FAKE_HWND ? FAKE_HWND : 0; }
 static u64 __attribute__((ms_abi))
 impl_ReleaseCapture(void) { return 1; }
 static u64 __attribute__((ms_abi))
-impl_SetFocus(u64 hw) { (void)hw; return FAKE_HWND; }
+impl_SetFocus(u64 hw)
+{
+    if (hw && hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    u64 previous = g_window_focused ? FAKE_HWND : 0;
+    if (hw == FAKE_HWND && !g_window_focused) {
+        g_window_focused = 1;
+        call_guest_wndproc(0x0007, 0, 0);
+    } else if (!hw && g_window_focused) {
+        g_window_focused = 0;
+        call_guest_wndproc(0x0008, 0, 0);
+    }
+    return previous;
+}
 static u64 __attribute__((ms_abi))
-impl_GetFocus(void) { return FAKE_HWND; }
+impl_GetFocus(void) { return g_window_focused ? FAKE_HWND : 0; }
 static u64 __attribute__((ms_abi))
-impl_GetActiveWindow(void) { return FAKE_HWND; }
+impl_GetActiveWindow(void) { return g_window_focused ? FAKE_HWND : 0; }
 static u64 __attribute__((ms_abi))
 impl_SetActiveWindow(u64 hwnd)
 {
-    if (hwnd && hwnd != FAKE_HWND) {
-        g_last_error = 1400; /* ERROR_INVALID_WINDOW_HANDLE */
-        return 0;
-    }
-    return FAKE_HWND; /* previous active window */
+    if (hwnd && hwnd != FAKE_HWND) { g_last_error = 1400; return 0; }
+    u64 previous = g_window_focused ? FAKE_HWND : 0;
+    impl_SetFocus(hwnd);
+    return previous;
 }
 
 /* Message loop */
-static u64 __attribute__((ms_abi))
-impl_PeekMessageW(u64 *msg, u64 hw, u32 min, u32 max, u32 remove) {
-    (void)hw;(void)min;(void)max;(void)remove;
-    if (xwayland_window_pump_events()) {
-        g_win_quit = 1;
-        g_win_quit_code = 0;
-    }
-    if (msg) memset(msg, 0, 5*8); /* MSG struct */
-    if (g_win_quit) {
-        if (msg) {
-            msg[0] = FAKE_HWND;  /* hwnd */
-            msg[1] = 0x0012;     /* WM_QUIT */
-            msg[2] = g_win_quit_code;
-        }
-        return 1;
-    }
-    return 0; /* no messages */
+typedef struct {
+    u64 hwnd;
+    u32 message;
+    u32 padding;
+    u64 wParam;
+    u64 lParam;
+    u32 time;
+    WIN_POINT pt;
+    u32 lPrivate;
+} WIN_MSG;
+_Static_assert(sizeof(WIN_MSG) == 48, "MSG must be 48 bytes on Win64");
+
+#define WIN_MESSAGE_CAPACITY 256
+static WIN_MSG g_win_messages[WIN_MESSAGE_CAPACITY];
+static u32 g_win_message_head, g_win_message_count;
+static pthread_mutex_t g_win_message_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define WIN_TIMER_CAPACITY 32
+typedef struct {
+    u64 hwnd;
+    u64 id;
+    u32 interval_ms;
+    u64 callback;
+    u64 next_fire_ms;
+    int active;
+} WIN_TIMER;
+static WIN_TIMER g_win_timers[WIN_TIMER_CAPACITY];
+static pthread_mutex_t g_win_timer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic(u64) g_next_win_timer_id = 1;
+
+static u64 monotonic_milliseconds(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (u64)now.tv_sec * 1000 + (u64)now.tv_nsec / 1000000;
 }
-static u64 __attribute__((ms_abi))
-impl_GetMessageW(u64 *msg, u64 hw, u32 min, u32 max) {
-    (void)hw;(void)min;(void)max;
-    if (xwayland_window_pump_events()) {
-        g_win_quit = 1;
-        g_win_quit_code = 0;
-    }
-    if (msg) memset(msg, 0, 5*8);
-    if (g_win_quit) {
-        if (msg) {
-            msg[0] = FAKE_HWND;  /* hwnd */
-            msg[1] = 0x0012;     /* WM_QUIT */
-            msg[2] = g_win_quit_code;
-        }
+
+static int queue_window_message(u32 message, u64 wparam, u64 lparam)
+{
+    pthread_mutex_lock(&g_win_message_mutex);
+    if (g_win_message_count == WIN_MESSAGE_CAPACITY) {
+        pthread_mutex_unlock(&g_win_message_mutex);
         return 0;
     }
-
-    /* Keep message loops alive instead of returning WM_QUIT immediately. */
-    if (msg) {
-        msg[0] = FAKE_HWND; /* hwnd */
-        msg[1] = 0x0000;    /* WM_NULL */
-    }
-    struct timespec ts = {0, 1000000L};
-    nanosleep(&ts, NULL);
+    u32 index = (g_win_message_head + g_win_message_count) % WIN_MESSAGE_CAPACITY;
+    g_win_messages[index] = (WIN_MSG){
+        .hwnd = message == 0x0012 ? 0 : FAKE_HWND,
+        .message = message, .wParam = wparam, .lParam = lparam,
+        .time = (u32)(clock() * 1000 / CLOCKS_PER_SEC)
+    };
+    ++g_win_message_count;
+    pthread_mutex_unlock(&g_win_message_mutex);
     return 1;
 }
+
+static void collect_native_window_events(void)
+{
+    XwaylandEvent event;
+    while (xwayland_window_poll_event(&event)) {
+        switch (event.type) {
+            case XWAYLAND_EVENT_CLOSE: queue_window_message(0x0010, 0, 0); break;
+            case XWAYLAND_EVENT_SHOW: queue_window_message(0x0018, 1, 0); break;
+            case XWAYLAND_EVENT_HIDE: queue_window_message(0x0018, 0, 0); break;
+            case XWAYLAND_EVENT_FOCUS_IN:
+                g_window_focused = 1;
+                queue_window_message(0x001c, 1, 0);
+                queue_window_message(0x0006, 1, 0);
+                queue_window_message(0x0007, 0, 0);
+                break;
+            case XWAYLAND_EVENT_FOCUS_OUT:
+                g_window_focused = 0;
+                queue_window_message(0x0008, 0, 0);
+                queue_window_message(0x0006, 0, 0);
+                queue_window_message(0x001c, 0, 0);
+                break;
+            case XWAYLAND_EVENT_CONFIGURE:
+                queue_window_message(0x0003, 0, ((u64)(u16)event.y << 16) | (u16)event.x);
+                queue_window_message(0x0005, 0, ((u64)(u16)event.height << 16) | (u16)event.width);
+                break;
+            case XWAYLAND_EVENT_EXPOSE: queue_window_message(0x000f, 0, 0); break;
+            default: break;
+        }
+    }
+}
+
+static void collect_window_timers(void)
+{
+    u64 now = monotonic_milliseconds();
+    pthread_mutex_lock(&g_win_timer_mutex);
+    for (u32 i = 0; i < WIN_TIMER_CAPACITY; ++i) {
+        WIN_TIMER *timer = &g_win_timers[i];
+        if (!timer->active || now < timer->next_fire_ms) continue;
+        do timer->next_fire_ms += timer->interval_ms;
+        while (timer->next_fire_ms <= now);
+        /* Timer callbacks are dispatched by DispatchMessage on Windows. The
+         * title path registers a normal window timer (callback == NULL). */
+        queue_window_message(0x0113, timer->id, timer->callback);
+    }
+    pthread_mutex_unlock(&g_win_timer_mutex);
+}
+
 static u64 __attribute__((ms_abi))
-impl_TranslateMessage(u64 *msg) { (void)msg; return 0; }
+impl_SetTimer(u64 hwnd, u64 id, u32 interval_ms, u64 callback)
+{
+    if (hwnd && hwnd != FAKE_HWND) { g_last_error = 1400; return 0; }
+    if (interval_ms < 10) interval_ms = 10; /* USER_TIMER_MINIMUM */
+    pthread_mutex_lock(&g_win_timer_mutex);
+    WIN_TIMER *free_slot = NULL;
+    for (u32 i = 0; i < WIN_TIMER_CAPACITY; ++i) {
+        WIN_TIMER *timer = &g_win_timers[i];
+        if (timer->active && timer->hwnd == hwnd && timer->id == id && id) {
+            free_slot = timer;
+            break;
+        }
+        if (!timer->active && !free_slot) free_slot = timer;
+    }
+    if (!free_slot) {
+        pthread_mutex_unlock(&g_win_timer_mutex);
+        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
+        return 0;
+    }
+    if (!id) id = atomic_fetch_add(&g_next_win_timer_id, 1);
+    *free_slot = (WIN_TIMER){
+        .hwnd = hwnd, .id = id, .interval_ms = interval_ms,
+        .callback = callback, .next_fire_ms = monotonic_milliseconds() + interval_ms,
+        .active = 1
+    };
+    pthread_mutex_unlock(&g_win_timer_mutex);
+    return id;
+}
+
 static u64 __attribute__((ms_abi))
-impl_DispatchMessageW(u64 *msg) { (void)msg; return 0; }
+impl_KillTimer(u64 hwnd, u64 id)
+{
+    if (hwnd && hwnd != FAKE_HWND) { g_last_error = 1400; return 0; }
+    int removed = 0;
+    pthread_mutex_lock(&g_win_timer_mutex);
+    for (u32 i = 0; i < WIN_TIMER_CAPACITY; ++i) {
+        WIN_TIMER *timer = &g_win_timers[i];
+        if (timer->active && timer->hwnd == hwnd && timer->id == id) {
+            timer->active = 0;
+            removed = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_win_timer_mutex);
+    return removed;
+}
+
 static u64 __attribute__((ms_abi))
-impl_PostQuitMessage(u32 code) { g_win_quit = 1; g_win_quit_code = code; return 0; }
+impl_IsZoomed(u64 hwnd)
+{
+    if (hwnd != FAKE_HWND || !xwayland_window_exists()) {
+        g_last_error = 1400;
+        return 0;
+    }
+    return 0; /* fullscreen is distinct from WS_MAXIMIZE */
+}
+
+static u64 __attribute__((ms_abi))
+impl_D3DPERF_GetStatus(void)
+{
+    return 0; /* no D3D debug/performance capture tool is active */
+}
+
+static int take_window_message(WIN_MSG *message, u32 min, u32 max, int remove)
+{
+    int found = 0;
+    pthread_mutex_lock(&g_win_message_mutex);
+    for (u32 i = 0; i < g_win_message_count; ++i) {
+        u32 index = (g_win_message_head + i) % WIN_MESSAGE_CAPACITY;
+        u32 id = g_win_messages[index].message;
+        if ((min || max) && (id < min || id > max)) continue;
+        if (message) *message = g_win_messages[index];
+        if (remove) {
+            for (u32 j = i; j + 1 < g_win_message_count; ++j) {
+                u32 to = (g_win_message_head + j) % WIN_MESSAGE_CAPACITY;
+                u32 from = (g_win_message_head + j + 1) % WIN_MESSAGE_CAPACITY;
+                g_win_messages[to] = g_win_messages[from];
+            }
+            --g_win_message_count;
+        }
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&g_win_message_mutex);
+    return found;
+}
+
+static u64 __attribute__((ms_abi))
+impl_PeekMessageW(WIN_MSG *msg, u64 hw, u32 min, u32 max, u32 remove)
+{
+    if (hw && hw != FAKE_HWND) return 0;
+    collect_native_window_events();
+    collect_window_timers();
+    return take_window_message(msg, min, max, (remove & 1) != 0);
+}
+static u64 __attribute__((ms_abi))
+impl_GetMessageW(WIN_MSG *msg, u64 hw, u32 min, u32 max)
+{
+    if (!msg || (hw && hw != FAKE_HWND)) { g_last_error = 87; return (u64)-1; }
+    for (;;) {
+        collect_native_window_events();
+        collect_window_timers();
+        if (take_window_message(msg, min, max, 1))
+            return msg->message == 0x0012 ? 0 : 1;
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+}
+static u64 __attribute__((ms_abi))
+impl_TranslateMessage(const WIN_MSG *msg) { (void)msg; return 0; }
+static u64 __attribute__((ms_abi))
+impl_DispatchMessageW(const WIN_MSG *msg)
+{
+    if (!msg || msg->message == 0x0012) return 0;
+    if (msg->message == 0x0113 && msg->lParam) {
+        typedef void __attribute__((ms_abi)) (*GuestTimerProc)(u64, u32, u64, u32);
+        ((GuestTimerProc)(uintptr_t)msg->lParam)(msg->hwnd, msg->message,
+                                                msg->wParam, msg->time);
+        return 0;
+    }
+    if (!msg->hwnd) return 0;
+    return call_guest_wndproc(msg->message, msg->wParam, msg->lParam);
+}
+static u64 __attribute__((ms_abi))
+impl_PostQuitMessage(u32 code)
+{
+    g_win_quit = 1; g_win_quit_code = code;
+    queue_window_message(0x0012, code, 0);
+    return 0;
+}
 static u64 __attribute__((ms_abi))
 impl_SendMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
-    { (void)hw;(void)msg;(void)wp;(void)lp; return 0; }
+{
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    return call_guest_wndproc(msg, wp, lp);
+}
 static u64 __attribute__((ms_abi))
 impl_PostMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
-    { (void)hw;(void)msg;(void)wp;(void)lp; return 1; }
+{
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    return queue_window_message(msg, wp, lp);
+}
 static u64 __attribute__((ms_abi))
 impl_DefWindowProcW(u64 hw, u32 msg, u64 wp, u64 lp)
-    { (void)hw;(void)msg;(void)wp;(void)lp; return 0; }
+{
+    (void)wp; (void)lp;
+    if (hw != FAKE_HWND) return 0;
+    if (msg == 0x0010) return impl_DestroyWindow(hw);
+    return msg == 0x0081 ? 1 : 0;
+}
 static u64 __attribute__((ms_abi))
 impl_CallWindowProcW(u64 proc, u64 hw, u32 msg, u64 wp, u64 lp)
-    { (void)proc;(void)hw;(void)msg;(void)wp;(void)lp; return 0; }
+{
+    if (!proc) return impl_DefWindowProcW(hw, msg, wp, lp);
+    return ((GuestWndProc)(uintptr_t)proc)(hw, msg, wp, lp);
+}
+static u64 window_long_value(s32 index)
+{
+    if (index == -4) return g_window_proc;
+    if (index == -21) return g_window_userdata;
+    if (index == -16) return g_window_style;
+    if (index == -20) return g_window_exstyle;
+    return 0;
+}
+static u64 set_window_long_value(u64 hw, s32 index, u64 value)
+{
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    u64 old = window_long_value(index);
+    if (index == -4) g_window_proc = value;
+    else if (index == -21) g_window_userdata = value;
+    else if (index == -16) g_window_style = value;
+    else if (index == -20) g_window_exstyle = value;
+    else { g_last_error = 87; return 0; }
+    return old;
+}
 static u64 __attribute__((ms_abi))
-impl_SetWindowLongPtrW(u64 hw, s32 idx, u64 new)
-    { (void)hw;(void)idx;(void)new; return 0; }
+impl_SetWindowLongPtrW(u64 hw, s32 idx, u64 new_value)
+    { return set_window_long_value(hw, idx, new_value); }
 static u64 __attribute__((ms_abi))
-impl_GetWindowLongPtrW(u64 hw, s32 idx) { (void)hw;(void)idx; return 0; }
+impl_GetWindowLongPtrW(u64 hw, s32 idx)
+    { if (hw != FAKE_HWND) { g_last_error = 1400; return 0; } return window_long_value(idx); }
 static u64 __attribute__((ms_abi))
-impl_SetWindowLongW(u64 hw, s32 idx, s32 new)
-    { (void)hw;(void)idx;(void)new; return 0; }
+impl_SetWindowLongW(u64 hw, s32 idx, s32 new_value)
+    { return (u32)set_window_long_value(hw, idx, (u32)new_value); }
 static u64 __attribute__((ms_abi))
-impl_GetWindowLongW(u64 hw, s32 idx) { (void)hw;(void)idx; return 0; }
+impl_GetWindowLongW(u64 hw, s32 idx)
+    { return (u32)impl_GetWindowLongPtrW(hw, idx); }
 static u64 __attribute__((ms_abi))
-impl_SetForegroundWindow(u64 hw) { (void)hw; return 1; }
+impl_SetForegroundWindow(u64 hw)
+{
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    impl_SetFocus(hw);
+    return 1;
+}
 static u64 __attribute__((ms_abi))
 impl_SetWindowsHookExW(s32 type, u64 fn, u64 mod, u32 tid)
     { (void)type;(void)fn;(void)mod;(void)tid; return 0xD0010002u; }
@@ -5839,6 +6258,39 @@ static BeerFmodObject g_fmod_channel_group = { g_fmod_plain_vtable, 1 };
 static BeerFmodObject g_fmod_dsp           = { g_fmod_plain_vtable, 1 };
 static BeerFmodObject g_fmod_connection    = { g_fmod_plain_vtable, 1 };
 static BeerFmodObject g_fmod_sound         = { g_fmod_plain_vtable, 1 };
+static BeerFmodObject g_fmod_channel       = { g_fmod_plain_vtable, 1 };
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_Event_getInfo(BeerFmodObject *self, int *index, char **name,
+                        void *event_info)
+{
+    (void)event_info;
+    if (!self) return BEER_FMOD_ERR_INVALID_PARAM;
+    if (index) *index = 0;
+    if (name) *name = (char *)"Beer Silent Event";
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_System_createDSP(BeerFmodObject *self, const void *description,
+                           BeerFmodObject **out)
+{
+    if (!self || !description || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_dsp;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_System_playDSP(BeerFmodObject *self, int channel_index,
+                         BeerFmodObject *dsp, int paused,
+                         BeerFmodObject **out)
+{
+    (void)channel_index;
+    (void)paused;
+    if (!self || !dsp || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_channel;
+    return BEER_FMOD_OK;
+}
 
 static u64 __attribute__((ms_abi))
 impl_FMOD_System_createSound(BeerFmodObject *self, const char *name_or_data,
@@ -6481,6 +6933,8 @@ static ImplEntry g_impls[] = {
     /* FMOD Ex: coherent silent event/core objects.  These decorated C++
      * exports are the exact names imported by Sekiro's FMOD Ex build. */
     {"FMOD_EventSystem_Create", (ImplFn)impl_FMOD_EventSystem_Create},
+    {"FMOD_Memory_Initialize", (ImplFn)impl_FMOD_ok},
+    {"FMOD_Debug_SetLevel", (ImplFn)impl_FMOD_ok},
     {"?getSystemObject@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAVSystem@2@@Z", (ImplFn)impl_FMOD_EventSystem_getSystemObject},
     {"?load@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDPEAUFMOD_EVENT_LOADINFO@@PEAPEAVEventProject@2@@Z", (ImplFn)impl_FMOD_EventSystem_load},
     {"?init@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@HIPEAXI@Z", (ImplFn)impl_FMOD_ok},
@@ -6493,6 +6947,7 @@ static ImplEntry g_impls[] = {
     {"?getCategory@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDPEAPEAVEventCategory@2@@Z", (ImplFn)impl_FMOD_EventSystem_getCategory},
     {"?getCategoryByIndex@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@HPEAPEAVEventCategory@2@@Z", (ImplFn)impl_FMOD_EventSystem_getCategoryByIndex},
     {"?getEvent@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDIPEAPEAVEvent@2@@Z", (ImplFn)impl_FMOD_EventSystem_getEvent},
+    {"?getInfo@Event@FMOD@@QEAA?AW4FMOD_RESULT@@PEAHPEAPEADPEAUFMOD_EVENT_INFO@@@Z", (ImplFn)impl_FMOD_Event_getInfo},
     {"?start@Event@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", (ImplFn)impl_FMOD_ok},
     {"?getChannelGroup@Event@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAVChannelGroup@2@@Z", (ImplFn)impl_FMOD_Event_getChannelGroup},
     {"?createChannelGroup@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDPEAPEAVChannelGroup@2@@Z", (ImplFn)impl_FMOD_System_createChannelGroup},
@@ -6521,12 +6976,21 @@ static ImplEntry g_impls[] = {
     {"?setDSPBufferSize@System@FMOD@@QEAA?AW4FMOD_RESULT@@IH@Z", (ImplFn)impl_FMOD_ok},
     {"?setSpeakerMode@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_SPEAKERMODE@@@Z", (ImplFn)impl_FMOD_ok},
     {"?setDriver@System@FMOD@@QEAA?AW4FMOD_RESULT@@H@Z", (ImplFn)impl_FMOD_ok},
+    {"?createDSP@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAUFMOD_DSP_DESCRIPTION@@PEAPEAVDSP@2@@Z", (ImplFn)impl_FMOD_System_createDSP},
+    {"?playDSP@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_CHANNELINDEX@@PEAVDSP@2@_NPEAPEAVChannel@2@@Z", (ImplFn)impl_FMOD_System_playDSP},
+    {"?setVolume@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@M@Z", (ImplFn)impl_FMOD_ok},
+    {"?setFrequency@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@M@Z", (ImplFn)impl_FMOD_ok},
     {"?createSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDIPEAUFMOD_CREATESOUNDEXINFO@@PEAPEAVSound@2@@Z", (ImplFn)impl_FMOD_System_createSound},
     {"?preloadFSB@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDHPEAVSound@2@_N@Z", (ImplFn)impl_FMOD_EventSystem_preloadFSB},
+    {"?setStreamBufferSize@System@FMOD@@QEAA?AW4FMOD_RESULT@@II@Z", (ImplFn)impl_FMOD_ok},
+    {"?setFileSystem@System@FMOD@@QEAA?AW4FMOD_RESULT@@P6A?AW43@PEBDHPEAIPEAPEAX2@ZP6A?AW43@PEAX4@ZP6A?AW43@44I14@ZP6A?AW43@4I4@ZP6A?AW43@PEAUFMOD_ASYNCREADINFO@@4@Z5H@Z", (ImplFn)impl_FMOD_ok},
+    {"?setCallback@System@FMOD@@QEAA?AW4FMOD_RESULT@@P6A?AW43@PEAUFMOD_SYSTEM@@W4FMOD_SYSTEM_CALLBACKTYPE@@PEAX2@Z@Z", (ImplFn)impl_FMOD_ok},
+    {"?setAdvancedSettings@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAUFMOD_ADVANCEDSETTINGS@@@Z", (ImplFn)impl_FMOD_ok},
     /* D3D11 / shader container helpers */
     {"D3D11CreateDevice",                     (ImplFn)impl_D3D11CreateDevice},
     {"D3D11CreateDeviceAndSwapChain",         (ImplFn)impl_D3D11CreateDeviceAndSwapChain},
     {"D3DGetBlobPart",                        (ImplFn)impl_D3DGetBlobPart},
+    {"D3DPERF_GetStatus",                     (ImplFn)impl_D3DPERF_GetStatus},
     /* String / locale */
     {"MultiByteToWideChar",                   (ImplFn)impl_MultiByteToWideChar},
     {"WideCharToMultiByte",                   (ImplFn)impl_WideCharToMultiByte},
@@ -6600,6 +7064,9 @@ static ImplEntry g_impls[] = {
     {"GetSystemMetrics",                      (ImplFn)impl_GetSystemMetrics},
     {"GetDesktopWindow",                      (ImplFn)impl_GetDesktopWindow},
     {"GetForegroundWindow",                   (ImplFn)impl_GetForegroundWindow},
+    {"SetTimer",                              (ImplFn)impl_SetTimer},
+    {"KillTimer",                             (ImplFn)impl_KillTimer},
+    {"IsZoomed",                              (ImplFn)impl_IsZoomed},
     {"ShowWindow",                            (ImplFn)impl_ShowWindow},
     {"UpdateWindow",                          (ImplFn)impl_UpdateWindow},
     {"GetModuleHandleExW",                    (ImplFn)impl_GetModuleHandleExW},
@@ -6686,6 +7153,13 @@ static ImplEntry g_impls[] = {
     {"ReleaseDC",                             (ImplFn)impl_ReleaseDC},
     {"SetCursor",                             (ImplFn)impl_SetCursor},
     {"ShowCursor",                            (ImplFn)impl_ShowCursor},
+    {"GetCursorPos",                          (ImplFn)impl_GetCursorPos},
+    {"ScreenToClient",                        (ImplFn)impl_ScreenToClient},
+    {"ClipCursor",                            (ImplFn)impl_ClipCursor},
+    {"GetKeyboardState",                      (ImplFn)impl_GetKeyboardState},
+    {"GetAsyncKeyState",                      (ImplFn)impl_GetAsyncKeyState},
+    {"XInputGetState",                        (ImplFn)impl_XInputDisconnected},
+    {"XInputSetState",                        (ImplFn)impl_XInputDisconnected},
     {"SetCapture",                            (ImplFn)impl_SetCapture},
     {"ReleaseCapture",                        (ImplFn)impl_ReleaseCapture},
     {"SetFocus",                              (ImplFn)impl_SetFocus},
@@ -7175,10 +7649,11 @@ static void pe_imports(void)
 
             char buf[288];
             const char *fn_only = NULL;
-            if (ilt[i] & (1ULL << 63)) {
-                /* import by ordinal */
+            int import_by_ordinal = (ilt[i] & (1ULL << 63)) != 0;
+            if (import_by_ordinal) {
+                /* Import-by-ordinal labels are diagnostic names, not export names. */
                 snprintf(buf, sizeof(buf), "%s!#%u", dll, (u16)(ilt[i] & 0xFFFF));
-                fn_only = buf; /* ordinals can't match by name */
+                fn_only = NULL;
             } else {
                 /* import by name – IMAGE_IMPORT_BY_NAME: 2-byte hint then ASCII */
                 fn_only = (const char *)rva_ptr((u32)ilt[i]) + 2;
@@ -7188,6 +7663,12 @@ static void pe_imports(void)
             /* Use a Beer implementation first, then an export from a loaded
              * bundled PE DLL, otherwise retain the explicit logging stub. */
             ImplFn real = fn_only ? find_impl(fn_only) : NULL;
+            if (!real && import_by_ordinal && !strcasecmp(dll, "xinput1_3.dll")) {
+                u16 ordinal = (u16)(ilt[i] & 0xffff);
+                /* XInput 1.3 ordinal 2 is XInputGetStateEx. The offline input
+                 * backend reports no connected controller, like GetState. */
+                if (ordinal == 2) real = (ImplFn)impl_XInputDisconnected;
+            }
             GuestDll *guest = guest_dll_find(dll);
             u64 guest_export = (guest && fn_only) ? guest_dll_export(guest, fn_only) : 0;
             if (guest_export && fn_only && !strcmp(guest->name, "oo2core_6_win64.dll") &&
@@ -7566,7 +8047,12 @@ static int try_startup_helper_frame_resume(u64 rip, u64 rsp, u64 *out_ret, u64 *
  */
 static int patch_transaction_assertions(void)
 {
-    if (!g_img) return 0;
+    if (!g_img || !getenv("BEER_ENABLE_TRANSACTION_PATCHES")) {
+        fprintf(stderr,
+                "[PATCH] Leaving transaction assertion branches intact by default. "
+                "Set BEER_ENABLE_TRANSACTION_PATCHES=1 to opt in.\n");
+        return 0;
+    }
 
     NtHdrs64 *nt   = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
     SecHdr   *secs = (SecHdr *)((u8 *)&nt->opt + nt->file.opthdr_sz);
@@ -7598,6 +8084,12 @@ static void patch_known_bad_targets(void)
     if (!g_img) return;
 
     const int aggressive = getenv("BEER_ENABLE_HARD_PATCHES") != NULL;
+    if (!aggressive && !getenv("BEER_ENABLE_KNOWN_TARGET_PATCHES")) {
+        fprintf(stderr,
+                "[PATCH] Leaving known guest code targets intact by default. "
+                "Set BEER_ENABLE_KNOWN_TARGET_PATCHES=1 to opt in.\n");
+        return;
+    }
 
     /* Known crashing target hit by worker threads: img+0x3dd7570 */
     {

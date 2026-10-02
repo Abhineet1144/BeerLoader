@@ -11,6 +11,25 @@ typedef struct {
     int visible;
 } XwaylandWindowState;
 
+typedef enum {
+    XWAYLAND_EVENT_NONE = 0,
+    XWAYLAND_EVENT_CLOSE,
+    XWAYLAND_EVENT_SHOW,
+    XWAYLAND_EVENT_HIDE,
+    XWAYLAND_EVENT_FOCUS_IN,
+    XWAYLAND_EVENT_FOCUS_OUT,
+    XWAYLAND_EVENT_CONFIGURE,
+    XWAYLAND_EVENT_EXPOSE
+} XwaylandEventType;
+
+typedef struct {
+    XwaylandEventType type;
+    int x;
+    int y;
+    int width;
+    int height;
+} XwaylandEvent;
+
 /* Xlib is loaded at runtime so Beer remains buildable without X11 headers. */
 int xwayland_window_create(int x, int y, int width, int height,
                            const char *title, int initially_visible);
@@ -22,6 +41,9 @@ int xwayland_window_move_resize(int x, int y, int width, int height,
                                 int move, int resize);
 int xwayland_window_set_title(const char *title);
 int xwayland_window_get_state(XwaylandWindowState *state);
+/* Returns one native lifecycle event at a time. Input events remain reserved for
+ * the DirectInput backend; window activation/configuration belongs to USER32. */
+int xwayland_window_poll_event(XwaylandEvent *event);
 int xwayland_window_pump_events(void);
 /* Presents tightly packed RGBA8 pixels. The backend converts them to the
  * native XWayland visual without taking ownership of the caller's storage. */
