@@ -2590,12 +2590,17 @@ impl_D3D11CreateDeviceAndSwapChain(u64 adapter, u32 dtype, u64 sw, u32 flags,
     u64 **ppDevice, u32 *pFL, u64 **ppCtx)
 {
     (void)adapter;(void)dtype;(void)sw;(void)flags;
-    (void)fls;(void)nfl;(void)sdk;(void)swdesc;
+    (void)fls;(void)nfl;(void)sdk;
     fprintf(stderr, "[D3D11] CreateDeviceAndSwapChain -> returning real COM objects\n");
+    if (!swdesc || !ppSwap || !g_dxgi_swapchain) return (u64)0x80070057;
+    *ppSwap = NULL;
+    HRESULT hr = dxgi_swapchain_configure(g_dxgi_swapchain, g_d3d11_device,
+        (const BeerDxgiSwapChainDesc *)swdesc);
+    if (hr != S_OK) return (u64)(uint32_t)hr;
     if (ppDevice) *ppDevice = (u64 *)g_d3d11_device;
     if (pFL)      *pFL      = D3D_FEATURE_LEVEL_11_0;
     if (ppCtx)    *ppCtx    = (u64 *)g_d3d11_context;
-    if (ppSwap)   *ppSwap   = (u64 *)g_dxgi_swapchain;
+    *ppSwap = (u64 *)g_dxgi_swapchain;
     return S_OK;
 }
 
@@ -2603,8 +2608,20 @@ impl_D3D11CreateDeviceAndSwapChain(u64 adapter, u32 dtype, u64 sw, u32 flags,
 static u64 __attribute__((ms_abi))
 dxgi_CreateSwapChain(u64 *obj, u64 *device, u64 *desc, u64 **ppSwap)
 {
-    (void)obj;(void)device;(void)desc;
-    if (ppSwap) *ppSwap = (u64 *)g_dxgi_swapchain;
+    static _Atomic(u32) calls;
+    u32 call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 8) {
+        fprintf(stderr,
+                "[DXGI TRACE] CreateSwapChain #%u factory=%p device=%p desc=%p output=%p\n",
+                call, (void *)obj, (void *)device, (void *)desc, (void *)ppSwap);
+    }
+    if (!ppSwap) return (u64)0x80070057; /* E_INVALIDARG */
+    *ppSwap = NULL;
+    if (!device || !desc || !g_dxgi_swapchain) return E_FAIL;
+    HRESULT hr = dxgi_swapchain_configure(g_dxgi_swapchain,
+        (ID3D11Device *)device, (const BeerDxgiSwapChainDesc *)desc);
+    if (hr != S_OK) return (u64)(uint32_t)hr;
+    *ppSwap = (u64 *)g_dxgi_swapchain;
     return S_OK;
 }
 
@@ -2919,6 +2936,7 @@ typedef struct {
 
 static WinEvent g_events[MAX_EVENTS];
 static int g_event_cnt = 1;
+static pthread_mutex_t g_event_table_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static u32 g_sem_val[MAX_SEMS];
 static u32 g_sem_max[MAX_SEMS];
@@ -2959,8 +2977,22 @@ static int calc_abs_deadline(struct timespec *ts, u32 ms)
 
 static u64 event_alloc(int manual, int initial)
 {
-    if (g_event_cnt >= MAX_EVENTS) return 0;
-    int id = g_event_cnt++;
+    pthread_mutex_lock(&g_event_table_mtx);
+    int id = 0;
+    for (int candidate = 1; candidate < g_event_cnt; ++candidate) {
+        if (!g_events[candidate].used) {
+            id = candidate;
+            break;
+        }
+    }
+    if (!id) {
+        if (g_event_cnt >= MAX_EVENTS) {
+            pthread_mutex_unlock(&g_event_table_mtx);
+            g_last_error = 4; /* ERROR_TOO_MANY_OPEN_FILES */
+            return 0;
+        }
+        id = g_event_cnt++;
+    }
     WinEvent *ev = &g_events[id];
     memset(ev, 0, sizeof(*ev));
     ev->used = 1;
@@ -2968,6 +3000,7 @@ static u64 event_alloc(int manual, int initial)
     ev->signaled = initial ? 1 : 0;
     pthread_mutex_init(&ev->mtx, NULL);
     pthread_cond_init(&ev->cv, NULL);
+    pthread_mutex_unlock(&g_event_table_mtx);
     return (u64)(0xE0000000u + (u32)id);
 }
 
@@ -3766,10 +3799,12 @@ impl_CloseHandle(u64 h)
 
     int eid = event_id_from_handle(h);
     if (eid >= 0) {
+        pthread_mutex_lock(&g_event_table_mtx);
         WinEvent *ev = &g_events[eid];
         pthread_mutex_destroy(&ev->mtx);
         pthread_cond_destroy(&ev->cv);
         ev->used = 0;
+        pthread_mutex_unlock(&g_event_table_mtx);
         return 1;
     }
 
@@ -4733,7 +4768,12 @@ impl_FreeLibraryWhenCallbackReturns(u64 pci, u64 hmod)
 /* ---- CreateEventExW ---- */
 static u64 __attribute__((ms_abi))
 impl_CreateEventExW(u64 sa, u64 name, u32 flags, u32 access)
-    { (void)sa;(void)name;(void)flags;(void)access; return 0xE0000001; }
+{
+    (void)sa; (void)name; (void)access;
+    /* CREATE_EVENT_MANUAL_RESET=1, CREATE_EVENT_INITIAL_SET=2. */
+    if (flags & ~3u) { g_last_error = 87; return 0; }
+    return event_alloc((flags & 1u) != 0, (flags & 2u) != 0);
+}
 
 /* ---- GetCurrentPackageId: not running in an AppX package ---- */
 #define APPMODEL_ERROR_NO_PACKAGE 15700u
@@ -5036,6 +5076,219 @@ impl_D3DGetBlobPart(const u8 *src, size_t src_size, u32 part,
     return S_OK;
 }
 
+/* ---- Minimal FMOD event/core objects ----
+ * Sekiro uses the legacy FMOD Ex C++ exports.  Returning FMOD_OK without
+ * populating their mandatory output pointers is invalid and led directly to a
+ * null dereference in the event-project loader.  These objects model a silent
+ * (no-output) system: lifecycle/configuration calls succeed, getters return
+ * coherent defaults, and project load returns a valid inert project object. */
+typedef struct BeerFmodObject {
+    void **vtable;
+    _Atomic(u32) refs;
+} BeerFmodObject;
+
+enum {
+    BEER_FMOD_OK = 0,
+    BEER_FMOD_ERR_INVALID_PARAM = 31,
+    /* FMOD Ex reports a non-zero result when indexed enumeration reaches the
+     * end. The exact event-not-found value is version-specific; callers only
+     * rely on success versus failure for this method. */
+    BEER_FMOD_ERR_EVENT_NOTFOUND = 74
+};
+
+static u64 __attribute__((ms_abi)) beer_fmod_object_release(BeerFmodObject *obj)
+{
+    (void)obj;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_fmod_project_describe(BeerFmodObject *obj, void *description)
+{
+    (void)obj;
+    (void)description;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_fmod_project_get_state(BeerFmodObject *obj, u32 *state)
+{
+    (void)obj;
+    if (state) *state = 0;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_fmod_noop(BeerFmodObject *obj, u64 a, u64 b, u64 c)
+{
+    (void)obj; (void)a; (void)b; (void)c;
+    return BEER_FMOD_OK;
+}
+
+static void *g_fmod_project_vtable[16] = {
+    (void *)beer_fmod_object_release,
+    (void *)beer_fmod_project_describe,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_project_get_state,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop
+};
+
+static u64 __attribute__((ms_abi))
+beer_fmod_zero_count(BeerFmodObject *obj, int *out)
+{
+    (void)obj;
+    if (!out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = 0;
+    return BEER_FMOD_OK;
+}
+
+static void *g_fmod_plain_vtable[16] = {
+    (void *)beer_fmod_object_release, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop
+};
+
+/* EventCategory slot 3 is getNumSubCategories(int *).  The silent backend has
+ * no child categories; writing zero is essential because callers initialize
+ * the output storage with debug sentinels before testing it. */
+static void *g_fmod_category_vtable[16] = {
+    (void *)beer_fmod_object_release, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_zero_count,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop,
+    (void *)beer_fmod_noop, (void *)beer_fmod_noop
+};
+
+static BeerFmodObject g_fmod_event_system = { g_fmod_plain_vtable, 1 };
+static BeerFmodObject g_fmod_core_system  = { g_fmod_plain_vtable, 1 };
+static BeerFmodObject g_fmod_project      = { g_fmod_project_vtable, 1 };
+static BeerFmodObject g_fmod_category     = { g_fmod_category_vtable, 1 };
+
+static u64 __attribute__((ms_abi)) impl_FMOD_EventSystem_Create(BeerFmodObject **out)
+{
+    if (!out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_event_system;
+    fprintf(stderr, "[FMOD] EventSystem_Create -> silent event system %p\n", (void *)*out);
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_EventSystem_getSystemObject(BeerFmodObject *self, BeerFmodObject **out)
+{
+    if (!self || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_core_system;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_EventSystem_load(BeerFmodObject *self, const char *name,
+                           const void *load_info, BeerFmodObject **out)
+{
+    (void)load_info;
+    if (!self || !name || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_project;
+    fprintf(stderr, "[FMOD] EventSystem::load(\"%s\") -> inert project %p\n",
+            name, (void *)*out);
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_EventSystem_getCategory(BeerFmodObject *self, const char *name,
+                                  BeerFmodObject **out)
+{
+    if (!self || !name || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_category;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_EventSystem_getCategoryByIndex(BeerFmodObject *self, int index,
+                                         BeerFmodObject **out)
+{
+    if (!self || !out || index < 0) return BEER_FMOD_ERR_INVALID_PARAM;
+    /* The silent event system exposes no categories. Reporting successful
+     * objects for arbitrary indices makes the guest's enumeration unbounded. */
+    *out = NULL;
+    return BEER_FMOD_ERR_EVENT_NOTFOUND;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_get_int(BeerFmodObject *self, int *out)
+{
+    if (!self || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = 0;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_getSpeakerMode(BeerFmodObject *self, u32 *mode)
+{
+    if (!self || !mode) return BEER_FMOD_ERR_INVALID_PARAM;
+    *mode = 3; /* FMOD_SPEAKERMODE_STEREO */
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_getSoftwareFormat(BeerFmodObject *self, int *rate, u32 *format,
+                            int *channels, int *max_input, u32 *resampler,
+                            int *bits)
+{
+    if (!self) return BEER_FMOD_ERR_INVALID_PARAM;
+    if (rate) *rate = 48000;
+    if (format) *format = 2; /* FMOD_SOUND_FORMAT_PCM16 */
+    if (channels) *channels = 2;
+    if (max_input) *max_input = 0;
+    if (resampler) *resampler = 1;
+    if (bits) *bits = 16;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_getDriverCaps(BeerFmodObject *self, int id, u32 *caps,
+                        int *min_frequency, u32 *speaker_mode)
+{
+    (void)id;
+    if (!self) return BEER_FMOD_ERR_INVALID_PARAM;
+    if (caps) *caps = 0;
+    if (min_frequency) *min_frequency = 48000;
+    if (speaker_mode) *speaker_mode = 3; /* FMOD_SPEAKERMODE_STEREO */
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_get_output_object(BeerFmodObject *self, BeerFmodObject **out)
+{
+    if (!self || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_core_system;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_ok(BeerFmodObject *self, u64 a, u64 b, u64 c)
+{
+    (void)a; (void)b; (void)c;
+    return self ? BEER_FMOD_OK : BEER_FMOD_ERR_INVALID_PARAM;
+}
+
 /* ---- CommandLineToArgvW ---- */
 static u64 __attribute__((ms_abi))
 impl_CommandLineToArgvW(const u16 *cmdline, int *argc)
@@ -5050,6 +5303,29 @@ impl_CommandLineToArgvW(const u16 *cmdline, int *argc)
 /* ---- ImmDisableIME ---- */
 static u64 __attribute__((ms_abi))
 impl_ImmDisableIME(u32 tid) { (void)tid; return 1; }
+
+/* ---- AMD AGS ----
+ * The host backend does not expose AMD GPU Services. Returning AGS_SUCCESS from
+ * the generic stub left both mandatory outputs untouched, after which Sekiro
+ * treated a zeroed GPU-info object as initialized and called a null method.
+ * Report the documented no-driver condition and clear the context output so the
+ * game can take its vendor-neutral D3D11 path. */
+#define AGS_NO_AMD_DRIVER_INSTALLED 6
+static u64 __attribute__((ms_abi))
+impl_agsInit(void **context, const void *configuration, void *gpu_info)
+{
+    (void)configuration;
+    (void)gpu_info;
+    if (context) *context = NULL;
+    fprintf(stderr, "[AGS] AMD GPU Services unavailable; using standard D3D11 path\n");
+    return AGS_NO_AMD_DRIVER_INSTALLED;
+}
+
+static u64 __attribute__((ms_abi)) impl_agsDeInit(void *context)
+{
+    (void)context;
+    return AGS_NO_AMD_DRIVER_INSTALLED;
+}
 
 /* ---- Impl dispatch table ---- */
 typedef struct { const char *name; ImplFn fn; } ImplEntry;
@@ -5175,6 +5451,37 @@ static ImplEntry g_impls[] = {
     {"CoInitializeEx",                        (ImplFn)impl_CoInitializeEx},
     {"CoUninitialize",                        (ImplFn)impl_CoUninitialize},
     {"CoCreateInstance",                      (ImplFn)impl_CoCreateInstance},
+    /* FMOD Ex: coherent silent event/core objects.  These decorated C++
+     * exports are the exact names imported by Sekiro's FMOD Ex build. */
+    {"FMOD_EventSystem_Create", (ImplFn)impl_FMOD_EventSystem_Create},
+    {"?getSystemObject@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAVSystem@2@@Z", (ImplFn)impl_FMOD_EventSystem_getSystemObject},
+    {"?load@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDPEAUFMOD_EVENT_LOADINFO@@PEAPEAVEventProject@2@@Z", (ImplFn)impl_FMOD_EventSystem_load},
+    {"?init@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@HIPEAXI@Z", (ImplFn)impl_FMOD_ok},
+    {"?release@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", (ImplFn)impl_FMOD_ok},
+    {"?update@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", (ImplFn)impl_FMOD_ok},
+    {"?set3DListenerAttributes@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@HPEBUFMOD_VECTOR@@000@Z", (ImplFn)impl_FMOD_ok},
+    {"?unload@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", (ImplFn)impl_FMOD_ok},
+    {"?setLanguage@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBD@Z", (ImplFn)impl_FMOD_ok},
+    {"?setMediaPath@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBD@Z", (ImplFn)impl_FMOD_ok},
+    {"?getCategory@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDPEAPEAVEventCategory@2@@Z", (ImplFn)impl_FMOD_EventSystem_getCategory},
+    {"?getCategoryByIndex@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@HPEAPEAVEventCategory@2@@Z", (ImplFn)impl_FMOD_EventSystem_getCategoryByIndex},
+    {"?getNumProjects@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
+    {"?getNumDrivers@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
+    {"?getSoftwareChannels@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
+    {"?FS_GetSoftwareChannelsUsed@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
+    {"?FS_GetEmulatedChannelsUsed@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
+    {"?getHardwareChannels@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
+    {"?getSpeakerMode@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAW4FMOD_SPEAKERMODE@@@Z", (ImplFn)impl_FMOD_getSpeakerMode},
+    {"?getSoftwareFormat@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAHPEAW4FMOD_SOUND_FORMAT@@00PEAW4FMOD_DSP_RESAMPLER@@0@Z", (ImplFn)impl_FMOD_getSoftwareFormat},
+    {"?getDriverCaps@System@FMOD@@QEAA?AW4FMOD_RESULT@@HPEAIPEAHPEAW4FMOD_SPEAKERMODE@@@Z", (ImplFn)impl_FMOD_getDriverCaps},
+    {"?getOutputHandle@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAX@Z", (ImplFn)impl_FMOD_get_output_object},
+    {"?getMasterChannelGroup@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAVChannelGroup@2@@Z", (ImplFn)impl_FMOD_get_output_object},
+    {"?setOutput@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_OUTPUTTYPE@@@Z", (ImplFn)impl_FMOD_ok},
+    {"?setSoftwareChannels@System@FMOD@@QEAA?AW4FMOD_RESULT@@H@Z", (ImplFn)impl_FMOD_ok},
+    {"?setSoftwareFormat@System@FMOD@@QEAA?AW4FMOD_RESULT@@HW4FMOD_SOUND_FORMAT@@HHW4FMOD_DSP_RESAMPLER@@@Z", (ImplFn)impl_FMOD_ok},
+    {"?setDSPBufferSize@System@FMOD@@QEAA?AW4FMOD_RESULT@@IH@Z", (ImplFn)impl_FMOD_ok},
+    {"?setSpeakerMode@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_SPEAKERMODE@@@Z", (ImplFn)impl_FMOD_ok},
+    {"?setDriver@System@FMOD@@QEAA?AW4FMOD_RESULT@@H@Z", (ImplFn)impl_FMOD_ok},
     /* D3D11 / shader container helpers */
     {"D3D11CreateDevice",                     (ImplFn)impl_D3D11CreateDevice},
     {"D3D11CreateDeviceAndSwapChain",         (ImplFn)impl_D3D11CreateDeviceAndSwapChain},
@@ -5434,6 +5741,9 @@ static ImplEntry g_impls[] = {
     {"CommandLineToArgvW",                    (ImplFn)impl_CommandLineToArgvW},
     /* IME */
     {"ImmDisableIME",                         (ImplFn)impl_ImmDisableIME},
+    /* Optional vendor graphics extension */
+    {"agsInit",                               (ImplFn)impl_agsInit},
+    {"agsDeInit",                             (ImplFn)impl_agsDeInit},
     {NULL, NULL}
 };
 
@@ -8909,14 +9219,18 @@ int main(int argc, char **argv)
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = on_crash;
     sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+
+    /* Delay installing guest-fault recovery until after the PE image has been
+     * mapped. This keeps the preferred image range available to debuggers,
+     * which may plant breakpoints there before the inferior reaches main. */
+    printf("=== Beer Loader ===\n");
+    pe_load(exe);
+
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
     sigaction(SIGILL,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);  /* int3 / abort() in Windows CRT */
-
-    printf("=== Beer Loader ===\n");
-    pe_load(exe);
     
     /* DIAGNOSTIC: Check if blocker address is loaded correctly right after PE load */
     {
@@ -9043,9 +9357,6 @@ int main(int argc, char **argv)
     g_dxgi_vtab[7]  = (u64)dxgi_EnumAdapters_with_fake;  /* EnumAdapters */
     g_dxgi_vtab[10] = (u64)dxgi_CreateSwapChain;          /* CreateSwapChain */
     g_dxgi_vtab[12] = (u64)dxgi_EnumAdapters_with_fake;   /* EnumAdapters1 */
-    g_dxgi_vtab[8]  = (u64)dxgi_Present;       /* IDXGISwapChain::Present */
-    g_dxgi_vtab[9]  = (u64)dxgi_GetBuffer;     /* IDXGISwapChain::GetBuffer */
-    g_dxgi_vtab[13] = (u64)dxgi_ResizeBuffers; /* IDXGISwapChain::ResizeBuffers */
     
     /* CHECK: After vtable patching */
     {

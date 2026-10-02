@@ -8,6 +8,9 @@
 #include <string.h>
 
 typedef struct _XDisplay Display;
+typedef struct _XVisual Visual;
+typedef struct _XGC *GC;
+typedef struct _XImage XImage;
 typedef unsigned long XID;
 typedef XID Window;
 typedef XID Atom;
@@ -59,6 +62,14 @@ typedef struct {
     int (*SelectInput)(Display *, Window, long);
     int (*Pending)(Display *);
     int (*NextEvent)(Display *, XEvent *);
+    Visual *(*DefaultVisual)(Display *, int);
+    int (*DefaultDepth)(Display *, int);
+    GC (*DefaultGC)(Display *, int);
+    XImage *(*CreateImage)(Display *, Visual *, unsigned int, int, int, char *,
+                           unsigned int, unsigned int, int, int);
+    int (*PutImage)(Display *, Window, GC, XImage *, int, int, int, int,
+                    unsigned int, unsigned int);
+    int (*DestroyImage)(XImage *);
     int (*Flush)(Display *);
 } XwaylandBackend;
 
@@ -97,6 +108,12 @@ static int initialize_locked(void)
     X11_LOAD(SelectInput, "XSelectInput");
     X11_LOAD(Pending, "XPending");
     X11_LOAD(NextEvent, "XNextEvent");
+    X11_LOAD(DefaultVisual, "XDefaultVisual");
+    X11_LOAD(DefaultDepth, "XDefaultDepth");
+    X11_LOAD(DefaultGC, "XDefaultGC");
+    X11_LOAD(CreateImage, "XCreateImage");
+    X11_LOAD(PutImage, "XPutImage");
+    X11_LOAD(DestroyImage, "XDestroyImage");
     X11_LOAD(Flush, "XFlush");
 
     g_x11.InitThreads();
@@ -248,6 +265,56 @@ int xwayland_window_pump_events(void)
     }
     pthread_mutex_unlock(&g_x11.lock);
     return close_requested;
+}
+
+int xwayland_window_present_rgba8(const uint8_t *pixels, int width, int height,
+                                  int row_pitch)
+{
+    if (!pixels || width <= 0 || height <= 0 || row_pitch < width * 4)
+        return 0;
+
+    size_t size = (size_t)width * (size_t)height * 4;
+    uint8_t *native = malloc(size);
+    if (!native) return 0;
+
+    /* The default 24-bit TrueColor XWayland visual stores pixels as B,G,R,x on
+     * little-endian hosts. Keep alpha opaque because the top-level window has
+     * no alpha channel. */
+    for (int y = 0; y < height; ++y) {
+        const uint8_t *src = pixels + (size_t)y * (size_t)row_pitch;
+        uint8_t *dst = native + (size_t)y * (size_t)width * 4;
+        for (int x = 0; x < width; ++x) {
+            dst[x * 4 + 0] = src[x * 4 + 2];
+            dst[x * 4 + 1] = src[x * 4 + 1];
+            dst[x * 4 + 2] = src[x * 4 + 0];
+            dst[x * 4 + 3] = 0xff;
+        }
+    }
+
+    pthread_mutex_lock(&g_x11.lock);
+    int ok = g_x11.display && g_x11.window;
+    XImage *image = NULL;
+    if (ok) {
+        int screen = 0;
+        image = g_x11.CreateImage(g_x11.display,
+                                  g_x11.DefaultVisual(g_x11.display, screen),
+                                  (unsigned)g_x11.DefaultDepth(g_x11.display, screen),
+                                  2, 0, (char *)native, (unsigned)width,
+                                  (unsigned)height, 32, width * 4);
+        ok = image && g_x11.PutImage(g_x11.display, g_x11.window,
+                                     g_x11.DefaultGC(g_x11.display, screen),
+                                     image, 0, 0, 0, 0,
+                                     (unsigned)width, (unsigned)height) == 0;
+        if (ok) g_x11.Flush(g_x11.display);
+    }
+    if (image) {
+        /* XDestroyImage owns and frees image->data. */
+        g_x11.DestroyImage(image);
+        native = NULL;
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    free(native);
+    return ok;
 }
 
 void xwayland_window_destroy(void)

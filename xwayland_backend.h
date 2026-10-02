@@ -20,6 +20,10 @@ int xwayland_window_move_resize(int x, int y, int width, int height,
 int xwayland_window_set_title(const char *title);
 int xwayland_window_get_state(XwaylandWindowState *state);
 int xwayland_window_pump_events(void);
+/* Presents tightly packed RGBA8 pixels. The backend converts them to the
+ * native XWayland visual without taking ownership of the caller's storage. */
+int xwayland_window_present_rgba8(const uint8_t *pixels, int width, int height,
+                                  int row_pitch);
 void xwayland_window_destroy(void);
 int xwayland_window_exists(void);
 
