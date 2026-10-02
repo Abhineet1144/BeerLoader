@@ -15,6 +15,9 @@ typedef struct {
 int xwayland_window_create(int x, int y, int width, int height,
                            const char *title, int initially_visible);
 int xwayland_window_show(int visible);
+/* Requests compositor-managed fullscreen through EWMH. Under Wayland this is
+ * handled by XWayland and the active Wayland compositor. */
+int xwayland_window_set_fullscreen(int fullscreen);
 int xwayland_window_move_resize(int x, int y, int width, int height,
                                 int move, int resize);
 int xwayland_window_set_title(const char *title);

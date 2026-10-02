@@ -11,15 +11,18 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -2468,37 +2471,98 @@ impl_GetUserNameA(char *buf, u32 *sz) {
     strcpy(buf,"Player"); *sz=7; return 1;
 }
 
-/* ---- SHGetFolderPathW ---- */
+/* ---- Shell known-folder paths ---- */
+static const char *beer_roaming_appdata_path(void)
+{
+    const char *path = getenv("BEER_APPDATA");
+    if (path && *path) return path;
+    path = getenv("APPDATA");
+    if (path && *path) return path;
+
+    static char fallback[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    snprintf(fallback, sizeof(fallback), "%s/.config/Beer/AppData/Roaming", home);
+    return fallback;
+}
+
+static const char *beer_local_appdata_path(void)
+{
+    const char *path = getenv("BEER_LOCAL_APPDATA");
+    if (path && *path) return path;
+    path = getenv("LOCALAPPDATA");
+    if (path && *path) return path;
+
+    static char fallback[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    snprintf(fallback, sizeof(fallback), "%s/.local/share/Beer/AppData/Local", home);
+    return fallback;
+}
+
+static const char *beer_csidl_path(s32 csidl)
+{
+    switch ((u32)csidl & 0xffu) {
+    case 0x1a: /* CSIDL_APPDATA */
+        return beer_roaming_appdata_path();
+    case 0x1c: /* CSIDL_LOCAL_APPDATA */
+        return beer_local_appdata_path();
+    default:
+        return beer_roaming_appdata_path();
+    }
+}
+
+static int copy_ascii_to_wide_path(u16 *dst, size_t capacity, const char *src)
+{
+    if (!dst || !capacity || !src) return 0;
+    size_t length = strlen(src);
+    if (length >= capacity) return 0;
+    for (size_t i = 0; i <= length; ++i) dst[i] = (u8)src[i];
+    return 1;
+}
+
 static u64 __attribute__((ms_abi))
 impl_SHGetFolderPathW(u64 hwnd, s32 csidl, u64 tok, u32 flags, u16 *buf)
 {
-    (void)hwnd;(void)tok;(void)flags;
-    if (!buf) return (u64)-1;
-    /* Return /tmp as the "folder" for all CSIDL_* */
-    const char *path = "/tmp";
-    int i; for(i=0;path[i]&&i<255;i++) buf[i]=(u8)path[i]; buf[i]=0;
+    (void)hwnd; (void)tok; (void)flags;
+    const char *path = beer_csidl_path(csidl);
+    if (!copy_ascii_to_wide_path(buf, 260, path))
+        return (u64)(u32)0x8007007a; /* HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) */
+    fprintf(stderr, "[SHELL] SHGetFolderPathW(csidl=0x%x) -> %s\n", csidl, path);
     return 0; /* S_OK */
 }
+
 static u64 __attribute__((ms_abi))
 impl_SHGetFolderPathA(u64 hwnd, s32 csidl, u64 tok, u32 flags, char *buf)
 {
-    (void)hwnd;(void)tok;(void)flags;(void)csidl;
-    if (buf) strcpy(buf, "/tmp");
+    (void)hwnd; (void)tok; (void)flags;
+    const char *path = beer_csidl_path(csidl);
+    if (!buf || strlen(path) >= 260)
+        return (u64)(u32)0x8007007a;
+    strcpy(buf, path);
+    fprintf(stderr, "[SHELL] SHGetFolderPathA(csidl=0x%x) -> %s\n", csidl, path);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_SHGetKnownFolderPath(u64 rfid, u32 flags, u64 tok, u64 *out)
+{
+    (void)rfid; (void)flags; (void)tok;
+    if (!out) return (u64)(u32)0x80070057; /* E_INVALIDARG */
+    *out = 0;
+    const char *path = beer_roaming_appdata_path();
+    size_t length = strlen(path);
+    u16 *wide = malloc((length + 1) * sizeof(*wide));
+    if (!wide) return (u64)(u32)0x8007000e; /* E_OUTOFMEMORY */
+    if (!copy_ascii_to_wide_path(wide, length + 1, path)) {
+        free(wide);
+        return (u64)(u32)0x80070057;
+    }
+    *out = (u64)wide;
     return 0;
 }
 static u64 __attribute__((ms_abi))
-impl_SHGetKnownFolderPath(u64 rfid, u32 flags, u64 tok, u64 *out) {
-    (void)rfid;(void)flags;(void)tok;
-    /* Return a CoTaskMem-allocated wstring "/tmp" */
-    u16 *p = malloc(8 * sizeof(u16));
-    if (!p) return (u64)-1;
-    const char *s = "/tmp"; int i;
-    for(i=0;s[i];i++) p[i]=(u8)s[i]; p[i]=0;
-    if (out) *out = (u64)p;
-    return 0;
-}
-static u64 __attribute__((ms_abi))
-impl_CoTaskMemFree(void *p) { (void)p; return 0; }
+impl_CoTaskMemFree(void *p) { free(p); return 0; }
 
 /* ---- COM CoInitialize ---- */
 static u64 __attribute__((ms_abi))
@@ -3053,6 +3117,24 @@ impl_ResetEvent(u64 h)
 }
 
 static u64 __attribute__((ms_abi))
+impl_PulseEvent(u64 h)
+{
+    int eid = event_id_from_handle(h);
+    if (eid < 0) return 0;
+    WinEvent *ev = &g_events[eid];
+    pthread_mutex_lock(&ev->mtx);
+    /* PulseEvent releases only threads already waiting and resets the event
+     * before returning. It is inherently racy on Windows, but it is not an
+     * unconditional failure. */
+    ev->signaled = 1;
+    if (ev->manual_reset) pthread_cond_broadcast(&ev->cv);
+    else pthread_cond_signal(&ev->cv);
+    ev->signaled = 0;
+    pthread_mutex_unlock(&ev->mtx);
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
 impl_WaitForSingleObject(u64 h, u32 ms)
 {
     /* WAIT_OBJECT_0=0, WAIT_TIMEOUT=0x102, WAIT_FAILED=0xFFFFFFFF */
@@ -3065,8 +3147,12 @@ impl_WaitForSingleObject(u64 h, u32 ms)
         int rc = 0;
         pthread_mutex_lock(&ev->mtx);
         if (ms == 0xFFFFFFFFu) {
-            if (!ev->signaled)
-                fprintf(stderr, "[WAIT] WaitForSingleObject(event%d) blocking forever...\n", eid);
+            if (!ev->signaled) {
+                static _Atomic(u32) infinite_wait_logs;
+                u32 log_index = atomic_fetch_add(&infinite_wait_logs, 1);
+                if (log_index < 64)
+                    fprintf(stderr, "[WAIT] WaitForSingleObject(event%d) blocking forever...\n", eid);
+            }
             while (!ev->signaled) pthread_cond_wait(&ev->cv, &ev->mtx);
         } else if (ms == 0) {
             if (!ev->signaled) rc = ETIMEDOUT;
@@ -3297,51 +3383,259 @@ static u64 __attribute__((ms_abi))
 impl_GetModuleHandleExA(u32 flags, u64 name, u64 *out)
     { (void)flags;(void)name; if(out)*out=(u64)g_img; return 1; }
 
-/* ---- Condition variables (CONDITION_VARIABLE = pointer-sized opaque) ---- */
+/* ---- Condition variables (CONDITION_VARIABLE = pointer-sized opaque) ----
+ * Windows stores condition-variable state in one pointer-sized word. Keep the
+ * guest word zero-compatible and associate host pthread state by its address.
+ * The old implementation returned immediately for INFINITE sleeps, turning
+ * producer/consumer waits into busy loops and losing every wake notification. */
+#define MAX_CONDITION_VARIABLES 256
+
+typedef struct {
+    u64 *guest_address;
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    u64 generation;
+    u32 waiters;
+    int used;
+} WinConditionVariable;
+
+static WinConditionVariable g_condition_variables[MAX_CONDITION_VARIABLES];
+static pthread_mutex_t g_condition_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static WinConditionVariable *condition_variable_get(u64 *address, int create)
+{
+    if (!address) return NULL;
+    pthread_mutex_lock(&g_condition_table_mutex);
+    WinConditionVariable *free_slot = NULL;
+    for (size_t i = 0; i < MAX_CONDITION_VARIABLES; ++i) {
+        WinConditionVariable *entry = &g_condition_variables[i];
+        if (entry->used && entry->guest_address == address) {
+            pthread_mutex_unlock(&g_condition_table_mutex);
+            return entry;
+        }
+        if (!entry->used && !free_slot) free_slot = entry;
+    }
+    if (create && free_slot) {
+        memset(free_slot, 0, sizeof(*free_slot));
+        free_slot->guest_address = address;
+        pthread_mutex_init(&free_slot->mutex, NULL);
+        pthread_cond_init(&free_slot->condition, NULL);
+        free_slot->used = 1;
+    }
+    pthread_mutex_unlock(&g_condition_table_mutex);
+    return create ? free_slot : NULL;
+}
+
 static u64 __attribute__((ms_abi)) impl_InitializeConditionVariable(u64 *cv)
-    { if(cv) *cv = 0; return 0; }
+{
+    if (!cv) return 0;
+    *cv = 0;
+    return condition_variable_get(cv, 1) ? 1 : 0;
+}
+
 static u64 __attribute__((ms_abi)) impl_WakeConditionVariable(u64 *cv)
-    { (void)cv; return 0; }
+{
+    WinConditionVariable *entry = condition_variable_get(cv, 0);
+    if (!entry) return 0;
+    pthread_mutex_lock(&entry->mutex);
+    ++entry->generation;
+    pthread_cond_signal(&entry->condition);
+    pthread_mutex_unlock(&entry->mutex);
+    return 0;
+}
+
 static u64 __attribute__((ms_abi)) impl_WakeAllConditionVariable(u64 *cv)
-    { (void)cv; return 0; }
+{
+    WinConditionVariable *entry = condition_variable_get(cv, 0);
+    if (!entry) return 0;
+    pthread_mutex_lock(&entry->mutex);
+    ++entry->generation;
+    pthread_cond_broadcast(&entry->condition);
+    pthread_mutex_unlock(&entry->mutex);
+    return 0;
+}
+
 static u64 __attribute__((ms_abi))
 impl_SleepConditionVariableCS(u64 *cv, WIN_CS *cs, u32 ms)
 {
-    (void)cv;
-    impl_LeaveCriticalSection(cs);
-    if (ms && ms != 0xFFFFFFFF) {
-        struct timespec ts = { ms/1000, (long)(ms%1000)*1000000L };
-        nanosleep(&ts, NULL);
+    WinConditionVariable *entry = condition_variable_get(cv, 1);
+    if (!entry || !cs) {
+        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
+        return 0;
     }
+
+    pthread_mutex_lock(&entry->mutex);
+    u64 generation = entry->generation;
+    ++entry->waiters;
+    impl_LeaveCriticalSection(cs);
+
+    int rc = 0;
+    if (ms == 0) {
+        rc = ETIMEDOUT;
+    } else if (ms == 0xFFFFFFFFu) {
+        while (entry->generation == generation && rc == 0)
+            rc = pthread_cond_wait(&entry->condition, &entry->mutex);
+    } else {
+        struct timespec deadline;
+        if (calc_abs_deadline(&deadline, ms) != 0) rc = ETIMEDOUT;
+        while (entry->generation == generation && rc == 0)
+            rc = pthread_cond_timedwait(&entry->condition, &entry->mutex,
+                                        &deadline);
+    }
+    --entry->waiters;
+    pthread_mutex_unlock(&entry->mutex);
     impl_EnterCriticalSection(cs);
-    return 1;
-}
-static u64 __attribute__((ms_abi))
-impl_SleepConditionVariableSRW(u64 *cv, u64 *lock, u32 ms, u32 flags)
-{
-    (void)cv;(void)lock;(void)flags;
-    if (ms && ms != 0xFFFFFFFF) {
-        struct timespec ts = { ms/1000, (long)(ms%1000)*1000000L };
-        nanosleep(&ts, NULL);
+
+    if (rc == ETIMEDOUT) {
+        g_last_error = 1460; /* ERROR_TIMEOUT */
+        return 0;
+    }
+    if (rc != 0) {
+        g_last_error = 1;
+        return 0;
     }
     return 1;
 }
 
-/* ---- SRWLOCK ---- */
-static u64 __attribute__((ms_abi)) impl_InitializeSRWLock(u64 *l)
-    { if(l) *l=0; return 0; }
-static u64 __attribute__((ms_abi)) impl_AcquireSRWLockExclusive(u64 *l)
-    { if(l) *l=1; return 0; }
-static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockExclusive(u64 *l)
-    { if(l) *l=1; return 1; }
-static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockExclusive(u64 *l)
-    { if(l) *l=0; return 0; }
-static u64 __attribute__((ms_abi)) impl_AcquireSRWLockShared(u64 *l)
-    { (void)l; return 0; }
-static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockShared(u64 *l)
-    { (void)l; return 1; }
-static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockShared(u64 *l)
-    { (void)l; return 0; }
+/* ---- SRWLOCK ----
+ * Like Windows SRWLOCK, the guest-visible object is one pointer-sized word.
+ * Host pthread state is associated by address so PE objects can remain
+ * zero-initialized and retain their Windows layout. */
+#define MAX_SRW_LOCKS 256
+#define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1u
+
+typedef struct {
+    u64 *guest_address;
+    pthread_rwlock_t lock;
+    int used;
+} WinSrwLock;
+
+static WinSrwLock g_srw_locks[MAX_SRW_LOCKS];
+static pthread_mutex_t g_srw_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static WinSrwLock *srw_lock_get(u64 *address, int create)
+{
+    if (!address) return NULL;
+    pthread_mutex_lock(&g_srw_table_mutex);
+    WinSrwLock *free_slot = NULL;
+    for (size_t i = 0; i < MAX_SRW_LOCKS; ++i) {
+        WinSrwLock *entry = &g_srw_locks[i];
+        if (entry->used && entry->guest_address == address) {
+            pthread_mutex_unlock(&g_srw_table_mutex);
+            return entry;
+        }
+        if (!entry->used && !free_slot) free_slot = entry;
+    }
+    if (create && free_slot) {
+        memset(free_slot, 0, sizeof(*free_slot));
+        free_slot->guest_address = address;
+        if (pthread_rwlock_init(&free_slot->lock, NULL) == 0)
+            free_slot->used = 1;
+        else
+            free_slot = NULL;
+    }
+    pthread_mutex_unlock(&g_srw_table_mutex);
+    return create ? free_slot : NULL;
+}
+
+static u64 __attribute__((ms_abi)) impl_InitializeSRWLock(u64 *lock)
+{
+    if (!lock) return 0;
+    *lock = 0;
+    (void)srw_lock_get(lock, 1);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_AcquireSRWLockExclusive(u64 *lock)
+{
+    WinSrwLock *entry = srw_lock_get(lock, 1);
+    if (entry) pthread_rwlock_wrlock(&entry->lock);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockExclusive(u64 *lock)
+{
+    WinSrwLock *entry = srw_lock_get(lock, 1);
+    return entry && pthread_rwlock_trywrlock(&entry->lock) == 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockExclusive(u64 *lock)
+{
+    WinSrwLock *entry = srw_lock_get(lock, 0);
+    if (entry) pthread_rwlock_unlock(&entry->lock);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_AcquireSRWLockShared(u64 *lock)
+{
+    WinSrwLock *entry = srw_lock_get(lock, 1);
+    if (entry) pthread_rwlock_rdlock(&entry->lock);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockShared(u64 *lock)
+{
+    WinSrwLock *entry = srw_lock_get(lock, 1);
+    return entry && pthread_rwlock_tryrdlock(&entry->lock) == 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockShared(u64 *lock)
+{
+    WinSrwLock *entry = srw_lock_get(lock, 0);
+    if (entry) pthread_rwlock_unlock(&entry->lock);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_SleepConditionVariableSRW(u64 *cv, u64 *lock, u32 ms, u32 flags)
+{
+    if (flags & ~CONDITION_VARIABLE_LOCKMODE_SHARED) {
+        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+    WinConditionVariable *condition = condition_variable_get(cv, 1);
+    WinSrwLock *srw = srw_lock_get(lock, 1);
+    if (!condition || !srw) {
+        g_last_error = 87;
+        return 0;
+    }
+
+    pthread_mutex_lock(&condition->mutex);
+    u64 generation = condition->generation;
+    ++condition->waiters;
+    pthread_rwlock_unlock(&srw->lock);
+
+    int rc = 0;
+    if (ms == 0) {
+        rc = ETIMEDOUT;
+    } else if (ms == 0xFFFFFFFFu) {
+        while (condition->generation == generation && rc == 0)
+            rc = pthread_cond_wait(&condition->condition, &condition->mutex);
+    } else {
+        struct timespec deadline;
+        if (calc_abs_deadline(&deadline, ms) != 0) rc = ETIMEDOUT;
+        while (condition->generation == generation && rc == 0)
+            rc = pthread_cond_timedwait(&condition->condition,
+                                        &condition->mutex, &deadline);
+    }
+    --condition->waiters;
+    pthread_mutex_unlock(&condition->mutex);
+
+    if (flags & CONDITION_VARIABLE_LOCKMODE_SHARED)
+        pthread_rwlock_rdlock(&srw->lock);
+    else
+        pthread_rwlock_wrlock(&srw->lock);
+
+    if (rc == ETIMEDOUT) {
+        g_last_error = 1460; /* ERROR_TIMEOUT */
+        return 0;
+    }
+    if (rc != 0) {
+        g_last_error = 1;
+        return 0;
+    }
+    return 1;
+}
 
 /* ---- InitializeCriticalSectionEx / InitOnceExecuteOnce ---- */
 static u64 __attribute__((ms_abi))
@@ -3740,24 +4034,112 @@ static int fh_get(u64 h) {
     return -1;
 }
 
+static int resolve_windows_host_path(const char *name, char *output,
+                                     size_t output_size)
+{
+    if (!name || !output || output_size < 2) return 0;
+
+    char normalized[PATH_MAX];
+    size_t length = strlen(name);
+    if (length >= sizeof(normalized)) return 0;
+    for (size_t i = 0; i <= length; ++i)
+        normalized[i] = name[i] == '\\' ? '/' : name[i];
+
+    const char *input = normalized;
+    if (((input[0] >= 'A' && input[0] <= 'Z') ||
+         (input[0] >= 'a' && input[0] <= 'z')) && input[1] == ':')
+        input += 2;
+
+    char resolved[PATH_MAX];
+    size_t used = 0;
+    if (*input == '/') {
+        resolved[used++] = '/';
+        while (*input == '/') ++input;
+    }
+    resolved[used] = 0;
+
+    while (*input) {
+        const char *separator = strchr(input, '/');
+        size_t component_length = separator ? (size_t)(separator - input)
+                                            : strlen(input);
+        if (component_length == 0) {
+            input = separator ? separator + 1 : input + component_length;
+            continue;
+        }
+        if (component_length >= 256) return 0;
+
+        char component[256];
+        memcpy(component, input, component_length);
+        component[component_length] = 0;
+
+        char directory_path[PATH_MAX];
+        if (used == 0) strcpy(directory_path, ".");
+        else {
+            memcpy(directory_path, resolved, used);
+            directory_path[used] = 0;
+        }
+
+        DIR *directory = opendir(directory_path);
+        if (directory) {
+            struct dirent *entry;
+            while ((entry = readdir(directory)) != NULL) {
+                if (strcasecmp(entry->d_name, component) == 0) {
+                    size_t actual_length = strlen(entry->d_name);
+                    if (actual_length < sizeof(component))
+                        memcpy(component, entry->d_name, actual_length + 1);
+                    break;
+                }
+            }
+            closedir(directory);
+        }
+
+        size_t actual_length = strlen(component);
+        if (used && resolved[used - 1] != '/') {
+            if (used + 1 >= sizeof(resolved)) return 0;
+            resolved[used++] = '/';
+        }
+        if (used + actual_length >= sizeof(resolved)) return 0;
+        memcpy(resolved + used, component, actual_length);
+        used += actual_length;
+        resolved[used] = 0;
+
+        if (!separator) break;
+        input = separator + 1;
+        while (*input == '/') ++input;
+    }
+
+    if (used + 1 > output_size) return 0;
+    memcpy(output, resolved, used + 1);
+    return 1;
+}
+
 static u64 __attribute__((ms_abi))
 impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
                   u32 creation, u32 attrs, u64 tmpl)
 {
-    (void)sa;(void)attrs;(void)tmpl;(void)share;
+    (void)sa; (void)attrs; (void)tmpl; (void)share;
     if (!name) return INVALID_HANDLE_VALUE64;
+
+    char host_path[PATH_MAX];
+    if (!resolve_windows_host_path(name, host_path, sizeof(host_path))) {
+        g_last_error = 206;
+        return INVALID_HANDLE_VALUE64;
+    }
+
     int flags = 0;
     int mode  = 0644;
     if ((access & 0xC0000000) == 0xC0000000) flags = O_RDWR;
     else if (access & 0x80000000)            flags = O_RDONLY;
     else if (access & 0x40000000)            flags = O_WRONLY;
     else                                     flags = O_RDONLY;
-    if (creation == 2)       flags |= O_CREAT|O_TRUNC;  /* CREATE_ALWAYS */
-    else if (creation == 1)  flags |= O_CREAT|O_EXCL;   /* CREATE_NEW */
-    else if (creation == 4)  flags |= O_CREAT;          /* OPEN_ALWAYS */
-    /* creation==3 = OPEN_EXISTING: no extra flags */
-    int fd = open(name, flags, mode);
-    if (fd < 0) { g_last_error = 2; return INVALID_HANDLE_VALUE64; }
+    if (creation == 2)       flags |= O_CREAT|O_TRUNC;
+    else if (creation == 1)  flags |= O_CREAT|O_EXCL;
+    else if (creation == 4)  flags |= O_CREAT;
+    int fd = open(host_path, flags, mode);
+    if (fd < 0) {
+        g_last_error = errno == EACCES ? 5 : 2;
+        return INVALID_HANDLE_VALUE64;
+    }
     return fh_alloc(fd);
 }
 static u64 __attribute__((ms_abi))
@@ -3901,10 +4283,13 @@ static u64 __attribute__((ms_abi))
 impl_SetFilePointer(u64 h, s32 lo, s32 *hi, u32 method) {
     int fd = fh_get(h); if(fd<0) return INVALID_HANDLE_VALUE64;
     int whence = (method==0)?SEEK_SET:(method==1)?SEEK_CUR:SEEK_END;
-    off_t dist = lo;
-    if (hi) dist |= ((off_t)(u32)*hi << 32);
+    /* With a high-DWORD pointer the offset is the 64-bit pair (hi:lo) and lo is
+     * UNSIGNED; without it lo is a signed 32-bit LONG. */
+    off_t dist = hi ? (off_t)((((u64)(u32)*hi) << 32) | (u64)(u32)lo) : (off_t)lo;
     off_t r = lseek(fd, dist, whence);
+    if (r < 0) { g_last_error = (u32)errno; return 0xFFFFFFFFu; }
     if (hi) *hi = (s32)(r>>32);
+    g_last_error = 0;
     return (u64)(u32)r;
 }
 
@@ -4113,6 +4498,7 @@ static u64 __attribute__((ms_abi))
 impl_ReleaseDC(u64 hw, u64 dc) { (void)hw;(void)dc; return 1; }
 static u64 __attribute__((ms_abi))
 impl_SetCursor(u64 hc) { (void)hc; return 0; }
+
 static u64 __attribute__((ms_abi))
 impl_ShowCursor(s32 show) { (void)show; return 1; }
 static u64 __attribute__((ms_abi))
@@ -5178,10 +5564,14 @@ static void *g_fmod_category_vtable[16] = {
     (void *)beer_fmod_noop, (void *)beer_fmod_noop
 };
 
-static BeerFmodObject g_fmod_event_system = { g_fmod_plain_vtable, 1 };
-static BeerFmodObject g_fmod_core_system  = { g_fmod_plain_vtable, 1 };
-static BeerFmodObject g_fmod_project      = { g_fmod_project_vtable, 1 };
-static BeerFmodObject g_fmod_category     = { g_fmod_category_vtable, 1 };
+static BeerFmodObject g_fmod_event_system  = { g_fmod_plain_vtable, 1 };
+static BeerFmodObject g_fmod_core_system   = { g_fmod_plain_vtable, 1 };
+static BeerFmodObject g_fmod_project       = { g_fmod_project_vtable, 1 };
+static BeerFmodObject g_fmod_category      = { g_fmod_category_vtable, 1 };
+static BeerFmodObject g_fmod_event         = { g_fmod_plain_vtable, 1 };
+static BeerFmodObject g_fmod_channel_group = { g_fmod_plain_vtable, 1 };
+static BeerFmodObject g_fmod_dsp           = { g_fmod_plain_vtable, 1 };
+static BeerFmodObject g_fmod_connection    = { g_fmod_plain_vtable, 1 };
 
 static u64 __attribute__((ms_abi)) impl_FMOD_EventSystem_Create(BeerFmodObject **out)
 {
@@ -5283,10 +5673,307 @@ impl_FMOD_get_output_object(BeerFmodObject *self, BeerFmodObject **out)
 }
 
 static u64 __attribute__((ms_abi))
+impl_FMOD_EventSystem_getEvent(BeerFmodObject *self, const char *name,
+                               u32 mode, BeerFmodObject **out)
+{
+    (void)mode;
+    if (!self || !name || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_event;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_Event_getChannelGroup(BeerFmodObject *self, BeerFmodObject **out)
+{
+    if (!self || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_channel_group;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_System_createChannelGroup(BeerFmodObject *self, const char *name,
+                                    BeerFmodObject **out)
+{
+    (void)name;
+    if (!self || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_channel_group;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_ChannelGroup_getDSPHead(BeerFmodObject *self, BeerFmodObject **out)
+{
+    if (!self || !out) return BEER_FMOD_ERR_INVALID_PARAM;
+    *out = &g_fmod_dsp;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FMOD_DSP_addInput(BeerFmodObject *self, BeerFmodObject *input,
+                       BeerFmodObject **connection)
+{
+    if (!self || !input || !connection) return BEER_FMOD_ERR_INVALID_PARAM;
+    *connection = &g_fmod_connection;
+    return BEER_FMOD_OK;
+}
+
+static u64 __attribute__((ms_abi))
 impl_FMOD_ok(BeerFmodObject *self, u64 a, u64 b, u64 c)
 {
     (void)a; (void)b; (void)c;
     return self ? BEER_FMOD_OK : BEER_FMOD_ERR_INVALID_PARAM;
+}
+
+/* ---- DirectInput 8 -------------------------------------------------------
+ * Sekiro creates DirectInput after its first UI draws.  Returning S_OK from
+ * the generic import stub without writing ppvOut made the guest immediately
+ * dereference NULL.  These objects implement the documented COM layouts and
+ * expose a quiet keyboard/mouse backend until X11 event translation is wired
+ * into device state. */
+typedef struct BeerDirectInput BeerDirectInput;
+typedef struct BeerDirectInputDevice BeerDirectInputDevice;
+
+struct BeerDirectInput {
+    void **vtable;
+    _Atomic(u32) refs;
+};
+
+struct BeerDirectInputDevice {
+    void **vtable;
+    _Atomic(u32) refs;
+    u8 guid[16];
+    int acquired;
+};
+
+#define DI_OK 0
+#define DIENUM_STOP 0
+#define DIERR_INVALIDPARAM ((u64)(u32)0x80070057u)
+#define DIERR_OUTOFMEMORY  ((u64)(u32)0x8007000eu)
+
+static const u8 beer_iid_iunknown[16] = {
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x46
+};
+static const u8 beer_iid_directinput8a[16] = {
+    0x30,0x80,0x79,0xbf,0x3a,0x48,0xa2,0x4d,
+    0xaa,0x99,0x5d,0x64,0xed,0x36,0x97,0x00
+};
+static const u8 beer_iid_directinput8w[16] = {
+    0x31,0x80,0x79,0xbf,0x3a,0x48,0xa2,0x4d,
+    0xaa,0x99,0x5d,0x64,0xed,0x36,0x97,0x00
+};
+static const u8 beer_iid_directinputdevice8a[16] = {
+    0x80,0x10,0xd4,0x54,0x15,0xdc,0x33,0x48,
+    0xa4,0x1b,0x74,0x8f,0x73,0xa3,0x81,0x79
+};
+static const u8 beer_iid_directinputdevice8w[16] = {
+    0x81,0x10,0xd4,0x54,0x15,0xdc,0x33,0x48,
+    0xa4,0x1b,0x74,0x8f,0x73,0xa3,0x81,0x79
+};
+
+static int beer_guid_is(const void *value, const u8 expected[16])
+{
+    return value && memcmp(value, expected, 16) == 0;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_QueryInterface(BeerDirectInput *self, const void *iid, void **out)
+{
+    if (!out) return DIERR_INVALIDPARAM;
+    *out = NULL;
+    if (!self || (!beer_guid_is(iid, beer_iid_iunknown) &&
+                  !beer_guid_is(iid, beer_iid_directinput8a) &&
+                  !beer_guid_is(iid, beer_iid_directinput8w)))
+        return E_NOINTERFACE;
+    atomic_fetch_add(&self->refs, 1);
+    *out = self;
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi)) beer_dinput_AddRef(BeerDirectInput *self)
+{
+    return self ? atomic_fetch_add(&self->refs, 1) + 1 : 0;
+}
+
+static u64 __attribute__((ms_abi)) beer_dinput_Release(BeerDirectInput *self)
+{
+    if (!self) return 0;
+    u32 old = atomic_fetch_sub(&self->refs, 1);
+    if (old == 1) { free(self); return 0; }
+    return old - 1;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_QueryInterface(BeerDirectInputDevice *self,
+                                  const void *iid, void **out)
+{
+    if (!out) return DIERR_INVALIDPARAM;
+    *out = NULL;
+    if (!self || (!beer_guid_is(iid, beer_iid_iunknown) &&
+                  !beer_guid_is(iid, beer_iid_directinputdevice8a) &&
+                  !beer_guid_is(iid, beer_iid_directinputdevice8w)))
+        return E_NOINTERFACE;
+    atomic_fetch_add(&self->refs, 1);
+    *out = self;
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_AddRef(BeerDirectInputDevice *self)
+{
+    return self ? atomic_fetch_add(&self->refs, 1) + 1 : 0;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_Release(BeerDirectInputDevice *self)
+{
+    if (!self) return 0;
+    u32 old = atomic_fetch_sub(&self->refs, 1);
+    if (old == 1) { free(self); return 0; }
+    return old - 1;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_ok(BeerDirectInputDevice *self, u64 a, u64 b, u64 c)
+{
+    (void)a; (void)b; (void)c;
+    return self ? DI_OK : DIERR_INVALIDPARAM;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_Acquire(BeerDirectInputDevice *self)
+{
+    if (!self) return DIERR_INVALIDPARAM;
+    self->acquired = 1;
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_Unacquire(BeerDirectInputDevice *self)
+{
+    if (!self) return DIERR_INVALIDPARAM;
+    self->acquired = 0;
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
+                                  void *state)
+{
+    if (!self || !state || size == 0) return DIERR_INVALIDPARAM;
+    memset(state, 0, size);
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_GetDeviceData(BeerDirectInputDevice *self, u32 object_size,
+                                 void *data, u32 *count, u32 flags)
+{
+    (void)object_size; (void)data; (void)flags;
+    if (!self || !count) return DIERR_INVALIDPARAM;
+    *count = 0;
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_Poll(BeerDirectInputDevice *self)
+{
+    return self ? DI_OK : DIERR_INVALIDPARAM;
+}
+
+static void *g_dinput_device_vtable[32] = {
+    (void *)beer_dinput_device_QueryInterface,
+    (void *)beer_dinput_device_AddRef,
+    (void *)beer_dinput_device_Release,
+    (void *)beer_dinput_device_ok, /* GetCapabilities */
+    (void *)beer_dinput_device_ok, /* EnumObjects */
+    (void *)beer_dinput_device_ok, /* GetProperty */
+    (void *)beer_dinput_device_ok, /* SetProperty */
+    (void *)beer_dinput_device_Acquire,
+    (void *)beer_dinput_device_Unacquire,
+    (void *)beer_dinput_device_GetDeviceState,
+    (void *)beer_dinput_device_GetDeviceData,
+    (void *)beer_dinput_device_ok, /* SetDataFormat */
+    (void *)beer_dinput_device_ok, /* SetEventNotification */
+    (void *)beer_dinput_device_ok, /* SetCooperativeLevel */
+    (void *)beer_dinput_device_ok, /* GetObjectInfo */
+    (void *)beer_dinput_device_ok, /* GetDeviceInfo */
+    (void *)beer_dinput_device_ok, /* RunControlPanel */
+    (void *)beer_dinput_device_ok, /* Initialize */
+    (void *)beer_dinput_device_ok, (void *)beer_dinput_device_ok,
+    (void *)beer_dinput_device_ok, (void *)beer_dinput_device_ok,
+    (void *)beer_dinput_device_ok, (void *)beer_dinput_device_ok,
+    (void *)beer_dinput_device_ok, (void *)beer_dinput_device_Poll,
+    (void *)beer_dinput_device_ok, (void *)beer_dinput_device_ok,
+    (void *)beer_dinput_device_ok, (void *)beer_dinput_device_ok,
+    (void *)beer_dinput_device_ok, (void *)beer_dinput_device_ok
+};
+
+static u64 __attribute__((ms_abi))
+beer_dinput_CreateDevice(BeerDirectInput *self, const void *guid,
+                         BeerDirectInputDevice **out, void *outer)
+{
+    (void)outer;
+    if (!self || !guid || !out) return DIERR_INVALIDPARAM;
+    *out = NULL;
+    BeerDirectInputDevice *device = calloc(1, sizeof(*device));
+    if (!device) return DIERR_OUTOFMEMORY;
+    device->vtable = g_dinput_device_vtable;
+    atomic_init(&device->refs, 1);
+    memcpy(device->guid, guid, sizeof(device->guid));
+    *out = device;
+    fprintf(stderr, "[DINPUT] CreateDevice -> quiet device %p\n", (void *)device);
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_EnumDevices(BeerDirectInput *self, u32 type, void *callback,
+                        void *context, u32 flags)
+{
+    (void)type; (void)callback; (void)context; (void)flags;
+    return self ? DI_OK : DIERR_INVALIDPARAM;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_ok(BeerDirectInput *self, u64 a, u64 b, u64 c)
+{
+    (void)a; (void)b; (void)c;
+    return self ? DI_OK : DIERR_INVALIDPARAM;
+}
+
+static void *g_dinput_vtable[11] = {
+    (void *)beer_dinput_QueryInterface,
+    (void *)beer_dinput_AddRef,
+    (void *)beer_dinput_Release,
+    (void *)beer_dinput_CreateDevice,
+    (void *)beer_dinput_EnumDevices,
+    (void *)beer_dinput_ok, /* GetDeviceStatus */
+    (void *)beer_dinput_ok, /* RunControlPanel */
+    (void *)beer_dinput_ok, /* Initialize */
+    (void *)beer_dinput_ok, /* FindDevice */
+    (void *)beer_dinput_ok, /* EnumDevicesBySemantics */
+    (void *)beer_dinput_ok  /* ConfigureDevices */
+};
+
+static u64 __attribute__((ms_abi))
+impl_DirectInput8Create(u64 instance, u32 version, const void *iid,
+                        BeerDirectInput **out, void *outer)
+{
+    (void)instance;
+    if (!out) return DIERR_INVALIDPARAM;
+    *out = NULL;
+    if (outer || version < 0x0800 ||
+        (!beer_guid_is(iid, beer_iid_directinput8a) &&
+         !beer_guid_is(iid, beer_iid_directinput8w)))
+        return DIERR_INVALIDPARAM;
+    BeerDirectInput *object = calloc(1, sizeof(*object));
+    if (!object) return DIERR_OUTOFMEMORY;
+    object->vtable = g_dinput_vtable;
+    atomic_init(&object->refs, 1);
+    *out = object;
+    fprintf(stderr, "[DINPUT] DirectInput8Create(version=0x%x) -> %p\n",
+            version, (void *)object);
+    return DI_OK;
 }
 
 /* ---- CommandLineToArgvW ---- */
@@ -5451,6 +6138,8 @@ static ImplEntry g_impls[] = {
     {"CoInitializeEx",                        (ImplFn)impl_CoInitializeEx},
     {"CoUninitialize",                        (ImplFn)impl_CoUninitialize},
     {"CoCreateInstance",                      (ImplFn)impl_CoCreateInstance},
+    /* DirectInput */
+    {"DirectInput8Create",                    (ImplFn)impl_DirectInput8Create},
     /* FMOD Ex: coherent silent event/core objects.  These decorated C++
      * exports are the exact names imported by Sekiro's FMOD Ex build. */
     {"FMOD_EventSystem_Create", (ImplFn)impl_FMOD_EventSystem_Create},
@@ -5465,6 +6154,18 @@ static ImplEntry g_impls[] = {
     {"?setMediaPath@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBD@Z", (ImplFn)impl_FMOD_ok},
     {"?getCategory@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDPEAPEAVEventCategory@2@@Z", (ImplFn)impl_FMOD_EventSystem_getCategory},
     {"?getCategoryByIndex@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@HPEAPEAVEventCategory@2@@Z", (ImplFn)impl_FMOD_EventSystem_getCategoryByIndex},
+    {"?getEvent@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDIPEAPEAVEvent@2@@Z", (ImplFn)impl_FMOD_EventSystem_getEvent},
+    {"?start@Event@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", (ImplFn)impl_FMOD_ok},
+    {"?getChannelGroup@Event@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAVChannelGroup@2@@Z", (ImplFn)impl_FMOD_Event_getChannelGroup},
+    {"?createChannelGroup@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDPEAPEAVChannelGroup@2@@Z", (ImplFn)impl_FMOD_System_createChannelGroup},
+    {"?getDSPHead@ChannelGroup@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAVDSP@2@@Z", (ImplFn)impl_FMOD_ChannelGroup_getDSPHead},
+    {"?addInput@DSP@FMOD@@QEAA?AW4FMOD_RESULT@@PEAV12@PEAPEAVDSPConnection@2@@Z", (ImplFn)impl_FMOD_DSP_addInput},
+    {"?getNumGroups@ChannelGroup@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
+    {"?setLevels@DSPConnection@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_SPEAKER@@PEAMH@Z", (ImplFn)impl_FMOD_ok},
+    {"?disconnectAll@DSP@FMOD@@QEAA?AW4FMOD_RESULT@@_N0@Z", (ImplFn)impl_FMOD_ok},
+    {"?setVolume@ChannelGroup@FMOD@@QEAA?AW4FMOD_RESULT@@M@Z", (ImplFn)impl_FMOD_ok},
+    {"?addGroup@ChannelGroup@FMOD@@QEAA?AW4FMOD_RESULT@@PEAV12@@Z", (ImplFn)impl_FMOD_ok},
+    {"?set3DNumListeners@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@H@Z", (ImplFn)impl_FMOD_ok},
     {"?getNumProjects@EventSystem@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
     {"?getNumDrivers@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
     {"?getSoftwareChannels@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", (ImplFn)impl_FMOD_get_int},
@@ -5529,6 +6230,7 @@ static ImplEntry g_impls[] = {
     {"WaitForMultipleObjects",                (ImplFn)impl_WaitForMultipleObjects},
     {"SetEvent",                              (ImplFn)impl_SetEvent},
     {"ResetEvent",                            (ImplFn)impl_ResetEvent},
+    {"PulseEvent",                            (ImplFn)impl_PulseEvent},
     /* Mutex */
     {"CreateMutexA",                          (ImplFn)impl_CreateMutexA},
     {"CreateMutexW",                          (ImplFn)impl_CreateMutexW},

@@ -58,6 +58,7 @@ typedef struct {
     int (*MoveResizeWindow)(Display *, Window, int, int, unsigned int, unsigned int);
     int (*StoreName)(Display *, Window, const char *);
     Atom (*InternAtom)(Display *, const char *, Bool);
+    int (*SendEvent)(Display *, Window, Bool, long, XEvent *);
     int (*SetWMProtocols)(Display *, Window, Atom *, int);
     int (*SelectInput)(Display *, Window, long);
     int (*Pending)(Display *);
@@ -104,6 +105,7 @@ static int initialize_locked(void)
     X11_LOAD(MoveResizeWindow, "XMoveResizeWindow");
     X11_LOAD(StoreName, "XStoreName");
     X11_LOAD(InternAtom, "XInternAtom");
+    X11_LOAD(SendEvent, "XSendEvent");
     X11_LOAD(SetWMProtocols, "XSetWMProtocols");
     X11_LOAD(SelectInput, "XSelectInput");
     X11_LOAD(Pending, "XPending");
@@ -197,6 +199,42 @@ int xwayland_window_show(int visible)
     g_x11.Flush(g_x11.display);
     pthread_mutex_unlock(&g_x11.lock);
     return 1;
+}
+
+int xwayland_window_set_fullscreen(int fullscreen)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    if (!g_x11.display || !g_x11.window) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 0;
+    }
+
+    Atom wm_state = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE", 0);
+    Atom wm_fullscreen = g_x11.InternAtom(
+        g_x11.display, "_NET_WM_STATE_FULLSCREEN", 0);
+    if (!wm_state || !wm_fullscreen) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 0;
+    }
+
+    XEvent event;
+    memset(&event, 0, sizeof(event));
+    XClientMessageEvent *client = (XClientMessageEvent *)&event;
+    client->type = 33; /* ClientMessage */
+    client->display = g_x11.display;
+    client->window = g_x11.window;
+    client->message_type = wm_state;
+    client->format = 32;
+    client->data.l[0] = fullscreen ? 1 : 0; /* _NET_WM_STATE_ADD/REMOVE */
+    client->data.l[1] = (long)wm_fullscreen;
+    client->data.l[3] = 1; /* normal application source */
+
+    Window root = g_x11.DefaultRootWindow(g_x11.display);
+    long mask = (1L << 20) | (1L << 19); /* SubstructureRedirect/Notify */
+    int ok = g_x11.SendEvent(g_x11.display, root, 0, mask, &event) != 0;
+    if (ok) g_x11.Flush(g_x11.display);
+    pthread_mutex_unlock(&g_x11.lock);
+    return ok;
 }
 
 int xwayland_window_move_resize(int x, int y, int width, int height,
