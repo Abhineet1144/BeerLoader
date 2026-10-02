@@ -17,6 +17,8 @@ typedef enum {
     COM_TYPE_RESOURCE = 4,
     COM_TYPE_VIEW = 5,
     COM_TYPE_STATE = 6,
+    COM_TYPE_SHADER = 7,
+    COM_TYPE_INPUT_LAYOUT = 8,
 } ComObjectType;
 
 typedef struct {
@@ -567,49 +569,133 @@ static HRESULT __attribute__((ms_abi)) device_create_buffer(ID3D11Device* this, 
     return S_OK;
 }
 
+typedef enum {
+    BEER_SHADER_VERTEX,
+    BEER_SHADER_GEOMETRY,
+    BEER_SHADER_PIXEL,
+    BEER_SHADER_COMPUTE,
+} BeerD3D11ShaderKind;
+
+typedef struct {
+    void **vtable;
+    ID3D11Device *device;
+    BeerD3D11ShaderKind kind;
+    size_t bytecode_size;
+    uint8_t bytecode[];
+} BeerD3D11Shader;
+
+typedef struct {
+    void **vtable;
+    ID3D11Device *device;
+    uint32_t element_count;
+    size_t signature_size;
+    uint8_t signature[];
+} BeerD3D11InputLayout;
+
+static void *g_child_vtable[7];
+
+static HRESULT __attribute__((ms_abi)) child_query_interface(
+    void *object, REFIID riid, LPVOID *out)
+{
+    static const uint8_t iid_iunknown[16] = {
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x46
+    };
+    if (!out) return (HRESULT)0x80070057;
+    *out = NULL;
+    if (!iid_equal(riid, iid_iunknown)) return E_NOINTERFACE;
+    *out = object;
+    com_addref(object);
+    return S_OK;
+}
+
+static void __attribute__((ms_abi)) child_get_device(
+    BeerD3D11Shader *object, ID3D11Device **device)
+{
+    if (!device) return;
+    *device = object->device;
+    if (*device) device_addref(*device);
+}
+
+static void init_child_vtable(void)
+{
+    if (g_child_vtable[0]) return;
+    g_child_vtable[0] = (void *)child_query_interface;
+    g_child_vtable[1] = (void *)com_addref;
+    g_child_vtable[2] = (void *)com_release;
+    g_child_vtable[3] = (void *)child_get_device;
+    g_child_vtable[4] = (void *)resource_private_data_unsupported;
+    g_child_vtable[5] = (void *)resource_private_data_unsupported;
+    g_child_vtable[6] = (void *)resource_private_data_unsupported;
+}
+
+static HRESULT create_shader(ID3D11Device *device, const void *bytecode,
+    size_t bytecode_size, void **output, BeerD3D11ShaderKind kind)
+{
+    if (!output) return (HRESULT)0x80070057;
+    *output = NULL;
+    if (!bytecode || !bytecode_size || bytecode_size > SIZE_MAX - sizeof(BeerD3D11Shader))
+        return (HRESULT)0x80070057;
+    init_child_vtable();
+    BeerD3D11Shader *shader = com_alloc(sizeof(*shader) + bytecode_size,
+        COM_TYPE_SHADER, 0);
+    if (!shader) return (HRESULT)0x8007000e;
+    shader->vtable = g_child_vtable;
+    shader->device = device;
+    shader->kind = kind;
+    shader->bytecode_size = bytecode_size;
+    memcpy(shader->bytecode, bytecode, bytecode_size);
+    *output = shader;
+    static _Atomic(uint32_t) calls;
+    uint32_t call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 32)
+        fprintf(stderr, "[D3D11 TRACE] CreateShader #%u kind=%u bytes=%zu object=%p\n",
+                call, (unsigned)kind, bytecode_size, (void *)shader);
+    return S_OK;
+}
+
 static HRESULT __attribute__((ms_abi)) device_create_input_layout(ID3D11Device* this, void* pInputElementDescs, uint32_t NumElements, void* pShaderBytecode, size_t BytecodeLength, void** ppInputLayout) {
-    if (!ppInputLayout) return E_NOINTERFACE;
-    void* layout = malloc(32);
-    if (!layout) return 0x80000002;
-    memset(layout, 0, 32);
+    (void)pInputElementDescs;
+    if (!ppInputLayout) return (HRESULT)0x80070057;
+    *ppInputLayout = NULL;
+    if ((!pShaderBytecode && BytecodeLength) || BytecodeLength > SIZE_MAX - sizeof(BeerD3D11InputLayout))
+        return (HRESULT)0x80070057;
+    init_child_vtable();
+    BeerD3D11InputLayout *layout = com_alloc(sizeof(*layout) + BytecodeLength,
+        COM_TYPE_INPUT_LAYOUT, 0);
+    if (!layout) return (HRESULT)0x8007000e;
+    layout->vtable = g_child_vtable;
+    layout->device = this;
+    layout->element_count = NumElements;
+    layout->signature_size = BytecodeLength;
+    if (BytecodeLength) memcpy(layout->signature, pShaderBytecode, BytecodeLength);
     *ppInputLayout = layout;
+    static _Atomic(uint32_t) calls;
+    uint32_t call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 24)
+        fprintf(stderr, "[D3D11 TRACE] CreateInputLayout #%u elements=%u bytes=%zu object=%p\n",
+                call, NumElements, BytecodeLength, (void *)layout);
     return S_OK;
 }
 
 static HRESULT __attribute__((ms_abi)) device_create_vertex_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppVertexShader) {
-    if (!ppVertexShader) return E_NOINTERFACE;
-    void* shader = malloc(32);
-    if (!shader) return 0x80000002;
-    memset(shader, 0, 32);
-    *ppVertexShader = shader;
-    return S_OK;
+    (void)pClassLinkage;
+    return create_shader(this, pShaderBytecode, BytecodeLength, ppVertexShader, BEER_SHADER_VERTEX);
 }
 
 static HRESULT __attribute__((ms_abi)) device_create_pixel_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppPixelShader) {
-    if (!ppPixelShader) return E_NOINTERFACE;
-    void* shader = malloc(32);
-    if (!shader) return 0x80000002;
-    memset(shader, 0, 32);
-    *ppPixelShader = shader;
-    return S_OK;
+    (void)pClassLinkage;
+    return create_shader(this, pShaderBytecode, BytecodeLength, ppPixelShader, BEER_SHADER_PIXEL);
 }
 
 static HRESULT __attribute__((ms_abi)) device_create_geometry_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppGeometryShader) {
-    if (!ppGeometryShader) return E_NOINTERFACE;
-    void* shader = malloc(32);
-    if (!shader) return 0x80000002;
-    memset(shader, 0, 32);
-    *ppGeometryShader = shader;
-    return S_OK;
+    (void)pClassLinkage;
+    return create_shader(this, pShaderBytecode, BytecodeLength, ppGeometryShader, BEER_SHADER_GEOMETRY);
 }
 
 static HRESULT __attribute__((ms_abi)) device_create_compute_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppComputeShader) {
-    if (!ppComputeShader) return E_NOINTERFACE;
-    void* shader = malloc(32);
-    if (!shader) return 0x80000002;
-    memset(shader, 0, 32);
-    *ppComputeShader = shader;
-    return S_OK;
+    (void)pClassLinkage;
+    return create_shader(this, pShaderBytecode, BytecodeLength, ppComputeShader, BEER_SHADER_COMPUTE);
 }
 
 typedef enum {
@@ -1016,8 +1102,18 @@ static uint32_t __attribute__((ms_abi)) context_release(ID3D11DeviceContext* thi
     return com_release(this);
 }
 
+static void trace_binding(const char *name, const void *object, uint32_t count)
+{
+    static _Atomic(uint32_t) calls;
+    uint32_t call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 80)
+        fprintf(stderr, "[D3D11 BIND] %s #%u object=%p count=%u\n",
+                name, call, object, count);
+}
+
 static void __attribute__((ms_abi)) context_ia_set_input_layout(ID3D11DeviceContext* this, void* pInputLayout) {
-    /* Stub - do nothing */
+    (void)this;
+    trace_binding("IASetInputLayout", pInputLayout, pInputLayout ? 1 : 0);
 }
 
 static void __attribute__((ms_abi)) context_ia_set_vertex_buffers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumBuffers, void* ppVertexBuffers, void* pStrides, void* pOffsets) {
@@ -1033,7 +1129,8 @@ static void __attribute__((ms_abi)) context_ia_set_primitive_topology(ID3D11Devi
 }
 
 static void __attribute__((ms_abi)) context_vs_set_shader(ID3D11DeviceContext* this, void* pVertexShader, void* ppClassInstances, uint32_t NumClassInstances) {
-    /* Stub - do nothing */
+    (void)this; (void)ppClassInstances;
+    trace_binding("VSSetShader", pVertexShader, NumClassInstances);
 }
 
 static void __attribute__((ms_abi)) context_vs_set_constant_buffers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumBuffers, void* ppConstantBuffers) {
@@ -1041,7 +1138,8 @@ static void __attribute__((ms_abi)) context_vs_set_constant_buffers(ID3D11Device
 }
 
 static void __attribute__((ms_abi)) context_ps_set_shader(ID3D11DeviceContext* this, void* pPixelShader, void* ppClassInstances, uint32_t NumClassInstances) {
-    /* Stub - do nothing */
+    (void)this; (void)ppClassInstances;
+    trace_binding("PSSetShader", pPixelShader, NumClassInstances);
 }
 
 static void __attribute__((ms_abi)) context_ps_set_constant_buffers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumBuffers, void* ppConstantBuffers) {
@@ -1057,7 +1155,8 @@ static void __attribute__((ms_abi)) context_ps_set_samplers(ID3D11DeviceContext*
 }
 
 static void __attribute__((ms_abi)) context_gs_set_shader(ID3D11DeviceContext* this, void* pGeometryShader, void* ppClassInstances, uint32_t NumClassInstances) {
-    /* Stub - do nothing */
+    (void)this; (void)ppClassInstances;
+    trace_binding("GSSetShader", pGeometryShader, NumClassInstances);
 }
 
 static void __attribute__((ms_abi)) context_draw_indexed(ID3D11DeviceContext* this, uint32_t IndexCount, uint32_t StartIndexLocation, int32_t BaseVertexLocation) {
@@ -1075,6 +1174,49 @@ static void __attribute__((ms_abi)) context_draw(ID3D11DeviceContext* this, uint
     if (call <= 8)
         fprintf(stderr, "[D3D11 TRACE] Draw #%u vertices=%u start=%u\n",
                 call, VertexCount, StartVertexLocation);
+    (void)this;
+}
+
+static void __attribute__((ms_abi)) context_draw_indexed_instanced(
+    ID3D11DeviceContext *this, uint32_t index_count, uint32_t instance_count,
+    uint32_t start_index, int32_t base_vertex, uint32_t start_instance)
+{
+    static _Atomic(uint32_t) calls;
+    uint32_t call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 16)
+        fprintf(stderr, "[D3D11 TRACE] DrawIndexedInstanced #%u indices=%u instances=%u start=%u base=%d firstInstance=%u\n",
+                call, index_count, instance_count, start_index, base_vertex, start_instance);
+    (void)this;
+}
+
+static void __attribute__((ms_abi)) context_draw_instanced(
+    ID3D11DeviceContext *this, uint32_t vertex_count, uint32_t instance_count,
+    uint32_t start_vertex, uint32_t start_instance)
+{
+    static _Atomic(uint32_t) calls;
+    uint32_t call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 16)
+        fprintf(stderr, "[D3D11 TRACE] DrawInstanced #%u vertices=%u instances=%u start=%u firstInstance=%u\n",
+                call, vertex_count, instance_count, start_vertex, start_instance);
+    (void)this;
+}
+
+static void __attribute__((ms_abi)) context_draw_auto(ID3D11DeviceContext *this)
+{
+    static _Atomic(uint32_t) calls;
+    uint32_t call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 16) fprintf(stderr, "[D3D11 TRACE] DrawAuto #%u\n", call);
+    (void)this;
+}
+
+static void __attribute__((ms_abi)) context_draw_indirect(
+    ID3D11DeviceContext *this, void *buffer, uint32_t offset)
+{
+    static _Atomic(uint32_t) calls;
+    uint32_t call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 16)
+        fprintf(stderr, "[D3D11 TRACE] DrawIndirect #%u buffer=%p offset=%u\n",
+                call, buffer, offset);
     (void)this;
 }
 
@@ -1339,6 +1481,14 @@ static void __attribute__((ms_abi)) context_unmap(
     (void)this; (void)pResource; (void)Subresource;
 }
 
+static void __attribute__((ms_abi)) context_clear_state(ID3D11DeviceContext *this)
+{
+    static _Atomic(uint32_t) calls;
+    uint32_t call = atomic_fetch_add(&calls, 1) + 1;
+    if (call <= 16) fprintf(stderr, "[D3D11 TRACE] ClearState #%u\n", call);
+    (void)this;
+}
+
 static void __attribute__((ms_abi)) context_flush(ID3D11DeviceContext* this) {
     /* Stub - do nothing */
 }
@@ -1373,9 +1523,14 @@ static void init_context_vtable(void)
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_GS_SET_SHADER] = (void *)context_gs_set_shader;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_DRAW_INDEXED] = (void *)context_draw_indexed;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_DRAW] = (void *)context_draw;
+    g_context_vtable.slots[D3D11_CONTEXT_SLOT_DRAW_INDEXED_INSTANCED] = (void *)context_draw_indexed_instanced;
+    g_context_vtable.slots[D3D11_CONTEXT_SLOT_DRAW_INSTANCED] = (void *)context_draw_instanced;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_BEGIN] = (void *)context_begin;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_END] = (void *)context_end;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_GET_DATA] = (void *)context_get_data;
+    g_context_vtable.slots[D3D11_CONTEXT_SLOT_DRAW_AUTO] = (void *)context_draw_auto;
+    g_context_vtable.slots[D3D11_CONTEXT_SLOT_DRAW_INDEXED_INSTANCED_INDIRECT] = (void *)context_draw_indirect;
+    g_context_vtable.slots[D3D11_CONTEXT_SLOT_DRAW_INSTANCED_INDIRECT] = (void *)context_draw_indirect;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_DISPATCH] = (void *)context_dispatch;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_DISPATCH_INDIRECT] = (void *)context_dispatch_indirect;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_OM_SET_RENDER_TARGETS] = (void *)context_om_set_render_targets;
@@ -1393,6 +1548,7 @@ static void init_context_vtable(void)
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_EXECUTE_COMMAND_LIST] = (void *)context_execute_command_list;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_MAP] = (void *)context_map;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_UNMAP] = (void *)context_unmap;
+    g_context_vtable.slots[D3D11_CONTEXT_SLOT_CLEAR_STATE] = (void *)context_clear_state;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_FLUSH] = (void *)context_flush;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_FINISH_COMMAND_LIST] = (void *)context_finish_command_list;
 }
