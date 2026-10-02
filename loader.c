@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 
 /* D3D11 COM object stubs from graphics/ */
 #include "d3d11_compat.h"
+#include "xwayland_backend.h"
 
 /* arch_prctl – set GS base so gs:[0x30] / gs:[0x60] work as TEB/PEB */
 #ifndef ARCH_SET_GS
@@ -141,6 +143,7 @@ static u64 g_stale_guest_stack_rip = 0;
 static u32 g_stale_guest_stack_hits = 0;
 static u64 g_bad_stack_operand = 0;
 static u32 g_bad_stack_operand_hits = 0;
+static u32 g_bad_callback_range_hits = 0;
 
 /* Cross-site dead-cycle detector: the various named recovery gates each
  * reset their own "consecutive same bucket" counters whenever the fault
@@ -529,6 +532,7 @@ static u64 g_entry_rsp = 0;
 static u64 g_entry_rsp_limit = 0;
 static u64 g_guest_stack_low = 0;
 static u64 g_guest_stack_high = 0;
+static void __attribute__((noreturn)) guest_exit_stub(void);
 
 /* Diagnostics: track which path beer_dispatch_trampoline takes */
 __thread int g_trampoline_path = 0;  /* 0=outer, 1=nested */
@@ -569,19 +573,18 @@ static void seed_guest_entry_frame(u64 ret_target)
 {
     if (!g_entry_rsp) return;
     if (!ret_target)
-        ret_target = guest_resume_rip();
+        ret_target = (u64)guest_exit_stub;
 
-    /* The helper at 0x235a636..0x235a654 does:
-     *     mov rbx, [rsp+0x5d0]
-     *     add rsp, 0x5c0
-     *     pop rbp
-     *     ret
-     * so the valid caller frame is anchored at the current %rsp and the saved
-     * return address lives at [rsp+0x5c8]. We seed the frame at that real
-     * caller-base, not at a synthetic offset that would make the next RET pop a
-     * stale value. */
+    /* AddressOfEntryPoint is entered as a normal Win64 callee: RSP is 8 mod 16
+     * and [RSP] is its caller's return address.  The old synthetic frame left
+     * [RSP] zero and placed a startup continuation only at RSP+0x5c8.  Once the
+     * entry point completed normally, RET therefore loaded both RIP and RSP
+     * from zeroed context.  Keep the legacy helper slots for narrowly validated
+     * recovery paths, but make the architectural return slot authoritative. */
     for (u64 p = g_entry_rsp; p + 8 <= g_entry_rsp + 0x1000; p += 8)
         *(u64 *)p = 0;
+
+    *(u64 *)g_entry_rsp = ret_target;
 
     u64 rbp_slot = g_entry_rsp + 0x5c0;
     u64 ret_slot = g_entry_rsp + 0x5c8;
@@ -796,7 +799,7 @@ static int detect_stuck_cycle(int *out_period, int *out_repeats)
 
     u32 n = g_cycle_hist_n < CYCLE_HIST_LEN ? g_cycle_hist_n : CYCLE_HIST_LEN;
 
-    for (int period = 2; period <= CYCLE_HIST_PERIOD_MAX; period++) {
+    for (int period = 1; period <= CYCLE_HIST_PERIOD_MAX; period++) {
         u32 need = (u32)(period * CYCLE_HIST_MIN_REPEATS);
         if (need > n) continue;
 
@@ -981,6 +984,7 @@ __asm__(
     "    jb 1f\n"                           /* (rsp - base) < SIZE => already on it */
     "    mov %rsp, %gs:0xA0\n"              /* Save to TEB SavedGuestRsp @ 0xA0 */
     "    mov %gs:0xB0, %rsp\n"              /* Switch to HostCallStackTop from TEB @ 0xB0 */
+    "    and $-16, %rsp\n"                  /* Guarantee Windows ABI pre-call alignment */
     "    lea g_impl_targets(%rip), %r11\n"
     "    mov (%r11,%r10,8), %rax\n"
     /* Windows x64 ABI requires the CALLER to reserve 32 bytes of "shadow
@@ -1005,11 +1009,16 @@ __asm__(
     ".endr\n"
     "    call *%r10\n"
     "    add $0x80, %rsp\n"
-    "    lea get_saved_guest_rsp_from_teb(%rip), %r11\n"  /* Call helper */
-    "    call *%r11\n"
-    "    mov %rax, %rsp\n"                  /* Restore guest RSP */
-    "    pop %rax\n"                        /* Pop return address from guest stack */
-    "    jmp *%rax\n"                       /* Jump to return address */
+    /* Preserve the implementation's RAX return value. Reading SavedGuestRsp
+     * directly from the TEB needs no helper call, and R11 is volatile under the
+     * Windows x64 ABI so it can carry the guest continuation without changing
+     * any observable nonvolatile state. The old helper returned guest RSP in
+     * RAX and the subsequent `pop %rax` replaced every API result with the
+     * caller's continuation address. */
+    "    mov %gs:0xA0, %rsp\n"
+    "    movq $0, %gs:0xA0\n"              /* No outer dispatch remains active after restore */
+    "    pop %r11\n"
+    "    jmp *%r11\n"
     "1:\n"                                /* nested: keep using the current (already-switched) rsp */
     "    lea g_impl_targets(%rip), %r11\n"
     "    mov (%r11,%r10,8), %rax\n"
@@ -1510,6 +1519,39 @@ impl_RtlVirtualUnwind(u32 type, u64 base, u64 pc, u64 func,
 
 /* ---- Module handles ---- */
 static const char *g_exe_path = NULL;
+static char g_exe_path_storage[4096];
+
+/* A Windows game launcher starts the process with a stable executable path and,
+ * in Sekiro's case, the installation directory as its current directory.  Host
+ * relative opens such as Data1.bhd must therefore be resolved from the game
+ * directory, not from the loader's build directory. */
+static const char *configure_guest_process_path(const char *exe)
+{
+    char resolved[sizeof(g_exe_path_storage)];
+    if (!exe || !realpath(exe, resolved))
+        return NULL;
+
+    size_t len = strlen(resolved);
+    if (len >= sizeof(g_exe_path_storage)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(g_exe_path_storage, resolved, len + 1);
+
+    char directory[sizeof(g_exe_path_storage)];
+    memcpy(directory, resolved, len + 1);
+    char *slash = strrchr(directory, '/');
+    if (!slash) {
+        errno = EINVAL;
+        return NULL;
+    }
+    *slash = 0;
+    if (chdir(directory) != 0)
+        return NULL;
+
+    g_exe_path = g_exe_path_storage;
+    return g_exe_path;
+}
 
 /* Fake handles for Windows system DLLs we emulate */
 #define HMOD_EXE     ((u64)g_img)
@@ -1594,6 +1636,7 @@ impl_GetModuleFileNameA(u64 hmod, char *buf, u32 sz)
 /* Forward declarations needed by GetProcAddress */
 typedef u64 (*ImplFn)(void);
 static ImplFn find_impl(const char *name);  /* defined later */
+static __thread u32 g_last_error;
 
 /* GetProcAddress – look up in our stub name table, then impl table */
 static u64 __attribute__((ms_abi))
@@ -1620,24 +1663,14 @@ impl_GetProcAddress(u64 hmod, const char *procname)
         }
     }
 
-    /* Do not return NULL for unresolved dynamic lookups.
-     * Some engine paths assume a callable pointer and crash on NULL. */
-    if (g_nstubs < MAX_STUBS) {
-        size_t n = strlen(procname);
-        char *dyn = malloc(n + 5); /* "dyn!" + name + NUL */
-        if (dyn) {
-            memcpy(dyn, "dyn!", 4);
-            memcpy(dyn + 4, procname, n + 1);
-            g_snames[g_nstubs] = dyn;
-            emit_thunk(g_nstubs);
-            u64 addr = (u64)(g_tramp + g_nstubs * THUNK_SZ);
-            g_nstubs++;
-            fprintf(stderr, "[IMPL] GetProcAddress(\"%s\") -> dynamic stub\n", procname);
-            return addr;
-        }
-    }
-
-    fprintf(stderr, "[IMPL] GetProcAddress(\"%s\") -> NULL (stub table full/OOM)\n", procname);
+    /* Windows returns NULL with ERROR_PROC_NOT_FOUND when the requested export
+     * is absent.  Returning a generic callable thunk invents an export and lets
+     * callers enter an optional subsystem with no implementation behind it.
+     * In particular, Sekiro treated a fabricated compatInit export as present,
+     * called it, and later used subsystem state that had never been created. */
+    g_last_error = 127; /* ERROR_PROC_NOT_FOUND */
+    fprintf(stderr, "[IMPL] GetProcAddress(0x%lx, \"%s\") -> NULL (export not found)\n",
+            hmod, procname);
     return 0;
 }
 
@@ -1919,7 +1952,6 @@ impl_QueryPerformanceFrequency(u64 *out)
     { if (out) *out = 1000000000ULL; return 1; }
 
 /* ---- Error ---- */
-static __thread u32 g_last_error = 0;
 static u64 __attribute__((ms_abi)) impl_GetLastError(void)  { return g_last_error; }
 static u64 __attribute__((ms_abi)) impl_SetLastError(u32 e) { g_last_error = e; return 0; }
 
@@ -1952,12 +1984,45 @@ static u64 __attribute__((ms_abi)) impl_UnhandledExceptionFilter(u64 ep) {
     u32 code = 0;
     fprintf(stderr, "[WARN] UnhandledExceptionFilter");
     if (ep) {
-        /* EXCEPTION_POINTERS = { EXCEPTION_RECORD*, CONTEXT* } */
+        /* EXCEPTION_POINTERS = { EXCEPTION_RECORD*, CONTEXT* }.  Preserve the
+         * guest's failure evidence before TerminateProcess ends the run: AMD64
+         * CONTEXT stores RSP/R14/RIP at 0x98/0xe8/0xf8, while an
+         * EXCEPTION_RECORD64 stores NumberParameters at 0x18 and its 15
+         * ULONG_PTR values at 0x20. */
         u64 *ptrs = (u64*)ep;
-        if (ptrs[0]) {
-            code = *(u32*)ptrs[0];
-            fprintf(stderr, ": code=0x%08x", code);
+        const u8 *record = (const u8 *)(uintptr_t)ptrs[0];
+        const u8 *context = (const u8 *)(uintptr_t)ptrs[1];
+        if (record) {
+            code = *(const u32 *)(record + 0x00);
+            u32 parameter_count = *(const u32 *)(record + 0x18);
+            if (parameter_count > 15) parameter_count = 15;
+            fprintf(stderr, ": code=0x%08x address=0x%lx params=%u",
+                    code, *(const u64 *)(record + 0x10), parameter_count);
+            for (u32 i = 0; i < parameter_count; i++)
+                fprintf(stderr, " p%u=0x%lx", i,
+                        *(const u64 *)(record + 0x20 + (size_t)i * 8));
             /* 0xE06D7363 = C++ exception, 0xC0000005 = access violation */
+        }
+        if (context) {
+            u64 guest_rsp = *(const u64 *)(context + 0x98);
+            u64 guest_r14 = *(const u64 *)(context + 0xe8);
+            u64 guest_rip = *(const u64 *)(context + 0xf8);
+            fprintf(stderr, " context-RIP=0x%lx(RVA=0x%lx) RSP=0x%lx R14=0x%lx",
+                    guest_rip,
+                    (g_img && guest_rip >= (u64)g_img) ? guest_rip - (u64)g_img : guest_rip,
+                    guest_rsp, guest_r14);
+            if (is_guest_stack_rsp(guest_rsp)) {
+                const u64 *stack = (const u64 *)(uintptr_t)guest_rsp;
+                fputs(" stack-RVAs=", stderr);
+                for (int i = 0, shown = 0; i < 96 && shown < 12; i++) {
+                    u64 candidate = stack[i];
+                    if (image_addr_is_exec(candidate)) {
+                        fprintf(stderr, "%s0x%lx", shown ? "," : "",
+                                candidate - (u64)g_img);
+                        shown++;
+                    }
+                }
+            }
         }
     }
     fputs("\n", stderr);
@@ -2304,6 +2369,7 @@ static u64 __attribute__((ms_abi)) dxgi_CreateSwapChain(u64 *, u64 *, u64 *, u64
 static u64 __attribute__((ms_abi)) dxgi_Present(u64 *, u32, u32);
 static u64 __attribute__((ms_abi)) dxgi_GetBuffer(u64 *, u32, u64, void **);
 static u64 __attribute__((ms_abi)) dxgi_ResizeBuffers(u64 *, u32, u32, u32, u32, u32);
+static u64 __attribute__((ms_abi)) dxgi_adapter_EnumOutputs(u64 *, u32, u64 **);
 
 static void init_dxgi_fake(void) {
     /* Slots 0-2: IUnknown */
@@ -2557,37 +2623,159 @@ static u64 __attribute__((ms_abi))
 dxgi_ResizeBuffers(u64 *obj, u32 n, u32 w, u32 h, u32 fmt, u32 flags)
     { (void)obj;(void)n;(void)w;(void)h;(void)fmt;(void)flags; return S_OK; }
 
-/* IDXGIAdapter stubs for EnumAdapters returning one fake adapter */
+/* IDXGIAdapter/IDXGIOutput compatibility objects. The USER32 backend already
+ * exposes one 1920x1080 virtual desktop, so DXGI must expose the corresponding
+ * output instead of claiming the adapter has no attached display. */
 #define DXGI_VTAB2_SZ 64
-static u64  g_dxgi_vtab2[DXGI_VTAB2_SZ];   /* adapter vtable */
+static u64  g_dxgi_vtab2[DXGI_VTAB2_SZ];
+static u64  g_dxgi_output_vtab[32];
 static u64 *g_dxgi_adapter = NULL;
+static u64 *g_dxgi_output = NULL;
+
+static u64 __attribute__((ms_abi))
+dxgi_adapter_GetParent(u64 *obj, const u8 *riid, void **parent)
+{
+    static const u8 iid_idxgifactory[16] = {
+        0xec, 0x66, 0x71, 0x7b, 0xc7, 0x21, 0xae, 0x44,
+        0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69
+    };
+    (void)obj;
+    if (!parent) return (u64)0x80070057; /* E_INVALIDARG */
+    *parent = NULL;
+    if (!riid || memcmp(riid, iid_idxgifactory, sizeof(iid_idxgifactory)))
+        return E_NOINTERFACE;
+    if (!g_dxgi_factory) return E_FAIL;
+    *parent = g_dxgi_factory;
+    dxgi_AddRef(g_dxgi_factory);
+    return S_OK;
+}
 
 static u64 __attribute__((ms_abi))
 dxgi_adapter_GetDesc(u64 *obj, u8 *desc)
 {
     (void)obj;
-    /* DXGI_ADAPTER_DESC: 128 wchars Description + other fields (total ~128+48=176 bytes) */
-    if (desc) {
-        memset(desc, 0, 176);
-        /* Description: "Fake GPU\0" as wchar */
-        const char *s = "Fake GPU"; int i;
-        u16 *wd = (u16*)desc;
-        for(i=0;s[i];i++) wd[i]=(u8)s[i]; wd[i]=0;
-        /* DedicatedVideoMemory at offset 128+16 = 144: 1 GB */
-        *(u64*)(desc+144) = 1024ULL*1024*1024;
-    }
+    if (!desc) return E_FAIL;
+
+    /* DXGI_ADAPTER_DESC is 304 bytes on Win64: WCHAR Description[128], four
+     * DWORD IDs, three SIZE_T memory amounts, and a 64-bit LUID. */
+    memset(desc, 0, 304);
+    const char *s = "Beer Virtual D3D11 Adapter";
+    u16 *wd = (u16 *)desc;
+    int i;
+    for (i = 0; s[i] && i < 127; i++) wd[i] = (u8)s[i];
+    wd[i] = 0;
+    *(u32 *)(desc + 256) = 0x1414;                /* VendorId: software adapter */
+    *(u32 *)(desc + 260) = 1;                     /* DeviceId */
+    *(u64 *)(desc + 272) = 1024ULL * 1024 * 1024; /* DedicatedVideoMemory */
+    *(u64 *)(desc + 280) = 256ULL * 1024 * 1024;  /* DedicatedSystemMemory */
+    *(u64 *)(desc + 288) = 2ULL * 1024 * 1024 * 1024; /* SharedSystemMemory */
+    return S_OK;
+}
+
+static u64 __attribute__((ms_abi))
+dxgi_output_GetDesc(u64 *obj, u8 *desc)
+{
+    (void)obj;
+    fprintf(stderr, "[DXGI] IDXGIOutput::GetDesc(desc=%p)\n", (void *)desc);
+    if (!desc) return E_FAIL;
+    /* DXGI_OUTPUT_DESC: WCHAR[32], RECT (four LONGs), BOOL, HMONITOR. */
+    memset(desc, 0, 96);
+    const char *name = "\\\\.\\DISPLAY1";
+    u16 *wd = (u16 *)desc;
+    for (int i = 0; name[i] && i < 31; i++) wd[i] = (u8)name[i];
+    *(s32 *)(desc + 64) = 0;
+    *(s32 *)(desc + 68) = 0;
+    *(s32 *)(desc + 72) = 1920;
+    *(s32 *)(desc + 76) = 1080;
+    *(u32 *)(desc + 80) = 1;          /* AttachedToDesktop */
+    *(u64 *)(desc + 88) = 0x10001;     /* stable virtual monitor handle */
+    return S_OK;
+}
+
+static void dxgi_write_mode(u8 *mode, u32 width, u32 height, u32 format)
+{
+    memset(mode, 0, 28);
+    *(u32 *)(mode + 0) = width;
+    *(u32 *)(mode + 4) = height;
+    *(u32 *)(mode + 8) = 60;
+    *(u32 *)(mode + 12) = 1;
+    *(u32 *)(mode + 16) = format;
+    *(u32 *)(mode + 20) = 0; /* progressive scan */
+    *(u32 *)(mode + 24) = 0; /* unspecified scaling */
+}
+
+static u64 __attribute__((ms_abi))
+dxgi_output_GetDisplayModeList(u64 *obj, u32 format, u32 flags, u32 *count, u8 *modes)
+{
+    (void)obj; (void)flags;
+    if (!count) return E_FAIL;
+    if (!modes) { *count = 1; return S_OK; }
+    if (*count < 1) { *count = 1; return 0x887a0003ULL; } /* DXGI_ERROR_MORE_DATA */
+    dxgi_write_mode(modes, 1920, 1080, format);
+    *count = 1;
+    return S_OK;
+}
+
+static u64 __attribute__((ms_abi))
+dxgi_output_FindClosestMatchingMode(u64 *obj, const u8 *requested, u8 *closest, u64 *device)
+{
+    (void)obj; (void)device;
+    if (!requested || !closest) return E_FAIL;
+    u32 width = *(const u32 *)(requested + 0);
+    u32 height = *(const u32 *)(requested + 4);
+    u32 format = *(const u32 *)(requested + 16);
+    dxgi_write_mode(closest, width ? width : 1920, height ? height : 1080, format);
+    return S_OK;
+}
+
+static u64 __attribute__((ms_abi))
+dxgi_output_WaitForVBlank(u64 *obj)
+{
+    (void)obj;
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 16666667 };
+    nanosleep(&ts, NULL);
     return S_OK;
 }
 
 static void init_dxgi_adapter_fake(void) {
-    for (int i=0;i<DXGI_VTAB2_SZ;i++) g_dxgi_vtab2[i]=(u64)dxgi_generic_fail;
-    g_dxgi_vtab2[0]=(u64)dxgi_QueryInterface;
-    g_dxgi_vtab2[1]=(u64)dxgi_AddRef;
-    g_dxgi_vtab2[2]=(u64)dxgi_Release;
-    g_dxgi_vtab2[8]=(u64)dxgi_adapter_GetDesc; /* IDXGIAdapter::GetDesc vtable[8] */
+    for (int i = 0; i < DXGI_VTAB2_SZ; i++) g_dxgi_vtab2[i] = (u64)dxgi_generic_fail;
+    for (int i = 0; i < 32; i++) g_dxgi_output_vtab[i] = (u64)dxgi_generic_fail;
+    g_dxgi_vtab2[0] = (u64)dxgi_QueryInterface;
+    g_dxgi_vtab2[1] = (u64)dxgi_AddRef;
+    g_dxgi_vtab2[2] = (u64)dxgi_Release;
+    g_dxgi_vtab2[6] = (u64)dxgi_adapter_GetParent;
+    g_dxgi_vtab2[7] = (u64)dxgi_adapter_EnumOutputs;
+    g_dxgi_vtab2[8] = (u64)dxgi_adapter_GetDesc;
 
-    g_dxgi_adapter=mmap(NULL,256,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    if(g_dxgi_adapter!=MAP_FAILED) g_dxgi_adapter[0]=(u64)g_dxgi_vtab2;
+    g_dxgi_output_vtab[0] = (u64)dxgi_QueryInterface;
+    g_dxgi_output_vtab[1] = (u64)dxgi_AddRef;
+    g_dxgi_output_vtab[2] = (u64)dxgi_Release;
+    g_dxgi_output_vtab[7] = (u64)dxgi_output_GetDesc;
+    g_dxgi_output_vtab[8] = (u64)dxgi_output_GetDisplayModeList;
+    g_dxgi_output_vtab[9] = (u64)dxgi_output_FindClosestMatchingMode;
+    g_dxgi_output_vtab[10] = (u64)dxgi_output_WaitForVBlank;
+
+    g_dxgi_adapter = mmap(NULL, 256, PROT_READ|PROT_WRITE,
+                          MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    g_dxgi_output = mmap(NULL, 256, PROT_READ|PROT_WRITE,
+                         MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (g_dxgi_adapter != MAP_FAILED) g_dxgi_adapter[0] = (u64)g_dxgi_vtab2;
+    else g_dxgi_adapter = NULL;
+    if (g_dxgi_output != MAP_FAILED) g_dxgi_output[0] = (u64)g_dxgi_output_vtab;
+    else g_dxgi_output = NULL;
+    d3d11_device_set_dxgi_adapter(g_dxgi_adapter);
+}
+
+static u64 __attribute__((ms_abi))
+dxgi_adapter_EnumOutputs(u64 *obj, u32 idx, u64 **pp)
+{
+    (void)obj;
+    if (!pp) return E_FAIL;
+    *pp = NULL;
+    if (idx != 0 || !g_dxgi_output) return (u64)DXGI_ERROR_NOT_FOUND;
+    *pp = g_dxgi_output;
+    dxgi_AddRef(g_dxgi_output);
+    return S_OK;
 }
 
 /* Override EnumAdapters to return our fake adapter */
@@ -2595,8 +2783,9 @@ static u64 __attribute__((ms_abi))
 dxgi_EnumAdapters_with_fake(u64 *obj, u32 idx, u64 **pp) {
     (void)obj;
     if (idx == 0) {
-        if (pp) *pp = g_dxgi_adapter;
-        return S_OK; /* one adapter at index 0 */
+        if (!pp) return (u64)E_FAIL;
+        *pp = g_dxgi_adapter;
+        return g_dxgi_adapter ? S_OK : (u64)E_FAIL; /* one adapter at index 0 */
     }
     if (pp) *pp = NULL;
     return (u64)DXGI_ERROR_NOT_FOUND;
@@ -3050,11 +3239,22 @@ static u64 __attribute__((ms_abi))
 impl_GetForegroundWindow(void) { return FAKE_HWND; }
 static u64 __attribute__((ms_abi))
 impl_ShowWindow(u64 hw, u32 cmd) {
+    if (hw != FAKE_HWND || !xwayland_window_exists()) {
+        g_last_error = 1400; /* ERROR_INVALID_WINDOW_HANDLE */
+        return 0;
+    }
     fprintf(stderr, "[WIN] ShowWindow(hwnd=0x%lx, cmd=%u)\n", hw, cmd);
-    return 1;
+    return xwayland_window_show(cmd != 0);
 }
 static u64 __attribute__((ms_abi))
-impl_UpdateWindow(u64 hw) { (void)hw; return 1; }
+impl_UpdateWindow(u64 hw) {
+    if (hw != FAKE_HWND || !xwayland_window_exists()) {
+        g_last_error = 1400;
+        return 0;
+    }
+    xwayland_window_pump_events();
+    return 1;
+}
 
 /* ---- HMODULE GetModuleHandleExA/W ---- */
 static u64 __attribute__((ms_abi))
@@ -3385,19 +3585,109 @@ impl_GetTempPathA(u32 sz, char *buf) {
     strncpy(buf,"/tmp/",sz-1); buf[sz-1]=0; return 5;
 }
 
-static u64 __attribute__((ms_abi))
-impl_GetFullPathNameW(const u16 *path, u32 sz, u16 *buf, u16 **part) {
-    if (!buf || !sz || !path) return 0;
-    int i; for(i=0;i<(int)sz-1&&path[i];i++) buf[i]=path[i]; buf[i]=0;
-    if (part) *part = buf;
-    return (u64)i;
+static size_t win_full_path_a(const char *path, char *out, size_t cap)
+{
+    if (!path || !out || cap == 0) return 0;
+
+    char joined[4096];
+    size_t used = 0;
+    int absolute = path[0] == '/' || path[0] == '\\' ||
+                   (((path[0] >= 'A' && path[0] <= 'Z') ||
+                     (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':');
+    if (!absolute) {
+        char cwd[2048];
+        if (!getcwd(cwd, sizeof(cwd))) return 0;
+        for (size_t i = 0; cwd[i] && used + 1 < sizeof(joined); i++)
+            joined[used++] = cwd[i] == '/' ? '\\' : cwd[i];
+        if (used && joined[used - 1] != '\\' && used + 1 < sizeof(joined))
+            joined[used++] = '\\';
+    }
+    for (size_t i = 0; path[i] && used + 1 < sizeof(joined); i++)
+        joined[used++] = path[i] == '/' ? '\\' : path[i];
+    joined[used] = 0;
+
+    /* Lexically collapse duplicate separators and dot components.  This keeps
+     * Windows root paths stable ("\\" stays "\\") instead of repeatedly
+     * presenting the root separator as a file-name component. */
+    size_t prefix = 0, n = 0;
+    if (used >= 2 && joined[1] == ':') {
+        if (n + 2 < cap) { out[n++] = joined[0]; out[n++] = ':'; }
+        prefix = 2;
+    }
+    int rooted = joined[prefix] == '\\';
+    if (rooted && n + 1 < cap) out[n++] = '\\';
+
+    size_t component_starts[256];
+    size_t component_count = 0;
+    size_t i = prefix + (rooted ? 1 : 0);
+    while (i < used) {
+        while (joined[i] == '\\') i++;
+        size_t start = i;
+        while (i < used && joined[i] != '\\') i++;
+        size_t len = i - start;
+        if (!len || (len == 1 && joined[start] == '.')) continue;
+        if (len == 2 && joined[start] == '.' && joined[start + 1] == '.') {
+            if (component_count) n = component_starts[--component_count];
+            continue;
+        }
+        size_t rollback = n;
+        if (n && out[n - 1] != '\\') {
+            if (n + 1 >= cap) return 0;
+            out[n++] = '\\';
+        }
+        if (n + len >= cap) return 0;
+        component_starts[component_count < 256 ? component_count++ : 255] = rollback;
+        memcpy(out + n, joined + start, len);
+        n += len;
+    }
+    if (n == 0 && rooted) out[n++] = '\\';
+    out[n] = 0;
+    return n;
 }
+
 static u64 __attribute__((ms_abi))
-impl_GetFullPathNameA(const char *path, u32 sz, char *buf, char **part) {
-    if (!buf || !sz || !path) return 0;
-    strncpy(buf,path,sz-1); buf[sz-1]=0;
-    if (part) *part = buf;
-    return (u64)strlen(buf);
+impl_GetFullPathNameW(const u16 *path, u32 sz, u16 *buf, u16 **part)
+{
+    if (part) *part = NULL;
+    if (!path) { g_last_error = 87; return 0; }
+
+    char narrow[4096], full[4096];
+    size_t in_len = 0;
+    while (path[in_len] && in_len + 1 < sizeof(narrow)) {
+        narrow[in_len] = (char)(path[in_len] & 0x7f);
+        in_len++;
+    }
+    narrow[in_len] = 0;
+    size_t len = win_full_path_a(narrow, full, sizeof(full));
+    if (!len) { g_last_error = 206; return 0; }
+    if (!buf || sz <= len) return (u64)(len + 1);
+
+    for (size_t i = 0; i <= len; i++) buf[i] = (u8)full[i];
+    if (part && len && full[len - 1] != '\\') {
+        size_t leaf = len;
+        while (leaf && full[leaf - 1] != '\\' && full[leaf - 1] != ':') leaf--;
+        *part = buf + leaf;
+    }
+    return (u64)len;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetFullPathNameA(const char *path, u32 sz, char *buf, char **part)
+{
+    if (part) *part = NULL;
+    if (!path) { g_last_error = 87; return 0; }
+
+    char full[4096];
+    size_t len = win_full_path_a(path, full, sizeof(full));
+    if (!len) { g_last_error = 206; return 0; }
+    if (!buf || sz <= len) return (u64)(len + 1);
+    memcpy(buf, full, len + 1);
+    if (part && len && full[len - 1] != '\\') {
+        size_t leaf = len;
+        while (leaf && full[leaf - 1] != '\\' && full[leaf - 1] != ':') leaf--;
+        *part = buf + leaf;
+    }
+    return (u64)len;
 }
 
 /* Fake file handle pool */
@@ -3440,10 +3730,24 @@ impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
 static u64 __attribute__((ms_abi))
 impl_CreateFileW(const u16 *name, u32 acc, u32 share, u64 sa, u32 cr, u32 att, u64 tmpl)
 {
-    char buf[512]; int i;
-    for(i=0;i<511&&name&&name[i];i++) buf[i]=(char)(name[i]&0x7f);
-    buf[i]=0;
-    return impl_CreateFileA(buf, acc, share, sa, cr, att, tmpl);
+    char buf[4096];
+    size_t i = 0;
+    if (!name) { g_last_error = 87; return INVALID_HANDLE_VALUE64; }
+    for (; i + 1 < sizeof(buf) && name[i]; i++) {
+        char c = (char)(name[i] & 0x7f);
+        buf[i] = c == '\\' ? '/' : c;
+    }
+    if (name[i]) { g_last_error = 206; return INVALID_HANDLE_VALUE64; }
+    buf[i] = 0;
+
+    /* A drive-qualified path cannot be represented directly on Linux.  The
+     * game also emits root-relative paths such as "\\tmp\\Sekiro"; translating
+     * separators preserves the path's meaning for the host filesystem. */
+    const char *host_path = buf;
+    if (((buf[0] >= 'A' && buf[0] <= 'Z') || (buf[0] >= 'a' && buf[0] <= 'z')) &&
+        buf[1] == ':')
+        host_path = buf + 2;
+    return impl_CreateFileA(host_path, acc, share, sa, cr, att, tmpl);
 }
 static u64 __attribute__((ms_abi))
 impl_CloseHandle(u64 h)
@@ -3492,6 +3796,64 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, u64 ov)
     if (done) *done = (u32)(r<0?0:r);
     return r >= 0 ? 1 : 0;
 }
+typedef struct {
+    u32 FileAttributes;
+    u32 CreationTimeLow;
+    u32 CreationTimeHigh;
+    u32 LastAccessTimeLow;
+    u32 LastAccessTimeHigh;
+    u32 LastWriteTimeLow;
+    u32 LastWriteTimeHigh;
+    u32 VolumeSerialNumber;
+    u32 FileSizeHigh;
+    u32 FileSizeLow;
+    u32 NumberOfLinks;
+    u32 FileIndexHigh;
+    u32 FileIndexLow;
+} WIN_BY_HANDLE_FILE_INFORMATION;
+
+static u64 unix_time_to_filetime(time_t sec, long nsec)
+{
+    const u64 windows_epoch = 11644473600ULL;
+    return ((u64)sec + windows_epoch) * 10000000ULL + (u64)nsec / 100ULL;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetFileInformationByHandle(u64 h, WIN_BY_HANDLE_FILE_INFORMATION *info)
+{
+    int fd = fh_get(h);
+    if (fd < 0 || !info) { g_last_error = 6; return 0; }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) { g_last_error = (u32)errno; return 0; }
+    memset(info, 0, sizeof(*info));
+    info->FileAttributes = S_ISDIR(st.st_mode) ? 0x10u : 0x80u;
+    if (!(st.st_mode & S_IWUSR)) info->FileAttributes |= 0x1u;
+#if defined(__linux__)
+    u64 creation = unix_time_to_filetime(st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
+    u64 access = unix_time_to_filetime(st.st_atim.tv_sec, st.st_atim.tv_nsec);
+    u64 write = unix_time_to_filetime(st.st_mtim.tv_sec, st.st_mtim.tv_nsec);
+#else
+    u64 creation = unix_time_to_filetime(st.st_ctime, 0);
+    u64 access = unix_time_to_filetime(st.st_atime, 0);
+    u64 write = unix_time_to_filetime(st.st_mtime, 0);
+#endif
+    info->CreationTimeLow = (u32)creation;
+    info->CreationTimeHigh = (u32)(creation >> 32);
+    info->LastAccessTimeLow = (u32)access;
+    info->LastAccessTimeHigh = (u32)(access >> 32);
+    info->LastWriteTimeLow = (u32)write;
+    info->LastWriteTimeHigh = (u32)(write >> 32);
+    info->VolumeSerialNumber = (u32)st.st_dev;
+    info->FileSizeHigh = (u32)((u64)st.st_size >> 32);
+    info->FileSizeLow = (u32)st.st_size;
+    info->NumberOfLinks = (u32)st.st_nlink;
+    info->FileIndexHigh = (u32)((u64)st.st_ino >> 32);
+    info->FileIndexLow = (u32)st.st_ino;
+    g_last_error = 0;
+    return 1;
+}
+
 static u64 __attribute__((ms_abi))
 impl_GetFileSize(u64 h, u32 *high) {
     int fd = fh_get(h);
@@ -3534,6 +3896,23 @@ impl_SetFileAttributesW(const u16 *p, u32 a) { (void)p;(void)a; return 1; }
 static u64 __attribute__((ms_abi))
 impl_SetThreadAffinityMask(u64 h, u64 mask) { (void)h;(void)mask; return mask; }
 
+/* SetThreadIdealProcessor returns the previous preferred processor, not a
+ * BOOL. Keep the Windows-visible preference per hosted thread; 64 denotes
+ * MAXIMUM_PROCESSORS (no prior preference) on Win64. */
+static _Thread_local u32 g_ideal_processor = 64;
+static u64 __attribute__((ms_abi))
+impl_SetThreadIdealProcessor(u64 thread, u32 processor)
+{
+    (void)thread;
+    if (processor >= 64) {
+        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
+        return 0xffffffffu;
+    }
+    u32 previous = g_ideal_processor;
+    g_ideal_processor = processor;
+    return previous;
+}
+
 /* LocalAlloc / LocalFree / GlobalAlloc / GlobalFree */
 static u64 __attribute__((ms_abi)) impl_LocalAlloc(u32 f, u64 sz)
     { (void)f; return (u64)malloc((size_t)sz); }
@@ -3551,14 +3930,46 @@ static u64 __attribute__((ms_abi)) impl_SetErrorMode(u32 mode)
 
 /* ── USER32 window system ─────────────────────────────────────────── */
 
+/* Win32 RECT contains four signed 32-bit LONGs even in a 64-bit process.
+ * Treating it as four u64s writes 32 bytes into the caller's 16-byte object;
+ * GetWindowRect consequently overwrote Sekiro's adjacent /GS cookie with
+ * `right == 1920` and produced FAST_FAIL_STACK_COOKIE_CHECK_FAILURE. */
+typedef struct {
+    s32 left;
+    s32 top;
+    s32 right;
+    s32 bottom;
+} WIN_RECT;
+_Static_assert(sizeof(WIN_RECT) == 16, "Win32 RECT must remain 16 bytes");
+
 static u64 __attribute__((ms_abi))
-impl_GetWindowRect(u64 hwnd, u64 *rect) {
-    (void)hwnd;
-    if (rect) { rect[0]=0; rect[1]=0; rect[2]=1920; rect[3]=1080; }
+impl_GetWindowRect(u64 hwnd, WIN_RECT *rect) {
+    if (!rect) { g_last_error = 87; return 0; }
+    XwaylandWindowState state;
+    if (hwnd != FAKE_HWND || !xwayland_window_get_state(&state)) {
+        g_last_error = 1400;
+        return 0;
+    }
+    rect->left = state.x;
+    rect->top = state.y;
+    rect->right = state.x + state.width;
+    rect->bottom = state.y + state.height;
     return 1;
 }
 static u64 __attribute__((ms_abi))
-impl_GetClientRect(u64 hwnd, u64 *rect) { return impl_GetWindowRect(hwnd, rect); }
+impl_GetClientRect(u64 hwnd, WIN_RECT *rect) {
+    if (!rect) { g_last_error = 87; return 0; }
+    XwaylandWindowState state;
+    if (hwnd != FAKE_HWND || !xwayland_window_get_state(&state)) {
+        g_last_error = 1400;
+        return 0;
+    }
+    rect->left = 0;
+    rect->top = 0;
+    rect->right = state.width;
+    rect->bottom = state.height;
+    return 1;
+}
 static u64 __attribute__((ms_abi))
 impl_LoadIconW(u64 hmod, u64 name) { (void)hmod;(void)name; return 0x10000001; }
 static u64 __attribute__((ms_abi))
@@ -3568,46 +3979,99 @@ impl_LoadCursorW(u64 hmod, u64 name) { (void)hmod;(void)name; return 0x20000001;
 static u64 __attribute__((ms_abi))
 impl_LoadCursorA(u64 hmod, u64 name) { (void)hmod;(void)name; return 0x20000001; }
 static u64 __attribute__((ms_abi))
-impl_AdjustWindowRect(u64 *rect, u32 style, u32 menu) {
+impl_AdjustWindowRect(WIN_RECT *rect, u32 style, u32 menu) {
     (void)style;(void)menu;
-    if (rect) { rect[0]-=8; rect[1]-=30; rect[2]+=8; rect[3]+=8; }
+    if (!rect) { g_last_error = 87; return 0; }
+    rect->left -= 8;
+    rect->top -= 30;
+    rect->right += 8;
+    rect->bottom += 8;
     return 1;
 }
 static u64 __attribute__((ms_abi))
-impl_AdjustWindowRectEx(u64 *rect, u32 style, u32 menu, u32 exstyle)
+impl_AdjustWindowRectEx(WIN_RECT *rect, u32 style, u32 menu, u32 exstyle)
     { (void)exstyle; return impl_AdjustWindowRect(rect,style,menu); }
+static void window_title_from_wide(const u16 *wide, char *out, size_t capacity)
+{
+    if (!out || !capacity) return;
+    size_t i = 0;
+    if (wide) {
+        for (; i + 1 < capacity && wide[i]; i++)
+            out[i] = wide[i] <= 0x7f ? (char)wide[i] : '?';
+    }
+    out[i] = 0;
+}
+
+static u64 create_native_window(s32 x, s32 y, s32 w, s32 h, const char *title)
+{
+    /* CW_USEDEFAULT is 0x80000000. XWayland's compositor chooses final placement. */
+    if ((u32)x == 0x80000000u) x = 0;
+    if ((u32)y == 0x80000000u) y = 0;
+    if (!xwayland_window_create(x, y, w, h, title, 1)) {
+        g_last_error = 1407; /* ERROR_CANNOT_FIND_WND_CLASS / backend unavailable */
+        return 0;
+    }
+    if (!g_api_createwindow) {
+        g_api_createwindow = 1;
+        fprintf(stderr, "[PROGRESS] native XWayland window created\n");
+    }
+    return FAKE_HWND;
+}
+
 static u64 __attribute__((ms_abi))
 impl_CreateWindowExW(u32 exstyle, u64 classname, u64 title, u32 style,
                       s32 x, s32 y, s32 w, s32 h, u64 parent, u64 menu, u64 inst, u64 param)
 {
-    (void)exstyle;(void)classname;(void)title;(void)style;
-    (void)x;(void)y;(void)w;(void)h;(void)parent;(void)menu;(void)inst;(void)param;
-    if (!g_api_createwindow) { g_api_createwindow=1; fprintf(stderr, "[PROGRESS] CreateWindowExW called - window created\n"); }
-    fprintf(stderr, "[WIN] CreateWindowExW(%dx%d) -> HWND\n", w, h);
-    return FAKE_HWND;
+    (void)exstyle;(void)classname;(void)style;(void)parent;(void)menu;(void)inst;(void)param;
+    char utf8_title[512];
+    window_title_from_wide((const u16 *)(uintptr_t)title, utf8_title, sizeof(utf8_title));
+    fprintf(stderr, "[WIN] CreateWindowExW(%dx%d, title=%s)\n", w, h,
+            utf8_title[0] ? utf8_title : "(untitled)");
+    return create_native_window(x, y, w, h, utf8_title);
 }
 static u64 __attribute__((ms_abi))
 impl_CreateWindowExA(u32 exstyle, u64 classname, u64 title, u32 style,
                       s32 x, s32 y, s32 w, s32 h, u64 parent, u64 menu, u64 inst, u64 param)
 {
-    (void)exstyle;(void)classname;(void)title;(void)style;
-    (void)x;(void)y;(void)w;(void)h;(void)parent;(void)menu;(void)inst;(void)param;
-    if (!g_api_createwindow) { g_api_createwindow=1; fprintf(stderr, "[PROGRESS] CreateWindowExA called - window created\n"); }
-    fprintf(stderr, "[WIN] CreateWindowExA(%dx%d) -> HWND\n", w, h);
-    return FAKE_HWND;
+    (void)exstyle;(void)classname;(void)style;(void)parent;(void)menu;(void)inst;(void)param;
+    const char *ascii_title = (const char *)(uintptr_t)title;
+    fprintf(stderr, "[WIN] CreateWindowExA(%dx%d, title=%s)\n", w, h,
+            (ascii_title && *ascii_title) ? ascii_title : "(untitled)");
+    return create_native_window(x, y, w, h, ascii_title);
 }
-static u64 __attribute__((ms_abi)) impl_DestroyWindow(u64 hw) { (void)hw; return 1; }
-static u64 __attribute__((ms_abi)) impl_IsWindow(u64 hw) { return hw==FAKE_HWND?1:0; }
 static u64 __attribute__((ms_abi))
-impl_SetWindowTextW(u64 hw, u64 txt) { (void)hw;(void)txt; return 1; }
+impl_DestroyWindow(u64 hw) {
+    if (hw != FAKE_HWND || !xwayland_window_exists()) { g_last_error = 1400; return 0; }
+    xwayland_window_destroy();
+    return 1;
+}
 static u64 __attribute__((ms_abi))
-impl_SetWindowTextA(u64 hw, u64 txt) { (void)hw;(void)txt; return 1; }
+impl_IsWindow(u64 hw) { return hw == FAKE_HWND && xwayland_window_exists(); }
 static u64 __attribute__((ms_abi))
-impl_MoveWindow(u64 hw, s32 x, s32 y, s32 w, s32 h, u32 rep)
-    { (void)hw;(void)x;(void)y;(void)w;(void)h;(void)rep; return 1; }
+impl_SetWindowTextW(u64 hw, u64 txt) {
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    char title[512];
+    window_title_from_wide((const u16 *)(uintptr_t)txt, title, sizeof(title));
+    return xwayland_window_set_title(title);
+}
 static u64 __attribute__((ms_abi))
-impl_SetWindowPos(u64 hw, u64 ins, s32 x, s32 y, s32 w, s32 h, u32 flags)
-    { (void)hw;(void)ins;(void)x;(void)y;(void)w;(void)h;(void)flags; return 1; }
+impl_SetWindowTextA(u64 hw, u64 txt) {
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    return xwayland_window_set_title((const char *)(uintptr_t)txt);
+}
+static u64 __attribute__((ms_abi))
+impl_MoveWindow(u64 hw, s32 x, s32 y, s32 w, s32 h, u32 rep) {
+    (void)rep;
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    return xwayland_window_move_resize(x, y, w, h, 1, 1);
+}
+static u64 __attribute__((ms_abi))
+impl_SetWindowPos(u64 hw, u64 ins, s32 x, s32 y, s32 w, s32 h, u32 flags) {
+    (void)ins;
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    return xwayland_window_move_resize(x, y, w, h,
+                                       !(flags & 0x0002), !(flags & 0x0001));
+}
 static u64 __attribute__((ms_abi))
 impl_GetDC(u64 hw) { (void)hw; return FAKE_HDC; }
 static u64 __attribute__((ms_abi))
@@ -3626,11 +4090,24 @@ static u64 __attribute__((ms_abi))
 impl_GetFocus(void) { return FAKE_HWND; }
 static u64 __attribute__((ms_abi))
 impl_GetActiveWindow(void) { return FAKE_HWND; }
+static u64 __attribute__((ms_abi))
+impl_SetActiveWindow(u64 hwnd)
+{
+    if (hwnd && hwnd != FAKE_HWND) {
+        g_last_error = 1400; /* ERROR_INVALID_WINDOW_HANDLE */
+        return 0;
+    }
+    return FAKE_HWND; /* previous active window */
+}
 
 /* Message loop */
 static u64 __attribute__((ms_abi))
 impl_PeekMessageW(u64 *msg, u64 hw, u32 min, u32 max, u32 remove) {
     (void)hw;(void)min;(void)max;(void)remove;
+    if (xwayland_window_pump_events()) {
+        g_win_quit = 1;
+        g_win_quit_code = 0;
+    }
     if (msg) memset(msg, 0, 5*8); /* MSG struct */
     if (g_win_quit) {
         if (msg) {
@@ -3645,6 +4122,10 @@ impl_PeekMessageW(u64 *msg, u64 hw, u32 min, u32 max, u32 remove) {
 static u64 __attribute__((ms_abi))
 impl_GetMessageW(u64 *msg, u64 hw, u32 min, u32 max) {
     (void)hw;(void)min;(void)max;
+    if (xwayland_window_pump_events()) {
+        g_win_quit = 1;
+        g_win_quit_code = 0;
+    }
     if (msg) memset(msg, 0, 5*8);
     if (g_win_quit) {
         if (msg) {
@@ -3817,6 +4298,69 @@ impl_EnumSystemLocalesW(u64 callback, u32 flags)
     }
     return 1;
 }
+
+/* Vista+ locale-name APIs queried dynamically by the Universal CRT. Keep the
+ * callback ABI and return contracts exact: EnumSystemLocalesEx invokes the
+ * callback with a BCP-47 locale name, flags and caller lParam; a FALSE callback
+ * result stops enumeration but is not an API failure. */
+static int u16_ascii_equal_ci(const u16 *value, const char *ascii)
+{
+    if (!value || !ascii) return 0;
+    for (size_t i = 0;; i++) {
+        u16 a = value[i];
+        u16 b = (u8)ascii[i];
+        if (a >= 'A' && a <= 'Z') a = (u16)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (u16)(b + ('a' - 'A'));
+        if (a != b) return 0;
+        if (!a) return 1;
+    }
+}
+
+static int copy_ascii_to_u16(const char *src, u16 *dst, int capacity)
+{
+    int needed = (int)strlen(src) + 1;
+    if (!dst || capacity == 0) return needed;
+    if (capacity < needed) {
+        g_last_error = 122; /* ERROR_INSUFFICIENT_BUFFER */
+        return 0;
+    }
+    for (int i = 0; i < needed; i++) dst[i] = (u8)src[i];
+    return needed;
+}
+
+static u64 __attribute__((ms_abi))
+impl_EnumSystemLocalesEx(u64 callback, u32 flags, u64 lparam, void *reserved)
+{
+    (void)flags;
+    if (!callback || reserved) {
+        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+    static u16 locale_names[][6] = {
+        {'e','n','-','U','S',0},
+        {'j','a','-','J','P',0}
+    };
+    typedef u64 __attribute__((ms_abi)) (*LocaleEnumProcEx)(u16 *, u32, u64);
+    for (size_t i = 0; i < sizeof(locale_names) / sizeof(locale_names[0]); i++) {
+        if (!((LocaleEnumProcEx)callback)(locale_names[i], 0, lparam))
+            break;
+    }
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_IsValidLocaleName(const u16 *name)
+{
+    if (!name || !name[0]) return 0;
+    if (!name[1] && name[0] == 0x7f) return 1; /* LOCALE_NAME_INVARIANT */
+    /* UCRT accepts both canonical locale names and the legacy language aliases
+     * it obtains from LOCALE_SENGLANGUAGE while constructing std::locale. */
+    return u16_ascii_equal_ci(name, "en-US") ||
+           u16_ascii_equal_ci(name, "ja-JP") ||
+           u16_ascii_equal_ci(name, "English") ||
+           u16_ascii_equal_ci(name, "Japanese");
+}
+
 static u64 __attribute__((ms_abi))
 impl_IsValidLocale(u32 lcid, u32 flags) { (void)flags; return lcid <= 0xFFFF ? 1 : 0; }
 static u64 __attribute__((ms_abi))
@@ -4220,6 +4764,38 @@ static u64 __attribute__((ms_abi))
 impl_SetFileInformationByHandle(u64 handle, u32 cls, void *info, u32 sz)
     { (void)handle;(void)cls;(void)info;(void)sz; return 1; }
 
+static u64 __attribute__((ms_abi))
+impl_CreateDirectoryA(const char *path, void *security_attributes)
+{
+    (void)security_attributes;
+    if (!path || !*path) { g_last_error = 3; return 0; }
+    char host_path[4096];
+    size_t i = 0;
+    for (; path[i] && i + 1 < sizeof(host_path); i++)
+        host_path[i] = path[i] == '\\' ? '/' : path[i];
+    if (path[i]) { g_last_error = 206; return 0; }
+    host_path[i] = 0;
+    const char *p = host_path;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':')
+        p += 2;
+    if (mkdir(p, 0777) == 0) { g_last_error = 0; return 1; }
+    g_last_error = errno == EEXIST ? 183u : (errno == ENOENT ? 3u : (u32)errno);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CreateDirectoryW(const u16 *path, void *security_attributes)
+{
+    if (!path) { g_last_error = 3; return 0; }
+    char narrow[4096];
+    size_t i = 0;
+    for (; path[i] && i + 1 < sizeof(narrow); i++)
+        narrow[i] = (char)(path[i] & 0x7f);
+    if (path[i]) { g_last_error = 206; return 0; }
+    narrow[i] = 0;
+    return impl_CreateDirectoryA(narrow, security_attributes);
+}
+
 /* ---- CompareStringEx / GetLocaleInfoEx / LCMapStringEx ---- */
 static u64 __attribute__((ms_abi))
 impl_CompareStringEx(u64 locale, u32 flags, const u16 *s1, int n1,
@@ -4229,7 +4805,43 @@ impl_CompareStringEx(u64 locale, u32 flags, const u16 *s1, int n1,
 
 static u64 __attribute__((ms_abi))
 impl_GetLocaleInfoEx(u64 locale, u32 lctype, u16 *data, int cchdata)
-    { (void)locale; return impl_GetLocaleInfoW(0x0409, lctype, data, cchdata); }
+{
+    const u16 *name = (const u16 *)locale;
+    const int return_number = (lctype & 0x20000000u) != 0;
+    const u32 type = lctype & ~0x20000000u;
+
+    if (return_number) {
+        u32 value;
+        switch (type) {
+            case 0x1004: value = 0x0409; break; /* LOCALE_ILANGUAGE */
+            default: value = 0;
+        }
+        if (!data || cchdata == 0) return 2; /* DWORD measured in WCHARs */
+        if (cchdata < 2) { g_last_error = 122; return 0; }
+        memcpy(data, &value, sizeof(value));
+        return 2;
+    }
+
+    const int japanese = name && (u16_ascii_equal_ci(name, "ja-JP") ||
+                                  u16_ascii_equal_ci(name, "Japanese"));
+    switch (type) {
+        case 0x00000002: /* LOCALE_SLANGUAGE */
+        case 0x00001001: /* LOCALE_SENGLANGUAGE */
+            return copy_ascii_to_u16(japanese ? "Japanese" : "English (United States)",
+                                     data, cchdata);
+        case 0x0000005c: /* LOCALE_SNAME */
+            return copy_ascii_to_u16(japanese ? "ja-JP" : "en-US", data, cchdata);
+        case 0x00000001: /* LOCALE_ILANGUAGE */
+            return copy_ascii_to_u16(japanese ? "0411" : "0409", data, cchdata);
+        case 0x0000000e: /* LOCALE_SDECIMAL */
+            return copy_ascii_to_u16(".", data, cchdata);
+        case 0x0000000f: /* LOCALE_STHOUSAND */
+            return copy_ascii_to_u16(",", data, cchdata);
+        default:
+            return impl_GetLocaleInfoW(japanese ? 0x0411 : 0x0409,
+                                       type, data, cchdata);
+    }
+}
 
 static u64 __attribute__((ms_abi))
 impl_LCMapStringEx(u64 locale, u32 flags, const u16 *src, int srclen,
@@ -4291,9 +4903,138 @@ impl_FileTimeToSystemTime(const u64 *ft, u64 *st)
     return 1;
 }
 
-/* ---- GetSystemDefaultLangID ---- */
+/* ---- GetSystemDefaultLangID / GetSystemDirectory ---- */
 static u64 __attribute__((ms_abi))
 impl_GetSystemDefaultLangID(void) { return 0x0409; /* en-US */ }
+
+static u64 __attribute__((ms_abi))
+impl_GetSystemDirectoryW(u16 *buffer, u32 size)
+{
+    static const u16 directory[] = {
+        'C',':','\\','W','i','n','d','o','w','s','\\','S','y','s','t','e','m','3','2',0
+    };
+    const u32 length = (u32)(sizeof(directory) / sizeof(directory[0]) - 1);
+    if (!buffer || size <= length) {
+        g_last_error = 122; /* ERROR_INSUFFICIENT_BUFFER */
+        return length + 1;
+    }
+    memcpy(buffer, directory, sizeof(directory));
+    return length;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetSystemDirectoryA(char *buffer, u32 size)
+{
+    static const char directory[] = "C:\\Windows\\System32";
+    const u32 length = (u32)(sizeof(directory) - 1);
+    if (!buffer || size <= length) {
+        g_last_error = 122;
+        return length + 1;
+    }
+    memcpy(buffer, directory, sizeof(directory));
+    return length;
+}
+
+/* ID3DBlob used by D3DGetBlobPart. The returned part is an owned copy, as on
+ * Windows, rather than an alias into the caller's shader bytecode. */
+typedef struct {
+    void **vtable;
+    _Atomic(u32) refs;
+    size_t size;
+    u8 data[];
+} BeerD3DBlob;
+
+static u64 __attribute__((ms_abi)) beer_blob_QueryInterface(
+    BeerD3DBlob *blob, const u8 *iid, void **out)
+{
+    static const u8 iid_iunknown[16] = {
+        0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0,0x46
+    };
+    static const u8 iid_blob[16] = {
+        0x78,0x0a,0x2f,0x8b,0x79,0x42,0x6e,0x41,
+        0x93,0x13,0x0b,0xa0,0xb5,0x6d,0x19,0xcd
+    };
+    if (!out) return E_FAIL;
+    *out = NULL;
+    if (!iid || (memcmp(iid, iid_iunknown, 16) && memcmp(iid, iid_blob, 16)))
+        return E_NOINTERFACE;
+    *out = blob;
+    atomic_fetch_add(&blob->refs, 1);
+    return S_OK;
+}
+
+static u64 __attribute__((ms_abi)) beer_blob_AddRef(BeerD3DBlob *blob)
+{
+    return atomic_fetch_add(&blob->refs, 1) + 1;
+}
+
+static u64 __attribute__((ms_abi)) beer_blob_Release(BeerD3DBlob *blob)
+{
+    u32 old = atomic_fetch_sub(&blob->refs, 1);
+    if (old == 1) { free(blob); return 0; }
+    return old - 1;
+}
+
+static u64 __attribute__((ms_abi)) beer_blob_GetBufferPointer(BeerD3DBlob *blob)
+{
+    return (u64)blob->data;
+}
+
+static u64 __attribute__((ms_abi)) beer_blob_GetBufferSize(BeerD3DBlob *blob)
+{
+    return blob->size;
+}
+
+static void *g_d3d_blob_vtable[] = {
+    (void *)beer_blob_QueryInterface,
+    (void *)beer_blob_AddRef,
+    (void *)beer_blob_Release,
+    (void *)beer_blob_GetBufferPointer,
+    (void *)beer_blob_GetBufferSize
+};
+
+static u64 __attribute__((ms_abi))
+impl_D3DGetBlobPart(const u8 *src, size_t src_size, u32 part,
+                    u32 flags, BeerD3DBlob **out)
+{
+    (void)flags;
+    if (!out) return E_FAIL;
+    *out = NULL;
+    if (!src || src_size < 32 || memcmp(src, "DXBC", 4)) return E_FAIL;
+
+    u32 chunk_count = *(const u32 *)(src + 28);
+    if (chunk_count > (src_size - 32) / 4) return E_FAIL;
+    const char *wanted = NULL;
+    switch (part) {
+        case 0: wanted = "ISGN"; break; /* D3D_BLOB_INPUT_SIGNATURE_BLOB */
+        case 1: wanted = "OSGN"; break; /* D3D_BLOB_OUTPUT_SIGNATURE_BLOB */
+        default: return (u64)0x80070057; /* E_INVALIDARG */
+    }
+
+    const u8 *chunk = NULL;
+    size_t chunk_size = 0;
+    for (u32 i = 0; i < chunk_count; ++i) {
+        u32 offset = *(const u32 *)(src + 32 + i * 4);
+        if (offset > src_size - 8) return E_FAIL;
+        u32 size = *(const u32 *)(src + offset + 4);
+        if ((size_t)size > src_size - offset - 8) return E_FAIL;
+        if (!memcmp(src + offset, wanted, 4)) {
+            chunk = src + offset;
+            chunk_size = (size_t)size + 8;
+            break;
+        }
+    }
+    if (!chunk) return E_FAIL;
+
+    BeerD3DBlob *blob = malloc(sizeof(*blob) + chunk_size);
+    if (!blob) return (u64)0x8007000e;
+    blob->vtable = g_d3d_blob_vtable;
+    atomic_init(&blob->refs, 1);
+    blob->size = chunk_size;
+    memcpy(blob->data, chunk, chunk_size);
+    *out = blob;
+    return S_OK;
+}
 
 /* ---- CommandLineToArgvW ---- */
 static u64 __attribute__((ms_abi))
@@ -4330,6 +5071,8 @@ static ImplEntry g_impls[] = {
     {"GetModuleHandleW",                      (ImplFn)impl_GetModuleHandleW},
     {"GetModuleFileNameA",                    (ImplFn)impl_GetModuleFileNameA},
     {"GetProcAddress",                        (ImplFn)impl_GetProcAddress},
+    {"GetSystemDirectoryA",                   (ImplFn)impl_GetSystemDirectoryA},
+    {"GetSystemDirectoryW",                   (ImplFn)impl_GetSystemDirectoryW},
     /* Heap */
     {"GetProcessHeap",                        (ImplFn)impl_GetProcessHeap},
     {"HeapCreate",                            (ImplFn)impl_HeapCreate},
@@ -4432,9 +5175,10 @@ static ImplEntry g_impls[] = {
     {"CoInitializeEx",                        (ImplFn)impl_CoInitializeEx},
     {"CoUninitialize",                        (ImplFn)impl_CoUninitialize},
     {"CoCreateInstance",                      (ImplFn)impl_CoCreateInstance},
-    /* D3D11 */
+    /* D3D11 / shader container helpers */
     {"D3D11CreateDevice",                     (ImplFn)impl_D3D11CreateDevice},
     {"D3D11CreateDeviceAndSwapChain",         (ImplFn)impl_D3D11CreateDeviceAndSwapChain},
+    {"D3DGetBlobPart",                        (ImplFn)impl_D3DGetBlobPart},
     /* String / locale */
     {"MultiByteToWideChar",                   (ImplFn)impl_MultiByteToWideChar},
     {"WideCharToMultiByte",                   (ImplFn)impl_WideCharToMultiByte},
@@ -4506,6 +5250,7 @@ static ImplEntry g_impls[] = {
     {"RegisterClassExW",                      (ImplFn)impl_RegisterClassExW},
     {"GetSystemMetrics",                      (ImplFn)impl_GetSystemMetrics},
     {"GetDesktopWindow",                      (ImplFn)impl_GetDesktopWindow},
+    {"GetForegroundWindow",                   (ImplFn)impl_GetForegroundWindow},
     {"ShowWindow",                            (ImplFn)impl_ShowWindow},
     {"UpdateWindow",                          (ImplFn)impl_UpdateWindow},
     {"GetModuleHandleExW",                    (ImplFn)impl_GetModuleHandleExW},
@@ -4554,6 +5299,7 @@ static ImplEntry g_impls[] = {
     {"CloseHandle",                           (ImplFn)impl_CloseHandle},
     {"ReadFile",                              (ImplFn)impl_ReadFile},
     {"WriteFile",                             (ImplFn)impl_WriteFile},
+    {"GetFileInformationByHandle",            (ImplFn)impl_GetFileInformationByHandle},
     {"GetFileSize",                           (ImplFn)impl_GetFileSize},
     {"SetFilePointer",                        (ImplFn)impl_SetFilePointer},
     {"GetFileAttributesA",                    (ImplFn)impl_GetFileAttributesA},
@@ -4562,6 +5308,7 @@ static ImplEntry g_impls[] = {
     {"SetFileAttributesW",                    (ImplFn)impl_SetFileAttributesW},
     /* Thread affinity */
     {"SetThreadAffinityMask",                 (ImplFn)impl_SetThreadAffinityMask},
+    {"SetThreadIdealProcessor",               (ImplFn)impl_SetThreadIdealProcessor},
     /* Memory */
     {"LocalAlloc",                            (ImplFn)impl_LocalAlloc},
     {"LocalFree",                             (ImplFn)impl_LocalFree},
@@ -4595,6 +5342,7 @@ static ImplEntry g_impls[] = {
     {"SetFocus",                              (ImplFn)impl_SetFocus},
     {"GetFocus",                              (ImplFn)impl_GetFocus},
     {"GetActiveWindow",                       (ImplFn)impl_GetActiveWindow},
+    {"SetActiveWindow",                       (ImplFn)impl_SetActiveWindow},
     {"PeekMessageW",                          (ImplFn)impl_PeekMessageW},
     {"GetMessageW",                           (ImplFn)impl_GetMessageW},
     {"TranslateMessage",                      (ImplFn)impl_TranslateMessage},
@@ -4634,7 +5382,9 @@ static ImplEntry g_impls[] = {
     {"RtlPcToFileHeader",                     (ImplFn)impl_RtlPcToFileHeader},
     /* Locale */
     {"EnumSystemLocalesW",                    (ImplFn)impl_EnumSystemLocalesW},
+    {"EnumSystemLocalesEx",                   (ImplFn)impl_EnumSystemLocalesEx},
     {"IsValidLocale",                         (ImplFn)impl_IsValidLocale},
+    {"IsValidLocaleName",                     (ImplFn)impl_IsValidLocaleName},
     {"GetLocaleInfoA",                        (ImplFn)impl_GetLocaleInfoA},
     {"GetUserDefaultLocaleName",              (ImplFn)impl_GetUserDefaultLocaleName},
     {"CompareStringW",                        (ImplFn)impl_CompareStringW},
@@ -4670,6 +5420,8 @@ static ImplEntry g_impls[] = {
     {"GetLocaleInfoEx",                       (ImplFn)impl_GetLocaleInfoEx},
     {"LCMapStringEx",                         (ImplFn)impl_LCMapStringEx},
     /* Directory */
+    {"CreateDirectoryW",                      (ImplFn)impl_CreateDirectoryW},
+    {"CreateDirectoryA",                      (ImplFn)impl_CreateDirectoryA},
     {"GetCurrentDirectoryW",                  (ImplFn)impl_GetCurrentDirectoryW},
     {"GetCurrentDirectoryA",                  (ImplFn)impl_GetCurrentDirectoryA},
     {"SetCurrentDirectoryW",                  (ImplFn)impl_SetCurrentDirectoryW},
@@ -5281,23 +6033,9 @@ static void patch_known_bad_targets(void)
         }
     }
 
-    /* Sekiro game-init bad-return at RVA 0x237ce59: a function epilogue tries to
-     * return via a NULL stack slot (NULL return address). This creates an infinite
-     * loop as the fault handler can't break out. Patch the `ret` to jump to a safe
-     * stub (xor eax,eax; ret) that allows the function chain to complete. */
-    {
-        u64 target = (u64)g_img + 0x237ce59;
-        u64 page   = target & ~(u64)0xFFF;
-        if (mprotect((void *)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-            u8 *p = (u8 *)target;
-            p[0] = 0x31; p[1] = 0xC0; /* xor eax,eax */
-            p[2] = 0xC3;              /* ret */
-            fprintf(stderr, "[PATCH] Sekiro bad-return stub at RVA 0x237ce59 patched to safe return\n");
-        } else {
-            fprintf(stderr, "[WARN] Failed to patch Sekiro bad-return at RVA 0x237ce59: %s\n",
-                    strerror(errno));
-        }
-    }
+    /* Keep the valid `ret; int3` boundary at RVA 0x237ce59 intact.  Replacing
+     * three bytes here used to turn the following function's leading INT3 into
+     * a second RET, shifting recovery into malformed instruction boundaries. */
 
     if (aggressive) {
         /* Entry bootstrap helper ... */
@@ -6042,15 +6780,52 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         }
     }
 
-    /* EMERGENCY: If RSP is 0, reset to entry baseline immediately.
-     * This can happen if beer_dispatch_trampoline's return path corrupted RSP.
-     * Without this, RSP=0 leads to infinite crashes and cycle detection firing. */
-    if (sig == SIGSEGV && rsp0 == 0 && g_entry_rsp) {
-        fprintf(stderr, "[WARN] RSP=0 detected at RIP=0x%lx; resetting to entry baseline 0x%lx\n",
-                rip, g_entry_rsp);
-        reset_rsp_to_entry_baseline(uc);
-        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
-        return;
+    /* This post-device fault reads the display/config record vector from the
+     * root object.  Record the producer-owned state before generic unwind
+     * changes the call chain; this is diagnostic only and never fabricates the
+     * missing record. */
+    if (sig == SIGSEGV && g_img && rip == (u64)g_img + 0x0f817f1) {
+        u64 root = *(u64 *)(g_img + 0x3f3b400);
+        if (root) {
+            fprintf(stderr,
+                    "[ROOT] RVA 0x0f817f1: root=0x%lx records=[0x%lx,0x%lx,0x%lx] count=%u backend=0x%lx service=0x%lx\n",
+                    root, *(u64 *)(root + 0x98), *(u64 *)(root + 0xa0),
+                    *(u64 *)(root + 0xa8), *(u32 *)(root + 0x2a0),
+                    *(u64 *)(root + 0x458), *(u64 *)(root + 0x328));
+        }
+    }
+
+    /* Sekiro's internal nonlocal-context restore loads its target RSP from
+     * [RCX+0x10] and target RIP from [RCX+0x50].  Continuing with an empty
+     * context destroys all architectural state and previously led to repeated
+     * RIP=0/RSP=0 recovery.  Reject that stale context at its source instead of
+     * fabricating a stack or pretending the restore succeeded. */
+    if (sig == SIGSEGV && g_img && rip == (u64)g_img + 0x269643d) {
+        u64 context = rcx0;
+        u64 target_rsp = context ? *(u64 *)(uintptr_t)(context + 0x10) : 0;
+        u64 target_rip = context ? *(u64 *)(uintptr_t)(context + 0x50) : 0;
+        if (!is_guest_stack_rsp(target_rsp) || !is_valid_resume_target(target_rip)) {
+            fprintf(stderr,
+                    "[FATAL] Refusing stale guest context restore at RVA 0x269643d: context=0x%lx RSP=0x%lx RIP=0x%lx\n",
+                    context, target_rsp, target_rip);
+            report_window_progress();
+            fflush(stderr);
+            _exit(2);
+        }
+    }
+
+    /* A zero RSP is never recoverable without inventing a caller frame. At the
+     * observed failure RCX still identifies the zeroed restore record, so report
+     * that source context and stop on the first secondary execute fault. */
+    if (sig == SIGSEGV && rsp0 == 0) {
+        u64 context_rsp = rcx0 ? *(u64 *)(uintptr_t)(rcx0 + 0x10) : 0;
+        u64 context_rip = rcx0 ? *(u64 *)(uintptr_t)(rcx0 + 0x50) : 0;
+        fprintf(stderr,
+                "[FATAL] Invalid guest context was applied: context=0x%lx saved-RSP=0x%lx saved-RIP=0x%lx; refusing synthetic recovery\n",
+                rcx0, context_rsp, context_rip);
+        report_window_progress();
+        fflush(stderr);
+        _exit(2);
     }
 
     /* Handle early-startup faults (CRT initialization region RVA 0x2600-0x27ff) using real-unwind.
@@ -6132,57 +6907,72 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     /* ============================================================================
      * Sync Memory Infrastructure: Handle XCHG crashes in game-init
      * ============================================================================
-     * The game-init code tries to use synchronization primitives (XCHG locks)
-     * on unallocated memory at specific RVAs. Strategy:
-     * 1. Allocate real memory at the faultaddr
-     * 2. Skip the XCHG instruction (treat as lock acquire with immediate success)
-     * 3. Initialize result register to 0 (lock was free, acquire succeeded)
+     * The remaining known XCHG sites use lock tables in the image's data section.
+     * Emulate those exact instructions atomically rather than mapping fault-derived
+     * addresses or modifying adjacent instructions.
      */
     
     /* Specific XCHG crash points: Emulate using real atomic XCHG on game's .data section */
     int is_xchg_crash = (rip == (u64)g_img + 0x237cff0 || rip == (u64)g_img + 0x23b1318);
     
     if (is_xchg_crash) {
-        /* Two known XCHG sites in game initialization:
-         * 0x14237cff0: XCHG [rcx + r14*8 + 0x3f33030], rdx
-         * 0x1423b1318: XCHG [r15 + r14*8 + 0x3f33bb0], rdx
-         * 
-         * Emulate using atomic operations on the game's own .data section.
-         * r14 is a raw pointer without .bind normalization; clamp to r14 % 8192 for safety. */
-        
+        /* Both complete resolver functions copy their 32-bit selector from ECX
+         * into R14D in the prologue. Recovery corruption can nevertheless enter
+         * these sites with a stale selector. Keep the historical bounded slot
+         * mapping for now, but record the intact resolver frame so the corrupt
+         * caller can be identified without weakening the cycle detector. */
         u64 r14_raw = (u64)uc->uc_mcontext.gregs[REG_R14];
-        u64 r14_slot = r14_raw % 8192;  /* Safe slot index */
-        u64 rdx_val = (u64)uc->uc_mcontext.gregs[REG_RDX];
-        
-        u64 address_to_xchg = 0;
-        if (rip == (u64)g_img + 0x237cff0) {
-            /* XCHG [rcx + r14*8 + 0x3f33030], rdx */
-            u64 rcx = (u64)uc->uc_mcontext.gregs[REG_RCX];
-            address_to_xchg = rcx + (r14_slot * 8) + 0x3f33030;
-        } else {
-            /* XCHG [r15 + r14*8 + 0x3f33bb0], rdx */
-            /* r15 should already be set, but .bind usually initializes it; use g_img as fallback */
-            u64 r15 = (u64)uc->uc_mcontext.gregs[REG_R15];
-            if (r15 == 0) {
-                r15 = (u64)g_img;  /* Fallback: use image base if r15 not yet set */
-                uc->uc_mcontext.gregs[REG_R15] = (greg_t)r15;
-            }
-            address_to_xchg = r15 + (r14_slot * 8) + 0x3f33bb0;
+        int first_resolver = rip == (u64)g_img + 0x237cff0;
+        u64 selector_max = first_resolver ? 8 : 31;
+        u64 frame_ret = 0;
+        if (is_guest_stack_rsp(rsp0) && is_guest_stack_rsp(rsp0 + 0x50))
+            frame_ret = *(u64 *)(rsp0 + 0x48);
+
+        /* R14D is the selector captured from ECX at function entry. All direct
+         * wrappers use 4..8 for the first resolver and 0..31 for the second.
+         * If recovery entered with a stale pointer/value, complete this intact
+         * resolver frame as a failed lookup. Its real epilogue restores every
+         * saved nonvolatile register and returns through the verified frame slot;
+         * modulo-indexing the stale value instead mutates an unrelated cache slot
+         * and is what sustains the cross-resolver cycle. The global detector also
+         * covers period-1 cycles so a repeated fault inside any one recovery
+         * branch remains bounded. Do not apply this to the initial synthetic
+         * handoff frame: its return slot points into the guest stack rather than
+         * to an executable image caller, so that first compatibility access keeps
+         * the historical bounded behavior. */
+        if (r14_raw > selector_max &&
+            (image_addr_is_exec(frame_ret) ||
+             (g_tramp && frame_ret >= (u64)g_tramp && frame_ret < (u64)(g_tramp + g_trampsz)))) {
+            u64 epilogue = (u64)g_img + (first_resolver ? 0x237d027 : 0x23b134f);
+            fprintf(stderr,
+                    "[XCHG] Invalid selector 0x%lx at RVA 0x%lx; failed lookup via epilogue, caller=0x%lx\n",
+                    r14_raw, rip - (u64)g_img, frame_ret);
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)epilogue;
+            return;
         }
-        
-        /* Perform atomic XCHG: exchange RDX with value at address, return old value in RDX */
+
+        u64 r14_slot = r14_raw % 8192;
+        u64 rdx_val = (u64)uc->uc_mcontext.gregs[REG_RDX];
+        u64 table_rva = first_resolver ? 0x3f33030 : 0x3f33bb0;
+        u64 address_to_xchg = (u64)g_img + table_rva + (r14_slot * 8);
+
+        if (first_resolver)
+            uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
+        else
+            uc->uc_mcontext.gregs[REG_R15] = (greg_t)g_img;
+
+        /* XCHG returns the old memory value in RDX and does not modify RAX. */
         volatile u64 *target = (volatile u64 *)address_to_xchg;
         u64 old_value = __sync_lock_test_and_set(target, rdx_val);
-        
-        /* Set RDX (and RAX) to the old value */
         uc->uc_mcontext.gregs[REG_RDX] = (greg_t)old_value;
-        uc->uc_mcontext.gregs[REG_RAX] = (greg_t)old_value;
-        
-        /* Skip 8 bytes past the XCHG instruction */
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 8);
-        
-        fprintf(stderr, "[XCHG] emulated at 0x%lx: XCHG [0x%lx], 0x%lx -> RDX=0x%lx\n",
-                rip, address_to_xchg, rdx_val, old_value);
+
+        fprintf(stderr,
+                "[XCHG] emulated at RVA 0x%lx: raw-selector=0x%lx slot=%lu "
+                "XCHG [0x%lx], 0x%lx -> RDX=0x%lx RSP=0x%lx frame-ret=0x%lx\n",
+                rip - (u64)g_img, r14_raw, r14_slot, address_to_xchg,
+                rdx_val, old_value, rsp0, frame_ret);
         return;
     }
     
@@ -6192,7 +6982,10 @@ sync_alloc_skip:
      * ============================================================================
      * PHASE 5: Only initialize locks in data pages, preserve code pages
      */
-    if (faultaddr >= 0x1000 && faultaddr < 0x7f0000000000ULL && !is_xchg_crash) {
+    if (faultaddr >= 0x1000 && faultaddr < 0x7f0000000000ULL && faultaddr != rip &&
+        !is_xchg_crash &&
+        (!g_img || rip < (u64)g_img || rip >= (u64)g_img + 0x42d2000) &&
+        (!g_guest_stack_low || faultaddr < g_guest_stack_low || faultaddr >= g_guest_stack_high)) {
         u64 page_aligned = faultaddr & ~0xFFF;
         u64 alloc_size = 0x100000;
         static u32 generic_alloc_count = 0;  /* Track allocation attempts */
@@ -6296,75 +7089,117 @@ sync_alloc_skip:
     }
 
 generic_alloc_skip:
-    /* Cycle detection for 0x237cde0-0x23b1400: Game-init and graphics-setup region.
-     * Try runtime patching of problematic instructions. */
-    if (sig == SIGSEGV && rip >= (u64)g_img + 0x237cde0 && rip <= (u64)g_img + 0x23b1400) {
-        static u32 sekiro_cycle_faults = 0;
-        static u32 ce5x_attempts = 0;  
-        static u64 last_rip = 0;  
-        static u32 same_rip_count = 0;
-        
-        sekiro_cycle_faults++;
-        
-        /* Track if we're looping on the exact same RIP */
-        if (last_rip == rip) {
-            same_rip_count++;
-        } else {
-            same_rip_count = 1;
-            last_rip = rip;
-        }
-        
-        /* AGGRESSIVE: If we're stuck at any RIP after 3 repeats, try NOP patching */
-        if (same_rip_count >= 3) {
-            fprintf(stderr, "[PATCH] Runtime patching stuck RIP 0x%lx (%d repeats) with NOPs\n", rip, same_rip_count);
-            u8 *patch_addr = (u8 *)rip;
-            mprotect((void*)((u64)rip & ~0xFFF), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
-            for (int i = 0; i < 8; i++) patch_addr[i] = 0x90;  /* NOPs */
-            mprotect((void*)((u64)rip & ~0xFFF), 0x2000, PROT_READ | PROT_EXEC);
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)rip;
+    /* Do not mutate instructions in the broad game-init range. In particular,
+     * replacing eight bytes at an arbitrary fault RIP can split instructions,
+     * erase function epilogues, and destroy RSP. Exact sites are handled above;
+     * all other faults continue to metadata-driven unwind recovery below. */
+
+    /* RVA 0x237ce28 has one direct caller in the image: the CALL at 0x23596ce,
+     * whose continuation is 0x23596d3. Recovery can enter the helper with RSP
+     * three qwords below that caller frame; after its normal `add rsp, 0x28`
+     * epilogue, the RET consequently sees recovery scratch data instead of the
+     * saved continuation. Do not scan for an arbitrary executable address and
+     * do not skip the RET. Reconstruct only this statically verified call edge,
+     * and only when the expected continuation is in its exact observed slot. */
+    if (sig == SIGSEGV && g_img && rip == (u64)g_img + 0x237ce59 &&
+        is_guest_stack_rsp(rsp0) && is_guest_stack_rsp(rsp0 + 0x20)) {
+        u64 expected_ret = (u64)g_img + 0x23596d3;
+        u64 *sp = (u64 *)rsp0;
+        if (sp[3] == expected_ret && image_addr_is_exec(expected_ret) &&
+            (!g_entry_rsp_limit || rsp0 + 0x20 <= g_entry_rsp_limit)) {
+            fprintf(stderr,
+                    "[FRAME] Reconstructed 0x237ce28 caller: RET slot 0x%lx -> 0x%lx (discarded 0x18 recovery bytes)\n",
+                    rsp0 + 0x18, expected_ret);
+            uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(rsp0 + 0x20);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)expected_ret;
             return;
         }
-        
-        /* Detect if we're looping at 0x237ce59-0x237ce5b with NULL fault addresses */
-        if (rip >= (u64)g_img + 0x237ce59 && rip <= (u64)g_img + 0x237ce5b && faultaddr == 0) {
-            ce5x_attempts++;
-            if (ce5x_attempts >= 2) {
-                fprintf(stderr, "[SKIP] Sekiro stuck at 0x237ce59-0x237ce5b [attempt %d] - jumping to safe return\n",
-                        ce5x_attempts);
-                uc->uc_mcontext.gregs[REG_RAX] = 0;
-                uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;
-                uc->uc_mcontext.gregs[REG_R14] = 0;
-                reset_rsp_to_entry_baseline(uc);
-                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)guest_resume_rip();
-                return;
-            }
-        } else {
-            ce5x_attempts = 0;  
+    }
+
+    /* The callback-record walker calls callbacks at RVA 0x23bb5ef and its
+     * wrapper was called from 0x23596db (continuation 0x23596e0).  By the time
+     * callback RVA 0x23b1ab0 reaches its RET, prior recovery has already popped
+     * beyond both the callback and walker frames: the walker's continuation is
+     * retained in RSI, while the exact wrapper continuation is now at RSP+0x10.
+     * Generic unwind incorrectly consumes RSP+0x28 (0x237ce48), re-entering the
+     * broken startup chain.  Finish the failed callback walk only for this exact
+     * verified frame shape, preserving the callback's AL result. */
+    if (sig == SIGSEGV && g_img && rip == (u64)g_img + 0x23b1b15 &&
+        is_guest_stack_rsp(rsp0) && is_guest_stack_rsp(rsp0 + 0x18)) {
+        u64 walker_cont = (u64)g_img + 0x23bb5f1;
+        u64 wrapper_cont = (u64)g_img + 0x23596e0;
+        u64 *sp = (u64 *)rsp0;
+        if ((u64)uc->uc_mcontext.gregs[REG_RSI] == walker_cont &&
+            sp[2] == wrapper_cont && image_addr_is_exec(wrapper_cont) &&
+            (!g_entry_rsp_limit || rsp0 + 0x18 <= g_entry_rsp_limit)) {
+            fprintf(stderr,
+                    "[FRAME] Reconstructed failed callback walk: RVA 0x23b1b15 -> 0x23596e0 (discarded 0x10 recovery bytes)\n");
+            uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(rsp0 + 0x18);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)wrapper_cont;
+            return;
         }
-        if (sekiro_cycle_faults > 500000) {
-            fprintf(stderr, "[FATAL] Sekiro game-init region unbreakable cycle detected (%d faults), exiting to avoid spin\n",
-                    sekiro_cycle_faults);
-            fprintf(stderr, "        Last fault at RIP=0x%lx RCX=0x%lx RDX=0x%lx R8=0x%lx R14=0x%lx RSP=0x%lx\n",
-                    rip, uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
-                    uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R14],
-                    uc->uc_mcontext.gregs[REG_RSP]);
-            report_window_progress();
-            exit(97);
+
+        /* A second exact shape occurs after the nested callback's own
+         * 0x23b1af2 epilogue has completed: RSI identifies the 0x237ce28
+         * startup helper and RSP+0x10 contains that helper's verified caller
+         * continuation. Complete that return instead of skipping the RET into
+         * the next function. */
+        u64 startup_cont = (u64)g_img + 0x23596d3;
+        if ((u64)uc->uc_mcontext.gregs[REG_RSI] == (u64)g_img + 0x237ce3b &&
+            sp[2] == startup_cont && image_addr_is_exec(startup_cont) &&
+            (!g_entry_rsp_limit || rsp0 + 0x18 <= g_entry_rsp_limit)) {
+            fprintf(stderr,
+                    "[FRAME] Reconstructed nested callback return: RVA 0x23b1b15 -> 0x23596d3 (discarded 0x10 recovery bytes)\n");
+            uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(rsp0 + 0x18);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)startup_cont;
+            return;
         }
-        
-        /* Reduce log verbosity for long runs */
-        if (sekiro_cycle_faults % 20000 == 1) {
-            fprintf(stderr, "[SKIP] Sekiro game-init region RIP=0x%lx (+0x%lx), faultaddr=0x%lx [fault %d/200000] R14=0x%lx\n",
-                    rip, rip - (u64)g_img, faultaddr, sekiro_cycle_faults,
-                    uc->uc_mcontext.gregs[REG_R14]);
-        }
-        
-        /* Initialize key registers to prevent address overflows and invalid accesses. */
+    }
+
+    /* RVA 0x23921e8 tears down a three-entry worker array held in global
+     * RVA 0x3f331a8.  The initializer is allowed to leave that allocation
+     * NULL, but this cleanup routine dereferences it unconditionally at
+     * 0x2392201.  The two cleanup calls preceding the loop have already run by
+     * this point, so an absent array means there are no entries to destroy and
+     * the correct structural recovery is the function's real epilogue.  Keep
+     * this exact: require the first loop iteration, the NULL global, and the
+     * expected zero byte offset rather than skipping individual instructions. */
+    if (sig == SIGSEGV && g_img && rip == (u64)g_img + 0x2392201 &&
+        (u64)uc->uc_mcontext.gregs[REG_RBX] == 0 &&
+        *(u64 *)(g_img + 0x3f331a8) == 0) {
+        fprintf(stderr,
+                "[CLEANUP] Worker array is NULL at RVA 0x2392201; resuming at the function epilogue\n");
         uc->uc_mcontext.gregs[REG_RAX] = 0;
-        uc->uc_mcontext.gregs[REG_RCX] = (greg_t)g_img;  
-        uc->uc_mcontext.gregs[REG_R14] = 0;              
-        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "game-init-escape");
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)((u64)g_img + 0x239223d);
         return;
+    }
+
+    /* RVA 0x23ab7d0 is a bounded destructor/callback-array walker.  When an
+     * entry is not executable, the fault occurs after `call rsi` has pushed
+     * the exact continuation 0x23ab81f.  Generic execute-fault recovery resumes
+     * that loop with already-corrupt iterator state and can walk indefinitely
+     * beyond the nominal array.  Treat a bad callback as a failed teardown and
+     * run the walker's real epilogue, but only for its exact frame shape: the
+     * callback continuation must be on top, the nominal count must be small,
+     * and the walker's own return slot at callback-RSP+0x30 must be executable. */
+    if (sig == SIGSEGV && g_img && faultaddr == rip &&
+        !(rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) &&
+        is_guest_stack_rsp(rsp0) && is_guest_stack_rsp(rsp0 + 0x38)) {
+        u64 *sp = (u64 *)rsp0;
+        u64 walker_cont = (u64)g_img + 0x23ab81f;
+        u64 walker_ret = sp[6];
+        u64 count = (u64)uc->uc_mcontext.gregs[REG_RDI];
+        if (sp[0] == walker_cont && count > 0 && count <= 0x1000 &&
+            image_addr_is_exec(walker_ret) &&
+            (!g_entry_rsp_limit || rsp0 + 0x38 <= g_entry_rsp_limit)) {
+            fprintf(stderr,
+                    "[CALLBACK] Invalid destructor target 0x%lx in %lu-entry walk; finishing at RVA 0x23ab82b (caller 0x%lx)\n",
+                    rip, count, walker_ret);
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(rsp0 + 8);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)((u64)g_img + 0x23ab82b);
+            return;
+        }
     }
 
     if (g_guest_stack_low && g_guest_stack_high &&
@@ -6513,85 +7348,42 @@ generic_alloc_skip:
         return;
     }
     
-    /* NEW REGION: Execute fault in 0x1423b1000-0x1424b1000 (post-game-init)
-     * This region was mistakenly allocated with sync locks, but game is executing code here.
-     * Skip 8 bytes at a time (typical x64 instruction or lock structure) to advance past the problem.
-     * Increased limit to 500000 to push through problematic code. */
-    if (sig == SIGSEGV && rip >= 0x1423b1000ULL && rip < 0x1424b1000ULL) {
-        /* BLOCKER PRIORITY: Check special blockers BEFORE generic JIT handling */
-        if (rip == 0x1423b1403ULL) {
-            static int blocker_hit_count = 0;
-            blocker_hit_count++;
-            
-            u64 rdi = uc->uc_mcontext.gregs[REG_RDI];
-            u64 rax = uc->uc_mcontext.gregs[REG_RAX];
-            u64 rsi = uc->uc_mcontext.gregs[REG_RSI];
-            u64 rdx = uc->uc_mcontext.gregs[REG_RDX];
-            u64 rcx = uc->uc_mcontext.gregs[REG_RCX];
-            u64 r8  = uc->uc_mcontext.gregs[REG_R8];
-            u64 r9  = uc->uc_mcontext.gregs[REG_R9];
-            u64 rsp = uc->uc_mcontext.gregs[REG_RSP];
-            u64 rbp = uc->uc_mcontext.gregs[REG_RBP];
-            
-            /* Dump 8 bytes of instruction at RIP */
-            u8 *bytes = (u8*)rip;
-            
-            /* DEBUG: Check what's at this address in the loaded image section */
-            u64 offset_in_image = rip - (u64)g_img;
-            u8 *section_bytes = (u8*)g_img + offset_in_image;
-            
-            if (blocker_hit_count <= 3) {
-                fprintf(stderr, "\n[REVERSE_ENG] ========== BLOCKER HIT at 0x1423b1403 #%d ==========\n", blocker_hit_count);
-                fprintf(stderr, "[REVERSE_ENG] RIP=0x%lx (offset 0x%lx in .text section)\n", rip, offset_in_image);
-                fprintf(stderr, "[REVERSE_ENG] Instruction bytes at RIP: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
-                fprintf(stderr, "[REVERSE_ENG] Same via g_img:         %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                        section_bytes[0], section_bytes[1], section_bytes[2], section_bytes[3],
-                        section_bytes[4], section_bytes[5], section_bytes[6], section_bytes[7]);
-                fprintf(stderr, "[REVERSE_ENG] Previous 8 bytes:        %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                        bytes[-8], bytes[-7], bytes[-6], bytes[-5], bytes[-4], bytes[-3], bytes[-2], bytes[-1]);
-                fprintf(stderr, "[REVERSE_ENG] REGS: RAX=0x%016lx RCX=0x%016lx RDX=0x%016lx\n", rax, rcx, rdx);
-                fprintf(stderr, "[REVERSE_ENG]      RDI=0x%016lx RSI=0x%016lx RBP=0x%016lx RSP=0x%016lx\n", rdi, rsi, rbp, rsp);
-                fprintf(stderr, "[REVERSE_ENG]      R8=0x%016lx R9=0x%016lx\n", r8, r9);
-                fprintf(stderr, "[REVERSE_ENG] STACK at RSP: 0x%016lx 0x%016lx 0x%016lx 0x%016lx\n",
-                        rsp < 0xffffffffffff ? ((u64*)rsp)[0] : 0,
-                        rsp < 0xffffffffffff ? ((u64*)rsp)[1] : 0,
-                        rsp < 0xffffffffffff ? ((u64*)rsp)[2] : 0,
-                        rsp < 0xffffffffffff ? ((u64*)rsp)[3] : 0);
-                fprintf(stderr, "[REVERSE_ENG] FaultAddr=0x%lx\n", faultaddr);
-                fprintf(stderr, "[REVERSE_ENG] ===============================================\n\n");
+    /* RVA 0x23bb5b8 walks [begin,end) callback records in 16-byte steps.
+     * Its only direct entry is the tail wrapper at RVA 0x23ab634, which supplies
+     * the static image range 0x30c6480..0x30c6570.  Recovery can incorrectly
+     * enter the walker with unrelated stack/code pointers; letting it continue
+     * then calls values 0/1 as callbacks.  Treat only a structurally impossible
+     * range as empty and use the helper's real success epilogue. */
+    if (sig == SIGSEGV && g_img && rip == (u64)g_img + 0x23bb5de) {
+        u64 begin = (u64)uc->uc_mcontext.gregs[REG_RDI];
+        u64 end = (u64)uc->uc_mcontext.gregs[REG_RSI];
+        u64 span = end >= begin ? end - begin : UINT64_MAX;
+        if (!begin || !end || end < begin || (span & 0xf) || span > 0x100000) {
+            g_bad_callback_range_hits++;
+            fprintf(stderr,
+                    "[RANGE] Invalid callback range 0x%lx..0x%lx at RVA 0x23bb5de; reconstructing wrapper return to RVA 0x23596e0 [%u/8]\n",
+                    begin, end, g_bad_callback_range_hits);
+            if (g_bad_callback_range_hits > 8) {
+                fprintf(stderr,
+                        "[FATAL] Callback-range recovery made no forward progress after 8 attempts; aborting boundedly.\n");
+                report_window_progress();
+                fflush(stderr);
+                _exit(2);
             }
-            
-            if (rdi == 0) {
-                fprintf(stderr, "[DIAG] 0x1423b1403 NULL-write: RDI=0x%lx - escaping\n", rdi);
-                uc->uc_mcontext.gregs[REG_RAX] = 0;
-                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "jit-blocker-null");
-                return;
-            }
-            
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "jit-blocker");
-            return;
-        }
-        
-        /* Generic JIT region handling */
-        static int jit_region_faults = 0;
-        jit_region_faults++;
-        if (jit_region_faults <= 500000) {
-            if (jit_region_faults % 10000 == 1 || jit_region_faults <= 5) {
-                fprintf(stderr, "[SKIP] JIT-region execute-fault at RIP=0x%lx, skipping 8 bytes [%d/500000]\n",
-                        rip, jit_region_faults);
-            }
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 8);
-            return;
-        } else {
-            fprintf(stderr, "[GATE] JIT-region limit exceeded (%d), switching to escape mode\n", jit_region_faults);
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "jit-region");
+            uc->uc_mcontext.gregs[REG_RAX] =
+                (greg_t)(((u64)uc->uc_mcontext.gregs[REG_RAX] & ~0xffULL) | 1);
+            /* The only caller of the 0x23ab634 wrapper is CALL 0x23ab634 at
+             * 0x23596db. Discard the walker's 0x28-byte frame plus its return
+             * slot, then resume at that call's exact continuation. */
+            uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(rsp0 + 0x30);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)((u64)g_img + 0x23596e0);
             return;
         }
     }
+
+    /* The old 0x1423b1000..0x1424b1000 "JIT" rule skipped eight bytes at
+     * every fault, including valid PE instructions.  It is intentionally gone:
+     * ordinary image faults now use exact handlers or PE unwind metadata. */
     
     if (sig == SIGILL && g_img &&
         rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) {
@@ -8092,9 +8884,11 @@ static void __attribute__((noreturn)) guest_exit_stub(void)
 /* ── main ───────────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
-    const char *exe = (argc > 1) ? argv[1]
+    const char *exe_arg = (argc > 1) ? argv[1]
         : "/run/media/abhineet/56A4064AA4062CD5/Games/Sekiro - Shadows Die Twice/sekiro.exe";
-    g_exe_path = exe;
+    const char *exe = configure_guest_process_path(exe_arg);
+    if (!exe)
+        die("cannot configure guest process path '%s': %s", exe_arg, strerror(errno));
 
     /* Install a dedicated alternate signal stack. When the guest runs on a
      * synthetic RSP, the crash handler must not consume the guest stack frame:
@@ -8330,9 +9124,9 @@ int main(int argc, char **argv)
     u64 guest_ret_slot = guest_frame_base + 0x5c8;
     u64 guest_rbp_slot = guest_frame_base + 0x5c0;
     u64 guest_frame_ptr_slot = guest_frame_base + 0x5d0;
-    u64 guest_initial_ret = g_img ? ((u64)g_img + 0x235a120) : (u64)guest_exit_stub;
-    if (!g_img || !image_addr_is_exec(guest_initial_ret))
-        guest_initial_ret = (u64)guest_exit_stub;
+    /* A PE entry point is called by the Windows loader. If it returns, control
+     * belongs to the loader, not to the executable's CRT startup routine again. */
+    u64 guest_initial_ret = (u64)guest_exit_stub;
     *(u64 *)guest_rbp_slot = guest_rbp_slot;
     *(u64 *)guest_ret_slot = guest_initial_ret;
     *(u64 *)guest_frame_ptr_slot = guest_ret_slot;
@@ -8352,8 +9146,8 @@ int main(int argc, char **argv)
     fprintf(stderr, "[ENTRY] Entry point at %p, g_entry_rsp=%p, g_host_call_stack: %p..%p\n",
             (void*)entry, (void*)g_entry_rsp, (void*)g_host_call_stack_base, (void*)g_host_call_stack_top);
 
-    /* SavedGuestRsp will be set by beer_dispatch_trampoline on first outer call.
-     * Don't set it here - let the trampoline handle it. */
+    /* SavedGuestRsp is transient: an outer dispatch sets it while host code is
+     * active and clears it when guest RSP is restored. */
     fprintf(stderr, "[SETUP] Entry frame at 0x%lx..0x%lx, first API will set SavedGuestRsp\n",
             g_entry_rsp, g_entry_rsp + 0x1000);
     
