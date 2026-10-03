@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "xwayland_backend.h"
+#include "vulkan_presenter.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -59,6 +60,16 @@ typedef struct {
     int height;
     int visible;
     int initialized;
+    XImage *present_image;
+    uint8_t *present_pixels;
+    int present_width;
+    int present_height;
+    uint64_t source_hash;
+    int source_width;
+    int source_height;
+    int source_row_pitch;
+    int source_hash_valid;
+    XwaylandPresenter presenter;
     pthread_mutex_t lock;
 
     int (*InitThreads)(void);
@@ -88,9 +99,37 @@ typedef struct {
                     unsigned int, unsigned int);
     int (*DestroyImage)(XImage *);
     int (*Flush)(Display *);
+    int (*Sync)(Display *, Bool);
 } XwaylandBackend;
 
-static XwaylandBackend g_x11 = { .lock = PTHREAD_MUTEX_INITIALIZER };
+static XwaylandBackend g_x11 = {
+    .presenter = XWAYLAND_PRESENTER_AUTO,
+    .lock = PTHREAD_MUTEX_INITIALIZER
+};
+
+const char *xwayland_presenter_name(XwaylandPresenter presenter)
+{
+    switch (presenter) {
+    case XWAYLAND_PRESENTER_AUTO: return "auto";
+    case XWAYLAND_PRESENTER_VULKAN: return "vulkan";
+    case XWAYLAND_PRESENTER_X11: return "x11";
+    default: return "unknown";
+    }
+}
+
+int xwayland_set_presenter(XwaylandPresenter presenter)
+{
+    if (presenter < XWAYLAND_PRESENTER_AUTO || presenter > XWAYLAND_PRESENTER_X11)
+        return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    if (g_x11.display || g_x11.window || vulkan_presenter_is_active()) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 0;
+    }
+    g_x11.presenter = presenter;
+    pthread_mutex_unlock(&g_x11.lock);
+    return 1;
+}
 
 #define X11_LOAD(field, symbol) do { \
     *(void **)(&g_x11.field) = dlsym(g_x11.library, symbol); \
@@ -133,6 +172,7 @@ static int initialize_locked(void)
     X11_LOAD(PutImage, "XPutImage");
     X11_LOAD(DestroyImage, "XDestroyImage");
     X11_LOAD(Flush, "XFlush");
+    X11_LOAD(Sync, "XSync");
 
     g_x11.InitThreads();
     g_x11.display = g_x11.OpenDisplay(NULL);
@@ -320,9 +360,16 @@ int xwayland_window_poll_event(XwaylandEvent *out)
     switch (event.type) {
         case 9: out->type = XWAYLAND_EVENT_FOCUS_IN; break;
         case 10: out->type = XWAYLAND_EVENT_FOCUS_OUT; break;
-        case 12: out->type = XWAYLAND_EVENT_EXPOSE; break;
+        case 12:
+            g_x11.source_hash_valid = 0;
+            out->type = XWAYLAND_EVENT_EXPOSE;
+            break;
         case 18: g_x11.visible = 0; out->type = XWAYLAND_EVENT_HIDE; break;
-        case 19: g_x11.visible = 1; out->type = XWAYLAND_EVENT_SHOW; break;
+        case 19:
+            g_x11.visible = 1;
+            g_x11.source_hash_valid = 0;
+            out->type = XWAYLAND_EVENT_SHOW;
+            break;
         case 22: {
             XConfigureEvent *configure = (XConfigureEvent *)&event;
             g_x11.x = configure->x; g_x11.y = configure->y;
@@ -353,64 +400,173 @@ int xwayland_window_pump_events(void)
     return close_requested;
 }
 
-int xwayland_window_present_rgba8(const uint8_t *pixels, int width, int height,
+static int present_rgba8_internal(const void *resource, uint64_t serial,
+                                  const uint8_t *pixels, int width, int height,
                                   int row_pitch)
 {
     if (!pixels || width <= 0 || height <= 0 || row_pitch < width * 4)
         return 0;
 
-    size_t size = (size_t)width * (size_t)height * 4;
-    uint8_t *native = malloc(size);
-    if (!native) return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    int ok = g_x11.display && g_x11.window;
+    int output_width = g_x11.width > 0 ? g_x11.width : width;
+    int output_height = g_x11.height > 0 ? g_x11.height : height;
+    if (!ok || output_width <= 0 || output_height <= 0 ||
+        (size_t)output_width > SIZE_MAX / 4u / (size_t)output_height) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 0;
+    }
 
-    /* The default 24-bit TrueColor XWayland visual stores pixels as B,G,R,x on
-     * little-endian hosts. Keep alpha opaque because the top-level window has
-     * no alpha channel. */
-    for (int y = 0; y < height; ++y) {
-        const uint8_t *src = pixels + (size_t)y * (size_t)row_pitch;
-        uint8_t *dst = native + (size_t)y * (size_t)width * 4;
-        for (int x = 0; x < width; ++x) {
-            dst[x * 4 + 0] = src[x * 4 + 2];
-            dst[x * 4 + 1] = src[x * 4 + 1];
-            dst[x * 4 + 2] = src[x * 4 + 0];
-            dst[x * 4 + 3] = 0xff;
+    /* Prefer Vulkan for final presentation. The D3D11 compatibility renderer
+     * remains CPU-backed; Vulkan owns only the native swapchain upload/present.
+     * This gives overlays such as MangoHud a real Vulkan queue to observe. */
+    if (g_x11.presenter != XWAYLAND_PRESENTER_X11) {
+        if (vulkan_presenter_present_resource_rgba8(
+                g_x11.display, g_x11.window, resource, serial, pixels,
+                width, height, row_pitch, output_width, output_height)) {
+            pthread_mutex_unlock(&g_x11.lock);
+            return 1;
+        }
+        if (g_x11.presenter == XWAYLAND_PRESENTER_VULKAN) {
+            fprintf(stderr, "[VULKAN] strict presenter failed; no X11 fallback\n");
+            pthread_mutex_unlock(&g_x11.lock);
+            return 0;
         }
     }
 
-    pthread_mutex_lock(&g_x11.lock);
-    int ok = g_x11.display && g_x11.window;
-    XImage *image = NULL;
-    if (ok) {
-        int screen = 0;
-        image = g_x11.CreateImage(g_x11.display,
-                                  g_x11.DefaultVisual(g_x11.display, screen),
-                                  (unsigned)g_x11.DefaultDepth(g_x11.display, screen),
-                                  2, 0, (char *)native, (unsigned)width,
-                                  (unsigned)height, 32, width * 4);
-        ok = image && g_x11.PutImage(g_x11.display, g_x11.window,
-                                     g_x11.DefaultGC(g_x11.display, screen),
-                                     image, 0, 0, 0, 0,
-                                     (unsigned)width, (unsigned)height) == 0;
-        if (ok) g_x11.Flush(g_x11.display);
+    /* Avoid re-scaling and uploading byte-identical frames. Present still
+     * succeeds and guest timing remains unchanged; XWayland retains the last
+     * image until a new frame or an expose event requires repainting. */
+    uint64_t source_hash = 1469598103934665603ULL;
+    for (int y = 0; y < height; ++y) {
+        const uint8_t *row = pixels + (size_t)y * (size_t)row_pitch;
+        for (int x = 0; x < width * 4; ++x) {
+            source_hash ^= row[x];
+            source_hash *= 1099511628211ULL;
+        }
     }
-    if (image) {
-        /* XDestroyImage owns and frees image->data. */
-        g_x11.DestroyImage(image);
-        native = NULL;
+    if (g_x11.source_hash_valid && g_x11.source_hash == source_hash &&
+        g_x11.source_width == width && g_x11.source_height == height &&
+        g_x11.source_row_pitch == row_pitch &&
+        g_x11.present_width == output_width &&
+        g_x11.present_height == output_height) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 1;
+    }
+
+    size_t size = (size_t)output_width * (size_t)output_height * 4;
+    if (!g_x11.present_image || g_x11.present_width != output_width ||
+        g_x11.present_height != output_height) {
+        if (g_x11.present_image) {
+            g_x11.DestroyImage(g_x11.present_image);
+            g_x11.present_image = NULL;
+            g_x11.present_pixels = NULL;
+        }
+        uint8_t *storage = malloc(size);
+        if (!storage) {
+            pthread_mutex_unlock(&g_x11.lock);
+            return 0;
+        }
+        int screen = 0;
+        g_x11.present_image = g_x11.CreateImage(
+            g_x11.display, g_x11.DefaultVisual(g_x11.display, screen),
+            (unsigned)g_x11.DefaultDepth(g_x11.display, screen), 2, 0,
+            (char *)storage, (unsigned)output_width, (unsigned)output_height,
+            32, output_width * 4);
+        if (!g_x11.present_image) {
+            free(storage);
+            pthread_mutex_unlock(&g_x11.lock);
+            return 0;
+        }
+        g_x11.present_pixels = storage;
+        g_x11.present_width = output_width;
+        g_x11.present_height = output_height;
+    }
+
+    /* Scale and convert in one pass. Precompute horizontal source offsets once
+     * per output size; division in the inner 3.7-million-pixel loop was a major
+     * avoidable cost on every Present. */
+    static int *source_x_offsets;
+    static int source_x_width;
+    if (source_x_width != output_width) {
+        int *offsets = realloc(source_x_offsets, (size_t)output_width * sizeof(*offsets));
+        if (!offsets) {
+            pthread_mutex_unlock(&g_x11.lock);
+            return 0;
+        }
+        source_x_offsets = offsets;
+        source_x_width = output_width;
+        for (int x = 0; x < output_width; ++x)
+            source_x_offsets[x] = (int)((uint64_t)(unsigned)x * (unsigned)width /
+                                        (unsigned)output_width) * 4;
+    }
+    for (int y = 0; y < output_height; ++y) {
+        int source_y = (int)((uint64_t)(unsigned)y * (unsigned)height /
+                             (unsigned)output_height);
+        const uint8_t *source_row = pixels + (size_t)source_y * (size_t)row_pitch;
+        uint8_t *destination_row = g_x11.present_pixels +
+            (size_t)y * (size_t)output_width * 4;
+        for (int x = 0; x < output_width; ++x) {
+            const uint8_t *src = source_row + source_x_offsets[x];
+            uint8_t *dst = destination_row + (size_t)x * 4;
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = 0xff;
+        }
+    }
+
+    int screen = 0;
+    ok = g_x11.PutImage(g_x11.display, g_x11.window,
+                        g_x11.DefaultGC(g_x11.display, screen),
+                        g_x11.present_image, 0, 0, 0, 0,
+                        (unsigned)output_width, (unsigned)output_height) == 0;
+    /* Flush submits the image without a round trip. Presentation diagnostics
+     * describe the submitted frame; callers needing a screenshot can opt into
+     * the back-buffer capture path without stalling every guest Present. */
+    if (ok) {
+        g_x11.Flush(g_x11.display);
+        g_x11.source_hash = source_hash;
+        g_x11.source_width = width;
+        g_x11.source_height = height;
+        g_x11.source_row_pitch = row_pitch;
+        g_x11.source_hash_valid = 1;
     }
     pthread_mutex_unlock(&g_x11.lock);
-    free(native);
     return ok;
+}
+
+int xwayland_window_present_rgba8(const uint8_t *pixels, int width, int height,
+                                  int row_pitch)
+{
+    return present_rgba8_internal(NULL, 0, pixels, width, height, row_pitch);
+}
+
+int xwayland_window_present_resource_rgba8(const void *resource, uint64_t serial,
+                                           const uint8_t *pixels, int width,
+                                           int height, int row_pitch)
+{
+    return present_rgba8_internal(resource, serial, pixels,
+                                  width, height, row_pitch);
 }
 
 void xwayland_window_destroy(void)
 {
     pthread_mutex_lock(&g_x11.lock);
+    vulkan_presenter_destroy();
     if (g_x11.display && g_x11.window) {
         g_x11.DestroyWindow(g_x11.display, g_x11.window);
         g_x11.Flush(g_x11.display);
         g_x11.window = 0;
         g_x11.visible = 0;
+    }
+    if (g_x11.present_image) {
+        g_x11.DestroyImage(g_x11.present_image);
+        g_x11.present_image = NULL;
+        g_x11.present_pixels = NULL;
+        g_x11.present_width = 0;
+        g_x11.present_height = 0;
+        g_x11.source_hash_valid = 0;
     }
     pthread_mutex_unlock(&g_x11.lock);
 }

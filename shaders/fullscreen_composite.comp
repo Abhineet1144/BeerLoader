@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer SourceBuffer {
+    uint source_pixels[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer OverlayBuffer {
+    uint overlay_pixels[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer TargetBuffer {
+    uint target_pixels[];
+};
+layout(push_constant) uniform Parameters {
+    uint pixel_count;
+    uint mode;
+} parameters;
+
+vec4 unpack_r10g10b10a2(uint packed)
+{
+    return vec4(float(packed & 1023u) / 1023.0,
+                float((packed >> 10) & 1023u) / 1023.0,
+                float((packed >> 20) & 1023u) / 1023.0,
+                float((packed >> 30) & 3u) / 3.0);
+}
+
+uint pack_r10g10b10a2(vec4 color)
+{
+    uvec4 value = uvec4(round(clamp(color, 0.0, 1.0) * vec4(1023.0, 1023.0, 1023.0, 3.0)));
+    return value.x | (value.y << 10) | (value.z << 20) | (value.w << 30);
+}
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.pixel_count)
+        return;
+
+    if (parameters.mode == 1u) {
+        vec4 scene = unpack_r10g10b10a2(source_pixels[index]);
+        vec4 ui = unpackUnorm4x8(overlay_pixels[index]);
+        vec3 rgb = clamp(scene.rgb * ui.a + ui.rgb, 0.0, 1.0);
+        target_pixels[index] = pack_r10g10b10a2(vec4(rgb, 1.0));
+    } else {
+        /* Mode 1 writes an R10G10B10A2 intermediate.  The final target is
+         * RGBA8, so copying the packed word directly makes the 10-bit channel
+         * fields bleed into different 8-bit channels as splash alpha changes. */
+        target_pixels[index] = packUnorm4x8(unpack_r10g10b10a2(source_pixels[index]));
+    }
+}

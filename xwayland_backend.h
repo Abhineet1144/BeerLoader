@@ -30,6 +30,17 @@ typedef struct {
     int height;
 } XwaylandEvent;
 
+typedef enum {
+    XWAYLAND_PRESENTER_AUTO = 0,
+    XWAYLAND_PRESENTER_VULKAN,
+    XWAYLAND_PRESENTER_X11
+} XwaylandPresenter;
+
+/* Must be selected before the native window is created. AUTO prefers Vulkan
+ * and falls back to XPutImage; VULKAN is strict and never silently falls back. */
+int xwayland_set_presenter(XwaylandPresenter presenter);
+const char *xwayland_presenter_name(XwaylandPresenter presenter);
+
 /* Xlib is loaded at runtime so Beer remains buildable without X11 headers. */
 int xwayland_window_create(int x, int y, int width, int height,
                            const char *title, int initially_visible);
@@ -49,6 +60,9 @@ int xwayland_window_pump_events(void);
  * native XWayland visual without taking ownership of the caller's storage. */
 int xwayland_window_present_rgba8(const uint8_t *pixels, int width, int height,
                                   int row_pitch);
+int xwayland_window_present_resource_rgba8(const void *resource, uint64_t serial,
+                                           const uint8_t *pixels, int width,
+                                           int height, int row_pitch);
 void xwayland_window_destroy(void);
 int xwayland_window_exists(void);
 

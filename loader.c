@@ -932,14 +932,21 @@ typedef struct {
     u64 StackLimit;             /* +0x010 */
     u8  _pad0[0x30 - 0x18];
     u64 Self;                   /* +0x030 */
-    u8  _pad1[0x60 - 0x38];
+    u8  _pad1[0x40 - 0x38];
+    u64 UniqueProcess;          /* +0x040 CLIENT_ID.UniqueProcess */
+    u64 UniqueThread;           /* +0x048 CLIENT_ID.UniqueThread  */
+    u8  _pad2[0x60 - 0x50];
     u64 ProcEnvBlk;             /* +0x060 */
-    u8  _pad2[0xA0 - 0x68];
+    u8  _pad3[0xA0 - 0x68];
     u64 SavedGuestRsp;          /* +0x0A0 for beer_dispatch_trampoline */
     u64 HostCallStackBase;      /* +0x0A8 for beer_dispatch_trampoline */
     u64 HostCallStackTop;       /* +0x0B0 for beer_dispatch_trampoline */
-    u8  _pad3[0x1000 - 0xB8];
+    u8  _pad4[0x1000 - 0xB8];
 } WinTEB;
+
+_Static_assert(offsetof(WinTEB, UniqueProcess) == 0x40, "WinTEB process ID offset");
+_Static_assert(offsetof(WinTEB, UniqueThread) == 0x48, "WinTEB thread ID offset");
+_Static_assert(offsetof(WinTEB, ProcEnvBlk) == 0x60, "WinTEB PEB offset");
 
 /* Forward declaration of WinTEB */
 WinTEB;
@@ -1358,6 +1365,19 @@ typedef struct {
 } WIN_CS;
 
 static pthread_mutex_t g_fallback_cs_mutex = PTHREAD_MUTEX_INITIALIZER;
+static __thread u64 g_cached_windows_thread_id;
+
+static inline u64 current_windows_thread_id(void)
+{
+    if (g_cached_windows_thread_id) return g_cached_windows_thread_id;
+    u64 gs_base = 0;
+    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
+        WinTEB *teb = (WinTEB *)gs_base;
+        if (teb->UniqueThread)
+            return g_cached_windows_thread_id = teb->UniqueThread;
+    }
+    return g_cached_windows_thread_id = (u64)(u32)syscall(SYS_gettid);
+}
 
 static void *host_alloc(size_t size)
 {
@@ -1475,7 +1495,7 @@ impl_EnterCriticalSection(WIN_CS *cs)
     if (valid) {
         cs->RecursionCount++;
         cs->LockCount++;
-        cs->OwningThread = (u64)syscall(SYS_gettid);
+        cs->OwningThread = current_windows_thread_id();
     }
     return 0;
 }
@@ -1506,7 +1526,7 @@ impl_TryEnterCriticalSection(WIN_CS *cs)
         if (valid) {
             cs->RecursionCount++;
             cs->LockCount++;
-            cs->OwningThread = (u64)syscall(SYS_gettid);
+            cs->OwningThread = current_windows_thread_id();
         }
         return 1; /* TRUE */
     }
@@ -1558,6 +1578,8 @@ impl_RtlVirtualUnwind(u32 type, u64 base, u64 pc, u64 func,
 /* ---- Module handles ---- */
 static const char *g_exe_path = NULL;
 static char g_exe_path_storage[4096];
+static u16 g_exe_path_w[4096];
+static u16 *g_guest_argv_w[2] = {g_exe_path_w, NULL};
 
 /* A Windows game launcher starts the process with a stable executable path and,
  * in Sekiro's case, the installation directory as its current directory.  Host
@@ -1575,6 +1597,8 @@ static const char *configure_guest_process_path(const char *exe)
         return NULL;
     }
     memcpy(g_exe_path_storage, resolved, len + 1);
+    for (size_t i = 0; i <= len; i++)
+        g_exe_path_w[i] = (u8)resolved[i];
 
     char directory[sizeof(g_exe_path_storage)];
     memcpy(directory, resolved, len + 1);
@@ -1836,10 +1860,8 @@ static HeapGuardEntry *heap_guard_find_locked(void *user_ptr)
 
 static void heap_guard_insert(void *user_ptr, void *base, size_t total_size, size_t user_size)
 {
-    void *raw = mmap(NULL, sizeof(HeapGuardEntry), PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (raw == MAP_FAILED) return;
-    HeapGuardEntry *e = (HeapGuardEntry *)raw;
+    HeapGuardEntry *e = malloc(sizeof(*e));
+    if (!e) return;
     memset(e, 0, sizeof(*e));
     e->user_ptr = user_ptr;
     e->base = base;
@@ -1865,7 +1887,7 @@ static int heap_guard_remove(void *user_ptr, void **out_base, size_t *out_total,
             if (out_user_size) *out_user_size = e->user_size;
             *pp = e->next;
             pthread_mutex_unlock(&g_heap_guard_mutex);
-            munmap(e, sizeof(HeapGuardEntry));
+            free(e);
             return 1;
         }
         pp = &(*pp)->next;
@@ -1874,9 +1896,31 @@ static int heap_guard_remove(void *user_ptr, void **out_base, size_t *out_total,
     return 0;
 }
 
+static int heap_guards_enabled(void)
+{
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        const char *value = getenv("BEER_HEAP_GUARDS");
+        enabled = value && *value && strcmp(value, "0") != 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
 static void *heap_guard_alloc(size_t size, int zero)
 {
     size_t want = size ? size : 1;
+    if (!heap_guards_enabled()) {
+        /* Guarding every allocation previously caused hundreds of thousands of
+         * mmap/mprotect/munmap syscalls during startup. Normal runs use the
+         * host allocator while retaining Beer’s size table; fault-isolation
+         * runs can opt back in with BEER_HEAP_GUARDS=1. */
+        void *user_ptr = zero ? calloc(1, want) : malloc(want);
+        if (user_ptr) heap_guard_insert(user_ptr, user_ptr, 0, want);
+        return user_ptr;
+    }
+
     size_t alloc_pages = (want + HEAP_GUARD_PAGE - 1) / HEAP_GUARD_PAGE;
     size_t total = (alloc_pages + 1) * HEAP_GUARD_PAGE; /* +1 trailing guard page */
 
@@ -1887,15 +1931,7 @@ static void *heap_guard_alloc(size_t size, int zero)
         fprintf(stderr, "[HEAPGUARD] mprotect guard page failed: %s\n", strerror(errno));
 
     uintptr_t end = (uintptr_t)base + alloc_pages * HEAP_GUARD_PAGE;
-    uintptr_t start = end - want;
-    /* The host allocator requires 16-byte-aligned user pointers; the previous
-     * formula could put the payload at an unaligned offset relative to the
-     * guard-page region and trigger libc's "malloc(): unaligned tcache chunk"
-     * check when a later host allocation or free path touches that buffer. Keep
-     * the payload inside the mapped region, but floor the start to a 16-byte
-     * boundary so the guest-visible heap behaves like a real Windows heap.
-     */
-    start &= ~((uintptr_t)15);
+    uintptr_t start = (end - want) & ~((uintptr_t)15);
     void *user_ptr = (void *)start;
     if (zero) memset(user_ptr, 0, want);
     heap_guard_insert(user_ptr, base, total, want);
@@ -1953,7 +1989,8 @@ impl_HeapReAlloc(u64 heap, u32 flags, void *ptr, u64 size)
         memset((u8 *)newp + old_user_size, 0, (size_t)size - old_user_size);
 
     heap_guard_remove(ptr, NULL, NULL, NULL);
-    munmap(old_base, old_total);
+    if (old_total) munmap(old_base, old_total);
+    else free(old_base);
     return (u64)newp;
 }
 
@@ -1964,8 +2001,10 @@ impl_HeapFree(u64 heap, u32 flags, void *ptr)
     if (!ptr) return 1;
     void *base = NULL;
     size_t total = 0;
-    if (heap_guard_remove(ptr, &base, &total, NULL))
-        munmap(base, total);
+    if (heap_guard_remove(ptr, &base, &total, NULL)) {
+        if (total) munmap(base, total);
+        else free(base);
+    }
     /* Untracked pointers: leave as a no-op, matching prior behavior, since
      * we don't know their true origin/size. */
     return 1;
@@ -2031,7 +2070,13 @@ static u64 __attribute__((ms_abi))
 impl_GetCurrentProcessId(void) { return (u64)getpid(); }
 
 static u64 __attribute__((ms_abi))
-impl_GetCurrentThreadId(void)  { return (u64)syscall(SYS_gettid); }
+impl_GetCurrentThreadId(void)
+{
+    /* Windows thread IDs are immutable. Cache the TEB value per host thread so
+     * this hot API and critical-section ownership checks avoid arch_prctl/gettid
+     * syscalls on every synchronization operation. */
+    return current_windows_thread_id();
+}
 
 /* Windows FILETIME = 100-nanosecond intervals since 1601-01-01 */
 #define EPOCH_DIFF 116444736000000000ULL
@@ -2568,14 +2613,49 @@ impl_CreateDXGIFactory2(u32 flags, u64 riid, u64 **ppFactory)
     { (void)flags; return impl_CreateDXGIFactory(riid, ppFactory); }
 
 /* ── WS2_32 (Winsock 2) ──────────────────────────────────────────── */
+static __thread s32 g_wsa_last_error;
+static __thread u32 g_wsa_startup_count;
+
 static u64 __attribute__((ms_abi))
-impl_WSAStartup(u32 ver, u8 *wsadata) {
-    (void)ver; if (wsadata) memset(wsadata, 0, 408); return 0;
+impl_WSAStartup(u32 version, u8 *wsadata)
+{
+    if (!wsadata) {
+        g_wsa_last_error = 10014; /* WSAEFAULT */
+        return 10014;
+    }
+    u16 requested = (u16)version;
+    if ((requested & 0xffu) > 2u || (requested & 0xffu) == 0u) {
+        g_wsa_last_error = 10092; /* WSAVERNOTSUPPORTED */
+        return 10092;
+    }
+    memset(wsadata, 0, 408);
+    *(u16 *)(wsadata + 0) = 0x0202; /* wVersion */
+    *(u16 *)(wsadata + 2) = 0x0202; /* wHighVersion */
+    memcpy(wsadata + 4, "Beer Winsock 2.2", 17);
+    memcpy(wsadata + 261, "Running", 8);
+    *(u16 *)(wsadata + 390) = 0; /* iMaxSockets is ignored for Winsock 2 */
+    *(u16 *)(wsadata + 392) = 0;
+    *(u64 *)(wsadata + 400) = 0;
+    ++g_wsa_startup_count;
+    g_wsa_last_error = 0;
+    return 0;
 }
-static u64 __attribute__((ms_abi)) impl_WSACleanup(void)    { return 0; }
-static u64 __attribute__((ms_abi)) impl_WSAGetLastError(void) { return 10057; }
+
 static u64 __attribute__((ms_abi))
-impl_WSASetLastError(u32 e) { (void)e; return 0; }
+impl_WSACleanup(void)
+{
+    if (!g_wsa_startup_count) {
+        g_wsa_last_error = 10093; /* WSANOTINITIALISED */
+        return (u32)-1;
+    }
+    --g_wsa_startup_count;
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_WSAGetLastError(void)
+    { return (u32)g_wsa_last_error; }
+static u64 __attribute__((ms_abi))
+impl_WSASetLastError(u32 error) { g_wsa_last_error = (s32)error; return 0; }
 
 /* ---- NtQuerySystemInformation ---- */
 static u64 __attribute__((ms_abi))
@@ -2771,7 +2851,7 @@ dxgi_log_ok(u64 a, u64 b, u64 c, u64 d) {
 }
 
 static void init_d3d11_fake(void) {
-    /* Initialize D3D11 objects using graphics module with real vtables */
+    /* Initialize D3D11 objects using graphics module with real vtables. */
     g_d3d11_device   = d3d11_device_create();
     g_d3d11_context  = d3d11_device_context_create();
     g_dxgi_swapchain = dxgi_swapchain_create();
@@ -3136,7 +3216,7 @@ static u64 __attribute__((ms_abi))
 impl_GetModuleFileNameW(u64 hmod, u16 *buf, u32 size) {
     (void)hmod;
     if (!buf || !size) return 0;
-    const char *p = g_exe_path ? g_exe_path : "sekiro.exe";
+    const char *p = g_exe_path ? g_exe_path : "";
     u32 i;
     for (i = 0; i < size - 1 && p[i]; i++) buf[i] = (u8)p[i];
     buf[i] = 0;
@@ -3368,6 +3448,67 @@ impl_WaitForSingleObject(u64 h, u32 ms)
 
     /* Unknown handle type: treat as already signaled. */
     return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_WaitForMultipleObjects(u32 n, u64 *handles, u32 all, u32 ms);
+
+static u64 __attribute__((ms_abi))
+impl_WSACreateEvent(void)
+{
+    if (!g_wsa_startup_count) {
+        g_wsa_last_error = 10093; /* WSANOTINITIALISED */
+        return 0;
+    }
+    u64 handle = event_alloc(1, 0);
+    if (!handle) g_wsa_last_error = 10055; /* WSAENOBUFS */
+    return handle;
+}
+
+static u64 __attribute__((ms_abi))
+impl_WSACloseEvent(u64 handle)
+{
+    int eid = event_id_from_handle(handle);
+    if (eid < 0) { g_wsa_last_error = 10022; return 0; }
+    pthread_mutex_lock(&g_event_table_mtx);
+    WinEvent *event = &g_events[eid];
+    pthread_mutex_destroy(&event->mtx);
+    pthread_cond_destroy(&event->cv);
+    event->used = 0;
+    pthread_mutex_unlock(&g_event_table_mtx);
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_WSASetEvent(u64 handle)
+{
+    u64 result = impl_SetEvent(handle);
+    if (!result) g_wsa_last_error = 10022;
+    return result;
+}
+
+static u64 __attribute__((ms_abi))
+impl_WSAResetEvent(u64 handle)
+{
+    u64 result = impl_ResetEvent(handle);
+    if (!result) g_wsa_last_error = 10022;
+    return result;
+}
+
+static u64 __attribute__((ms_abi))
+impl_WSAWaitForMultipleEvents(u32 count, const u64 *events, u32 wait_all,
+                              u32 timeout, u32 alertable)
+{
+    (void)alertable;
+    if (!g_wsa_startup_count) {
+        g_wsa_last_error = 10093;
+        return 0xffffffffu; /* WSA_WAIT_FAILED */
+    }
+    if (!events || count == 0 || count > 64) {
+        g_wsa_last_error = 10022;
+        return 0xffffffffu;
+    }
+    return impl_WaitForMultipleObjects(count, (u64 *)events, wait_all, timeout);
 }
 
 static u64 __attribute__((ms_abi))
@@ -3940,7 +4081,11 @@ static void *win_thread_trampoline(void *p) {
     if (gs_rc != 0) fprintf(stderr, "[GS] CreateThread: arch_prctl failed: %d\n", gs_rc);
 
     pthread_mutex_lock(&t->mtx);
-    t->tid = (u32)syscall(SYS_gettid);
+    /* Keep the Windows ID allocated by CreateThread. Linux’s native TID is an
+     * implementation detail and must not replace the ID already returned to
+     * the guest or stored in its TEB. */
+    ((WinTEB *)teb)->UniqueThread = t->tid;
+    g_cached_windows_thread_id = t->tid;
     pthread_cond_broadcast(&t->cv);
     pthread_mutex_unlock(&t->mtx);
 
@@ -4015,6 +4160,10 @@ impl_CreateThread(u64 attr, u64 stack, u64 fn, u64 arg, u32 flags, u32 *tid)
     WinThread *t = &g_threads[id];
     memset(t, 0, sizeof(*t));
     t->used = 1;
+    /* Windows allocates the thread ID before CreateThread returns, even when
+     * CREATE_SUSPENDED is requested. Use Beer’s stable handle-table ID rather
+     * than returning it first and later replacing it with a Linux TID. */
+    t->tid = (u32)id;
     t->fn = fn;
     t->arg = arg;
     t->suspended = (flags & 0x4) ? 1 : 0; /* CREATE_SUSPENDED */
@@ -4028,7 +4177,7 @@ impl_CreateThread(u64 attr, u64 stack, u64 fn, u64 arg, u32 flags, u32 *tid)
         return 0;
     }
 
-    if (tid) *tid = t->tid ? t->tid : (u32)id;
+    if (tid) *tid = t->tid;
     return (u64)(THREAD_HANDLE_BASE + (u32)id);
 }
 static u64 __attribute__((ms_abi)) impl_GetCurrentThread(void)            { return (u64)-2; }
@@ -4842,6 +4991,64 @@ impl_GetAsyncKeyState(s32 virtual_key)
 }
 
 static u64 __attribute__((ms_abi))
+impl_GetMessageExtraInfo(void)
+{
+    /* No synthetic input metadata is attached to the quiet host-input state. */
+    return 0;
+}
+
+typedef struct {
+    s32 dx;
+    s32 dy;
+    u32 mouse_data;
+    u32 flags;
+    u32 time;
+    u64 extra_info;
+} WIN_MOUSEINPUT;
+
+typedef struct {
+    u16 virtual_key;
+    u16 scan_code;
+    u32 flags;
+    u32 time;
+    u64 extra_info;
+} WIN_KEYBDINPUT;
+
+typedef struct {
+    u32 message;
+    u16 param_l;
+    u16 param_h;
+} WIN_HARDWAREINPUT;
+
+typedef struct {
+    u32 type;
+    u32 _padding;
+    union {
+        WIN_MOUSEINPUT mouse;
+        WIN_KEYBDINPUT keyboard;
+        WIN_HARDWAREINPUT hardware;
+    } data;
+} WIN_INPUT;
+
+_Static_assert(sizeof(WIN_INPUT) == 40, "Win64 INPUT layout");
+
+static u64 __attribute__((ms_abi))
+impl_SendInput(u32 count, const WIN_INPUT *inputs, s32 size)
+{
+    if (size != (s32)sizeof(WIN_INPUT)) { g_last_error = 87; return 0; }
+    if (count && !inputs) { g_last_error = 87; return 0; }
+
+    /* Beer currently exposes quiet input rather than injecting host events back
+     * into XWayland. Validate every Windows INPUT record and report it consumed;
+     * returning zero made the game's cursor/input bootstrap treat a valid
+     * request as an API failure. */
+    for (u32 i = 0; i < count; ++i) {
+        if (inputs[i].type > 2u) { g_last_error = 87; return i; }
+    }
+    return count;
+}
+
+static u64 __attribute__((ms_abi))
 impl_XInputDisconnected(u32 user_index, void *state_or_vibration)
 {
     (void)user_index;
@@ -5440,12 +5647,9 @@ impl_FreeEnvironmentStringsW(u64 p)
 static u64 __attribute__((ms_abi))
 impl_GetEnvironmentVariableW(u64 n, u64 b, u32 sz) { (void)n;(void)b;(void)sz; return 0; }
 static u64 __attribute__((ms_abi))
-impl_GetCommandLineA(void) { return (u64)"sekiro.exe"; }
+impl_GetCommandLineA(void) { return (u64)(g_exe_path ? g_exe_path : ""); }
 static u64 __attribute__((ms_abi))
-impl_GetCommandLineW(void) {
-    static u16 wcmd[] = {'s','e','k','i','r','o','.','e','x','e',0};
-    return (u64)wcmd;
-}
+impl_GetCommandLineW(void) { return (u64)g_exe_path_w; }
 
 static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
     /* ExitProcess never returns on real Windows; a stubbed no-op return leaves
@@ -6727,9 +6931,7 @@ impl_CommandLineToArgvW(const u16 *cmdline, int *argc)
 {
     (void)cmdline;
     if (argc) *argc = 1;
-    static u16  fakecmd[] = {'s','e','k','i','r','o','.','e','x','e',0};
-    static u16 *fakev[2]  = {fakecmd, NULL};
-    return (u64)fakev;
+    return (u64)g_guest_argv_w;
 }
 
 /* ---- ImmDisableIME ---- */
@@ -6760,13 +6962,39 @@ static u64 __attribute__((ms_abi)) impl_agsDeInit(void *context)
 }
 
 /* ---- Cryptographic random provider ---- */
+#define BEER_CRYPT_PROVIDER 0x4352595054424545ULL
+#define BEER_CALG_MD5       0x00008003u
+#define BEER_CALG_SHA1      0x00008004u
+#define BEER_HP_HASHVAL     0x0002u
+#define BEER_HP_HASHSIZE    0x0004u
+
+typedef struct BeerCryptHash {
+    u64 magic;
+    u32 algorithm;
+    u8 *data;
+    size_t size;
+    size_t capacity;
+} BeerCryptHash;
+
+#define BEER_CRYPT_HASH_MAGIC 0x4841534842454552ULL
+
 static u64 __attribute__((ms_abi))
 impl_CryptAcquireContextW(u64 *provider, const u16 *container,
                           const u16 *provider_name, u32 provider_type, u32 flags)
 {
     (void)container; (void)provider_name; (void)provider_type; (void)flags;
     if (!provider) { g_last_error = 87; return 0; }
-    *provider = 0x4352595054424545ULL; /* stable opaque Beer crypto handle */
+    *provider = BEER_CRYPT_PROVIDER; /* stable opaque Beer crypto handle */
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CryptAcquireContextA(u64 *provider, const char *container,
+                          const char *provider_name, u32 provider_type, u32 flags)
+{
+    (void)container; (void)provider_name; (void)provider_type; (void)flags;
+    if (!provider) { g_last_error = 87; return 0; }
+    *provider = BEER_CRYPT_PROVIDER;
     return 1;
 }
 
@@ -6774,13 +7002,13 @@ static u64 __attribute__((ms_abi))
 impl_CryptReleaseContext(u64 provider, u32 flags)
 {
     (void)flags;
-    return provider == 0x4352595054424545ULL;
+    return provider == BEER_CRYPT_PROVIDER;
 }
 
 static u64 __attribute__((ms_abi))
 impl_CryptGenRandom(u64 provider, u32 length, u8 *buffer)
 {
-    if (provider != 0x4352595054424545ULL || (!buffer && length)) {
+    if (provider != BEER_CRYPT_PROVIDER || (!buffer && length)) {
         g_last_error = 87;
         return 0;
     }
@@ -6791,6 +7019,111 @@ impl_CryptGenRandom(u64 provider, u32 length, u8 *buffer)
         if (got <= 0) { g_last_error = (u32)errno; return 0; }
         done += (size_t)got;
     }
+    return 1;
+}
+
+static BeerCryptHash *beer_crypt_hash(u64 handle)
+{
+    BeerCryptHash *hash = (BeerCryptHash *)(uintptr_t)handle;
+    return hash && hash->magic == BEER_CRYPT_HASH_MAGIC ? hash : NULL;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CryptCreateHash(u64 provider, u32 algorithm, u64 key, u32 flags,
+                     u64 *hash_handle)
+{
+    (void)flags;
+    if (hash_handle) *hash_handle = 0;
+    if (provider != BEER_CRYPT_PROVIDER || !hash_handle || key != 0 ||
+        (algorithm != BEER_CALG_MD5 && algorithm != BEER_CALG_SHA1)) {
+        g_last_error = 87;
+        return 0;
+    }
+    BeerCryptHash *hash = calloc(1, sizeof(*hash));
+    if (!hash) { g_last_error = 8; return 0; }
+    hash->magic = BEER_CRYPT_HASH_MAGIC;
+    hash->algorithm = algorithm;
+    *hash_handle = (u64)(uintptr_t)hash;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CryptHashData(u64 hash_handle, const u8 *data, u32 length, u32 flags)
+{
+    (void)flags;
+    BeerCryptHash *hash = beer_crypt_hash(hash_handle);
+    if (!hash || (!data && length)) { g_last_error = 87; return 0; }
+    if ((size_t)length > SIZE_MAX - hash->size) { g_last_error = 8; return 0; }
+    size_t required = hash->size + length;
+    if (required > hash->capacity) {
+        size_t capacity = hash->capacity ? hash->capacity : 64;
+        while (capacity < required) {
+            if (capacity > SIZE_MAX / 2) { capacity = required; break; }
+            capacity *= 2;
+        }
+        u8 *grown = realloc(hash->data, capacity);
+        if (!grown) { g_last_error = 8; return 0; }
+        hash->data = grown;
+        hash->capacity = capacity;
+    }
+    if (length) memcpy(hash->data + hash->size, data, length);
+    hash->size = required;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CryptGetHashParam(u64 hash_handle, u32 parameter, u8 *data,
+                       u32 *data_length, u32 flags)
+{
+    (void)flags;
+    BeerCryptHash *hash = beer_crypt_hash(hash_handle);
+    if (!hash || !data_length) { g_last_error = 87; return 0; }
+    u32 required = hash->algorithm == BEER_CALG_MD5 ? 16u : 20u;
+    if (parameter == BEER_HP_HASHSIZE) {
+        required = sizeof(u32);
+        if (!data || *data_length < required) {
+            *data_length = required;
+            g_last_error = 234; /* ERROR_MORE_DATA */
+            return 0;
+        }
+        *(u32 *)data = hash->algorithm == BEER_CALG_MD5 ? 16u : 20u;
+        *data_length = required;
+        return 1;
+    }
+    if (parameter != BEER_HP_HASHVAL) { g_last_error = 87; return 0; }
+    if (!data || *data_length < required) {
+        *data_length = required;
+        g_last_error = 234;
+        return 0;
+    }
+    /* CryptoAPI consumers on this path need deterministic identity bytes, not
+     * cryptographic authentication. Produce a stable digest of the complete
+     * byte stream while preserving the documented output sizing contract. */
+    u64 a = 1469598103934665603ULL;
+    u64 b = 1099511628211ULL ^ hash->size;
+    for (size_t i = 0; i < hash->size; ++i) {
+        a = (a ^ hash->data[i]) * 1099511628211ULL;
+        b ^= a + ((u64)hash->data[i] << ((i & 7u) * 8u));
+        b = (b << 7) | (b >> 57);
+    }
+    for (u32 i = 0; i < required; ++i) {
+        u64 value = i < 8 ? a : b;
+        data[i] = (u8)(value >> ((i & 7u) * 8u));
+        a = (a ^ (u64)i) * 1099511628211ULL;
+        b ^= a >> 11;
+    }
+    *data_length = required;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CryptDestroyHash(u64 hash_handle)
+{
+    BeerCryptHash *hash = beer_crypt_hash(hash_handle);
+    if (!hash) { g_last_error = 6; return 0; }
+    hash->magic = 0;
+    free(hash->data);
+    free(hash);
     return 1;
 }
 
@@ -6874,9 +7207,14 @@ static ImplEntry g_impls[] = {
     /* Security */
     {"InitializeSecurityDescriptor",          (ImplFn)impl_InitializeSecurityDescriptor},
     {"SetSecurityDescriptorDacl",             (ImplFn)impl_SetSecurityDescriptorDacl},
+    {"CryptAcquireContextA",                  (ImplFn)impl_CryptAcquireContextA},
     {"CryptAcquireContextW",                  (ImplFn)impl_CryptAcquireContextW},
     {"CryptReleaseContext",                   (ImplFn)impl_CryptReleaseContext},
     {"CryptGenRandom",                        (ImplFn)impl_CryptGenRandom},
+    {"CryptCreateHash",                       (ImplFn)impl_CryptCreateHash},
+    {"CryptHashData",                         (ImplFn)impl_CryptHashData},
+    {"CryptGetHashParam",                     (ImplFn)impl_CryptGetHashParam},
+    {"CryptDestroyHash",                      (ImplFn)impl_CryptDestroyHash},
     {"SystemFunction036",                     (ImplFn)impl_SystemFunction036},
     /* Steam */
     {"SteamAPI_Init",                         (ImplFn)impl_SteamAPI_Init},
@@ -6905,6 +7243,11 @@ static ImplEntry g_impls[] = {
     {"WSACleanup",                            (ImplFn)impl_WSACleanup},
     {"WSAGetLastError",                       (ImplFn)impl_WSAGetLastError},
     {"WSASetLastError",                       (ImplFn)impl_WSASetLastError},
+    {"WSACreateEvent",                        (ImplFn)impl_WSACreateEvent},
+    {"WSACloseEvent",                         (ImplFn)impl_WSACloseEvent},
+    {"WSASetEvent",                           (ImplFn)impl_WSASetEvent},
+    {"WSAResetEvent",                         (ImplFn)impl_WSAResetEvent},
+    {"WSAWaitForMultipleEvents",              (ImplFn)impl_WSAWaitForMultipleEvents},
     /* NTDLL */
     {"NtQuerySystemInformation",              (ImplFn)impl_NtQuerySystemInformation},
     {"GetLogicalProcessorInformation",        (ImplFn)impl_GetLogicalProcessorInformation},
@@ -7158,6 +7501,8 @@ static ImplEntry g_impls[] = {
     {"ClipCursor",                            (ImplFn)impl_ClipCursor},
     {"GetKeyboardState",                      (ImplFn)impl_GetKeyboardState},
     {"GetAsyncKeyState",                      (ImplFn)impl_GetAsyncKeyState},
+    {"GetMessageExtraInfo",                   (ImplFn)impl_GetMessageExtraInfo},
+    {"SendInput",                             (ImplFn)impl_SendInput},
     {"XInputGetState",                        (ImplFn)impl_XInputDisconnected},
     {"XInputSetState",                        (ImplFn)impl_XInputDisconnected},
     {"SetCapture",                            (ImplFn)impl_SetCapture},
@@ -7669,6 +8014,15 @@ static void pe_imports(void)
                  * backend reports no connected controller, like GetState. */
                 if (ordinal == 2) real = (ImplFn)impl_XInputDisconnected;
             }
+            if (!real && import_by_ordinal && !strcasecmp(dll, "ws2_32.dll")) {
+                u16 ordinal = (u16)(ilt[i] & 0xffff);
+                /* Winsock's legacy ordinal exports are still used by Sekiro's
+                 * networking bootstrap. Resolve the observed lifecycle calls
+                 * to the same implementations as their named exports. */
+                if (ordinal == 111) real = (ImplFn)impl_WSAGetLastError;
+                else if (ordinal == 115) real = (ImplFn)impl_WSAStartup;
+                else if (ordinal == 116) real = (ImplFn)impl_WSACleanup;
+            }
             GuestDll *guest = guest_dll_find(dll);
             u64 guest_export = (guest && fn_only) ? guest_dll_export(guest, fn_only) : 0;
             if (guest_export && fn_only && !strcmp(guest->name, "oo2core_6_win64.dll") &&
@@ -7712,6 +8066,11 @@ typedef struct {
     u8  _pad1[0x1000 - 0x20];
 } WinPEB;
 
+/* All Windows threads in a process reference the same PEB through gs:[0x60].
+ * Worker TEBs previously left this field zero, causing guest runtime code on
+ * those threads to observe an invalid process environment. */
+static WinPEB *g_process_peb;
+
 /* ── IMAGE_TLS_DIRECTORY64 (shared type used by both helpers) ───── */
 typedef struct {
     u64  StartAddr;       /* VA of raw tls data start  */
@@ -7728,9 +8087,9 @@ typedef struct {
  * alloc_teb_for_thread — allocate a private WinTEB with its own TLS array
  * and implicit-TLS data block for any thread (main or worker).
  *
- * Does NOT set up StackBase/StackLimit/ProcEnvBlk — callers that need
- * those (i.e. setup_teb_peb for the main thread) fill them in afterwards.
- * Does NOT call arch_prctl — caller does that.
+ * Sets StackBase/StackLimit from the current pthread and points ProcEnvBlk at
+ * the process-wide PEB once it exists. Does NOT call arch_prctl; the caller
+ * installs the returned TEB as the thread's GS base.
  */
 static void *alloc_teb_for_thread(void)
 {
@@ -7746,6 +8105,10 @@ static void *alloc_teb_for_thread(void)
     if (teb == MAP_FAILED) die("mmap(worker TEB): %s", strerror(errno));
     memset(teb, 0, sizeof(*teb));
     teb->Self = (u64)teb;
+    teb->ProcEnvBlk = (u64)g_process_peb;
+    teb->UniqueProcess = (u64)(u32)getpid();
+    teb->UniqueThread = (u64)(u32)syscall(SYS_gettid);
+    g_cached_windows_thread_id = teb->UniqueThread;
 
     /* Populate the host call stack TEB fields with THIS thread's stack bounds.
      * This must happen BEFORE we populate the global variables, to avoid
@@ -7844,6 +8207,7 @@ static void setup_teb_peb(void)
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (peb == MAP_FAILED) die("mmap(PEB): %s", strerror(errno));
     memset(peb, 0, sizeof(*peb));
+    g_process_peb = peb;
 
     /* StackBase/StackLimit are already filled in by alloc_teb_for_thread()
      * with this (main) thread's real stack bounds — do NOT override them
@@ -10979,8 +11343,53 @@ static void __attribute__((noreturn)) guest_exit_stub(void)
 /* ── main ───────────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
-    const char *exe_arg = (argc > 1) ? argv[1]
-        : "/run/media/abhineet/56A4064AA4062CD5/Games/Sekiro - Shadows Die Twice/sekiro.exe";
+    XwaylandPresenter presenter = XWAYLAND_PRESENTER_VULKAN;
+    BeerD3D11Renderer renderer = BEER_D3D11_RENDERER_VULKAN;
+    const char *exe_arg = NULL;
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (strncmp(arg, "--presenter=", 12) == 0) {
+            const char *value = arg + 12;
+            if (strcmp(value, "vulkan") != 0) {
+                fprintf(stderr, "Unknown presenter '%s' (only vulkan is supported)\n",
+                        value);
+                return 2;
+            }
+            presenter = XWAYLAND_PRESENTER_VULKAN;
+        } else if (strncmp(arg, "--renderer=", 11) == 0) {
+            const char *value = arg + 11;
+            if (strcmp(value, "vulkan") != 0) {
+                fprintf(stderr, "Unknown renderer '%s' (only vulkan is supported)\n",
+                        value);
+                return 2;
+            }
+            renderer = BEER_D3D11_RENDERER_VULKAN;
+        } else if (arg[0] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", arg);
+            return 2;
+        } else if (!exe_arg) {
+            exe_arg = arg;
+        } else {
+            fprintf(stderr, "Unexpected extra argument: %s\n", arg);
+            return 2;
+        }
+    }
+    if (!exe_arg) {
+        fprintf(stderr,
+                "Usage: %s [--renderer=vulkan] [--presenter=vulkan] "
+                "<windows-executable>\n",
+                argv[0]);
+        return 2;
+    }
+    if (!d3d11_set_renderer(renderer))
+        die("cannot select D3D11 renderer '%s'", d3d11_renderer_name(renderer));
+    fprintf(stderr, "[RENDERER] selected Vulkan-only rendering; software fallback removed\n");
+    if (presenter != XWAYLAND_PRESENTER_VULKAN)
+        die("Vulkan rendering requires --presenter=vulkan; fallback is disabled");
+    if (!xwayland_set_presenter(presenter))
+        die("cannot select native presenter '%s'", xwayland_presenter_name(presenter));
+    fprintf(stderr, "[PRESENTER] selected %s\n", xwayland_presenter_name(presenter));
+
     const char *exe = configure_guest_process_path(exe_arg);
     if (!exe)
         die("cannot configure guest process path '%s': %s", exe_arg, strerror(errno));
