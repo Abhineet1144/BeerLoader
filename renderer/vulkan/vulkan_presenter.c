@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "vulkan_presenter.h"
 #include "vulkan_renderer.h"
+#include "vulkan_indexed_renderer.h"
+#include "vulkan_context.h"
 
 #include <dlfcn.h>
 #include <stdio.h>
@@ -142,6 +144,10 @@ static void destroy_swapchain(void)
 
 void vulkan_presenter_destroy(void)
 {
+    /* The shared Vulkan device outlives all three stages. Destroy compute-stage
+     * resources before the presenter releases the final surface resources. */
+    vulkan_renderer_destroy();
+    vulkan_indexed_renderer_destroy();
     destroy_swapchain();
     if (g_vk.device) {
         if (g_vk.submit_fence && g_vk.DestroyFence)
@@ -149,14 +155,11 @@ void vulkan_presenter_destroy(void)
         if (g_vk.image_available) g_vk.DestroySemaphore(g_vk.device, g_vk.image_available, NULL);
         if (g_vk.render_finished) g_vk.DestroySemaphore(g_vk.device, g_vk.render_finished, NULL);
         if (g_vk.command_pool) g_vk.DestroyCommandPool(g_vk.device, g_vk.command_pool, NULL);
-        g_vk.DestroyDevice(g_vk.device, NULL);
     }
     if (g_vk.surface && g_vk.DestroySurfaceKHR)
         g_vk.DestroySurfaceKHR(g_vk.instance, g_vk.surface, NULL);
-    if (g_vk.instance && g_vk.DestroyInstance)
-        g_vk.DestroyInstance(g_vk.instance, NULL);
-    if (g_vk.library) dlclose(g_vk.library);
     memset(&g_vk, 0, sizeof(g_vk));
+    beer_vulkan_context_destroy();
 }
 
 static int load_instance_functions(void)
@@ -224,33 +227,18 @@ static int initialize(void *display, unsigned long window)
     if (g_vk.initialized) return 1;
     if (g_vk.permanently_unavailable) return 0;
 
-    g_vk.library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!g_vk.library) goto unavailable;
-    g_vk.GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)
-        dlsym(g_vk.library, "vkGetInstanceProcAddr");
-    PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)
-        dlsym(g_vk.library, "vkCreateInstance");
-    if (!g_vk.GetInstanceProcAddr || !create_instance) goto unavailable;
-
-    const char *extensions[] = { VK_KHR_SURFACE_EXTENSION_NAME,
-                                 VK_KHR_XLIB_SURFACE_EXTENSION_NAME };
-    VkApplicationInfo application = {
-        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pApplicationName = "Beer",
-        .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
-        .pEngineName = "Beer CPU D3D11",
-        .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-        .apiVersion = VK_API_VERSION_1_0
-    };
-    VkInstanceCreateInfo instance_info = {
-        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pApplicationInfo = &application,
-        .enabledExtensionCount = 2,
-        .ppEnabledExtensionNames = extensions
-    };
-    if (create_instance(&instance_info, NULL, &g_vk.instance) != VK_SUCCESS)
+    if (!beer_vulkan_context_initialize()) goto unavailable;
+    g_vk.instance = beer_vulkan_instance();
+    g_vk.physical_device = beer_vulkan_physical_device();
+    g_vk.device = beer_vulkan_device();
+    g_vk.queue = beer_vulkan_queue();
+    g_vk.queue_family = beer_vulkan_queue_family();
+    g_vk.GetInstanceProcAddr = beer_vulkan_get_instance_proc_addr();
+    g_vk.GetDeviceProcAddr = beer_vulkan_get_device_proc_addr();
+    if (!g_vk.instance || !g_vk.physical_device || !g_vk.device || !g_vk.queue ||
+        !g_vk.GetInstanceProcAddr || !g_vk.GetDeviceProcAddr)
         goto unavailable;
-    if (!load_instance_functions()) goto unavailable;
+    if (!load_instance_functions() || !load_device_functions()) goto unavailable;
 
     VkXlibSurfaceCreateInfoKHR surface_info = {
         .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
@@ -260,53 +248,11 @@ static int initialize(void *display, unsigned long window)
     if (g_vk.CreateXlibSurfaceKHR(g_vk.instance, &surface_info, NULL,
                                   &g_vk.surface) != VK_SUCCESS)
         goto unavailable;
-
-    uint32_t physical_count = 0;
-    if (g_vk.EnumeratePhysicalDevices(g_vk.instance, &physical_count, NULL) != VK_SUCCESS ||
-        physical_count == 0) goto unavailable;
-    VkPhysicalDevice *physical = calloc(physical_count, sizeof(*physical));
-    if (!physical) goto unavailable;
-    g_vk.EnumeratePhysicalDevices(g_vk.instance, &physical_count, physical);
-    for (uint32_t p = 0; p < physical_count && !g_vk.physical_device; ++p) {
-        uint32_t queue_count = 0;
-        g_vk.GetPhysicalDeviceQueueFamilyProperties(physical[p], &queue_count, NULL);
-        VkQueueFamilyProperties *queues = calloc(queue_count, sizeof(*queues));
-        if (!queues) continue;
-        g_vk.GetPhysicalDeviceQueueFamilyProperties(physical[p], &queue_count, queues);
-        for (uint32_t q = 0; q < queue_count; ++q) {
-            VkBool32 present = VK_FALSE;
-            g_vk.GetPhysicalDeviceSurfaceSupportKHR(physical[p], q, g_vk.surface, &present);
-            if (present && (queues[q].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
-                g_vk.physical_device = physical[p];
-                g_vk.queue_family = q;
-                break;
-            }
-        }
-        free(queues);
-    }
-    free(physical);
-    if (!g_vk.physical_device) goto unavailable;
-
-    float priority = 1.0f;
-    VkDeviceQueueCreateInfo queue_info = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex = g_vk.queue_family,
-        .queueCount = 1,
-        .pQueuePriorities = &priority
-    };
-    const char *device_extensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
-    VkDeviceCreateInfo device_info = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &queue_info,
-        .enabledExtensionCount = 1,
-        .ppEnabledExtensionNames = device_extensions
-    };
-    if (g_vk.CreateDevice(g_vk.physical_device, &device_info, NULL,
-                          &g_vk.device) != VK_SUCCESS)
+    VkBool32 present_supported = VK_FALSE;
+    if (g_vk.GetPhysicalDeviceSurfaceSupportKHR(
+            g_vk.physical_device, g_vk.queue_family, g_vk.surface,
+            &present_supported) != VK_SUCCESS || !present_supported)
         goto unavailable;
-    if (!load_device_functions()) goto unavailable;
-    g_vk.GetDeviceQueue(g_vk.device, g_vk.queue_family, 0, &g_vk.queue);
 
     VkCommandPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -562,17 +508,33 @@ static int present_rgba8_staging(void *display, unsigned long window,
         if (!recreate_swapchain(output_width, output_height, width, height)) return 0;
     }
 
+    /* Presentation is asynchronous. Wait only when this frame reuses the
+     * single staging buffer/command buffer from the preceding submission,
+     * rather than blocking again immediately after QueuePresentKHR. This lets
+     * guest frame construction overlap the compositor's presentation work. */
+    if (g_vk.WaitForFences(g_vk.device, 1, &g_vk.submit_fence, VK_TRUE,
+                           UINT64_MAX) != VK_SUCCESS)
+        return 0;
+
     size_t bytes = (size_t)width * (size_t)height * 4u;
-    int copied_gpu_mirror = row_pitch == width * 4 && resource &&
-        vulkan_renderer_copy_target(resource, serial, g_vk.staging_map, bytes);
-    if (!copied_gpu_mirror)
+    uint64_t shared_handle = 0;
+    int direct_gpu_mirror = row_pitch == width * 4 && resource &&
+        (vulkan_renderer_get_target_buffer(resource, serial, bytes,
+                                           &shared_handle) ||
+         vulkan_indexed_renderer_get_target_buffer(resource, serial, bytes,
+                                                    &shared_handle));
+    VkBuffer frame_buffer = direct_gpu_mirror
+        ? (VkBuffer)(uintptr_t)shared_handle : g_vk.staging_buffer;
+    if (!direct_gpu_mirror)
         copy_rgba8_to_staging(pixels, width, height, row_pitch);
     static uint64_t gpu_mirror_presents;
-    if (copied_gpu_mirror) {
+    if (direct_gpu_mirror) {
         uint64_t count = ++gpu_mirror_presents;
-        if (count <= 4 || (count % 256u) == 0)
-            fprintf(stderr, "[VULKAN] presenter source=compositor-mirror count=%llu "
-                    "serial=%llu bytes=%zu\n", (unsigned long long)count,
+        if (getenv("BEER_RENDER_DIAGNOSTICS") &&
+            (count <= 4 || (count % 256u) == 0))
+            fprintf(stderr, "[VULKAN] presenter source=compositor-mirror-direct "
+                    "count=%llu serial=%llu bytes=%zu\n",
+                    (unsigned long long)count,
                     (unsigned long long)serial, bytes);
     }
     uint32_t image_index = 0;
@@ -619,6 +581,21 @@ static int present_rgba8_staging(void *display, unsigned long window,
             .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
         }
     };
+    if (direct_gpu_mirror) {
+        /* The source buffer was written by the fullscreen compute stage on
+         * this shared queue. Submission order alone is not a memory
+         * dependency: make those shader writes visible to the transfer read
+         * before copying into the upload image. */
+        VkMemoryBarrier source_ready = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+        };
+        g_vk.CmdPipelineBarrier(g_vk.command_buffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            1, &source_ready, 0, NULL, 0, NULL);
+    }
     g_vk.CmdPipelineBarrier(g_vk.command_buffer,
         (g_vk.upload_initialized || g_vk.image_initialized[image_index])
             ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
@@ -628,7 +605,7 @@ static int present_rgba8_staging(void *display, unsigned long window,
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .imageExtent = { g_vk.upload_extent.width, g_vk.upload_extent.height, 1 }
     };
-    g_vk.CmdCopyBufferToImage(g_vk.command_buffer, g_vk.staging_buffer,
+    g_vk.CmdCopyBufferToImage(g_vk.command_buffer, frame_buffer,
                               g_vk.upload_image,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     VkImageMemoryBarrier upload_read = barriers[0];
@@ -675,9 +652,16 @@ static int present_rgba8_staging(void *display, unsigned long window,
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &g_vk.render_finished
     };
-    if (g_vk.ResetFences(g_vk.device, 1, &g_vk.submit_fence) != VK_SUCCESS ||
-        g_vk.QueueSubmit(g_vk.queue, 1, &submit, g_vk.submit_fence) != VK_SUCCESS)
+    /* Reset only once the frame is fully acquired and recorded.  Resetting
+     * before AcquireNextImageKHR/recreation left this fence permanently
+     * unsignaled on early returns, freezing the next Present (and MangoHud). */
+    if (g_vk.ResetFences(g_vk.device, 1, &g_vk.submit_fence) != VK_SUCCESS)
         return 0;
+    beer_vulkan_queue_lock();
+    if (g_vk.QueueSubmit(g_vk.queue, 1, &submit, g_vk.submit_fence) != VK_SUCCESS) {
+        beer_vulkan_queue_unlock();
+        return 0;
+    }
     VkPresentInfoKHR present = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .waitSemaphoreCount = 1,
@@ -687,9 +671,7 @@ static int present_rgba8_staging(void *display, unsigned long window,
         .pImageIndices = &image_index
     };
     result = g_vk.QueuePresentKHR(g_vk.queue, &present);
-    if (g_vk.WaitForFences(g_vk.device, 1, &g_vk.submit_fence, VK_TRUE,
-                           UINT64_MAX) != VK_SUCCESS)
-        return 0;
+    beer_vulkan_queue_unlock();
     g_vk.upload_initialized = 1;
     g_vk.image_initialized[image_index] = 1;
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {

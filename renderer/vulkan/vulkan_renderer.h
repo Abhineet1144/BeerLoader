@@ -22,10 +22,13 @@ int vulkan_renderer_composite_rgba8(const void *source_resource,
                                     uint32_t mode);
 int vulkan_renderer_sync_target(const void *resource, uint64_t serial,
                                 uint8_t *pixels, size_t bytes);
-/* Copies a completed compositor target into presentation staging without
- * first synchronizing the guest's CPU resource. */
+/* Copies a completed compositor target into host-visible storage for genuine
+ * CPU consumers. Presentation should prefer the shared Vulkan buffer below. */
 int vulkan_renderer_copy_target(const void *resource, uint64_t serial,
                                 uint8_t *destination, size_t bytes);
+/* Returns the shared-device Vulkan buffer containing a compositor result. */
+int vulkan_renderer_get_target_buffer(const void *resource, uint64_t serial,
+                                      size_t bytes, uint64_t *buffer_handle);
 void vulkan_renderer_forget_resource(const void *resource);
 void vulkan_renderer_destroy(void);
 

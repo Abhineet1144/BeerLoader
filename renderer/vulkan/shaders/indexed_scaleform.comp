@@ -1,0 +1,591 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer VertexBuffer { uint vertices[]; };
+layout(set = 0, binding = 1, std430) readonly buffer IndexBuffer { uint indices[]; };
+layout(set = 0, binding = 2, std430) readonly buffer ConstantBuffer { uint constants_data[]; };
+layout(set = 0, binding = 3, std430) buffer TargetBuffer { uint target_pixels[]; };
+layout(set = 0, binding = 4, std430) readonly buffer TextureBuffer { uint texture_pixels[]; };
+layout(set = 0, binding = 5, std430) readonly buffer TextureBuffer2 { uint texture2_pixels[]; };
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint height;
+    uint vertex_offset;
+    uint index_offset;
+    uint index_count;
+    int base_vertex;
+    uint mode;
+    uint stride;
+    vec4 viewport;
+    ivec4 scissor;
+    uint blend_enable;
+    uint source_blend;
+    uint destination_blend;
+    uint color_operation;
+    uint source_alpha;
+    uint destination_alpha;
+    uint alpha_operation;
+    uint write_mask;
+    vec4 blend_factor;
+    uint texture_width;
+    uint texture_height;
+    uint sampler_flags;
+    uint dispatch_origin_x;
+    uint dispatch_origin_y;
+    uint dispatch_width;
+    uint dispatch_pixels;
+    vec4 constant_color;
+} p;
+
+uint load_byte(uint byte_offset)
+{
+    uint word = vertices[byte_offset >> 2];
+    return (word >> ((byte_offset & 3u) * 8u)) & 255u;
+}
+
+uint load_vertex_word(uint byte_offset)
+{
+    return vertices[byte_offset >> 2];
+}
+
+int load_int16(uint byte_offset)
+{
+    uint word = vertices[byte_offset >> 2];
+    uint value = (word >> ((byte_offset & 2u) * 8u)) & 65535u;
+    return int(value << 16u) >> 16;
+}
+
+vec4 load_short4_as_float(uint byte_offset)
+{
+    return vec4(float(load_int16(byte_offset)),
+                float(load_int16(byte_offset + 2u)),
+                float(load_int16(byte_offset + 4u)),
+                float(load_int16(byte_offset + 6u)));
+}
+
+uint load_index(uint index)
+{
+    uint byte_offset = p.index_offset + index * 2u;
+    uint word = indices[byte_offset >> 2];
+    return (word >> ((byte_offset & 2u) * 8u)) & 65535u;
+}
+
+float constant_float(uint index)
+{
+    return uintBitsToFloat(constants_data[index]);
+}
+
+float address_coordinate(float coordinate, uint mode)
+{
+    if (mode == 3u) return clamp(coordinate, 0.0, 1.0);
+    float integral = floor(coordinate);
+    coordinate -= integral;
+    if (mode == 2u && (int(integral) & 1) != 0) coordinate = 1.0 - coordinate;
+    return coordinate;
+}
+
+vec4 texture_texel(ivec2 coordinate)
+{
+    coordinate = clamp(coordinate, ivec2(0), ivec2(int(p.texture_width) - 1,
+                                                   int(p.texture_height) - 1));
+    uint pixel = uint(coordinate.y) * p.texture_width + uint(coordinate.x);
+    if (p.mode == 5u || p.mode == 10u || p.mode == 14u) {
+        uint word = texture_pixels[pixel >> 2u];
+        float value = float((word >> ((pixel & 3u) * 8u)) & 255u) / 255.0;
+        return vec4(value, 0.0, 0.0, 1.0);
+    }
+    return unpackUnorm4x8(texture_pixels[pixel]);
+}
+
+vec4 sample_texture(vec2 uv)
+{
+    uint address_u = (p.sampler_flags >> 1u) & 7u;
+    uint address_v = (p.sampler_flags >> 4u) & 7u;
+    uv.x = address_coordinate(uv.x, address_u);
+    uv.y = address_coordinate(uv.y, address_v);
+    if ((p.sampler_flags & 1u) == 0u) {
+        ivec2 coordinate = ivec2(uv * vec2(p.texture_width, p.texture_height));
+        return texture_texel(coordinate);
+    }
+    vec2 texel = uv * vec2(p.texture_width, p.texture_height) - vec2(0.5);
+    ivec2 base = ivec2(floor(texel));
+    vec2 fraction_value = fract(texel);
+    vec4 top = mix(texture_texel(base), texture_texel(base + ivec2(1, 0)),
+                   fraction_value.x);
+    vec4 bottom = mix(texture_texel(base + ivec2(0, 1)),
+                      texture_texel(base + ivec2(1, 1)), fraction_value.x);
+    return mix(top, bottom, fraction_value.y);
+}
+
+vec4 texture2_texel(ivec2 coordinate)
+{
+    coordinate = clamp(coordinate, ivec2(0), ivec2(int(p.texture_width) - 1,
+                                                   int(p.texture_height) - 1));
+    uint pixel = uint(coordinate.y) * p.texture_width + uint(coordinate.x);
+    return unpackUnorm4x8(texture2_pixels[pixel]);
+}
+
+vec4 sample_texture2(vec2 uv)
+{
+    uint address_u = (p.sampler_flags >> 1u) & 7u;
+    uint address_v = (p.sampler_flags >> 4u) & 7u;
+    uv.x = address_coordinate(uv.x, address_u);
+    uv.y = address_coordinate(uv.y, address_v);
+    if ((p.sampler_flags & 1u) == 0u)
+        return texture2_texel(ivec2(uv * vec2(p.texture_width, p.texture_height)));
+    vec2 texel = uv * vec2(p.texture_width, p.texture_height) - vec2(0.5);
+    ivec2 base = ivec2(floor(texel));
+    vec2 fraction_value = fract(texel);
+    vec4 top = mix(texture2_texel(base), texture2_texel(base + ivec2(1, 0)),
+                   fraction_value.x);
+    vec4 bottom = mix(texture2_texel(base + ivec2(0, 1)),
+                      texture2_texel(base + ivec2(1, 1)), fraction_value.x);
+    return mix(top, bottom, fraction_value.y);
+}
+
+struct Vertex {
+    vec2 position;
+    vec4 color0;
+    vec4 color1;
+    vec4 color2;
+    vec2 uv;
+};
+
+/* Large Scaleform draws are split by the host into at most 255 index
+ * occurrences (85 triangles). Cache each chunk's transformed vertices once
+ * per 256-pixel workgroup instead of reloading and transforming all three
+ * vertices for every triangle at every pixel. */
+shared Vertex cached_vertices[256];
+shared uint cached_vertex_valid[256];
+/* Cache triangle edge equations once per workgroup. Previously every pixel
+ * recomputed triangle area and both barycentric numerators for every triangle,
+ * which dominates the Scaleform compute rasterizer at 1080p. */
+shared vec4 cached_triangle_w0[85];
+shared vec4 cached_triangle_w1[85];
+shared ivec4 cached_triangle_bounds[85];
+shared uvec4 cached_triangle_edges[85];
+shared uint cached_triangle_valid[85];
+
+Vertex load_vertex(uint index)
+{
+    uint offset = p.vertex_offset + index * p.stride;
+    Vertex result;
+    result.color0 = vec4(load_byte(offset), load_byte(offset + 1u),
+                         load_byte(offset + 2u), load_byte(offset + 3u)) / 255.0;
+    result.color1 = p.stride == 16u
+        ? vec4(load_byte(offset + 4u), load_byte(offset + 5u),
+               load_byte(offset + 6u), load_byte(offset + 7u)) / 255.0
+        : vec4(1.0);
+    result.color2 = vec4(1.0);
+    uint position_offset = offset + ((p.mode == 11u || p.mode == 15u) ? 0u :
+                                     p.stride == 16u ? 8u :
+                                     (p.stride == 20u || p.stride == 24u) ? 12u :
+                                     p.stride == 8u ? 0u : 4u);
+    vec2 input_position = vec2(uintBitsToFloat(vertices[position_offset >> 2]),
+                               uintBitsToFloat(vertices[(position_offset + 4u) >> 2]));
+    uint row = (p.mode == 2u || p.mode == 3u || p.mode == 5u ||
+                p.mode == 7u || p.mode == 11u || p.mode == 14u) ? 8u : 0u;
+    if (p.mode == 10u)
+        row = load_vertex_word(offset + 20u) * 16u + 8u;
+    vec2 clip_position = vec2(
+        input_position.x * constant_float(row) +
+        input_position.y * constant_float(row + 1u) + constant_float(row + 3u),
+        input_position.x * constant_float(row + 4u) +
+        input_position.y * constant_float(row + 5u) + constant_float(row + 7u));
+    result.position = vec2(p.viewport.x + (clip_position.x + 1.0) * p.viewport.z * 0.5,
+                           p.viewport.y + (1.0 - clip_position.y) * p.viewport.w * 0.5);
+    if (p.mode == 2u) {
+        vec4 add_value = vec4(constant_float(0u), constant_float(1u),
+                              constant_float(2u), constant_float(3u));
+        vec4 multiply_value = vec4(constant_float(4u), constant_float(5u),
+                                   constant_float(6u), constant_float(7u));
+        result.color0 = result.color0 * multiply_value + add_value;
+    }
+    if (p.mode == 3u || p.mode == 6u || p.mode == 14u) {
+        result.uv = vec2(
+            input_position.x * constant_float(16u) + input_position.y * constant_float(17u) + constant_float(19u),
+            input_position.x * constant_float(20u) + input_position.y * constant_float(21u) + constant_float(23u));
+        result.color0.a = result.color0.a * constant_float(7u) + constant_float(3u);
+    } else if (p.mode == 4u) {
+        result.uv = vec2(
+            input_position.x * constant_float(8u) + input_position.y * constant_float(9u) + constant_float(11u),
+            input_position.x * constant_float(12u) + input_position.y * constant_float(13u) + constant_float(15u));
+    } else if (p.mode == 5u || p.mode == 10u || p.mode == 14u) {
+        result.uv = vec2(uintBitsToFloat(vertices[(offset + 4u) >> 2]),
+                         uintBitsToFloat(vertices[(offset + 8u) >> 2]));
+        uint color_row = p.mode == 10u
+            ? load_vertex_word(offset + 20u) * 16u
+            : 0u;
+        vec4 add_value = vec4(constant_float(color_row),
+                              constant_float(color_row + 1u),
+                              constant_float(color_row + 2u),
+                              constant_float(color_row + 3u));
+        vec4 multiply_value = vec4(constant_float(color_row + 4u),
+                                   constant_float(color_row + 5u),
+                                   constant_float(color_row + 6u),
+                                   constant_float(color_row + 7u));
+        result.color0 = result.color0 * multiply_value + add_value;
+    } else if (p.mode == 7u) {
+        result.uv = vec2(uintBitsToFloat(vertices[offset >> 2]),
+                         uintBitsToFloat(vertices[(offset + 4u) >> 2]));
+        result.color0 = vec4(constant_float(0u), constant_float(1u),
+                             constant_float(2u), constant_float(3u));
+        result.color1 = vec4(constant_float(4u), constant_float(5u),
+                             constant_float(6u), constant_float(7u));
+    } else if (p.mode == 8u) {
+        vec4 encoded = result.color0 * vec4(1020.0) +
+            vec4(1020.0, 1020.0, 1020.0, 2.1);
+        result.color0 = clamp(encoded, vec4(0.1), vec4(3.1));
+        result.color0 = vec4(constant_float(0u), constant_float(1u),
+                             constant_float(2u), constant_float(3u)) * result.color0 +
+            vec4(constant_float(4u), constant_float(5u),
+                 constant_float(6u), constant_float(7u));
+        result.color1 = vec4(constant_float(8u), constant_float(9u),
+                             constant_float(10u), constant_float(11u)) * result.color0 +
+            vec4(constant_float(12u), constant_float(13u),
+                 constant_float(14u), constant_float(15u));
+        result.uv = vec2(0.0);
+    } else if (p.mode == 9u) {
+        /* Exact VS 509b6f3e contract from D3DDisassemble:
+         *   v0 = COLOR0 (R8G8B8A8_UNORM),
+         *   v1 = SV_Position (R32G32_FLOAT, promoted to x,y,0,1).
+         * COLOR0.b selects one six-row constant group. Rows +0/+1 are emitted
+         * color add/multiply values, +2/+3 transform SV_Position, and +4/+5
+         * transform TEXCOORD. Keep these two transforms in this order: the
+         * previous UV/position swap stretched controls across the viewport. */
+        uint group_row = load_byte(offset + 2u) * 6u;
+        vec4 input_position4 = vec4(input_position, 0.0, 1.0);
+        /* PS acdd04cc consumes the original vertex alpha separately and
+         * computes saturate(texture * o2 + o1). Preserve all three varyings;
+         * folding them into COLOR0 loses the dynamic control tint/mask used by
+         * buttons and scrollbars. */
+        result.color1 = vec4(constant_float((group_row + 0u) * 4u),
+                             constant_float((group_row + 0u) * 4u + 1u),
+                             constant_float((group_row + 0u) * 4u + 2u),
+                             constant_float((group_row + 0u) * 4u + 3u));
+        result.color2 = vec4(constant_float((group_row + 1u) * 4u),
+                             constant_float((group_row + 1u) * 4u + 1u),
+                             constant_float((group_row + 1u) * 4u + 2u),
+                             constant_float((group_row + 1u) * 4u + 3u));
+        vec4 position_row0 = vec4(
+            constant_float((group_row + 2u) * 4u),
+            constant_float((group_row + 2u) * 4u + 1u),
+            constant_float((group_row + 2u) * 4u + 2u),
+            constant_float((group_row + 2u) * 4u + 3u));
+        vec4 position_row1 = vec4(
+            constant_float((group_row + 3u) * 4u),
+            constant_float((group_row + 3u) * 4u + 1u),
+            constant_float((group_row + 3u) * 4u + 2u),
+            constant_float((group_row + 3u) * 4u + 3u));
+        vec2 dynamic_clip = vec2(dot(input_position4, position_row0),
+                                 dot(input_position4, position_row1));
+        vec4 uv_row0 = vec4(
+            constant_float((group_row + 4u) * 4u),
+            constant_float((group_row + 4u) * 4u + 1u),
+            constant_float((group_row + 4u) * 4u + 2u),
+            constant_float((group_row + 4u) * 4u + 3u));
+        vec4 uv_row1 = vec4(
+            constant_float((group_row + 5u) * 4u),
+            constant_float((group_row + 5u) * 4u + 1u),
+            constant_float((group_row + 5u) * 4u + 2u),
+            constant_float((group_row + 5u) * 4u + 3u));
+        result.uv = vec2(dot(input_position4, uv_row0),
+                         dot(input_position4, uv_row1));
+        result.position = vec2(
+            p.viewport.x + (dynamic_clip.x + 1.0) * p.viewport.z * 0.5,
+            p.viewport.y + (1.0 - dynamic_clip.y) * p.viewport.w * 0.5);
+    } else if (p.mode == 11u) {
+        /* VS a7b2c1e7 transforms the position through cb0 and emits no pixel
+         * varyings. PS 7bf3bccb writes cb0[0] as a uniform RGBA color. */
+        result.color0 = p.constant_color;
+        result.uv = vec2(0.0);
+    } else if (p.mode == 15u) {
+        /* Bink's RGBA conversion/composition pass uses normalized quad
+         * positions. VS 759406e5 maps position through cb0 rows 2/3 and UV
+         * through rows 4/5; the observed constants map 0..1 into clip space
+         * and into the valid sub-rectangle of the 64x64 conversion texture. */
+        uint position_row = 8u;
+        uint uv_row = 16u;
+        vec2 dynamic_clip = vec2(
+            input_position.x * constant_float(position_row) +
+            input_position.y * constant_float(position_row + 1u) +
+            constant_float(position_row + 3u),
+            input_position.x * constant_float(position_row + 4u) +
+            input_position.y * constant_float(position_row + 5u) +
+            constant_float(position_row + 7u));
+        result.position = vec2(
+            p.viewport.x + (dynamic_clip.x + 1.0) * p.viewport.z * 0.5,
+            p.viewport.y + (1.0 - dynamic_clip.y) * p.viewport.w * 0.5);
+        result.uv = vec2(
+            input_position.x * constant_float(uv_row) +
+            input_position.y * constant_float(uv_row + 1u) +
+            constant_float(uv_row + 3u),
+            input_position.x * constant_float(uv_row + 4u) +
+            input_position.y * constant_float(uv_row + 5u) +
+            constant_float(uv_row + 7u));
+        result.color0 = vec4(1.0);
+    } else if (p.mode == 16u) {
+        /* The filtered Bink pass shares VS 759406e5 with mode 15. */
+        uint position_row = 8u;
+        uint uv_row = 16u;
+        vec2 dynamic_clip = vec2(
+            input_position.x * constant_float(position_row) +
+            input_position.y * constant_float(position_row + 1u) +
+            constant_float(position_row + 3u),
+            input_position.x * constant_float(position_row + 4u) +
+            input_position.y * constant_float(position_row + 5u) +
+            constant_float(position_row + 7u));
+        result.position = vec2(
+            p.viewport.x + (dynamic_clip.x + 1.0) * p.viewport.z * 0.5,
+            p.viewport.y + (1.0 - dynamic_clip.y) * p.viewport.w * 0.5);
+        result.uv = vec2(
+            input_position.x * constant_float(uv_row) +
+            input_position.y * constant_float(uv_row + 1u) +
+            constant_float(uv_row + 3u),
+            input_position.x * constant_float(uv_row + 4u) +
+            input_position.y * constant_float(uv_row + 5u) +
+            constant_float(uv_row + 7u));
+        result.color0 = vec4(1.0);
+    } else if (p.mode == 12u) {
+        /* VS 4b88febe passes TEXCOORD0 directly and transforms POSITION.xy
+         * with cb0 rows 0-1. PS 7c5e6472 returns the sampled texture. */
+        result.color0 = vec4(1.0);
+        result.uv = vec2(uintBitsToFloat(vertices[offset >> 2]),
+                         uintBitsToFloat(vertices[(offset + 4u) >> 2]));
+    } else if (p.mode == 13u) {
+        /* VS f0193c6c batches Scaleform quads by encoding four transform rows
+         * in COLOR0. The decoded indices select one of four 2-row transforms:
+         * rows 2/3 create UV and rows 0/1 create SV_Position. COLOR0 itself is
+         * passed through; PS f383c6dd copies sampled RGB and multiplies alpha. */
+        uvec4 packed_color = uvec4(load_byte(offset), load_byte(offset + 1u),
+                                   load_byte(offset + 2u), load_byte(offset + 3u));
+        /* DXBC computes ftoi(COLOR0 * 1020 + {0.1,1.1,2.1,3.1}).
+         * COLOR0 is RGBA8_UNORM, so each byte selects a four-row matrix group. */
+        uvec4 row_index = packed_color * 4u + uvec4(0u, 1u, 2u, 3u);
+        uint uv_row = row_index.z * 8u;
+        uint position_row = row_index.x * 8u;
+        result.uv = vec2(
+            input_position.x * constant_float(uv_row) +
+            input_position.y * constant_float(uv_row + 1u) + constant_float(uv_row + 3u),
+            input_position.x * constant_float(uv_row + 4u) +
+            input_position.y * constant_float(uv_row + 5u) + constant_float(uv_row + 7u));
+        vec2 dynamic_clip = vec2(
+            input_position.x * constant_float(position_row) +
+            input_position.y * constant_float(position_row + 1u) +
+            constant_float(position_row + 3u),
+            input_position.x * constant_float(position_row + 4u) +
+            input_position.y * constant_float(position_row + 5u) +
+            constant_float(position_row + 7u));
+        result.position = vec2(p.viewport.x + (dynamic_clip.x + 1.0) * p.viewport.z * 0.5,
+                               p.viewport.y + (1.0 - dynamic_clip.y) * p.viewport.w * 0.5);
+    } else {
+        result.uv = vec2(0.0);
+    }
+    return result;
+}
+
+float blend_factor_value(uint factor, uint channel, vec4 source, vec4 destination)
+{
+    if (factor == 1u) return 0.0;
+    if (factor == 2u) return 1.0;
+    if (factor == 3u) return source[channel];
+    if (factor == 4u) return 1.0 - source[channel];
+    if (factor == 5u) return source.a;
+    if (factor == 6u) return 1.0 - source.a;
+    if (factor == 7u) return destination.a;
+    if (factor == 8u) return 1.0 - destination.a;
+    if (factor == 9u) return destination[channel];
+    if (factor == 10u) return 1.0 - destination[channel];
+    if (factor == 11u) return channel == 3u ? 1.0 : min(source.a, 1.0 - destination.a);
+    if (factor == 14u) return p.blend_factor[channel];
+    if (factor == 15u) return 1.0 - p.blend_factor[channel];
+    return 1.0;
+}
+
+float blend_operation(uint operation, float source, float destination)
+{
+    if (operation == 1u) return source + destination;
+    if (operation == 2u) return source - destination;
+    if (operation == 3u) return destination - source;
+    if (operation == 4u) return min(source, destination);
+    if (operation == 5u) return max(source, destination);
+    return source;
+}
+
+vec4 blend(vec4 source, vec4 destination)
+{
+    if (p.blend_enable == 0u) return source;
+    vec4 output_value;
+    for (uint channel = 0u; channel < 3u; ++channel) {
+        float sf = blend_factor_value(p.source_blend, channel, source, destination);
+        float df = blend_factor_value(p.destination_blend, channel, source, destination);
+        output_value[channel] = blend_operation(
+            p.color_operation, source[channel] * sf, destination[channel] * df);
+    }
+    float sf = blend_factor_value(p.source_alpha, 3u, source, destination);
+    float df = blend_factor_value(p.destination_alpha, 3u, source, destination);
+    output_value.a = blend_operation(
+        p.alpha_operation, source.a * sf, destination.a * df);
+    return output_value;
+}
+
+void main()
+{
+    uint lane = gl_LocalInvocationID.x;
+    if (lane < p.index_count) {
+        uint vertex_index = load_index(lane);
+        int resolved_index = int(vertex_index) + p.base_vertex;
+        cached_vertex_valid[lane] = resolved_index >= 0 ? 1u : 0u;
+        if (resolved_index >= 0)
+            cached_vertices[lane] = load_vertex(uint(resolved_index));
+    }
+    barrier();
+
+    uint triangle = lane;
+    uint triangle_count = p.index_count / 3u;
+    if (triangle < triangle_count) {
+        uint first = triangle * 3u;
+        bool valid = cached_vertex_valid[first] != 0u &&
+                     cached_vertex_valid[first + 1u] != 0u &&
+                     cached_vertex_valid[first + 2u] != 0u;
+        if (valid) {
+            vec2 a = cached_vertices[first].position;
+            vec2 b = cached_vertices[first + 1u].position;
+            vec2 c = cached_vertices[first + 2u].position;
+            float area = (c.x - a.x) * (b.y - a.y) -
+                         (c.y - a.y) * (b.x - a.x);
+            valid = area != 0.0;
+            if (valid) {
+                float inverse_area = 1.0 / area;
+                cached_triangle_w0[triangle] = vec4(
+                    (c.y - b.y) * inverse_area,
+                    (b.x - c.x) * inverse_area,
+                    (-b.x * (c.y - b.y) + b.y * (c.x - b.x)) * inverse_area,
+                    0.0);
+                cached_triangle_w1[triangle] = vec4(
+                    (a.y - c.y) * inverse_area,
+                    (c.x - a.x) * inverse_area,
+                    (-c.x * (a.y - c.y) + c.y * (a.x - c.x)) * inverse_area,
+                    0.0);
+                /* D3D rasterization uses a half-open top-left fill rule. Store
+                 * one inclusion bit for each barycentric edge (b->c, c->a,
+                 * a->b), reversing the edge when normalization flipped a
+                 * clockwise triangle. Without this, both triangles in every
+                 * Scaleform quad shade their shared diagonal and alpha-blend
+                 * it twice, making small legal text shimmer between frames. */
+                vec2 edge0_start = area > 0.0 ? b : c;
+                vec2 edge0_end = area > 0.0 ? c : b;
+                vec2 edge1_start = area > 0.0 ? c : a;
+                vec2 edge1_end = area > 0.0 ? a : c;
+                vec2 edge2_start = area > 0.0 ? a : b;
+                vec2 edge2_end = area > 0.0 ? b : a;
+                vec2 edge0 = edge0_end - edge0_start;
+                vec2 edge1 = edge1_end - edge1_start;
+                vec2 edge2 = edge2_end - edge2_start;
+                cached_triangle_w0[triangle].w =
+                    (edge0.y < 0.0 || (edge0.y == 0.0 && edge0.x > 0.0)) ? 1.0 : 0.0;
+                cached_triangle_w1[triangle].w =
+                    (edge1.y < 0.0 || (edge1.y == 0.0 && edge1.x > 0.0)) ? 1.0 : 0.0;
+                vec2 minimum_value = floor(min(a, min(b, c)));
+                vec2 maximum_value = ceil(max(a, max(b, c)));
+                cached_triangle_bounds[triangle] = ivec4(
+                    int(minimum_value.x), int(minimum_value.y),
+                    int(maximum_value.x), int(maximum_value.y));
+                cached_triangle_edges[triangle] = uvec4(
+                    uint(cached_triangle_w0[triangle].w),
+                    uint(cached_triangle_w1[triangle].w),
+                    (edge2.y < 0.0 || (edge2.y == 0.0 && edge2.x > 0.0)) ? 1u : 0u,
+                    0u);
+            }
+        }
+        cached_triangle_valid[triangle] = valid ? 1u : 0u;
+    }
+    barrier();
+
+    uint local_pixel = gl_GlobalInvocationID.x;
+    if (local_pixel >= p.dispatch_pixels) return;
+    uint x = p.dispatch_origin_x + local_pixel % p.dispatch_width;
+    uint y = p.dispatch_origin_y + local_pixel / p.dispatch_width;
+    uint pixel = y * p.width + x;
+    if (int(x) < p.scissor.x || int(y) < p.scissor.y ||
+        int(x) >= p.scissor.z || int(y) >= p.scissor.w)
+        return;
+
+    vec4 destination = unpackUnorm4x8(target_pixels[pixel]);
+    vec2 sample_position = vec2(float(x) + 0.5, float(y) + 0.5);
+    for (uint triangle_index = 0u; triangle_index < triangle_count; ++triangle_index) {
+        if (cached_triangle_valid[triangle_index] == 0u) continue;
+        ivec4 bounds = cached_triangle_bounds[triangle_index];
+        if (int(x) < bounds.x || int(y) < bounds.y ||
+            int(x) > bounds.z || int(y) > bounds.w)
+            continue;
+        uint first = triangle_index * 3u;
+        Vertex v0 = cached_vertices[first];
+        Vertex v1 = cached_vertices[first + 1u];
+        Vertex v2 = cached_vertices[first + 2u];
+        vec4 equation0 = cached_triangle_w0[triangle_index];
+        vec4 equation1 = cached_triangle_w1[triangle_index];
+        float w0 = dot(equation0.xyz, vec3(sample_position, 1.0));
+        float w1 = dot(equation1.xyz, vec3(sample_position, 1.0));
+        float w2 = 1.0 - w0 - w1;
+        uvec4 included_edges = cached_triangle_edges[triangle_index];
+        const float edge_epsilon = 1.0e-6;
+        if (w0 < -edge_epsilon || w1 < -edge_epsilon || w2 < -edge_epsilon ||
+            (abs(w0) <= edge_epsilon && included_edges.x == 0u) ||
+            (abs(w1) <= edge_epsilon && included_edges.y == 0u) ||
+            (abs(w2) <= edge_epsilon && included_edges.z == 0u))
+            continue;
+        vec4 color0 = v0.color0 * w0 + v1.color0 * w1 + v2.color0 * w2;
+        float secondary_alpha = v0.color1.a * w0 + v1.color1.a * w1 + v2.color1.a * w2;
+        if (p.mode == 3u || p.mode == 4u || p.mode == 5u || p.mode == 6u ||
+            p.mode == 7u || p.mode == 8u || p.mode == 9u || p.mode == 10u ||
+            p.mode == 12u || p.mode == 13u || p.mode == 14u || p.mode == 15u ||
+            p.mode == 16u) {
+            vec2 uv = v0.uv * w0 + v1.uv * w1 + v2.uv * w2;
+            vec4 texture_color = sample_texture(uv);
+            if (p.mode == 5u || p.mode == 10u) {
+                color0.a *= texture_color.r;
+            } else if (p.mode == 6u) {
+                float vertex_alpha = color0.a;
+                color0.rgb = texture_color.rgb * texture_color.a;
+                color0.a = texture_color.a * vertex_alpha;
+            } else if (p.mode == 7u) {
+                color0 = texture_color * color0 +
+                    (v0.color1 * w0 + v1.color1 * w1 + v2.color1 * w2);
+            } else if (p.mode == 8u) {
+                vec4 secondary = v0.color1 * w0 + v1.color1 * w1 + v2.color1 * w2;
+                color0 = texture_color * color0 + secondary;
+            } else if (p.mode == 9u) {
+                vec4 add_value = v0.color1 * w0 + v1.color1 * w1 + v2.color1 * w2;
+                vec4 multiply_value = v0.color2 * w0 + v1.color2 * w1 + v2.color2 * w2;
+                float vertex_alpha = color0.a;
+                color0 = clamp(texture_color * multiply_value + add_value, 0.0, 1.0);
+                color0.a *= vertex_alpha;
+            } else if (p.mode == 15u) {
+                /* Preserve all four channels of Bink's conversion texture;
+                 * later movie passes apply the YUV conversion matrix. */
+                color0 = texture_color;
+            } else if (p.mode == 16u) {
+                /* PS d804183a is Bink's filtered composition pass. The first
+                 * conversion surface supplies color, the second supplies the
+                 * alpha/mask term. Apply the captured scale and colour
+                 * constants while preserving strict GPU execution. */
+                vec4 mask_color = sample_texture2(uv);
+                float alpha = clamp(mask_color.a * p.constant_color.a, 0.0, 1.0);
+                color0 = clamp(texture_color * vec4(p.constant_color.rgb, alpha),
+                               0.0, 1.0);
+            } else {
+                color0.rgb = texture_color.rgb;
+                color0.a *= texture_color.a;
+            }
+        } else {
+            color0.a *= secondary_alpha;
+        }
+        vec4 result = clamp(blend(color0, destination), 0.0, 1.0);
+        for (uint channel = 0u; channel < 4u; ++channel)
+            if ((p.write_mask & (1u << channel)) != 0u)
+                destination[channel] = result[channel];
+    }
+    target_pixels[pixel] = packUnorm4x8(destination);
+}

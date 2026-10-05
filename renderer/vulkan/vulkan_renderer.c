@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "vulkan_renderer.h"
 #include "vulkan_indexed_renderer.h"
+#include "vulkan_context.h"
+#include "target_mirror.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -11,6 +13,37 @@
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
+
+#define COMPOSITOR_MIRROR_COUNT 8
+
+typedef struct {
+    const void *resource;
+    uint8_t *cpu_pixels;
+    uint64_t serial;
+    uint64_t last_use;
+    VkDeviceSize bytes;
+    VkDeviceSize capacity;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    uint8_t *map;
+    int gpu_dirty;
+    /* See renderer/vulkan/target_mirror.h: identity plus serial is not
+     * sufficient to prove this slot's device memory belongs to the caller's
+     * frame, because serial 0 is valid and slots are recycled. */
+    int content_valid;
+} CompositorMirror;
+
+static BeerTargetMirrorState compositor_mirror_state(
+    const CompositorMirror *mirror)
+{
+    BeerTargetMirrorState state = {
+        .resource = mirror->resource,
+        .serial = mirror->serial,
+        .bytes = (size_t)mirror->bytes,
+        .content_valid = mirror->content_valid
+    };
+    return state;
+}
 
 typedef struct {
     void *library;
@@ -27,15 +60,13 @@ typedef struct {
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
     VkFence fence;
-    VkBuffer buffers[3];
-    VkDeviceMemory memories[3];
-    uint8_t *maps[3];
+    VkBuffer buffers[2];
+    VkDeviceMemory memories[2];
+    uint8_t *maps[2];
     VkDeviceSize capacity;
-    const void *pending_resource;
-    uint8_t *pending_pixels;
-    uint64_t pending_serial;
-    VkDeviceSize pending_bytes;
-    int pending_dirty;
+    CompositorMirror output_mirrors[COMPOSITOR_MIRROR_COUNT];
+    uint64_t output_use_serial;
+    int submission_pending;
     int initialized;
     int unavailable;
 
@@ -78,6 +109,7 @@ typedef struct {
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
     PFN_vkCmdPushConstants CmdPushConstants;
     PFN_vkCmdDispatch CmdDispatch;
+    PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
     PFN_vkQueueSubmit QueueSubmit;
     PFN_vkCreateFence CreateFence;
     PFN_vkDestroyFence DestroyFence;
@@ -91,6 +123,33 @@ static pthread_mutex_t g_renderer_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_indexed_bridge_copies;
 static uint64_t g_compositor_bridge_copies;
 static uint64_t g_cpu_input_copies;
+static uint64_t g_pending_writebacks;
+
+static int wait_for_pending_submission(void)
+{
+    if (!g_renderer.submission_pending) return 1;
+    if (g_renderer.WaitForFences(g_renderer.device, 1, &g_renderer.fence, VK_TRUE,
+                                 UINT64_MAX) != VK_SUCCESS)
+        return 0;
+    g_renderer.submission_pending = 0;
+    return 1;
+}
+
+static void writeback_output_mirror(CompositorMirror *mirror)
+{
+    if (!mirror || !mirror->gpu_dirty || !mirror->cpu_pixels || !mirror->map ||
+        !mirror->bytes)
+        return;
+    memcpy(mirror->cpu_pixels, mirror->map, (size_t)mirror->bytes);
+    mirror->gpu_dirty = 0;
+    ++g_pending_writebacks;
+    if (getenv("BEER_RENDER_DIAGNOSTICS") &&
+        (g_pending_writebacks <= 4 || (g_pending_writebacks % 64u) == 0))
+        fprintf(stderr, "[D3D11 VULKAN] compositor writeback=%llu resource=%p "
+                "serial=%llu bytes=%zu\n",
+                (unsigned long long)g_pending_writebacks, mirror->resource,
+                (unsigned long long)mirror->serial, (size_t)mirror->bytes);
+}
 
 #define LOAD_INSTANCE(name) do { \
     g_renderer.name = (PFN_vk##name)g_renderer.GetInstanceProcAddr( \
@@ -106,8 +165,8 @@ static uint64_t g_cpu_input_copies;
 static void destroy_buffers(void)
 {
     if (!g_renderer.device) return;
-    if (g_renderer.DeviceWaitIdle) g_renderer.DeviceWaitIdle(g_renderer.device);
-    for (uint32_t i = 0; i < 3; ++i) {
+    if (!wait_for_pending_submission()) return;
+    for (uint32_t i = 0; i < 2; ++i) {
         if (g_renderer.maps[i] && g_renderer.UnmapMemory)
             g_renderer.UnmapMemory(g_renderer.device, g_renderer.memories[i]);
         if (g_renderer.buffers[i] && g_renderer.DestroyBuffer)
@@ -119,6 +178,17 @@ static void destroy_buffers(void)
         g_renderer.memories[i] = VK_NULL_HANDLE;
     }
     g_renderer.capacity = 0;
+    for (uint32_t i = 0; i < COMPOSITOR_MIRROR_COUNT; ++i) {
+        CompositorMirror *mirror = &g_renderer.output_mirrors[i];
+        writeback_output_mirror(mirror);
+        if (mirror->map && g_renderer.UnmapMemory)
+            g_renderer.UnmapMemory(g_renderer.device, mirror->memory);
+        if (mirror->buffer && g_renderer.DestroyBuffer)
+            g_renderer.DestroyBuffer(g_renderer.device, mirror->buffer, NULL);
+        if (mirror->memory && g_renderer.FreeMemory)
+            g_renderer.FreeMemory(g_renderer.device, mirror->memory, NULL);
+        memset(mirror, 0, sizeof(*mirror));
+    }
 }
 
 void vulkan_renderer_destroy(void)
@@ -132,11 +202,7 @@ void vulkan_renderer_destroy(void)
         if (g_renderer.descriptor_pool) g_renderer.DestroyDescriptorPool(g_renderer.device, g_renderer.descriptor_pool, NULL);
         if (g_renderer.descriptor_layout) g_renderer.DestroyDescriptorSetLayout(g_renderer.device, g_renderer.descriptor_layout, NULL);
         if (g_renderer.command_pool) g_renderer.DestroyCommandPool(g_renderer.device, g_renderer.command_pool, NULL);
-        g_renderer.DestroyDevice(g_renderer.device, NULL);
     }
-    if (g_renderer.instance && g_renderer.DestroyInstance)
-        g_renderer.DestroyInstance(g_renderer.instance, NULL);
-    if (g_renderer.library) dlclose(g_renderer.library);
     memset(&g_renderer, 0, sizeof(g_renderer));
 }
 
@@ -145,7 +211,7 @@ static int read_shader(uint32_t **code, size_t *size)
     const char *path = getenv("BEER_VULKAN_COMPOSITOR_SPV");
     char executable_relative[4096];
     if (!path || !*path) {
-        path = "shaders/fullscreen_composite.comp.spv";
+        path = "renderer/vulkan/shaders/fullscreen_composite.comp.spv";
         FILE *probe = fopen(path, "rb");
         if (probe) {
             fclose(probe);
@@ -158,7 +224,7 @@ static int read_shader(uint32_t **code, size_t *size)
                 if (separator) {
                     separator[1] = '\0';
                     strncat(executable_relative,
-                            "shaders/fullscreen_composite.comp.spv",
+                            "renderer/vulkan/shaders/fullscreen_composite.comp.spv",
                             sizeof(executable_relative) - strlen(executable_relative) - 1);
                     path = executable_relative;
                 }
@@ -191,75 +257,19 @@ static int initialize(void)
     if (g_renderer.initialized) return 1;
     if (g_renderer.unavailable) return 0;
     failure_stage = "load Vulkan library";
-    g_renderer.library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!g_renderer.library) goto fail;
-    g_renderer.GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(
-        g_renderer.library, "vkGetInstanceProcAddr");
-    PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)dlsym(
-        g_renderer.library, "vkCreateInstance");
-    if (!g_renderer.GetInstanceProcAddr || !create_instance) goto fail;
-
-    failure_stage = "create Vulkan instance";
-    VkApplicationInfo app = {
-        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pApplicationName = "Beer D3D11 Vulkan Renderer",
-        .apiVersion = VK_API_VERSION_1_0
-    };
-    VkInstanceCreateInfo instance_info = {
-        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pApplicationInfo = &app
-    };
-    if (create_instance(&instance_info, NULL, &g_renderer.instance) != VK_SUCCESS)
+    if (!beer_vulkan_context_initialize()) goto fail;
+    g_renderer.instance = beer_vulkan_instance();
+    g_renderer.physical_device = beer_vulkan_physical_device();
+    g_renderer.device = beer_vulkan_device();
+    g_renderer.queue = beer_vulkan_queue();
+    g_renderer.queue_family = beer_vulkan_queue_family();
+    g_renderer.GetInstanceProcAddr = beer_vulkan_get_instance_proc_addr();
+    g_renderer.GetDeviceProcAddr = beer_vulkan_get_device_proc_addr();
+    if (!g_renderer.instance || !g_renderer.physical_device ||
+        !g_renderer.device || !g_renderer.queue ||
+        !g_renderer.GetInstanceProcAddr || !g_renderer.GetDeviceProcAddr)
         goto fail;
-    LOAD_INSTANCE(DestroyInstance);
-    LOAD_INSTANCE(EnumeratePhysicalDevices);
-    LOAD_INSTANCE(GetPhysicalDeviceQueueFamilyProperties);
     LOAD_INSTANCE(GetPhysicalDeviceMemoryProperties);
-    LOAD_INSTANCE(CreateDevice);
-    g_renderer.GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)
-        g_renderer.GetInstanceProcAddr(g_renderer.instance, "vkGetDeviceProcAddr");
-    if (!g_renderer.GetDeviceProcAddr) goto fail;
-
-    failure_stage = "select compute device";
-    uint32_t physical_count = 0;
-    if (g_renderer.EnumeratePhysicalDevices(g_renderer.instance, &physical_count, NULL) != VK_SUCCESS || !physical_count)
-        goto fail;
-    VkPhysicalDevice *physical = calloc(physical_count, sizeof(*physical));
-    if (!physical) goto fail;
-    g_renderer.EnumeratePhysicalDevices(g_renderer.instance, &physical_count, physical);
-    for (uint32_t p = 0; p < physical_count && !g_renderer.physical_device; ++p) {
-        uint32_t count = 0;
-        g_renderer.GetPhysicalDeviceQueueFamilyProperties(physical[p], &count, NULL);
-        VkQueueFamilyProperties *properties = calloc(count, sizeof(*properties));
-        if (!properties) continue;
-        g_renderer.GetPhysicalDeviceQueueFamilyProperties(physical[p], &count, properties);
-        for (uint32_t q = 0; q < count; ++q) {
-            if (properties[q].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-                g_renderer.physical_device = physical[p];
-                g_renderer.queue_family = q;
-                break;
-            }
-        }
-        free(properties);
-    }
-    free(physical);
-    if (!g_renderer.physical_device) goto fail;
-
-    failure_stage = "create compute device";
-    float priority = 1.0f;
-    VkDeviceQueueCreateInfo queue_info = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex = g_renderer.queue_family,
-        .queueCount = 1,
-        .pQueuePriorities = &priority
-    };
-    VkDeviceCreateInfo device_info = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &queue_info
-    };
-    if (g_renderer.CreateDevice(g_renderer.physical_device, &device_info, NULL, &g_renderer.device) != VK_SUCCESS)
-        goto fail;
 
     LOAD_DEVICE(DestroyDevice); LOAD_DEVICE(GetDeviceQueue);
     LOAD_DEVICE(CreateCommandPool); LOAD_DEVICE(DestroyCommandPool);
@@ -277,6 +287,7 @@ static int initialize(void)
     LOAD_DEVICE(MapMemory); LOAD_DEVICE(UnmapMemory);
     LOAD_DEVICE(CmdBindPipeline); LOAD_DEVICE(CmdBindDescriptorSets);
     LOAD_DEVICE(CmdPushConstants); LOAD_DEVICE(CmdDispatch);
+    LOAD_DEVICE(CmdPipelineBarrier);
     LOAD_DEVICE(QueueSubmit); LOAD_DEVICE(CreateFence); LOAD_DEVICE(DestroyFence);
     LOAD_DEVICE(ResetFences); LOAD_DEVICE(WaitForFences); LOAD_DEVICE(DeviceWaitIdle);
     g_renderer.GetDeviceQueue(g_renderer.device, g_renderer.queue_family, 0, &g_renderer.queue);
@@ -411,15 +422,98 @@ static int find_memory_type(uint32_t bits, VkMemoryPropertyFlags required, uint3
     return 0;
 }
 
+static int allocate_output_buffer(VkDeviceSize capacity, VkBuffer *buffer,
+                                  VkDeviceMemory *memory, uint8_t **map)
+{
+    VkBufferCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = capacity,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (g_renderer.CreateBuffer(g_renderer.device, &info, NULL, buffer) != VK_SUCCESS)
+        return 0;
+    VkMemoryRequirements requirements;
+    g_renderer.GetBufferMemoryRequirements(g_renderer.device, *buffer, &requirements);
+    uint32_t memory_type;
+    if (!find_memory_type(requirements.memoryTypeBits,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          &memory_type))
+        return 0;
+    VkMemoryAllocateInfo allocation = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = requirements.size,
+        .memoryTypeIndex = memory_type
+    };
+    return g_renderer.AllocateMemory(g_renderer.device, &allocation, NULL, memory) == VK_SUCCESS &&
+        g_renderer.BindBufferMemory(g_renderer.device, *buffer, *memory, 0) == VK_SUCCESS &&
+        g_renderer.MapMemory(g_renderer.device, *memory, 0, capacity, 0,
+                             (void **)map) == VK_SUCCESS;
+}
+
+static CompositorMirror *acquire_output_mirror(const void *resource,
+                                                uint8_t *cpu_pixels,
+                                                uint64_t serial,
+                                                VkDeviceSize bytes)
+{
+    CompositorMirror *candidate = NULL;
+    for (uint32_t i = 0; i < COMPOSITOR_MIRROR_COUNT; ++i) {
+        CompositorMirror *mirror = &g_renderer.output_mirrors[i];
+        if (mirror->resource == resource && mirror->bytes == bytes) {
+            candidate = mirror;
+            break;
+        }
+        if (!candidate || !mirror->resource || mirror->last_use < candidate->last_use)
+            candidate = mirror;
+    }
+    if (!candidate) return NULL;
+    if (candidate->resource && candidate->resource != resource) {
+        writeback_output_mirror(candidate);
+        candidate->content_valid = 0;
+    }
+    if (candidate->bytes != bytes) candidate->content_valid = 0;
+    if (candidate->capacity < bytes) {
+        writeback_output_mirror(candidate);
+        candidate->content_valid = 0;
+        if (candidate->map)
+            g_renderer.UnmapMemory(g_renderer.device, candidate->memory);
+        if (candidate->buffer)
+            g_renderer.DestroyBuffer(g_renderer.device, candidate->buffer, NULL);
+        if (candidate->memory)
+            g_renderer.FreeMemory(g_renderer.device, candidate->memory, NULL);
+        memset(candidate, 0, sizeof(*candidate));
+        if (!allocate_output_buffer(bytes, &candidate->buffer,
+                                    &candidate->memory, &candidate->map))
+            return NULL;
+        candidate->capacity = bytes;
+    }
+    candidate->resource = resource;
+    candidate->cpu_pixels = cpu_pixels;
+    candidate->bytes = bytes;
+    /* Claiming a slot for an upcoming composite does not produce content.
+     * Publishing `serial` here would let another worker's lookup match this
+     * slot and read the previous frame's pixels as if they were the result
+     * of the dispatch that has not run yet. The serial and validity flag are
+     * published together only after the submission succeeds. */
+    BeerTargetMirrorState claim = compositor_mirror_state(candidate);
+    candidate->content_valid = beer_target_mirror_claim_valid(
+        &claim, resource, serial, (size_t)bytes);
+    candidate->last_use = ++g_renderer.output_use_serial;
+    return candidate;
+}
+
 static int ensure_buffers(VkDeviceSize required)
 {
     if (g_renderer.capacity >= required) return 1;
     destroy_buffers();
-    for (uint32_t i = 0; i < 3; ++i) {
+    for (uint32_t i = 0; i < 2; ++i) {
         VkBufferCreateInfo info = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = required,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE
         };
         if (g_renderer.CreateBuffer(g_renderer.device, &info, NULL, &g_renderer.buffers[i]) != VK_SUCCESS)
@@ -442,11 +536,11 @@ static int ensure_buffers(VkDeviceSize required)
             return 0;
     }
     g_renderer.capacity = required;
-    VkDescriptorBufferInfo buffer_info[3];
-    VkWriteDescriptorSet writes[3];
+    VkDescriptorBufferInfo buffer_info[2];
+    VkWriteDescriptorSet writes[2];
     memset(buffer_info, 0, sizeof(buffer_info));
     memset(writes, 0, sizeof(writes));
-    for (uint32_t i = 0; i < 3; ++i) {
+    for (uint32_t i = 0; i < 2; ++i) {
         buffer_info[i].buffer = g_renderer.buffers[i];
         buffer_info[i].range = required;
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -456,35 +550,50 @@ static int ensure_buffers(VkDeviceSize required)
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &buffer_info[i];
     }
-    g_renderer.UpdateDescriptorSets(g_renderer.device, 3, writes, 0, NULL);
+    g_renderer.UpdateDescriptorSets(g_renderer.device, 2, writes, 0, NULL);
     return 1;
 }
 
-static void copy_compositor_input(const void *resource, uint64_t serial,
-                                  const uint8_t *cpu_pixels,
-                                  uint8_t *destination, size_t bytes)
+static VkBuffer select_compositor_input(const void *resource, uint64_t serial,
+                                        const uint8_t *cpu_pixels,
+                                        uint8_t *staging, VkBuffer staging_buffer,
+                                        size_t bytes)
 {
     uint64_t count;
     const char *source;
-    if (g_renderer.pending_resource == resource &&
-        g_renderer.pending_serial == serial &&
-        g_renderer.pending_bytes == bytes) {
-        memcpy(destination, g_renderer.maps[2], bytes);
-        count = ++g_compositor_bridge_copies;
-        source = "compositor-mirror";
-    } else if (vulkan_indexed_renderer_copy_target(resource, serial,
-                                                    destination, bytes)) {
+    uint64_t shared_handle = 0;
+    VkBuffer selected = staging_buffer;
+    for (uint32_t i = 0; i < COMPOSITOR_MIRROR_COUNT; ++i) {
+        CompositorMirror *mirror = &g_renderer.output_mirrors[i];
+        BeerTargetMirrorState state = compositor_mirror_state(mirror);
+        if (beer_target_mirror_matches(&state, resource, serial, bytes) &&
+            mirror->buffer) {
+            selected = mirror->buffer;
+            mirror->last_use = ++g_renderer.output_use_serial;
+            count = ++g_compositor_bridge_copies;
+            source = "compositor-mirror-direct";
+            goto selected_input;
+        }
+    }
+    if (vulkan_indexed_renderer_get_target_buffer(
+            resource, serial, bytes, &shared_handle)) {
+        /* All stages share one VkDevice. Bind the indexed target buffer
+         * directly instead of copying a full 1080p frame through host memory. */
+        selected = (VkBuffer)(uintptr_t)shared_handle;
         count = ++g_indexed_bridge_copies;
-        source = "indexed-mirror";
+        source = "indexed-mirror-direct";
     } else {
-        memcpy(destination, cpu_pixels, bytes);
+        memcpy(staging, cpu_pixels, bytes);
         count = ++g_cpu_input_copies;
         source = "cpu";
     }
-    if (count <= 4 || (count % 256u) == 0)
+selected_input:
+    if (getenv("BEER_RENDER_DIAGNOSTICS") &&
+        (count <= 4 || (count % 256u) == 0))
         fprintf(stderr, "[D3D11 VULKAN] compositor input source=%s count=%llu "
                 "serial=%llu bytes=%zu\n", source,
                 (unsigned long long)count, (unsigned long long)serial, bytes);
+    return selected;
 }
 
 int vulkan_renderer_composite_rgba8(const void *source_resource,
@@ -512,14 +621,50 @@ int vulkan_renderer_composite_rgba8(const void *source_resource,
     int result = 0;
     uint32_t pixel_count = width * height;
     VkDeviceSize bytes = (VkDeviceSize)pixel_count * 4;
-    if (!initialize() || !ensure_buffers(bytes)) goto done;
-    copy_compositor_input(source_resource, source_serial, source,
-                          g_renderer.maps[0], (size_t)bytes);
+    if (!initialize() || !wait_for_pending_submission() || !ensure_buffers(bytes))
+        goto done;
+    CompositorMirror *output_mirror = acquire_output_mirror(
+        target_resource, target, target_serial, bytes);
+    if (!output_mirror) goto done;
+    VkBuffer source_buffer = select_compositor_input(
+        source_resource, source_serial, source, g_renderer.maps[0],
+        g_renderer.buffers[0], (size_t)bytes);
+    VkBuffer overlay_buffer = g_renderer.buffers[1];
     if (overlay)
-        copy_compositor_input(overlay_resource, overlay_serial, overlay,
-                              g_renderer.maps[1], (size_t)bytes);
+        overlay_buffer = select_compositor_input(
+            overlay_resource, overlay_serial, overlay, g_renderer.maps[1],
+            g_renderer.buffers[1], (size_t)bytes);
     else
         memset(g_renderer.maps[1], 0, (size_t)bytes);
+
+    VkDescriptorBufferInfo input_infos[2] = {
+        { .buffer = source_buffer, .range = bytes },
+        { .buffer = overlay_buffer, .range = bytes }
+    };
+    VkWriteDescriptorSet input_writes[2];
+    memset(input_writes, 0, sizeof(input_writes));
+    for (uint32_t i = 0; i < 2; ++i) {
+        input_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        input_writes[i].dstSet = g_renderer.descriptor_set;
+        input_writes[i].dstBinding = i;
+        input_writes[i].descriptorCount = 1;
+        input_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        input_writes[i].pBufferInfo = &input_infos[i];
+    }
+    VkDescriptorBufferInfo output_info = {
+        .buffer = output_mirror->buffer,
+        .range = bytes
+    };
+    VkWriteDescriptorSet output_write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = g_renderer.descriptor_set,
+        .dstBinding = 2,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &output_info
+    };
+    g_renderer.UpdateDescriptorSets(g_renderer.device, 2, input_writes, 0, NULL);
+    g_renderer.UpdateDescriptorSets(g_renderer.device, 1, &output_write, 0, NULL);
 
     g_renderer.ResetCommandBuffer(g_renderer.command_buffer, 0);
     VkCommandBufferBeginInfo begin = {
@@ -528,6 +673,18 @@ int vulkan_renderer_composite_rgba8(const void *source_resource,
     };
     if (g_renderer.BeginCommandBuffer(g_renderer.command_buffer, &begin) != VK_SUCCESS)
         goto done;
+    /* Indexed targets and earlier compositor outputs are bound directly on
+     * the shared queue. Establish shader-write to shader-read visibility, and
+     * publish host-coherent writes for CPU-backed staging inputs. */
+    VkMemoryBarrier inputs_ready = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+    };
+    g_renderer.CmdPipelineBarrier(g_renderer.command_buffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+        1, &inputs_ready, 0, NULL, 0, NULL);
     g_renderer.CmdBindPipeline(g_renderer.command_buffer,
                                VK_PIPELINE_BIND_POINT_COMPUTE,
                                g_renderer.pipeline);
@@ -548,19 +705,22 @@ int vulkan_renderer_composite_rgba8(const void *source_resource,
         .commandBufferCount = 1,
         .pCommandBuffers = &g_renderer.command_buffer
     };
-    if (g_renderer.ResetFences(g_renderer.device, 1, &g_renderer.fence) != VK_SUCCESS ||
-        g_renderer.QueueSubmit(g_renderer.queue, 1, &submit, g_renderer.fence) != VK_SUCCESS ||
-        g_renderer.WaitForFences(g_renderer.device, 1, &g_renderer.fence, VK_TRUE,
-                                 UINT64_MAX) != VK_SUCCESS)
+    if (g_renderer.ResetFences(g_renderer.device, 1, &g_renderer.fence) != VK_SUCCESS)
         goto done;
-    g_renderer.pending_resource = target_resource;
-    g_renderer.pending_pixels = target;
-    g_renderer.pending_serial = target_serial;
-    g_renderer.pending_bytes = bytes;
-    g_renderer.pending_dirty = 1;
+    beer_vulkan_queue_lock();
+    VkResult submit_result = g_renderer.QueueSubmit(
+        g_renderer.queue, 1, &submit, g_renderer.fence);
+    beer_vulkan_queue_unlock();
+    if (submit_result != VK_SUCCESS) goto done;
+    g_renderer.submission_pending = 1;
+    output_mirror->serial = target_serial;
+    output_mirror->content_valid = 1;
+    output_mirror->gpu_dirty = 1;
+    output_mirror->last_use = ++g_renderer.output_use_serial;
     static uint32_t executions;
     ++executions;
-    if (executions <= 8 || executions % 64 == 0)
+    if (getenv("BEER_RENDER_DIAGNOSTICS") &&
+        (executions <= 8 || executions % 64 == 0))
         fprintf(stderr, "[D3D11 VULKAN] fullscreen compute execution=%u mode=%u %ux%u\n",
                 executions, mode, width, height);
     result = 1;
@@ -574,12 +734,24 @@ int vulkan_renderer_sync_target(const void *resource, uint64_t serial,
 {
     if (!resource || !pixels || !bytes) return 0;
     pthread_mutex_lock(&g_renderer_lock);
-    int found = g_renderer.pending_resource == resource &&
-        g_renderer.pending_serial == serial &&
-        g_renderer.pending_bytes == bytes;
-    if (found && g_renderer.pending_dirty) {
-        memcpy(pixels, g_renderer.maps[2], bytes);
-        g_renderer.pending_dirty = 0;
+    if (!wait_for_pending_submission()) {
+        pthread_mutex_unlock(&g_renderer_lock);
+        return 0;
+    }
+    int found = 0;
+    for (uint32_t i = 0; i < COMPOSITOR_MIRROR_COUNT; ++i) {
+        CompositorMirror *mirror = &g_renderer.output_mirrors[i];
+        BeerTargetMirrorState state = compositor_mirror_state(mirror);
+        if (!beer_target_mirror_matches(&state, resource, serial, bytes))
+            continue;
+        if (mirror->gpu_dirty) {
+            memcpy(pixels, mirror->map, bytes);
+            mirror->cpu_pixels = pixels;
+            mirror->gpu_dirty = 0;
+        }
+        mirror->last_use = ++g_renderer.output_use_serial;
+        found = 1;
+        break;
     }
     pthread_mutex_unlock(&g_renderer_lock);
     return found;
@@ -590,10 +762,42 @@ int vulkan_renderer_copy_target(const void *resource, uint64_t serial,
 {
     if (!resource || !destination || !bytes) return 0;
     pthread_mutex_lock(&g_renderer_lock);
-    int found = g_renderer.pending_resource == resource &&
-        g_renderer.pending_serial == serial &&
-        g_renderer.pending_bytes == bytes;
-    if (found) memcpy(destination, g_renderer.maps[2], bytes);
+    if (!wait_for_pending_submission()) {
+        pthread_mutex_unlock(&g_renderer_lock);
+        return 0;
+    }
+    int found = 0;
+    for (uint32_t i = 0; i < COMPOSITOR_MIRROR_COUNT; ++i) {
+        CompositorMirror *mirror = &g_renderer.output_mirrors[i];
+        BeerTargetMirrorState state = compositor_mirror_state(mirror);
+        if (!beer_target_mirror_matches(&state, resource, serial, bytes))
+            continue;
+        memcpy(destination, mirror->map, bytes);
+        mirror->last_use = ++g_renderer.output_use_serial;
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&g_renderer_lock);
+    return found;
+}
+
+int vulkan_renderer_get_target_buffer(const void *resource, uint64_t serial,
+                                      size_t bytes, uint64_t *buffer_handle)
+{
+    if (!resource || !bytes || !buffer_handle) return 0;
+    pthread_mutex_lock(&g_renderer_lock);
+    int found = 0;
+    for (uint32_t i = 0; i < COMPOSITOR_MIRROR_COUNT; ++i) {
+        CompositorMirror *mirror = &g_renderer.output_mirrors[i];
+        BeerTargetMirrorState state = compositor_mirror_state(mirror);
+        if (!beer_target_mirror_matches(&state, resource, serial, bytes) ||
+            !mirror->buffer)
+            continue;
+        *buffer_handle = (uint64_t)(uintptr_t)mirror->buffer;
+        mirror->last_use = ++g_renderer.output_use_serial;
+        found = 1;
+        break;
+    }
     pthread_mutex_unlock(&g_renderer_lock);
     return found;
 }
@@ -602,12 +806,21 @@ void vulkan_renderer_forget_resource(const void *resource)
 {
     if (!resource) return;
     pthread_mutex_lock(&g_renderer_lock);
-    if (g_renderer.pending_resource == resource) {
-        g_renderer.pending_resource = NULL;
-        g_renderer.pending_pixels = NULL;
-        g_renderer.pending_serial = 0;
-        g_renderer.pending_bytes = 0;
-        g_renderer.pending_dirty = 0;
+    if (!wait_for_pending_submission()) {
+        pthread_mutex_unlock(&g_renderer_lock);
+        return;
+    }
+    for (uint32_t i = 0; i < COMPOSITOR_MIRROR_COUNT; ++i) {
+        CompositorMirror *mirror = &g_renderer.output_mirrors[i];
+        if (mirror->resource != resource) continue;
+        writeback_output_mirror(mirror);
+        mirror->resource = NULL;
+        mirror->cpu_pixels = NULL;
+        mirror->serial = 0;
+        mirror->bytes = 0;
+        mirror->last_use = 0;
+        mirror->gpu_dirty = 0;
+        mirror->content_valid = 0;
     }
     pthread_mutex_unlock(&g_renderer_lock);
 }

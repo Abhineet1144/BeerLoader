@@ -8,6 +8,8 @@ typedef struct {
     int y;
     int width;
     int height;
+    int client_width;
+    int client_height;
     int visible;
 } XwaylandWindowState;
 
@@ -19,15 +21,26 @@ typedef enum {
     XWAYLAND_EVENT_FOCUS_IN,
     XWAYLAND_EVENT_FOCUS_OUT,
     XWAYLAND_EVENT_CONFIGURE,
-    XWAYLAND_EVENT_EXPOSE
+    XWAYLAND_EVENT_EXPOSE,
+    XWAYLAND_EVENT_KEY_DOWN,
+    XWAYLAND_EVENT_KEY_UP,
+    XWAYLAND_EVENT_BUTTON_DOWN,
+    XWAYLAND_EVENT_BUTTON_UP,
+    XWAYLAND_EVENT_POINTER_MOTION
 } XwaylandEventType;
 
 typedef struct {
     XwaylandEventType type;
     int x;
     int y;
+    int root_x;
+    int root_y;
     int width;
     int height;
+    unsigned int keycode;
+    unsigned long keysym;
+    unsigned int button;
+    unsigned int state;
 } XwaylandEvent;
 
 typedef enum {

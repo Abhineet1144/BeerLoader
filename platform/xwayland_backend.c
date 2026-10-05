@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "xwayland_backend.h"
-#include "vulkan_presenter.h"
+#include "../renderer/vulkan/vulkan_presenter.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -50,6 +50,44 @@ typedef struct {
 } XConfigureEvent;
 
 typedef struct {
+    int type;
+    unsigned long serial;
+    Bool send_event;
+    Display *display;
+    Window window;
+    Window root;
+    Window subwindow;
+    unsigned long time;
+    int x;
+    int y;
+    int x_root;
+    int y_root;
+    unsigned int state;
+    unsigned int keycode;
+    Bool same_screen;
+} XKeyEvent;
+
+typedef struct {
+    int type;
+    unsigned long serial;
+    Bool send_event;
+    Display *display;
+    Window window;
+    Window root;
+    Window subwindow;
+    unsigned long time;
+    int x;
+    int y;
+    int x_root;
+    int y_root;
+    unsigned int state;
+    unsigned int button;
+    Bool same_screen;
+} XButtonEvent;
+
+typedef XKeyEvent XMotionEvent;
+
+typedef struct {
     void *library;
     Display *display;
     Window window;
@@ -58,6 +96,10 @@ typedef struct {
     int y;
     int width;
     int height;
+    /* Guest-visible client dimensions remain the swap-chain dimensions even
+     * when XWayland scales the native fullscreen surface. */
+    int client_width;
+    int client_height;
     int visible;
     int initialized;
     XImage *present_image;
@@ -90,6 +132,7 @@ typedef struct {
     int (*SelectInput)(Display *, Window, long);
     int (*Pending)(Display *);
     int (*NextEvent)(Display *, XEvent *);
+    unsigned long (*LookupKeysym)(XKeyEvent *, int);
     Visual *(*DefaultVisual)(Display *, int);
     int (*DefaultDepth)(Display *, int);
     GC (*DefaultGC)(Display *, int);
@@ -165,6 +208,7 @@ static int initialize_locked(void)
     X11_LOAD(SelectInput, "XSelectInput");
     X11_LOAD(Pending, "XPending");
     X11_LOAD(NextEvent, "XNextEvent");
+    X11_LOAD(LookupKeysym, "XLookupKeysym");
     X11_LOAD(DefaultVisual, "XDefaultVisual");
     X11_LOAD(DefaultDepth, "XDefaultDepth");
     X11_LOAD(DefaultGC, "XDefaultGC");
@@ -224,6 +268,8 @@ int xwayland_window_create(int x, int y, int width, int height,
     g_x11.y = y;
     g_x11.width = width;
     g_x11.height = height;
+    g_x11.client_width = width;
+    g_x11.client_height = height;
     g_x11.StoreName(g_x11.display, g_x11.window,
                     (title && *title) ? title : "Beer Windows Application");
     g_x11.wm_delete = g_x11.InternAtom(g_x11.display, "WM_DELETE_WINDOW", 0);
@@ -234,7 +280,12 @@ int xwayland_window_create(int x, int y, int width, int height,
     g_x11.SelectInput(g_x11.display, g_x11.window,
                       (1L << 17) | /* StructureNotifyMask */
                       (1L << 21) | /* FocusChangeMask */
-                      (1L << 15)); /* ExposureMask */
+                      (1L << 15) | /* ExposureMask */
+                      (1L << 0)  | /* KeyPressMask */
+                      (1L << 1)  | /* KeyReleaseMask */
+                      (1L << 2)  | /* ButtonPressMask */
+                      (1L << 3)  | /* ButtonReleaseMask */
+                      (1L << 6));  /* PointerMotionMask */
     if (initially_visible) {
         g_x11.MapRaised(g_x11.display, g_x11.window);
         g_x11.visible = 1;
@@ -314,6 +365,10 @@ int xwayland_window_move_resize(int x, int y, int width, int height,
     g_x11.MoveResizeWindow(g_x11.display, g_x11.window, x, y,
                            (unsigned)width, (unsigned)height);
     g_x11.x = x; g_x11.y = y; g_x11.width = width; g_x11.height = height;
+    if (resize) {
+        g_x11.client_width = width;
+        g_x11.client_height = height;
+    }
     g_x11.Flush(g_x11.display);
     pthread_mutex_unlock(&g_x11.lock);
     return 1;
@@ -339,6 +394,10 @@ int xwayland_window_get_state(XwaylandWindowState *state)
     if (ok) {
         state->x = g_x11.x; state->y = g_x11.y;
         state->width = g_x11.width; state->height = g_x11.height;
+        state->client_width = g_x11.client_width > 0
+            ? g_x11.client_width : g_x11.width;
+        state->client_height = g_x11.client_height > 0
+            ? g_x11.client_height : g_x11.height;
         state->visible = g_x11.visible;
     }
     pthread_mutex_unlock(&g_x11.lock);
@@ -358,6 +417,35 @@ int xwayland_window_poll_event(XwaylandEvent *out)
     memset(&event, 0, sizeof(event));
     g_x11.NextEvent(g_x11.display, &event);
     switch (event.type) {
+        case 2:
+        case 3: {
+            XKeyEvent *key = (XKeyEvent *)&event;
+            out->type = event.type == 2 ? XWAYLAND_EVENT_KEY_DOWN : XWAYLAND_EVENT_KEY_UP;
+            out->x = key->x; out->y = key->y;
+            out->root_x = key->x_root; out->root_y = key->y_root;
+            out->keycode = key->keycode;
+            out->keysym = g_x11.LookupKeysym(key, 0);
+            out->state = key->state;
+            break;
+        }
+        case 4:
+        case 5: {
+            XButtonEvent *button = (XButtonEvent *)&event;
+            out->type = event.type == 4 ? XWAYLAND_EVENT_BUTTON_DOWN : XWAYLAND_EVENT_BUTTON_UP;
+            out->x = button->x; out->y = button->y;
+            out->root_x = button->x_root; out->root_y = button->y_root;
+            out->button = button->button;
+            out->state = button->state;
+            break;
+        }
+        case 6: {
+            XMotionEvent *motion = (XMotionEvent *)&event;
+            out->type = XWAYLAND_EVENT_POINTER_MOTION;
+            out->x = motion->x; out->y = motion->y;
+            out->root_x = motion->x_root; out->root_y = motion->y_root;
+            out->state = motion->state;
+            break;
+        }
         case 9: out->type = XWAYLAND_EVENT_FOCUS_IN; break;
         case 10: out->type = XWAYLAND_EVENT_FOCUS_OUT; break;
         case 12:
@@ -409,6 +497,11 @@ static int present_rgba8_internal(const void *resource, uint64_t serial,
 
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window;
+    /* The native fullscreen surface can differ from the guest swap-chain
+     * dimensions. Keep USER32 client coordinates in the guest render space so
+     * mouse hit testing matches the pixels that are scaled for presentation. */
+    g_x11.client_width = width;
+    g_x11.client_height = height;
     int output_width = g_x11.width > 0 ? g_x11.width : width;
     int output_height = g_x11.height > 0 ? g_x11.height : height;
     if (!ok || output_width <= 0 || output_height <= 0 ||
