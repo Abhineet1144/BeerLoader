@@ -222,6 +222,10 @@ typedef struct IDXGISwapChain_VTable {
 
 ID3D11Device* d3d11_device_create(void);
 ID3D11DeviceContext* d3d11_device_context_create(void);
+/* Returns a process-owned immediate context associated with device. The caller
+ * owns the returned reference and must Release it. */
+ID3D11DeviceContext* d3d11_device_get_immediate_context_owned(
+    ID3D11Device *device);
 IDXGISwapChain* dxgi_swapchain_create(void);
 HRESULT dxgi_swapchain_configure(IDXGISwapChain *swapchain,
                                  ID3D11Device *device,

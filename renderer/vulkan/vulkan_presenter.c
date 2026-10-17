@@ -368,6 +368,43 @@ static int recreate_swapchain(int requested_width, int requested_height,
         composite = (VkCompositeAlphaFlagBitsKHR)
             (capabilities.supportedCompositeAlpha & -capabilities.supportedCompositeAlpha);
 
+    /* FIFO makes every present wait for a compositor frame callback; under
+     * XWayland an unfocused/occluded window receives those about once per
+     * second, which capped the whole game at 1 FPS. The guest paces itself, so
+     * prefer MAILBOX (no tearing, never blocks), then IMMEDIATE. FIFO stays
+     * available through BEER_PRESENT_MODE=fifo. */
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    {
+        const char *requested = getenv("BEER_PRESENT_MODE");
+        VkPresentModeKHR wanted[3] = {
+            VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR,
+            VK_PRESENT_MODE_FIFO_KHR
+        };
+        if (requested && !strcmp(requested, "fifo"))
+            wanted[0] = VK_PRESENT_MODE_FIFO_KHR;
+        else if (requested && !strcmp(requested, "immediate")) {
+            wanted[0] = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            wanted[1] = VK_PRESENT_MODE_MAILBOX_KHR;
+        }
+        uint32_t mode_count = 0;
+        VkPresentModeKHR modes[16];
+        if (g_vk.GetPhysicalDeviceSurfacePresentModesKHR &&
+            g_vk.GetPhysicalDeviceSurfacePresentModesKHR(
+                g_vk.physical_device, g_vk.surface, &mode_count, NULL) == VK_SUCCESS &&
+            mode_count) {
+            if (mode_count > 16) mode_count = 16;
+            if (g_vk.GetPhysicalDeviceSurfacePresentModesKHR(
+                    g_vk.physical_device, g_vk.surface, &mode_count, modes) == VK_SUCCESS) {
+                for (int w = 0; w < 3; ++w) {
+                    int found = 0;
+                    for (uint32_t m = 0; m < mode_count; ++m)
+                        found |= modes[m] == wanted[w];
+                    if (found) { present_mode = wanted[w]; break; }
+                }
+            }
+        }
+        fprintf(stderr, "[VULKAN] present mode=%d\n", (int)present_mode);
+    }
     VkSwapchainCreateInfoKHR info = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = g_vk.surface,
@@ -408,9 +445,11 @@ static int recreate_swapchain(int requested_width, int requested_height,
     if (!(swapchain_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT))
         return 0;
 
-    /* Keep the CPU renderer's native RGBA8 frame at guest resolution. Vulkan
-     * performs channel conversion and scaling while blitting this image into
-     * the XWayland swapchain, removing the previous CPU full-window loop. */
+    /* Keep the upload image at the guest source resolution. The buffer copy
+     * below consumes tightly packed source rows, then VkCmdBlitImage scales
+     * that image to the native swapchain extent. Enlarging this image to the
+     * output extent makes Vulkan interpret source rows with the output width
+     * and read staging bytes that were never populated. */
     g_vk.upload_extent = (VkExtent2D) {
         (uint32_t)source_width, (uint32_t)source_height
     };
@@ -502,6 +541,7 @@ static int present_rgba8_staging(void *display, unsigned long window,
     if (!pixels || width <= 0 || height <= 0 || row_pitch < width * 4 ||
         output_width <= 0 || output_height <= 0)
         return 0;
+    if (beer_vulkan_device_lost()) return 0;
     if (!initialize(display, window)) return 0;
     if (!g_vk.swapchain || g_vk.extent.width != (uint32_t)output_width ||
         g_vk.extent.height != (uint32_t)output_height) {
@@ -512,13 +552,22 @@ static int present_rgba8_staging(void *display, unsigned long window,
      * single staging buffer/command buffer from the preceding submission,
      * rather than blocking again immediately after QueuePresentKHR. This lets
      * guest frame construction overlap the compositor's presentation work. */
-    if (g_vk.WaitForFences(g_vk.device, 1, &g_vk.submit_fence, VK_TRUE,
-                           UINT64_MAX) != VK_SUCCESS)
+    VkResult fence_result = g_vk.WaitForFences(
+        g_vk.device, 1, &g_vk.submit_fence, VK_TRUE, UINT64_MAX);
+    if (fence_result != VK_SUCCESS) {
+        beer_vulkan_record_result(fence_result, "presenter fence wait");
         return 0;
+    }
 
     size_t bytes = (size_t)width * (size_t)height * 4u;
     uint64_t shared_handle = 0;
-    int direct_gpu_mirror = row_pitch == width * 4 && resource &&
+    /* A compatibility resource can temporarily exist in more than one mirror
+     * cache. The generic D3D12 path synchronously publishes its authoritative
+     * CPU readback, but an older indexed clear can coincidentally advertise the
+     * same resource/serial. Allow correctness profiles to bypass that ambiguous
+     * zero-copy lookup and upload the supplied authoritative pixels instead. */
+    int direct_gpu_mirror = !getenv("BEER_PRESENTER_CPU_STAGING") &&
+        row_pitch == width * 4 && resource &&
         (vulkan_renderer_get_target_buffer(resource, serial, bytes,
                                            &shared_handle) ||
          vulkan_indexed_renderer_get_target_buffer(resource, serial, bytes,
@@ -545,7 +594,10 @@ static int present_rgba8_staging(void *display, unsigned long window,
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
         return recreate_swapchain(output_width, output_height, width, height);
     }
-    if (result != VK_SUCCESS) return 0;
+    if (result != VK_SUCCESS) {
+        beer_vulkan_record_result(result, "swapchain image acquisition");
+        return 0;
+    }
 
     g_vk.ResetCommandBuffer(g_vk.command_buffer, 0);
     VkCommandBufferBeginInfo begin = {
@@ -658,8 +710,11 @@ static int present_rgba8_staging(void *display, unsigned long window,
     if (g_vk.ResetFences(g_vk.device, 1, &g_vk.submit_fence) != VK_SUCCESS)
         return 0;
     beer_vulkan_queue_lock();
-    if (g_vk.QueueSubmit(g_vk.queue, 1, &submit, g_vk.submit_fence) != VK_SUCCESS) {
-        beer_vulkan_queue_unlock();
+    VkResult submit_result = g_vk.QueueSubmit(g_vk.queue, 1, &submit,
+                                               g_vk.submit_fence);
+    beer_vulkan_queue_unlock();
+    if (submit_result != VK_SUCCESS) {
+        beer_vulkan_record_result(submit_result, "presenter queue submission");
         return 0;
     }
     VkPresentInfoKHR present = {
@@ -670,8 +725,17 @@ static int present_rgba8_staging(void *display, unsigned long window,
         .pSwapchains = &g_vk.swapchain,
         .pImageIndices = &image_index
     };
+    /* Queue submissions and presentation each require external host
+     * synchronization, but they do not need one uninterrupted critical
+     * section. QueuePresentKHR may block for the compositor/vblank; retaining
+     * the process-wide queue mutex across it starved D3D compute and graphics
+     * submissions for tens of milliseconds. The render-finished semaphore
+     * preserves the submit->present dependency even when another queue call is
+     * interleaved between these two API calls. */
+    beer_vulkan_queue_lock();
     result = g_vk.QueuePresentKHR(g_vk.queue, &present);
     beer_vulkan_queue_unlock();
+    beer_vulkan_record_result(result, "queue presentation");
     g_vk.upload_initialized = 1;
     g_vk.image_initialized[image_index] = 1;
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {

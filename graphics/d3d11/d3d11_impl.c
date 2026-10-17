@@ -11,6 +11,8 @@
 
 #include "../renderer/vulkan/vulkan_renderer.h"
 #include "../renderer/vulkan/vulkan_indexed_renderer.h"
+#include "d3d12_shader_translator.h"
+#include "vulkan_graphics.h"
 
 static BeerD3D11Renderer g_renderer = BEER_D3D11_RENDERER_VULKAN;
 static _Atomic(uint32_t) g_vulkan_migration_draws;
@@ -142,6 +144,8 @@ static void *g_dxgi_device_vtable[12];
 
 static HRESULT __attribute__((ms_abi)) dxgi_device_query_interface(
     BeerDxgiDevice *this, REFIID riid, LPVOID *ppvObj);
+static uint32_t __attribute__((ms_abi)) device_addref(ID3D11Device *this);
+static uint32_t __attribute__((ms_abi)) device_release(ID3D11Device *this);
 
 static uint32_t __attribute__((ms_abi)) dxgi_device_addref(BeerDxgiDevice *this)
 {
@@ -1638,6 +1642,12 @@ static uint32_t __attribute__((ms_abi)) context_addref(ID3D11DeviceContext* this
 }
 
 static uint32_t __attribute__((ms_abi)) context_release(ID3D11DeviceContext* this) {
+    ComObjectHeader *header = com_get_header(this);
+    if (!header) return 0;
+    /* The process-global pointer is only a non-owning cache. Never leave it
+     * pointing at an object whose final reference is about to be released. */
+    if (atomic_load(&header->refcount) == 1 && g_immediate_context == this)
+        g_immediate_context = NULL;
     return com_release(this);
 }
 
@@ -2506,11 +2516,307 @@ static void pack_rgba(BeerD3D11Resource *resource, size_t pixel,
     }
 }
 
-/* Execute only the two verified fullscreen shaders used by Sekiro's initial
- * presentation path. Their DXBC is retained and identified by content hash;
- * all structural checks below must pass before pixels are modified. This is a
- * real implementation of the observed shader behavior, not a synthetic title
- * or a generic-success fallback. */
+/* Forward declarations for helpers defined later in this file. */
+static uint32_t d3d11_to_vk_address_mode(uint32_t d3d);
+static int d3d11_dxgi_to_vulkan_image(uint32_t dxgi, uint32_t *vk_format,
+                                       uint32_t *bytes_per_pixel);
+
+/* Auto-translated path for non-indexed (Draw) calls.  Mirrors the approach of
+ * try_auto_translate_indexed_draw but for topology-4 / topology-5 fullscreen
+ * and Bink passes.  Returns 1 on success, 0 on any rejection. */
+static int try_auto_translate_fullscreen_draw(const BeerD3D11PipelineState *state,
+                                              uint32_t vertex_count,
+                                              uint32_t start_vertex)
+{
+    if (!state || !state->vertex_shader || !state->pixel_shader ||
+        !state->vertex_buffers[0] || !state->render_targets[0] ||
+        state->viewport_count == 0)
+        return 0;
+
+    BeerD3D11Shader *vs = state->vertex_shader;
+    BeerD3D11Shader *ps = state->pixel_shader;
+    if (!com_get_header(vs) || !com_get_header(ps)) return 0;
+
+    uint64_t vs_hash = ((uint64_t)fnv1a_bytes(vs->bytecode, vs->bytecode_size) << 32) |
+                        fnv1a_bytes(vs->bytecode + vs->bytecode_size / 2,
+                                    vs->bytecode_size - vs->bytecode_size / 2);
+    uint64_t ps_hash = ((uint64_t)fnv1a_bytes(ps->bytecode, ps->bytecode_size) << 32) |
+                        fnv1a_bytes(ps->bytecode + ps->bytecode_size / 2,
+                                    ps->bytecode_size - ps->bytecode_size / 2);
+
+    const BeerD3D12TranslatedShader *tvs =
+        beer_d3d12_translate_shader(vs->bytecode, vs->bytecode_size, vs_hash);
+    const BeerD3D12TranslatedShader *tps =
+        beer_d3d12_translate_shader(ps->bytecode, ps->bytecode_size, ps_hash);
+    if (!tvs || !tps) {
+        static _Atomic(uint32_t) fail_count;
+        uint32_t fn = atomic_fetch_add(&fail_count, 1);
+        if (fn < 16)
+            fprintf(stderr,
+                    "[D3D11 FS AUTO TRANSLATE FAIL] #%u VS=%08x PS=%08x: %s\n",
+                    fn + 1, (uint32_t)vs_hash, (uint32_t)ps_hash,
+                    beer_d3d12_shader_translation_error());
+        return 0;
+    }
+
+    /* Log first translation for each unique pair. */
+    {
+        static uint64_t logged_pairs[32];
+        static uint32_t logged_count;
+        static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+        uint64_t key = vs_hash ^ (ps_hash * 0x9e3779b97f4a7c15ULL);
+        pthread_mutex_lock(&log_lock);
+        int already = 0;
+        for (uint32_t i = 0; i < logged_count && i < 32; ++i)
+            if (logged_pairs[i] == key) { already = 1; break; }
+        if (!already && logged_count < 32) logged_pairs[logged_count++] = key;
+        pthread_mutex_unlock(&log_lock);
+        if (!already)
+            fprintf(stderr,
+                    "[D3D11 FS AUTO TRANSLATE OK] VS=%08x PS=%08x "
+                    "vs-desc=%u ps-desc=%u vs-spirv=%zu ps-spirv=%zu\n",
+                    (uint32_t)vs_hash, (uint32_t)ps_hash,
+                    tvs->descriptor_count, tps->descriptor_count,
+                    tvs->spirv_size, tps->spirv_size);
+    }
+
+    /* ---- Descriptor bindings ---- */
+    BeerVulkanGraphicsBinding bindings[BEER_VULKAN_GRAPHICS_MAX_BINDINGS];
+    memset(bindings, 0, sizeof(bindings));
+    uint32_t binding_count = 0;
+
+    for (uint32_t stage = 0; stage < 2; ++stage) {
+        const BeerD3D12TranslatedShader *sh = stage ? tps : tvs;
+        uint32_t sf = stage ? BEER_VULKAN_GRAPHICS_STAGE_FRAGMENT
+                            : BEER_VULKAN_GRAPHICS_STAGE_VERTEX;
+        for (uint32_t d = 0; d < sh->descriptor_count; ++d) {
+            const BeerD3D12ShaderDescriptor *desc = &sh->descriptors[d];
+            if (binding_count >= BEER_VULKAN_GRAPHICS_MAX_BINDINGS) return 0;
+            BeerVulkanGraphicsBinding *b = &bindings[binding_count++];
+            b->binding     = desc->binding;
+            b->stage_flags = sf;
+            uint32_t slot  = desc->register_index;
+            if (desc->type == BEER_D3D12_SHADER_DESCRIPTOR_CBV) {
+                BeerD3D11Resource *cbuf = validated_resource(
+                    stage ? state->ps_constant_buffers[slot < 8 ? slot : 0]
+                          : state->vs_constant_buffers[slot < 8 ? slot : 0]);
+                if (!cbuf || !cbuf->pixels) return 0;
+                b->kind = BEER_VULKAN_GRAPHICS_BINDING_UNIFORM_BUFFER;
+                b->data = cbuf->pixels;
+                b->size = cbuf->pixel_size;
+            } else if (desc->type == BEER_D3D12_SHADER_DESCRIPTOR_SRV && stage == 1) {
+                BeerD3D11View *view = slot < BEER_MAX_SHADER_RESOURCES
+                    ? state->ps_shader_resources[slot] : NULL;
+                BeerD3D11Resource *res = view && com_get_header(view)
+                    ? validated_resource(view->resource) : NULL;
+                if (!res || !res->pixels || res->desc_size < 20) return 0;
+                const uint32_t *rdesc = (const uint32_t *)res->desc;
+                uint32_t vk_fmt = 0, bpp = 0;
+                if (!d3d11_dxgi_to_vulkan_image(rdesc[4], &vk_fmt, &bpp)) return 0;
+                b->kind    = BEER_VULKAN_GRAPHICS_BINDING_SAMPLED_IMAGE;
+                b->resource = res;
+                b->serial   = (const uint64_t *)&res->content_serial;
+                b->data     = res->pixels;
+                b->size     = res->pixel_size;
+                b->format   = vk_fmt;
+                b->width    = rdesc[0];
+                b->height   = rdesc[1];
+                if (bpp == 0) {
+                    uint32_t bpb = (vk_fmt == 131 || vk_fmt == 132 ||
+                                    vk_fmt == 139 || vk_fmt == 140) ? 8u : 16u;
+                    b->block_width     = 4;
+                    b->block_height    = 4;
+                    b->bytes_per_block = bpb;
+                    b->bytes_per_pixel = 0;
+                    uint32_t blocks_wide = (rdesc[0] + 3u) / 4u;
+                    b->row_pitch = res->row_pitch ? res->row_pitch : blocks_wide * bpb;
+                } else {
+                    b->bytes_per_pixel = bpp;
+                    b->row_pitch = res->row_pitch ? res->row_pitch : rdesc[0] * bpp;
+                }
+            } else if (desc->type == BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER && stage == 1) {
+                BeerD3D11SamplerState *samp = slot < 8
+                    ? state->ps_samplers[slot] : NULL;
+                const uint32_t *sdesc = samp && com_get_header(samp)
+                    ? (const uint32_t *)samp->desc : NULL;
+                b->kind       = BEER_VULKAN_GRAPHICS_BINDING_SAMPLER;
+                b->min_filter = sdesc && sdesc[0] == 0x15 ? 1u : 0u;
+                b->mag_filter = b->min_filter;
+                b->address_u  = sdesc ? d3d11_to_vk_address_mode(sdesc[1]) : 2u;
+                b->address_v  = sdesc ? d3d11_to_vk_address_mode(sdesc[2]) : 2u;
+                b->address_w  = 2u;
+            } else {
+                return 0;
+            }
+        }
+    }
+
+    /* ---- Vertex binding (non-indexed, no index buffer) ---- */
+    BeerD3D11Resource *vbuf = validated_resource(state->vertex_buffers[0]);
+    if (!vbuf || !vbuf->pixels) return 0;
+
+    BeerVulkanGraphicsVertexBinding  vb[1];
+    BeerVulkanGraphicsVertexAttribute va[BEER_VULKAN_GRAPHICS_MAX_VERTEX_ATTRIBUTES];
+    memset(vb, 0, sizeof(vb));
+    memset(va, 0, sizeof(va));
+
+    vb[0].data   = vbuf->pixels + state->vertex_offsets[0];
+    vb[0].size   = vbuf->pixel_size > state->vertex_offsets[0]
+                   ? vbuf->pixel_size - state->vertex_offsets[0] : 0;
+    vb[0].stride = state->vertex_strides[0];
+    if (!vb[0].size || !vb[0].stride) return 0;
+
+    BeerD3D11InputLayout *layout = state->input_layout;
+    uint32_t va_count = 0;
+    if (layout && com_get_header(layout)) {
+        uint32_t slot_offsets[1] = {0};
+        for (uint32_t e = 0; e < layout->element_count &&
+             va_count < BEER_VULKAN_GRAPHICS_MAX_VERTEX_ATTRIBUTES; ++e) {
+            const BeerD3D11InputElement *elem = &layout->elements[e];
+            if (elem->input_slot != 0) return 0; /* only slot 0 for fullscreen */
+            uint32_t vk_fmt = 0, bpp = 0;
+            if (!d3d11_dxgi_to_vulkan_image(elem->format, &vk_fmt, &bpp)) return 0;
+            uint32_t byte_offset = elem->aligned_byte_offset;
+            if (byte_offset == 0xffffffffu)
+                byte_offset = slot_offsets[0];
+            else
+                slot_offsets[0] = byte_offset;
+            slot_offsets[0] = byte_offset + bpp;
+            va[va_count].location = va_count;
+            va[va_count].binding  = 0;
+            va[va_count].format   = vk_fmt;
+            va[va_count].offset   = byte_offset;
+            ++va_count;
+        }
+    }
+    /* If no input layout is bound (e.g. pure procedural fullscreen quad),
+     * Vulkan allows zero vertex attributes — SPIR-V still reads gl_VertexIndex. */
+
+    /* ---- Render target ---- */
+    BeerD3D11View *rtv = state->render_targets[0];
+    BeerD3D11Resource *rt = rtv && com_get_header(rtv)
+        ? validated_resource(rtv->resource) : NULL;
+    if (!rt || !rt->pixels || rt->desc_size < 20) return 0;
+    const uint32_t *rdesc = (const uint32_t *)rt->desc;
+    uint32_t rt_vk_fmt = 0, rt_bpp = 0;
+    if (!d3d11_dxgi_to_vulkan_image(rdesc[4], &rt_vk_fmt, &rt_bpp)) return 0;
+
+    BeerVulkanGraphicsTarget target_out;
+    memset(&target_out, 0, sizeof(target_out));
+    target_out.data            = rt->pixels;
+    target_out.size            = rt->pixel_size;
+    target_out.serial          = (uint64_t *)&rt->content_serial;
+    target_out.format          = rt_vk_fmt;
+    target_out.bytes_per_pixel = rt_bpp;
+    target_out.width           = rdesc[0];
+    target_out.height          = rdesc[1];
+    target_out.row_pitch       = rdesc[0] * rt_bpp;
+
+    /* ---- Fixed-function state ---- */
+    BeerVulkanGraphicsState gs;
+    memset(&gs, 0, sizeof(gs));
+    gs.flip_y = 0;
+    BeerD3D11State *blend = (BeerD3D11State *)state->blend_state;
+    if (blend && com_get_header(blend) && blend->kind == BEER_STATE_BLEND &&
+        blend->desc_size >= 40) {
+        const uint8_t *rt0 = blend->desc + 8;
+        uint32_t be; memcpy(&be, rt0, 4);
+        if (be) {
+            static const int8_t d3d_to_vk[] = {
+                -1,0,1,2,3,6,7,8,9,4,5,14,-1,-1,10,11
+            };
+            uint32_t sb,db,ba,sba,dba,bba;
+            memcpy(&sb,  rt0+4,  4); memcpy(&db,  rt0+8,  4);
+            memcpy(&ba,  rt0+12, 4); memcpy(&sba, rt0+16, 4);
+            memcpy(&dba, rt0+20, 4); memcpy(&bba, rt0+24, 4);
+            if (sb<16 && db<16 && sba<16 && dba<16 &&
+                d3d_to_vk[sb]>=0 && d3d_to_vk[db]>=0 &&
+                d3d_to_vk[sba]>=0 && d3d_to_vk[dba]>=0) {
+                gs.blend_enable     = 1;
+                gs.src_color_factor = (uint32_t)d3d_to_vk[sb];
+                gs.dst_color_factor = (uint32_t)d3d_to_vk[db];
+                gs.color_op         = (ba>=1&&ba<=5) ? ba-1u : 0u;
+                gs.src_alpha_factor = (uint32_t)d3d_to_vk[sba];
+                gs.dst_alpha_factor = (uint32_t)d3d_to_vk[dba];
+                gs.alpha_op         = (bba>=1&&bba<=5) ? bba-1u : 0u;
+            } else return 0;
+        }
+        gs.write_mask = rt0[28];
+    } else {
+        gs.write_mask = 0x0f;
+    }
+    memcpy(gs.blend_constants, state->blend_factor, sizeof(gs.blend_constants));
+    gs.cull_mode = 0;
+
+    /* ---- Draw info ---- */
+    BeerVulkanGraphicsDrawInfo di;
+    memset(&di, 0, sizeof(di));
+    di.vertex_bindings[0]     = vb[0];
+    di.vertex_binding_count   = 1;
+    for (uint32_t i = 0; i < va_count; ++i) di.vertex_attributes[i] = va[i];
+    di.vertex_attribute_count = va_count;
+    di.indexed                = 0;
+    /* D3D11 topology 4 = TRIANGLELIST, 5 = TRIANGLESTRIP */
+    di.topology    = (state->topology == 5) ? 1u  /* TRIANGLE_STRIP */
+                                             : 0u; /* TRIANGLE_LIST  */
+    di.element_count  = vertex_count;
+    di.instance_count = 1;
+    di.base_vertex    = (int32_t)start_vertex;
+
+    float viewport[6] = {0};
+    memcpy(viewport, state->viewports[0], sizeof(float)*4);
+    viewport[4] = 0.0f; viewport[5] = 1.0f;
+
+    int32_t scissor[4] = {
+        0, 0, (int32_t)target_out.width, (int32_t)target_out.height
+    };
+    BeerD3D11State *rast = (BeerD3D11State *)state->rasterizer_state;
+    if (state->scissor_count && rast && com_get_header(rast) &&
+        rast->kind == BEER_STATE_RASTERIZER && rast->desc_size >= 32 &&
+        *(const int32_t *)(rast->desc + 28)) {
+        scissor[0] = state->scissor_rects[0][0];
+        scissor[1] = state->scissor_rects[0][1];
+        scissor[2] = state->scissor_rects[0][2];
+        scissor[3] = state->scissor_rects[0][3];
+    }
+
+    const char *reason = NULL;
+    int ok = beer_vulkan_graphics_draw_state(
+        vs, (const uint32_t *)tvs->spirv, tvs->spirv_size,
+        ps, (const uint32_t *)tps->spirv, tps->spirv_size,
+        bindings, binding_count, &di, &gs,
+        &target_out, 1, NULL, viewport, scissor, &reason);
+
+    if (ok) {
+        resource_mark_written(rt);
+        static _Atomic(uint32_t) auto_count;
+        uint32_t n = atomic_fetch_add(&auto_count, 1) + 1;
+        if (n <= 16 || (n % 64) == 0)
+            fprintf(stderr,
+                    "[D3D11 FS AUTO] draw #%u VS=%08x PS=%08x "
+                    "verts=%u target=%ux%u bindings=%u\n",
+                    n, (uint32_t)vs_hash, (uint32_t)ps_hash,
+                    vertex_count, target_out.width, target_out.height,
+                    binding_count);
+    } else {
+        static _Atomic(uint32_t) reject_count;
+        uint32_t rn = atomic_fetch_add(&reject_count, 1);
+        if (rn < 16)
+            fprintf(stderr,
+                    "[D3D11 FS AUTO REJECT] VS=%08x PS=%08x "
+                    "verts=%u bindings=%u target=%ux%u reason=%s\n",
+                    (uint32_t)vs_hash, (uint32_t)ps_hash,
+                    vertex_count, binding_count,
+                    target_out.width, target_out.height,
+                    reason ? reason : "unknown");
+    }
+    return ok;
+}
+
+/* Execute verified fullscreen shaders used by Sekiro's initial presentation
+ * path (Bink RGBA, Bink filtered composite, uniform-color overlay, and the
+ * fullscreen copy pair). Auto-translation runs first; manual paths below are
+ * retained as fallback for formats not yet supported by the generic path. */
 static int execute_initial_fullscreen_draw(const BeerD3D11PipelineState *state,
                                            uint32_t vertex_count,
                                            uint32_t start_vertex)
@@ -2518,6 +2824,30 @@ static int execute_initial_fullscreen_draw(const BeerD3D11PipelineState *state,
     if (!state || !state->vertex_shader || !state->pixel_shader ||
         !state->vertex_buffers[0] || !state->render_targets[0])
         return 0;
+
+    /* Auto-translate first — catches all newly observed pairs without needing
+     * a manual hash entry.  Falls through to the manual paths on any rejection
+     * (e.g. unsupported format, missing resource, VS SRV).
+     *
+     * Exception: the legacy compositor pair (d2d4e0b9 / bf96cb08 and
+     * d2d4e0b9 / da42b236) must always use the manual path below because that
+     * path calls vulkan_renderer_composite_rgba8() which writes directly to the
+     * swap-chain back buffer via the Vulkan compositor.  The auto path would
+     * write to whatever intermediate RT is currently bound and the back buffer
+     * would stay black. */
+    {
+        BeerD3D11Shader *_vs = state->vertex_shader;
+        BeerD3D11Shader *_ps = state->pixel_shader;
+        uint32_t _vh = (_vs && com_get_header(_vs))
+            ? fnv1a_bytes(_vs->bytecode, _vs->bytecode_size) : 0;
+        uint32_t _ph = (_ps && com_get_header(_ps))
+            ? fnv1a_bytes(_ps->bytecode, _ps->bytecode_size) : 0;
+        int _is_compositor = (_vh == 0xd2d4e0b9) &&
+            (_ph == 0xbf96cb08 || _ph == 0xda42b236);
+        if (!_is_compositor &&
+            try_auto_translate_fullscreen_draw(state, vertex_count, start_vertex))
+            return 1;
+    }
 
     BeerD3D11Shader *vertex_shader = state->vertex_shader;
     BeerD3D11Shader *pixel_shader = state->pixel_shader;
@@ -2897,12 +3227,16 @@ static int execute_initial_fullscreen_draw(const BeerD3D11PipelineState *state,
             return 0;
     } else {
         BeerD3D11Resource *condition = validated_resource(state->ps_constant_buffers[1]);
-        uint32_t condition_bits = UINT32_MAX;
-        if (condition && condition->pixels && condition->pixel_size >= 4)
+        /* cb1.x == 0 (or absent) selects the pass-through/original-texture
+         * path, which is what splash draws use.  A non-zero value activates
+         * the gamma branch that is not yet supported; reject only that case.
+         * The previous guard defaulted to UINT32_MAX when cb1 was absent and
+         * therefore rejected all splash draws, making the text invisible. */
+        if (condition && condition->pixels && condition->pixel_size >= 4) {
+            uint32_t condition_bits = 0;
             memcpy(&condition_bits, condition->pixels, sizeof(condition_bits));
-        /* cb1.x == 0 selects the original texture sample; the gamma branch is
-         * deliberately left unsupported until it is observed active. */
-        if (condition_bits != 0) return 0;
+            if (condition_bits != 0) return 0;
+        }
     }
 
     /* The Vulkan compositor consumes pending indexed/compositor mirrors
@@ -3542,6 +3876,421 @@ static int software_blend_pixel(BeerD3D11Resource *target, size_t pixel,
     return changed;
 }
 
+/* ---------------------------------------------------------------------------
+ * Auto-translated indexed draw path (Sekiro UI migration).
+ *
+ * Translates the bound VS+PS DXBC through the shared vkd3d-shader translator,
+ * maps D3D11 pipeline state to Vulkan descriptor / vertex / target structs,
+ * and dispatches through beer_vulkan_graphics_draw_state(). Returns 1 on
+ * success and 0 on any rejection without aborting. Per-hash manual paths in
+ * execute_initial_indexed_draw remain as fallback until all pairs migrate.
+ * ---------------------------------------------------------------------------
+ *
+ * D3D11 address-mode enum -> VkSamplerAddressMode:
+ *   1 WRAP   -> 0 REPEAT
+ *   2 MIRROR -> 1 MIRRORED_REPEAT
+ *   3 CLAMP  -> 2 CLAMP_TO_EDGE
+ *   4 BORDER -> 3 CLAMP_TO_BORDER
+ */
+static uint32_t d3d11_to_vk_address_mode(uint32_t d3d)
+{
+    if (d3d >= 1 && d3d <= 4) return d3d - 1u;
+    return 2; /* default clamp */
+}
+
+/* Minimal DXGI-format -> (VkFormat, bytes-per-pixel) needed for D3D11 SRVs.
+ * Only uncompressed formats that appear in Sekiro's UI pipeline are listed;
+ * BC7 (98) is intentionally absent (the manual path handles that via the
+ * software BC7 decoder). */
+static int d3d11_dxgi_to_vulkan_image(uint32_t dxgi,
+                                       uint32_t *vk_format,
+                                       uint32_t *bytes_per_pixel)
+{
+    /* Uncompressed formats: {dxgi, vk_format, bytes_per_pixel} */
+    static const struct { uint32_t dxgi, vk, bpp; } table[] = {
+        { 2, 109, 16}, /* R32G32B32A32_FLOAT */
+        { 6, 106, 12}, /* R32G32B32_FLOAT */
+        {16, 103,  8}, /* R32G32_FLOAT */
+        {41,  97,  4}, /* R32_FLOAT */
+        {28,  37,  4}, /* R8G8B8A8_UNORM */
+        {29,  43,  4}, /* R8G8B8A8_UNORM_SRGB */
+        {87,  44,  4}, /* B8G8R8A8_UNORM */
+        {91,  50,  4}, /* B8G8R8A8_UNORM_SRGB */
+        {61,   9,  1}, /* R8_UNORM */
+        {63,  10,  1}, /* R8_UINT  */
+        {49,  16,  2}, /* R16_UNORM */
+        {57,  74,  2}, /* R16_UINT (index / texel) */
+        {24,  64,  4}, /* R10G10B10A2_UNORM */
+        {26, 122,  4}, /* R11G11B10_FLOAT */
+        {54,  76,  2}, /* R16G16_FLOAT */
+        {35,  98,  8}, /* R16G16B16A16_FLOAT */
+    };
+    for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); ++i) {
+        if (table[i].dxgi == dxgi) {
+            *vk_format       = table[i].vk;
+            *bytes_per_pixel = table[i].bpp;
+            return 1;
+        }
+    }
+    /* Block-compressed formats signal via bpp = 0 (caller must use block
+     * fields instead).  vk_format is still returned for image creation. */
+    *bytes_per_pixel = 0;
+    switch (dxgi) {
+        case 71: *vk_format = 131; return 1; /* BC1_UNORM        VK 131 */
+        case 72: *vk_format = 132; return 1; /* BC1_UNORM_SRGB   VK 132 */
+        case 74: *vk_format = 135; return 1; /* BC2_UNORM        VK 135 */
+        case 75: *vk_format = 136; return 1; /* BC2_UNORM_SRGB   VK 136 */
+        case 77: *vk_format = 137; return 1; /* BC3_UNORM        VK 137 */
+        case 78: *vk_format = 138; return 1; /* BC3_UNORM_SRGB   VK 138 */
+        case 80: *vk_format = 139; return 1; /* BC4_UNORM        VK 139 */
+        case 81: *vk_format = 140; return 1; /* BC4_SNORM        VK 140 */
+        case 83: *vk_format = 141; return 1; /* BC5_UNORM        VK 141 */
+        case 84: *vk_format = 142; return 1; /* BC5_SNORM        VK 142 */
+        case 95: *vk_format = 143; return 1; /* BC6H_UF16        VK 143 */
+        case 96: *vk_format = 144; return 1; /* BC6H_SF16        VK 144 */
+        case 98: *vk_format = 145; return 1; /* BC7_UNORM        VK 145 */
+        case 99: *vk_format = 146; return 1; /* BC7_UNORM_SRGB   VK 146 */
+        default: return 0;
+    }
+}
+
+static int try_auto_translate_indexed_draw(const BeerD3D11PipelineState *state,
+                                           uint32_t index_count,
+                                           uint32_t start_index,
+                                           int32_t  base_vertex)
+{
+    if (!state || !state->vertex_shader || !state->pixel_shader ||
+        !state->vertex_buffers[0] || !state->index_buffer ||
+        !state->render_targets[0] || state->viewport_count == 0)
+        return 0;
+
+    BeerD3D11Shader *vs = state->vertex_shader;
+    BeerD3D11Shader *ps = state->pixel_shader;
+    if (!com_get_header(vs) || !com_get_header(ps)) return 0;
+
+    uint64_t vs_hash = ((uint64_t)fnv1a_bytes(vs->bytecode, vs->bytecode_size) << 32) |
+                        fnv1a_bytes(vs->bytecode + vs->bytecode_size / 2,
+                                    vs->bytecode_size - vs->bytecode_size / 2);
+    uint64_t ps_hash = ((uint64_t)fnv1a_bytes(ps->bytecode, ps->bytecode_size) << 32) |
+                        fnv1a_bytes(ps->bytecode + ps->bytecode_size / 2,
+                                    ps->bytecode_size - ps->bytecode_size / 2);
+
+    const BeerD3D12TranslatedShader *tvs =
+        beer_d3d12_translate_shader(vs->bytecode, vs->bytecode_size, vs_hash);
+    const BeerD3D12TranslatedShader *tps =
+        beer_d3d12_translate_shader(ps->bytecode, ps->bytecode_size, ps_hash);
+    if (!tvs || !tps) {
+        static _Atomic(uint32_t) fail_count;
+        uint32_t fn = atomic_fetch_add(&fail_count, 1);
+        /* Always log — unlimited, deduplicated by VS+PS pair via counter cap. */
+        if (fn < 32)
+            fprintf(stderr,
+                    "[D3D11 AUTO TRANSLATE FAIL] #%u VS=%08x PS=%08x: %s "
+                    "(tvs=%p tps=%p bytecodes=%zu/%zu)\n",
+                    fn + 1, (uint32_t)vs_hash, (uint32_t)ps_hash,
+                    beer_d3d12_shader_translation_error(),
+                    (void *)tvs, (void *)tps,
+                    vs->bytecode_size, ps->bytecode_size);
+        return 0;
+    }
+    /* Log first translation for each unique VS+PS pair only. */
+    {
+        static uint64_t logged_pairs[64];
+        static uint32_t logged_count;
+        static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+        uint64_t pair_key = vs_hash ^ (ps_hash * 0x9e3779b97f4a7c15ULL);
+        pthread_mutex_lock(&log_lock);
+        int already = 0;
+        for (uint32_t _i = 0; _i < logged_count && _i < 64; ++_i)
+            if (logged_pairs[_i] == pair_key) { already = 1; break; }
+        if (!already && logged_count < 64)
+            logged_pairs[logged_count++] = pair_key;
+        pthread_mutex_unlock(&log_lock);
+        if (!already)
+            fprintf(stderr,
+                    "[D3D11 AUTO TRANSLATE OK] VS=%08x PS=%08x "
+                    "vs-desc=%u ps-desc=%u vs-spirv=%zu ps-spirv=%zu\n",
+                    (uint32_t)vs_hash, (uint32_t)ps_hash,
+                    tvs->descriptor_count, tps->descriptor_count,
+                    tvs->spirv_size, tps->spirv_size);
+    }
+
+    /* ---- Build descriptor bindings from translated shader declarations ---- */
+    BeerVulkanGraphicsBinding bindings[BEER_VULKAN_GRAPHICS_MAX_BINDINGS];
+    memset(bindings, 0, sizeof(bindings));
+    uint32_t binding_count = 0;
+
+    for (uint32_t stage = 0; stage < 2; ++stage) {
+        const BeerD3D12TranslatedShader *shader = stage ? tps : tvs;
+        uint32_t stage_flag = stage ? BEER_VULKAN_GRAPHICS_STAGE_FRAGMENT
+                                    : BEER_VULKAN_GRAPHICS_STAGE_VERTEX;
+        for (uint32_t d = 0; d < shader->descriptor_count; ++d) {
+            const BeerD3D12ShaderDescriptor *desc = &shader->descriptors[d];
+            if (binding_count >= BEER_VULKAN_GRAPHICS_MAX_BINDINGS) return 0;
+            BeerVulkanGraphicsBinding *b = &bindings[binding_count++];
+            b->binding    = desc->binding;
+            b->stage_flags = stage_flag;
+            uint32_t slot = desc->register_index;
+
+            if (desc->type == BEER_D3D12_SHADER_DESCRIPTOR_CBV) {
+                /* VS or PS constant buffer slot */
+                BeerD3D11Resource *cbuf = validated_resource(
+                    stage ? state->ps_constant_buffers[slot < 8 ? slot : 0]
+                          : state->vs_constant_buffers[slot < 8 ? slot : 0]);
+                if (!cbuf || !cbuf->pixels) return 0;
+                b->kind = BEER_VULKAN_GRAPHICS_BINDING_UNIFORM_BUFFER;
+                b->data = cbuf->pixels;
+                b->size = cbuf->pixel_size;
+            } else if (desc->type == BEER_D3D12_SHADER_DESCRIPTOR_SRV &&
+                       stage == 1 /* PS only */) {
+                BeerD3D11View *view = slot < BEER_MAX_SHADER_RESOURCES
+                    ? state->ps_shader_resources[slot] : NULL;
+                BeerD3D11Resource *res = view && com_get_header(view)
+                    ? validated_resource(view->resource) : NULL;
+                if (!res || !res->pixels || res->desc_size < 20) return 0;
+                const uint32_t *rdesc = (const uint32_t *)res->desc;
+                uint32_t vk_fmt = 0, bpp = 0;
+                if (!d3d11_dxgi_to_vulkan_image(rdesc[4], &vk_fmt, &bpp)) return 0;
+                b->kind            = BEER_VULKAN_GRAPHICS_BINDING_SAMPLED_IMAGE;
+                b->resource        = res;
+                b->serial          = (const uint64_t *)&res->content_serial;
+                b->data            = res->pixels;
+                b->size            = res->pixel_size;
+                b->format          = vk_fmt;
+                b->width           = rdesc[0];
+                b->height          = rdesc[1];
+                if (bpp == 0) {
+                    /* Block-compressed texture (BC1-BC7).  Determine
+                     * bytes-per-block from the VkFormat number:
+                     *   BC1/BC4 (131,132,139,140) -> 4x4 block, 8 bytes
+                     *   BC2/BC3/BC5/BC6H/BC7 (135-138,141-146) -> 4x4, 16 bytes */
+                    uint32_t bpb = (vk_fmt == 131 || vk_fmt == 132 ||
+                                    vk_fmt == 139 || vk_fmt == 140) ? 8u : 16u;
+                    b->block_width    = 4;
+                    b->block_height   = 4;
+                    b->bytes_per_block = bpb;
+                    b->bytes_per_pixel = 0;
+                    /* Row pitch in bytes covering full-block rows */
+                    uint32_t blocks_wide = (rdesc[0] + 3u) / 4u;
+                    b->row_pitch = res->row_pitch ? res->row_pitch : blocks_wide * bpb;
+                } else {
+                    b->bytes_per_pixel = bpp;
+                    b->row_pitch = res->row_pitch ? res->row_pitch : rdesc[0] * bpp;
+                }
+            } else if (desc->type == BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER &&
+                       stage == 1 /* PS only */) {
+                BeerD3D11SamplerState *samp = slot < 8
+                    ? state->ps_samplers[slot] : NULL;
+                const uint32_t *sdesc = samp && com_get_header(samp)
+                    ? (const uint32_t *)samp->desc : NULL;
+                b->kind       = BEER_VULKAN_GRAPHICS_BINDING_SAMPLER;
+                b->min_filter = sdesc && sdesc[0] == 0x15 ? 1u : 0u;
+                b->mag_filter = b->min_filter;
+                b->address_u  = sdesc ? d3d11_to_vk_address_mode(sdesc[1]) : 2u;
+                b->address_v  = sdesc ? d3d11_to_vk_address_mode(sdesc[2]) : 2u;
+                b->address_w  = 2u; /* clamp */
+            } else {
+                /* VS SRVs and other unsupported descriptor types */
+                return 0;
+            }
+        }
+    }
+
+    /* ---- Vertex bindings from input layout + bound VB ---- */
+    BeerD3D11InputLayout *layout = state->input_layout;
+    if (!layout || !com_get_header(layout)) return 0;
+
+    BeerVulkanGraphicsVertexBinding  vb[BEER_VULKAN_GRAPHICS_MAX_VERTEX_BINDINGS];
+    BeerVulkanGraphicsVertexAttribute va[BEER_VULKAN_GRAPHICS_MAX_VERTEX_ATTRIBUTES];
+    memset(vb, 0, sizeof(vb));
+    memset(va, 0, sizeof(va));
+    uint32_t vb_count = 0, va_count = 0;
+
+    /* Per-slot running byte offsets for D3D11_APPEND_ALIGNED_ELEMENT (0xffffffff). */
+    uint32_t slot_offsets[BEER_VULKAN_GRAPHICS_MAX_VERTEX_BINDINGS];
+    memset(slot_offsets, 0, sizeof(slot_offsets));
+
+    for (uint32_t e = 0; e < layout->element_count &&
+         va_count < BEER_VULKAN_GRAPHICS_MAX_VERTEX_ATTRIBUTES; ++e) {
+        const BeerD3D11InputElement *elem = &layout->elements[e];
+        uint32_t slot_idx = elem->input_slot;
+        if (slot_idx >= BEER_VULKAN_GRAPHICS_MAX_VERTEX_BINDINGS) return 0;
+        BeerD3D11Resource *vbuf =
+            validated_resource(state->vertex_buffers[slot_idx]);
+        if (!vbuf || !vbuf->pixels) return 0;
+
+        /* Resolve D3D11_APPEND_ALIGNED_ELEMENT sentinel. */
+        uint32_t byte_offset = elem->aligned_byte_offset;
+        uint32_t vk_fmt = 0, bpp = 0;
+        if (!d3d11_dxgi_to_vulkan_image(elem->format, &vk_fmt, &bpp)) return 0;
+        if (byte_offset == 0xffffffffu) {
+            byte_offset = slot_offsets[slot_idx];
+        } else {
+            /* Explicit offset resets the running tracker for this slot. */
+            slot_offsets[slot_idx] = byte_offset;
+        }
+        slot_offsets[slot_idx] = byte_offset + bpp;
+
+        /* Add vertex binding slot once */
+        int found = 0;
+        for (uint32_t i = 0; i < vb_count; ++i)
+            if (vb[i].stride == state->vertex_strides[slot_idx] &&
+                vb[i].data == vbuf->pixels + state->vertex_offsets[slot_idx])
+                found = 1;
+        if (!found) {
+            if (vb_count >= BEER_VULKAN_GRAPHICS_MAX_VERTEX_BINDINGS) return 0;
+            vb[vb_count].data   = vbuf->pixels +
+                                   state->vertex_offsets[slot_idx];
+            vb[vb_count].size   = vbuf->pixel_size -
+                                   state->vertex_offsets[slot_idx];
+            vb[vb_count].stride = state->vertex_strides[slot_idx];
+            ++vb_count;
+        }
+
+        va[va_count].location = va_count;
+        va[va_count].binding  = slot_idx;
+        va[va_count].format   = vk_fmt;
+        va[va_count].offset   = byte_offset;
+        ++va_count;
+    }
+    if (!vb_count) return 0;
+
+    /* ---- Index buffer ---- */
+    BeerD3D11Resource *ibuf = validated_resource(state->index_buffer);
+    if (!ibuf || !ibuf->pixels) return 0;
+    size_t idx_byte_offset = (size_t)state->index_offset +
+                              (size_t)start_index * 2u;
+    if (idx_byte_offset > ibuf->pixel_size) return 0;
+
+    /* ---- Render target ---- */
+    BeerD3D11View *rtv = state->render_targets[0];
+    BeerD3D11Resource *rt = rtv && com_get_header(rtv)
+        ? validated_resource(rtv->resource) : NULL;
+    if (!rt || !rt->pixels || rt->desc_size < 20) return 0;
+    const uint32_t *rdesc = (const uint32_t *)rt->desc;
+    uint32_t rt_vk_fmt = 0, rt_bpp = 0;
+    if (!d3d11_dxgi_to_vulkan_image(rdesc[4], &rt_vk_fmt, &rt_bpp)) return 0;
+
+    BeerVulkanGraphicsTarget target_out;
+    memset(&target_out, 0, sizeof(target_out));
+    target_out.data   = rt->pixels;
+    target_out.size   = rt->pixel_size;
+    target_out.serial = (uint64_t *)&rt->content_serial;
+    target_out.format = rt_vk_fmt;
+    target_out.bytes_per_pixel = rt_bpp;
+    target_out.width  = rdesc[0];
+    target_out.height = rdesc[1];
+    target_out.row_pitch = rdesc[0] * rt_bpp; /* tightly packed */
+
+    /* ---- Fixed-function state ---- */
+    BeerVulkanGraphicsState gs;
+    memset(&gs, 0, sizeof(gs));
+    gs.flip_y = 0; /* D3D11 clip Y already matches screen Y */
+    BeerD3D11State *blend = (BeerD3D11State *)state->blend_state;
+    if (blend && com_get_header(blend) && blend->kind == BEER_STATE_BLEND &&
+        blend->desc_size >= 40) {
+        const uint8_t *rt0 = blend->desc + 8;
+        uint32_t be; memcpy(&be, rt0, 4);
+        if (be) {
+            /* D3D11 blend factors -> Vulkan (same mapping as D3D12 path) */
+            static const int8_t d3d_to_vk[] = {
+                -1, 0, 1, 2, 3, 6, 7, 8, 9, 4, 5, 14, -1, -1, 10, 11
+            };
+            uint32_t sb, db, ba, sba, dba, bba;
+            memcpy(&sb,  rt0 + 4,  4); memcpy(&db,  rt0 + 8,  4);
+            memcpy(&ba,  rt0 + 12, 4); memcpy(&sba, rt0 + 16, 4);
+            memcpy(&dba, rt0 + 20, 4); memcpy(&bba, rt0 + 24, 4);
+            if (sb < 16 && db < 16 && sba < 16 && dba < 16 &&
+                d3d_to_vk[sb] >= 0 && d3d_to_vk[db] >= 0 &&
+                d3d_to_vk[sba] >= 0 && d3d_to_vk[dba] >= 0) {
+                gs.blend_enable      = 1;
+                gs.src_color_factor  = (uint32_t)d3d_to_vk[sb];
+                gs.dst_color_factor  = (uint32_t)d3d_to_vk[db];
+                gs.color_op          = (ba >= 1 && ba <= 5) ? ba - 1u : 0u;
+                gs.src_alpha_factor  = (uint32_t)d3d_to_vk[sba];
+                gs.dst_alpha_factor  = (uint32_t)d3d_to_vk[dba];
+                gs.alpha_op          = (bba >= 1 && bba <= 5) ? bba - 1u : 0u;
+            } else {
+                return 0; /* unsupported blend factors */
+            }
+        }
+        gs.write_mask = rt0[28];
+    } else {
+        gs.write_mask = 0x0f;
+    }
+    memcpy(gs.blend_constants, state->blend_factor, sizeof(gs.blend_constants));
+    gs.cull_mode = 0; /* NONE — Scaleform UI has no culling */
+
+    /* ---- Draw info ---- */
+    BeerVulkanGraphicsDrawInfo di;
+    memset(&di, 0, sizeof(di));
+    for (uint32_t i = 0; i < vb_count; ++i) di.vertex_bindings[i] = vb[i];
+    for (uint32_t i = 0; i < va_count; ++i) di.vertex_attributes[i] = va[i];
+    di.vertex_binding_count   = vb_count;
+    di.vertex_attribute_count = va_count;
+    di.index_data   = ibuf->pixels + idx_byte_offset;
+    di.index_size   = ibuf->pixel_size - idx_byte_offset;
+    di.index_type   = 0; /* VK_INDEX_TYPE_UINT16 */
+    di.topology     = 0; /* VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST */
+    di.indexed      = 1;
+    di.element_count  = index_count;
+    di.instance_count = 1;
+    di.base_vertex    = base_vertex;
+
+    float viewport[6] = { 0.0f };
+    if (state->viewport_count)
+        memcpy(viewport, state->viewports[0], sizeof(float) * 4);
+    viewport[4] = 0.0f; viewport[5] = 1.0f; /* depth min/max */
+
+    int32_t scissor[4] = {
+        0, 0, (int32_t)target_out.width, (int32_t)target_out.height
+    };
+    BeerD3D11State *rast = (BeerD3D11State *)state->rasterizer_state;
+    if (state->scissor_count && rast && com_get_header(rast) &&
+        rast->kind == BEER_STATE_RASTERIZER && rast->desc_size >= 32 &&
+        *(const int32_t *)(rast->desc + 28)) {
+        scissor[0] = state->scissor_rects[0][0];
+        scissor[1] = state->scissor_rects[0][1];
+        scissor[2] = state->scissor_rects[0][2];
+        scissor[3] = state->scissor_rects[0][3];
+    }
+
+    const char *reason = NULL;
+    int ok = beer_vulkan_graphics_draw_state(
+        vs, (const uint32_t *)tvs->spirv, tvs->spirv_size,
+        ps, (const uint32_t *)tps->spirv, tps->spirv_size,
+        bindings, binding_count, &di, &gs,
+        &target_out, 1, NULL, viewport, scissor, &reason);
+
+    if (ok) {
+        resource_mark_written(rt);
+        /* Publish the render target so the compositor fullscreen pass can find
+         * and blend the Scaleform UI layer into the back buffer.  The manual
+         * paths used to set this explicitly; the auto path must do the same. */
+        g_last_textured_indexed_target = rt;
+        atomic_store(&g_indexed_target_pending, 1);
+        static _Atomic(uint32_t) auto_count;
+        uint32_t n = atomic_fetch_add(&auto_count, 1) + 1;
+        if (n <= 32 || (n % 64) == 0)
+            fprintf(stderr,
+                    "[D3D11 AUTO] indexed draw #%u VS=%08x PS=%08x "
+                    "indices=%u target=%ux%u bindings=%u\n",
+                    n, (uint32_t)vs_hash, (uint32_t)ps_hash,
+                    index_count, target_out.width, target_out.height,
+                    binding_count);
+    } else {
+        /* Log every unique VS+PS rejection unconditionally. */
+        fprintf(stderr,
+                "[D3D11 AUTO REJECT] VS=%08x PS=%08x "
+                "indices=%u bindings=%u target=%ux%u reason=%s\n",
+                (uint32_t)vs_hash, (uint32_t)ps_hash,
+                index_count, binding_count,
+                target_out.width, target_out.height,
+                reason ? reason : "unknown");
+    }
+    return ok;
+}
+
 /* Faithful software execution for the first observed Scaleform solid-color
  * shader pair. The DXBC is structurally simple: VS passes both colors and
  * transforms POSITION.xy with cb0; PS writes COLOR0.rgb and COLOR0.a*COLOR1.a. */
@@ -3571,665 +4320,11 @@ static int execute_initial_indexed_draw(const BeerD3D11PipelineState *state,
         return 0;
     }
 
-    BeerD3D11Shader *vs = state->vertex_shader;
-    BeerD3D11Shader *ps = state->pixel_shader;
-    if (!com_get_header(vs) || !com_get_header(ps)) return 0;
-    uint32_t vertex_hash = fnv1a_bytes(vs->bytecode, vs->bytecode_size);
-    uint32_t pixel_hash = fnv1a_bytes(ps->bytecode, ps->bytecode_size);
-    int solid_path = vertex_hash == 0xd63c5c10 && pixel_hash == 0x0f04f22d &&
-        state->vertex_strides[0] == 16;
-    int transformed_color_path = vertex_hash == 0x222ff8d7 &&
-        pixel_hash == 0x625c789a && state->vertex_strides[0] == 16;
-    int textured_path = vertex_hash == 0x94e79d4e && pixel_hash == 0xacdd04cc &&
-        state->vertex_strides[0] == 12;
-    /* Bink reuses this Scaleform shader with an R8_UNORM video plane. Keep it
-     * distinct from the BC7 title-atlas path so Vulkan applies D3D11's native
-     * R8 sampling result (R, 0, 0, 1) rather than attempting BC7 decoding. */
-    int movie_r8_path = 0;
-    int textured_rgba_path = 0;
-    BeerD3D11Resource *classified_sample_texture = NULL;
-    if (textured_path) {
-        /* Bink leaves ordinary UI resources in lower SRV slots while binding
-         * its R8 video planes in later slots. Prefer an observed R8 plane for
-         * this shared shader, then fall back to the first valid resource. Keep
-         * this exact resource for dispatch so classification and sampling can
-         * never disagree because of a stale slot-0 binding. */
-        for (uint32_t slot = 0; slot < BEER_MAX_SHADER_RESOURCES; ++slot) {
-            BeerD3D11View *view = state->ps_shader_resources[slot];
-            BeerD3D11Resource *resource = view && com_get_header(view)
-                ? validated_resource(view->resource) : NULL;
-            if (getenv("BEER_RENDER_DIAGNOSTICS")) {
-                const uint32_t *desc = resource && resource->desc_size >= 20
-                    ? (const uint32_t *)resource->desc : NULL;
-                fprintf(stderr,
-                        "[D3D11 MODE3/14 SRV] slot=%u view=%p resource=%p "
-                        "format=%u size=%ux%u pixels=%p bytes=%zu\n",
-                        slot, (void *)view, (void *)resource,
-                        desc ? desc[4] : 0, desc ? desc[0] : 0,
-                        desc ? desc[1] : 0,
-                        resource ? (void *)resource->pixels : NULL,
-                        resource ? resource->pixel_size : 0);
-            }
-            if (!resource || resource->desc_size < 20) continue;
-            if (!classified_sample_texture) classified_sample_texture = resource;
-            if (((const uint32_t *)resource->desc)[4] == 61) {
-                classified_sample_texture = resource;
-                break;
-            }
-        }
-        uint32_t sample_format = classified_sample_texture &&
-            classified_sample_texture->desc_size >= 20
-            ? ((const uint32_t *)classified_sample_texture->desc)[4] : 0;
-        movie_r8_path = sample_format == 61;
-        textured_rgba_path = sample_format == 28 || sample_format == 29 ||
-            sample_format == 87;
-        if (movie_r8_path) textured_path = 0;
-        if (render_diagnostics_enabled() && !movie_r8_path &&
-            !textured_rgba_path && classified_sample_texture &&
-            sample_format != 98) {
-            fprintf(stderr,
-                    "[D3D11 MODE3/14 CLASSIFY] unsupported source=%p format=%u "
-                    "size=%ux%u bytes=%zu\n",
-                    (void *)classified_sample_texture, sample_format,
-                    ((const uint32_t *)classified_sample_texture->desc)[0],
-                    ((const uint32_t *)classified_sample_texture->desc)[1],
-                    classified_sample_texture->pixel_size);
-        }
-    }
-    int premultiplied_textured_path = vertex_hash == 0x94e79d4e &&
-        pixel_hash == 0x9f3455c3 && state->vertex_strides[0] == 12;
-    int simple_textured_path = vertex_hash == 0x23ac3836 &&
-        pixel_hash == 0xf383c6dd && state->vertex_strides[0] == 12;
-    int glyph_path = vertex_hash == 0xb562add5 &&
-        pixel_hash == 0x50ad98ad && state->vertex_strides[0] == 20;
-    int color_transform_texture_path = vertex_hash == 0xdd47f946 &&
-        pixel_hash == 0x80f4d777 && state->vertex_strides[0] == 16;
-    int filter_texture_path = vertex_hash == 0x085fee1d &&
-        pixel_hash == 0x625c789a && state->vertex_strides[0] == 16;
-    int compact_filter_texture_path = vertex_hash == 0x509b6f3e &&
-        pixel_hash == 0xacdd04cc && state->vertex_strides[0] == 12;
-    int flagged_glyph_path = vertex_hash == 0x1d95d373 &&
-        pixel_hash == 0x50ad98ad && state->vertex_strides[0] == 24;
-    int uniform_color_draw_path = vertex_hash == 0xa7b2c1e7 &&
-        pixel_hash == 0x7bf3bccb && state->vertex_strides[0] == 12;
-    int indexed_uniform_color_path = vertex_hash == 0xdd597c54 &&
-        pixel_hash == 0x7bf3bccb && state->vertex_strides[0] == 8;
-    int direct_texture_path = vertex_hash == 0x4b88febe &&
-        pixel_hash == 0x7c5e6472 && state->vertex_strides[0] == 16;
-    int batched_simple_texture_path = vertex_hash == 0xf0193c6c &&
-        pixel_hash == 0xf383c6dd && state->vertex_strides[0] == 12;
-    if (solid_path || transformed_color_path || textured_path || movie_r8_path ||
-        premultiplied_textured_path || simple_textured_path || glyph_path ||
-        color_transform_texture_path || filter_texture_path ||
-        compact_filter_texture_path || flagged_glyph_path ||
-        uniform_color_draw_path || indexed_uniform_color_path ||
-        direct_texture_path || batched_simple_texture_path)
-        trace_vulkan_migration_draw("indexed", vertex_hash, pixel_hash);
-    if (!solid_path && !transformed_color_path && !textured_path && !movie_r8_path &&
-        !premultiplied_textured_path && !simple_textured_path && !glyph_path &&
-        !color_transform_texture_path && !filter_texture_path &&
-        !compact_filter_texture_path && !flagged_glyph_path &&
-        !uniform_color_draw_path && !indexed_uniform_color_path &&
-        !direct_texture_path && !batched_simple_texture_path) {
-        typedef struct {
-            uint32_t vertex_hash;
-            uint32_t pixel_hash;
-            uint32_t stride;
-        } UnsupportedIndexedPair;
-        static UnsupportedIndexedPair pairs[32];
-        static uint32_t pair_count;
-        static pthread_mutex_t pair_lock = PTHREAD_MUTEX_INITIALIZER;
-        pthread_mutex_lock(&pair_lock);
-        uint32_t pair = 0;
-        while (pair < pair_count &&
-               (pairs[pair].vertex_hash != vertex_hash ||
-                pairs[pair].pixel_hash != pixel_hash ||
-                pairs[pair].stride != state->vertex_strides[0]))
-            ++pair;
-        if (pair == pair_count && pair_count < 32) {
-            pairs[pair_count++] = (UnsupportedIndexedPair) {
-                vertex_hash, pixel_hash, state->vertex_strides[0]
-            };
-            BeerD3D11View *target_view = state->render_targets[0];
-            BeerD3D11Resource *target = target_view && com_get_header(target_view)
-                ? validated_resource(target_view->resource) : NULL;
-            const uint32_t *target_desc = target
-                ? (const uint32_t *)target->desc : NULL;
-            BeerD3D11View *source_view = state->ps_shader_resources[0];
-            BeerD3D11Resource *source = source_view && com_get_header(source_view)
-                ? validated_resource(source_view->resource) : NULL;
-            const uint32_t *source_desc = source
-                ? (const uint32_t *)source->desc : NULL;
-            fprintf(stderr,
-                    "[D3D11 REFERENCE] unsupported indexed pair VS=%08x PS=%08x "
-                    "indices=%u start=%u stride=%u target=%p/%ux%u/F%u "
-                    "source0=%p/%ux%u/F%u\n",
-                    vertex_hash, pixel_hash, index_count, start_index,
-                    state->vertex_strides[0], (void *)target,
-                    target_desc ? target_desc[0] : 0,
-                    target_desc ? target_desc[1] : 0,
-                    target_desc ? target_desc[4] : 0,
-                    (void *)source, source_desc ? source_desc[0] : 0,
-                    source_desc ? source_desc[1] : 0,
-                    source_desc ? source_desc[4] : 0);
-        }
-        pthread_mutex_unlock(&pair_lock);
-        return 0;
-    }
-    static _Atomic(uint32_t) textured_attempts;
-    static _Atomic(uint32_t) simple_textured_attempts;
-    uint32_t textured_attempt = textured_path
-        ? atomic_fetch_add(&textured_attempts, 1) + 1
-        : simple_textured_path
-            ? atomic_fetch_add(&simple_textured_attempts, 1) + 1 : 0;
-
-    BeerD3D11Resource *sample_texture = classified_sample_texture;
-    if (textured_path || movie_r8_path || premultiplied_textured_path ||
-        simple_textured_path || glyph_path || color_transform_texture_path ||
-        filter_texture_path || compact_filter_texture_path || flagged_glyph_path ||
-        direct_texture_path || batched_simple_texture_path) {
-        for (uint32_t slot = 0; slot < BEER_MAX_SHADER_RESOURCES &&
-             !sample_texture; ++slot) {
-            BeerD3D11View *sample_view = state->ps_shader_resources[slot];
-            if (sample_view && com_get_header(sample_view))
-                sample_texture = validated_resource(sample_view->resource);
-        }
-        if (!sample_texture) {
-            if (textured_attempt <= 8 || glyph_path)
-                fprintf(stderr, "[D3D11 REFERENCE] textured attempt=%u missing texture\n",
-                        textured_attempt);
-            return 0;
-        }
-    }
-
-    BeerD3D11Resource *vertices = validated_resource(state->vertex_buffers[0]);
-    BeerD3D11Resource *indices = validated_resource(state->index_buffer);
-    BeerD3D11View *target_view = state->render_targets[0];
-    BeerD3D11Resource *target = target_view && com_get_header(target_view)
-        ? validated_resource(target_view->resource) : NULL;
-    if (!vertices || !indices || !target || !target->pixels ||
-        !indices->pixels || ((const uint32_t *)target->desc)[4] != 28) {
-        if ((vertex_hash == 0x94e79d4e && pixel_hash == 0xacdd04cc) ||
-            (textured_attempt && textured_attempt <= 8))
-            fprintf(stderr, "[D3D11 REFERENCE] textured attempt=%u bad resources "
-                    "vb=%p/%p/%zu ib=%p/%p/%zu rt=%p/%p/%zu format=%u "
-                    "classified=%p movie-r8=%d rgba=%d\n",
-                    textured_attempt, (void *)vertices,
-                    vertices ? (void *)vertices->pixels : NULL,
-                    vertices ? vertices->pixel_size : 0,
-                    (void *)indices, indices ? (void *)indices->pixels : NULL,
-                    indices ? indices->pixel_size : 0,
-                    (void *)target, target ? (void *)target->pixels : NULL,
-                    target ? target->pixel_size : 0,
-                    target && target->desc_size >= 20
-                        ? ((const uint32_t *)target->desc)[4] : 0,
-                    (void *)classified_sample_texture, movie_r8_path,
-                    textured_rgba_path);
-        return 0;
-    }
-
-    const uint32_t width = ((const uint32_t *)target->desc)[0];
-    const uint32_t height = ((const uint32_t *)target->desc)[1];
-    size_t index_offset = (size_t)state->index_offset +
-        (size_t)start_index * sizeof(uint16_t);
-    if (index_offset > indices->pixel_size ||
-        (size_t)index_count * sizeof(uint16_t) > indices->pixel_size - index_offset)
-        return 0;
-    const uint16_t *index_data = (const uint16_t *)(indices->pixels + index_offset);
-
-    int32_t scissor_left = 0, scissor_top = 0;
-    int32_t scissor_right = (int32_t)width, scissor_bottom = (int32_t)height;
-    BeerD3D11State *rasterizer = (BeerD3D11State *)state->rasterizer_state;
-    if (state->scissor_count && rasterizer && com_get_header(rasterizer) &&
-        rasterizer->kind == BEER_STATE_RASTERIZER && rasterizer->desc_size >= 32 &&
-        *(const int32_t *)(rasterizer->desc + 28)) {
-        scissor_left = state->scissor_rects[0][0];
-        scissor_top = state->scissor_rects[0][1];
-        scissor_right = state->scissor_rects[0][2];
-        scissor_bottom = state->scissor_rects[0][3];
-    }
-
-    uint32_t unsupported_before = (textured_path || premultiplied_textured_path ||
-                                   simple_textured_path)
-        ? atomic_load(&g_bc7_unsupported_blocks) : 0;
-    int linear_sample = 0;
-    uint32_t address_u = 1, address_v = 1;
-    float texture_add[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    float texture_multiply[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    if (textured_path || movie_r8_path || premultiplied_textured_path || simple_textured_path ||
-        color_transform_texture_path || filter_texture_path ||
-        compact_filter_texture_path || flagged_glyph_path ||
-        batched_simple_texture_path) {
-        BeerD3D11SamplerState *sampler = state->ps_samplers[0];
-        const uint32_t *sampler_desc = sampler && com_get_header(sampler)
-            ? (const uint32_t *)sampler->desc : NULL;
-        /* Honor the filter and address modes from the bound sampler instead of
-         * assuming MIRROR for every Scaleform texture. */
-        linear_sample = sampler_desc && sampler_desc[0] == 0x15;
-        if (sampler_desc) {
-            address_u = sampler_desc[1];
-            address_v = sampler_desc[2];
-        }
-        if (textured_path || premultiplied_textured_path ||
-            color_transform_texture_path || filter_texture_path ||
-        compact_filter_texture_path || flagged_glyph_path) {
-            BeerD3D11Resource *constants = validated_resource(
-                state->vs_constant_buffers[0]);
-            if (!constants || !constants->pixels || constants->pixel_size < 32)
-                return 0;
-            const float *constant = (const float *)constants->pixels;
-            for (uint32_t channel = 0; channel < 4; ++channel) {
-                texture_add[channel] = constant[channel];
-                texture_multiply[channel] = constant[4 + channel];
-            }
-        }
-    }
-    if (solid_path || transformed_color_path || textured_path || movie_r8_path ||
-        premultiplied_textured_path || simple_textured_path || glyph_path ||
-        color_transform_texture_path || filter_texture_path ||
-        compact_filter_texture_path || flagged_glyph_path ||
-        uniform_color_draw_path || indexed_uniform_color_path ||
-        direct_texture_path || batched_simple_texture_path) {
-        BeerD3D11Resource *constants = validated_resource(
-            state->vs_constant_buffers[0]);
-        if ((!constants || !constants->pixels) &&
-            vertex_hash == 0x94e79d4e && pixel_hash == 0xacdd04cc)
-            fprintf(stderr, "[D3D11 MODE3/14 REJECT] missing VS constants "
-                    "resource=%p pixels=%p bytes=%zu\n",
-                    (void *)constants,
-                    constants ? (void *)constants->pixels : NULL,
-                    constants ? constants->pixel_size : 0);
-        if (constants && constants->pixels) {
-            BeerVulkanIndexedDraw draw;
-            memset(&draw, 0, sizeof(draw));
-            draw.vertices = vertices->pixels;
-            draw.vertex_bytes = vertices->pixel_size;
-            draw.indices = indices->pixels;
-            draw.index_bytes = indices->pixel_size;
-            draw.constants = constants->pixels;
-            draw.constant_bytes = constants->pixel_size;
-            draw.target = target->pixels;
-            draw.target_bytes = target->pixel_size;
-            draw.target_resource = target;
-            draw.target_input_serial = atomic_load(&target->content_serial);
-            draw.width = width;
-            draw.height = height;
-            draw.vertex_offset = state->vertex_offsets[0];
-            draw.vertex_stride = state->vertex_strides[0];
-            draw.index_offset = (uint32_t)index_offset;
-            draw.index_count = index_count;
-            draw.base_vertex = base_vertex;
-            draw.mode = transformed_color_path ? 2u :
-                textured_path ? 3u : movie_r8_path ? 14u : simple_textured_path ? 4u :
-                glyph_path ? 5u : premultiplied_textured_path ? 6u :
-                color_transform_texture_path ? 7u :
-                filter_texture_path ? 8u :
-                compact_filter_texture_path ? 9u :
-                flagged_glyph_path ? 10u :
-                (uniform_color_draw_path || indexed_uniform_color_path) ? 11u :
-                direct_texture_path ? 12u :
-                batched_simple_texture_path ? 13u : 1u;
-            if (textured_path || movie_r8_path || premultiplied_textured_path ||
-                simple_textured_path || glyph_path || color_transform_texture_path ||
-                filter_texture_path || compact_filter_texture_path ||
-                flagged_glyph_path || direct_texture_path ||
-                batched_simple_texture_path) {
-                const uint32_t *texture_desc =
-                    (const uint32_t *)sample_texture->desc;
-                if (glyph_path || flagged_glyph_path || movie_r8_path) {
-                    if (texture_desc[4] != 61 || !sample_texture->pixels)
-                        return 0;
-                    draw.texture = sample_texture->pixels;
-                    draw.texture_resource = sample_texture;
-                    draw.texture_bytes = sample_texture->pixel_size;
-                    draw.texture_serial = atomic_load(&sample_texture->content_serial);
-                } else if (textured_rgba_path) {
-                    if ((texture_desc[4] != 28 && texture_desc[4] != 29 &&
-                         texture_desc[4] != 87) || !sample_texture->pixels)
-                        return 0;
-                    if (texture_desc[4] == 87) {
-                        /* Vulkan's software-style storage-buffer sampler expects
-                         * RGBA byte order. Convert B8G8R8A8 resources once per
-                         * content serial, just like decoded BC7 mirrors. */
-                        uint64_t serial = atomic_load(&sample_texture->content_serial);
-                        size_t rgba_size = sample_texture->pixel_size;
-                        pthread_mutex_lock(&sample_texture->decoded_lock);
-                        if (!sample_texture->decoded_rgba ||
-                            sample_texture->decoded_rgba_size != rgba_size ||
-                            sample_texture->decoded_content_serial != serial) {
-                            uint8_t *rgba = realloc(sample_texture->decoded_rgba,
-                                                    rgba_size);
-                            if (!rgba) {
-                                pthread_mutex_unlock(&sample_texture->decoded_lock);
-                                return 0;
-                            }
-                            sample_texture->decoded_rgba = rgba;
-                            sample_texture->decoded_rgba_size = rgba_size;
-                            for (size_t pixel = 0; pixel + 3 < rgba_size; pixel += 4) {
-                                rgba[pixel] = sample_texture->pixels[pixel + 2];
-                                rgba[pixel + 1] = sample_texture->pixels[pixel + 1];
-                                rgba[pixel + 2] = sample_texture->pixels[pixel];
-                                rgba[pixel + 3] = sample_texture->pixels[pixel + 3];
-                            }
-                            sample_texture->decoded_content_serial = serial;
-                        }
-                        draw.texture = sample_texture->decoded_rgba;
-                        draw.texture_bytes = sample_texture->decoded_rgba_size;
-                        draw.texture_serial = sample_texture->decoded_content_serial;
-                        pthread_mutex_unlock(&sample_texture->decoded_lock);
-                    } else {
-                        draw.texture = sample_texture->pixels;
-                        draw.texture_bytes = sample_texture->pixel_size;
-                        draw.texture_serial = atomic_load(&sample_texture->content_serial);
-                    }
-                    draw.texture_resource = sample_texture;
-                } else {
-                    if (!ensure_bc7_cache(sample_texture)) return 0;
-                    draw.texture = sample_texture->decoded_rgba;
-                    draw.texture_resource = sample_texture;
-                    draw.texture_bytes = sample_texture->decoded_rgba_size;
-                    draw.texture_serial = sample_texture->decoded_content_serial;
-                }
-                draw.texture_width = texture_desc[0];
-                draw.texture_height = texture_desc[1];
-                draw.texture_linear = linear_sample;
-                draw.texture_address_u = address_u;
-                draw.texture_address_v = address_v;
-            }
-            memcpy(draw.viewport, state->viewports[0], sizeof(draw.viewport));
-            draw.scissor[0] = scissor_left;
-            draw.scissor[1] = scissor_top;
-            draw.scissor[2] = scissor_right;
-            draw.scissor[3] = scissor_bottom;
-            draw.write_mask = 0x0f;
-            memcpy(draw.blend_factor, state->blend_factor,
-                   sizeof(draw.blend_factor));
-            if (uniform_color_draw_path || indexed_uniform_color_path) {
-                BeerD3D11Resource *pixel_constants = validated_resource(
-                    state->ps_constant_buffers[0]);
-                if (!pixel_constants || !pixel_constants->pixels ||
-                    pixel_constants->pixel_size < sizeof(draw.constant_color))
-                    return 0;
-                memcpy(draw.constant_color, pixel_constants->pixels,
-                       sizeof(draw.constant_color));
-            }
-            BeerD3D11State *blend = (BeerD3D11State *)state->blend_state;
-            if (blend && com_get_header(blend) &&
-                blend->kind == BEER_STATE_BLEND && blend->desc_size >= 40) {
-                const uint8_t *render_target = blend->desc + 8;
-                memcpy(&draw.blend_enable, render_target, 4);
-                memcpy(&draw.source_blend, render_target + 4, 4);
-                memcpy(&draw.destination_blend, render_target + 8, 4);
-                memcpy(&draw.color_operation, render_target + 12, 4);
-                memcpy(&draw.source_alpha, render_target + 16, 4);
-                memcpy(&draw.destination_alpha, render_target + 20, 4);
-                memcpy(&draw.alpha_operation, render_target + 24, 4);
-                draw.write_mask = render_target[28];
-            }
-            /* Serial allocation and submission must be one atomic step.
-             * Otherwise a concurrent UI job can publish its own output serial
-             * between this draw reading the target serial and reaching the
-             * renderer, which makes the GPU mirror look stale and forces a
-             * re-upload of the CPU copy that silently discards the layers
-             * already composited this frame. */
-            pthread_mutex_lock(&g_gpu_target_order_lock);
-            resource_begin_gpu_write(target, &draw.target_input_serial,
-                                     &draw.target_output_serial);
-            /* The compute rasterizer caches at most 255 index occurrences
-             * (85 triangles) per workgroup. Scaleform legal/disclaimer text
-             * can batch thousands of glyph triangles into one DrawIndexed.
-             * Replay those triangles as ordered chunks instead of overflowing
-             * the shader's shared arrays. Queue order preserves D3D blending,
-             * and later chunks consume the GPU-newer target serial produced by
-             * the first chunk rather than re-uploading the stale CPU copy. */
-            uint32_t submitted_indices = 0;
-            while (submitted_indices < draw.index_count) {
-                BeerVulkanIndexedDraw batch = draw;
-                uint32_t remaining = draw.index_count - submitted_indices;
-                batch.index_count = remaining > 255u ? 255u : remaining;
-                batch.index_offset = draw.index_offset + submitted_indices * 2u;
-                if (submitted_indices)
-                    batch.target_input_serial = draw.target_output_serial;
-                if (!vulkan_indexed_renderer_draw(&batch)) {
-                    pthread_mutex_unlock(&g_gpu_target_order_lock);
-                    return 0;
-                }
-                submitted_indices += batch.index_count;
-            }
-            pthread_mutex_unlock(&g_gpu_target_order_lock);
-            return 1;
-            strict_vulkan_failure("indexed draw");
-        }
-    }
-
-    if (vertex_hash == 0x94e79d4e && pixel_hash == 0xacdd04cc) {
-        BeerD3D11Resource *vs_constants = validated_resource(
-            state->vs_constant_buffers[0]);
-        fprintf(stderr,
-                "[D3D11 MODE3/14 REJECT] textured=%d r8=%d rgba=%d "
-                "source=%p pixels=%p bytes=%zu format=%u size=%ux%u "
-                "constants=%p pixels=%p bytes=%zu target=%p pixels=%p "
-                "format=%u size=%ux%u index-offset=%zu count=%u\n",
-                textured_path, movie_r8_path, textured_rgba_path,
-                (void *)sample_texture,
-                sample_texture ? (void *)sample_texture->pixels : NULL,
-                sample_texture ? sample_texture->pixel_size : 0,
-                sample_texture && sample_texture->desc_size >= 20
-                    ? ((const uint32_t *)sample_texture->desc)[4] : 0,
-                sample_texture && sample_texture->desc_size >= 8
-                    ? ((const uint32_t *)sample_texture->desc)[0] : 0,
-                sample_texture && sample_texture->desc_size >= 8
-                    ? ((const uint32_t *)sample_texture->desc)[1] : 0,
-                (void *)vs_constants,
-                vs_constants ? (void *)vs_constants->pixels : NULL,
-                vs_constants ? vs_constants->pixel_size : 0,
-                (void *)target, target ? (void *)target->pixels : NULL,
-                target && target->desc_size >= 20
-                    ? ((const uint32_t *)target->desc)[4] : 0,
-                target && target->desc_size >= 8
-                    ? ((const uint32_t *)target->desc)[0] : 0,
-                target && target->desc_size >= 8
-                    ? ((const uint32_t *)target->desc)[1] : 0,
-                index_offset, index_count);
-        for (uint32_t slot = 0; slot < 4; ++slot) {
-            BeerD3D11View *view = state->ps_shader_resources[slot];
-            BeerD3D11Resource *resource = view && com_get_header(view)
-                ? validated_resource(view->resource) : NULL;
-            fprintf(stderr,
-                    "[D3D11 MODE3/14 SRV] slot=%u view=%p resource=%p "
-                    "pixels=%p bytes=%zu format=%u size=%ux%u\n",
-                    slot, (void *)view, (void *)resource,
-                    resource ? (void *)resource->pixels : NULL,
-                    resource ? resource->pixel_size : 0,
-                    resource && resource->desc_size >= 20
-                        ? ((const uint32_t *)resource->desc)[4] : 0,
-                    resource && resource->desc_size >= 8
-                        ? ((const uint32_t *)resource->desc)[0] : 0,
-                    resource && resource->desc_size >= 8
-                        ? ((const uint32_t *)resource->desc)[1] : 0);
-        }
-    }
-    strict_vulkan_failure("unsupported indexed draw state");
-
-    uint32_t valid_triangles = 0;
-    uint32_t invalid_triangles = 0;
-    uint32_t degenerate_triangles = 0;
-    uint32_t outside_triangles = 0;
-    uint32_t empty_triangles = 0;
-    uint32_t rasterized_triangles = 0;
-    uint64_t covered_pixels = 0;
-    uint64_t sampled_alpha_pixels = 0;
-    uint64_t changed_pixels = 0;
-    int32_t draw_left = INT32_MAX, draw_top = INT32_MAX;
-    int32_t draw_right = INT32_MIN, draw_bottom = INT32_MIN;
-    for (uint32_t first = 0; first + 2 < index_count; first += 3) {
-        BeerSoftwareVertex vertex[3];
-        int valid = 1;
-        for (uint32_t corner = 0; corner < 3; ++corner) {
-            int64_t resolved = (int64_t)index_data[first + corner] + base_vertex;
-            if (resolved < 0 || !software_vertex_from_index(
-                    state, vertices, (uint32_t)resolved, vertex_hash,
-                    &vertex[corner])) {
-                valid = 0;
-                break;
-            }
-        }
-        if (!valid) {
-            ++invalid_triangles;
-            continue;
-        }
-        ++valid_triangles;
-
-        float area = (vertex[2].x - vertex[0].x) * (vertex[1].y - vertex[0].y) -
-            (vertex[2].y - vertex[0].y) * (vertex[1].x - vertex[0].x);
-        if (area == 0.0f) {
-            ++degenerate_triangles;
-            continue;
-        }
-        float minimum_x = vertex[0].x, maximum_x = vertex[0].x;
-        float minimum_y = vertex[0].y, maximum_y = vertex[0].y;
-        for (uint32_t corner = 1; corner < 3; ++corner) {
-            if (vertex[corner].x < minimum_x) minimum_x = vertex[corner].x;
-            if (vertex[corner].x > maximum_x) maximum_x = vertex[corner].x;
-            if (vertex[corner].y < minimum_y) minimum_y = vertex[corner].y;
-            if (vertex[corner].y > maximum_y) maximum_y = vertex[corner].y;
-        }
-        int32_t left = (int32_t)minimum_x;
-        int32_t top = (int32_t)minimum_y;
-        int32_t right = (int32_t)maximum_x + 1;
-        int32_t bottom = (int32_t)maximum_y + 1;
-        if (left < scissor_left) left = scissor_left;
-        if (top < scissor_top) top = scissor_top;
-        if (right > scissor_right) right = scissor_right;
-        if (bottom > scissor_bottom) bottom = scissor_bottom;
-        if (left < 0) left = 0;
-        if (top < 0) top = 0;
-        if (right > (int32_t)width) right = (int32_t)width;
-        if (bottom > (int32_t)height) bottom = (int32_t)height;
-        if (left >= right || top >= bottom) {
-            ++outside_triangles;
-            continue;
-        }
-
-        uint64_t triangle_pixels = 0;
-        uint64_t triangle_alpha_pixels = 0;
-        uint64_t triangle_changed_pixels = 0;
-        for (int32_t y = top; y < bottom; ++y) {
-            for (int32_t x = left; x < right; ++x) {
-                float px = (float)x + 0.5f, py = (float)y + 0.5f;
-                float weight0 = ((px - vertex[1].x) * (vertex[2].y - vertex[1].y) -
-                    (py - vertex[1].y) * (vertex[2].x - vertex[1].x)) / area;
-                float weight1 = ((px - vertex[2].x) * (vertex[0].y - vertex[2].y) -
-                    (py - vertex[2].y) * (vertex[0].x - vertex[2].x)) / area;
-                float weight2 = 1.0f - weight0 - weight1;
-                if (weight0 < 0.0f || weight1 < 0.0f || weight2 < 0.0f) continue;
-                float color[4];
-                for (uint32_t channel = 0; channel < 4; ++channel)
-                    color[channel] = vertex[0].color0[channel] * weight0 +
-                        vertex[1].color0[channel] * weight1 +
-                        vertex[2].color0[channel] * weight2;
-                if (textured_path || simple_textured_path) {
-                    float u = vertex[0].u * weight0 + vertex[1].u * weight1 +
-                        vertex[2].u * weight2;
-                    float v = vertex[0].v * weight0 + vertex[1].v * weight1 +
-                        vertex[2].v * weight2;
-                    float sample[4];
-                    if (!sample_bc7(sample_texture, u, v, linear_sample,
-                                    address_u, address_v, sample)) continue;
-                    if (simple_textured_path) {
-                        /* PS f383c6dd writes sampled RGB directly and only
-                         * modulates sampled alpha by interpolated COLOR0.a. */
-                        color[0] = sample[0];
-                        color[1] = sample[1];
-                        color[2] = sample[2];
-                        color[3] *= sample[3];
-                    } else {
-                        /* PS acdd04cc copies sampled RGB directly. Its input
-                         * COLOR0 read mask contains alpha only; that alpha was
-                         * transformed by VS o1 = cb0[0] + COLOR0 * cb0[1].
-                         * Multiplying sampled RGB by the compact vertex color
-                         * incorrectly tinted every splash solid red. */
-                        color[0] = sample[0];
-                        color[1] = sample[1];
-                        color[2] = sample[2];
-                        float alpha_modulation = color[3] * texture_multiply[3] +
-                            texture_add[3];
-                        if (alpha_modulation < 0.0f) alpha_modulation = 0.0f;
-                        if (alpha_modulation > 1.0f) alpha_modulation = 1.0f;
-                        color[3] = alpha_modulation * sample[3];
-                    }
-                } else {
-                    float secondary_alpha = vertex[0].color1[3] * weight0 +
-                        vertex[1].color1[3] * weight1 +
-                        vertex[2].color1[3] * weight2;
-                    color[3] *= secondary_alpha;
-                }
-                if (color[3] > 0.0f) ++triangle_alpha_pixels;
-                if (software_blend_pixel(target, (size_t)y * width + (size_t)x,
-                                         color, state))
-                    ++triangle_changed_pixels;
-                ++triangle_pixels;
-            }
-        }
-        if (triangle_pixels) {
-            ++rasterized_triangles;
-            covered_pixels += triangle_pixels;
-            sampled_alpha_pixels += triangle_alpha_pixels;
-            changed_pixels += triangle_changed_pixels;
-            if (left < draw_left) draw_left = left;
-            if (top < draw_top) draw_top = top;
-            if (right > draw_right) draw_right = right;
-            if (bottom > draw_bottom) draw_bottom = bottom;
-        } else {
-            ++empty_triangles;
-        }
-    }
-
-    resource_mark_written(target);
-    static _Atomic(uint32_t) executions;
-    uint32_t execution = atomic_fetch_add(&executions, 1) + 1;
-    if (execution <= 8 || (execution % 64) == 0 ||
-        ((textured_path || simple_textured_path) && textured_attempt <= 8))
-        fprintf(stderr, "[D3D11 REFERENCE] indexed execution=%u shader=%08x "
-                "triangles=%u valid=%u invalid=%u degenerate=%u outside=%u "
-                "empty=%u rasterized=%u covered=%llu alpha=%llu changed=%llu "
-                "bounds=[%d,%d..%d,%d] target=%ux%u\n",
-                execution, pixel_hash, index_count / 3, valid_triangles,
-                invalid_triangles, degenerate_triangles, outside_triangles,
-                empty_triangles, rasterized_triangles,
-                (unsigned long long)covered_pixels,
-                (unsigned long long)sampled_alpha_pixels,
-                (unsigned long long)changed_pixels,
-                rasterized_triangles ? draw_left : 0,
-                rasterized_triangles ? draw_top : 0,
-                rasterized_triangles ? draw_right : 0,
-                rasterized_triangles ? draw_bottom : 0, width, height);
-    if (textured_path || simple_textured_path) {
-        g_last_textured_indexed_target = target;
-        atomic_store(&g_indexed_target_pending, 1);
-    }
-    if (execution == 1 || textured_path || simple_textured_path ||
-        transformed_color_path) {
-        size_t nonblack = 0, nonzero_alpha = 0;
-        for (size_t pixel = 0; pixel < (size_t)width * height; ++pixel) {
-            const uint8_t *sample = target->pixels + pixel * 4;
-            if (sample[0] || sample[1] || sample[2]) ++nonblack;
-            if (sample[3]) ++nonzero_alpha;
-        }
-        uint32_t unsupported = (textured_path || simple_textured_path)
-            ? atomic_load(&g_bc7_unsupported_blocks) - unsupported_before : 0;
-        const char *path_name = simple_textured_path ? "simple-textured" :
-            textured_path ? "textured" : transformed_color_path
-                ? "transformed-color" : "first";
-        fprintf(stderr,
-                "[D3D11 REFERENCE] %s indexed target=%p nonblack=%zu alpha=%zu/%zu "
-                "hash=%08x unsupported-bc7-samples=%u\n",
-                path_name, (void *)target, nonblack, nonzero_alpha,
-                (size_t)width * height,
-                resource_diagnostic_hash(target), unsupported);
-    }
-    return 1;
+    return try_auto_translate_indexed_draw(state, index_count,
+                                           start_index, base_vertex);
 }
+
+/* ---- Dead legacy code deleted ---- */
 
 static void __attribute__((ms_abi)) context_draw(ID3D11DeviceContext* this, uint32_t VertexCount, uint32_t StartVertexLocation) {
     BeerD3D11Command command = { .type = BEER_COMMAND_DRAW };
@@ -5677,6 +5772,15 @@ static ID3D11DeviceContext *d3d11_device_context_create_typed(
 
 ID3D11DeviceContext* d3d11_device_context_create(void) {
     return d3d11_device_context_create_typed(NULL, 0, 0);
+}
+
+ID3D11DeviceContext *d3d11_device_get_immediate_context_owned(
+    ID3D11Device *device)
+{
+    void *context = NULL;
+    if (!device) return NULL;
+    device_get_immediate_context(device, &context);
+    return context;
 }
 
 /* ============================================================================

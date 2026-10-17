@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/time.h>
+#include <sys/uio.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -40,16 +42,31 @@
 /* D3D11 COM object stubs from graphics/ */
 #include "d3d11_compat.h"
 #include "d3d12_compat.h"
-#include "d3d12_compute.h"
+
+
+#include "d3d12_shader_translator.h"
+#include "d3d12_vulkan_compute.h"
+#include "d3d12_vulkan_graphics.h"
+#include "renderer/vulkan/vulkan_compute.h"
+#include "renderer/vulkan/vulkan_graphics.h"
+#include "renderer/vulkan/vulkan_renderer.h"
 #include "platform/xwayland_backend.h"
 #include "platform/directinput_format.h"
+#include "platform/guid_compat.h"
+#include "platform/steam_offline_policy.h"
 #include "platform/win32_input.h"
-#include "platform/directinput_format.h"
+#include "platform/win32_filesystem_policy.h"
+#include "platform/window_style_policy.h"
+#include "platform/window_icon_policy.h"
 #include "audio/audio_backend.h"
+#include "audio/wasapi_compat.h"
 #include "media/media_foundation.h"
 #include "renderer/vulkan/vulkan_indexed_renderer.h"
 
 static void beer_signal_guest_event(uint64_t event_handle);
+static uint64_t beer_mf_invoke_on_read_sample(void *, uint64_t, uint32_t,
+                                               uint32_t, int64_t, void *);
+static uint64_t beer_mf_invoke_on_flush(void *, uint32_t);
 
 /* arch_prctl – set GS base so gs:[0x30] / gs:[0x60] work as TEB/PEB */
 #ifndef ARCH_SET_GS
@@ -108,6 +125,12 @@ typedef struct {
 typedef struct { u32 orig_ilt, timestamp, fwd, name_rva, iat_rva; } ImportDesc;
 typedef struct {
     u32 characteristics, timestamp;
+    u16 major, minor, named_count, id_count;
+} ResourceDir;
+typedef struct { u32 name, offset; } ResourceEntry;
+typedef struct { u32 data_rva, size, codepage, reserved; } ResourceData;
+typedef struct {
+    u32 characteristics, timestamp;
     u16 major, minor;
     u32 name_rva, ordinal_base, function_count, name_count;
     u32 functions_rva, names_rva, ordinals_rva;
@@ -133,12 +156,18 @@ typedef struct {
 #define SCN_READ  0x40000000
 #define SCN_WRITE 0x80000000
 
-#define DIR_IMPORT 1
-#define DIR_RELOC  5
+#define DIR_IMPORT   1
+#define DIR_RESOURCE 2
+#define DIR_RELOC    5
 
 /* ── Globals ────────────────────────────────────────────────────── */
 static u8    *g_img     = NULL;   /* image base in our VA space    */
+static u64    g_img_size = 0;     /* loaded PE OptionalHeader.SizeOfImage */
 static u64    g_delta   = 0;      /* relocation delta              */
+static u32   *g_app_icon_pixels;
+static int    g_app_icon_width;
+static int    g_app_icon_height;
+static char   g_desktop_app_id[128];
 
 typedef struct {
     char name[64];
@@ -748,7 +777,7 @@ static int is_poisoned_stack_addr(u64 addr)
 
 static int is_in_image_exec_range(u64 addr)
 {
-    return g_img && addr >= (u64)g_img && addr < (u64)g_img + 0x42d2000 && image_addr_is_exec(addr);
+    return g_img && addr >= (u64)g_img && addr < (u64)g_img + g_img_size && image_addr_is_exec(addr);
 }
 
 static int is_in_trampoline_range(u64 addr)
@@ -830,7 +859,7 @@ static int is_probably_stack_value(u64 v)
     if (!v) return 0;
     if (v >= 0x7ff000000000ULL && v < 0x800000000000ULL)
         return 1;
-    if (g_img && v >= (u64)g_img && v < (u64)g_img + 0x42d2000)
+    if (g_img && v >= (u64)g_img && v < (u64)g_img + g_img_size)
         return image_addr_is_exec(v);
     return 0;
 }
@@ -985,6 +1014,13 @@ __thread u64 g_dispatch_incoming_rsp;
 __thread u64 g_dispatch_incoming_return;
 static u64 g_impl_targets[MAX_STUBS];
 
+static int is_current_host_call_stack_rsp(u64 rsp)
+{
+    return g_host_call_stack_base && g_host_call_stack_top &&
+           rsp >= g_host_call_stack_base + 0x200 &&
+           rsp < g_host_call_stack_top;
+}
+
 /* ── Minimal Windows TEB / PEB ──────────────────────────────────── */
 /*
  * Windows x64 uses gs:[offset] to access TEB fields.
@@ -1122,13 +1158,25 @@ __asm__(
      * parked in r10 (index already consumed). */
     "    mov %rax, %r10\n"
     "    mov %gs:0xA0, %r11\n"             /* Changed: load from TEB SavedGuestRsp */
-    "    sub $0x80, %rsp\n"
+    /* Windows x64 makes XMM6-XMM15 nonvolatile, while the Linux System V
+     * callees reached by impl_* functions may freely clobber every XMM
+     * register. Preserve the Windows nonvolatile SIMD bank at the ABI bridge.
+     * RE8 keeps its frame-clock frequency in XMM9 across
+     * QueryPerformanceCounter; losing it turns the frame delta into infinity
+     * and prevents normal frame scheduling after resource initialization. */
+    "    sub $0x120, %rsp\n"
+    ".irp reg,6,7,8,9,10,11,12,13,14,15\n"
+    "    movdqu %xmm\\reg, (0x20+\\reg*0x10)(%rsp)\n"
+    ".endr\n"
     ".irp off,0,8,16,24,32,40,48,56,64,72,80,88\n"
     "    mov 0x28+\\off(%r11), %rax\n"
     "    mov %rax, 0x20+\\off(%rsp)\n"
     ".endr\n"
     "    call *%r10\n"
-    "    add $0x80, %rsp\n"
+    ".irp reg,6,7,8,9,10,11,12,13,14,15\n"
+    "    movdqu (0x20+\\reg*0x10)(%rsp), %xmm\\reg\n"
+    ".endr\n"
+    "    add $0x120, %rsp\n"
     /* Preserve the implementation's RAX return value. Reading SavedGuestRsp
      * directly from the TEB needs no helper call, and R11 is volatile under the
      * Windows x64 ABI so it can carry the guest continuation without changing
@@ -1154,14 +1202,20 @@ __asm__(
     "    mov %rax, %r10\n"
     "    mov %rsp, %r11\n"
     "    and $-16, %rsp\n"
-    "    sub $0x90, %rsp\n"
-    "    mov %r11, 0x80(%rsp)\n"            /* exact incoming rsp, above the arg window */
+    "    sub $0x130, %rsp\n"
+    "    mov %r11, 0x120(%rsp)\n"           /* exact incoming rsp, above saved SIMD state */
+    ".irp reg,6,7,8,9,10,11,12,13,14,15\n"
+    "    movdqu %xmm\\reg, (0x20+\\reg*0x10)(%rsp)\n"
+    ".endr\n"
     ".irp off,0,8,16,24,32,40,48,56,64,72,80,88\n"
     "    mov 0x28+\\off(%r11), %rax\n"
     "    mov %rax, 0x20+\\off(%rsp)\n"
     ".endr\n"
     "    call *%r10\n"
-    "    mov 0x80(%rsp), %rsp\n"
+    ".irp reg,6,7,8,9,10,11,12,13,14,15\n"
+    "    movdqu (0x20+\\reg*0x10)(%rsp), %xmm\\reg\n"
+    ".endr\n"
+    "    mov 0x120(%rsp), %rsp\n"
     "    ret\n"
 );
 extern void beer_dispatch_trampoline(void);
@@ -1684,6 +1738,8 @@ static const char g_windows_dir[] = "C:\\Windows";
 static const char g_system_dir[] = "C:\\Windows\\System32";
 static const char g_temp_dir[] = "C:\\Windows\\Temp";
 static const char g_user_profile[] = "C:\\Users\\Player";
+static const char g_documents[] = "C:\\Users\\Player\\Documents";
+static const char g_saved_games[] = "C:\\Users\\Player\\Saved Games";
 static const char g_roaming_appdata[] = "C:\\Users\\Player\\AppData\\Roaming";
 static const char g_local_appdata[] = "C:\\Users\\Player\\AppData\\Local";
 static const char g_program_data[] = "C:\\ProgramData";
@@ -1701,6 +1757,235 @@ static int mkdir_tree(const char *path)
         *p = '/';
     }
     return mkdir(copy, 0777) == 0 || errno == EEXIST;
+}
+
+static int write_all_fd(int fd, const void *data, size_t size)
+{
+    const uint8_t *bytes = data;
+    while (size) {
+        ssize_t written = write(fd, bytes, size);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return 0;
+        bytes += (size_t)written;
+        size -= (size_t)written;
+    }
+    return 1;
+}
+
+static uint32_t desktop_icon_crc32(const uint8_t *data, size_t size)
+{
+    uint32_t crc = UINT32_C(0xffffffff);
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (unsigned bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (UINT32_C(0xedb88320) &
+                  (uint32_t)-(int32_t)(crc & 1u));
+    }
+    return ~crc;
+}
+
+static int desktop_icon_write_u32_be(int fd, uint32_t value)
+{
+    uint8_t bytes[4] = {
+        (uint8_t)(value >> 24), (uint8_t)(value >> 16),
+        (uint8_t)(value >> 8), (uint8_t)value
+    };
+    return write_all_fd(fd, bytes, sizeof(bytes));
+}
+
+static int desktop_icon_write_chunk(int fd, const char type[4],
+                                    const uint8_t *data, size_t size)
+{
+    if (size > UINT32_MAX || !desktop_icon_write_u32_be(fd, (uint32_t)size) ||
+        !write_all_fd(fd, type, 4) || (size && !write_all_fd(fd, data, size)))
+        return 0;
+    uint8_t *crc_data = malloc(size + 4u);
+    if (!crc_data) return 0;
+    memcpy(crc_data, type, 4);
+    if (size) memcpy(crc_data + 4u, data, size);
+    uint32_t crc = desktop_icon_crc32(crc_data, size + 4u);
+    free(crc_data);
+    return desktop_icon_write_u32_be(fd, crc);
+}
+
+/* Write a standards-compliant RGBA PNG without adding a runtime image-library
+ * dependency. The zlib stream uses stored DEFLATE blocks; desktop icons are
+ * small enough that compression is immaterial. */
+static int desktop_icon_write_png(int fd, const uint32_t *pixels,
+                                  int width, int height)
+{
+    if (fd < 0 || !pixels || width <= 0 || height <= 0) return 0;
+    size_t row_size = 1u + (size_t)width * 4u;
+    if (row_size < 5u || (size_t)height > SIZE_MAX / row_size) return 0;
+    size_t raw_size = row_size * (size_t)height;
+    uint8_t *raw = malloc(raw_size);
+    if (!raw) return 0;
+    for (int y = 0; y < height; ++y) {
+        uint8_t *row = raw + (size_t)y * row_size;
+        row[0] = 0; /* PNG filter: None */
+        for (int x = 0; x < width; ++x) {
+            uint32_t argb = pixels[(size_t)y * (size_t)width + (size_t)x];
+            row[1u + (size_t)x * 4u + 0u] = (uint8_t)(argb >> 16);
+            row[1u + (size_t)x * 4u + 1u] = (uint8_t)(argb >> 8);
+            row[1u + (size_t)x * 4u + 2u] = (uint8_t)argb;
+            row[1u + (size_t)x * 4u + 3u] = (uint8_t)(argb >> 24);
+        }
+    }
+
+    size_t block_count = (raw_size + 65534u) / 65535u;
+    if (block_count > (SIZE_MAX - raw_size - 6u) / 5u) {
+        free(raw);
+        return 0;
+    }
+    size_t zlib_size = 2u + raw_size + block_count * 5u + 4u;
+    uint8_t *zlib = malloc(zlib_size);
+    if (!zlib) {
+        free(raw);
+        return 0;
+    }
+    size_t out = 0, consumed = 0;
+    zlib[out++] = 0x78; zlib[out++] = 0x01;
+    while (consumed < raw_size) {
+        size_t remaining = raw_size - consumed;
+        uint16_t length = (uint16_t)(remaining > 65535u ? 65535u : remaining);
+        zlib[out++] = (consumed + length == raw_size) ? 1u : 0u;
+        zlib[out++] = (uint8_t)length; zlib[out++] = (uint8_t)(length >> 8);
+        uint16_t inverse = (uint16_t)~length;
+        zlib[out++] = (uint8_t)inverse; zlib[out++] = (uint8_t)(inverse >> 8);
+        memcpy(zlib + out, raw + consumed, length);
+        out += length;
+        consumed += length;
+    }
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < raw_size; ++i) {
+        a = (a + raw[i]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    uint32_t adler = (b << 16) | a;
+    zlib[out++] = (uint8_t)(adler >> 24); zlib[out++] = (uint8_t)(adler >> 16);
+    zlib[out++] = (uint8_t)(adler >> 8); zlib[out++] = (uint8_t)adler;
+    free(raw);
+
+    static const uint8_t signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    uint8_t ihdr[13] = {
+        (uint8_t)((uint32_t)width >> 24), (uint8_t)((uint32_t)width >> 16),
+        (uint8_t)((uint32_t)width >> 8), (uint8_t)width,
+        (uint8_t)((uint32_t)height >> 24), (uint8_t)((uint32_t)height >> 16),
+        (uint8_t)((uint32_t)height >> 8), (uint8_t)height,
+        8, 6, 0, 0, 0
+    };
+    int ok = out == zlib_size && write_all_fd(fd, signature, sizeof(signature)) &&
+             desktop_icon_write_chunk(fd, "IHDR", ihdr, sizeof(ihdr)) &&
+             desktop_icon_write_chunk(fd, "IDAT", zlib, zlib_size) &&
+             desktop_icon_write_chunk(fd, "IEND", NULL, 0);
+    free(zlib);
+    return ok;
+}
+
+static int desktop_exec_quote(FILE *file, const char *value)
+{
+    if (!file || !value || fputc('"', file) == EOF) return 0;
+    for (const char *p = value; *p; ++p) {
+        if ((*p == '"' || *p == '\\' || *p == '`' || *p == '$') &&
+            fputc('\\', file) == EOF)
+            return 0;
+        if (fputc((unsigned char)*p, file) == EOF) return 0;
+    }
+    return fputc('"', file) != EOF;
+}
+
+/* GNOME and other desktop shells associate X11 windows with launchers through
+ * StartupWMClass. _NET_WM_ICON is still published for window managers that use
+ * it directly, but install a hidden, per-executable desktop identity as well.
+ * Every value is derived from the current executable and its PE icon. */
+static int install_desktop_identity(void)
+{
+    if (!g_desktop_app_id[0] || !g_exe_host_path || !g_app_icon_pixels ||
+        g_app_icon_width <= 0 || g_app_icon_height <= 0)
+        return 0;
+
+    const char *data_home = getenv("XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+    char data_root[PATH_MAX];
+    if (data_home && *data_home) {
+        if (snprintf(data_root, sizeof(data_root), "%s", data_home) >=
+            (int)sizeof(data_root))
+            return 0;
+    } else if (!home || !*home ||
+               snprintf(data_root, sizeof(data_root), "%s/.local/share", home) >=
+                   (int)sizeof(data_root)) {
+        return 0;
+    }
+
+    char applications[PATH_MAX];
+    char icon_directory[PATH_MAX];
+    char desktop_path[PATH_MAX];
+    char icon_path[PATH_MAX];
+    char desktop_file_id[160];
+    char icon_name[160];
+    if (snprintf(desktop_file_id, sizeof(desktop_file_id), "beer-%s",
+                 g_desktop_app_id) >= (int)sizeof(desktop_file_id) ||
+        snprintf(icon_name, sizeof(icon_name), "beer-%s", g_desktop_app_id) >=
+            (int)sizeof(icon_name) ||
+        snprintf(applications, sizeof(applications), "%s/applications", data_root) >=
+            (int)sizeof(applications) ||
+        snprintf(icon_directory, sizeof(icon_directory),
+                 "%s/icons/hicolor/256x256/apps", data_root) >=
+            (int)sizeof(icon_directory) ||
+        snprintf(desktop_path, sizeof(desktop_path), "%s/%s.desktop",
+                 applications, desktop_file_id) >= (int)sizeof(desktop_path) ||
+        snprintf(icon_path, sizeof(icon_path), "%s/%s.png", icon_directory,
+                 icon_name) >= (int)sizeof(icon_path) ||
+        !mkdir_tree(applications) || !mkdir_tree(icon_directory))
+        return 0;
+
+    char temporary[PATH_MAX];
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp-%ld", icon_path,
+                 (long)getpid()) >= (int)sizeof(temporary))
+        return 0;
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return 0;
+    int ok = desktop_icon_write_png(fd, g_app_icon_pixels,
+                                    g_app_icon_width, g_app_icon_height);
+    if (close(fd) != 0) ok = 0;
+    if (!ok || rename(temporary, icon_path) != 0) {
+        unlink(temporary);
+        return 0;
+    }
+
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp-%ld", desktop_path,
+                 (long)getpid()) >= (int)sizeof(temporary))
+        return 0;
+    FILE *desktop = fopen(temporary, "w");
+    if (!desktop) return 0;
+    char loader_path[PATH_MAX];
+    ssize_t loader_length = readlink("/proc/self/exe", loader_path,
+                                     sizeof(loader_path) - 1u);
+    if (loader_length <= 0 || (size_t)loader_length >= sizeof(loader_path)) {
+        fclose(desktop);
+        unlink(temporary);
+        return 0;
+    }
+    loader_path[loader_length] = 0;
+    /* Use the absolute PNG path here rather than a themed icon name. GNOME's
+     * hicolor cache can predate a newly extracted per-executable icon, causing
+     * an otherwise correctly matched XWayland window to fall back to the gear
+     * until the desktop session refreshes that cache. Desktop entries permit
+     * absolute icon paths, which also makes the association deterministic. */
+    ok = fprintf(desktop,
+                 "[Desktop Entry]\nType=Application\nName=%s\nNoDisplay=true\n"
+                 "Terminal=false\nStartupNotify=false\nStartupWMClass=%s\nIcon=%s\nExec=",
+                 g_desktop_app_id, g_desktop_app_id, icon_path) > 0 &&
+         desktop_exec_quote(desktop, loader_path) &&
+         fputs(" --renderer=vulkan --presenter=auto ", desktop) != EOF &&
+         desktop_exec_quote(desktop, g_exe_host_path) &&
+         fputc('\n', desktop) != EOF;
+    if (fclose(desktop) != 0) ok = 0;
+    if (!ok || rename(temporary, desktop_path) != 0) {
+        unlink(temporary);
+        return 0;
+    }
+    return 1;
 }
 
 static int configure_guest_prefix(const char *requested)
@@ -2353,7 +2638,7 @@ static void dbg_dump_guest_callchain(const char *tag) {
     int printed = 0;
     for (int i = 0; i < 200 && printed < 24; i++) {
         u64 v = sp[i];
-        if (v >= (u64)g_img && v < (u64)g_img + 0x42d2000) {
+        if (v >= (u64)g_img && v < (u64)g_img + g_img_size) {
             fprintf(stderr, "[CHAIN:%s]   [%3d] img+0x%lx\n", tag, i, v - (u64)g_img);
             printed++;
         }
@@ -3400,41 +3685,17 @@ impl_SetSecurityDescriptorDacl(u64 sd, u32 p, u64 acl, u32 def)
     { (void)sd;(void)p;(void)acl;(void)def; return 1; }
 
 /* ── Steam API stubs ─────────────────────────────────────────────── */
-static void steam_disable_unsupported_online_probe(void)
-{
-    static int completed;
-    if (completed || !g_img) return;
-
-    /* CSNetFpsCheckStep's writable function/name table is populated by guest
-     * static constructors, so it is not available during Beer's pre-entry
-     * setup. Once Steam initializes, replace only STEP_Checking with the game's
-     * own STEP_Finish routine. Otherwise the unsupported network FPS request
-     * eventually invokes STEP_ApplyResult (RVA 0x1068a80), sets status +0xa52,
-     * and raises asynchronous FDP_System_Message(4161). */
-    u64 *checking_slot = (u64 *)(g_img + 0x3d93bd0);
-    u64 expected = (u64)g_img + 0x1068ab0;
-    u64 offline_finish = (u64)g_img + 0x1068d50;
-    if (*checking_slot == expected) {
-        *checking_slot = offline_finish;
-        completed = 1;
-        fprintf(stderr,
-                "[STEAM] Disabled unsupported CSNetFpsCheckStep online probe "
-                "(step-table RVA 0x3d93bd0 -> STEP_Finish)\n");
-    }
-}
-
 static u64 __attribute__((ms_abi)) impl_SteamAPI_Init(void) {
-    /* Expose an initialized local runtime so Sekiro can retain its deterministic
-     * identity/save path. Online interfaces remain explicitly unavailable. */
-    steam_disable_unsupported_online_probe();
+    /* Expose an initialized local runtime so applications can retain their
+     * deterministic identity/save path. Online interfaces remain explicitly
+     * unavailable; never modify guest code or data to bypass online checks. */
     fprintf(stderr, "[STEAM] Steam runtime initialized (offline user)\n");
     return 1;
 }
 static u64 __attribute__((ms_abi))
 impl_SteamAPI_RestartAppIfNecessary(u32 appid) { (void)appid; return 0; }
 static u64 __attribute__((ms_abi)) impl_SteamAPI_Shutdown(void)     { return 0; }
-static u64 __attribute__((ms_abi)) impl_SteamAPI_RunCallbacks(void)
-    { steam_disable_unsupported_online_probe(); return 0; }
+static u64 __attribute__((ms_abi)) impl_SteamAPI_RunCallbacks(void);
 static u64 __attribute__((ms_abi)) impl_SteamAPI_IsSteamRunning(void) { return 1; }
 
 static u64 __attribute__((ms_abi)) impl_SteamApps(void);
@@ -3470,6 +3731,14 @@ impl_SteamInternal_CreateInterface(const char *version)
     if (strstr(lower, "steamutils"))         return impl_SteamUtils();
     if (strstr(lower, "steamugc"))           return impl_SteamUGC();
     if (strstr(lower, "steamremotestorage")) return impl_SteamRemoteStorage();
+    if (strstr(lower, "steamnetworking")) {
+        static atomic_flag warned = ATOMIC_FLAG_INIT;
+        if (!atomic_flag_test_and_set_explicit(&warned, memory_order_relaxed))
+            fprintf(stderr,
+                    "[STEAM] %s unavailable in offline profile "
+                    "(benign unless online play is requested)\n", version);
+        return 0;
+    }
     fprintf(stderr, "[STEAM] unsupported interface %s\n", version);
     return 0;
 }
@@ -3517,11 +3786,9 @@ impl_SteamAPI_RegisterCallback(u64 cb, u32 id)   { (void)cb; (void)id; return 0;
 static u64 __attribute__((ms_abi))
 impl_SteamAPI_UnregisterCallback(u64 cb)          { (void)cb; return 0; }
 static u64 __attribute__((ms_abi))
-impl_SteamAPI_RegisterCallResult(u64 cb, u64 call)
-    { (void)cb; (void)call; return 0; }
+impl_SteamAPI_RegisterCallResult(u64 cb, u64 call);
 static u64 __attribute__((ms_abi))
-impl_SteamAPI_UnregisterCallResult(u64 cb, u64 call)
-    { (void)cb; (void)call; return 0; }
+impl_SteamAPI_UnregisterCallResult(u64 cb, u64 call);
 
 /*
  * Minimal offline Steam interface objects.
@@ -3552,11 +3819,11 @@ static u64 __attribute__((ms_abi))
 steam_user_get_steam_id(u64 self, u64 *steam_id)
 {
     (void)self;
+    /* CSteamID is a non-trivial C++ return type in the Steamworks ABI. MSVC
+     * supplies a hidden result pointer in RDX even though its payload is only
+     * eight bytes. Return that pointer after constructing the value in place. */
     if (!steam_id) return 0;
-    /* CSteamID is an eight-byte value returned through the MSVC aggregate
-     * return pointer supplied in RDX. Account type Individual and universe
-     * Public make this a structurally valid offline identity. */
-    *steam_id = 0x0110000100000001ULL;
+    *steam_id = beer_steam_local_user_id();
     return (u64)steam_id;
 }
 
@@ -3564,10 +3831,480 @@ static u64  g_steam_vtab[STEAM_VTAB_SZ];
 static u64  g_steam_apps_vtab[STEAM_VTAB_SZ];
 static u64  g_steam_friends_vtab[STEAM_VTAB_SZ];
 static u64  g_steam_user_vtab[STEAM_VTAB_SZ];
+static u64  g_steam_utils_vtab[STEAM_VTAB_SZ];
+static u64  g_steam_remote_storage_vtab[STEAM_VTAB_SZ];
 static u64 *g_steam_obj;
 static u64  g_steam_apps_obj;
 static u64  g_steam_friends_obj;
 static u64  g_steam_user_obj;
+static u64  g_steam_utils_obj;
+static u64  g_steam_remote_storage_obj;
+static pthread_mutex_t g_steam_storage_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_steam_cloud_enabled = 1;
+
+static int save_diagnostics_enabled(void);
+static void save_diagnostic_payload(const char *backend, const char *operation,
+                                    const char *name, const void *data,
+                                    size_t size);
+
+typedef struct BeerSteamCall {
+    u64 handle;
+    u64 call_result;
+    u32 callback_id;
+    u32 result_size;
+    u8 result[32];
+    char read_path[PATH_MAX];
+    u64 read_offset;
+    u32 read_size;
+    int used;
+    int dispatched;
+} BeerSteamCall;
+
+#define BEER_STEAM_CALL_CAPACITY 64
+static BeerSteamCall g_steam_calls[BEER_STEAM_CALL_CAPACITY];
+static pthread_mutex_t g_steam_call_mutex = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic(u64) g_next_steam_call = 1;
+
+typedef struct BeerSteamDispatch {
+    u64 callback;
+    u64 handle;
+    u32 callback_id;
+    u32 result_size;
+    u8 result[32];
+} BeerSteamDispatch;
+
+static u64 __attribute__((ms_abi))
+impl_SteamAPI_RegisterCallResult(u64 callback, u64 call_handle)
+{
+    pthread_mutex_lock(&g_steam_call_mutex);
+    BeerSteamCall *call = &g_steam_calls[call_handle % BEER_STEAM_CALL_CAPACITY];
+    int valid = callback && call->used && call->handle == call_handle;
+    if (valid) {
+        call->call_result = callback;
+        call->dispatched = 0;
+    }
+    pthread_mutex_unlock(&g_steam_call_mutex);
+    if (getenv("BEER_FILE_DIAGNOSTICS"))
+        fprintf(stderr, "[STEAM] RegisterCallResult call=%llu callback=0x%llx valid=%d\n",
+                (unsigned long long)call_handle,
+                (unsigned long long)callback, valid);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_SteamAPI_UnregisterCallResult(u64 callback, u64 call_handle)
+{
+    pthread_mutex_lock(&g_steam_call_mutex);
+    BeerSteamCall *call = &g_steam_calls[call_handle % BEER_STEAM_CALL_CAPACITY];
+    if (call->used && call->handle == call_handle &&
+        call->call_result == callback) {
+        call->call_result = 0;
+        call->dispatched = 1;
+    }
+    pthread_mutex_unlock(&g_steam_call_mutex);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_SteamAPI_RunCallbacks(void)
+{
+    BeerSteamDispatch pending[BEER_STEAM_CALL_CAPACITY];
+    size_t count = 0;
+    pthread_mutex_lock(&g_steam_call_mutex);
+    for (size_t i = 0; i < BEER_STEAM_CALL_CAPACITY; ++i) {
+        BeerSteamCall *call = &g_steam_calls[i];
+        if (!call->used || !call->call_result || call->dispatched) continue;
+        BeerSteamDispatch *dispatch = &pending[count++];
+        dispatch->callback = call->call_result;
+        dispatch->handle = call->handle;
+        dispatch->callback_id = call->callback_id;
+        dispatch->result_size = call->result_size;
+        memcpy(dispatch->result, call->result, call->result_size);
+        call->dispatched = 1;
+    }
+    pthread_mutex_unlock(&g_steam_call_mutex);
+
+    for (size_t i = 0; i < count; ++i) {
+        BeerSteamDispatch *dispatch = &pending[i];
+        u64 *object = (u64 *)(uintptr_t)dispatch->callback;
+        u64 *vtable = object ? (u64 *)(uintptr_t)object[0] : NULL;
+        if (!vtable || !vtable[1]) continue;
+        typedef void __attribute__((ms_abi)) (*RunCallResult)(
+            u64, void *, u32, u64);
+        ((RunCallResult)(uintptr_t)vtable[1])(
+            dispatch->callback, dispatch->result, 0, dispatch->handle);
+        if (getenv("BEER_FILE_DIAGNOSTICS"))
+            fprintf(stderr,
+                    "[STEAM] dispatched call=%llu callback-id=%u size=%u\n",
+                    (unsigned long long)dispatch->handle,
+                    dispatch->callback_id, dispatch->result_size);
+    }
+    return 0;
+}
+
+static int steam_storage_path(const char *name, char *path, size_t capacity)
+{
+    char relative[PATH_MAX];
+    if (!beer_steam_storage_normalize_path(name, relative, sizeof(relative))) {
+        if (getenv("BEER_FILE_DIAGNOSTICS"))
+            fprintf(stderr, "[STEAM STORAGE] rejected path=%s\n",
+                    name ? name : "(null)");
+        return 0;
+    }
+    return snprintf(path, capacity, "%s/steam_remote_storage/%s",
+                    g_prefix_path, relative) < (int)capacity;
+}
+
+static int steam_storage_ensure_parent(const char *path)
+{
+    char parent[PATH_MAX];
+    if (!path || strlen(path) >= sizeof(parent)) return 0;
+    strcpy(parent, path);
+    char *separator = strrchr(parent, '/');
+    if (!separator) return 0;
+    *separator = 0;
+    return mkdir_tree(parent);
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_file_write(u64 self, const char *name, const void *data, s32 size)
+{
+    (void)self;
+    if (size < 0 || (size && !data)) return 0;
+    char path[PATH_MAX];
+    if (!steam_storage_path(name, path, sizeof(path)) ||
+        !steam_storage_ensure_parent(path)) return 0;
+    pthread_mutex_lock(&g_steam_storage_mutex);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    size_t written = 0;
+    while (fd >= 0 && written < (size_t)size) {
+        ssize_t result = write(fd, (const u8 *)data + written,
+                               (size_t)size - written);
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) break;
+        written += (size_t)result;
+    }
+    int ok = fd >= 0 && written == (size_t)size && fsync(fd) == 0;
+    if (fd >= 0) close(fd);
+    if (!ok) unlink(path);
+    pthread_mutex_unlock(&g_steam_storage_mutex);
+    if (getenv("BEER_FILE_DIAGNOSTICS"))
+        fprintf(stderr, "[STEAM STORAGE] FileWrite name=%s bytes=%d ok=%d\n",
+                name ? name : "(null)", size, ok);
+    return ok;
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_file_read(u64 self, const char *name, void *data, s32 capacity)
+{
+    (void)self;
+    if (capacity < 0 || (capacity && !data)) return 0;
+    char path[PATH_MAX];
+    if (!steam_storage_path(name, path, sizeof(path))) return 0;
+    pthread_mutex_lock(&g_steam_storage_mutex);
+    int fd = open(path, O_RDONLY);
+    struct stat status;
+    int stat_ok = fd >= 0 && fstat(fd, &status) == 0;
+    ssize_t received = fd >= 0 ? read(fd, data, (size_t)capacity) : -1;
+    int saved_errno = received < 0 ? errno : 0;
+    if (fd >= 0) close(fd);
+    pthread_mutex_unlock(&g_steam_storage_mutex);
+    if (save_diagnostics_enabled()) {
+        fprintf(stderr, "[SAVE READ] backend=steam operation=FileRead name=%s "
+                "host=%s capacity=%d stored=%lld received=%lld errno=%d\n",
+                name ? name : "(null)", path, capacity,
+                (long long)(stat_ok ? status.st_size : -1),
+                (long long)received, saved_errno);
+        if (received > 0)
+            save_diagnostic_payload("steam", "FileReadData", name, data,
+                                    (size_t)received);
+    }
+    return received < 0 ? 0 : (u64)(u32)received;
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_file_delete(u64 self, const char *name)
+{
+    (void)self;
+    char path[PATH_MAX];
+    if (!steam_storage_path(name, path, sizeof(path))) return 0;
+    pthread_mutex_lock(&g_steam_storage_mutex);
+    int ok = unlink(path) == 0 || errno == ENOENT;
+    pthread_mutex_unlock(&g_steam_storage_mutex);
+    return ok;
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_file_exists(u64 self, const char *name)
+{
+    (void)self;
+    char path[PATH_MAX];
+    struct stat status;
+    int path_ok = steam_storage_path(name, path, sizeof(path));
+    int exists = path_ok && stat(path, &status) == 0 && S_ISREG(status.st_mode);
+    if (save_diagnostics_enabled())
+        fprintf(stderr, "[SAVE READ] backend=steam operation=FileExists name=%s "
+                "host=%s exists=%d size=%lld errno=%d\n",
+                name ? name : "(null)", path_ok ? path : "(invalid)", exists,
+                (long long)(exists ? status.st_size : -1), exists ? 0 : errno);
+    return exists;
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_file_size(u64 self, const char *name)
+{
+    (void)self;
+    char path[PATH_MAX];
+    struct stat status;
+    int path_ok = steam_storage_path(name, path, sizeof(path));
+    int found = path_ok && stat(path, &status) == 0;
+    if (save_diagnostics_enabled())
+        fprintf(stderr, "[SAVE READ] backend=steam operation=GetFileSize name=%s "
+                "host=%s found=%d size=%lld errno=%d\n",
+                name ? name : "(null)", path_ok ? path : "(invalid)", found,
+                (long long)(found ? status.st_size : -1), found ? 0 : errno);
+    return found ? (u64)(u32)status.st_size : 0;
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_file_timestamp(u64 self, const char *name)
+{
+    (void)self;
+    char path[PATH_MAX];
+    struct stat status;
+    return steam_storage_path(name, path, sizeof(path)) && stat(path, &status) == 0
+        ? (u64)(s64)status.st_mtime : 0;
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_get_quota(u64 self, u64 *total, u64 *available)
+{
+    (void)self;
+    struct statvfs space;
+    if (statvfs(g_prefix_path, &space) != 0) return 0;
+    u64 unit = space.f_frsize ? space.f_frsize : space.f_bsize;
+    if (total) *total = (u64)space.f_blocks * unit;
+    if (available) *available = (u64)space.f_bavail * unit;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_cloud_enabled(u64 self) { (void)self; return g_steam_cloud_enabled != 0; }
+static u64 __attribute__((ms_abi))
+steam_storage_set_cloud_enabled(u64 self, u32 enabled)
+    { (void)self; g_steam_cloud_enabled = enabled != 0; return 0; }
+
+static u64 steam_call_complete(u32 callback_id, const void *result, u32 result_size)
+{
+    u64 handle = atomic_fetch_add_explicit(&g_next_steam_call, 1,
+                                            memory_order_relaxed);
+    if (!handle) handle = atomic_fetch_add_explicit(&g_next_steam_call, 1,
+                                                     memory_order_relaxed);
+    pthread_mutex_lock(&g_steam_call_mutex);
+    BeerSteamCall *call = &g_steam_calls[handle % BEER_STEAM_CALL_CAPACITY];
+    memset(call, 0, sizeof(*call));
+    call->handle = handle;
+    call->callback_id = callback_id;
+    call->result_size = result_size > sizeof(call->result)
+        ? sizeof(call->result) : result_size;
+    if (result && call->result_size) memcpy(call->result, result, call->result_size);
+    call->used = 1;
+    pthread_mutex_unlock(&g_steam_call_mutex);
+    return handle;
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_file_write_async(u64 self, const char *name,
+                               const void *data, u32 size)
+{
+    u32 result = steam_storage_file_write(self, name, data, (s32)size)
+        ? 1u : 2u;
+    u64 call = steam_call_complete(BEER_STEAM_REMOTE_STORAGE_WRITE_CALLBACK_ID,
+                                   &result, sizeof(result));
+    if (getenv("BEER_FILE_DIAGNOSTICS"))
+        fprintf(stderr, "[STEAM STORAGE] FileWriteAsync name=%s bytes=%u call=%llu result=%u\n",
+                name ? name : "(null)", size, (unsigned long long)call, result);
+    return call;
+}
+
+/* Steam's 8-byte-packed RemoteStorageFileReadAsyncComplete_t is 24 bytes:
+ * SteamAPICall_t, EResult, offset, byte count, and tail padding. Keep the file
+ * identity on the call record so FileReadAsyncComplete can perform the
+ * caller-supplied-buffer transfer after the completion has been observed. */
+typedef struct BeerSteamReadAsyncComplete {
+    u64 call;
+    u32 result;
+    u32 offset;
+    u32 bytes;
+} BeerSteamReadAsyncComplete;
+
+_Static_assert(sizeof(BeerSteamReadAsyncComplete) ==
+               BEER_STEAM_REMOTE_STORAGE_READ_RESULT_SIZE,
+               "Steam async-read completion ABI size");
+_Static_assert(offsetof(BeerSteamReadAsyncComplete, offset) == 12,
+               "Steam async-read completion offset field");
+_Static_assert(offsetof(BeerSteamReadAsyncComplete, bytes) == 16,
+               "Steam async-read completion byte-count field");
+
+static u64 __attribute__((ms_abi))
+steam_storage_file_read_async(u64 self, const char *name,
+                              u32 offset, u32 bytes_to_read)
+{
+    (void)self;
+    char path[PATH_MAX];
+    struct stat status;
+    int path_ok = steam_storage_path(name, path, sizeof(path));
+    int found = 0;
+    u32 result = 2u;
+    if (path_ok) {
+        pthread_mutex_lock(&g_steam_storage_mutex);
+        found = stat(path, &status) == 0 && S_ISREG(status.st_mode);
+        pthread_mutex_unlock(&g_steam_storage_mutex);
+        if (found && offset <= (u64)status.st_size &&
+            (u64)bytes_to_read <= (u64)status.st_size - offset)
+            result = 1u;
+    }
+
+    BeerSteamReadAsyncComplete completion = {
+        .call = 0,
+        .result = result,
+        .offset = offset,
+        .bytes = result == 1u ? bytes_to_read : 0u,
+    };
+    u64 call = steam_call_complete(BEER_STEAM_REMOTE_STORAGE_READ_CALLBACK_ID,
+                                   &completion, sizeof(completion));
+    completion.call = call;
+
+    pthread_mutex_lock(&g_steam_call_mutex);
+    BeerSteamCall *record = &g_steam_calls[call % BEER_STEAM_CALL_CAPACITY];
+    if (record->used && record->handle == call) {
+        memcpy(record->result, &completion, sizeof(completion));
+        if (path_ok) snprintf(record->read_path, sizeof(record->read_path), "%s", path);
+        record->read_offset = offset;
+        record->read_size = completion.bytes;
+    }
+    pthread_mutex_unlock(&g_steam_call_mutex);
+
+    if (save_diagnostics_enabled())
+        fprintf(stderr,
+                "[SAVE READ] backend=steam operation=FileReadAsync name=%s "
+                "host=%s offset=%llu requested=%u stored=%lld call=%llu result=%u\n",
+                name ? name : "(null)", path_ok ? path : "(invalid)",
+                (unsigned long long)offset, bytes_to_read,
+                (long long)(found ? status.st_size : -1),
+                (unsigned long long)call, result);
+    return call;
+}
+
+static u64 __attribute__((ms_abi))
+steam_storage_file_read_async_complete(u64 self, u64 call_handle,
+                                       void *data, u32 capacity)
+{
+    (void)self;
+    if (capacity && !data) return 0;
+    char path[PATH_MAX] = {0};
+    u64 offset = 0;
+    u32 expected = 0;
+
+    pthread_mutex_lock(&g_steam_call_mutex);
+    BeerSteamCall *call = &g_steam_calls[call_handle % BEER_STEAM_CALL_CAPACITY];
+    int valid = call->used && call->handle == call_handle &&
+                call->callback_id == BEER_STEAM_REMOTE_STORAGE_READ_CALLBACK_ID &&
+                call->read_path[0] && call->read_size <= capacity;
+    if (valid) {
+        snprintf(path, sizeof(path), "%s", call->read_path);
+        offset = call->read_offset;
+        expected = call->read_size;
+    }
+    pthread_mutex_unlock(&g_steam_call_mutex);
+
+    size_t received = 0;
+    int saved_errno = 0;
+    if (valid) {
+        pthread_mutex_lock(&g_steam_storage_mutex);
+        int fd = open(path, O_RDONLY);
+        while (fd >= 0 && received < expected) {
+            ssize_t result = pread(fd, (u8 *)data + received,
+                                   expected - received,
+                                   (off_t)(offset + received));
+            if (result < 0 && errno == EINTR) continue;
+            if (result <= 0) {
+                if (result < 0) saved_errno = errno;
+                break;
+            }
+            received += (size_t)result;
+        }
+        if (fd < 0) saved_errno = errno;
+        if (fd >= 0) close(fd);
+        pthread_mutex_unlock(&g_steam_storage_mutex);
+    }
+    int ok = valid && received == expected;
+    if (ok) {
+        pthread_mutex_lock(&g_steam_call_mutex);
+        call = &g_steam_calls[call_handle % BEER_STEAM_CALL_CAPACITY];
+        if (call->used && call->handle == call_handle) call->used = 0;
+        pthread_mutex_unlock(&g_steam_call_mutex);
+    }
+    if (save_diagnostics_enabled()) {
+        fprintf(stderr,
+                "[SAVE READ] backend=steam operation=FileReadAsyncComplete "
+                "call=%llu host=%s offset=%llu capacity=%u expected=%u "
+                "received=%zu ok=%d errno=%d\n",
+                (unsigned long long)call_handle, path[0] ? path : "(none)",
+                (unsigned long long)offset, capacity, expected, received, ok,
+                saved_errno);
+        if (received)
+            save_diagnostic_payload("steam", "FileReadAsyncData", path, data,
+                                    received);
+    }
+    return ok;
+}
+
+static u64 __attribute__((ms_abi))
+steam_utils_is_api_call_completed(u64 self, u64 call_handle, u32 *failed)
+{
+    (void)self;
+    if (failed) *failed = 0;
+    pthread_mutex_lock(&g_steam_call_mutex);
+    BeerSteamCall *call = &g_steam_calls[call_handle % BEER_STEAM_CALL_CAPACITY];
+    int complete = call->used && call->handle == call_handle;
+    pthread_mutex_unlock(&g_steam_call_mutex);
+    if (getenv("BEER_FILE_DIAGNOSTICS"))
+        fprintf(stderr,
+                "[STEAM] IsAPICallCompleted call=%llu complete=%d failed=%u\n",
+                (unsigned long long)call_handle, complete,
+                failed ? *failed : 0u);
+    return complete;
+}
+
+static u64 __attribute__((ms_abi))
+steam_utils_get_api_call_result(u64 self, u64 call_handle, void *callback,
+                                s32 callback_size, s32 expected_id, u32 *failed)
+{
+    (void)self;
+    if (failed) *failed = 0;
+    if (!callback || callback_size < 0) {
+        if (failed) *failed = 1;
+        return 0;
+    }
+    pthread_mutex_lock(&g_steam_call_mutex);
+    BeerSteamCall *call = &g_steam_calls[call_handle % BEER_STEAM_CALL_CAPACITY];
+    int valid = call->used && call->handle == call_handle &&
+                call->callback_id == (u32)expected_id &&
+                (u32)callback_size == call->result_size;
+    if (valid) {
+        memcpy(callback, call->result, call->result_size);
+        call->used = 0;
+    }
+    pthread_mutex_unlock(&g_steam_call_mutex);
+    if (!valid && failed) *failed = 1;
+    if (getenv("BEER_FILE_DIAGNOSTICS"))
+        fprintf(stderr,
+                "[STEAM] GetAPICallResult call=%llu expected=%d size=%d valid=%d failed=%u\n",
+                (unsigned long long)call_handle, expected_id, callback_size,
+                valid, failed ? *failed : 0u);
+    return valid;
+}
 
 static void init_steam_fake(void) {
     for (int i = 0; i < STEAM_VTAB_SZ; i++) {
@@ -3581,24 +4318,47 @@ static void init_steam_fake(void) {
         g_steam_apps_vtab[i] = (u64)steam_vfn_false;
         g_steam_friends_vtab[i] = (u64)steam_vfn_false;
         g_steam_user_vtab[i] = (u64)steam_vfn_false;
+        g_steam_utils_vtab[i] = (u64)steam_vfn_false;
+        g_steam_remote_storage_vtab[i] = (u64)steam_vfn_false;
     }
+    /* ISteamRemoteStorage014 begins with the stable local file API. Cloud
+     * backing is persisted inside the selected Beer prefix, so saves remain
+     * isolated per prefix while preserving Steamworks semantics. */
+    g_steam_remote_storage_vtab[0] = (u64)steam_storage_file_write;
+    g_steam_remote_storage_vtab[1] = (u64)steam_storage_file_read;
+    g_steam_remote_storage_vtab[5] = (u64)steam_vfn_true; /* FileForget */
+    g_steam_remote_storage_vtab[6] = (u64)steam_storage_file_delete;
+    g_steam_remote_storage_vtab[8] = (u64)steam_vfn_true; /* SetSyncPlatforms */
+    g_steam_remote_storage_vtab[13] = (u64)steam_storage_file_exists;
+    g_steam_remote_storage_vtab[14] = (u64)steam_storage_file_exists; /* persisted */
+    g_steam_remote_storage_vtab[15] = (u64)steam_storage_file_size;
+    g_steam_remote_storage_vtab[16] = (u64)steam_storage_file_timestamp;
+    g_steam_remote_storage_vtab[20] = (u64)steam_storage_get_quota;
+    g_steam_remote_storage_vtab[21] = (u64)steam_storage_cloud_enabled;
+    g_steam_remote_storage_vtab[22] = (u64)steam_storage_cloud_enabled;
+    g_steam_remote_storage_vtab[23] = (u64)steam_storage_set_cloud_enabled;
+    /* ISteamRemoteStorage014 places FileWriteAsync at slot 2, directly after
+     * FileWrite and FileRead. Its call handle is exposed through ISteamUtils. */
+    g_steam_remote_storage_vtab[2] = (u64)steam_storage_file_write_async;
+    g_steam_remote_storage_vtab[3] = (u64)steam_storage_file_read_async;
+    g_steam_remote_storage_vtab[4] = (u64)steam_storage_file_read_async_complete;
+    /* ISteamUtils009: IsAPICallCompleted and GetAPICallResult. */
+    g_steam_utils_vtab[11] = (u64)steam_utils_is_api_call_completed;
+    g_steam_utils_vtab[14] = (u64)steam_utils_get_api_call_result;
     /* ISteamApps vtable[4]=GetCurrentGameLanguage, [5]=GetAvailableGameLanguages. */
     g_steam_apps_vtab[4] = (u64)steam_vfn_english;
     g_steam_apps_vtab[5] = (u64)steam_vfn_english;
     /* ISteamFriends vtable[0]=GetPersonaName. */
     g_steam_friends_vtab[0] = (u64)steam_friends_get_persona_name;
-    /* ISteamUser vtable[0]=GetHSteamUser and [1]=BLoggedOn. Beer exposes a
-     * valid local Steam runtime but an offline user. Returning TRUE from the
-     * old catch-all slot 1 made Sekiro enter its game-server login flow; the
-     * asynchronous failure sets network-state byte +0xa52 and raises
-     * FDP_System_Message(4161). */
+    /* Beer has no connected Steam client session. Keep BLoggedOn false while
+     * still exposing a stable local CSteamID for offline persistence keys. */
     g_steam_user_vtab[1] = (u64)steam_vfn_false;
-    /* ISteamUser vtable[2]=GetSteamID. The 64-bit aggregate is returned via
-     * the hidden output pointer used by this MSVC ABI call site. */
     g_steam_user_vtab[2] = (u64)steam_user_get_steam_id;
     g_steam_apps_obj = (u64)g_steam_apps_vtab;
     g_steam_friends_obj = (u64)g_steam_friends_vtab;
     g_steam_user_obj = (u64)g_steam_user_vtab;
+    g_steam_utils_obj = (u64)g_steam_utils_vtab;
+    g_steam_remote_storage_obj = (u64)g_steam_remote_storage_vtab;
 
     g_steam_obj = mmap(NULL, 4096, PROT_READ|PROT_WRITE,
                        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -3610,12 +4370,13 @@ static void init_steam_fake(void) {
 
 static u64 __attribute__((ms_abi)) impl_SteamApps(void)     { return (u64)&g_steam_apps_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamClient(void)   { return (u64)g_steam_obj; }
-static u64 __attribute__((ms_abi)) impl_SteamUtils(void)    { return (u64)g_steam_obj; }
+static u64 __attribute__((ms_abi)) impl_SteamUtils(void)    { return (u64)&g_steam_utils_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamUser(void)     { return (u64)&g_steam_user_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamFriends(void)  { return (u64)&g_steam_friends_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamUserStats(void){ return (u64)g_steam_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamUGC(void)      { return (u64)g_steam_obj; }
-static u64 __attribute__((ms_abi)) impl_SteamRemoteStorage(void) { return (u64)g_steam_obj; }
+static u64 __attribute__((ms_abi)) impl_SteamRemoteStorage(void)
+    { return (u64)&g_steam_remote_storage_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamNetworking(void) { return 0; }
 
 /* ── Engine internal allocator (vtable[10] on fake COM objects) ─────
@@ -3978,6 +4739,46 @@ impl_SystemTimeToFileTime(const u16 *systime, u64 *filetime) {
     return 1;
 }
 
+static u64 __attribute__((ms_abi))
+impl_FileTimeToLocalFileTime(const u64 *utc_filetime, u64 *local_filetime)
+{
+    if (!utc_filetime || !local_filetime) {
+        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+
+    const u64 epoch_seconds = EPOCH_DIFF / 10000000ULL;
+    const u64 ticks = *utc_filetime;
+    const u64 seconds_since_1601 = ticks / 10000000ULL;
+    if (seconds_since_1601 < epoch_seconds) {
+        g_last_error = 87;
+        return 0;
+    }
+
+    time_t utc_seconds = (time_t)(seconds_since_1601 - epoch_seconds);
+    struct tm local_fields;
+    if (!localtime_r(&utc_seconds, &local_fields)) {
+        g_last_error = 87;
+        return 0;
+    }
+
+    /* A local FILETIME encodes local wall-clock fields in FILETIME units. */
+    time_t local_as_utc = timegm(&local_fields);
+    if (local_as_utc == (time_t)-1 && errno == EOVERFLOW) {
+        g_last_error = 87;
+        return 0;
+    }
+    int64_t offset_seconds = (int64_t)local_as_utc - (int64_t)utc_seconds;
+    if (offset_seconds < 0 && ticks < (u64)(-offset_seconds) * 10000000ULL) {
+        g_last_error = 87;
+        return 0;
+    }
+
+    *local_filetime = (u64)((int64_t)ticks + offset_seconds * 10000000LL);
+    g_last_error = 0;
+    return 1;
+}
+
 /* Vista+ locale/date helpers dynamically queried by RE8's bundled runtime.
  * Beer exposes one coherent en-US locale rather than returning NULL exports
  * and sending the runtime down partially initialized fallback paths. */
@@ -4102,6 +4903,8 @@ impl_GetUserNameA(char *buf, u32 *sz) {
 }
 
 /* ---- Shell known-folder paths ---- */
+static int resolve_windows_host_path(const char *name, char *output,
+                                     size_t output_size);
 static const char *beer_roaming_appdata_path(void) { return g_roaming_appdata; }
 static const char *beer_local_appdata_path(void) { return g_local_appdata; }
 
@@ -4150,12 +4953,32 @@ impl_SHGetFolderPathA(u64 hwnd, s32 csidl, u64 tok, u32 flags, char *buf)
 }
 
 static u64 __attribute__((ms_abi))
-impl_SHGetKnownFolderPath(u64 rfid, u32 flags, u64 tok, u64 *out)
+impl_SHGetKnownFolderPath(const void *rfid, u32 flags, u64 tok, u64 *out)
 {
-    (void)rfid; (void)flags; (void)tok;
-    if (!out) return (u64)(u32)0x80070057; /* E_INVALIDARG */
+    (void)tok;
+    enum { KF_FLAG_CREATE = 0x00008000u };
+    if (!rfid || !out) return (u64)(u32)0x80070057; /* E_INVALIDARG */
     *out = 0;
-    const char *path = beer_roaming_appdata_path();
+
+    BeerKnownFolder folder = beer_classify_known_folder(rfid);
+    const char *path = NULL;
+    switch (folder) {
+    case BEER_KNOWN_FOLDER_PROFILE: path = g_user_profile; break;
+    case BEER_KNOWN_FOLDER_DOCUMENTS: path = g_documents; break;
+    case BEER_KNOWN_FOLDER_SAVED_GAMES: path = g_saved_games; break;
+    case BEER_KNOWN_FOLDER_ROAMING_APPDATA: path = g_roaming_appdata; break;
+    case BEER_KNOWN_FOLDER_LOCAL_APPDATA: path = g_local_appdata; break;
+    case BEER_KNOWN_FOLDER_PROGRAM_DATA: path = g_program_data; break;
+    default:
+        return (u64)(u32)0x80070002; /* HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) */
+    }
+
+    if (flags & KF_FLAG_CREATE) {
+        char host_path[PATH_MAX];
+        if (!resolve_windows_host_path(path, host_path, sizeof(host_path)) ||
+            !mkdir_tree(host_path))
+            return (u64)(u32)0x80070003; /* ERROR_PATH_NOT_FOUND */
+    }
     size_t length = strlen(path);
     u16 *wide = malloc((length + 1) * sizeof(*wide));
     if (!wide) return (u64)(u32)0x8007000e; /* E_OUTOFMEMORY */
@@ -4163,7 +4986,10 @@ impl_SHGetKnownFolderPath(u64 rfid, u32 flags, u64 tok, u64 *out)
         free(wide);
         return (u64)(u32)0x80070057;
     }
-    *out = (u64)wide;
+    *out = (u64)(uintptr_t)wide;
+    if (getenv("BEER_FILE_DIAGNOSTICS"))
+        fprintf(stderr, "[FILE] SHGetKnownFolderPath folder=%d flags=0x%x -> %s\n",
+                (int)folder, flags, path);
     return 0;
 }
 static u64 __attribute__((ms_abi))
@@ -4176,6 +5002,26 @@ static u64 __attribute__((ms_abi))
 impl_CoInitializeEx(u64 reserved, u32 model) { (void)reserved;(void)model; return 0; }
 static u64 __attribute__((ms_abi))
 impl_CoUninitialize(void) { return 0; }
+
+static u64 __attribute__((ms_abi))
+impl_CoCreateGuid(u8 *guid)
+{
+    if (!guid) return UINT64_C(0x80004003); /* E_POINTER */
+
+    size_t written = 0;
+    while (written < 16) {
+        ssize_t received = getrandom(guid + written, 16 - written, 0);
+        if (received < 0 && errno == EINTR) continue;
+        if (received <= 0) {
+            memset(guid, 0, 16);
+            return (u64)E_FAIL;
+        }
+        written += (size_t)received;
+    }
+    beer_guid_apply_v4_bits(guid);
+    return S_OK;
+}
+
 static u64 __attribute__((ms_abi))
 impl_CoInitializeSecurity(void *security_descriptor, s32 authentication_services,
                           void *authentication_service_list, void *reserved1,
@@ -4198,9 +5044,40 @@ impl_CoInitializeSecurity(void *security_descriptor, s32 authentication_services
     return atomic_exchange(&initialized, 1) ? UINT64_C(0x80010119) : 0;
 }
 static u64 __attribute__((ms_abi))
-impl_CoCreateInstance(u64 rclsid, u64 outer, u32 ctx, u64 riid, void **ppv) {
-    (void)rclsid;(void)outer;(void)ctx;(void)riid;
+impl_CoCreateInstance(const u8 *rclsid, u64 outer, u32 ctx,
+                      const u8 *riid, void **ppv)
+{
+    (void)outer;
     if (ppv) *ppv = NULL;
+    u64 wasapi_result = beer_wasapi_create_instance(rclsid, riid, ppv);
+    if (wasapi_result == 0) {
+        fprintf(stderr, "[COM] CoCreateInstance MMDeviceEnumerator -> %p\n",
+                ppv ? *ppv : NULL);
+        return 0;
+    }
+    static _Atomic(u32) diagnostic_count;
+    u32 diagnostic = atomic_fetch_add_explicit(&diagnostic_count, 1,
+                                                memory_order_relaxed);
+    if (diagnostic < 32) {
+        const u8 zero_guid[16] = {0};
+        const u8 *class_id = rclsid ? rclsid : zero_guid;
+        const u8 *interface_id = riid ? riid : zero_guid;
+        fprintf(stderr,
+                "[COM] CoCreateInstance caller=%p ctx=0x%x "
+                "clsid=%02x%02x%02x%02x-%02x%02x-%02x%02x-"
+                "%02x%02x-%02x%02x%02x%02x%02x%02x "
+                "iid=%02x%02x%02x%02x-%02x%02x-%02x%02x-"
+                "%02x%02x-%02x%02x%02x%02x%02x%02x -> E_FAIL\n",
+                __builtin_return_address(0), ctx,
+                class_id[3], class_id[2], class_id[1], class_id[0],
+                class_id[5], class_id[4], class_id[7], class_id[6],
+                class_id[8], class_id[9], class_id[10], class_id[11],
+                class_id[12], class_id[13], class_id[14], class_id[15],
+                interface_id[3], interface_id[2], interface_id[1], interface_id[0],
+                interface_id[5], interface_id[4], interface_id[7], interface_id[6],
+                interface_id[8], interface_id[9], interface_id[10], interface_id[11],
+                interface_id[12], interface_id[13], interface_id[14], interface_id[15]);
+    }
     return (u64)E_FAIL;
 }
 
@@ -4241,12 +5118,24 @@ dxgi_log_ok(u64 a, u64 b, u64 c, u64 d) {
 }
 
 static void init_d3d11_fake(void) {
-    /* Initialize D3D11 objects using graphics module with real vtables. */
+    /* These process-owned references keep the reusable compatibility objects
+     * alive. Every COM pointer returned to a caller receives a separate AddRef
+     * below, exactly as D3D11CreateDevice/CreateSwapChain require. */
     g_d3d11_device   = d3d11_device_create();
-    g_d3d11_context  = d3d11_device_context_create();
+    g_d3d11_context  = g_d3d11_device
+        ? d3d11_device_get_immediate_context_owned(g_d3d11_device) : NULL;
     g_dxgi_swapchain = dxgi_swapchain_create();
     fprintf(stderr, "[D3D11] Initialized real COM objects: device=0x%lx context=0x%lx swapchain=0x%lx\n",
             (u64)g_d3d11_device, (u64)g_d3d11_context, (u64)g_dxgi_swapchain);
+}
+
+static void d3d11_retain_com_output(void *object)
+{
+    if (!object) return;
+    void **vtable = *(void ***)object;
+    if (!vtable || !vtable[1]) return;
+    typedef u32 __attribute__((ms_abi)) (*AddRefFn)(void *);
+    ((AddRefFn)vtable[1])(object);
 }
 
 /*
@@ -4265,12 +5154,24 @@ impl_D3D11CreateDevice(u64 adapter, u32 driver_type, u64 software,
 {
     (void)adapter;(void)driver_type;(void)software;(void)flags;
     (void)feature_levels;(void)n_levels;(void)sdk_ver;
-    if (!g_api_createdevice) { g_api_createdevice=1; fprintf(stderr, "[PROGRESS] D3D11CreateDevice called - graphics device created\n"); }
-    fprintf(stderr, "[D3D11] CreateDevice -> returning real COM objects device=0x%lx context=0x%lx\n", 
-            (u64)g_d3d11_device, (u64)g_d3d11_context);
-    if (ppDevice)      *ppDevice  = (u64 *)g_d3d11_device;
+    if (ppDevice) *ppDevice = NULL;
+    if (ppContext) *ppContext = NULL;
+    if (!g_d3d11_device || !g_d3d11_context) return (u64)0x8007000e;
+    g_api_createdevice = 1;
+    if (getenv("BEER_D3D11_DIAGNOSTICS"))
+        fprintf(stderr,
+                "[D3D11] CreateDevice -> returning real COM objects "
+                "device=0x%lx context=0x%lx\n",
+                (u64)g_d3d11_device, (u64)g_d3d11_context);
+    if (ppDevice) {
+        d3d11_retain_com_output(g_d3d11_device);
+        *ppDevice = (u64 *)g_d3d11_device;
+    }
     if (pFeatureLevel) *pFeatureLevel = D3D_FEATURE_LEVEL_11_0;
-    if (ppContext)     *ppContext = (u64 *)g_d3d11_context;
+    if (ppContext) {
+        d3d11_retain_com_output(g_d3d11_context);
+        *ppContext = (u64 *)g_d3d11_context;
+    }
     return S_OK;
 }
 
@@ -4282,14 +5183,25 @@ impl_D3D11CreateDeviceAndSwapChain(u64 adapter, u32 dtype, u64 sw, u32 flags,
     (void)adapter;(void)dtype;(void)sw;(void)flags;
     (void)fls;(void)nfl;(void)sdk;
     fprintf(stderr, "[D3D11] CreateDeviceAndSwapChain -> returning real COM objects\n");
-    if (!swdesc || !ppSwap || !g_dxgi_swapchain) return (u64)0x80070057;
-    *ppSwap = NULL;
+    if (ppDevice) *ppDevice = NULL;
+    if (ppCtx) *ppCtx = NULL;
+    if (ppSwap) *ppSwap = NULL;
+    if (!swdesc || !ppSwap || !g_dxgi_swapchain ||
+        !g_d3d11_device || !g_d3d11_context)
+        return (u64)0x80070057;
     HRESULT hr = dxgi_swapchain_configure(g_dxgi_swapchain, g_d3d11_device,
         (const BeerDxgiSwapChainDesc *)swdesc);
     if (hr != S_OK) return (u64)(uint32_t)hr;
-    if (ppDevice) *ppDevice = (u64 *)g_d3d11_device;
-    if (pFL)      *pFL      = D3D_FEATURE_LEVEL_11_0;
-    if (ppCtx)    *ppCtx    = (u64 *)g_d3d11_context;
+    if (ppDevice) {
+        d3d11_retain_com_output(g_d3d11_device);
+        *ppDevice = (u64 *)g_d3d11_device;
+    }
+    if (pFL) *pFL = D3D_FEATURE_LEVEL_11_0;
+    if (ppCtx) {
+        d3d11_retain_com_output(g_d3d11_context);
+        *ppCtx = (u64 *)g_d3d11_context;
+    }
+    d3d11_retain_com_output(g_dxgi_swapchain);
     *ppSwap = (u64 *)g_dxgi_swapchain;
     return S_OK;
 }
@@ -4311,6 +5223,7 @@ dxgi_CreateSwapChain(u64 *obj, u64 *device, u64 *desc, u64 **ppSwap)
     HRESULT hr = dxgi_swapchain_configure(g_dxgi_swapchain,
         (ID3D11Device *)device, (const BeerDxgiSwapChainDesc *)desc);
     if (hr != S_OK) return (u64)(uint32_t)hr;
+    d3d11_retain_com_output(g_dxgi_swapchain);
     *ppSwap = (u64 *)g_dxgi_swapchain;
     return S_OK;
 }
@@ -4873,6 +5786,46 @@ static void beer_signal_guest_event(uint64_t event_handle)
     impl_SetEvent(event_handle);
 }
 
+/* IMFSourceReaderCallback::OnReadSample trampoline.
+ * Calls vtable slot 3 on the guest-allocated callback object via ms_abi. */
+static uint64_t beer_mf_invoke_on_read_sample(void *callback_object,
+                                               uint64_t hr,
+                                               uint32_t stream_index,
+                                               uint32_t stream_flags,
+                                               int64_t timestamp,
+                                               void *sample)
+{
+    if (!callback_object) return 0;
+    void **vt = *(void ***)callback_object;
+    typedef uint64_t __attribute__((ms_abi)) (*OnReadSampleFn)(
+        void *, uint64_t, uint32_t, uint32_t, int64_t, void *);
+    uint64_t result = ((OnReadSampleFn)vt[3])(
+        callback_object, hr, stream_index, stream_flags, timestamp, sample);
+    static _Atomic(uint32_t) diag_count;
+    if (getenv("BEER_MF_DIAGNOSTICS") &&
+        atomic_fetch_add_explicit(&diag_count, 1, memory_order_relaxed) < 32)
+        fprintf(stderr,
+                "[MF CB] OnReadSample cb=%p stream=%u flags=0x%x ts=%lld "
+                "sample=%p -> %#llx\n",
+                callback_object, stream_index, stream_flags,
+                (long long)timestamp, sample, (unsigned long long)result);
+    return result;
+}
+
+/* IMFSourceReaderCallback::OnFlush trampoline — vtable slot 4. */
+static uint64_t beer_mf_invoke_on_flush(void *callback_object,
+                                        uint32_t stream_index)
+{
+    if (!callback_object) return 0;
+    void **vt = *(void ***)callback_object;
+    typedef uint64_t __attribute__((ms_abi)) (*OnFlushFn)(void *, uint32_t);
+    uint64_t result = ((OnFlushFn)vt[4])(callback_object, stream_index);
+    if (getenv("BEER_MF_DIAGNOSTICS"))
+        fprintf(stderr, "[MF CB] OnFlush cb=%p stream=%u -> %#llx\n",
+                callback_object, stream_index, (unsigned long long)result);
+    return result;
+}
+
 static u64 __attribute__((ms_abi))
 impl_ResetEvent(u64 h)
 {
@@ -4904,7 +5857,7 @@ impl_PulseEvent(u64 h)
 }
 
 static u64 __attribute__((ms_abi))
-impl_WaitForSingleObject(u64 h, u32 ms)
+beer_wait_single_raw(u64 h, u32 ms)
 {
     if (getenv("BEER_MAIN_THREAD_DIAGNOSTICS") && g_window_thread_id &&
         current_windows_thread_id() == g_window_thread_id) {
@@ -4928,7 +5881,7 @@ impl_WaitForSingleObject(u64 h, u32 ms)
         pthread_mutex_lock(&ev->mtx);
         ++ev->waiter_count;
         if (ms == 0xFFFFFFFFu) {
-            if (!ev->signaled) {
+            if (!ev->signaled && getenv("BEER_WAIT_DIAGNOSTICS")) {
                 static _Atomic(u32) infinite_wait_logs;
                 u32 log_index = atomic_fetch_add(&infinite_wait_logs, 1);
                 if (log_index < 64)
@@ -4999,6 +5952,34 @@ impl_WaitForSingleObject(u64 h, u32 ms)
      * state race ahead. Match Windows and fail with ERROR_INVALID_HANDLE. */
     g_last_error = 6;
     return 0xFFFFFFFFu;
+}
+
+static u64 beer_wait_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
+}
+
+/* BEER_WAIT_DIAGNOSTICS=1 logs guest waits that block for >= 100 ms. */
+static u64 __attribute__((ms_abi))
+impl_WaitForSingleObject(u64 h, u32 ms)
+{
+    static int diag = -1;
+    if (diag < 0) diag = getenv("BEER_WAIT_DIAGNOSTICS") != NULL;
+    if (!diag) return beer_wait_single_raw(h, ms);
+    u64 t0 = beer_wait_now_ms();
+    u64 r = beer_wait_single_raw(h, ms);
+    u64 dt = beer_wait_now_ms() - t0;
+    static _Atomic(u32) logs;
+    if (dt >= 100 && atomic_fetch_add(&logs, 1) < 100000)
+        fprintf(stderr,
+                "[LONGWAIT] single handle=0x%llx timeout=%u result=%llu "
+                "ms=%llu thread=%u caller=0x%llx\n",
+                (unsigned long long)h, ms, (unsigned long long)r,
+                (unsigned long long)dt, (unsigned)current_windows_thread_id(),
+                (unsigned long long)g_dispatch_incoming_return);
+    return r;
 }
 
 static u64 __attribute__((ms_abi))
@@ -5105,7 +6086,7 @@ static int wait_handle_poll(u64 handle, int consume)
 }
 
 static u64 __attribute__((ms_abi))
-impl_WaitForMultipleObjects(u32 n, const u64 *handles, u32 all, u32 ms)
+beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
 {
     /* MAXIMUM_WAIT_OBJECTS is 64. Windows rejects invalid parameters before
      * inspecting or consuming any object. */
@@ -5173,6 +6154,26 @@ impl_WaitForMultipleObjects(u32 n, const u64 *handles, u32 all, u32 ms)
         struct timespec delay = {0, 1000000L};
         nanosleep(&delay, NULL);
     }
+}
+
+static u64 __attribute__((ms_abi))
+impl_WaitForMultipleObjects(u32 n, const u64 *handles, u32 all, u32 ms)
+{
+    static int diag = -1;
+    if (diag < 0) diag = getenv("BEER_WAIT_DIAGNOSTICS") != NULL;
+    if (!diag) return beer_wait_multiple_raw(n, handles, all, ms);
+    u64 t0 = beer_wait_now_ms();
+    u64 r = beer_wait_multiple_raw(n, handles, all, ms);
+    u64 dt = beer_wait_now_ms() - t0;
+    static _Atomic(u32) logs;
+    if (dt >= 100 && atomic_fetch_add(&logs, 1) < 100000)
+        fprintf(stderr,
+                "[LONGWAIT] multiple count=%u all=%u timeout=%u result=%llu "
+                "ms=%llu thread=%u caller=0x%llx\n",
+                n, all, ms, (unsigned long long)r, (unsigned long long)dt,
+                (unsigned)current_windows_thread_id(),
+                (unsigned long long)g_dispatch_incoming_return);
+    return r;
 }
 
 static u64 __attribute__((ms_abi))
@@ -5508,13 +6509,33 @@ impl_FormatMessageW(u32 flags, u64 src, u32 msgid, u32 langid,
 #define FAKE_HWND  ((u64)0xD0000001u)
 #define FAKE_HDC   ((u64)0xDC000001u)
 
+/* Forward declarations — these functions are defined later in the file but
+ * are needed by impl_ShowWindow, impl_InvalidateRect, etc. which appear
+ * earlier in the translation unit. */
+static u64 call_guest_wndproc(u32 message, u64 wparam, u64 lparam);
+static int queue_window_message(u32 message, u64 wparam, u64 lparam);
+
 static volatile int g_win_quit = 0;
 static u32 g_win_quit_code = 0;
+/* Per-window paint-pending flag (issue 7).  Set when XWAYLAND_EVENT_EXPOSE or
+ * InvalidateRect queues a WM_PAINT; cleared by BeginPaint or ValidateRect.
+ * Prevents unbounded WM_PAINT pile-up when the compositor keeps sending expose
+ * events faster than the game's message loop can drain them. */
+static _Atomic(int) g_paint_pending;
 static u64 g_window_proc;
 static u64 g_window_userdata;
 static u64 g_window_style;
 static u64 g_window_exstyle;
 static u64 g_window_instance;
+static u64 g_window_icon;
+static u64 g_window_small_icon;
+/* Win32 keeps outer-window geometry separate from the drawable client area.
+ * X11's window dimensions are client dimensions, so retain the guest outer
+ * rectangle here instead of inferring it from the native drawable. */
+static s32 g_window_outer_x;
+static s32 g_window_outer_y;
+static s32 g_window_outer_width;
+static s32 g_window_outer_height;
 static int g_window_focused;
 
 #define WINDOW_PROPERTY_CAPACITY 256
@@ -5555,6 +6576,8 @@ static u64 register_window_class(const WIN_WNDCLASSEX *window_class, const char 
     }
     g_window_proc = window_class->lpfnWndProc;
     g_window_instance = window_class->hInstance;
+    g_window_icon = window_class->hIcon;
+    g_window_small_icon = window_class->hIconSm;
     if (!g_api_registerclass) {
         g_api_registerclass = 1;
         fprintf(stderr, "[PROGRESS] %s retained WndProc=0x%lx\n", api, g_window_proc);
@@ -5580,12 +6603,61 @@ impl_ShowWindow(u64 hw, u32 cmd) {
     }
     XwaylandWindowState state;
     int was_visible = xwayland_window_get_state(&state) && state.visible;
-    int visible = cmd != 0;
+    /* SW_SHOW=5, SW_SHOWNORMAL=1, SW_SHOWDEFAULT=10, SW_RESTORE=9 → visible.
+     * SW_HIDE=0 → hide. Any non-zero cmd is "show" for Beer purposes. */
+    int visible = (cmd != 0); /* SW_HIDE = 0 */
     fprintf(stderr, "[WIN] ShowWindow(hwnd=0x%lx, cmd=%u)\n", hw, cmd);
     if (!xwayland_window_show(visible)) return 0;
-    if (was_visible != visible && g_window_proc) {
-        typedef u64 __attribute__((ms_abi)) (*WndProc)(u64, u32, u64, u64);
-        ((WndProc)(uintptr_t)g_window_proc)(FAKE_HWND, 0x0018, visible, 0);
+    if (g_window_proc) {
+        /* WM_SHOWWINDOW always sent on visibility change. */
+        if (was_visible != visible)
+            call_guest_wndproc(0x0018, visible ? 1 : 0, 0);
+
+        /* Deliver the activation burst when transitioning from hidden → visible
+         * and the window has not been activated yet (g_window_focused == 0).
+         * This covers the pattern: CreateWindowEx(no WS_VISIBLE) + ShowWindow. */
+        if (visible && !was_visible && !g_window_focused) {
+            /* WM_WINDOWPOSCHANGING */
+            {
+                u64 wpos[7];
+                int wx = 0, wy = 0, ww = 0, wh = 0;
+                if (xwayland_window_get_state(&state)) {
+                    wx = state.x; wy = state.y;
+                    ww = state.width; wh = state.height;
+                }
+                wpos[0] = hw; wpos[1] = 0;
+                ((s32*)wpos)[4] = wx; ((s32*)wpos)[5] = wy;
+                ((s32*)wpos)[6] = ww; ((s32*)wpos)[7] = wh;
+                ((u32*)wpos)[8] = 0x0040; /* SWP_SHOWWINDOW */
+                call_guest_wndproc(0x0046, 0, (u64)(uintptr_t)wpos);
+            }
+            /* WM_ACTIVATEAPP */
+            call_guest_wndproc(0x001c, 1, 0);
+            /* WM_NCACTIVATE */
+            call_guest_wndproc(0x0086, 1, 0);
+            /* WM_ACTIVATE */
+            call_guest_wndproc(0x0006, 1, 0);
+            /* WM_SETFOCUS */
+            g_window_focused = 1;
+            call_guest_wndproc(0x0007, 0, 0);
+            /* WM_WINDOWPOSCHANGED */
+            {
+                u64 wpos[7];
+                int wx = 0, wy = 0, ww = 0, wh = 0;
+                if (xwayland_window_get_state(&state)) {
+                    wx = state.x; wy = state.y;
+                    ww = state.width; wh = state.height;
+                }
+                wpos[0] = hw; wpos[1] = 0;
+                ((s32*)wpos)[4] = wx; ((s32*)wpos)[5] = wy;
+                ((s32*)wpos)[6] = ww; ((s32*)wpos)[7] = wh;
+                ((u32*)wpos)[8] = 0x0040; /* SWP_SHOWWINDOW */
+                call_guest_wndproc(0x0047, 0, (u64)(uintptr_t)wpos);
+            }
+            fprintf(stderr,
+                    "[WIN] ShowWindow: delivered synchronous activation sequence "
+                    "(WM_ACTIVATEAPP/WM_ACTIVATE/WM_SETFOCUS)\n");
+        }
     }
     return was_visible;
 }
@@ -5618,23 +6690,105 @@ impl_IsIconic(u64 hwnd)
 static u64 __attribute__((ms_abi))
 impl_SystemParametersInfoW(u32 action, u32 parameter, void *value, u32 update)
 {
-    (void)parameter;
     (void)update;
-    /* RE8 probes the system-beep setting while constructing its window/input
-     * runtime. SPI_GETBEEP writes a BOOL; SPI_SETBEEP has no output. Keep the
-     * process-local setting coherent rather than returning false success. */
     static u32 beep_enabled = 1;
     switch (action) {
-    case 0x0002: /* SPI_SETBEEP */
-        beep_enabled = parameter != 0;
-        return 1;
+    /* ---- Beep ---- */
     case 0x0001: /* SPI_GETBEEP */
         if (!value) { g_last_error = 87; return 0; }
-        *(u32 *)value = beep_enabled;
+        *(u32 *)value = beep_enabled; return 1;
+    case 0x0002: /* SPI_SETBEEP */
+        beep_enabled = parameter != 0; return 1;
+
+    /* ---- Mouse ---- */
+    case 0x0003: /* SPI_GETMOUSE — three UINT values */
+        if (value) { u32 *v = (u32*)value; v[0]=6; v[1]=10; v[2]=1; } return 1;
+    case 0x0004: /* SPI_SETMOUSE */ return 1;
+    case 0x0070: /* SPI_GETMOUSESPEED 1..20 */
+        if (value) *(u32*)value = 10; return 1;
+    case 0x0071: /* SPI_SETMOUSESPEED */ return 1;
+    case 0x0062: /* SPI_GETMOUSEHOVERWIDTH */
+        if (value) *(u32*)value = 4; return 1;
+    case 0x0064: /* SPI_GETMOUSEHOVERHEIGHT */
+        if (value) *(u32*)value = 4; return 1;
+    case 0x0066: /* SPI_GETMOUSEHOVERTIME */
+        if (value) { *(u32*)value = 400; } return 1;
+    case 0x0060: /* SPI_GETMOUSEVANISH */
+        if (value) { *(u32*)value = 0; } return 1;
+
+    /* ---- Keyboard ---- */
+    case 0x000a: /* SPI_GETKEYBOARDDELAY */
+        if (value) *(u32*)value = 1; return 1;
+    case 0x000e: /* SPI_GETKEYBOARDSPEED */
+        if (value) *(u32*)value = 31; return 1;
+    case 0x0020: /* SPI_GETMENUANIMATION */
+        if (value) *(u32*)value = 1; return 1;
+
+    /* ---- Screen / desktop geometry ---- */
+    case 0x0030: { /* SPI_GETWORKAREA — RECT of usable desktop area */
+        if (!value) { g_last_error = 87; return 0; }
+        int sw = 1920, sh = 1080;
+        xwayland_get_screen_size(&sw, &sh);
+        s32 *r = (s32*)value;   /* left, top, right, bottom */
+        r[0] = 0; r[1] = 0; r[2] = (s32)sw; r[3] = (s32)sh;
         return 1;
+    }
+    case 0x002f: /* SPI_GETDROPSHADOW */
+        if (value) *(u32*)value = 1; return 1;
+    case 0x0068: /* SPI_GETFLATMENU */
+        if (value) *(u32*)value = 0; return 1;
+    case 0x0024: /* SPI_GETDESKWALLPAPER */
+        if (value && parameter > 0) *(u16*)value = 0; return 1;
+
+    /* ---- Non-client metrics ---- */
+    case 0x0029: { /* SPI_GETNONCLIENTMETRICS */
+        /* Struct is at minimum 84 bytes (cbSize at offset 0).  Return
+         * plausible defaults so callers reading icon/caption font info
+         * do not fault on uninitialised fields. */
+        if (!value) { g_last_error = 87; return 0; }
+        u32 *sz = (u32*)value;
+        u32 cb = *sz;
+        if (cb >= 4) memset((u8*)value + 4, 0, cb > 4 ? cb - 4 : 0);
+        /* iBorderWidth at +4, iScrollWidth/Height at +8/+12 etc. */
+        if (cb >= 8)  *(s32*)((u8*)value + 4)  = 1; /* iBorderWidth */
+        if (cb >= 12) *(s32*)((u8*)value + 8)  = 17; /* iScrollWidth */
+        if (cb >= 16) *(s32*)((u8*)value + 12) = 17; /* iScrollHeight */
+        if (cb >= 20) *(s32*)((u8*)value + 16) = 17; /* iCaptionWidth */
+        if (cb >= 24) *(s32*)((u8*)value + 20) = 19; /* iCaptionHeight */
+        return 1;
+    }
+
+    /* ---- Wheel scrolling ---- */
+    /* SPI_GETWHEELSCROLLLINES = 0x0068 conflicts with SPI_GETFLATMENU above;
+     * they have the same numeric value on older SDK headers.  The 104 decimal
+     * variant already handled above via 0x0068. */
+    case 0x006D: /* SPI_GETWHEELSCROLLCHARS */
+        if (value) { *(u32*)value = 3; } return 1;
+
+    /* ---- Accessibility / misc ---- */
+    case 0x004A: /* SPI_GETSNAPTODEFBUTTON */
+        if (value) *(u32*)value = 0; return 1;
+    case 0x0072: /* SPI_GETMOUSESONAR */
+        if (value) *(u32*)value = 0; return 1;
+    case 0x0074: /* SPI_GETMOUSECLICKLOCK */
+        if (value) *(u32*)value = 0; return 1;
+    case 0x0076: /* SPI_GETMOUSEKEYS */
+        /* MOUSEKEYS struct, just zero it if present */ return 1;
+    case 0x0050: /* SPI_GETFONTSMOOTHINGTYPE */
+        if (value) *(u32*)value = 2; /* FE_FONTSMOOTHINGCLEARTYPE */ return 1;
+    case 0x004C: /* SPI_GETFONTSMOOTHING */
+        if (value) *(u32*)value = 1; return 1;
+    case 0x0028: /* SPI_GETLOWPOWERACTIVE */
+        if (value) *(u32*)value = 0; return 1;
+    case 0x0078: /* SPI_GETBLOCKSENDINPUTRESETS */
+        if (value) *(u32*)value = 1; return 1;
+
     default:
-        g_last_error = 87;
-        return 0;
+        /* Unknown action — return success silently to avoid breaking callers
+         * that probe optional settings.  Do not set last-error for get calls
+         * as real Windows returns 1 for most unknown get actions. */
+        (void)parameter;
+        return 1;
     }
 }
 
@@ -6616,14 +7770,50 @@ impl_GetFullPathNameA(const char *path, u32 sz, char *buf, char **part)
 #define MAX_FHANDLES 4096
 static int g_fh_fd[MAX_FHANDLES];
 static u8 g_fh_used[MAX_FHANDLES];
+static char g_fh_guest_path[MAX_FHANDLES][PATH_MAX];
+static char g_fh_host_path[MAX_FHANDLES][PATH_MAX];
 static pthread_mutex_t g_fh_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-static u64 fh_alloc(int fd) {
+static int save_diagnostics_enabled(void)
+{
+    return getenv("BEER_SAVE_DIAGNOSTICS") != NULL ||
+           getenv("BEER_FILE_DIAGNOSTICS") != NULL;
+}
+
+static u64 save_diagnostic_hash(const void *data, size_t size)
+{
+    const u8 *bytes = data;
+    u64 hash = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < size; ++i)
+        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
+    return hash;
+}
+
+static void save_diagnostic_payload(const char *backend, const char *operation,
+                                    const char *name, const void *data, size_t size)
+{
+    if (!save_diagnostics_enabled()) return;
+    size_t shown = size < 32 ? size : 32;
+    fprintf(stderr, "[SAVE READ] backend=%s operation=%s name=%s bytes=%zu "
+            "fnv1a64=%016llx prefix=",
+            backend, operation, name ? name : "(unknown)", size,
+            (unsigned long long)save_diagnostic_hash(data, size));
+    const u8 *bytes = data;
+    for (size_t i = 0; i < shown; ++i) fprintf(stderr, "%02x", bytes[i]);
+    if (!shown) fputc('-', stderr);
+    fputc('\n', stderr);
+}
+
+static u64 fh_alloc(int fd, const char *guest_path, const char *host_path) {
     pthread_mutex_lock(&g_fh_mtx);
     for (u32 id = 1; id < MAX_FHANDLES; ++id) {
         if (g_fh_used[id]) continue;
         g_fh_used[id] = 1;
         g_fh_fd[id] = fd;
+        snprintf(g_fh_guest_path[id], sizeof(g_fh_guest_path[id]), "%s",
+                 guest_path ? guest_path : "");
+        snprintf(g_fh_host_path[id], sizeof(g_fh_host_path[id]), "%s",
+                 host_path ? host_path : "");
         pthread_mutex_unlock(&g_fh_mtx);
         return (u64)(0xF0000000u + id);
     }
@@ -6639,6 +7829,24 @@ static int fh_get(u64 h) {
     pthread_mutex_unlock(&g_fh_mtx);
     return fd;
 }
+
+static int fh_paths(u64 h, char *guest, size_t guest_size,
+                    char *host, size_t host_size)
+{
+    if (h < 0xF0000001ULL || h >= 0xF0000000ULL + MAX_FHANDLES) return 0;
+    u32 id = (u32)(h - 0xF0000000ULL);
+    pthread_mutex_lock(&g_fh_mtx);
+    int valid = g_fh_used[id];
+    if (valid) {
+        if (guest && guest_size)
+            snprintf(guest, guest_size, "%s", g_fh_guest_path[id]);
+        if (host && host_size)
+            snprintf(host, host_size, "%s", g_fh_host_path[id]);
+    }
+    pthread_mutex_unlock(&g_fh_mtx);
+    return valid;
+}
+
 static int fh_close(u64 h) {
     if (h < 0xF0000001ULL || h >= 0xF0000000ULL + MAX_FHANDLES) return 0;
     u32 id = (u32)(h - 0xF0000000ULL);
@@ -6647,6 +7855,8 @@ static int fh_close(u64 h) {
     if (fd >= 0) {
         g_fh_used[id] = 0;
         g_fh_fd[id] = -1;
+        g_fh_guest_path[id][0] = 0;
+        g_fh_host_path[id][0] = 0;
     }
     pthread_mutex_unlock(&g_fh_mtx);
     if (fd < 0) return 0;
@@ -6949,15 +8159,39 @@ impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
     else if (access & 0x80000000)            flags = O_RDONLY;
     else if (access & 0x40000000)            flags = O_WRONLY;
     else                                     flags = O_RDONLY;
-    if (creation == 2)       flags |= O_CREAT|O_TRUNC;
-    else if (creation == 1)  flags |= O_CREAT|O_EXCL;
-    else if (creation == 4)  flags |= O_CREAT;
-    int fd = open(host_path, flags, mode);
-    if (fd < 0) {
-        g_last_error = errno == EACCES ? 5 : 2;
+
+    int disposition_flags = 0;
+    if (!beer_creation_disposition_flags(creation, &disposition_flags)) {
+        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
         return INVALID_HANDLE_VALUE64;
     }
-    return fh_alloc(fd);
+    if (disposition_flags & (1 << 0)) flags |= O_CREAT;
+    if (disposition_flags & (1 << 1)) flags |= O_EXCL;
+    if (disposition_flags & (1 << 2)) flags |= O_TRUNC;
+
+    int fd = open(host_path, flags, mode);
+    if (fd < 0) {
+        switch (errno) {
+        case EACCES: case EPERM: case EROFS: g_last_error = 5; break;
+        case EEXIST: g_last_error = 80; break;
+        case ENOENT: case ENOTDIR: g_last_error = 3; break;
+        case EMFILE: case ENFILE: g_last_error = 4; break;
+        default: g_last_error = 1; break;
+        }
+        if (getenv("BEER_FILE_DIAGNOSTICS"))
+            fprintf(stderr, "[FILE] CreateFile failed guest=%s host=%s access=0x%x "
+                    "creation=%u errno=%d winerr=%u\n", name, host_path, access,
+                    creation, errno, g_last_error);
+        return INVALID_HANDLE_VALUE64;
+    }
+    u64 handle = fh_alloc(fd, name, host_path);
+    if (handle == INVALID_HANDLE_VALUE64) close(fd);
+    else g_last_error = (creation == 4 && !(flags & O_EXCL)) ? 0 : 0;
+    if (getenv("BEER_FILE_DIAGNOSTICS"))
+        fprintf(stderr, "[FILE] CreateFile guest=%s host=%s access=0x%x "
+                "creation=%u -> 0x%llx\n", name, host_path, access, creation,
+                (unsigned long long)handle);
+    return handle;
 }
 static u64 __attribute__((ms_abi))
 impl_CreateFileW(const u16 *name, u32 access, u32 share, u64 security,
@@ -7078,6 +8312,20 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
     if (received < 0) {
         g_last_error = (u32)errno;
         return 0;
+    }
+    if (save_diagnostics_enabled()) {
+        char guest_path[PATH_MAX] = {0};
+        char host_path[PATH_MAX] = {0};
+        if (fh_paths(h, guest_path, sizeof(guest_path), host_path, sizeof(host_path))) {
+            fprintf(stderr, "[SAVE READ] backend=win32 operation=ReadFile "
+                    "guest=%s host=%s requested=%u received=%lld "
+                    "overlapped=%d\n",
+                    guest_path, host_path, n, (long long)received,
+                    overlapped != NULL);
+            if (received > 0)
+                save_diagnostic_payload("win32", "ReadFileData", guest_path,
+                                        buf, (size_t)received);
+        }
     }
     g_last_error = 0;
     return 1;
@@ -7284,6 +8532,115 @@ impl_CopyFileW(const u16 *source, const u16 *destination, u32 fail_if_exists)
                                fail_if_exists != 0);
 }
 
+static int windows_wide_path_to_ascii(const u16 *source, char *destination,
+                                      size_t capacity)
+{
+    if (!source || !destination || capacity == 0) return 0;
+    size_t length = 0;
+    while (source[length] && length + 1 < capacity) {
+        if (source[length] > 0x7f) return 0;
+        destination[length] = (char)source[length];
+        ++length;
+    }
+    if (source[length]) return 0;
+    destination[length] = 0;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_DeleteFileW(const u16 *path)
+{
+    char narrow[PATH_MAX], host[PATH_MAX];
+    if (!windows_wide_path_to_ascii(path, narrow, sizeof(narrow))) {
+        g_last_error = path ? 1113u : 87u;
+        return 0;
+    }
+    if (!resolve_windows_host_path(narrow, host, sizeof(host))) {
+        g_last_error = 3;
+        return 0;
+    }
+    if (unlink(host) != 0) {
+        g_last_error = errno == EACCES || errno == EPERM ? 5u :
+                       (errno == ENOENT ? 2u : 1u);
+        return 0;
+    }
+    g_last_error = 0;
+    return 1;
+}
+
+static int move_windows_file_w(const u16 *source, const u16 *destination,
+                               u32 flags)
+{
+    enum { MOVEFILE_REPLACE_EXISTING = 1u, MOVEFILE_COPY_ALLOWED = 2u,
+           MOVEFILE_WRITE_THROUGH = 8u };
+    char source_narrow[PATH_MAX], destination_narrow[PATH_MAX];
+    char source_host[PATH_MAX], destination_host[PATH_MAX];
+    if (!windows_wide_path_to_ascii(source, source_narrow, sizeof(source_narrow)) ||
+        !windows_wide_path_to_ascii(destination, destination_narrow,
+                                    sizeof(destination_narrow))) {
+        g_last_error = 1113;
+        return 0;
+    }
+    if (!resolve_windows_host_path(source_narrow, source_host, sizeof(source_host)) ||
+        !resolve_windows_host_path(destination_narrow, destination_host,
+                                   sizeof(destination_host))) {
+        g_last_error = 3;
+        return 0;
+    }
+    if (!(flags & MOVEFILE_REPLACE_EXISTING) && access(destination_host, F_OK) == 0) {
+        g_last_error = 183; /* ERROR_ALREADY_EXISTS */
+        return 0;
+    }
+    if (rename(source_host, destination_host) != 0) {
+        if (errno == EXDEV && (flags & MOVEFILE_COPY_ALLOWED)) {
+            if (!copy_windows_file_a(source_narrow, destination_narrow,
+                                     !(flags & MOVEFILE_REPLACE_EXISTING)))
+                return 0;
+            if (unlink(source_host) != 0) { g_last_error = 5; return 0; }
+        } else {
+            g_last_error = errno == EEXIST || errno == ENOTEMPTY ? 183u :
+                           (errno == EACCES || errno == EPERM ? 5u :
+                           (errno == ENOENT ? 2u : 1u));
+            return 0;
+        }
+    }
+    if (flags & MOVEFILE_WRITE_THROUGH) {
+        char parent[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%s", destination_host);
+        char *slash = strrchr(parent, '/');
+        if (slash) {
+            *slash = 0;
+            int directory = open(parent[0] ? parent : "/", O_RDONLY | O_DIRECTORY);
+            if (directory >= 0) { fsync(directory); close(directory); }
+        }
+    }
+    g_last_error = 0;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_MoveFileW(const u16 *source, const u16 *destination)
+{
+    return move_windows_file_w(source, destination, 0);
+}
+
+static u64 __attribute__((ms_abi))
+impl_MoveFileExW(const u16 *source, const u16 *destination, u32 flags)
+{
+    if (!destination || (flags & ~0xbu)) { g_last_error = 87; return 0; }
+    return move_windows_file_w(source, destination, flags);
+}
+
+static u64 __attribute__((ms_abi))
+impl_ReplaceFileW(const u16 *replaced, const u16 *replacement,
+                  const u16 *backup, u32 flags, void *exclude, void *reserved)
+{
+    (void)exclude; (void)reserved;
+    if (flags & ~2u) { g_last_error = 87; return 0; }
+    if (backup && *backup && !impl_CopyFileW(replaced, backup, 0)) return 0;
+    return move_windows_file_w(replacement, replaced, 1u | 8u);
+}
+
 static u64 __attribute__((ms_abi))
 impl_GetFileAttributesA(const char *path)
 {
@@ -7366,10 +8723,10 @@ impl_GetWindowRect(u64 hwnd, WIN_RECT *rect) {
         g_last_error = 1400;
         return 0;
     }
-    rect->left = state.x;
-    rect->top = state.y;
-    rect->right = state.x + state.width;
-    rect->bottom = state.y + state.height;
+    rect->left = g_window_outer_x;
+    rect->top = g_window_outer_y;
+    rect->right = g_window_outer_x + g_window_outer_width;
+    rect->bottom = g_window_outer_y + g_window_outer_height;
     return 1;
 }
 static u64 __attribute__((ms_abi))
@@ -7387,21 +8744,27 @@ impl_GetClientRect(u64 hwnd, WIN_RECT *rect) {
     return 1;
 }
 static u64 __attribute__((ms_abi))
-impl_LoadIconW(u64 hmod, u64 name) { (void)hmod;(void)name; return 0x10000001; }
+impl_LoadIconW(u64 hmod, u64 name)
+{
+    (void)hmod; (void)name;
+    return g_app_icon_pixels ? (u64)(uintptr_t)g_app_icon_pixels : 0;
+}
 static u64 __attribute__((ms_abi))
-impl_LoadIconA(u64 hmod, u64 name) { (void)hmod;(void)name; return 0x10000001; }
+impl_LoadIconA(u64 hmod, u64 name) { return impl_LoadIconW(hmod, name); }
 static u64 __attribute__((ms_abi))
 impl_LoadCursorW(u64 hmod, u64 name) { (void)hmod;(void)name; return 0x20000001; }
 static u64 __attribute__((ms_abi))
 impl_LoadCursorA(u64 hmod, u64 name) { (void)hmod;(void)name; return 0x20000001; }
 static u64 __attribute__((ms_abi))
 impl_AdjustWindowRect(WIN_RECT *rect, u32 style, u32 menu) {
-    (void)style;(void)menu;
+    (void)menu;
     if (!rect) { g_last_error = 87; return 0; }
-    rect->left -= 8;
-    rect->top -= 30;
-    rect->right += 8;
-    rect->bottom += 8;
+    if (beer_window_style_is_decorated(style)) {
+        rect->left -= BEER_WINDOW_FRAME_LEFT;
+        rect->top -= BEER_WINDOW_FRAME_TOP;
+        rect->right += BEER_WINDOW_FRAME_RIGHT;
+        rect->bottom += BEER_WINDOW_FRAME_BOTTOM;
+    }
     return 1;
 }
 static u64 __attribute__((ms_abi))
@@ -7410,12 +8773,52 @@ impl_AdjustWindowRectEx(WIN_RECT *rect, u32 style, u32 menu, u32 exstyle)
 static void window_title_from_wide(const u16 *wide, char *out, size_t capacity)
 {
     if (!out || !capacity) return;
-    size_t i = 0;
+    size_t out_pos = 0;
     if (wide) {
-        for (; i + 1 < capacity && wide[i]; i++)
-            out[i] = wide[i] <= 0x7f ? (char)wide[i] : '?';
+        for (size_t i = 0; wide[i] && out_pos + 1 < capacity; i++) {
+            u32 codepoint = wide[i];
+            /* Handle UTF-16 surrogate pairs for characters outside the BMP */
+            if (codepoint >= 0xd800 && codepoint <= 0xdbff && wide[i + 1] >= 0xdc00 && wide[i + 1] <= 0xdfff) {
+                u32 high = codepoint - 0xd800;
+                u32 low = wide[i + 1] - 0xdc00;
+                codepoint = 0x10000 + (high << 10) + low;
+                i++; /* Skip the low surrogate */
+            }
+            /* Encode the codepoint as UTF-8 */
+            if (codepoint <= 0x7f) {
+                if (out_pos + 1 < capacity) {
+                    out[out_pos++] = (char)codepoint;
+                } else {
+                    break;
+                }
+            } else if (codepoint <= 0x7ff) {
+                if (out_pos + 2 < capacity) {
+                    out[out_pos++] = (char)(0xc0 | (codepoint >> 6));
+                    out[out_pos++] = (char)(0x80 | (codepoint & 0x3f));
+                } else {
+                    break;
+                }
+            } else if (codepoint <= 0xffff) {
+                if (out_pos + 3 < capacity) {
+                    out[out_pos++] = (char)(0xe0 | (codepoint >> 12));
+                    out[out_pos++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+                    out[out_pos++] = (char)(0x80 | (codepoint & 0x3f));
+                } else {
+                    break;
+                }
+            } else if (codepoint <= 0x10ffff) {
+                if (out_pos + 4 < capacity) {
+                    out[out_pos++] = (char)(0xf0 | (codepoint >> 18));
+                    out[out_pos++] = (char)(0x80 | ((codepoint >> 12) & 0x3f));
+                    out[out_pos++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+                    out[out_pos++] = (char)(0x80 | (codepoint & 0x3f));
+                } else {
+                    break;
+                }
+            }
+        }
     }
-    out[i] = 0;
+    out[out_pos] = 0;
 }
 
 static void ensure_native_input_pump(void);
@@ -7466,23 +8869,156 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
                 "[THREAD] window owner thread=%u creator=0x%llx\n",
                 g_window_thread_id,
                 (unsigned long long)g_dispatch_incoming_return);
-    u64 hwnd = create_native_window(x, y, w, h, native_title);
+    g_window_outer_x = (u32)x == 0x80000000u ? 0 : x;
+    g_window_outer_y = (u32)y == 0x80000000u ? 0 : y;
+    g_window_outer_width = w;
+    g_window_outer_height = h;
+
+    const int decorated = beer_window_style_is_decorated(style);
+    const int resizable = beer_window_style_is_resizable(style);
+    int client_x = 0, client_y = 0, client_w = 0, client_h = 0;
+    if (!beer_window_client_from_outer(w, h, decorated, &client_x, &client_y,
+                                       &client_w, &client_h)) {
+        g_last_error = 87;
+        return 0;
+    }
+    /* X11 window dimensions are drawable client dimensions. Keep the Win32
+     * outer rectangle separately for GetWindowRect and WINDOWPOS messages. */
+    u64 hwnd = create_native_window(x, y, client_w, client_h, native_title);
     if (!hwnd) return 0;
+    if (g_app_icon_pixels)
+        (void)xwayland_window_set_icon_argb(g_app_icon_pixels,
+                                             g_app_icon_width,
+                                             g_app_icon_height);
+
+    fprintf(stderr,
+            "[WIN] native style=0x%08x decorated=%d resizable=%d pos=%d,%d size=%dx%d\n",
+            style, decorated, resizable, x, y, w, h);
+    xwayland_window_set_style(decorated, resizable);
+    /* CreateWindowExW receives the outer size. USER32 reports the corresponding
+     * client extent, but the X11 window and its events are already expressed in
+     * client coordinates. Keep the native/presentation origin at (0,0); only
+     * the extent is derived from Beer's declared frame metrics. */
+    xwayland_window_set_client_rect(0, 0, client_w, client_h);
+    int screen_width = 1920, screen_height = 1080;
+    xwayland_get_screen_size(&screen_width, &screen_height);
+    s32 policy_x = (u32)x == 0x80000000u ? 0 : x;
+    s32 policy_y = (u32)y == 0x80000000u ? 0 : y;
+    int fullscreen_request = beer_window_request_is_fullscreen(
+        style, policy_x, policy_y, w, h, screen_width, screen_height);
+    if (fullscreen_request) {
+        if (xwayland_window_set_fullscreen(1))
+            fprintf(stderr,
+                    "[WIN] fixed game window -> compositor fullscreen\n");
+    }
+
     WIN_CREATESTRUCT create = {
         .lpCreateParams = param, .hInstance = g_window_instance, .hMenu = menu,
         .hwndParent = parent, .cy = h, .cx = w, .y = y, .x = x,
         .style = (s32)style, .lpszName = title, .lpszClass = classname,
         .dwExStyle = exstyle
     };
+    /* WM_GETMINMAXINFO (0x0024) — sent before WM_NCCREATE on Windows so the
+     * game can constrain the window to monitor dimensions. Pack a MINMAXINFO
+     * struct (40 bytes) with sensible defaults. */
+    {
+        /* MINMAXINFO layout (Win64):
+         *   ptReserved       POINT  +0   (8 bytes)
+         *   ptMaxSize        POINT  +8   max window size
+         *   ptMaxPosition    POINT +16   maximized position
+         *   ptMinTrackSize   POINT +24   minimum tracking size
+         *   ptMaxTrackSize   POINT +32   maximum tracking size (= screen) */
+        s32 mmi[10];
+        memset(mmi, 0, sizeof(mmi));
+        mmi[2] = 1920; mmi[3] = 1080; /* ptMaxSize */
+        mmi[4] = 0;    mmi[5] = 0;    /* ptMaxPosition */
+        mmi[6] = 32;   mmi[7] = 32;   /* ptMinTrackSize */
+        mmi[8] = 1920; mmi[9] = 1080; /* ptMaxTrackSize */
+        call_guest_wndproc(0x0024, 0, (u64)(uintptr_t)mmi);
+    }
+
     if (!call_guest_wndproc(0x0081, 0, (u64)(uintptr_t)&create)) {
         xwayland_window_destroy(); return 0;
     }
+
+    /* WM_NCCALCSIZE (0x0083) — send the proposed outer rectangle. The guest
+     * may customize it; DefWindowProc applies Beer's declared frame metrics. */
+    {
+        s32 ncrect[4] = { x, y, x + w, y + h };
+        call_guest_wndproc(0x0083, 0, (u64)(uintptr_t)ncrect);
+    }
+
     if ((s64)call_guest_wndproc(0x0001, 0, (u64)(uintptr_t)&create) == -1) {
         call_guest_wndproc(0x0082, 0, 0); xwayland_window_destroy(); return 0;
     }
     call_guest_wndproc(0x0003, 0, ((u64)(u16)y << 16) | (u16)x);
-    call_guest_wndproc(0x0005, 0, ((u64)(u16)h << 16) | (u16)w);
-    if (style & 0x10000000u) call_guest_wndproc(0x0018, 1, 0);
+    call_guest_wndproc(0x0005, 0,
+                       ((u64)(u16)client_h << 16) | (u16)client_w);
+
+    if (style & 0x10000000u) {
+        /* WS_VISIBLE — ShowWindow is implied. Deliver the full synchronous
+         * activation sequence that Windows sends before CreateWindowEx returns.
+         * These messages go through the WndProc (not the queue) because on
+         * Windows they are delivered synchronously during window creation. */
+
+        /* WM_SHOWWINDOW (0x0018): wParam=1 (being shown), lParam=0 */
+        call_guest_wndproc(0x0018, 1, 0);
+
+        /* WM_WINDOWPOSCHANGING (0x0046): lParam → WINDOWPOS; use a simple
+         * stack-allocated WINDOWPOS (44 bytes) with SWP_SHOWWINDOW flag. */
+        {
+            /* WINDOWPOS layout: hwnd, hwndInsertAfter, x, y, cx, cy, flags */
+            u64 wpos[7];
+            wpos[0] = hwnd; wpos[1] = 0;
+            ((s32*)wpos)[4] = x; ((s32*)wpos)[5] = y;
+            ((s32*)wpos)[6] = w; ((s32*)wpos)[7] = h;
+            ((u32*)wpos)[8] = 0x0040; /* SWP_SHOWWINDOW */
+            call_guest_wndproc(0x0046, 0, (u64)(uintptr_t)wpos);
+        }
+
+        /* WM_ACTIVATEAPP (0x001c): wParam=1 (activated), lParam=0 (no other TID) */
+        call_guest_wndproc(0x001c, 1, 0);
+
+        /* WM_NCACTIVATE (0x0086): wParam=1 (title bar active), lParam=0 */
+        call_guest_wndproc(0x0086, 1, 0);
+
+        /* WM_ACTIVATE (0x0006): wParam=1 (WA_ACTIVE, not minimized), lParam=0 */
+        call_guest_wndproc(0x0006, 1, 0);
+
+        /* WM_SETFOCUS (0x0007): wParam=0 (losing-focus hwnd, none), lParam=0 */
+        g_window_focused = 1;
+        call_guest_wndproc(0x0007, 0, 0);
+
+        /* WM_WINDOWPOSCHANGED (0x0047): same WINDOWPOS as 0x0046 */
+        {
+            u64 wpos[7];
+            wpos[0] = hwnd; wpos[1] = 0;
+            ((s32*)wpos)[4] = x; ((s32*)wpos)[5] = y;
+            ((s32*)wpos)[6] = w; ((s32*)wpos)[7] = h;
+            ((u32*)wpos)[8] = 0x0040; /* SWP_SHOWWINDOW */
+            call_guest_wndproc(0x0047, 0, (u64)(uintptr_t)wpos);
+        }
+
+        /* WM_SIZE (0x0005) and WM_MOVE (0x0003) again, as Windows sends them
+         * a second time during the show sequence after WM_WINDOWPOSCHANGED. */
+        call_guest_wndproc(0x0005, 0,
+                           ((u64)(u16)client_h << 16) | (u16)client_w);
+        call_guest_wndproc(0x0003, 0, ((u64)(u16)y << 16) | (u16)x);
+
+    } else {
+        /* Window not WS_VISIBLE at creation — no activation burst. */
+        /* WM_SHOWWINDOW is still sent if SW_SHOW/SW_HIDE style bits imply
+         * it but WS_VISIBLE was not in style; skip for non-visible case. */
+    }
+
+    /* Mark activated so XWAYLAND_EVENT_FOCUS_IN does not re-deliver the
+     * activation burst if the compositor also sends a focus-in. */
+    if (style & 0x10000000u) {
+        fprintf(stderr,
+                "[WIN] create_guest_window: delivered synchronous activation "
+                "sequence (WM_ACTIVATEAPP/WM_ACTIVATE/WM_SETFOCUS)\n");
+    }
+
     return hwnd;
 }
 
@@ -7530,25 +9066,139 @@ impl_SetWindowTextA(u64 hw, u64 txt) {
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     return xwayland_window_set_title((const char *)(uintptr_t)txt);
 }
+static int resize_native_from_outer(s32 x, s32 y, s32 w, s32 h,
+                                    int move, int resize)
+{
+    int client_x = 0, client_y = 0, client_w = w, client_h = h;
+    if (resize && !beer_window_client_from_outer(
+            w, h, beer_window_style_is_decorated((u32)g_window_style),
+            &client_x, &client_y, &client_w, &client_h))
+        return 0;
+    if (move) { g_window_outer_x = x; g_window_outer_y = y; }
+    if (resize) {
+        g_window_outer_width = w; g_window_outer_height = h;
+        xwayland_window_set_client_rect(0, 0, client_w, client_h);
+    }
+    return xwayland_window_move_resize(x, y, client_w, client_h, move, resize);
+}
+
 static u64 __attribute__((ms_abi))
 impl_MoveWindow(u64 hw, s32 x, s32 y, s32 w, s32 h, u32 rep) {
     (void)rep;
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
-    return xwayland_window_move_resize(x, y, w, h, 1, 1);
+    return resize_native_from_outer(x, y, w, h, 1, 1);
 }
 static u64 __attribute__((ms_abi))
 impl_SetWindowPos(u64 hw, u64 ins, s32 x, s32 y, s32 w, s32 h, u32 flags) {
     (void)ins;
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
-    return xwayland_window_move_resize(x, y, w, h,
-                                       !(flags & 0x0002), !(flags & 0x0001));
+    return resize_native_from_outer(x, y, w, h,
+                                    !(flags & 0x0002), !(flags & 0x0001));
 }
 static u64 __attribute__((ms_abi))
 impl_GetDC(u64 hw) { (void)hw; return FAKE_HDC; }
 static u64 __attribute__((ms_abi))
 impl_ReleaseDC(u64 hw, u64 dc) { (void)hw;(void)dc; return 1; }
+static _Atomic(u64) g_current_cursor = 0x20000001;
+
 static u64 __attribute__((ms_abi))
-impl_SetCursor(u64 hc) { (void)hc; return 0; }
+impl_SetCursor(u64 cursor)
+{
+    u64 previous = atomic_exchange(&g_current_cursor, cursor);
+    /* Stock cursor handles loaded by Beer map to the compositor's default
+     * pointer. A null handle hides it, matching Win32 SetCursor semantics. */
+    xwayland_window_set_cursor_visible(cursor != 0);
+    return previous;
+}
+
+/* ---- PAINTSTRUCT / paint helpers ----------------------------------------
+ * RE8's WndProc may process WM_PAINT via BeginPaint/EndPaint and call
+ * ValidateRect to suppress repeated WM_PAINT delivery.  The Win64
+ * PAINTSTRUCT is 72 bytes: HDC(8) + fErase(4) + rcPaint RECT(16) +
+ * fRestore(4) + fIncUpdate(4) + rgbReserved[32].
+ * We return a plausible fake HDC and full-client-area rcPaint so any
+ * subsequent drawing call has a valid context pointer.                     */
+typedef struct {
+    u64 hdc;       /* HDC (8 bytes) */
+    u32 fErase;
+    /* rcPaint: left, top, right, bottom */
+    s32 rc_left, rc_top, rc_right, rc_bottom;
+    u32 fRestore;
+    u32 fIncUpdate;
+    u8  rgbReserved[32];
+} BEER_PAINTSTRUCT;
+_Static_assert(sizeof(BEER_PAINTSTRUCT) == 72,
+               "PAINTSTRUCT must be 72 bytes on Win64");
+
+static u64 __attribute__((ms_abi))
+impl_BeginPaint(u64 hw, BEER_PAINTSTRUCT *ps)
+{
+    (void)hw;
+    if (!ps) return 0;
+    memset(ps, 0, sizeof(*ps));
+    ps->hdc     = FAKE_HDC;
+    ps->fErase  = 1;
+    /* Entire client area — exactly the same extent as GetClientRect. */
+    XwaylandWindowState st;
+    s32 w = 1920, h = 1080;
+    if (xwayland_window_get_state(&st)) {
+        w = st.client_width;
+        h = st.client_height;
+    }
+    ps->rc_right  = w;
+    ps->rc_bottom = h;
+    /* BeginPaint implicitly validates the update region just like on Windows.
+     * Clear the paint-pending flag so the expose handler may queue a fresh
+     * WM_PAINT on the next compositor redraw (issue 7). */
+    atomic_store(&g_paint_pending, 0);
+    return FAKE_HDC;
+}
+
+static u64 __attribute__((ms_abi))
+impl_EndPaint(u64 hw, const BEER_PAINTSTRUCT *ps)
+{
+    (void)hw; (void)ps;
+    return 1; /* always succeeds */
+}
+
+static u64 __attribute__((ms_abi))
+impl_ValidateRect(u64 hw, const void *rect)
+{
+    (void)hw; (void)rect;
+    /* Clear the paint-pending flag so the next XWAYLAND_EVENT_EXPOSE or
+     * InvalidateRect call can queue a fresh WM_PAINT (issue 7). */
+    atomic_store(&g_paint_pending, 0);
+    return 1; /* suppress further WM_PAINT */
+}
+
+static u64 __attribute__((ms_abi))
+impl_InvalidateRect(u64 hw, const void *rect, u32 erase)
+{
+    (void)rect; (void)erase;
+    /* Queue WM_PAINT only if no paint is already pending (same coalescing
+     * rule as XWAYLAND_EVENT_EXPOSE).  Set g_paint_pending first so the
+     * expose handler cannot race in between (issue 7). */
+    if (hw == FAKE_HWND) {
+        int expected_clean = 0;
+        if (atomic_compare_exchange_strong(&g_paint_pending, &expected_clean, 1))
+            queue_window_message(0x000f, 0, 0);
+    }
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetUpdateRect(u64 hw, WIN_RECT *rect, u32 erase)
+{
+    (void)erase;
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    if (rect) {
+        XwaylandWindowState st;
+        s32 w = 1920, h = 1080;
+        if (xwayland_window_get_state(&st)) { w = st.width; h = st.height; }
+        rect->left = 0; rect->top = 0; rect->right = w; rect->bottom = h;
+    }
+    return 1;
+}
 
 static u64 __attribute__((ms_abi))
 impl_ShowCursor(s32 show)
@@ -7560,6 +9210,8 @@ impl_ShowCursor(s32 show)
     s32 value = show
         ? atomic_fetch_add(&display_count, 1) + 1
         : atomic_fetch_sub(&display_count, 1) - 1;
+    xwayland_window_set_cursor_visible(value >= 0 &&
+                                       atomic_load(&g_current_cursor) != 0);
     static _Atomic(u32) logs;
     u32 log = atomic_fetch_add(&logs, 1);
     if (log < 16)
@@ -7577,6 +9229,7 @@ typedef struct {
     s32 client_x, client_y;
     s32 delta_x, delta_y, wheel;
     u8 mouse_buttons[8];
+    u8 pointer_position_valid;
 } BEER_INPUT_STATE;
 
 typedef struct {
@@ -7609,8 +9262,38 @@ static pthread_mutex_t g_input_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* USER32 queue-state synchronization is declared with input state because
  * GetKeyState is defined before the message queue implementation below. */
 static pthread_mutex_t g_win_message_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Condition variable that GetMessageW blocks on. queue_message_for_thread
+ * signals it after appending to the ring so the sleeping thread wakes
+ * immediately instead of polling every 1 ms. */
+static pthread_cond_t g_win_message_ready = PTHREAD_COND_INITIALIZER;
 static u8 g_win_message_keys[256];
 static _Atomic(u32) g_input_event_logs;
+
+typedef struct {
+    u16 usage_page;
+    u16 usage;
+    u32 flags;
+    u64 target;
+} BEER_RAW_INPUT_DEVICE;
+_Static_assert(sizeof(BEER_RAW_INPUT_DEVICE) == 16,
+               "Win64 RAWINPUTDEVICE layout");
+
+#define BEER_RAW_INPUT_CAPACITY 256
+static BeerRawInput g_raw_inputs[BEER_RAW_INPUT_CAPACITY];
+static u32 g_raw_input_next;
+static pthread_mutex_t g_raw_input_mutex = PTHREAD_MUTEX_INITIALIZER;
+static BEER_RAW_INPUT_DEVICE g_raw_mouse_registration;
+static BEER_RAW_INPUT_DEVICE g_raw_keyboard_registration;
+static int g_raw_mouse_registered;
+static int g_raw_keyboard_registered;
+
+/* Low-level hooks execute on the installing/message thread on Windows. Native
+ * events are therefore translated into queued messages first, and callbacks
+ * are invoked by DispatchMessage rather than from Beer's host input thread. */
+static _Atomic(u64) g_keyboard_hook_proc;
+static _Atomic(u64) g_mouse_hook_proc;
+static _Atomic(u64) g_keyboard_hook_handle;
+static _Atomic(u64) g_mouse_hook_handle;
 /* Xlib event consumption is process-global. Serialize every producer so one
  * polling thread cannot consume an event while another suppresses delivery. */
 static pthread_mutex_t g_event_collect_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -7654,12 +9337,12 @@ static void native_to_guest_client(s32 native_x, s32 native_y,
                                    s32 *guest_x, s32 *guest_y)
 {
     XwaylandWindowState state;
-    if (xwayland_window_get_state(&state) && state.width > 0 && state.height > 0 &&
-        state.client_width > 0 && state.client_height > 0) {
-        *guest_x = (s32)((s64)native_x * state.client_width / state.width);
-        *guest_y = (s32)((s64)native_y * state.client_height / state.height);
+    if (xwayland_window_get_state(&state) &&
+        beer_window_map_client_point(native_x, native_y,
+                                     state.width, state.height,
+                                     state.client_width, state.client_height,
+                                     guest_x, guest_y))
         return;
-    }
     *guest_x = native_x;
     *guest_y = native_y;
 }
@@ -7723,6 +9406,25 @@ impl_GetCursorPos(WIN_POINT *point)
 }
 
 static u64 __attribute__((ms_abi))
+impl_SetCursorPos(s32 x, s32 y)
+{
+    int result = xwayland_window_set_cursor_position(x, y);
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        static _Atomic(u32) logs;
+        u32 log = atomic_fetch_add(&logs, 1);
+        if (log < 64) {
+            XwaylandWindowState state = {0};
+            xwayland_window_get_state(&state);
+            fprintf(stderr,
+                    "[INPUT MAP] SetCursorPos root=%d,%d result=%d native=%dx%d client=%dx%d\n",
+                    x, y, result, state.width, state.height,
+                    state.client_width, state.client_height);
+        }
+    }
+    return result;
+}
+
+static u64 __attribute__((ms_abi))
 impl_ScreenToClient(u64 hwnd, WIN_POINT *point)
 {
     if (hwnd != FAKE_HWND || !point) { g_last_error = hwnd == FAKE_HWND ? 87 : 1400; return 0; }
@@ -7730,10 +9432,13 @@ impl_ScreenToClient(u64 hwnd, WIN_POINT *point)
     if (!xwayland_window_get_state(&state)) { g_last_error = 1400; return 0; }
     point->x -= state.x;
     point->y -= state.y;
-    if (state.width > 0 && state.height > 0 &&
-        state.client_width > 0 && state.client_height > 0) {
-        point->x = (s32)((s64)point->x * state.client_width / state.width);
-        point->y = (s32)((s64)point->y * state.client_height / state.height);
+    s32 client_x = point->x, client_y = point->y;
+    if (beer_window_map_client_point(point->x, point->y,
+                                     state.width, state.height,
+                                     state.client_width, state.client_height,
+                                     &client_x, &client_y)) {
+        point->x = client_x;
+        point->y = client_y;
     }
     return 1;
 }
@@ -7778,7 +9483,8 @@ impl_GetKeyState(s32 virtual_key)
     u16 result = beer_win32_get_key_state(g_win_message_keys, virtual_key);
     pthread_mutex_unlock(&g_win_message_mutex);
     if (getenv("BEER_INPUT_DIAGNOSTICS") &&
-        (virtual_key == 0x01 || virtual_key == 0x02 || virtual_key == 0x04)) {
+        (virtual_key == 0x01 || virtual_key == 0x02 || virtual_key == 0x04 ||
+         virtual_key == 0x0d || virtual_key == 0x20 || virtual_key == 0x1b)) {
         static _Atomic(u32) logs;
         u32 log = atomic_fetch_add(&logs, 1);
         if (log < 128)
@@ -7791,8 +9497,118 @@ impl_GetKeyState(s32 virtual_key)
 static u64 __attribute__((ms_abi))
 impl_GetMessageExtraInfo(void)
 {
-    /* No synthetic input metadata is attached to the quiet host-input state. */
     return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_RegisterRawInputDevices(const BEER_RAW_INPUT_DEVICE *devices,
+                             u32 count, u32 size)
+{
+    if ((count && !devices) || size != sizeof(BEER_RAW_INPUT_DEVICE)) {
+        g_last_error = 87;
+        return 0;
+    }
+    pthread_mutex_lock(&g_raw_input_mutex);
+    for (u32 i = 0; i < count; ++i) {
+        const BEER_RAW_INPUT_DEVICE *device = &devices[i];
+        if (device->usage_page != 1 ||
+            (device->usage != 2 && device->usage != 6)) {
+            pthread_mutex_unlock(&g_raw_input_mutex);
+            g_last_error = 87;
+            return 0;
+        }
+        BEER_RAW_INPUT_DEVICE *registration = device->usage == 2
+            ? &g_raw_mouse_registration : &g_raw_keyboard_registration;
+        int *registered = device->usage == 2
+            ? &g_raw_mouse_registered : &g_raw_keyboard_registered;
+        if (device->flags & 0x00000001u) { /* RIDEV_REMOVE */
+            if (device->target) {
+                pthread_mutex_unlock(&g_raw_input_mutex);
+                g_last_error = 87;
+                return 0;
+            }
+            memset(registration, 0, sizeof(*registration));
+            *registered = 0;
+        } else {
+            *registration = *device;
+            *registered = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_raw_input_mutex);
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        fprintf(stderr, "[INPUT] registered raw input devices count=%u", count);
+        for (u32 i = 0; i < count; ++i)
+            fprintf(stderr, " usage=%u:%u flags=0x%x target=0x%llx",
+                    devices[i].usage_page, devices[i].usage, devices[i].flags,
+                    (unsigned long long)devices[i].target);
+        fputc('\n', stderr);
+    }
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetRegisteredRawInputDevices(BEER_RAW_INPUT_DEVICE *devices,
+                                  u32 *count, u32 size)
+{
+    if (!count || size != sizeof(BEER_RAW_INPUT_DEVICE)) {
+        g_last_error = 87;
+        return (u64)UINT32_MAX;
+    }
+    pthread_mutex_lock(&g_raw_input_mutex);
+    u32 available = (u32)g_raw_mouse_registered + (u32)g_raw_keyboard_registered;
+    if (!devices) {
+        *count = available;
+        pthread_mutex_unlock(&g_raw_input_mutex);
+        return 0;
+    }
+    if (*count < available) {
+        *count = available;
+        pthread_mutex_unlock(&g_raw_input_mutex);
+        g_last_error = 122; /* ERROR_INSUFFICIENT_BUFFER */
+        return (u64)UINT32_MAX;
+    }
+    u32 written = 0;
+    if (g_raw_mouse_registered) devices[written++] = g_raw_mouse_registration;
+    if (g_raw_keyboard_registered) devices[written++] = g_raw_keyboard_registration;
+    *count = written;
+    pthread_mutex_unlock(&g_raw_input_mutex);
+    return written;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetRawInputData(u64 handle, u32 command, void *data,
+                     u32 *size, u32 header_size)
+{
+    if (!size || header_size != sizeof(BeerRawInputHeader) ||
+        handle == 0 || handle > BEER_RAW_INPUT_CAPACITY ||
+        (command != 0x10000003u && command != 0x10000005u)) {
+        g_last_error = 87;
+        return (u64)UINT32_MAX;
+    }
+    pthread_mutex_lock(&g_raw_input_mutex);
+    BeerRawInput input = g_raw_inputs[(u32)(handle - 1)];
+    pthread_mutex_unlock(&g_raw_input_mutex);
+    u32 required = command == 0x10000005u
+        ? (u32)sizeof(BeerRawInputHeader) : input.header.size;
+    if (!data) {
+        *size = required;
+        return 0;
+    }
+    if (*size < required) {
+        *size = required;
+        g_last_error = 122;
+        return (u64)UINT32_MAX;
+    }
+    memcpy(data, &input, required);
+    *size = required;
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        static _Atomic(u32) logs;
+        u32 log = atomic_fetch_add(&logs, 1);
+        if (log < 128)
+            fprintf(stderr, "[INPUT] GetRawInputData handle=%llu command=0x%x type=%u bytes=%u\n",
+                    (unsigned long long)handle, command, input.header.type, required);
+    }
+    return required;
 }
 
 typedef struct {
@@ -7889,10 +9705,20 @@ impl_SetFocus(u64 hw)
 {
     if (hw && hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     u64 previous = g_window_focused ? FAKE_HWND : 0;
-    if (hw == FAKE_HWND && !g_window_focused) {
-        g_window_focused = 1;
-        call_guest_wndproc(0x0007, 0, 0);
-    } else if (!hw && g_window_focused) {
+    if (hw == FAKE_HWND) {
+        /* Guest focus and compositor focus are separate. Reporting WM_SETFOCUS
+         * without focusing the native XWayland window leaves keyboard events
+         * routed to the terminal/editor even though USER32 says this window is
+         * active. Keep both sides of the focus contract synchronized. */
+        if (!xwayland_window_request_focus()) {
+            g_last_error = 5;
+            return 0;
+        }
+        if (!g_window_focused) {
+            g_window_focused = 1;
+            call_guest_wndproc(0x0007, 0, 0);
+        }
+    } else if (g_window_focused) {
         g_window_focused = 0;
         call_guest_wndproc(0x0008, 0, 0);
     }
@@ -7923,6 +9749,22 @@ typedef struct {
     u32 lPrivate;
 } WIN_MSG;
 _Static_assert(sizeof(WIN_MSG) == 48, "MSG must be 48 bytes on Win64");
+
+typedef struct {
+    u32 virtual_key;
+    u32 scan_code;
+    u32 flags;
+    u32 time;
+    u64 extra_info;
+} BEER_KBDLLHOOKSTRUCT;
+
+typedef struct {
+    WIN_POINT point;
+    u32 mouse_data;
+    u32 flags;
+    u32 time;
+    u64 extra_info;
+} BEER_MSLLHOOKSTRUCT;
 
 #define WIN_MESSAGE_CAPACITY 256
 static WIN_MSG g_win_messages[WIN_MESSAGE_CAPACITY];
@@ -8026,6 +9868,8 @@ static int queue_message_for_thread(u32 owner, u64 hwnd, u32 message,
     g_win_message_threads[index] = owner;
     ++g_win_message_count;
     u32 queued_count = g_win_message_count;
+    /* Wake any thread blocked in GetMessageW. */
+    pthread_cond_broadcast(&g_win_message_ready);
     pthread_mutex_unlock(&g_win_message_mutex);
     if (getenv("BEER_MESSAGE_DIAGNOSTICS")) {
         static _Atomic(u32) queue_logs;
@@ -8048,6 +9892,35 @@ static int queue_window_message(u32 message, u64 wparam, u64 lparam)
     u32 owner = g_window_thread_id ? g_window_thread_id :
                                     (u32)current_windows_thread_id();
     return queue_message_for_thread(owner, FAKE_HWND, message, wparam, lparam);
+}
+
+static u64 store_raw_input(const BeerRawInput *input)
+{
+    pthread_mutex_lock(&g_raw_input_mutex);
+    u32 index = g_raw_input_next++ % BEER_RAW_INPUT_CAPACITY;
+    g_raw_inputs[index] = *input;
+    pthread_mutex_unlock(&g_raw_input_mutex);
+    return (u64)index + 1;
+}
+
+static void queue_raw_input(const BeerRawInput *input, int keyboard)
+{
+    pthread_mutex_lock(&g_raw_input_mutex);
+    int registered = keyboard ? g_raw_keyboard_registered :
+                                g_raw_mouse_registered;
+    u32 flags = keyboard ? g_raw_keyboard_registration.flags :
+                           g_raw_mouse_registration.flags;
+    u64 target = keyboard ? g_raw_keyboard_registration.target :
+                            g_raw_mouse_registration.target;
+    pthread_mutex_unlock(&g_raw_input_mutex);
+    if (!registered) return;
+    u64 handle = store_raw_input(input);
+    /* RIDEV_INPUTSINK permits delivery without focus; wParam distinguishes
+     * sink (1) from normal foreground (0) delivery. */
+    queue_message_for_thread(g_window_thread_id ? g_window_thread_id :
+                                                  (u32)current_windows_thread_id(),
+                             target ? target : FAKE_HWND, 0x00ff,
+                             (flags & 0x00000100u) ? 1 : 0, handle);
 }
 
 static void collect_native_window_events(void)
@@ -8080,16 +9953,27 @@ static void collect_native_window_events(void)
                     u64 lparam = 1 | ((u64)(dik & 0x7f) << 16);
                     if (!down) lparam |= 0xc0000000ULL;
                     queue_window_message(down ? 0x0100 : 0x0101, vk, lparam);
-                    u32 log = atomic_fetch_add(&g_input_event_logs, 1);
-                    if (log < 32)
-                        fprintf(stderr, "[INPUT] key %s vk=0x%02x dik=0x%02x\n",
-                                down ? "down" : "up", vk, dik);
+                    BeerRawInput raw = beer_raw_keyboard_input(vk, dik, down);
+                    queue_raw_input(&raw, 1);
+                    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+                        u32 log = atomic_fetch_add(&g_input_event_logs, 1);
+                        if (log < 32)
+                            fprintf(stderr,
+                                    "[INPUT] key %s vk=0x%02x dik=0x%02x\n",
+                                    down ? "down" : "up", vk, dik);
+                    }
                 }
                 break;
             }
             case XWAYLAND_EVENT_BUTTON_DOWN:
             case XWAYLAND_EVENT_BUTTON_UP: {
                 int down = event.type == XWAYLAND_EVENT_BUTTON_DOWN;
+                /* A click activates a normal top-level Windows window. The
+                 * guest focus flag can predate compositor activation because
+                 * CreateWindow sends WM_SETFOCUS synchronously; renew native
+                 * focus on the real button press so subsequent keyboard input
+                 * is routed to this XWayland surface. */
+                if (down) xwayland_window_request_focus();
                 if (event.button >= 1 && event.button <= 3) {
                     /* messages[button_index][!down]: [0]=down message, [1]=up message.
                      * Button 1 = left (0x0201 down / 0x0202 up)
@@ -8112,6 +9996,7 @@ static void collect_native_window_events(void)
                                                    down ? 0x80u : 0u);
                     g_input.client_x = guest_x; g_input.client_y = guest_y;
                     g_input.root_x = event.root_x; g_input.root_y = event.root_y;
+                    g_input.pointer_position_valid = 1;
                     u64 button_flags = 0;
                     if (g_input.mouse_buttons[0] & 0x80) button_flags |= 0x0001; /* MK_LBUTTON */
                     if (g_input.mouse_buttons[1] & 0x80) button_flags |= 0x0010; /* MK_MBUTTON */
@@ -8123,12 +10008,20 @@ static void collect_native_window_events(void)
                         queue_window_message(messages[event.button - 1][!down],
                                              button_flags,
                                              ((u64)(u16)guest_y << 16) | (u16)guest_x);
-                        u32 log = atomic_fetch_add(&g_input_event_logs, 1);
-                        if (log < 64)
-                            fprintf(stderr,
-                                    "[INPUT] mouse button %u %s vk=0x%02x at %d,%d\n",
-                                    event.button, down ? "down" : "up", vk,
-                                    guest_x, guest_y);
+                        static const u16 raw_down_flags[3] = {0x0001, 0x0010, 0x0004};
+                        static const u16 raw_up_flags[3] = {0x0002, 0x0020, 0x0008};
+                        BeerRawInput raw = beer_raw_mouse_input(
+                            0, 0, down ? raw_down_flags[event.button - 1] :
+                                        raw_up_flags[event.button - 1], 0);
+                        queue_raw_input(&raw, 0);
+                        if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+                            u32 log = atomic_fetch_add(&g_input_event_logs, 1);
+                            if (log < 64)
+                                fprintf(stderr,
+                                        "[INPUT] mouse button %u %s vk=0x%02x at %d,%d\n",
+                                        event.button, down ? "down" : "up", vk,
+                                        guest_x, guest_y);
+                        }
                     }
                 } else if (down && (event.button == 4 || event.button == 5)) {
                     s32 wheel = event.button == 4 ? 120 : -120;
@@ -8139,9 +10032,13 @@ static void collect_native_window_events(void)
                     if (top_level)
                         queue_dinput_event_locked(1, 8, (u32)wheel);
                     pthread_mutex_unlock(&g_input_mutex);
-                    if (top_level)
+                    if (top_level) {
                         queue_window_message(0x020a, (u64)(u16)wheel << 16,
                                              ((u64)(u16)guest_y << 16) | (u16)guest_x);
+                        BeerRawInput raw = beer_raw_mouse_input(
+                            0, 0, 0x0400, (u16)wheel); /* RI_MOUSE_WHEEL */
+                        queue_raw_input(&raw, 0);
+                    }
                 }
                 break;
             }
@@ -8149,8 +10046,24 @@ static void collect_native_window_events(void)
                 s32 guest_x, guest_y;
                 native_to_guest_client(event.x, event.y, &guest_x, &guest_y);
                 pthread_mutex_lock(&g_input_mutex);
-                s32 dx = guest_x - g_input.client_x;
-                s32 dy = guest_y - g_input.client_y;
+                s32 previous_x = g_input.client_x;
+                s32 previous_y = g_input.client_y;
+                int position_valid = g_input.pointer_position_valid;
+                s32 dx = 0, dy = 0;
+                beer_win32_pointer_motion_delta(
+                    position_valid, previous_x, previous_y,
+                    guest_x, guest_y, &dx, &dy);
+                if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+                    static _Atomic(u32) map_logs;
+                    u32 log = atomic_fetch_add(&map_logs, 1);
+                    if (log < 128)
+                        fprintf(stderr,
+                                "[INPUT MAP] native=%d,%d root=%d,%d guest=%d,%d previous=%d,%d valid=%d delta=%d,%d\n",
+                                event.x, event.y, event.root_x, event.root_y,
+                                guest_x, guest_y, previous_x, previous_y,
+                                position_valid, dx, dy);
+                }
+                g_input.pointer_position_valid = 1;
                 g_input.delta_x += dx;
                 g_input.delta_y += dy;
                 if (top_level) {
@@ -8160,9 +10073,14 @@ static void collect_native_window_events(void)
                 g_input.client_x = guest_x; g_input.client_y = guest_y;
                 g_input.root_x = event.root_x; g_input.root_y = event.root_y;
                 pthread_mutex_unlock(&g_input_mutex);
-                if (top_level)
+                if (top_level) {
                     queue_window_message(0x0200, 0,
                                          ((u64)(u16)guest_y << 16) | (u16)guest_x);
+                    if (dx || dy) {
+                        BeerRawInput raw = beer_raw_mouse_input(dx, dy, 0, 0);
+                        queue_raw_input(&raw, 0);
+                    }
+                }
                 break;
             }
             case XWAYLAND_EVENT_CLOSE:
@@ -8172,11 +10090,20 @@ static void collect_native_window_events(void)
             case XWAYLAND_EVENT_HIDE:
                 if (top_level) queue_window_message(0x0018, 0, 0); break;
             case XWAYLAND_EVENT_FOCUS_IN:
-                g_window_focused = 1;
-                if (top_level) {
-                    queue_window_message(0x001c, 1, 0);
-                    queue_window_message(0x0006, 1, 0);
-                    queue_window_message(0x0007, 0, 0);
+                /* If focus was already granted synchronously during
+                 * create_guest_window (WS_VISIBLE path), do not re-deliver
+                 * WM_ACTIVATEAPP/WM_ACTIVATE/WM_SETFOCUS; just record state. */
+                if (!g_window_focused) {
+                    g_window_focused = 1;
+                    if (top_level) {
+                        queue_window_message(0x001c, 1, 0);
+                        queue_window_message(0x0086, 1, 0);
+                        queue_window_message(0x0006, 1, 0);
+                        queue_window_message(0x0007, 0, 0);
+                    }
+                } else {
+                    /* Already focused — compositor echoed our own show. */
+                    g_window_focused = 1;
                 }
                 break;
             case XWAYLAND_EVENT_FOCUS_OUT:
@@ -8185,6 +10112,7 @@ static void collect_native_window_events(void)
                 memset(g_input.keys, 0, sizeof(g_input.keys));
                 memset(g_input.dik, 0, sizeof(g_input.dik));
                 memset(g_input.mouse_buttons, 0, sizeof(g_input.mouse_buttons));
+                g_input.pointer_position_valid = 0;
                 pthread_mutex_unlock(&g_input_mutex);
                 if (top_level) {
                     queue_window_message(0x0008, 0, 0);
@@ -8194,6 +10122,21 @@ static void collect_native_window_events(void)
                 break;
             case XWAYLAND_EVENT_CONFIGURE:
                 if (top_level) {
+                    g_window_outer_x = event.x;
+                    g_window_outer_y = event.y;
+                    /* The native drawable and Win32 client extent now change
+                     * together. Re-seed relative mouse motion so the resize
+                     * cannot turn the coordinate-space change into a delta. */
+                    pthread_mutex_lock(&g_input_mutex);
+                    g_input.pointer_position_valid = 0;
+                    pthread_mutex_unlock(&g_input_mutex);
+                    int outer_w = event.width, outer_h = event.height;
+                    beer_window_outer_from_client(
+                        event.width, event.height,
+                        beer_window_style_is_decorated((u32)g_window_style),
+                        &outer_w, &outer_h);
+                    g_window_outer_width = outer_w;
+                    g_window_outer_height = outer_h;
                     queue_window_message(0x0003, 0,
                                          ((u64)(u16)event.y << 16) | (u16)event.x);
                     queue_window_message(0x0005, 0,
@@ -8201,7 +10144,17 @@ static void collect_native_window_events(void)
                 }
                 break;
             case XWAYLAND_EVENT_EXPOSE:
-                if (top_level) queue_window_message(0x000f, 0, 0); break;
+                /* Only queue one WM_PAINT at a time.  Multiple consecutive
+                 * expose events (compositor-driven redraws) must not fill the
+                 * ring with duplicate WM_PAINT entries and starve button/key
+                 * transitions (issue 7). */
+                if (top_level) {
+                    int expected_clean = 0;
+                    if (atomic_compare_exchange_strong(&g_paint_pending,
+                                                       &expected_clean, 1))
+                        queue_window_message(0x000f, 0, 0);
+                }
+                break;
             default: break;
         }
     }
@@ -8378,25 +10331,191 @@ impl_GetMessageW(WIN_MSG *msg, u64 hw, u32 min, u32 max)
         collect_window_timers();
         if (take_window_message(msg, min, max, 1))
             return msg->message == 0x0012 ? 0 : 1;
-        struct timespec ts = {0, 1000000L};
-        nanosleep(&ts, NULL);
+
+        /* Block efficiently until a message is posted for this thread.
+         * Use a 4 ms ceiling so timers and native events are still serviced
+         * even if a wakeup is missed.  This replaces the old 1 ms nanosleep
+         * busy-loop and eliminates an entire wasted CPU core while idle. */
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 4000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec  += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        pthread_mutex_lock(&g_win_message_mutex);
+        /* Only sleep when there are genuinely no messages for this thread. */
+        int has_msg = 0;
+        u32 tid = (u32)current_windows_thread_id();
+        for (u32 i = 0; i < g_win_message_count && !has_msg; ++i) {
+            u32 idx = (g_win_message_head + i) % WIN_MESSAGE_CAPACITY;
+            if (g_win_message_threads[idx] == tid)
+                has_msg = 1;
+        }
+        if (!has_msg)
+            pthread_cond_timedwait(&g_win_message_ready,
+                                   &g_win_message_mutex, &deadline);
+        pthread_mutex_unlock(&g_win_message_mutex);
     }
 }
 static u64 __attribute__((ms_abi))
-impl_TranslateMessage(const WIN_MSG *msg) { (void)msg; return 0; }
+impl_TranslateMessage(const WIN_MSG *msg)
+{
+    if (!msg) return 0;
+    pthread_mutex_lock(&g_input_mutex);
+    int shift = (g_input.keys[0xa0] | g_input.keys[0xa1] |
+                 g_input.keys[0x10]) & 0x80;
+    int caps_lock = g_input.keys[0x14] & 1;
+    pthread_mutex_unlock(&g_input_mutex);
+    u32 character = beer_win32_key_message_character(
+        msg->message, (u32)msg->wParam, shift, caps_lock);
+    if (!character) return 0;
+    u32 message = msg->message == 0x0104 ? 0x0106 : 0x0102;
+    return queue_message_for_thread(
+        g_window_thread_id ? g_window_thread_id :
+                             (u32)current_windows_thread_id(),
+        msg->hwnd, message, character, msg->lParam);
+}
 static u64 __attribute__((ms_abi))
 impl_DispatchMessageW(const WIN_MSG *msg)
 {
     if (!msg || msg->message == 0x0012) return 0;
+
+    typedef u64 __attribute__((ms_abi)) (*GuestHookProc)(s32, u64, u64);
+    u64 hook_proc = 0;
+    if (msg->message >= 0x0100 && msg->message <= 0x0105) {
+        hook_proc = atomic_load(&g_keyboard_hook_proc);
+        if (hook_proc) {
+            BEER_KBDLLHOOKSTRUCT data = {
+                .virtual_key = (u32)msg->wParam,
+                .scan_code = (u32)((msg->lParam >> 16) & 0xffu),
+                .flags = ((msg->lParam >> 24) & 1u) |
+                         ((msg->lParam >> 30) & 1u ? 0x80u : 0u),
+                .time = msg->time,
+                .extra_info = 0
+            };
+            ((GuestHookProc)(uintptr_t)hook_proc)(
+                0, msg->message, (u64)(uintptr_t)&data);
+        }
+    } else if (beer_win32_message_is_button_transition(msg->message) ||
+               msg->message == 0x0200 || msg->message == 0x020a) {
+        hook_proc = atomic_load(&g_mouse_hook_proc);
+        if (hook_proc) {
+            BEER_MSLLHOOKSTRUCT data = {
+                .point = msg->pt,
+                .mouse_data = msg->message == 0x020a ?
+                    (u32)(msg->wParam & 0xffff0000u) : 0,
+                .flags = 0,
+                .time = msg->time,
+                .extra_info = 0
+            };
+            ((GuestHookProc)(uintptr_t)hook_proc)(
+                0, msg->message, (u64)(uintptr_t)&data);
+        }
+    }
+    /* WM_TIMER (0x0113): lParam is the optional timer-proc address */
     if (msg->message == 0x0113 && msg->lParam) {
         typedef void __attribute__((ms_abi)) (*GuestTimerProc)(u64, u32, u64, u32);
         ((GuestTimerProc)(uintptr_t)msg->lParam)(msg->hwnd, msg->message,
                                                 msg->wParam, msg->time);
         return 0;
     }
+    /* Thread messages (hwnd == NULL) are not dispatched through WndProc.
+     * On Windows DispatchMessage returns 0 for them. */
     if (!msg->hwnd) return 0;
+    /* WM_SETCURSOR (0x0020) and WM_NCHITTEST (0x0084): handled by DefWindowProc
+     * if the WndProc returns 0, but we let the game's WndProc decide first. */
     return call_guest_wndproc(msg->message, msg->wParam, msg->lParam);
 }
+
+/* MsgWaitForMultipleObjects — block until a message is posted OR one of the
+ * given handles is signaled, with an optional timeout.  RE8 uses this in its
+ * window/render-scheduler threads to sleep until work arrives without
+ * burning a core.  We implement it as: check handles first, then wait on
+ * the message condvar if no handle is ready. */
+static u64 __attribute__((ms_abi))
+impl_MsgWaitForMultipleObjects(u32 count, const u64 *handles,
+                                u32 wait_all, u32 timeout_ms, u32 wake_mask)
+{
+    (void)wake_mask;
+    /* First check handle state without blocking */
+    u64 r = impl_WaitForMultipleObjects(count, handles, wait_all, 0);
+    if (r != 0x00000102u) /* WAIT_TIMEOUT */ return r;
+    if (timeout_ms == 0) {
+        /* A message is present? Return QS_ALLPOSTMESSAGE index */
+        u32 tid = (u32)current_windows_thread_id();
+        pthread_mutex_lock(&g_win_message_mutex);
+        int has_msg = 0;
+        for (u32 i = 0; i < g_win_message_count && !has_msg; ++i) {
+            u32 idx = (g_win_message_head + i) % WIN_MESSAGE_CAPACITY;
+            if (g_win_message_threads[idx] == tid) has_msg = 1;
+        }
+        pthread_mutex_unlock(&g_win_message_mutex);
+        if (has_msg) return count; /* WAIT_OBJECT_0 + count = message ready */
+        return 0x00000102u; /* WAIT_TIMEOUT */
+    }
+    /* Wait up to timeout for either a handle or a message */
+    u64 deadline_ms = monotonic_milliseconds() + timeout_ms;
+    for (;;) {
+        u64 now = monotonic_milliseconds();
+        if (now >= deadline_ms) return 0x00000102u;
+        u64 left = deadline_ms - now;
+        /* Sleep at most 4 ms at a time so we check handles at a reasonable rate */
+        u64 slice = left < 4 ? left : 4;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)(slice * 1000000ULL);
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_mutex_lock(&g_win_message_mutex);
+        u32 tid = (u32)current_windows_thread_id();
+        int has_msg = 0;
+        for (u32 i = 0; i < g_win_message_count && !has_msg; ++i) {
+            u32 idx = (g_win_message_head + i) % WIN_MESSAGE_CAPACITY;
+            if (g_win_message_threads[idx] == tid) has_msg = 1;
+        }
+        if (!has_msg)
+            pthread_cond_timedwait(&g_win_message_ready, &g_win_message_mutex, &ts);
+        pthread_mutex_unlock(&g_win_message_mutex);
+        /* Re-check handles */
+        r = impl_WaitForMultipleObjects(count, handles, wait_all, 0);
+        if (r != 0x00000102u) return r;
+        /* Check message */
+        pthread_mutex_lock(&g_win_message_mutex);
+        has_msg = 0;
+        for (u32 i = 0; i < g_win_message_count && !has_msg; ++i) {
+            u32 idx = (g_win_message_head + i) % WIN_MESSAGE_CAPACITY;
+            if (g_win_message_threads[idx] == tid) has_msg = 1;
+        }
+        pthread_mutex_unlock(&g_win_message_mutex);
+        if (has_msg) return count;
+    }
+}
+/* WaitMessage — blocks until at least one message is in the calling thread's
+ * queue.  Equivalent to MsgWaitForMultipleObjects(0, NULL, FALSE,
+ * INFINITE, QS_ALLINPUT) without the handle-wait component. */
+static u64 __attribute__((ms_abi))
+impl_WaitMessage(void)
+{
+    u32 tid = (u32)current_windows_thread_id();
+    for (;;) {
+        pthread_mutex_lock(&g_win_message_mutex);
+        int has_msg = 0;
+        for (u32 i = 0; i < g_win_message_count && !has_msg; ++i) {
+            u32 idx = (g_win_message_head + i) % WIN_MESSAGE_CAPACITY;
+            if (g_win_message_threads[idx] == tid) has_msg = 1;
+        }
+        if (has_msg) { pthread_mutex_unlock(&g_win_message_mutex); return 1; }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 4000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_win_message_ready, &g_win_message_mutex, &ts);
+        pthread_mutex_unlock(&g_win_message_mutex);
+        collect_native_window_events();
+        collect_window_timers();
+    }
+}
+
 static u64 __attribute__((ms_abi))
 impl_PostQuitMessage(u32 code)
 {
@@ -8408,6 +10527,16 @@ static u64 __attribute__((ms_abi))
 impl_SendMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
 {
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    if (msg == 0x0080) { /* WM_SETICON */
+        u64 *slot = wp ? &g_window_icon : &g_window_small_icon;
+        u64 previous = *slot;
+        *slot = lp;
+        if (lp == (u64)(uintptr_t)g_app_icon_pixels && g_app_icon_pixels)
+            (void)xwayland_window_set_icon_argb(g_app_icon_pixels,
+                                                 g_app_icon_width,
+                                                 g_app_icon_height);
+        return previous;
+    }
     return call_guest_wndproc(msg, wp, lp);
 }
 static u64 __attribute__((ms_abi))
@@ -8428,10 +10557,37 @@ impl_PostThreadMessageW(u32 thread_id, u32 msg, u64 wp, u64 lp)
 static u64 __attribute__((ms_abi))
 impl_DefWindowProcW(u64 hw, u32 msg, u64 wp, u64 lp)
 {
-    (void)wp; (void)lp;
     if (hw != FAKE_HWND) return 0;
-    if (msg == 0x0010) return impl_DestroyWindow(hw);
-    return msg == 0x0081 ? 1 : 0;
+    switch (msg) {
+        case 0x0010: /* WM_CLOSE */
+            return impl_DestroyWindow(hw);
+        case 0x0081: /* WM_NCCREATE */
+            return 1;
+        case 0x000f: /* WM_PAINT */
+            /* Default handling: validate the whole client area to stop the
+             * loop — mirroring real DefWindowProc which calls ValidateRect. */
+            impl_ValidateRect(hw, NULL);
+            return 0;
+        case 0x0014: /* WM_ERASEBKGND */
+            /* Return 1 = background has been erased, preventing WM_PAINT loop */
+            return 1;
+        case 0x0024: /* WM_GETMINMAXINFO — return without changing the struct */
+            (void)wp; (void)lp; return 0;
+        case 0x0083: /* WM_NCCALCSIZE */
+            if (!wp && lp && beer_window_style_is_decorated((u32)g_window_style)) {
+                WIN_RECT *rect = (WIN_RECT *)(uintptr_t)lp;
+                rect->left += BEER_WINDOW_FRAME_LEFT;
+                rect->top += BEER_WINDOW_FRAME_TOP;
+                rect->right -= BEER_WINDOW_FRAME_RIGHT;
+                rect->bottom -= BEER_WINDOW_FRAME_BOTTOM;
+            }
+            return 0;
+        case 0x0086: /* WM_NCACTIVATE — return 1 to allow default title draw */
+            return 1;
+        default:
+            (void)wp; (void)lp;
+            return 0;
+    }
 }
 static u64 __attribute__((ms_abi))
 impl_CallWindowProcW(u64 proc, u64 hw, u32 msg, u64 wp, u64 lp)
@@ -8453,8 +10609,13 @@ static u64 set_window_long_value(u64 hw, s32 index, u64 value)
     u64 old = window_long_value(index);
     if (index == -4) g_window_proc = value;
     else if (index == -21) g_window_userdata = value;
-    else if (index == -16) g_window_style = value;
-    else if (index == -20) g_window_exstyle = value;
+    else if (index == -16) {
+        g_window_style = value;
+        if (xwayland_window_exists())
+            xwayland_window_set_style(
+                beer_window_style_is_decorated((u32)value),
+                beer_window_style_is_resizable((u32)value));
+    } else if (index == -20) g_window_exstyle = value;
     else { g_last_error = 87; return 0; }
     return old;
 }
@@ -8620,20 +10781,124 @@ impl_SetForegroundWindow(u64 hw)
     return 1;
 }
 static u64 __attribute__((ms_abi))
-impl_SetWindowsHookExW(s32 type, u64 fn, u64 mod, u32 tid)
-    { (void)type;(void)fn;(void)mod;(void)tid; return 0xD0010002u; }
+impl_BringWindowToTop(u64 hw)
+{
+    if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    return impl_SetForegroundWindow(hw);
+}
 static u64 __attribute__((ms_abi))
-impl_UnhookWindowsHookEx(u64 hk) { (void)hk; return 1; }
+impl_RegisterHotKey(u64 hw, s32 id, u32 mods, u32 vkey)
+    { (void)hw;(void)id;(void)mods;(void)vkey; return 1; }
+static u64 __attribute__((ms_abi))
+impl_UnregisterHotKey(u64 hw, s32 id)
+    { (void)hw;(void)id; return 1; }
+static u64 __attribute__((ms_abi))
+impl_ChangeWindowMessageFilterEx(u64 hw, u32 msg, u32 action, void *info)
+    { (void)hw;(void)msg;(void)action;(void)info; return 1; }
+static u64 __attribute__((ms_abi))
+impl_SetWindowDisplayAffinity(u64 hw, u32 affinity)
+    { (void)hw;(void)affinity; return 1; }
+static u64 __attribute__((ms_abi))
+impl_GetWindowDisplayAffinity(u64 hw, u32 *affinity)
+    { (void)hw; if (affinity) *affinity = 0; return 1; }
+
+/* EnumDisplayMonitors — calls back once with our single fake monitor.
+ * Prototype: BOOL CALLBACK MonitorEnumProc(HMONITOR,HDC,LPRECT*,LPARAM) */
+typedef u64 __attribute__((ms_abi)) (*MonitorEnumProc)(u64, u64, u64, u64);
+static u64 __attribute__((ms_abi))
+impl_EnumDisplayMonitors(u64 hdc, void *clip, MonitorEnumProc proc, u64 data)
+{
+    (void)hdc; (void)clip;
+    if (!proc) return 0;
+    int sw = 1920, sh = 1080;
+    xwayland_get_screen_size(&sw, &sh);
+    /* Pass a stack RECT for the monitor bounds */
+    s32 rect[4] = {0, 0, sw, sh};
+    return proc(0xD0000002u, (u64)FAKE_HDC, (u64)(uintptr_t)rect, data);
+}
+
+/* EnumDisplaySettingsW — reports a single fullscreen mode matching the screen */
+static u64 __attribute__((ms_abi))
+impl_EnumDisplaySettingsW(const u16 *device, u32 mode_num, u8 *devmode)
+{
+    (void)device;
+    /* Only mode 0 and ENUM_CURRENT_SETTINGS (0xFFFFFFFF) are supported */
+    if (mode_num != 0 && mode_num != 0xFFFFFFFFu) return 0;
+    if (!devmode) return 0;
+    /* DEVMODEW is 220 bytes on Win64.  Zero it, fill key fields. */
+    memset(devmode, 0, 220);
+    /* dmSize at offset 36 (after dmDeviceName[32] + dmSpecVersion[2] +
+     * dmDriverVersion[2]); dmDriverExtra at offset 38 */
+    *(u16*)(devmode + 36) = 220; /* dmSize */
+    *(u16*)(devmode + 38) = 0;   /* dmDriverExtra */
+    /* dmFields at offset 40 */
+    *(u32*)(devmode + 40) = (1<<19)|(1<<20)|(1<<16)|(1<<17); /* bitsperpel|pelswidth|pelsheight|displayfreq */
+    int sw = 1920, sh = 1080;
+    xwayland_get_screen_size(&sw, &sh);
+    /* dmBitsPerPel at offset 104, dmPelsWidth at 108, dmPelsHeight at 112,
+     * dmDisplayFrequency at 120 */
+    *(u32*)(devmode + 104) = 32;
+    *(u32*)(devmode + 108) = (u32)sw;
+    *(u32*)(devmode + 112) = (u32)sh;
+    *(u32*)(devmode + 120) = 60;
+    return 1;
+}
+static u64 __attribute__((ms_abi))
+impl_EnumDisplaySettingsA(u64 device, u32 mode_num, u8 *devmode)
+    { return impl_EnumDisplaySettingsW((const u16*)(uintptr_t)device, mode_num, devmode); }
+
+static u64 __attribute__((ms_abi))
+impl_SetWindowsHookExW(s32 type, u64 fn, u64 mod, u32 tid)
+{
+    (void)mod;
+    if (!fn || (tid && tid != (u32)current_windows_thread_id())) {
+        g_last_error = 87;
+        return 0;
+    }
+    static _Atomic(u64) next_hook = 0xd0010002u;
+    u64 handle = atomic_fetch_add(&next_hook, 1);
+    if (type == 13) { /* WH_KEYBOARD_LL */
+        atomic_store(&g_keyboard_hook_proc, fn);
+        atomic_store(&g_keyboard_hook_handle, handle);
+    } else if (type == 14) { /* WH_MOUSE_LL */
+        atomic_store(&g_mouse_hook_proc, fn);
+        atomic_store(&g_mouse_hook_handle, handle);
+    } else {
+        g_last_error = 1428; /* ERROR_HOOK_NEEDS_HMOD / unsupported hook kind */
+        return 0;
+    }
+    return handle;
+}
+static u64 __attribute__((ms_abi))
+impl_UnhookWindowsHookEx(u64 handle)
+{
+    if (handle && handle == atomic_load(&g_keyboard_hook_handle)) {
+        atomic_store(&g_keyboard_hook_proc, 0);
+        atomic_store(&g_keyboard_hook_handle, 0);
+        return 1;
+    }
+    if (handle && handle == atomic_load(&g_mouse_hook_handle)) {
+        atomic_store(&g_mouse_hook_proc, 0);
+        atomic_store(&g_mouse_hook_handle, 0);
+        return 1;
+    }
+    g_last_error = 1404; /* ERROR_INVALID_HOOK_HANDLE */
+    return 0;
+}
 static u64 __attribute__((ms_abi))
 impl_CallNextHookEx(u64 hk, s32 code, u64 wp, u64 lp)
     { (void)hk;(void)code;(void)wp;(void)lp; return 0; }
 static u64 __attribute__((ms_abi))
 impl_GetSystemMetrics(u32 n) {
+    int sw = 1920, sh = 1080;
+    /* Query actual screen dimensions from the X11 display rather than
+     * returning hardcoded 1920×1080 (issue G). */
+    xwayland_get_screen_size(&sw, &sh);
     switch(n) {
-        case 0:  return 1920; /* SM_CXSCREEN */
-        case 1:  return 1080; /* SM_CYSCREEN */
-        case 78: return 1920; /* SM_CXVIRTUALSCREEN */
-        case 79: return 1080; /* SM_CYVIRTUALSCREEN */
+        case 0:  return (u64)sw;  /* SM_CXSCREEN */
+        case 1:  return (u64)sh;  /* SM_CYSCREEN */
+        case 78: return (u64)sw;  /* SM_CXVIRTUALSCREEN */
+        case 79: return (u64)sh;  /* SM_CYVIRTUALSCREEN */
         case 11: case 12: return 16; /* SM_CXICON, SM_CYICON */
     }
     return 0;
@@ -8644,12 +10909,16 @@ static u64 __attribute__((ms_abi))
 impl_GetMonitorInfoW(u64 hm, u64 *mi) {
     (void)hm;
     if (mi) {
+        int sw = 1920, sh = 1080;
+        xwayland_get_screen_size(&sw, &sh);
         u8 *b = (u8*)mi;
         *(u32*)b = 40; /* cbSize */
-        /* rcMonitor: {0,0,1920,1080} */
-        *(s32*)(b+ 4)=0; *(s32*)(b+ 8)=0; *(s32*)(b+12)=1920; *(s32*)(b+16)=1080;
-        /* rcWork: same */
-        *(s32*)(b+20)=0; *(s32*)(b+24)=0; *(s32*)(b+28)=1920; *(s32*)(b+32)=1080;
+        /* rcMonitor: {0,0,sw,sh} (issue H — real screen dimensions) */
+        *(s32*)(b+ 4)=0; *(s32*)(b+ 8)=0;
+        *(s32*)(b+12)=(s32)sw; *(s32*)(b+16)=(s32)sh;
+        /* rcWork: same — Beer has no taskbar so work area == monitor */
+        *(s32*)(b+20)=0; *(s32*)(b+24)=0;
+        *(s32*)(b+28)=(s32)sw; *(s32*)(b+32)=(s32)sh;
         *(u32*)(b+36)=1; /* dwFlags = MONITORINFOF_PRIMARY */
     }
     return 1;
@@ -8704,12 +10973,14 @@ impl_ReleaseSemaphore(u64 h, u32 n, u32 *prev)
 static u64 __attribute__((ms_abi))
 impl_RaiseException(u32 code, u32 flags, u32 nargs, const u64 *args)
 {
-    fputs("[TRACE] impl_RaiseException called\n", stderr);
-    fprintf(stderr, "[IMPL] RaiseException(code=0x%08x flags=0x%x nargs=%u)\n",
-            code, flags, nargs);
-    for (u32 i = 0; i < nargs && i < 8 && args; i++)
-        fprintf(stderr, "         args[%u]=0x%lx\n", i, args[i]);
-    fflush(stderr);
+    if (getenv("BEER_EXCEPTION_DIAGNOSTICS")) {
+        fprintf(stderr,
+                "[IMPL] RaiseException(code=0x%08x flags=0x%x nargs=%u)\n",
+                code, flags, nargs);
+        for (u32 i = 0; i < nargs && i < 8 && args; i++)
+            fprintf(stderr, "         args[%u]=0x%lx\n", i, args[i]);
+        fflush(stderr);
+    }
     if (flags & 1) { /* EXCEPTION_NONCONTINUABLE */
         exit(1);
     }
@@ -10504,17 +12775,15 @@ impl_FMOD_ok(BeerFmodObject *self, u64 a, u64 b, u64 c)
 }
 
 /* ---- DirectInput 8 -------------------------------------------------------
- * Sekiro creates DirectInput after its first UI draws.  Returning S_OK from
- * the generic import stub without writing ppvOut made the guest immediately
- * dereference NULL.  These objects implement the documented COM layouts and
- * expose a quiet keyboard/mouse backend until X11 event translation is wired
- * into device state. */
+ * Implement the documented COM layouts and expose host keyboard/mouse state
+ * through standard DirectInput device discovery, formatting, and polling. */
 typedef struct BeerDirectInput BeerDirectInput;
 typedef struct BeerDirectInputDevice BeerDirectInputDevice;
 
 struct BeerDirectInput {
     void **vtable;
     _Atomic(u32) refs;
+    int wide;
 };
 
 struct BeerDirectInputDevice {
@@ -10522,13 +12791,63 @@ struct BeerDirectInputDevice {
     _Atomic(u32) refs;
     u8 guid[16];
     int kind; /* 1 = system mouse, 2 = system keyboard */
+    int wide;
     int acquired;
+    u32 cooperative_flags;
+    u32 buffer_size;
+    u32 data_size;
+    u32 axis_offsets[3];
+    u32 button_offsets[8];
+    u32 key_offsets[256];
 };
+
+typedef struct {
+    u32 size;
+    u32 object_size;
+    u32 flags;
+    u32 data_size;
+    u32 object_count;
+    const void *objects;
+} BEER_DIDATAFORMAT;
+
+typedef struct {
+    const void *guid;
+    u32 offset;
+    u32 type;
+    u32 flags;
+} BEER_DIOBJECTDATAFORMAT;
 
 #define DI_OK 0
 #define DIENUM_STOP 0
 #define DIERR_INVALIDPARAM ((u64)(u32)0x80070057u)
 #define DIERR_OUTOFMEMORY  ((u64)(u32)0x8007000eu)
+#define DIERR_NOTACQUIRED  ((u64)(u32)0x8007000cu)
+
+typedef struct {
+    u32 size;
+    u32 flags;
+    u32 device_type;
+    u32 axes;
+    u32 buttons;
+    u32 povs;
+    u32 ff_sample_period;
+    u32 ff_min_time_resolution;
+    u32 firmware_revision;
+    u32 hardware_revision;
+    u32 ff_driver_version;
+} BEER_DIDEVCAPS;
+
+typedef struct {
+    u32 size;
+    u32 header_size;
+    u32 object;
+    u32 how;
+} BEER_DIPROPHEADER;
+
+typedef struct {
+    BEER_DIPROPHEADER header;
+    u32 data;
+} BEER_DIPROPDWORD;
 
 static const u8 beer_iid_iunknown[16] = {
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,
@@ -10621,10 +12940,78 @@ beer_dinput_device_ok(BeerDirectInputDevice *self, u64 a, u64 b, u64 c)
 }
 
 static u64 __attribute__((ms_abi))
+beer_dinput_device_GetCapabilities(BeerDirectInputDevice *self,
+                                   BEER_DIDEVCAPS *caps)
+{
+    if (!self || !caps || caps->size < sizeof(*caps))
+        return DIERR_INVALIDPARAM;
+    u32 caller_size = caps->size;
+    memset(caps, 0, sizeof(*caps));
+    caps->size = caller_size;
+    caps->device_type = self->kind == 1 ? 0x12u : 0x13u;
+    caps->axes = self->kind == 1 ? 3u : 0u;
+    caps->buttons = beer_dinput_button_count(self->kind);
+    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[DINPUT] GetCapabilities kind=%d type=0x%x axes=%u buttons=%u\n",
+                self->kind, caps->device_type, caps->axes, caps->buttons);
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_SetProperty(BeerDirectInputDevice *self, const void *guid,
+                               const BEER_DIPROPHEADER *header)
+{
+    if (!self || !guid || !header || header->size < sizeof(*header) ||
+        header->header_size != sizeof(*header))
+        return DIERR_INVALIDPARAM;
+    uintptr_t property_value = (uintptr_t)guid;
+    u32 property;
+    if (property_value <= UINT32_MAX)
+        property = (u32)property_value;
+    else
+        memcpy(&property, guid, sizeof(property));
+    /* DirectInput encodes predefined property GUIDs as small integer pointers.
+     * DIPROP_BUFFERSIZE is 1 and carries a DIPROPDWORD. */
+    if (property == 1u) {
+        const BEER_DIPROPDWORD *value = (const BEER_DIPROPDWORD *)header;
+        if (header->size < sizeof(*value) || value->data > BEER_DINPUT_EVENT_CAPACITY)
+            return DIERR_INVALIDPARAM;
+        self->buffer_size = value->data;
+        if (!self->buffer_size) {
+            pthread_mutex_lock(&g_input_mutex);
+            memset(&g_dinput_queues[self->kind], 0,
+                   sizeof(g_dinput_queues[self->kind]));
+            pthread_mutex_unlock(&g_input_mutex);
+        }
+    }
+    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[DINPUT] SetProperty kind=%d property=%u value=%u\n",
+                self->kind, property,
+                property == 1u ? self->buffer_size : 0u);
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_SetCooperativeLevel(BeerDirectInputDevice *self,
+                                       u64 hwnd, u32 flags)
+{
+    if (!self || (hwnd && hwnd != FAKE_HWND)) return DIERR_INVALIDPARAM;
+    self->cooperative_flags = flags;
+    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[DINPUT] SetCooperativeLevel kind=%d hwnd=0x%llx flags=0x%x\n",
+                self->kind, (unsigned long long)hwnd, flags);
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
 beer_dinput_device_Acquire(BeerDirectInputDevice *self)
 {
     if (!self) return DIERR_INVALIDPARAM;
+    if (!beer_dinput_can_acquire(g_window_focused, self->cooperative_flags))
+        return DIERR_NOTACQUIRED;
     self->acquired = 1;
+    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[DINPUT] Acquire kind=%d\n", self->kind);
     return DI_OK;
 }
 
@@ -10642,22 +13029,100 @@ beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
 {
     if (!self || !state || size == 0) return DIERR_INVALIDPARAM;
     collect_native_window_events();
+    /* Polling before an explicit Acquire is common. Once a foreground window
+     * is focused, expose the same acquisition state that Acquire would grant. */
+    if (!self->acquired) {
+        if (!beer_dinput_can_acquire(g_window_focused, self->cooperative_flags))
+            return DIERR_NOTACQUIRED;
+        self->acquired = 1;
+    }
     memset(state, 0, size);
     pthread_mutex_lock(&g_input_mutex);
     if (self->kind == 1) {
-        /* Sekiro's pre-regression input path uses the standard DIMOUSESTATE
-         * layout: three LONG axes followed by four byte-sized buttons. */
         const s32 axes[3] = {g_input.delta_x, g_input.delta_y, g_input.wheel};
-        beer_dinput_write_standard_mouse_state(state, size, axes,
-                                                g_input.mouse_buttons);
+        if (self->data_size)
+            beer_dinput_write_mouse_state(state, size, axes,
+                                           g_input.mouse_buttons,
+                                           self->axis_offsets,
+                                           self->button_offsets);
+        else
+            beer_dinput_write_standard_mouse_state(state, size, axes,
+                                                    g_input.mouse_buttons);
         g_input.delta_x = 0;
         g_input.delta_y = 0;
         g_input.wheel = 0;
     } else if (self->kind == 2) {
-        u32 keys = size < sizeof(g_input.dik) ? size : sizeof(g_input.dik);
-        memcpy(state, g_input.dik, keys);
+        if (self->data_size)
+            beer_dinput_write_keyboard_state(state, size, g_input.dik,
+                                              self->key_offsets);
+        else {
+            u32 keys = size < sizeof(g_input.dik) ? size : sizeof(g_input.dik);
+            memcpy(state, g_input.dik, keys);
+        }
+    }
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        static _Atomic(u32) logs;
+        u32 log = atomic_fetch_add(&logs, 1);
+        if (log < 256) {
+            if (self->kind == 1)
+                fprintf(stderr, "[DINPUT] GetDeviceState mouse dx=%d dy=%d wheel=%d buttons=%02x,%02x,%02x\n",
+                        g_input.delta_x, g_input.delta_y, g_input.wheel,
+                        g_input.mouse_buttons[0], g_input.mouse_buttons[1],
+                        g_input.mouse_buttons[2]);
+            else
+                fprintf(stderr, "[DINPUT] GetDeviceState keyboard enter=%02x space=%02x escape=%02x\n",
+                        g_input.dik[0x1c], g_input.dik[0x39], g_input.dik[0x01]);
+        }
     }
     pthread_mutex_unlock(&g_input_mutex);
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_SetDataFormat(BeerDirectInputDevice *self,
+                                 const BEER_DIDATAFORMAT *format)
+{
+    if (!self || !format || format->size < sizeof(*format) ||
+        format->object_size < sizeof(BEER_DIOBJECTDATAFORMAT) ||
+        !format->data_size || (format->object_count && !format->objects))
+        return DIERR_INVALIDPARAM;
+
+    for (u32 i = 0; i < 3; ++i) self->axis_offsets[i] = UINT32_MAX;
+    for (u32 i = 0; i < 8; ++i) self->button_offsets[i] = UINT32_MAX;
+    for (u32 i = 0; i < 256; ++i) self->key_offsets[i] = UINT32_MAX;
+
+    const u8 *objects = format->objects;
+    u32 next_axis = 0, next_button = 0;
+    for (u32 i = 0; i < format->object_count; ++i) {
+        const BEER_DIOBJECTDATAFORMAT *object =
+            (const BEER_DIOBJECTDATAFORMAT *)(objects + (size_t)i * format->object_size);
+        u32 category = object->type & 0xffu;
+        u32 instance;
+        if (beer_dinput_type_is_axis(category))
+            instance = beer_dinput_resolve_instance(object->type, &next_axis);
+        else if (beer_dinput_type_is_button(category))
+            instance = beer_dinput_resolve_instance(object->type, &next_button);
+        else
+            continue;
+        if (self->kind == 2 && beer_dinput_type_is_button(category) && instance < 256)
+            self->key_offsets[instance] = object->offset;
+        else if (self->kind == 1 && beer_dinput_type_is_axis(category) && instance < 3)
+            self->axis_offsets[instance] = object->offset;
+        else if (self->kind == 1 && beer_dinput_type_is_button(category) && instance < 8)
+            self->button_offsets[instance] = object->offset;
+    }
+    self->data_size = format->data_size;
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        u32 mapped = 0;
+        if (self->kind == 1) {
+            for (u32 i = 0; i < 3; ++i) mapped += self->axis_offsets[i] != UINT32_MAX;
+            for (u32 i = 0; i < 8; ++i) mapped += self->button_offsets[i] != UINT32_MAX;
+        } else {
+            for (u32 i = 0; i < 256; ++i) mapped += self->key_offsets[i] != UINT32_MAX;
+        }
+        fprintf(stderr, "[DINPUT] SetDataFormat kind=%d size=%u objects=%u mapped=%u\n",
+                self->kind, format->data_size, format->object_count, mapped);
+    }
     return DI_OK;
 }
 
@@ -10665,10 +13130,60 @@ static u64 __attribute__((ms_abi))
 beer_dinput_device_GetDeviceData(BeerDirectInputDevice *self, u32 object_size,
                                  void *data, u32 *count, u32 flags)
 {
-    (void)object_size; (void)data; (void)flags;
-    if (!self || !count) return DIERR_INVALIDPARAM;
-    *count = 0;
-    return DI_OK;
+    if (!self || !count || object_size < 16 || self->kind < 1 || self->kind > 2)
+        return DIERR_INVALIDPARAM;
+    collect_native_window_events();
+    if (!self->acquired) {
+        if (!beer_dinput_can_acquire(g_window_focused, self->cooperative_flags))
+            return DIERR_NOTACQUIRED;
+        self->acquired = 1;
+    }
+    if (!self->buffer_size) return DIERR_INVALIDPARAM;
+
+    u32 requested = *count;
+    pthread_mutex_lock(&g_input_mutex);
+    BEER_DINPUT_QUEUE *queue = &g_dinput_queues[self->kind];
+    u32 available = queue->count;
+    if (!data) {
+        *count = available;
+        pthread_mutex_unlock(&g_input_mutex);
+        return DI_OK;
+    }
+    if (requested == UINT32_MAX || requested > available)
+        requested = available;
+
+    u8 *output = data;
+    u32 written = 0;
+    for (u32 consumed = 0; consumed < requested; ++consumed) {
+        u32 index = (queue->head + consumed) % BEER_DINPUT_EVENT_CAPACITY;
+        BEER_DINPUT_EVENT event = queue->events[index];
+        if (self->data_size) {
+            event.offset = beer_dinput_format_offset(
+                self->kind, event.offset, self->axis_offsets,
+                self->button_offsets, self->key_offsets);
+            if (event.offset == UINT32_MAX) continue;
+        }
+        memset(output + (size_t)written * object_size, 0, object_size);
+        size_t copy_size = object_size < sizeof(event) ? object_size : sizeof(event);
+        memcpy(output + (size_t)written * object_size, &event, copy_size);
+        ++written;
+    }
+    if (!(flags & 1u)) { /* DIGDD_PEEK */
+        queue->head = (queue->head + requested) % BEER_DINPUT_EVENT_CAPACITY;
+        queue->count -= requested;
+    }
+    int overflowed = queue->overflowed;
+    if (!(flags & 1u)) queue->overflowed = 0;
+    *count = written;
+    pthread_mutex_unlock(&g_input_mutex);
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        static _Atomic(u32) logs;
+        u32 log = atomic_fetch_add(&logs, 1);
+        if (log < 256)
+            fprintf(stderr, "[DINPUT] GetDeviceData kind=%d requested=%u available=%u written=%u flags=0x%x\n",
+                    self->kind, *count, available, written, flags);
+    }
+    return overflowed ? 1u : DI_OK; /* DI_BUFFEROVERFLOW == S_FALSE */
 }
 
 static u64 __attribute__((ms_abi))
@@ -10681,17 +13196,17 @@ static void *g_dinput_device_vtable[32] = {
     (void *)beer_dinput_device_QueryInterface,
     (void *)beer_dinput_device_AddRef,
     (void *)beer_dinput_device_Release,
-    (void *)beer_dinput_device_ok, /* GetCapabilities */
+    (void *)beer_dinput_device_GetCapabilities,
     (void *)beer_dinput_device_ok, /* EnumObjects */
     (void *)beer_dinput_device_ok, /* GetProperty */
-    (void *)beer_dinput_device_ok, /* SetProperty */
+    (void *)beer_dinput_device_SetProperty,
     (void *)beer_dinput_device_Acquire,
     (void *)beer_dinput_device_Unacquire,
     (void *)beer_dinput_device_GetDeviceState,
     (void *)beer_dinput_device_GetDeviceData,
-    (void *)beer_dinput_device_ok, /* SetDataFormat */
+    (void *)beer_dinput_device_SetDataFormat,
     (void *)beer_dinput_device_ok, /* SetEventNotification */
-    (void *)beer_dinput_device_ok, /* SetCooperativeLevel */
+    (void *)beer_dinput_device_SetCooperativeLevel,
     (void *)beer_dinput_device_ok, /* GetObjectInfo */
     (void *)beer_dinput_device_ok, /* GetDeviceInfo */
     (void *)beer_dinput_device_ok, /* RunControlPanel */
@@ -10716,6 +13231,7 @@ beer_dinput_CreateDevice(BeerDirectInput *self, const void *guid,
     if (!device) return DIERR_OUTOFMEMORY;
     device->vtable = g_dinput_device_vtable;
     atomic_init(&device->refs, 1);
+    device->wide = self->wide;
     memcpy(device->guid, guid, sizeof(device->guid));
     /* GUID_SysMouse and GUID_SysKeyboard differ in Data1 only. */
     u32 guid_data1;
@@ -10730,12 +13246,105 @@ beer_dinput_CreateDevice(BeerDirectInput *self, const void *guid,
     return DI_OK;
 }
 
+typedef struct {
+    u32 size;
+    u8 instance_guid[16];
+    u8 product_guid[16];
+    u32 device_type;
+    char instance_name[260];
+    char product_name[260];
+    u8 ff_driver_guid[16];
+    u16 usage_page;
+    u16 usage;
+} BEER_DIDEVICEINSTANCEA;
+
+typedef struct {
+    u32 size;
+    u8 instance_guid[16];
+    u8 product_guid[16];
+    u32 device_type;
+    u16 instance_name[260];
+    u16 product_name[260];
+    u8 ff_driver_guid[16];
+    u16 usage_page;
+    u16 usage;
+} BEER_DIDEVICEINSTANCEW;
+
+static void beer_ascii_to_wide(const char *source, u16 destination[260])
+{
+    size_t i = 0;
+    while (source[i] && i < 259) {
+        destination[i] = (u8)source[i];
+        ++i;
+    }
+    destination[i] = 0;
+}
+
+static int beer_dinput_enum_device(BeerDirectInput *self, void *callback,
+                                   void *context, const u8 guid[16],
+                                   u32 device_type, u16 usage,
+                                   const char *name)
+{
+    typedef s32 __attribute__((ms_abi)) (*EnumCallback)(const void *, void *);
+    if (self->wide) {
+        BEER_DIDEVICEINSTANCEW instance;
+        memset(&instance, 0, sizeof(instance));
+        instance.size = sizeof(instance);
+        memcpy(instance.instance_guid, guid, 16);
+        memcpy(instance.product_guid, guid, 16);
+        instance.device_type = device_type;
+        instance.usage_page = 1;
+        instance.usage = usage;
+        beer_ascii_to_wide(name, instance.instance_name);
+        beer_ascii_to_wide(name, instance.product_name);
+        return ((EnumCallback)callback)(&instance, context) != DIENUM_STOP;
+    }
+
+    BEER_DIDEVICEINSTANCEA instance;
+    memset(&instance, 0, sizeof(instance));
+    instance.size = sizeof(instance);
+    memcpy(instance.instance_guid, guid, 16);
+    memcpy(instance.product_guid, guid, 16);
+    instance.device_type = device_type;
+    instance.usage_page = 1;
+    instance.usage = usage;
+    snprintf(instance.instance_name, sizeof(instance.instance_name), "%s", name);
+    snprintf(instance.product_name, sizeof(instance.product_name), "%s", name);
+    return ((EnumCallback)callback)(&instance, context) != DIENUM_STOP;
+}
+
 static u64 __attribute__((ms_abi))
 beer_dinput_EnumDevices(BeerDirectInput *self, u32 type, void *callback,
                         void *context, u32 flags)
 {
-    (void)type; (void)callback; (void)context; (void)flags;
-    return self ? DI_OK : DIERR_INVALIDPARAM;
+    (void)flags;
+    if (!self || !callback) return DIERR_INVALIDPARAM;
+
+    /* DIDEVTYPE and DI8DEVTYPE requests use the low byte for the broad device
+     * class. DIDEVTYPE_ALL (0) enumerates both standard desktop devices. */
+    u32 requested = type & 0xffu;
+    int want_mouse = requested == 0 || requested == 2 || requested == 0x12;
+    int want_keyboard = requested == 0 || requested == 3 || requested == 0x13;
+    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[DINPUT] EnumDevices type=0x%x mouse=%d keyboard=%d\n",
+                type, want_mouse, want_keyboard);
+
+    static const u8 mouse_guid[16] = {
+        0x60,0x2b,0x1d,0x6f,0xa0,0xd5,0xcf,0x11,
+        0xbf,0xc7,0x44,0x45,0x53,0x54,0x00,0x00
+    };
+    static const u8 keyboard_guid[16] = {
+        0x61,0x2b,0x1d,0x6f,0xa0,0xd5,0xcf,0x11,
+        0xbf,0xc7,0x44,0x45,0x53,0x54,0x00,0x00
+    };
+    if (want_mouse && !beer_dinput_enum_device(self, callback, context,
+                                                mouse_guid, 0x12, 2,
+                                                "Beer System Mouse"))
+        return DI_OK;
+    if (want_keyboard)
+        beer_dinput_enum_device(self, callback, context, keyboard_guid, 0x13, 6,
+                                "Beer System Keyboard");
+    return DI_OK;
 }
 
 static u64 __attribute__((ms_abi))
@@ -10774,6 +13383,7 @@ impl_DirectInput8Create(u64 instance, u32 version, const void *iid,
     if (!object) return DIERR_OUTOFMEMORY;
     object->vtable = g_dinput_vtable;
     atomic_init(&object->refs, 1);
+    object->wide = beer_guid_is(iid, beer_iid_directinput8w);
     *out = object;
     fprintf(stderr, "[DINPUT] DirectInput8Create(version=0x%x) -> %p\n",
             version, (void *)object);
@@ -11568,6 +14178,7 @@ static ImplEntry g_impls[] = {
     {"GetLocalTime",                          (ImplFn)impl_GetLocalTime},
     {"GetSystemTime",                         (ImplFn)impl_GetSystemTime},
     {"SystemTimeToFileTime",                  (ImplFn)impl_SystemTimeToFileTime},
+    {"FileTimeToLocalFileTime",               (ImplFn)impl_FileTimeToLocalFileTime},
     {"GetDateFormatEx",                       (ImplFn)impl_GetDateFormatEx},
     {"GetTimeFormatEx",                       (ImplFn)impl_GetTimeFormatEx},
     {"LCIDToLocaleName",                      (ImplFn)impl_LCIDToLocaleName},
@@ -11588,6 +14199,7 @@ static ImplEntry g_impls[] = {
     {"CoInitializeEx",                        (ImplFn)impl_CoInitializeEx},
     {"CoInitializeSecurity",                  (ImplFn)impl_CoInitializeSecurity},
     {"CoUninitialize",                        (ImplFn)impl_CoUninitialize},
+    {"CoCreateGuid",                          (ImplFn)impl_CoCreateGuid},
     {"CoCreateInstance",                      (ImplFn)impl_CoCreateInstance},
     /* Media Foundation: typed, output-clearing boundaries. */
     {"MFStartup",                             (ImplFn)beer_mf_startup},
@@ -11825,6 +14437,10 @@ static ImplEntry g_impls[] = {
     {"SetEndOfFile",                          (ImplFn)impl_SetEndOfFile},
     {"CopyFileA",                             (ImplFn)impl_CopyFileA},
     {"CopyFileW",                             (ImplFn)impl_CopyFileW},
+    {"DeleteFileW",                           (ImplFn)impl_DeleteFileW},
+    {"MoveFileW",                             (ImplFn)impl_MoveFileW},
+    {"MoveFileExW",                           (ImplFn)impl_MoveFileExW},
+    {"ReplaceFileW",                          (ImplFn)impl_ReplaceFileW},
     {"GetFileAttributesA",                    (ImplFn)impl_GetFileAttributesA},
     {"GetFileAttributesW",                    (ImplFn)impl_GetFileAttributesW},
     {"PathFileExistsA",                       (ImplFn)impl_PathFileExistsA},
@@ -11867,18 +14483,27 @@ static ImplEntry g_impls[] = {
     {"SetWindowPos",                          (ImplFn)impl_SetWindowPos},
     {"GetDC",                                 (ImplFn)impl_GetDC},
     {"ReleaseDC",                             (ImplFn)impl_ReleaseDC},
+    {"BeginPaint",                            (ImplFn)impl_BeginPaint},
+    {"EndPaint",                              (ImplFn)impl_EndPaint},
+    {"ValidateRect",                          (ImplFn)impl_ValidateRect},
+    {"InvalidateRect",                        (ImplFn)impl_InvalidateRect},
+    {"GetUpdateRect",                         (ImplFn)impl_GetUpdateRect},
     {"GetStockObject",                        (ImplFn)impl_GetStockObject},
     {"DragAcceptFiles",                       (ImplFn)impl_DragAcceptFiles},
     {"ImmGetDefaultIMEWnd",                   (ImplFn)impl_ImmGetDefaultIMEWnd},
     {"SetCursor",                             (ImplFn)impl_SetCursor},
     {"ShowCursor",                            (ImplFn)impl_ShowCursor},
     {"GetCursorPos",                          (ImplFn)impl_GetCursorPos},
+    {"SetCursorPos",                          (ImplFn)impl_SetCursorPos},
     {"ScreenToClient",                        (ImplFn)impl_ScreenToClient},
     {"ClipCursor",                            (ImplFn)impl_ClipCursor},
     {"GetKeyboardState",                      (ImplFn)impl_GetKeyboardState},
     {"GetKeyState",                           (ImplFn)impl_GetKeyState},
     {"GetAsyncKeyState",                      (ImplFn)impl_GetAsyncKeyState},
     {"GetMessageExtraInfo",                   (ImplFn)impl_GetMessageExtraInfo},
+    {"RegisterRawInputDevices",               (ImplFn)impl_RegisterRawInputDevices},
+    {"GetRegisteredRawInputDevices",          (ImplFn)impl_GetRegisteredRawInputDevices},
+    {"GetRawInputData",                       (ImplFn)impl_GetRawInputData},
     {"SendInput",                             (ImplFn)impl_SendInput},
     {"XInputGetState",                        (ImplFn)impl_XInputDisconnected},
     {"XInputSetState",                        (ImplFn)impl_XInputDisconnected},
@@ -11889,14 +14514,21 @@ static ImplEntry g_impls[] = {
     {"GetActiveWindow",                       (ImplFn)impl_GetActiveWindow},
     {"SetActiveWindow",                       (ImplFn)impl_SetActiveWindow},
     {"PeekMessageW",                          (ImplFn)impl_PeekMessageW},
+    {"PeekMessageA",                          (ImplFn)impl_PeekMessageW},
     {"GetMessageW",                           (ImplFn)impl_GetMessageW},
+    {"GetMessageA",                           (ImplFn)impl_GetMessageW},
     {"TranslateMessage",                      (ImplFn)impl_TranslateMessage},
     {"DispatchMessageW",                      (ImplFn)impl_DispatchMessageW},
+    {"DispatchMessageA",                      (ImplFn)impl_DispatchMessageW},
     {"PostQuitMessage",                       (ImplFn)impl_PostQuitMessage},
     {"SendMessageW",                          (ImplFn)impl_SendMessageW},
+    {"SendMessageA",                          (ImplFn)impl_SendMessageW},
     {"PostMessageW",                          (ImplFn)impl_PostMessageW},
+    {"PostMessageA",                          (ImplFn)impl_PostMessageW},
     {"PostThreadMessageW",                    (ImplFn)impl_PostThreadMessageW},
+    {"PostThreadMessageA",                    (ImplFn)impl_PostThreadMessageW},
     {"DefWindowProcW",                        (ImplFn)impl_DefWindowProcW},
+    {"DefWindowProcA",                        (ImplFn)impl_DefWindowProcW},
     {"CallWindowProcW",                       (ImplFn)impl_CallWindowProcW},
     {"SetWindowLongPtrW",                     (ImplFn)impl_SetWindowLongPtrW},
     {"GetWindowLongPtrW",                     (ImplFn)impl_GetWindowLongPtrW},
@@ -11911,12 +14543,30 @@ static ImplEntry g_impls[] = {
     {"RemovePropW",                           (ImplFn)impl_RemovePropW},
     {"RemovePropA",                           (ImplFn)impl_RemovePropA},
     {"SetForegroundWindow",                   (ImplFn)impl_SetForegroundWindow},
+    {"BringWindowToTop",                      (ImplFn)impl_BringWindowToTop},
+    {"RegisterHotKey",                        (ImplFn)impl_RegisterHotKey},
+    {"UnregisterHotKey",                      (ImplFn)impl_UnregisterHotKey},
+    {"ChangeWindowMessageFilterEx",           (ImplFn)impl_ChangeWindowMessageFilterEx},
+    {"SetWindowDisplayAffinity",              (ImplFn)impl_SetWindowDisplayAffinity},
+    {"GetWindowDisplayAffinity",              (ImplFn)impl_GetWindowDisplayAffinity},
+    {"EnumDisplayMonitors",                   (ImplFn)impl_EnumDisplayMonitors},
+    {"EnumDisplaySettingsW",                  (ImplFn)impl_EnumDisplaySettingsW},
+    {"EnumDisplaySettingsA",                  (ImplFn)impl_EnumDisplaySettingsA},
+    {"EnumDisplaySettingsExW",                (ImplFn)impl_EnumDisplaySettingsW},
+    {"EnumDisplaySettingsExA",                (ImplFn)impl_EnumDisplaySettingsA},
     {"SetWindowsHookExW",                     (ImplFn)impl_SetWindowsHookExW},
     {"UnhookWindowsHookEx",                   (ImplFn)impl_UnhookWindowsHookEx},
     {"CallNextHookEx",                        (ImplFn)impl_CallNextHookEx},
     {"GetSystemMetrics",                      (ImplFn)impl_GetSystemMetrics},
     {"MonitorFromWindow",                     (ImplFn)impl_MonitorFromWindow},
+    {"MonitorFromPoint",                      (ImplFn)impl_MonitorFromWindow},
+    {"MonitorFromRect",                       (ImplFn)impl_MonitorFromWindow},
     {"GetMonitorInfoW",                       (ImplFn)impl_GetMonitorInfoW},
+    {"GetMonitorInfoA",                       (ImplFn)impl_GetMonitorInfoW},
+    {"MsgWaitForMultipleObjects",             (ImplFn)impl_MsgWaitForMultipleObjects},
+    {"MsgWaitForMultipleObjectsEx",           (ImplFn)impl_MsgWaitForMultipleObjects},
+    {"CallWindowProcA",                       (ImplFn)impl_CallWindowProcW},
+    {"WaitMessage",                           (ImplFn)impl_WaitMessage},
     /* Misc sync */
     {"GetCurrentProcessorNumber",             (ImplFn)impl_GetCurrentProcessorNumber},
     {"FlushProcessWriteBuffers",              (ImplFn)impl_FlushProcessWriteBuffers},
@@ -12018,6 +14668,151 @@ void die(const char *fmt, ...)
 
 static inline void *rva_ptr(u32 off) { return (void *)(g_img + off); }
 
+static const ResourceEntry *pe_resource_find_id(const u8 *root, size_t size,
+                                                u32 directory_offset, u16 id)
+{
+    if (!root || directory_offset > size ||
+        sizeof(ResourceDir) > size - directory_offset)
+        return NULL;
+    const ResourceDir *directory = (const ResourceDir *)(root + directory_offset);
+    size_t count = (size_t)directory->named_count + directory->id_count;
+    size_t entries_offset = (size_t)directory_offset + sizeof(*directory);
+    if (count > (size - entries_offset) / sizeof(ResourceEntry)) return NULL;
+    const ResourceEntry *entries = (const ResourceEntry *)(root + entries_offset);
+    for (size_t i = directory->named_count; i < count; ++i)
+        if (!(entries[i].name & UINT32_C(0x80000000)) &&
+            (u16)entries[i].name == id)
+            return &entries[i];
+    return NULL;
+}
+
+static const ResourceEntry *pe_resource_first_id(const u8 *root, size_t size,
+                                                  u32 directory_offset)
+{
+    if (!root || directory_offset > size ||
+        sizeof(ResourceDir) > size - directory_offset)
+        return NULL;
+    const ResourceDir *directory = (const ResourceDir *)(root + directory_offset);
+    size_t count = (size_t)directory->named_count + directory->id_count;
+    size_t entries_offset = (size_t)directory_offset + sizeof(*directory);
+    if (!count || count > (size - entries_offset) / sizeof(ResourceEntry)) return NULL;
+    return (const ResourceEntry *)(root + entries_offset);
+}
+
+static int pe_resource_first_group_icon(const u8 *root, size_t resource_size,
+                                        u32 resource_rva,
+                                        const u8 **data, size_t *size)
+{
+    if (!data || !size) return 0;
+    const ResourceEntry *type_entry = pe_resource_find_id(root, resource_size,
+                                                          0, 14 /* RT_GROUP_ICON */);
+    if (!type_entry || !(type_entry->offset & UINT32_C(0x80000000))) return 0;
+    u32 type_directory = type_entry->offset & UINT32_C(0x7fffffff);
+    const ResourceEntry *group_entry = pe_resource_first_id(root, resource_size,
+                                                            type_directory);
+    if (!group_entry || !(group_entry->offset & UINT32_C(0x80000000))) return 0;
+    u32 language_directory = group_entry->offset & UINT32_C(0x7fffffff);
+    const ResourceEntry *language_entry = pe_resource_first_id(root, resource_size,
+                                                               language_directory);
+    if (!language_entry || (language_entry->offset & UINT32_C(0x80000000))) return 0;
+    u32 data_offset = language_entry->offset;
+    if (data_offset > resource_size || sizeof(ResourceData) > resource_size - data_offset)
+        return 0;
+    const ResourceData *entry = (const ResourceData *)(root + data_offset);
+    if (entry->data_rva < resource_rva) return 0;
+    u32 relative = entry->data_rva - resource_rva;
+    if (relative > resource_size || entry->size > resource_size - relative) return 0;
+    *data = root + relative;
+    *size = entry->size;
+    return 1;
+}
+
+static int pe_resource_data_by_id(const u8 *root, size_t resource_size,
+                                  u32 resource_rva, u16 type, u16 id,
+                                  const u8 **data, size_t *size)
+{
+    if (!data || !size) return 0;
+    const ResourceEntry *type_entry = pe_resource_find_id(root, resource_size, 0, type);
+    if (!type_entry || !(type_entry->offset & UINT32_C(0x80000000))) return 0;
+    u32 type_directory = type_entry->offset & UINT32_C(0x7fffffff);
+    const ResourceEntry *name_entry = pe_resource_find_id(root, resource_size,
+                                                          type_directory, id);
+    if (!name_entry || !(name_entry->offset & UINT32_C(0x80000000))) return 0;
+    u32 language_directory = name_entry->offset & UINT32_C(0x7fffffff);
+    const ResourceEntry *language_entry = pe_resource_first_id(root, resource_size,
+                                                               language_directory);
+    if (!language_entry || (language_entry->offset & UINT32_C(0x80000000))) return 0;
+    u32 data_offset = language_entry->offset;
+    if (data_offset > resource_size || sizeof(ResourceData) > resource_size - data_offset)
+        return 0;
+    const ResourceData *entry = (const ResourceData *)(root + data_offset);
+    if (entry->data_rva < resource_rva) return 0;
+    u32 relative = entry->data_rva - resource_rva;
+    if (relative > resource_size || entry->size > resource_size - relative) return 0;
+    *data = root + relative;
+    *size = entry->size;
+    return 1;
+}
+
+static void pe_load_application_icon(void)
+{
+    NtHdrs64 *nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
+    if (nt->opt.nrva_sizes <= DIR_RESOURCE) return;
+    DataDir *resources = &nt->opt.dirs[DIR_RESOURCE];
+    if (!resources->rva || !resources->size ||
+        resources->rva > g_img_size || resources->size > g_img_size - resources->rva)
+        return;
+    const u8 *root = g_img + resources->rva;
+    const u8 *group_data = NULL;
+    size_t group_size = 0;
+    if ((!pe_resource_data_by_id(root, resources->size, resources->rva,
+                                 14 /* RT_GROUP_ICON */, 1,
+                                 &group_data, &group_size) &&
+         !pe_resource_first_group_icon(root, resources->size, resources->rva,
+                                       &group_data, &group_size)) ||
+        group_size < 6)
+        return;
+    u16 count = beer_icon_u16(group_data + 4);
+    if (!count || group_size < 6u + (size_t)count * 14u) return;
+
+    const u8 *best_data = NULL;
+    size_t best_size = 0;
+    unsigned best_area = 0;
+    for (u16 i = 0; i < count; ++i) {
+        const u8 *group = group_data + 6u + (size_t)i * 14u;
+        unsigned width = group[0] ? group[0] : 256u;
+        unsigned height = group[1] ? group[1] : 256u;
+        u16 bits = beer_icon_u16(group + 6);
+        u16 icon_id = beer_icon_u16(group + 12);
+        const u8 *icon_data = NULL;
+        size_t icon_size = 0;
+        if (bits != 24 && bits != 32) continue;
+        if (!pe_resource_data_by_id(root, resources->size, resources->rva,
+                                    3 /* RT_ICON */, icon_id,
+                                    &icon_data, &icon_size))
+            continue;
+        unsigned area = width * height;
+        if (area > best_area) {
+            best_area = area;
+            best_data = icon_data;
+            best_size = icon_size;
+        }
+    }
+    if (!best_data || !best_area) return;
+    u32 *pixels = calloc(best_area, sizeof(*pixels));
+    if (!pixels) return;
+    int width = 0, height = 0;
+    if (!beer_icon_decode_dib_argb(best_data, best_size, pixels, &width, &height)) {
+        free(pixels);
+        return;
+    }
+    free(g_app_icon_pixels);
+    g_app_icon_pixels = pixels;
+    g_app_icon_width = width;
+    g_app_icon_height = height;
+    fprintf(stderr, "[WIN] loaded PE application icon %dx%d\n", width, height);
+}
+
 /* ── PE loader ──────────────────────────────────────────────────── */
 static void pe_load(const char *path)
 {
@@ -12041,6 +14836,7 @@ static void pe_load(const char *path)
 
     u64 preferred = nt->opt.imagebase;
     u32 imgsz     = nt->opt.sz_image;
+    g_img_size = imgsz;
 
     printf("[PE]  %s\n", path);
     printf("[PE]  ImageBase=0x%lx  SzImage=0x%x  EntryRVA=+0x%x  Sections=%u\n",
@@ -12079,6 +14875,14 @@ static void pe_load(const char *path)
     }
 
     munmap(file, (size_t)st.st_size);
+    pe_load_application_icon();
+    if (g_app_icon_pixels) {
+        (void)xwayland_window_set_icon_argb(g_app_icon_pixels,
+                                             g_app_icon_width,
+                                             g_app_icon_height);
+        if (!install_desktop_identity())
+            fprintf(stderr, "[WIN] warning: desktop application identity install failed\n");
+    }
 
     /* ── base relocations (if loaded at non-preferred address) ── */
     if (g_delta) {
@@ -13814,20 +16618,9 @@ static u64 crash_pick_fallback_rip(u64 rip, const char *tag)
     return primary;
 }
 
-/* Report progress toward window creation based on which APIs have been called */
+/* Kept as a call-site marker for fatal paths; startup progress spam was obsolete. */
 static void report_window_progress(void)
 {
-    int progress = 0;
-    fprintf(stderr, "\n[PROGRESS SUMMARY]\n");
-    if (g_api_registerclass) { fprintf(stderr, "  [✓] RegisterClass\n"); progress += 25; }
-    if (g_api_createwindow) { fprintf(stderr, "  [✓] CreateWindow\n"); progress += 25; }
-    if (g_api_createfactory) { fprintf(stderr, "  [✓] CreateDXGIFactory\n"); progress += 25; }
-    if (g_api_createdevice) { fprintf(stderr, "  [✓] D3D11CreateDevice\n"); progress += 25; }
-    fprintf(stderr, "  Percentage to get window: %d%% (%d/4 major milestones)\n", progress, 
-            (g_api_registerclass ? 1 : 0) + (g_api_createwindow ? 1 : 0) + 
-            (g_api_createfactory ? 1 : 0) + (g_api_createdevice ? 1 : 0));
-    fprintf(stderr, "\n");
-    fflush(stderr);
 }
 
 static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
@@ -13888,7 +16681,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
                     u64 v = sp[i];
                     u64 rva = (g_img && v >= (u64)g_img) ? v - (u64)g_img : v;
                     fprintf(stderr, "  sp[%2d] = 0x%lx (RVA 0x%lx)%s\n", i, v, rva,
-                            (g_img && v >= (u64)g_img && v < (u64)g_img + 0x42d2000 &&
+                            (g_img && v >= (u64)g_img && v < (u64)g_img + g_img_size &&
                              image_addr_is_exec(v)) ? "  [exec]" : "");
                 }
             }
@@ -14105,7 +16898,7 @@ sync_alloc_skip:
      */
     if (faultaddr >= 0x1000 && faultaddr < 0x7f0000000000ULL && faultaddr != rip &&
         !is_xchg_crash &&
-        (!g_img || rip < (u64)g_img || rip >= (u64)g_img + 0x42d2000) &&
+        (!g_img || rip < (u64)g_img || rip >= (u64)g_img + g_img_size) &&
         (!g_guest_stack_low || faultaddr < g_guest_stack_low || faultaddr >= g_guest_stack_high)) {
         u64 page_aligned = faultaddr & ~0xFFF;
         u64 alloc_size = 0x100000;
@@ -14304,7 +17097,7 @@ generic_alloc_skip:
      * callback continuation must be on top, the nominal count must be small,
      * and the walker's own return slot at callback-RSP+0x30 must be executable. */
     if (sig == SIGSEGV && g_img && faultaddr == rip &&
-        !(rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) &&
+        !(rip >= (u64)g_img && rip < (u64)g_img + g_img_size) &&
         is_guest_stack_rsp(rsp0) && is_guest_stack_rsp(rsp0 + 0x38)) {
         u64 *sp = (u64 *)rsp0;
         u64 walker_cont = (u64)g_img + 0x23ab81f;
@@ -14323,13 +17116,14 @@ generic_alloc_skip:
         }
     }
 
-    if (rsp0 && !is_guest_stack_rsp(rsp0)) {
+    if (rsp0 && !is_guest_stack_rsp(rsp0) && !is_current_host_call_stack_rsp(rsp0)) {
         u64 low = g_current_guest_stack_low ? g_current_guest_stack_low : g_guest_stack_low;
         u64 high = g_current_guest_stack_high ? g_current_guest_stack_high : g_guest_stack_high;
         fprintf(stderr,
-                "[FATAL] Invalid RSP=0x%lx outside current thread stack 0x%lx..0x%lx; "
-                "faulting RIP=0x%lx (RVA 0x%lx) faultaddr=0x%lx rcx=0x%lx\n",
-                rsp0, low, high, rip,
+                "[FATAL] Invalid RSP=0x%lx outside guest stack 0x%lx..0x%lx and "
+                "host-call stack 0x%lx..0x%lx; faulting RIP=0x%lx (RVA 0x%lx) "
+                "faultaddr=0x%lx rcx=0x%lx\n",
+                rsp0, low, high, g_host_call_stack_base, g_host_call_stack_top, rip,
                 (g_img && rip >= (u64)g_img) ? rip - (u64)g_img : rip, faultaddr, rcx0);
         /* Never transplant a worker onto the main thread's synthetic startup
          * frame. That corrupts both call chains and turns one actionable fault
@@ -14342,7 +17136,7 @@ generic_alloc_skip:
     /* If the current RSP is already outside the guest stack but the fault is on a
      * real in-image code address, keep the guest on its own stack frame instead of
      * delivering a new host-side loop through the fallback entry path. */
-    if (sig == SIGSEGV && g_img && rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000 &&
+    if (sig == SIGSEGV && g_img && rip >= (u64)g_img && rip < (u64)g_img + g_img_size &&
         rsp0 && !is_guest_stack_rsp(rsp0)) {
         u64 rsp = g_entry_rsp ? g_entry_rsp : rsp0;
         u64 ret = 0, new_rsp = 0;
@@ -14361,14 +17155,21 @@ generic_alloc_skip:
         u64 *sp0 = (u64 *)rsp0;
         Dl_info dli;
         fprintf(stderr,
-                "[DBG] sig=%d rip=0x%lx fault=0x%lx rax=0x%lx rbx=0x%lx rcx=0x%lx rdx=0x%lx "
-                "rsi=0x%lx rdi=0x%lx r8=0x%lx r9=0x%lx rsp=0x%lx\n",
-                sig, rip, faultaddr,
+                "[DBG] sig=%d rip=0x%lx fault=0x%lx d3d12-backing=%zu peak=%zu snapshots=%zu\n"
+                "[DBG]   rax=0x%lx rbx=0x%lx rcx=0x%lx rdx=0x%lx\n"
+                "[DBG]   rsi=0x%lx rdi=0x%lx rbp=0x%lx rsp=0x%lx\n"
+                "[DBG]   r8=0x%lx r9=0x%lx r10=0x%lx r11=0x%lx\n"
+                "[DBG]   r12=0x%lx r13=0x%lx r14=0x%lx r15=0x%lx\n",
+                sig, rip, faultaddr, beer_d3d12_backing_bytes(),
+                beer_d3d12_backing_peak_bytes(), beer_d3d12_snapshot_bytes(),
                 (u64)uc->uc_mcontext.gregs[REG_RAX], (u64)uc->uc_mcontext.gregs[REG_RBX],
                 rcx0, (u64)uc->uc_mcontext.gregs[REG_RDX],
                 (u64)uc->uc_mcontext.gregs[REG_RSI], (u64)uc->uc_mcontext.gregs[REG_RDI],
+                (u64)uc->uc_mcontext.gregs[REG_RBP], rsp0,
                 (u64)uc->uc_mcontext.gregs[REG_R8], (u64)uc->uc_mcontext.gregs[REG_R9],
-                rsp0);
+                (u64)uc->uc_mcontext.gregs[REG_R10], (u64)uc->uc_mcontext.gregs[REG_R11],
+                (u64)uc->uc_mcontext.gregs[REG_R12], (u64)uc->uc_mcontext.gregs[REG_R13],
+                (u64)uc->uc_mcontext.gregs[REG_R14], (u64)uc->uc_mcontext.gregs[REG_R15]);
         if (dladdr((void *)rip, &dli) && (dli.dli_fname || dli.dli_sname)) {
             fprintf(stderr, "[DBG]   rip -> %s (%s) fbase=0x%lx fileoff=0x%lx\n",
                     dli.dli_sname ? dli.dli_sname : "?",
@@ -14391,7 +17192,7 @@ generic_alloc_skip:
     /* Primary recovery strategy: compute the REAL return address via
      * .pdata/UNWIND_INFO instead of guessing. Applies to any in-image
      * SIGSEGV where we haven't already special-cased the exact RVA. */
-    if (sig == SIGSEGV && g_img && rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) {
+    if (sig == SIGSEGV && g_img && rip >= (u64)g_img && rip < (u64)g_img + g_img_size) {
         u64 rsp = (u64)uc->uc_mcontext.gregs[REG_RSP];
         u64 ret = 0, new_rsp = 0;
         if (try_real_unwind_return(rip, rsp, &ret, &new_rsp)) {
@@ -14511,7 +17312,7 @@ generic_alloc_skip:
      * ordinary image faults now use exact handlers or PE unwind metadata. */
     
     if (sig == SIGILL && g_img &&
-        rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) {
+        rip >= (u64)g_img && rip < (u64)g_img + g_img_size) {
         fprintf(stderr, "[SKIP] SIGILL at RIP=0x%lx, redirecting\n", rip);
         uc->uc_mcontext.gregs[REG_RAX] = 0;
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)crash_pick_fallback_rip(rip, "sigill");
@@ -14555,7 +17356,7 @@ generic_alloc_skip:
             if (sp) {
                 u64 cand = sp[0];
                 int ok = 0;
-                if (cand >= (u64)g_img && cand < (u64)g_img + 0x42d2000)
+                if (cand >= (u64)g_img && cand < (u64)g_img + g_img_size)
                     ok = image_addr_is_exec(cand);
                 else if (g_tramp && cand >= (u64)g_tramp && cand < (u64)(g_tramp + g_trampsz))
                     ok = 1;
@@ -14658,7 +17459,7 @@ generic_alloc_skip:
             fprintf(stderr,
                     "[SKIP] Null-store sentinel host-stack fault at RIP=0x%lx; caller-return(sp[0])=0x%lx (+0x%lx); forcing safe return instead of chasing stale host stack contents.\n",
                     rip, caller,
-                    (g_img && caller >= (u64)g_img && caller < (u64)g_img + 0x42d2000) ? caller - (u64)g_img : 0);
+                    (g_img && caller >= (u64)g_img && caller < (u64)g_img + g_img_size) ? caller - (u64)g_img : 0);
             force_safe_fail_return(uc, rip);
             return;
         }
@@ -14670,7 +17471,7 @@ generic_alloc_skip:
     }
 
     if (sig == SIGSEGV && g_img && faultaddr != 0 && faultaddr < 0x1000 &&
-        !(rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) &&
+        !(rip >= (u64)g_img && rip < (u64)g_img + g_img_size) &&
         !(g_tramp && rip >= (u64)g_tramp && rip < (u64)(g_tramp + g_trampsz))) {
         u64 rsp = (u64)uc->uc_mcontext.gregs[REG_RSP];
         if (rsp) {
@@ -14697,7 +17498,7 @@ generic_alloc_skip:
         fprintf(stderr,
                 "[SKIP] Dead helper null-store at RIP=0x%lx (+0x%lx), fault=0x%lx; caller-return(sp[0])=0x%lx (+0x%lx) rcx=0x%lx rdx=0x%lx r8=0x%lx r9=0x%lx; resetting to the safe bootstrap continuation instead of returning through stale stack data.\n",
                 rip, rip - (u64)g_img, faultaddr, caller,
-                (g_img && caller >= (u64)g_img && caller < (u64)g_img + 0x42d2000) ? caller - (u64)g_img : 0,
+                (g_img && caller >= (u64)g_img && caller < (u64)g_img + g_img_size) ? caller - (u64)g_img : 0,
                 (u64)uc->uc_mcontext.gregs[REG_RCX],
                 (u64)uc->uc_mcontext.gregs[REG_RDX],
                 (u64)uc->uc_mcontext.gregs[REG_R8],
@@ -14765,7 +17566,7 @@ generic_alloc_skip:
         if (sp) {
             u64 cand = sp[0];
             int ok = 0;
-            if (cand >= (u64)g_img && cand < (u64)g_img + 0x42d2000) {
+            if (cand >= (u64)g_img && cand < (u64)g_img + g_img_size) {
                 if (image_addr_is_exec(cand) &&
                     !(cand >= (u64)g_img + 0x23ae170 && cand <= (u64)g_img + 0x23ae1d0))
                     ok = 1;
@@ -14841,7 +17642,7 @@ generic_alloc_skip:
         if (sp) {
             u64 ret = sp[0];
             int ok = 0;
-            if (ret >= (u64)g_img && ret < (u64)g_img + 0x42d2000)
+            if (ret >= (u64)g_img && ret < (u64)g_img + g_img_size)
                 ok = image_addr_is_exec(ret);
             else if (g_tramp && ret >= (u64)g_tramp && ret < (u64)(g_tramp + g_trampsz))
                 ok = 1;
@@ -14870,7 +17671,7 @@ generic_alloc_skip:
         if (sp) {
             u64 ret = sp[0];
             int ok = 0;
-            if (ret >= (u64)g_img && ret < (u64)g_img + 0x42d2000)
+            if (ret >= (u64)g_img && ret < (u64)g_img + g_img_size)
                 ok = image_addr_is_exec(ret);
             else if (g_tramp && ret >= (u64)g_tramp && ret < (u64)(g_tramp + g_trampsz))
                 ok = 1;
@@ -14899,7 +17700,7 @@ generic_alloc_skip:
         if (sp) {
             u64 ret = sp[0];
             int ok = 0;
-            if (ret >= (u64)g_img && ret < (u64)g_img + 0x42d2000)
+            if (ret >= (u64)g_img && ret < (u64)g_img + g_img_size)
                 ok = image_addr_is_exec(ret);
             else if (g_tramp && ret >= (u64)g_tramp && ret < (u64)(g_tramp + g_trampsz))
                 ok = 1;
@@ -14929,7 +17730,7 @@ generic_alloc_skip:
         if (sp) {
             u64 ret = sp[0];
             int ok = 0;
-            if (ret >= (u64)g_img && ret < (u64)g_img + 0x42d2000)
+            if (ret >= (u64)g_img && ret < (u64)g_img + g_img_size)
                 ok = image_addr_is_exec(ret);
             else if (g_tramp && ret >= (u64)g_tramp && ret < (u64)(g_tramp + g_trampsz))
                 ok = 1;
@@ -14984,7 +17785,7 @@ generic_alloc_skip:
         if (sp) {
             u64 ret = sp[0];
             int ok = 0;
-            if (ret >= (u64)g_img && ret < (u64)g_img + 0x42d2000)
+            if (ret >= (u64)g_img && ret < (u64)g_img + g_img_size)
                 ok = image_addr_is_exec(ret);
             else if (g_tramp && ret >= (u64)g_tramp && ret < (u64)(g_tramp + g_trampsz))
                 ok = 1;
@@ -15016,7 +17817,7 @@ generic_alloc_skip:
         if (sp) {
             u64 ret = sp[0];
             int ok = 0;
-            if (ret >= (u64)g_img && ret < (u64)g_img + 0x42d2000)
+            if (ret >= (u64)g_img && ret < (u64)g_img + g_img_size)
                 ok = image_addr_is_exec(ret);
             else if (g_tramp && ret >= (u64)g_tramp && ret < (u64)(g_tramp + g_trampsz))
                 ok = 1;
@@ -15046,7 +17847,7 @@ generic_alloc_skip:
         if (frame) {
             u64 ret = frame[0x5c8 / 8];
             int ok = 0;
-            if (ret >= (u64)g_img && ret < (u64)g_img + 0x42d2000)
+            if (ret >= (u64)g_img && ret < (u64)g_img + g_img_size)
                 ok = image_addr_is_exec(ret);
             else if (g_tramp && ret >= (u64)g_tramp && ret < (u64)(g_tramp + g_trampsz))
                 ok = 1;
@@ -15084,7 +17885,7 @@ generic_alloc_skip:
      * outside known executable ranges. Route through fallback immediately.
      */
     if (sig == SIGSEGV && g_img && faultaddr == rip &&
-        !(rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) &&
+        !(rip >= (u64)g_img && rip < (u64)g_img + g_img_size) &&
         !(g_tramp && rip >= (u64)g_tramp && rip < (u64)(g_tramp + g_trampsz))) {
         u64 rsp = (u64)uc->uc_mcontext.gregs[REG_RSP];
         u64 *sp = (u64 *)rsp;
@@ -15176,7 +17977,7 @@ generic_alloc_skip:
                 fprintf(stderr,
                        "[DBG]   ret0-validation: in_image_exec=%d, in_tramp=%d, entry_rsp_limit_ok=%d\n"
                        "[DBG]   is_known_guest_loop_island(ret0)=%d\n",
-                       (int)(ret0 >= (u64)g_img && ret0 < (u64)g_img + 0x42d2000 && image_addr_is_exec(ret0)),
+                       (int)(ret0 >= (u64)g_img && ret0 < (u64)g_img + g_img_size && image_addr_is_exec(ret0)),
                        (int)(g_tramp && ret0 >= (u64)g_tramp && ret0 < (u64)(g_tramp + g_trampsz)),
                        (int)(!g_entry_rsp_limit || rsp + 8 <= g_entry_rsp_limit),
                        (int)is_known_guest_loop_island(ret0));
@@ -15190,7 +17991,7 @@ generic_alloc_skip:
                     fprintf(stderr, "[DBG]   try_real_unwind_return: FAILED\n");
                 }
             }
-            if (((ret0 >= (u64)g_img && ret0 < (u64)g_img + 0x42d2000 && image_addr_is_exec(ret0)) ||
+            if (((ret0 >= (u64)g_img && ret0 < (u64)g_img + g_img_size && image_addr_is_exec(ret0)) ||
                  (g_tramp && ret0 >= (u64)g_tramp && ret0 < (u64)(g_tramp + g_trampsz))) &&
                 !(ret0 >= (u64)g_img + 0x23b7a20 && ret0 <= (u64)g_img + 0x23b7ac0) &&
                 (!g_entry_rsp_limit || rsp + 8 <= g_entry_rsp_limit)) {
@@ -15293,7 +18094,7 @@ generic_alloc_skip:
     }
 
     if (sig == SIGSEGV && g_img && faultaddr != 0 && faultaddr < 0x1000 &&
-        !(rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) &&
+        !(rip >= (u64)g_img && rip < (u64)g_img + g_img_size) &&
         !(g_tramp && rip >= (u64)g_tramp && rip < (u64)(g_tramp + g_trampsz))) {
         fprintf(stderr,
                 "[SKIP] Host near-null RIP=0x%lx (fault=0x%lx), redirecting\n",
@@ -15315,7 +18116,7 @@ generic_alloc_skip:
     }
 
     if (sig == SIGSEGV && g_img &&
-        !(rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) &&
+        !(rip >= (u64)g_img && rip < (u64)g_img + g_img_size) &&
         !(g_tramp && rip >= (u64)g_tramp && rip < (u64)(g_tramp + g_trampsz)) &&
         rip >= 0x100000ULL && rip < 0x700000000000ULL) {
         fprintf(stderr,
@@ -15327,7 +18128,7 @@ generic_alloc_skip:
     }
 
     if (sig == SIGSEGV && g_img && faultaddr >= 0xFFFFFFFFFFFFF000ULL &&
-        !(rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) &&
+        !(rip >= (u64)g_img && rip < (u64)g_img + g_img_size) &&
         !(g_tramp && rip >= (u64)g_tramp && rip < (u64)(g_tramp + g_trampsz))) {
         fprintf(stderr,
                 "[SKIP] Host signed near-null RIP=0x%lx (fault=0x%lx), redirecting\n",
@@ -15360,7 +18161,7 @@ generic_alloc_skip:
         if (sp) {
             u64 cand = sp[0];
             int ok = 0;
-            if (g_img && cand >= (u64)g_img && cand < (u64)g_img + 0x42d2000)
+            if (g_img && cand >= (u64)g_img && cand < (u64)g_img + g_img_size)
                 ok = image_addr_is_exec(cand);
             else if (g_tramp && cand >= (u64)g_tramp && cand < (u64)(g_tramp + g_trampsz))
                 ok = 1;
@@ -15399,7 +18200,7 @@ generic_alloc_skip:
      * the current frame is still consistent with real Windows call/ret semantics,
      * but never walks the full stack or guesses deep into memory. */
     if (sig == SIGSEGV && g_img &&
-        !(rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) &&
+        !(rip >= (u64)g_img && rip < (u64)g_img + g_img_size) &&
         !(g_tramp && rip >= (u64)g_tramp && rip < (u64)(g_tramp + g_trampsz))) {
         if (rip >= 0x700000000000ULL && rip < 0x800000000000ULL) {
             u64 rsp = (u64)uc->uc_mcontext.gregs[REG_RSP];
@@ -15408,7 +18209,7 @@ generic_alloc_skip:
                 for (int i = 0; i < 8; i++) {
                     u64 cand = sp[i];
                     if (!cand) continue;
-                    if (cand >= (u64)g_img && cand < (u64)g_img + 0x42d2000 &&
+                    if (cand >= (u64)g_img && cand < (u64)g_img + g_img_size &&
                         image_addr_is_exec(cand) &&
                         !(cand >= (u64)g_img + 0x235a636 && cand <= (u64)g_img + 0x235a6c5)) {
                         fprintf(stderr,
@@ -15457,7 +18258,7 @@ generic_alloc_skip:
         if (sp) {
             u64 cand = sp[0];
             int ok = 0;
-            if (g_img && cand >= (u64)g_img && cand < (u64)g_img + 0x42d2000)
+            if (g_img && cand >= (u64)g_img && cand < (u64)g_img + g_img_size)
                 ok = image_addr_is_exec(cand);
             else if (g_tramp && cand >= (u64)g_tramp && cand < (u64)(g_tramp + g_trampsz))
                 ok = 1;
@@ -15496,7 +18297,7 @@ generic_alloc_skip:
                     rip, rip - (u64)g_img);
             uc->uc_mcontext.gregs[REG_RAX] = 0;
             uc->uc_mcontext.gregs[REG_RCX] = 0;
-            if (ret >= (u64)g_img && ret < (u64)g_img + 0x42d2000 &&
+            if (ret >= (u64)g_img && ret < (u64)g_img + g_img_size &&
                 (!g_entry_rsp_limit || rsp + 8 <= g_entry_rsp_limit)) {
                 uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(rsp + 8);
                 uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ret;
@@ -15511,7 +18312,7 @@ generic_alloc_skip:
      * The instruction is: c7 04 25 00 00 00 00 xx xx xx xx (11 bytes, mov [0], imm32).
      * Skip past it so we can observe what happens after DL_PANIC. */
     if (sig == SIGSEGV && faultaddr == 0 &&
-        g_img && rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) {
+        g_img && rip >= (u64)g_img && rip < (u64)g_img + g_img_size) {
         /* PRIORITY 1: Blocker at 0x1411e424c & 0x1423b1403 - special escape logic
          * These locations have null-write patterns that crash
          * Detect and skip them */
@@ -15606,7 +18407,7 @@ generic_alloc_skip:
             if (sp) {
                 u64 cand = sp[0];
                 int ok = 0;
-                if (cand >= (u64)g_img && cand < (u64)g_img + 0x42d2000) {
+                if (cand >= (u64)g_img && cand < (u64)g_img + g_img_size) {
                     if (image_addr_is_exec(cand) &&
                         !(cand >= (u64)g_img + 0x23b7a20 && cand <= (u64)g_img + 0x23b7ac0))
                         ok = 1;
@@ -15755,7 +18556,7 @@ generic_alloc_skip:
                 instr_ptr[0], instr_ptr[1], instr_ptr[2], instr_ptr[3], instr_ptr[4]);
         for (int _i = 0; _i < 32; _i++) {
             u64 ret = sp[_i];
-            if (ret >= (u64)g_img && ret < (u64)g_img + 0x42d2000)
+            if (ret >= (u64)g_img && ret < (u64)g_img + g_img_size)
                 fprintf(stderr, "[PANIC_STACK]   [%2d] img+0x%lx\n", _i, ret - (u64)g_img);
         }
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + skip);
@@ -15794,7 +18595,7 @@ generic_alloc_skip:
      * means mod=00,reg=111(rdi),rm=001(rcx), no SIB/disp). Skip over it.
      */
     if (sig == SIGSEGV && faultaddr != 0 && faultaddr < 0x1000 &&
-        g_img && rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000) {
+        g_img && rip >= (u64)g_img && rip < (u64)g_img + g_img_size) {
         u8 *instr = (u8 *)rip;
 
         if (rip >= (u64)g_img + 0x237cec0 && rip <= (u64)g_img + 0x237d010) {
@@ -15866,7 +18667,7 @@ generic_alloc_skip:
      * Install a tiny executable stub at that address:
      *   xor eax,eax ; ret
      * Then resume at RIP so the call returns failure cleanly for all threads. */
-    if (sig == SIGSEGV && g_img && rip >= (u64)g_img && rip < (u64)g_img + 0x42d2000 &&
+    if (sig == SIGSEGV && g_img && rip >= (u64)g_img && rip < (u64)g_img + g_img_size &&
         !image_addr_is_exec(rip)) {
         u64 rva = rip - (u64)g_img;
         if ((rva >= 0x3f08bc0 && rva <= 0x3f08bff) ||
@@ -15981,14 +18782,16 @@ static void on_crash(int sig, siginfo_t *si, void *uctx)
 
     ucontext_t *uc  = (ucontext_t *)uctx;
     u64         rsp = (u64)uc->uc_mcontext.gregs[REG_RSP];
-    if (g_entry_rsp_limit && rsp > g_entry_rsp_limit) {
-        /* The seeded synthetic caller frame is intentionally *above* the
-         * initial entry baseline after a valid `ret`; only values beyond the
-         * bounded frame window are invalid. Keep the synthetic frame legal
-         * while still rejecting true stack desert walks. */
+    if (g_entry_rsp_limit && rsp > g_entry_rsp_limit &&
+        rsp >= g_guest_stack_low && rsp < g_guest_stack_high) {
+        /* g_entry_rsp_limit describes only the main synthetic guest frame.
+         * A recovered fault may legitimately remain on this thread's dedicated
+         * host-call stack, or on a worker's native guest stack; comparing either
+         * address with the main frame limit corrupts the active call chain. Only
+         * clamp an RSP that is actually inside the main synthetic guest stack. */
         u64 safe_rsp = g_entry_ret_slot ? g_entry_ret_slot : g_entry_rsp;
         fprintf(stderr,
-                "[GATE] Recovery tried to set RSP=0x%lx above the valid guest frame limit 0x%lx "
+                "[GATE] Recovery tried to set main guest RSP=0x%lx above the valid frame limit 0x%lx "
                 "(+0x%lx). Clamping to the seeded return slot and redirecting to a known "
                 "safe continuation instead of wandering into dead stack memory.\n",
                 rsp, g_entry_rsp_limit, rsp - g_entry_rsp_limit);
@@ -16007,12 +18810,190 @@ static void __attribute__((noreturn)) guest_exit_stub(void)
 }
 
 /* ── main ───────────────────────────────────────────────────────── */
+static _Atomic(uint64_t) g_last_present_source_nonblack;
+
+static uint64_t beer_monotonic_nanoseconds(void);
+
+void beer_vulkan_perf_take(uint64_t out[4]);
+
 static int beer_present_d3d12_resource(const void *resource, uint64_t serial,
                                        const uint8_t *pixels, int width,
                                        int height, int row_pitch)
 {
-    return xwayland_window_present_resource_rgba8(
+    /* Draws keep their newest color target in the graphics mirror. Publish the
+     * final back buffer only at Present instead of forcing an image readback and
+     * host memcpy after every intermediate draw. If no exact mirror exists the
+     * conservative CPU copy remains authoritative. */
+    if (resource && pixels && width > 0 && height > 0 && row_pitch >= width * 4) {
+        /* The final image can be produced directly by compute or by graphics.
+         * Publish only this presented resource; intermediate DEFAULT textures
+         * remain GPU-authoritative and do not commit sparse CPU-shadow pages. */
+        (void)beer_vulkan_compute_sync_resource(resource, serial);
+        (void)beer_vulkan_graphics_sync_resource(
+            resource, serial, (uint8_t *)(uintptr_t)pixels,
+            (size_t)row_pitch * (size_t)height, (uint32_t)width,
+            (uint32_t)height, 0u /* accept the mirror's concrete color format */,
+            4u);
+    }
+    static _Atomic(uint32_t) captured;
+    static _Atomic(uint32_t) present_count;
+    uint32_t call = atomic_fetch_add(&present_count, 1) + 1;
+    int presented = xwayland_window_present_resource_rgba8(
         resource, serial, pixels, width, height, row_pitch);
+    if (presented && getenv("BEER_D3D12_STARTUP_TIMING") && pixels &&
+        width > 0 && height > 0 && row_pitch >= width * 4) {
+        static pthread_mutex_t timing_lock = PTHREAD_MUTEX_INITIALIZER;
+        static uint64_t first_present_ns;
+        static uint64_t previous_present_ns;
+        static int previous_class = -1;
+        size_t nonblack = 0, differing = 0;
+        uint8_t reference[3] = {pixels[0], pixels[1], pixels[2]};
+        uint32_t colors[8] = {0};
+        size_t color_count = 0;
+        for (int y = 0; y < height; ++y) {
+            const uint8_t *row = pixels + (size_t)y * row_pitch;
+            for (int x = 0; x < width; ++x) {
+                const uint8_t *sample = row + (size_t)x * 4;
+                nonblack += sample[0] || sample[1] || sample[2];
+                differing += sample[0] != reference[0] ||
+                    sample[1] != reference[1] || sample[2] != reference[2];
+                if (color_count < 8) {
+                    uint32_t color = (uint32_t)sample[0] |
+                        ((uint32_t)sample[1] << 8) |
+                        ((uint32_t)sample[2] << 16);
+                    size_t index = 0;
+                    while (index < color_count && colors[index] != color) index++;
+                    if (index == color_count) colors[color_count++] = color;
+                }
+            }
+        }
+        int frame_class = !nonblack ? 0 : color_count <= 2 ? 1 : 2;
+        const char *class_name = frame_class == 0 ? "black" :
+            frame_class == 1 ? "flat" : "detailed";
+        uint64_t now_ns = beer_monotonic_nanoseconds();
+        pthread_mutex_lock(&timing_lock);
+        if (!first_present_ns) first_present_ns = now_ns;
+        uint64_t elapsed_ns = now_ns >= first_present_ns ?
+            now_ns - first_present_ns : 0;
+        uint64_t interval_ns = previous_present_ns && now_ns >= previous_present_ns ?
+            now_ns - previous_present_ns : 0;
+        if (frame_class != previous_class || call <= 8 || !(call % 30)) {
+            uint64_t gpu[4];
+            beer_vulkan_perf_take(gpu);
+            fprintf(stderr,
+                    "[D3D12 STARTUP] gpu-since-last-report compute=%llu/%llums "
+                    "graphics=%llu/%llums\n",
+                    (unsigned long long)gpu[0],
+                    (unsigned long long)(gpu[1] / UINT64_C(1000000)),
+                    (unsigned long long)gpu[2],
+                    (unsigned long long)(gpu[3] / UINT64_C(1000000)));
+            fprintf(stderr,
+                    "[D3D12 STARTUP] present=%u class=%s elapsed-ms=%llu.%03llu "
+                    "frame-ms=%llu.%03llu rgb0=%u,%u,%u differing=%zu\n",
+                    call, class_name,
+                    (unsigned long long)(elapsed_ns / UINT64_C(1000000)),
+                    (unsigned long long)((elapsed_ns / UINT64_C(1000)) % 1000),
+                    (unsigned long long)(interval_ns / UINT64_C(1000000)),
+                    (unsigned long long)((interval_ns / UINT64_C(1000)) % 1000),
+                    reference[0], reference[1], reference[2], differing);
+            fprintf(stderr,
+                    "[D3D12 MEMORY] backing=%zuMB peak=%zuMB snapshot=%zuMB\n",
+                    beer_d3d12_backing_bytes() >> 20,
+                    beer_d3d12_backing_peak_bytes() >> 20,
+                    beer_d3d12_snapshot_bytes() >> 20);
+        }
+        previous_class = frame_class;
+        previous_present_ns = now_ns;
+        pthread_mutex_unlock(&timing_lock);
+    }
+    if (getenv("BEER_D3D12_PRESENT_DIAGNOSTICS") && pixels && width > 0 &&
+        height > 0 && row_pitch >= width * 4) {
+        static _Atomic(uint32_t) present_traces;
+        uint32_t trace = atomic_fetch_add(&present_traces, 1);
+        if (trace < 160) {
+            size_t nonblack = 0;
+            uint64_t hash = UINT64_C(1469598103934665603);
+            for (int y = 0; y < height; ++y) {
+                const uint8_t *row = pixels + (size_t)y * row_pitch;
+                for (int x = 0; x < width; ++x) {
+                    const uint8_t *sample = row + (size_t)x * 4;
+                    nonblack += sample[0] || sample[1] || sample[2];
+                    for (int channel = 0; channel < 4; ++channel)
+                        hash = (hash ^ sample[channel]) *
+                            UINT64_C(1099511628211);
+                }
+            }
+            fprintf(stderr,
+                    "[D3D12 PRESENT PIXELS] call=%u resource=%p serial=%llu "
+                    "size=%dx%d nonblack=%zu source-nonzero=%llu "
+                    "hash=%016llx presented=%d\n",
+                    call, resource, (unsigned long long)serial, width, height,
+                    nonblack,
+                    (unsigned long long)atomic_load(
+                        &g_last_present_source_nonblack),
+                    (unsigned long long)hash, presented);
+        }
+    }
+    const char *capture_path = getenv("BEER_D3D12_FRAME_CAPTURE_PATH");
+    const char *minimum_text = getenv("BEER_D3D12_FRAME_CAPTURE_MIN_PRESENT");
+    uint32_t minimum = minimum_text ?
+        (uint32_t)strtoul(minimum_text, NULL, 10) : 1;
+    if (presented && call >= minimum && capture_path && *capture_path &&
+        pixels && width > 0 && height > 0 && row_pitch >= width * 4 &&
+        !atomic_load(&captured)) {
+        /* Startup legitimately presents black clears. Do not consume the
+         * one-shot diagnostic capture on those frames; wait until the actual
+         * D3D12 presentation resource contains visible RGB data. */
+        size_t nonblack = 0;
+        uint32_t colors[8] = {0};
+        size_t color_counts[8] = {0};
+        size_t color_count = 0;
+        for (int y = 0; y < height; ++y) {
+            const uint8_t *row = pixels + (size_t)y * row_pitch;
+            for (int x = 0; x < width; ++x) {
+                const uint8_t *sample = row + (size_t)x * 4;
+                nonblack += sample[0] || sample[1] || sample[2];
+                uint32_t color = (uint32_t)sample[0] |
+                    ((uint32_t)sample[1] << 8) |
+                    ((uint32_t)sample[2] << 16);
+                size_t index = 0;
+                while (index < color_count && colors[index] != color) index++;
+                if (index < color_count) {
+                    ++color_counts[index];
+                } else if (color_count < 8) {
+                    colors[color_count] = color;
+                    color_counts[color_count++] = 1;
+                }
+            }
+        }
+        /* Ignore isolated torn-write noise. A real image contributes multiple
+         * colors over a meaningful area; the observed transition corruption
+         * changes only a few pixels while the rest remains flat gray. */
+        size_t significant_colors = 0;
+        size_t minimum_pixels = (size_t)width * (size_t)height / 10000u;
+        if (minimum_pixels < 16) minimum_pixels = 16;
+        for (size_t index = 0; index < color_count; ++index)
+            significant_colors += color_counts[index] >= minimum_pixels;
+        if (nonblack && significant_colors > 2 &&
+            !atomic_exchange(&captured, 1)) {
+            FILE *output = fopen(capture_path, "wb");
+            if (output) {
+                fprintf(output, "P6\n%d %d\n255\n", width, height);
+                for (int y = 0; y < height; ++y) {
+                    const uint8_t *row = pixels + (size_t)y * row_pitch;
+                    for (int x = 0; x < width; ++x)
+                        fwrite(row + (size_t)x * 4, 1, 3, output);
+                }
+                fclose(output);
+                fprintf(stderr,
+                        "[D3D12 CAPTURE] wrote first nonblack present %u to %s\n",
+                        call, capture_path);
+            } else {
+                atomic_store(&captured, 0);
+            }
+        }
+    }
+    return presented;
 }
 
 static int beer_clear_d3d12_target(const void *resource,
@@ -16028,6 +19009,33 @@ static int beer_clear_d3d12_target(const void *resource,
         width, height, format, color);
 }
 
+static void beer_forget_d3d12_resource(const void *resource)
+{
+    /* A resource can be mirrored by the legacy shared-target renderers and by
+     * the generic D3D12 compute/graphics bridges. Flush or invalidate every
+     * cache before the compatibility layer frees authoritative host storage. */
+    beer_vulkan_compute_forget_resource(resource);
+    beer_vulkan_graphics_forget_resource(resource);
+    vulkan_indexed_renderer_forget_resource(resource);
+    vulkan_renderer_forget_resource(resource);
+}
+
+/* A copy source keeps its content serial, so the serial-validated graphics
+ * mirror stays valid and must not be discarded. */
+static void beer_forget_d3d12_source_resource(const void *resource)
+{
+    beer_vulkan_compute_forget_resource(resource);
+    vulkan_indexed_renderer_forget_resource(resource);
+    vulkan_renderer_forget_resource(resource);
+}
+
+static uint64_t beer_monotonic_nanoseconds(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
 static int beer_inspect_d3d12_compute(
     const BeerD3D12ComputeDispatch *dispatch)
 {
@@ -16035,8 +19043,80 @@ static int beer_inspect_d3d12_compute(
     static uint64_t dumped_shader_hash;
     if (!dispatch || !dispatch->shader || !dispatch->shader_size)
         return 0;
+    const BeerD3D12TranslatedShader *translated =
+        beer_d3d12_translate_shader(dispatch->shader, dispatch->shader_size,
+                                    dispatch->shader_hash);
+    static uint64_t translation_traces[64];
+    static uint32_t translation_trace_count;
+    uint32_t already_traced = 0;
+    for (uint32_t index = 0; index < translation_trace_count; ++index)
+        if (translation_traces[index] == dispatch->shader_hash)
+            already_traced = 1;
+    if (!already_traced && translation_trace_count < 64) {
+        translation_traces[translation_trace_count++] = dispatch->shader_hash;
+        if (getenv("BEER_D3D12_DIAGNOSTICS")) {
+            if (translated)
+                fprintf(stderr,
+                        "[D3D12 TRANSLATE] compute hash=%016llx dxbc=%zu "
+                        "spirv=%zu descriptors=%u\n",
+                        (unsigned long long)dispatch->shader_hash,
+                        dispatch->shader_size, translated->spirv_size,
+                        translated->descriptor_count);
+            else
+                fprintf(stderr,
+                        "[D3D12 TRANSLATE] compute hash=%016llx rejected: %s\n",
+                        (unsigned long long)dispatch->shader_hash,
+                        beer_d3d12_shader_translation_error());
+        }
+    }
+    if (translated) {
+        static int vulkan_compute_mode = -1;
+        if (vulkan_compute_mode < 0) {
+            const char *setting = getenv("BEER_D3D12_VULKAN_COMPUTE");
+            vulkan_compute_mode = !setting || setting[0] != '0';
+        }
+        if (vulkan_compute_mode) {
+            static _Atomic uint32_t vulkan_traces;
+            static _Atomic uint32_t slow_compute_traces;
+            uint64_t started_ns = beer_monotonic_nanoseconds();
+            const char *reason = NULL;
+            int executed = beer_d3d12_execute_vulkan_compute(
+                dispatch, translated, 0, &reason);
+            uint64_t ended_ns = beer_monotonic_nanoseconds();
+            uint64_t elapsed_ns = ended_ns >= started_ns ?
+                ended_ns - started_ns : 0;
+            if (getenv("BEER_D3D12_PERF") &&
+                elapsed_ns >= UINT64_C(50000000) &&
+                atomic_fetch_add(&slow_compute_traces, 1) < 128) {
+                fprintf(stderr,
+                        "[D3D12 PERF] compute hash=%016llx groups=%u,%u,%u "
+                        "elapsed-ms=%llu.%03llu %s%s\n",
+                        (unsigned long long)dispatch->shader_hash,
+                        dispatch->group_count_x, dispatch->group_count_y,
+                        dispatch->group_count_z,
+                        (unsigned long long)(elapsed_ns / UINT64_C(1000000)),
+                        (unsigned long long)((elapsed_ns / UINT64_C(1000)) % 1000),
+                        executed ? "executed" : "rejected: ",
+                        executed ? "" : (reason ? reason : "unknown"));
+            }
+            if ((!executed || getenv("BEER_D3D12_DIAGNOSTICS")) &&
+                (vulkan_traces < 96 || !executed)) {
+                if (vulkan_traces < 96) ++vulkan_traces;
+                fprintf(stderr,
+                        "[D3D12 VULKAN COMPUTE] hash=%016llx groups=%u,%u,%u "
+                        "%s%s\n",
+                        (unsigned long long)dispatch->shader_hash,
+                        dispatch->group_count_x, dispatch->group_count_y,
+                        dispatch->group_count_z,
+                        executed ? "executed" : "rejected: ",
+                        executed ? "" : (reason ? reason : "unknown"));
+            }
+            if (executed)
+                return 1;
+        }
+    }
     if (!getenv("BEER_D3D12_DUMP_COMPUTE"))
-        return beer_d3d12_execute_known_compute(dispatch);
+        return 0;
 
     pthread_mutex_lock(&dump_mutex);
     static unsigned binding_dump_count;
@@ -16105,24 +19185,763 @@ static int beer_inspect_d3d12_compute(
         dumped_shader_hash = dispatch->shader_hash;
     }
     pthread_mutex_unlock(&dump_mutex);
-    /* Inspection does not claim execution. The Vulkan backend must return
-     * success only after translating and submitting the workload. */
-    return beer_d3d12_execute_known_compute(dispatch);
+    /* Translation alone does not claim execution. The Vulkan backend must
+     * create descriptors/pipelines and submit the workload first. */
+    return 0;
+}
+
+typedef struct BeerD3D12DrawFingerprint {
+    uint64_t rgb_hash;
+    size_t nonblack;
+    size_t differing;
+    uint32_t first_rgb;
+    int valid;
+} BeerD3D12DrawFingerprint;
+
+static BeerD3D12DrawFingerprint beer_d3d12_draw_fingerprint(
+    const BeerD3D12GraphicsDraw *draw, uint32_t target)
+{
+    BeerD3D12DrawFingerprint result = {0};
+    if (!draw || target >= draw->render_target_count ||
+        !draw->render_target_storage[target] ||
+        !draw->render_target_width[target] ||
+        !draw->render_target_height[target])
+        return result;
+    size_t width = draw->render_target_width[target];
+    size_t height = draw->render_target_height[target];
+    if (width > SIZE_MAX / 4 || height > SIZE_MAX / (width * 4))
+        return result;
+    size_t bytes = width * height * 4;
+    if (bytes > draw->render_target_storage_size[target]) return result;
+
+    const uint8_t *pixels = draw->render_target_storage[target];
+    result.rgb_hash = UINT64_C(1469598103934665603);
+    result.first_rgb = (uint32_t)pixels[0] |
+        ((uint32_t)pixels[1] << 8) | ((uint32_t)pixels[2] << 16);
+    for (size_t offset = 0; offset < bytes; offset += 4) {
+        uint32_t rgb = (uint32_t)pixels[offset] |
+            ((uint32_t)pixels[offset + 1] << 8) |
+            ((uint32_t)pixels[offset + 2] << 16);
+        result.nonblack += rgb != 0;
+        result.differing += rgb != result.first_rgb;
+        for (uint32_t channel = 0; channel < 3; ++channel)
+            result.rgb_hash = (result.rgb_hash ^ pixels[offset + channel]) *
+                UINT64_C(1099511628211);
+    }
+    result.valid = 1;
+    return result;
+}
+
+static int beer_d3d12_draw_audit_begin(
+    const BeerD3D12GraphicsDraw *draw,
+    BeerD3D12DrawFingerprint before[BEER_D3D12_MAX_RENDER_TARGETS])
+{
+    const char *directory = getenv("BEER_D3D12_DRAW_AUDIT_DIR");
+    if (!directory || !*directory) return 0;
+    const char *minimum_text =
+        getenv("BEER_D3D12_DRAW_AUDIT_MIN_SUBMISSION");
+    uint64_t minimum = minimum_text ? strtoull(minimum_text, NULL, 10) : 0;
+    if (draw->debug_submission < minimum) return 0;
+    for (uint32_t target = 0; target < draw->render_target_count; ++target)
+        before[target] = beer_d3d12_draw_fingerprint(draw, target);
+    return 1;
+}
+
+static void beer_d3d12_draw_audit_end(
+    const BeerD3D12GraphicsDraw *draw,
+    const BeerD3D12DrawFingerprint before[BEER_D3D12_MAX_RENDER_TARGETS],
+    int executed)
+{
+    const char *directory = getenv("BEER_D3D12_DRAW_AUDIT_DIR");
+    if (!directory || !*directory) return;
+    mkdir(directory, 0777);
+    static _Atomic(uint32_t) captures;
+    for (uint32_t target = 0; target < draw->render_target_count; ++target) {
+        BeerD3D12DrawFingerprint after =
+            beer_d3d12_draw_fingerprint(draw, target);
+        int changed = before[target].valid && after.valid &&
+            before[target].rgb_hash != after.rgb_hash;
+        fprintf(stderr,
+                "[D3D12 DRAW AUDIT] submission=%llu list=%u sequence=%llu "
+                "vs=%016llx ps=%016llx indexed=%u elements=%u target=%u "
+                "resource=%p size=%ux%u format=%u executed=%d changed=%d "
+                "before=%016llx after=%016llx rgb0=%06x nonblack=%zu "
+                "differing=%zu\n",
+                (unsigned long long)draw->debug_submission,
+                draw->debug_list_index,
+                (unsigned long long)draw->debug_sequence,
+                (unsigned long long)draw->vertex_shader_hash,
+                (unsigned long long)draw->pixel_shader_hash,
+                draw->indexed, draw->element_count, target,
+                draw->render_targets[target],
+                draw->render_target_width[target],
+                draw->render_target_height[target],
+                draw->render_target_format[target], executed, changed,
+                (unsigned long long)before[target].rgb_hash,
+                (unsigned long long)after.rgb_hash, after.first_rgb,
+                after.nonblack, after.differing);
+        uint32_t capture = changed ? atomic_fetch_add(&captures, 1) : UINT32_MAX;
+        if (!changed || capture >= 256 || !after.valid) continue;
+        char path[768];
+        snprintf(path, sizeof(path),
+                 "%s/sub-%06llu-list-%u-seq-%04llu-%016llx-%016llx-t%u.ppm",
+                 directory, (unsigned long long)draw->debug_submission,
+                 draw->debug_list_index,
+                 (unsigned long long)draw->debug_sequence,
+                 (unsigned long long)draw->vertex_shader_hash,
+                 (unsigned long long)draw->pixel_shader_hash, target);
+        FILE *file = fopen(path, "wb");
+        if (!file) continue;
+        uint32_t width = draw->render_target_width[target];
+        uint32_t height = draw->render_target_height[target];
+        const uint8_t *pixels = draw->render_target_storage[target];
+        fprintf(file, "P6\n%u %u\n255\n", width, height);
+        for (size_t pixel = 0; pixel < (size_t)width * height; ++pixel)
+            fwrite(pixels + pixel * 4, 1, 3, file);
+        fclose(file);
+    }
+}
+
+static int beer_inspect_d3d12_graphics(const BeerD3D12GraphicsDraw *draw)
+{
+    static pthread_mutex_t trace_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t seen[1024];
+    static uint32_t seen_count;
+    if (!draw || !draw->pipeline_state || !draw->element_count ||
+        !draw->instance_count)
+        return 0;
+    BeerD3D12DrawFingerprint audit_before[BEER_D3D12_MAX_RENDER_TARGETS] = {{0}};
+    int audit_draw = beer_d3d12_draw_audit_begin(draw, audit_before);
+    if (getenv("BEER_D3D12_TRACE_DEPTH_WRITES") &&
+        draw->pso.depth_write_mask && draw->depth_stencil_storage &&
+        draw->depth_stencil_width && draw->depth_stencil_height) {
+        static _Atomic(uint32_t) depth_write_traces;
+        uint32_t trace = atomic_fetch_add(&depth_write_traces, 1);
+        if (trace < 128) {
+            size_t texel_bytes = draw->depth_stencil_source_bytes_per_pixel;
+            size_t texels = (size_t)draw->depth_stencil_width *
+                draw->depth_stencil_height;
+            size_t available = texel_bytes ?
+                draw->depth_stencil_storage_size / texel_bytes : 0;
+            if (texels > available) texels = available;
+            uint32_t nonzero = 0;
+            for (size_t i = 0; i < texels; ++i) {
+                uint32_t bits = 0;
+                memcpy(&bits, draw->depth_stencil_storage + i * texel_bytes,
+                       sizeof(bits));
+                nonzero += bits != 0;
+            }
+            fprintf(stderr,
+                    "[D3D12 DEPTH WRITE] vs=%016llx ps=%016llx size=%ux%u "
+                    "nonzero=%u serial=%llu\n",
+                    (unsigned long long)draw->vertex_shader_hash,
+                    (unsigned long long)draw->pixel_shader_hash,
+                    draw->depth_stencil_width, draw->depth_stencil_height,
+                    nonzero,
+                    (unsigned long long)(draw->depth_stencil_serial_location ?
+                        *draw->depth_stencil_serial_location : 0));
+        }
+    }
+    uint64_t signature = draw->vertex_shader_hash ^
+        (draw->pixel_shader_hash * UINT64_C(0x9e3779b97f4a7c15));
+    for (uint32_t index = 0; index < BEER_D3D12_MAX_ROOT_PARAMETERS; ++index) {
+        const BeerD3D12ComputeBinding *binding = &draw->bindings[index];
+        signature ^= (uint64_t)binding->kind << ((index % 8) * 8);
+    }
+    pthread_mutex_lock(&trace_mutex);
+    uint32_t known = 0;
+    for (uint32_t index = 0; index < seen_count; ++index)
+        if (seen[index] == signature) known = 1;
+    if (!known && seen_count < sizeof(seen) / sizeof(seen[0])) {
+        seen[seen_count++] = signature;
+        const int trace_graphics = getenv("BEER_D3D12_DIAGNOSTICS") ||
+            getenv("BEER_D3D12_DUMP_GRAPHICS") ||
+            getenv("BEER_D3D12_TRACE_GRAPHICS_BINDINGS");
+        const char *capture_directory = getenv("BEER_D3D12_DUMP_GRAPHICS");
+        if (capture_directory && *capture_directory) {
+            mkdir(capture_directory, 0777);
+            char path[512];
+            FILE *file;
+            if (draw->vertex_shader && draw->vertex_shader_size) {
+                snprintf(path, sizeof(path), "%s/%016llx.vs.dxbc",
+                         capture_directory,
+                         (unsigned long long)draw->vertex_shader_hash);
+                file = fopen(path, "wb");
+                if (file) {
+                    fwrite(draw->vertex_shader, 1, draw->vertex_shader_size,
+                           file);
+                    fclose(file);
+                }
+            }
+            if (draw->pixel_shader && draw->pixel_shader_size) {
+                snprintf(path, sizeof(path), "%s/%016llx.ps.dxbc",
+                         capture_directory,
+                         (unsigned long long)draw->pixel_shader_hash);
+                file = fopen(path, "wb");
+                if (file) {
+                    fwrite(draw->pixel_shader, 1, draw->pixel_shader_size,
+                           file);
+                    fclose(file);
+                }
+            }
+            if (draw->root_signature_blob && draw->root_signature_blob_size) {
+                snprintf(path, sizeof(path), "%s/%016llx-%016llx.rootsig",
+                         capture_directory,
+                         (unsigned long long)draw->vertex_shader_hash,
+                         (unsigned long long)draw->pixel_shader_hash);
+                file = fopen(path, "wb");
+                if (file) {
+                    fwrite(draw->root_signature_blob, 1,
+                           draw->root_signature_blob_size, file);
+                    fclose(file);
+                }
+            }
+        }
+        uint32_t viewport_bits[6];
+        memcpy(viewport_bits, draw->viewport, sizeof(viewport_bits));
+        if (trace_graphics) fprintf(stderr,
+                "[D3D12 GRAPHICS] indexed=%u elements=%u instances=%u "
+                "vs=%zu/%016llx ps=%zu/%016llx topology=%u rt=%u "
+                "vb-mask=%x ib-size=%u heaps=%u roots="
+                "%u,%u,%u,%u,%u,%u,%u,%u viewport-bits="
+                "%08x,%08x,%08x,%08x,%08x,%08x "
+                "scissor=%d,%d,%d,%d descriptors="
+                "%u,%u,%u,%u,%u,%u,%u,%u\n",
+                draw->indexed, draw->element_count, draw->instance_count,
+                draw->vertex_shader_size,
+                (unsigned long long)draw->vertex_shader_hash,
+                draw->pixel_shader_size,
+                (unsigned long long)draw->pixel_shader_hash,
+                draw->primitive_topology, draw->render_target_count,
+                draw->vertex_buffer_mask, draw->index_buffer.size,
+                draw->descriptor_heap_count,
+                draw->bindings[0].kind, draw->bindings[1].kind,
+                draw->bindings[2].kind, draw->bindings[3].kind,
+                draw->bindings[4].kind, draw->bindings[5].kind,
+                draw->bindings[6].kind, draw->bindings[7].kind,
+                viewport_bits[0], viewport_bits[1], viewport_bits[2],
+                viewport_bits[3], viewport_bits[4], viewport_bits[5],
+                draw->scissor[0], draw->scissor[1],
+                draw->scissor[2], draw->scissor[3],
+                draw->bindings[0].descriptor_count,
+                draw->bindings[1].descriptor_count,
+                draw->bindings[2].descriptor_count,
+                draw->bindings[3].descriptor_count,
+                draw->bindings[4].descriptor_count,
+                draw->bindings[5].descriptor_count,
+                draw->bindings[6].descriptor_count,
+                draw->bindings[7].descriptor_count);
+        if (getenv("BEER_D3D12_TRACE_GRAPHICS_BINDINGS")) {
+            for (uint32_t target = 0; target < draw->render_target_count;
+                 ++target) {
+                fprintf(stderr,
+                        "[D3D12 GRAPHICS BINDING] vs=%016llx ps=%016llx "
+                        "target%u=%p/storage%p/bytes%zu/%ux%u/f%u/serial%llu\n",
+                        (unsigned long long)draw->vertex_shader_hash,
+                        (unsigned long long)draw->pixel_shader_hash, target,
+                        draw->render_targets[target],
+                        draw->render_target_storage[target],
+                        draw->render_target_storage_size[target],
+                        draw->render_target_width[target],
+                        draw->render_target_height[target],
+                        draw->render_target_format[target],
+                        (unsigned long long)draw->render_target_serial[target]);
+            }
+            for (uint32_t parameter = 0;
+                 parameter < BEER_D3D12_MAX_ROOT_PARAMETERS; ++parameter) {
+                const BeerD3D12ComputeBinding *binding =
+                    &draw->bindings[parameter];
+                for (uint32_t descriptor = 0;
+                     descriptor < binding->descriptor_count; ++descriptor) {
+                    if (!binding->descriptor_resources[descriptor]) continue;
+                    fprintf(stderr,
+                            "[D3D12 GRAPHICS BINDING] vs=%016llx ps=%016llx "
+                            "p%u/d%u/type%u/r%u/s%u=%p/storage%p/bytes%zu/"
+                            "%ux%u/f%u\n",
+                            (unsigned long long)draw->vertex_shader_hash,
+                            (unsigned long long)draw->pixel_shader_hash,
+                            parameter, descriptor,
+                            binding->descriptor_types[descriptor],
+                            binding->descriptor_registers[descriptor],
+                            binding->descriptor_spaces[descriptor],
+                            binding->descriptor_resources[descriptor],
+                            binding->descriptor_resource_storage[descriptor],
+                            binding->descriptor_resource_storage_size[descriptor],
+                            binding->descriptor_widths[descriptor],
+                            binding->descriptor_heights[descriptor],
+                            binding->descriptor_formats[descriptor]);
+                }
+            }
+        }
+    }
+    if (draw->vertex_shader_hash == UINT64_C(0xa615f4b1611d38ab) &&
+        draw->pixel_shader_hash == UINT64_C(0x05e3f9074e53bc3a) &&
+        getenv("BEER_D3D12_DUMP_GUI")) {
+        static unsigned gui_pass_traces;
+        if (gui_pass_traces < 4) {
+            fprintf(stderr,
+                    "[D3D12 GUI PASS] indexed=%u elements=%u instances=%u "
+                    "target=%p/storage%p/bytes%zu/%ux%u/f%u vb-mask=%x "
+                    "vb0=%llx/%u/stride%u/resolved%p ib=%llx/%u/format%u/"
+                    "resolved%p vb-resource=%p ib-resource=%p "
+                    "input-elements=%u topology=%u",
+                    draw->indexed, draw->element_count, draw->instance_count,
+                    draw->render_targets[0], draw->render_target_storage[0],
+                    draw->render_target_storage_size[0],
+                    draw->render_target_width[0], draw->render_target_height[0],
+                    draw->render_target_format[0], draw->vertex_buffer_mask,
+                    (unsigned long long)draw->vertex_buffers[0].address,
+                    draw->vertex_buffers[0].size,
+                    draw->vertex_buffers[0].stride_or_format,
+                    draw->vertex_buffer_storage[0],
+                    (unsigned long long)draw->index_buffer.address,
+                    draw->index_buffer.size,
+                    draw->index_buffer.stride_or_format,
+                    draw->index_buffer_storage,
+                    draw->vertex_buffer_resources[0],
+                    draw->index_buffer_resource,
+                    draw->input_element_count,
+                    draw->primitive_topology);
+            for (uint32_t element = 0;
+                 element < draw->input_element_count; ++element) {
+                const BeerD3D12InputElement *input =
+                    &draw->input_elements[element];
+                fprintf(stderr,
+                        " input%u=f%u/slot%u/offset%u/class%u/step%u",
+                        element, input->format, input->input_slot,
+                        input->aligned_byte_offset, input->input_class,
+                        input->instance_step_rate);
+            }
+            for (uint32_t parameter = 0;
+                 parameter < BEER_D3D12_MAX_ROOT_PARAMETERS; ++parameter) {
+                const BeerD3D12ComputeBinding *binding =
+                    &draw->bindings[parameter];
+                if (binding->kind)
+                    fprintf(stderr,
+                            " root%u=kind%u/table%llx/address%llx/constants%u",
+                            parameter, binding->kind,
+                            (unsigned long long)binding->descriptor_table,
+                            (unsigned long long)binding->buffer_location,
+                            binding->constant_count);
+                for (uint32_t descriptor = 0;
+                     descriptor < binding->descriptor_count; ++descriptor) {
+                    if (binding->descriptor_types[descriptor] == 0 &&
+                        binding->descriptor_registers[descriptor] == 0 &&
+                        binding->descriptor_spaces[descriptor] == 0)
+                        fprintf(stderr,
+                                " t0=p%u/d%u/storage%p/bytes%zu/%ux%u/f%u",
+                                parameter, descriptor,
+                                binding->descriptor_resource_storage[descriptor],
+                                binding->descriptor_resource_storage_size[descriptor],
+                                binding->descriptor_widths[descriptor],
+                                binding->descriptor_heights[descriptor],
+                                binding->descriptor_formats[descriptor]);
+                }
+            }
+            fputc('\n', stderr);
+
+            char path[160];
+            if (draw->vertex_buffer_storage[0] &&
+                draw->vertex_buffer_storage_size[0]) {
+                snprintf(path, sizeof(path), "/tmp/beer-d3d12-gui-%u.vb",
+                         gui_pass_traces);
+                FILE *file = fopen(path, "wb");
+                if (file) {
+                    fwrite(draw->vertex_buffer_storage[0], 1,
+                           draw->vertex_buffer_storage_size[0], file);
+                    fclose(file);
+                }
+            }
+            if (draw->index_buffer_storage &&
+                draw->index_buffer_storage_size) {
+                snprintf(path, sizeof(path), "/tmp/beer-d3d12-gui-%u.ib",
+                         gui_pass_traces);
+                FILE *file = fopen(path, "wb");
+                if (file) {
+                    fwrite(draw->index_buffer_storage, 1,
+                           draw->index_buffer_storage_size, file);
+                    fclose(file);
+                }
+            }
+            ++gui_pass_traces;
+        }
+    }
+    if (getenv("BEER_D3D12_DIAGNOSTICS") &&
+        draw->vertex_shader_hash == UINT64_C(0xe5f478f2bdc20aa9) &&
+        draw->pixel_shader_hash == UINT64_C(0x065f80d5e5fe0855)) {
+        static unsigned final_pass_traces;
+        if (final_pass_traces < 4) {
+            fprintf(stderr,
+                    "[D3D12 FINAL PASS] target=%p bytes=%zu format=%u "
+                    "size=%ux%u",
+                    draw->render_targets[0],
+                    draw->render_target_storage_size[0],
+                    draw->render_target_format[0],
+                    draw->render_target_width[0],
+                    draw->render_target_height[0]);
+            for (uint32_t parameter = 0;
+                 parameter < BEER_D3D12_MAX_ROOT_PARAMETERS; ++parameter) {
+                const BeerD3D12ComputeBinding *binding =
+                    &draw->bindings[parameter];
+                for (uint32_t descriptor = 0;
+                     descriptor < binding->descriptor_count; ++descriptor) {
+                    if (binding->descriptor_types[descriptor] == 0 &&
+                        binding->descriptor_registers[descriptor] == 0 &&
+                        binding->descriptor_spaces[descriptor] == 0) {
+                        fprintf(stderr,
+                                " t0=p%u/d%u/resource%p/storage%p/bytes%zu/"
+                                "%ux%u/f%u",
+                                parameter, descriptor,
+                                binding->descriptor_resources[descriptor],
+                                binding->descriptor_resource_storage[descriptor],
+                                binding->descriptor_resource_storage_size[descriptor],
+                                binding->descriptor_widths[descriptor],
+                                binding->descriptor_heights[descriptor],
+                                binding->descriptor_formats[descriptor]);
+                    }
+                }
+            }
+            fputc('\n', stderr);
+            ++final_pass_traces;
+        }
+    }
+    pthread_mutex_unlock(&trace_mutex);
+    /* Keep the proven final-copy fast path. All other shader pairs are now
+     * translated automatically and cached; they remain explicit rejections
+     * until the Vulkan raster backend has created and submitted a pipeline. */
+    const BeerD3D12TranslatedShader *vertex =
+        beer_d3d12_translate_shader(draw->vertex_shader,
+                                    draw->vertex_shader_size,
+                                    draw->vertex_shader_hash);
+    const int vertex_only_depth = !draw->render_target_count &&
+        (!draw->pixel_shader || !draw->pixel_shader_size);
+    const BeerD3D12TranslatedShader *pixel = vertex_only_depth ? NULL :
+        beer_d3d12_translate_shader(draw->pixel_shader,
+                                    draw->pixel_shader_size,
+                                    draw->pixel_shader_hash);
+    static pthread_mutex_t translation_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t translated_pairs[1024];
+    static uint32_t translated_pair_count;
+    uint64_t pair = draw->vertex_shader_hash ^
+        (draw->pixel_shader_hash * UINT64_C(0x9e3779b97f4a7c15));
+    pthread_mutex_lock(&translation_mutex);
+    uint32_t already_traced = 0;
+    for (uint32_t index = 0; index < translated_pair_count; ++index)
+        if (translated_pairs[index] == pair) already_traced = 1;
+    if (!already_traced && translated_pair_count < 1024) {
+        translated_pairs[translated_pair_count++] = pair;
+        if (getenv("BEER_D3D12_DIAGNOSTICS")) {
+            if (vertex && (pixel || vertex_only_depth))
+                fprintf(stderr,
+                        "[D3D12 TRANSLATE] graphics vs=%016llx/%zu/%u "
+                        "ps=%016llx/%zu/%u%s\n",
+                        (unsigned long long)draw->vertex_shader_hash,
+                        vertex->spirv_size, vertex->descriptor_count,
+                        (unsigned long long)draw->pixel_shader_hash,
+                        pixel ? pixel->spirv_size : 0,
+                        pixel ? pixel->descriptor_count : 0,
+                        vertex_only_depth ? " depth-only" : "");
+            else
+                fprintf(stderr,
+                        "[D3D12 TRANSLATE] graphics vs=%016llx ps=%016llx "
+                        "rejected: %s\n",
+                        (unsigned long long)draw->vertex_shader_hash,
+                        (unsigned long long)draw->pixel_shader_hash,
+                        beer_d3d12_shader_translation_error());
+        }
+    }
+    pthread_mutex_unlock(&translation_mutex);
+    if (vertex && (pixel || vertex_only_depth)) {
+        static int vulkan_graphics_mode = -1;
+        if (vulkan_graphics_mode < 0) {
+            const char *setting = getenv("BEER_D3D12_VULKAN_GRAPHICS");
+            vulkan_graphics_mode = !setting || setting[0] != '0';
+        }
+        if (vulkan_graphics_mode) {
+            static _Atomic uint32_t vulkan_graphics_traces;
+            static _Atomic uint32_t slow_graphics_traces;
+            uint64_t started_ns = beer_monotonic_nanoseconds();
+            const char *reason = NULL;
+            int executed = beer_d3d12_execute_vulkan_graphics(
+                draw, vertex, pixel, &reason);
+            if (executed && getenv("BEER_D3D12_TRACE_TARGETS")) {
+                static _Atomic(uint32_t) target_traces;
+                uint32_t trace = atomic_fetch_add(&target_traces, 1);
+                if (trace < 256) {
+                    for (uint32_t target = 0;
+                         target < draw->render_target_count; ++target) {
+                        const uint8_t *storage =
+                            draw->render_target_storage[target];
+                        size_t size = draw->render_target_storage_size[target];
+                        size_t nonzero = 0;
+                        if (storage)
+                            for (size_t byte = 0; byte < size; ++byte)
+                                nonzero += storage[byte] != 0;
+                        if (target == 0)
+                            atomic_store(&g_last_present_source_nonblack,
+                                         nonzero);
+                        fprintf(stderr,
+                                "[D3D12 TARGET] vs=%016llx ps=%016llx "
+                                "target=%u resource=%p format=%u bytes=%zu "
+                                "nonzero=%zu serial=%llu\n",
+                                (unsigned long long)draw->vertex_shader_hash,
+                                (unsigned long long)draw->pixel_shader_hash,
+                                target, draw->render_targets[target],
+                                draw->render_target_format[target], size,
+                                nonzero,
+                                (unsigned long long)(
+                                    draw->render_target_serial_location[target] ?
+                                    *draw->render_target_serial_location[target] :
+                                    0));
+                    }
+                }
+            }
+            if (executed && getenv("BEER_D3D12_TRACE_VARIATION")) {
+                static pthread_mutex_t variation_mutex = PTHREAD_MUTEX_INITIALIZER;
+                static uint64_t variation_pairs[96];
+                static uint8_t variation_states[96];
+                static uint32_t variation_pair_count;
+                for (uint32_t target = 0;
+                     target < draw->render_target_count; ++target) {
+                    const uint8_t *storage =
+                        draw->render_target_storage[target];
+                    size_t size = draw->render_target_storage_size[target];
+                    if (!storage || !size) continue;
+                    uint8_t minimum = 0xff, maximum = 0;
+                    for (size_t byte = 0; byte < size; ++byte) {
+                        if (storage[byte] < minimum) minimum = storage[byte];
+                        if (storage[byte] > maximum) maximum = storage[byte];
+                    }
+                    uint8_t state = maximum == 0 ? 1u :
+                        minimum == maximum ? 2u : 4u;
+                    uint64_t target_pair = pair ^
+                        ((uint64_t)target * UINT64_C(0xd6e8feb86659fd93));
+                    int report = 0;
+                    pthread_mutex_lock(&variation_mutex);
+                    uint32_t slot = variation_pair_count;
+                    for (uint32_t index = 0;
+                         index < variation_pair_count; ++index)
+                        if (variation_pairs[index] == target_pair) {
+                            slot = index;
+                            break;
+                        }
+                    if (slot == variation_pair_count && slot < 96) {
+                        variation_pairs[slot] = target_pair;
+                        variation_states[slot] = 0;
+                        ++variation_pair_count;
+                    }
+                    if (slot < 96 && !(variation_states[slot] & state)) {
+                        variation_states[slot] |= state;
+                        report = 1;
+                    }
+                    pthread_mutex_unlock(&variation_mutex);
+                    if (report) {
+                        uint32_t first_pixel = 0;
+                        size_t differing_pixels = 0;
+                        if (size >= 4) {
+                            memcpy(&first_pixel, storage, sizeof(first_pixel));
+                            for (size_t offset = 4; offset + 4 <= size;
+                                 offset += 4) {
+                                uint32_t pixel = 0;
+                                memcpy(&pixel, storage + offset, sizeof(pixel));
+                                differing_pixels += pixel != first_pixel;
+                            }
+                        }
+                        fprintf(stderr,
+                                "[D3D12 VARIATION] vs=%016llx ps=%016llx "
+                                "target=%u resource=%p format=%u bytes=%zu "
+                                "min=%u max=%u first=%08x differing=%zu\n",
+                                (unsigned long long)draw->vertex_shader_hash,
+                                (unsigned long long)draw->pixel_shader_hash,
+                                target, draw->render_targets[target],
+                                draw->render_target_format[target], size,
+                                minimum, maximum, first_pixel,
+                                differing_pixels);
+                    }
+                }
+            }
+            uint64_t ended_ns = beer_monotonic_nanoseconds();
+            uint64_t elapsed_ns = ended_ns >= started_ns ?
+                ended_ns - started_ns : 0;
+            if (getenv("BEER_D3D12_PERF") &&
+                elapsed_ns >= UINT64_C(50000000) &&
+                atomic_fetch_add(&slow_graphics_traces, 1) < 128) {
+                fprintf(stderr,
+                        "[D3D12 PERF] graphics vs=%016llx ps=%016llx "
+                        "elements=%u elapsed-ms=%llu.%03llu %s%s\n",
+                        (unsigned long long)draw->vertex_shader_hash,
+                        (unsigned long long)draw->pixel_shader_hash,
+                        draw->element_count,
+                        (unsigned long long)(elapsed_ns / UINT64_C(1000000)),
+                        (unsigned long long)((elapsed_ns / UINT64_C(1000)) % 1000),
+                        executed ? "executed" : "rejected: ",
+                        executed ? "" : (reason ? reason : "unknown"));
+            }
+            if (getenv("BEER_D3D12_DIAGNOSTICS") &&
+                atomic_fetch_add(&vulkan_graphics_traces, 1) < 96) {
+                fprintf(stderr,
+                        "[D3D12 VULKAN GRAPHICS] vs=%016llx ps=%016llx "
+                        "%s%s\n",
+                        (unsigned long long)draw->vertex_shader_hash,
+                        (unsigned long long)draw->pixel_shader_hash,
+                        executed ? "executed" : "rejected: ",
+                        executed ? "" : (reason ? reason : "unknown"));
+            }
+            if (!executed) {
+                /* Aggregate telemetry showed a persistent rejected title draw,
+                 * but the bounded startup trace hid its identity. Report every
+                 * shader pair once, regardless of the normal trace budget, and
+                 * include its exact replay position for direct correlation. */
+                static pthread_mutex_t rejection_mutex =
+                    PTHREAD_MUTEX_INITIALIZER;
+                static uint64_t rejected_pairs[128];
+                static uint32_t rejected_pair_count;
+                int first_rejection = 0;
+                pthread_mutex_lock(&rejection_mutex);
+                uint32_t rejected_index = 0;
+                while (rejected_index < rejected_pair_count &&
+                       rejected_pairs[rejected_index] != pair)
+                    ++rejected_index;
+                if (rejected_index == rejected_pair_count &&
+                    rejected_pair_count <
+                        sizeof(rejected_pairs) / sizeof(rejected_pairs[0])) {
+                    rejected_pairs[rejected_pair_count++] = pair;
+                    first_rejection = 1;
+                }
+                pthread_mutex_unlock(&rejection_mutex);
+                if (first_rejection)
+                    fprintf(stderr,
+                            "[D3D12 GRAPHICS REJECTION] submission=%llu "
+                            "list=%u sequence=%llu vs=%016llx ps=%016llx "
+                            "indexed=%u elements=%u reason=%s\n",
+                            (unsigned long long)draw->debug_submission,
+                            draw->debug_list_index,
+                            (unsigned long long)draw->debug_sequence,
+                            (unsigned long long)draw->vertex_shader_hash,
+                            (unsigned long long)draw->pixel_shader_hash,
+                            draw->indexed, draw->element_count,
+                            reason ? reason : "unknown");
+            }
+            if (executed) {
+                if (audit_draw)
+                    beer_d3d12_draw_audit_end(draw, audit_before, 1);
+                return 1;
+            }
+        }
+    }
+    if (audit_draw)
+        beer_d3d12_draw_audit_end(draw, audit_before, 0);
+    return 0;
 }
 
 static void beer_observe_d3d12_submission(
     const BeerD3D12SubmissionStats *stats)
 {
     static _Atomic(uint64_t) submission_serial;
+    static pthread_mutex_t timing_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t previous_ns;
     if (!stats) return;
     uint64_t serial = atomic_fetch_add(&submission_serial, 1) + 1;
-    if (serial <= 128 || stats->draw_instanced_count ||
-        stats->draw_indexed_instanced_count ||
-        stats->render_target_binding_count) {
+    uint64_t now_ns = beer_monotonic_nanoseconds();
+    pthread_mutex_lock(&timing_mutex);
+    uint64_t interval_ns = previous_ns && now_ns >= previous_ns ?
+        now_ns - previous_ns : 0;
+    previous_ns = now_ns;
+    pthread_mutex_unlock(&timing_mutex);
+    if (getenv("BEER_D3D12_PERF")) {
+        static BeerVulkanGraphicsStats previous_graphics;
+        static BeerVulkanComputeStats previous_compute;
+        BeerVulkanGraphicsStats graphics = {0};
+        BeerVulkanComputeStats compute = {0};
+        beer_vulkan_graphics_get_stats(&graphics);
+        beer_vulkan_compute_get_stats(&compute);
+        const uint64_t graphics_submissions = graphics.queue_submissions -
+            previous_graphics.queue_submissions;
+        const uint64_t graphics_waits = graphics.fence_waits -
+            previous_graphics.fence_waits;
+        const uint64_t graphics_draws = graphics.draw_commands -
+            previous_graphics.draw_commands;
+        const uint64_t graphics_host_ns = graphics.host_execution_ns -
+            previous_graphics.host_execution_ns;
+        const uint64_t compute_submissions = compute.queue_submissions -
+            previous_compute.queue_submissions;
+        const uint64_t compute_waits = compute.host_fence_waits -
+            previous_compute.host_fence_waits;
+        const uint64_t compute_host_ns = compute.host_execution_ns -
+            previous_compute.host_execution_ns;
+        const uint64_t compute_epochs = compute.epoch_calls -
+            previous_compute.epoch_calls;
+        const uint64_t compute_operations = compute.epoch_operations -
+            previous_compute.epoch_operations;
+        const uint64_t compute_multi = compute.multi_operation_epochs -
+            previous_compute.multi_operation_epochs;
+        const uint64_t compute_shareable = compute.shareable_epoch_calls -
+            previous_compute.shareable_epoch_calls;
+        const uint64_t compute_shareable_ops =
+            compute.shareable_epoch_operations -
+            previous_compute.shareable_epoch_operations;
+        const uint64_t compute_shared = compute.shared_epoch_calls -
+            previous_compute.shared_epoch_calls;
+        const uint64_t compute_shared_ops = compute.shared_epoch_operations -
+            previous_compute.shared_epoch_operations;
+        const uint64_t compute_watchdog_fallbacks =
+            compute.watchdog_epoch_fallbacks -
+            previous_compute.watchdog_epoch_fallbacks;
+        const uint64_t compute_image_hits = compute.image_cache_hits -
+            previous_compute.image_cache_hits;
+        const uint64_t compute_image_evictions = compute.image_cache_evictions -
+            previous_compute.image_cache_evictions;
+        const uint64_t accounted_host_ns = graphics_host_ns + compute_host_ns;
+        const uint64_t unaccounted_ns = interval_ns > accounted_host_ns ?
+            interval_ns - accounted_host_ns : 0;
+        previous_graphics = graphics;
+        previous_compute = compute;
+        if (interval_ns >= UINT64_C(250000000))
+            fprintf(stderr,
+                    "[D3D12 PERF] submission=%llu interval-ms=%llu.%03llu "
+                    "dispatch=%llu draw=%llu draw-indexed=%llu "
+                    "vk-gfx-submit=%llu vk-gfx-wait=%llu vk-gfx-draw=%llu "
+                    "vk-compute-submit=%llu vk-compute-wait=%llu "
+                    "vk-compute-epochs=%llu vk-compute-ops=%llu "
+                    "vk-compute-multi=%llu shareable=%llu/%llu "
+                    "shared=%llu/%llu watchdog-fallback=%llu max-epoch=%u "
+                    "vk-compute-image-hit=%llu evict=%llu "
+                    "vk-host-ms=%llu/%llu unaccounted-ms=%llu\n",
+                    (unsigned long long)serial,
+                    (unsigned long long)(interval_ns / UINT64_C(1000000)),
+                    (unsigned long long)((interval_ns / UINT64_C(1000)) % 1000),
+                    (unsigned long long)stats->dispatch_count,
+                    (unsigned long long)stats->draw_instanced_count,
+                    (unsigned long long)stats->draw_indexed_instanced_count,
+                    (unsigned long long)graphics_submissions,
+                    (unsigned long long)graphics_waits,
+                    (unsigned long long)graphics_draws,
+                    (unsigned long long)compute_submissions,
+                    (unsigned long long)compute_waits,
+                    (unsigned long long)compute_epochs,
+                    (unsigned long long)compute_operations,
+                    (unsigned long long)compute_multi,
+                    (unsigned long long)compute_shareable,
+                    (unsigned long long)compute_shareable_ops,
+                    (unsigned long long)compute_shared,
+                    (unsigned long long)compute_shared_ops,
+                    (unsigned long long)compute_watchdog_fallbacks,
+                    compute.max_epoch_operations,
+                    (unsigned long long)compute_image_hits,
+                    (unsigned long long)compute_image_evictions,
+                    (unsigned long long)(compute_host_ns / UINT64_C(1000000)),
+                    (unsigned long long)(graphics_host_ns / UINT64_C(1000000)),
+                    (unsigned long long)(unaccounted_ns / UINT64_C(1000000)));
+    }
+    if (getenv("BEER_D3D12_DIAGNOSTICS") &&
+        (serial <= 128 || stats->draw_instanced_count ||
+         stats->draw_indexed_instanced_count ||
+         stats->render_target_binding_count)) {
         fprintf(stderr,
                 "[D3D12 STATE] submission=%llu lists=%u/%u open=%u "
                 "draw=%llu draw-indexed=%llu set-rt=%llu dispatch=%llu "
-                "executed=%u rejected=%u\n",
+                "dispatch-executed=%u dispatch-rejected=%u "
+                "draw-executed=%u draw-rejected=%u\n",
                 (unsigned long long)serial, stats->valid_list_count,
                 stats->submitted_list_count, stats->open_list_count,
                 (unsigned long long)stats->draw_instanced_count,
@@ -16130,19 +19949,114 @@ static void beer_observe_d3d12_submission(
                 (unsigned long long)stats->render_target_binding_count,
                 (unsigned long long)stats->dispatch_count,
                 stats->executed_dispatch_count,
-                stats->rejected_dispatch_count);
+                stats->rejected_dispatch_count,
+                stats->executed_draw_count,
+                stats->rejected_draw_count);
     }
+}
+
+/* Opt-in sampling profiler (BEER_PROF_SAMPLE=1). ITIMER_PROF fires every ~1 ms
+ * of process CPU time and records the interrupted RIP and thread id; SIGUSR2
+ * dumps /tmp/beer-prof.txt (maps, image base, raw samples). perf/gdb are
+ * unavailable here, so this is the only CPU profiler. */
+#define BEER_PROF_MAX 400000
+static volatile unsigned long long g_prof_rip[BEER_PROF_MAX];
+static volatile unsigned int g_prof_tid[BEER_PROF_MAX];
+static volatile unsigned long long g_prof_ret[BEER_PROF_MAX];
+static volatile unsigned int g_prof_count;
+
+static void prof_sample(int sig, siginfo_t *si, void *uctx)
+{
+    (void)sig; (void)si;
+    unsigned int i = g_prof_count;
+    if (i >= BEER_PROF_MAX) return;
+    g_prof_rip[i] = (unsigned long long)((ucontext_t *)uctx)->uc_mcontext.gregs[REG_RIP];
+    g_prof_tid[i] = (unsigned int)syscall(SYS_gettid);
+    {
+        unsigned long long sp =
+            (unsigned long long)((ucontext_t *)uctx)->uc_mcontext.gregs[REG_RSP];
+        unsigned long long words[2] = {0, 0};
+        struct iovec local = { words, sizeof(words) };
+        struct iovec remote = { (void *)(uintptr_t)sp, sizeof(words) };
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) < 0)
+            words[0] = words[1] = 0;
+        g_prof_ret[i] = words[0];
+    }
+    g_prof_count = i + 1;
+}
+
+static void prof_dump(int sig)
+{
+    (void)sig;
+    FILE *out = fopen("/tmp/beer-prof.txt", "w");
+    if (!out) return;
+    fprintf(out, "IMG %llx\n", (unsigned long long)(uintptr_t)g_img);
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512];
+    while (maps && fgets(line, sizeof(line), maps)) fprintf(out, "MAP %s", line);
+    if (maps) fclose(maps);
+    for (unsigned int i = 0; i < g_prof_count; ++i)
+        fprintf(out, "S %u %llx %llx\n", g_prof_tid[i], g_prof_rip[i], g_prof_ret[i]);
+    fclose(out);
+    fprintf(stderr, "[PROF] wrote %u samples\n", g_prof_count);
+}
+
+static void prof_start(void)
+{
+    struct sigaction pa;
+    memset(&pa, 0, sizeof(pa));
+    pa.sa_sigaction = prof_sample;
+    pa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+    sigaction(SIGPROF, &pa, NULL);
+    signal(SIGUSR2, prof_dump);
+    struct itimerval timer = { {0, 1000}, {0, 1000} };
+    setitimer(ITIMER_PROF, &timer, NULL);
 }
 
 int main(int argc, char **argv)
 {
+    beer_wasapi_set_event_signaler(beer_signal_guest_event);
     beer_d3d12_set_event_signaler(beer_signal_guest_event);
+
+    /* Wire the async-callback trampolines so the source reader fires
+     * IMFSourceReaderCallback::OnReadSample / OnFlush on the guest callback
+     * object that RE8 registers via MF_SOURCE_READER_ASYNC_CALLBACK.
+     *
+     * IMFSourceReaderCallback vtable (derived from IUnknown):
+     *   slot 0 QueryInterface, 1 AddRef, 2 Release
+     *   slot 3 OnReadSample(HRESULT, DWORD stream, DWORD flags,
+     *                       LONGLONG timestamp, IMFSample*)
+     *   slot 4 OnFlush(DWORD stream)
+     *   slot 5 OnEvent(DWORD stream, IMFMediaEvent*)
+     */
+    beer_mf_set_async_callback_invoker(beer_mf_invoke_on_read_sample,
+                                       beer_mf_invoke_on_flush);
     beer_d3d12_set_presenter(beer_present_d3d12_resource);
     beer_d3d12_set_clear_target(beer_clear_d3d12_target);
+    beer_d3d12_set_resource_forgetter(beer_forget_d3d12_resource);
+    beer_d3d12_set_resource_source_forgetter(beer_forget_d3d12_source_resource);
     beer_d3d12_set_compute_executor(beer_inspect_d3d12_compute);
+    beer_d3d12_set_compute_batch_executor(
+        beer_d3d12_execute_vulkan_compute_batch);
+    /* Normal queue replay bypasses loader-side draw auditing and calls the
+     * translated Vulkan bridge directly. Opt-in graphics diagnostics retain
+     * the inspector path without taxing every generated indirect draw. */
+    const int inspect_graphics = getenv("BEER_D3D12_DIAGNOSTICS") ||
+        getenv("BEER_D3D12_DRAW_AUDIT_DIR") ||
+        getenv("BEER_D3D12_DUMP_GRAPHICS") ||
+        getenv("BEER_D3D12_TRACE_GRAPHICS_BINDINGS") ||
+        getenv("BEER_D3D12_TRACE_DEPTH_WRITES") ||
+        getenv("BEER_D3D12_TRACE_TARGETS") ||
+        getenv("BEER_D3D12_TRACE_VARIATION") ||
+        getenv("BEER_D3D12_TRACE_TEMPORAL_INPUTS") ||
+        getenv("BEER_D3D12_TARGET_DIAGNOSTICS");
+    beer_d3d12_set_graphics_executor(inspect_graphics ?
+        beer_inspect_d3d12_graphics : beer_d3d12_execute_vulkan_graphics_fast);
+    beer_d3d12_set_graphics_batch_executor(inspect_graphics ? NULL :
+        beer_d3d12_execute_vulkan_graphics_batch);
     beer_d3d12_set_submission_observer(beer_observe_d3d12_submission);
 
-    XwaylandPresenter presenter = XWAYLAND_PRESENTER_VULKAN;
+    XwaylandPresenter presenter = XWAYLAND_PRESENTER_AUTO;
     BeerD3D11Renderer renderer = BEER_D3D11_RENDERER_VULKAN;
     const char *exe_arg = NULL;
     const char *prefix_arg = NULL;
@@ -16150,12 +20064,18 @@ int main(int argc, char **argv)
         const char *arg = argv[i];
         if (strncmp(arg, "--presenter=", 12) == 0) {
             const char *value = arg + 12;
-            if (strcmp(value, "vulkan") != 0) {
-                fprintf(stderr, "Unknown presenter '%s' (only vulkan is supported)\n",
+            if (!strcmp(value, "auto"))
+                presenter = XWAYLAND_PRESENTER_AUTO;
+            else if (!strcmp(value, "vulkan"))
+                presenter = XWAYLAND_PRESENTER_VULKAN;
+            else if (!strcmp(value, "x11"))
+                presenter = XWAYLAND_PRESENTER_X11;
+            else {
+                fprintf(stderr,
+                        "Unknown presenter '%s' (expected auto, vulkan, or x11)\n",
                         value);
                 return 2;
             }
-            presenter = XWAYLAND_PRESENTER_VULKAN;
         } else if (strncmp(arg, "--renderer=", 11) == 0) {
             const char *value = arg + 11;
             if (strcmp(value, "vulkan") != 0) {
@@ -16191,7 +20111,7 @@ int main(int argc, char **argv)
     }
     if (!exe_arg) {
         fprintf(stderr,
-                "Usage: %s [--renderer=vulkan] [--presenter=vulkan] "
+                "Usage: %s [--renderer=vulkan] [--presenter=auto|vulkan|x11] "
                 "[--prefix=PATH] [--audio=compat|fmod] <windows-executable>\n",
                 argv[0]);
         return 2;
@@ -16199,8 +20119,6 @@ int main(int argc, char **argv)
     if (!d3d11_set_renderer(renderer))
         die("cannot select D3D11 renderer '%s'", d3d11_renderer_name(renderer));
     fprintf(stderr, "[RENDERER] selected Vulkan-only rendering; software fallback removed\n");
-    if (presenter != XWAYLAND_PRESENTER_VULKAN)
-        die("Vulkan rendering requires --presenter=vulkan; fallback is disabled");
     if (!xwayland_set_presenter(presenter))
         die("cannot select native presenter '%s'", xwayland_presenter_name(presenter));
     fprintf(stderr, "[PRESENTER] selected %s\n", xwayland_presenter_name(presenter));
@@ -16213,6 +20131,20 @@ int main(int argc, char **argv)
     const char *exe = configure_guest_process_path(exe_arg);
     if (!exe)
         die("cannot configure guest process path '%s': %s", exe_arg, strerror(errno));
+    {
+        const char *base = strrchr(exe, '/');
+        base = base ? base + 1 : exe;
+        char executable_name[128];
+        size_t length = strnlen(base, sizeof(executable_name) - 1u);
+        memcpy(executable_name, base, length);
+        executable_name[length] = 0;
+        char *extension = strrchr(executable_name, '.');
+        if (extension) *extension = 0;
+        if (!beer_icon_sanitize_app_id(executable_name, g_desktop_app_id,
+                                       sizeof(g_desktop_app_id)))
+            strcpy(g_desktop_app_id, "beer-app");
+        (void)xwayland_window_set_app_id(g_desktop_app_id);
+    }
 
     /* Install a dedicated alternate signal stack. When the guest runs on a
      * synthetic RSP, the crash handler must not consume the guest stack frame:
@@ -16239,6 +20171,7 @@ int main(int argc, char **argv)
      * which may plant breakpoints there before the inferior reaches main. */
     printf("=== Beer Loader ===\n");
     pe_load(exe);
+    if (getenv("BEER_PROF_SAMPLE")) prof_start();
 
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
@@ -16309,6 +20242,7 @@ int main(int argc, char **argv)
     }
     
     patch_known_bad_targets();
+
     
     /* CHECK: After patch_known_bad_targets */
     {

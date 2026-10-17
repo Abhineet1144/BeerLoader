@@ -20,6 +20,37 @@ static inline void beer_dinput_write_standard_mouse_state(
     if (button_count) memcpy(bytes + 12, buttons, button_count);
 }
 
+static inline uint32_t beer_dinput_button_count(int kind)
+{
+    /* DirectInput models keyboard keys as 256 button objects. */
+    if (kind == 1) return 8;
+    if (kind == 2) return 256;
+    return 0;
+}
+
+static inline int beer_dinput_type_is_axis(uint32_t type)
+{
+    /* DIDFT_RELAXIS=1 and DIDFT_ABSAXIS=2; DIDFT_AXIS=3 is their mask. */
+    return (type & 0xffu) != 0 && ((type & 0xffu) & ~0x03u) == 0;
+}
+
+static inline int beer_dinput_type_is_button(uint32_t type)
+{
+    /* DIDFT_PSHBUTTON=4 and DIDFT_TGLBUTTON=8; DIDFT_BUTTON=0x0c is the mask. */
+    return (type & 0xffu) != 0 && ((type & 0xffu) & ~0x0cu) == 0;
+}
+
+static inline uint32_t beer_dinput_resolve_instance(uint32_t type,
+                                                     uint32_t *next_instance)
+{
+    uint32_t instance = (type >> 8) & 0xffffu;
+    if (instance == 0xffffu)
+        instance = (*next_instance)++;
+    else if (instance >= *next_instance)
+        *next_instance = instance + 1;
+    return instance;
+}
+
 /* Translate the canonical offsets used by Beer's host-event ring into the
  * offsets selected by a DirectInput device's current DIDATAFORMAT. */
 static inline uint32_t beer_dinput_format_offset(
@@ -38,6 +69,38 @@ static inline uint32_t beer_dinput_format_offset(
     if (canonical_offset >= 12 && canonical_offset < 20)
         return button_offsets[canonical_offset - 12];
     return UINT32_MAX;
+}
+
+static inline void beer_dinput_write_keyboard_state(
+    void *state, uint32_t size, const uint8_t keys[256],
+    const uint32_t key_offsets[256])
+{
+    uint8_t *bytes = state;
+    if (!bytes || !keys || !key_offsets) return;
+    for (uint32_t key = 0; key < 256; ++key) {
+        uint32_t offset = key_offsets[key];
+        if (offset < size)
+            bytes[offset] = keys[key];
+    }
+}
+
+static inline void beer_dinput_write_mouse_state(
+    void *state, uint32_t size, const int32_t axes[3],
+    const uint8_t buttons[8], const uint32_t axis_offsets[3],
+    const uint32_t button_offsets[8])
+{
+    uint8_t *bytes = state;
+    if (!bytes || !axes || !buttons || !axis_offsets || !button_offsets) return;
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+        uint32_t offset = axis_offsets[axis];
+        if (offset <= size && size - offset >= sizeof(int32_t))
+            memcpy(bytes + offset, &axes[axis], sizeof(int32_t));
+    }
+    for (uint32_t button = 0; button < 8; ++button) {
+        uint32_t offset = button_offsets[button];
+        if (offset < size)
+            bytes[offset] = buttons[button];
+    }
 }
 
 #endif

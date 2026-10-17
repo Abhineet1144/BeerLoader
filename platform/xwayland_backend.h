@@ -58,13 +58,35 @@ const char *xwayland_presenter_name(XwaylandPresenter presenter);
 int xwayland_window_create(int x, int y, int width, int height,
                            const char *title, int initially_visible);
 int xwayland_window_show(int visible);
+/* Requests native keyboard focus for the guest's top-level XWayland window. */
+int xwayland_window_request_focus(void);
+/* Applies the guest Win32 frame policy to the native XWayland window. */
+int xwayland_window_set_style(int decorated, int resizable);
 /* Requests compositor-managed fullscreen through EWMH. Under Wayland this is
  * handled by XWayland and the active Wayland compositor. */
 int xwayland_window_set_fullscreen(int fullscreen);
 int xwayland_window_move_resize(int x, int y, int width, int height,
                                 int move, int resize);
+/* Sets the guest-visible client extent. Native X11 window dimensions already
+ * describe a client surface, so the origin must normally remain (0,0). */
+int xwayland_window_set_client_rect(int client_x, int client_y,
+                                    int client_width, int client_height);
 int xwayland_window_set_title(const char *title);
+/* Sets the generic desktop identity used for WM_CLASS grouping. The value is
+ * cached before native-window creation and contains no title-specific policy. */
+int xwayland_window_set_app_id(const char *app_id);
+/* Publishes an ARGB32 application icon through EWMH for taskbars and switchers.
+ * Pixels use Win32's 0xAARRGGBB representation. The backend caches a bounded
+ * copy so it can install the property before mapping the native window. */
+int xwayland_window_set_icon_argb(const uint32_t *pixels, int width, int height);
+/* Applies Win32 ShowCursor visibility to the native XWayland window. */
+int xwayland_window_set_cursor_visible(int visible);
+/* Moves the native pointer to an absolute desktop coordinate. */
+int xwayland_window_set_cursor_position(int root_x, int root_y);
 int xwayland_window_get_state(XwaylandWindowState *state);
+/* Returns the physical screen dimensions in pixels via the X11 display
+ * connection.  Falls back to 1920x1080 when the display is unavailable. */
+void xwayland_get_screen_size(int *out_width, int *out_height);
 /* Returns one native lifecycle event at a time. Input events remain reserved for
  * the DirectInput backend; window activation/configuration belongs to USER32. */
 int xwayland_window_poll_event(XwaylandEvent *event);

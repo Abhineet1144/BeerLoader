@@ -1,0 +1,13 @@
+#version 450
+
+layout(local_size_x = 8) in;
+layout(set = 0, binding = 0, r32ui) uniform writeonly uimage1D target_image;
+layout(set = 0, binding = 1) uniform utexture1D source_image;
+layout(set = 0, binding = 2) uniform sampler source_sampler;
+
+void main()
+{
+    int x = int(gl_GlobalInvocationID.x);
+    imageStore(target_image, x,
+               texelFetch(usampler1D(source_image, source_sampler), x, 0));
+}

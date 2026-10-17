@@ -4,7 +4,7 @@ set -euo pipefail
 cd -- "$(dirname -- "$0")"
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 [--renderer=vulkan] [--presenter=vulkan] [--prefix=PATH] [--audio=fmod|compat] <windows-executable>" >&2
+    echo "Usage: $0 [--renderer=vulkan] [--presenter=auto|vulkan|x11] [--prefix=PATH] [--audio=fmod|compat] <windows-executable>" >&2
     exit 2
 fi
 

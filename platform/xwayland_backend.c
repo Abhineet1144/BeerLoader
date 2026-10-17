@@ -1,12 +1,17 @@
 #define _GNU_SOURCE
 #include "xwayland_backend.h"
+#include "window_icon_policy.h"
 #include "../renderer/vulkan/vulkan_presenter.h"
+
+/* Keep the platform backend independent of Vulkan SDK headers. */
+int beer_vulkan_device_lost(void);
 
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct _XDisplay Display;
 typedef struct _XVisual Visual;
@@ -15,6 +20,8 @@ typedef struct _XImage XImage;
 typedef unsigned long XID;
 typedef XID Window;
 typedef XID Atom;
+typedef XID Pixmap;
+typedef XID Cursor;
 typedef int Bool;
 
 typedef union {
@@ -48,6 +55,26 @@ typedef struct {
     Window above;
     Bool override_redirect;
 } XConfigureEvent;
+
+typedef struct {
+    long flags;
+    int x, y;
+    int width, height;
+    int min_width, min_height;
+    int max_width, max_height;
+    int width_inc, height_inc;
+    struct { int x, y; } min_aspect, max_aspect;
+    int base_width, base_height;
+    int win_gravity;
+} XSizeHints;
+
+typedef struct {
+    unsigned long flags;
+    unsigned long functions;
+    unsigned long decorations;
+    long input_mode;
+    unsigned long status;
+} MotifWmHints;
 
 typedef struct {
     int type;
@@ -87,6 +114,8 @@ typedef struct {
 
 typedef XKeyEvent XMotionEvent;
 
+#define BEER_DESKTOP_ICON_MAX_DIMENSION 64
+
 typedef struct {
     void *library;
     Display *display;
@@ -101,6 +130,7 @@ typedef struct {
     int client_width;
     int client_height;
     int visible;
+    int focus_requested;
     int initialized;
     XImage *present_image;
     uint8_t *present_pixels;
@@ -111,6 +141,12 @@ typedef struct {
     int source_height;
     int source_row_pitch;
     int source_hash_valid;
+    uint32_t *app_icon_pixels;
+    int app_icon_width;
+    int app_icon_height;
+    char app_id[128];
+    Cursor hidden_cursor;
+    int cursor_visible;
     XwaylandPresenter presenter;
     pthread_mutex_t lock;
 
@@ -122,11 +158,26 @@ typedef struct {
                                  unsigned int, unsigned int, unsigned long,
                                  unsigned long);
     int (*DestroyWindow)(Display *, Window);
+    Pixmap (*CreateBitmapFromData)(Display *, Window, const char *, unsigned int,
+                                   unsigned int);
+    Cursor (*CreatePixmapCursor)(Display *, Pixmap, Pixmap, void *, void *,
+                                 unsigned int, unsigned int);
+    int (*FreePixmap)(Display *, Pixmap);
+    int (*FreeCursor)(Display *, Cursor);
+    int (*DefineCursor)(Display *, Window, Cursor);
+    int (*UndefineCursor)(Display *, Window);
+    int (*WarpPointer)(Display *, Window, Window, int, int, unsigned int,
+                       unsigned int, int, int);
     int (*MapRaised)(Display *, Window);
     int (*UnmapWindow)(Display *, Window);
+    int (*SetInputFocus)(Display *, Window, int, unsigned long);
+    int (*RaiseWindow)(Display *, Window);
     int (*MoveResizeWindow)(Display *, Window, int, int, unsigned int, unsigned int);
     int (*StoreName)(Display *, Window, const char *);
     Atom (*InternAtom)(Display *, const char *, Bool);
+    int (*ChangeProperty)(Display *, Window, Atom, Atom, int, int,
+                          const unsigned char *, int);
+    void (*SetWMNormalHints)(Display *, Window, XSizeHints *);
     int (*SendEvent)(Display *, Window, Bool, long, XEvent *);
     int (*SetWMProtocols)(Display *, Window, Atom *, int);
     int (*SelectInput)(Display *, Window, long);
@@ -198,11 +249,22 @@ static int initialize_locked(void)
     X11_LOAD(DefaultRootWindow, "XDefaultRootWindow");
     X11_LOAD(CreateSimpleWindow, "XCreateSimpleWindow");
     X11_LOAD(DestroyWindow, "XDestroyWindow");
+    X11_LOAD(CreateBitmapFromData, "XCreateBitmapFromData");
+    X11_LOAD(CreatePixmapCursor, "XCreatePixmapCursor");
+    X11_LOAD(FreePixmap, "XFreePixmap");
+    X11_LOAD(FreeCursor, "XFreeCursor");
+    X11_LOAD(DefineCursor, "XDefineCursor");
+    X11_LOAD(UndefineCursor, "XUndefineCursor");
+    X11_LOAD(WarpPointer, "XWarpPointer");
     X11_LOAD(MapRaised, "XMapRaised");
     X11_LOAD(UnmapWindow, "XUnmapWindow");
+    X11_LOAD(SetInputFocus, "XSetInputFocus");
+    X11_LOAD(RaiseWindow, "XRaiseWindow");
     X11_LOAD(MoveResizeWindow, "XMoveResizeWindow");
     X11_LOAD(StoreName, "XStoreName");
     X11_LOAD(InternAtom, "XInternAtom");
+    X11_LOAD(ChangeProperty, "XChangeProperty");
+    X11_LOAD(SetWMNormalHints, "XSetWMNormalHints");
     X11_LOAD(SendEvent, "XSendEvent");
     X11_LOAD(SetWMProtocols, "XSetWMProtocols");
     X11_LOAD(SelectInput, "XSelectInput");
@@ -270,11 +332,63 @@ int xwayland_window_create(int x, int y, int width, int height,
     g_x11.height = height;
     g_x11.client_width = width;
     g_x11.client_height = height;
+    g_x11.cursor_visible = 1;
     g_x11.StoreName(g_x11.display, g_x11.window,
                     (title && *title) ? title : "Beer Windows Application");
+    if (g_x11.app_id[0]) {
+        Atom wm_class = g_x11.InternAtom(g_x11.display, "WM_CLASS", 0);
+        Atom string = g_x11.InternAtom(g_x11.display, "STRING", 0);
+        Atom utf8 = g_x11.InternAtom(g_x11.display, "UTF8_STRING", 0);
+        Atom gtk_application_id =
+            g_x11.InternAtom(g_x11.display, "_GTK_APPLICATION_ID", 0);
+        size_t length = strlen(g_x11.app_id);
+        char class_value[sizeof(g_x11.app_id) * 2u + 2u];
+        char desktop_id[sizeof(g_x11.app_id) + 6u];
+        memcpy(class_value, g_x11.app_id, length + 1u);
+        memcpy(class_value + length + 1u, g_x11.app_id, length + 1u);
+        snprintf(desktop_id, sizeof(desktop_id), "beer-%s", g_x11.app_id);
+        if (wm_class && string)
+            g_x11.ChangeProperty(g_x11.display, g_x11.window,
+                                 wm_class, string, 8, 0,
+                                 (const unsigned char *)class_value,
+                                 (int)(length * 2u + 2u));
+        if (gtk_application_id && utf8)
+            g_x11.ChangeProperty(g_x11.display, g_x11.window,
+                                 gtk_application_id, utf8, 8, 0,
+                                 (const unsigned char *)desktop_id,
+                                 (int)strlen(desktop_id));
+    }
+    {
+        Atom net_wm_pid = g_x11.InternAtom(g_x11.display, "_NET_WM_PID", 0);
+        Atom cardinal = g_x11.InternAtom(g_x11.display, "CARDINAL", 0);
+        unsigned long process_id = (unsigned long)(uint32_t)getpid();
+        if (net_wm_pid && cardinal)
+            g_x11.ChangeProperty(g_x11.display, g_x11.window,
+                                 net_wm_pid, cardinal, 32, 0,
+                                 (const unsigned char *)&process_id, 1);
+    }
     g_x11.wm_delete = g_x11.InternAtom(g_x11.display, "WM_DELETE_WINDOW", 0);
     if (g_x11.wm_delete)
         g_x11.SetWMProtocols(g_x11.display, g_x11.window, &g_x11.wm_delete, 1);
+    if (g_x11.app_icon_pixels && g_x11.app_icon_width > 0 &&
+        g_x11.app_icon_height > 0) {
+        Atom net_wm_icon = g_x11.InternAtom(g_x11.display, "_NET_WM_ICON", 0);
+        Atom cardinal = g_x11.InternAtom(g_x11.display, "CARDINAL", 0);
+        size_t count = (size_t)g_x11.app_icon_width *
+                       (size_t)g_x11.app_icon_height;
+        unsigned long *property = malloc((count + 2u) * sizeof(*property));
+        if (property && net_wm_icon && cardinal) {
+            property[0] = (unsigned long)(uint32_t)g_x11.app_icon_width;
+            property[1] = (unsigned long)(uint32_t)g_x11.app_icon_height;
+            for (size_t i = 0; i < count; ++i)
+                property[i + 2u] = (unsigned long)g_x11.app_icon_pixels[i];
+            g_x11.ChangeProperty(g_x11.display, g_x11.window,
+                                 net_wm_icon, cardinal, 32, 0,
+                                 (const unsigned char *)property,
+                                 (int)(count + 2u));
+        }
+        free(property);
+    }
     /* USER32 needs lifecycle, focus, configure and paint notifications. Keyboard
      * and pointer events remain owned by the DirectInput/input compatibility path. */
     g_x11.SelectInput(g_x11.display, g_x11.window,
@@ -291,6 +405,13 @@ int xwayland_window_create(int x, int y, int width, int height,
         g_x11.visible = 1;
     }
     g_x11.Flush(g_x11.display);
+    if (initially_visible) {
+        /* The map is asynchronous. Defer native focus until MapNotify so
+         * XSetInputFocus never targets a still-unviewable XWayland window. */
+        g_x11.focus_requested = 1;
+        g_x11.RaiseWindow(g_x11.display, g_x11.window);
+        g_x11.Flush(g_x11.display);
+    }
     fprintf(stderr, "[XWAYLAND] native window 0x%lx created (%dx%d)\n",
             g_x11.window, width, height);
     pthread_mutex_unlock(&g_x11.lock);
@@ -308,6 +429,40 @@ int xwayland_window_show(int visible)
     else g_x11.UnmapWindow(g_x11.display, g_x11.window);
     g_x11.visible = !!visible;
     g_x11.Flush(g_x11.display);
+    pthread_mutex_unlock(&g_x11.lock);
+    return 1;
+}
+
+int xwayland_window_set_style(int decorated, int resizable)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    if (!g_x11.display || !g_x11.window) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 0;
+    }
+
+    Atom motif = g_x11.InternAtom(g_x11.display, "_MOTIF_WM_HINTS", 0);
+    if (motif) {
+        MotifWmHints hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.flags = 1u << 1; /* MWM_HINTS_DECORATIONS */
+        hints.decorations = decorated ? 1u : 0u;
+        g_x11.ChangeProperty(g_x11.display, g_x11.window, motif, motif,
+                             32, 0, (const unsigned char *)&hints,
+                             (int)(sizeof(hints) / sizeof(long)));
+    }
+
+    XSizeHints size_hints;
+    memset(&size_hints, 0, sizeof(size_hints));
+    if (!resizable) {
+        size_hints.flags = (1L << 4) | (1L << 5); /* PMinSize | PMaxSize */
+        size_hints.min_width = size_hints.max_width = g_x11.width;
+        size_hints.min_height = size_hints.max_height = g_x11.height;
+    }
+    g_x11.SetWMNormalHints(g_x11.display, g_x11.window, &size_hints);
+    g_x11.Flush(g_x11.display);
+    fprintf(stderr, "[XWAYLAND] window frame decorated=%d resizable=%d\n",
+            !!decorated, !!resizable);
     pthread_mutex_unlock(&g_x11.lock);
     return 1;
 }
@@ -386,6 +541,195 @@ int xwayland_window_set_title(const char *title)
     return ok;
 }
 
+int xwayland_window_set_app_id(const char *app_id)
+{
+    if (!app_id || !*app_id) return 0;
+    size_t length = strnlen(app_id, sizeof(g_x11.app_id));
+    if (!length || length >= sizeof(g_x11.app_id)) return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    memcpy(g_x11.app_id, app_id, length + 1u);
+    pthread_mutex_unlock(&g_x11.lock);
+    return 1;
+}
+
+int xwayland_window_set_icon_argb(const uint32_t *pixels, int width, int height)
+{
+    if (!pixels || width <= 0 || height <= 0) return 0;
+
+    int published_width = width;
+    int published_height = height;
+    if (published_width > BEER_DESKTOP_ICON_MAX_DIMENSION ||
+        published_height > BEER_DESKTOP_ICON_MAX_DIMENSION) {
+        double scale_x = (double)BEER_DESKTOP_ICON_MAX_DIMENSION / published_width;
+        double scale_y = (double)BEER_DESKTOP_ICON_MAX_DIMENSION / published_height;
+        double scale = scale_x < scale_y ? scale_x : scale_y;
+        published_width = (int)(published_width * scale);
+        published_height = (int)(published_height * scale);
+        if (published_width < 1) published_width = 1;
+        if (published_height < 1) published_height = 1;
+    }
+    if ((size_t)published_width > SIZE_MAX / sizeof(uint32_t) /
+                                      (size_t)published_height)
+        return 0;
+
+    size_t pixel_count = (size_t)published_width * (size_t)published_height;
+    uint32_t *cached = malloc(pixel_count * sizeof(*cached));
+    if (!cached) return 0;
+    if (!beer_icon_scale_argb(pixels, width, height, cached,
+                              published_width, published_height)) {
+        free(cached);
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_x11.lock);
+    free(g_x11.app_icon_pixels);
+    g_x11.app_icon_pixels = cached;
+    g_x11.app_icon_width = published_width;
+    g_x11.app_icon_height = published_height;
+    int ok = 1;
+    if (g_x11.display && g_x11.window) {
+        Atom net_wm_icon = g_x11.InternAtom(g_x11.display, "_NET_WM_ICON", 0);
+        Atom cardinal = g_x11.InternAtom(g_x11.display, "CARDINAL", 0);
+        ok = net_wm_icon && cardinal;
+        if (ok) {
+            /* Xlib represents format-32 property elements as host longs even
+             * on LP64. Passing the uint32_t cache directly makes XChangeProperty
+             * stride through pairs of pixels and can replace a valid pre-map
+             * icon with malformed/empty data after WM_SETICON. */
+            unsigned long *property =
+                malloc((pixel_count + 2u) * sizeof(*property));
+            ok = property != NULL;
+            if (ok) {
+                property[0] = (unsigned long)(uint32_t)published_width;
+                property[1] = (unsigned long)(uint32_t)published_height;
+                for (size_t i = 0; i < pixel_count; ++i)
+                    property[i + 2u] = (unsigned long)cached[i];
+                g_x11.ChangeProperty(g_x11.display, g_x11.window,
+                                     net_wm_icon, cardinal, 32, 0,
+                                     (const unsigned char *)property,
+                                     (int)(pixel_count + 2u));
+                g_x11.Flush(g_x11.display);
+                free(property);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    return ok;
+}
+
+static int request_focus_locked(void)
+{
+    if (!g_x11.display || !g_x11.window) return 0;
+
+    /* XWayland is managed by the Wayland compositor. XSetInputFocus alone is
+     * commonly ignored (or targets a mapped-but-inactive X11 surface), while
+     * USER32 has already told the guest it owns focus. Ask the window manager
+     * to activate the surface through EWMH first, then synchronize X focus. */
+    Atom active = g_x11.InternAtom(g_x11.display, "_NET_ACTIVE_WINDOW", 0);
+    Window root = g_x11.DefaultRootWindow(g_x11.display);
+    if (active && root) {
+        XClientMessageEvent message;
+        memset(&message, 0, sizeof(message));
+        message.type = 33; /* ClientMessage */
+        message.display = g_x11.display;
+        message.window = g_x11.window;
+        message.message_type = active;
+        message.format = 32;
+        message.data.l[0] = 1; /* application-originated activation */
+        message.data.l[1] = 0; /* CurrentTime */
+        g_x11.SendEvent(g_x11.display, root, 0,
+                        (1L << 19) | (1L << 20), (XEvent *)&message);
+    }
+    g_x11.RaiseWindow(g_x11.display, g_x11.window);
+    int ok = g_x11.SetInputFocus(g_x11.display, g_x11.window, 1, 0) != 0;
+    g_x11.Flush(g_x11.display);
+    return ok;
+}
+
+int xwayland_window_request_focus(void)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    int ok = g_x11.display && g_x11.window;
+    if (ok) {
+        g_x11.focus_requested = 1;
+        /* XMapWindow is asynchronous. Apply focus immediately only after a
+         * MapNotify has made the window viewable; otherwise poll_event will
+         * fulfill this request when that notification arrives. */
+        if (g_x11.visible && request_focus_locked())
+            g_x11.focus_requested = 0;
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    return ok;
+}
+
+int xwayland_window_set_cursor_visible(int visible)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    int ok = g_x11.display && g_x11.window;
+    if (ok && !!visible != g_x11.cursor_visible) {
+        if (visible) {
+            ok = g_x11.UndefineCursor(g_x11.display, g_x11.window) != 0;
+        } else {
+            if (!g_x11.hidden_cursor) {
+                static const char empty[1] = {0};
+                struct {
+                    unsigned long pixel;
+                    unsigned short red, green, blue;
+                    char flags, pad;
+                } color;
+                memset(&color, 0, sizeof(color));
+                Pixmap bitmap = g_x11.CreateBitmapFromData(
+                    g_x11.display, g_x11.window, empty, 1, 1);
+                if (bitmap) {
+                    g_x11.hidden_cursor = g_x11.CreatePixmapCursor(
+                        g_x11.display, bitmap, bitmap, &color, &color, 0, 0);
+                    g_x11.FreePixmap(g_x11.display, bitmap);
+                }
+            }
+            ok = g_x11.hidden_cursor &&
+                 g_x11.DefineCursor(g_x11.display, g_x11.window,
+                                    g_x11.hidden_cursor) != 0;
+        }
+        if (ok) {
+            g_x11.cursor_visible = !!visible;
+            g_x11.Flush(g_x11.display);
+        }
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    return ok;
+}
+
+int xwayland_window_set_cursor_position(int root_x, int root_y)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    int ok = g_x11.display && g_x11.window;
+    if (ok) {
+        Window root = g_x11.DefaultRootWindow(g_x11.display);
+        ok = root && g_x11.WarpPointer(g_x11.display, 0, root, 0, 0, 0, 0,
+                                      root_x, root_y) != 0;
+        if (ok) g_x11.Flush(g_x11.display);
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    return ok;
+}
+
+int xwayland_window_set_client_rect(int client_x, int client_y,
+                                    int client_width, int client_height)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    int ok = g_x11.display && g_x11.window;
+    if (ok && client_x == 0 && client_y == 0 &&
+        client_width > 0 && client_height > 0) {
+        /* X11 drawable and input coordinates are already client-relative.
+         * Non-client metrics affect only USER32's outer rectangle; they never
+         * define a sub-rectangle inside a swapchain image. */
+        g_x11.client_width = client_width;
+        g_x11.client_height = client_height;
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    return ok;
+}
+
 int xwayland_window_get_state(XwaylandWindowState *state)
 {
     if (!state) return 0;
@@ -402,6 +746,33 @@ int xwayland_window_get_state(XwaylandWindowState *state)
     }
     pthread_mutex_unlock(&g_x11.lock);
     return ok;
+}
+
+void xwayland_get_screen_size(int *out_width, int *out_height)
+{
+    int w = 1920, h = 1080;
+    pthread_mutex_lock(&g_x11.lock);
+    if (g_x11.display) {
+        /* XDefaultScreen returns the index of the default screen.
+         * WidthOfScreen / HeightOfScreen are macros over the Screen struct,
+         * so we read directly through the display structure offset — but the
+         * portable path is XDisplayWidth / XDisplayHeight which are loaded
+         * from libX11 if available.  We use them here via a local dlsym so we
+         * do not need a new field in XwaylandBackend. */
+        typedef int (*XDisplayDim)(Display *, int);
+        XDisplayDim get_w = (XDisplayDim)dlsym(g_x11.library, "XDisplayWidth");
+        XDisplayDim get_h = (XDisplayDim)dlsym(g_x11.library, "XDisplayHeight");
+        if (get_w && get_h) {
+            /* screen index 0 is the default screen */
+            int sw = get_w(g_x11.display, 0);
+            int sh = get_h(g_x11.display, 0);
+            if (sw > 0) w = sw;
+            if (sh > 0) h = sh;
+        }
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    if (out_width)  *out_width  = w;
+    if (out_height) *out_height = h;
 }
 
 int xwayland_window_poll_event(XwaylandEvent *out)
@@ -456,12 +827,21 @@ int xwayland_window_poll_event(XwaylandEvent *out)
         case 19:
             g_x11.visible = 1;
             g_x11.source_hash_valid = 0;
+            if (g_x11.focus_requested && request_focus_locked())
+                g_x11.focus_requested = 0;
             out->type = XWAYLAND_EVENT_SHOW;
             break;
         case 22: {
             XConfigureEvent *configure = (XConfigureEvent *)&event;
             g_x11.x = configure->x; g_x11.y = configure->y;
             g_x11.width = configure->width; g_x11.height = configure->height;
+            /* An X11 ConfigureNotify changes the drawable's client extent.
+             * Reflect that same extent through GetClientRect, WM_SIZE, and
+             * pointer mapping. Keeping the pre-fullscreen requested size here
+             * made USER32 report 2560x1440 while the drawable and WM_SIZE were
+             * 1920x1080, scaling absolute pointer positions by 4/3. */
+            g_x11.client_width = configure->width;
+            g_x11.client_height = configure->height;
             out->type = XWAYLAND_EVENT_CONFIGURE;
             out->x = configure->x; out->y = configure->y;
             out->width = configure->width; out->height = configure->height;
@@ -497,11 +877,9 @@ static int present_rgba8_internal(const void *resource, uint64_t serial,
 
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window;
-    /* The native fullscreen surface can differ from the guest swap-chain
-     * dimensions. Keep USER32 client coordinates in the guest render space so
-     * mouse hit testing matches the pixels that are scaled for presentation. */
-    g_x11.client_width = width;
-    g_x11.client_height = height;
+    /* A swapchain image is already client content. Win32 non-client metrics
+     * affect only the outer window rectangle and must never crop source pixels.
+     * Scale the complete image to the native X11 client drawable. */
     int output_width = g_x11.width > 0 ? g_x11.width : width;
     int output_height = g_x11.height > 0 ? g_x11.height : height;
     if (!ok || output_width <= 0 || output_height <= 0 ||
@@ -512,8 +890,14 @@ static int present_rgba8_internal(const void *resource, uint64_t serial,
 
     /* Prefer Vulkan for final presentation. The D3D11 compatibility renderer
      * remains CPU-backed; Vulkan owns only the native swapchain upload/present.
-     * This gives overlays such as MangoHud a real Vulkan queue to observe. */
-    if (g_x11.presenter != XWAYLAND_PRESENTER_X11) {
+     * This gives overlays such as MangoHud a real Vulkan queue to observe.
+     *
+     * The CPU-X11 correctness path is intentionally stronger than Vulkan's
+     * staging option: it bypasses the Vulkan upload image, blit, swapchain, and
+     * compositor synchronization entirely. This makes it possible to prove
+     * whether a visible frame differs from the synchronized D3D12 pixels. */
+    const int force_cpu_x11 = getenv("BEER_PRESENTER_CPU_X11") != NULL;
+    if (!force_cpu_x11 && g_x11.presenter != XWAYLAND_PRESENTER_X11) {
         if (vulkan_presenter_present_resource_rgba8(
                 g_x11.display, g_x11.window, resource, serial, pixels,
                 width, height, row_pitch, output_width, output_height)) {
@@ -521,9 +905,24 @@ static int present_rgba8_internal(const void *resource, uint64_t serial,
             return 1;
         }
         if (g_x11.presenter == XWAYLAND_PRESENTER_VULKAN) {
-            fprintf(stderr, "[VULKAN] strict presenter failed; no X11 fallback\n");
+            static int strict_failure_announced;
+            if (!strict_failure_announced) {
+                fprintf(stderr,
+                        "[PRESENTER] strict Vulkan presentation failed%s; "
+                        "use --presenter=auto for X11 fallback\n",
+                        beer_vulkan_device_lost() ? " after device loss" : "");
+                strict_failure_announced = 1;
+            }
             pthread_mutex_unlock(&g_x11.lock);
             return 0;
+        }
+    }
+    if (force_cpu_x11) {
+        static int announced;
+        if (!announced) {
+            fprintf(stderr,
+                    "[PRESENTER] source=synchronized-d3d12 path=cpu-x11\n");
+            announced = 1;
         }
     }
 
@@ -648,10 +1047,15 @@ void xwayland_window_destroy(void)
     pthread_mutex_lock(&g_x11.lock);
     vulkan_presenter_destroy();
     if (g_x11.display && g_x11.window) {
+        if (g_x11.hidden_cursor) {
+            g_x11.FreeCursor(g_x11.display, g_x11.hidden_cursor);
+            g_x11.hidden_cursor = 0;
+        }
         g_x11.DestroyWindow(g_x11.display, g_x11.window);
         g_x11.Flush(g_x11.display);
         g_x11.window = 0;
         g_x11.visible = 0;
+        g_x11.cursor_visible = 1;
     }
     if (g_x11.present_image) {
         g_x11.DestroyImage(g_x11.present_image);

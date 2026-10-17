@@ -8,13 +8,39 @@ static uint64_t g_signaled_event;
 static uint32_t g_signal_count;
 static uint32_t g_present_count;
 static const void *g_present_resource;
+static uint64_t g_present_serial;
 static int g_present_width;
 static int g_present_height;
 static int g_present_pitch;
 static uint8_t g_present_pixels[64];
 static uint32_t g_clear_count;
+static uint32_t g_forget_count;
+static const void *g_forgotten_resource;
+static const void *g_forget_history[64];
+static uint32_t g_source_sync_count;
+static const void *g_source_sync_history[64];
 static uint32_t g_compute_count;
 static BeerD3D12ComputeDispatch g_last_compute;
+static uint32_t g_graphics_count;
+static uint32_t g_graphics_batch_count;
+static BeerD3D12GraphicsDraw g_last_graphics;
+static uint8_t g_graphics_defer_history[64];
+static uint32_t g_ordered_buffer_copy_draw_seen;
+static const void *g_ordered_buffer_copy_resource;
+static const uint8_t g_ordered_vertex_bytes[16] = {
+    0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8,
+    0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0
+};
+static const uint8_t g_ordered_index_bytes[6] = {0, 0, 1, 0, 2, 0};
+static uint32_t g_compute_batch_begin_count;
+static uint32_t g_compute_batch_end_count;
+static uint8_t g_depth_snapshot[64];
+static size_t g_depth_snapshot_size;
+static uint8_t g_depth_history[4][64];
+static size_t g_depth_history_sizes[4];
+static uint32_t g_depth_history_count;
+static char g_execution_order[32];
+static uint32_t g_execution_order_count;
 static uint32_t g_submission_count;
 static BeerD3D12SubmissionStats g_last_submission;
 
@@ -32,7 +58,141 @@ static int test_execute_compute(const BeerD3D12ComputeDispatch *dispatch)
         !dispatch->group_count_y || !dispatch->group_count_z)
         return 0;
     g_last_compute = *dispatch;
+    if (g_execution_order_count < sizeof(g_execution_order))
+        g_execution_order[g_execution_order_count++] = 'C';
     ++g_compute_count;
+    return 1;
+}
+
+static uint32_t g_compute_ir_batch_count;
+static uint32_t g_compute_ir_operation_count;
+
+static uint32_t g_compute_ir_access_count;
+static uint32_t g_compute_ir_hazards;
+
+static void test_execute_compute_batch(
+    const BeerD3D12ComputeCommandBatch *batch, uint8_t *results)
+{
+    ++g_compute_ir_batch_count;
+    g_compute_ir_operation_count += batch->command_count;
+    g_compute_ir_access_count += batch->access_count;
+    for (uint32_t index = 0; index < batch->command_count; ++index) {
+        g_compute_ir_hazards |= batch->commands[index].hazards_before;
+        results[index] = (uint8_t)test_execute_compute(
+            batch->commands[index].dispatch);
+    }
+}
+
+static void test_begin_compute_batch(void)
+{
+    ++g_compute_batch_begin_count;
+}
+
+static void test_end_compute_batch(void)
+{
+    ++g_compute_batch_end_count;
+}
+
+static int test_execute_graphics(const BeerD3D12GraphicsDraw *draw)
+{
+    if (!draw || !draw->pipeline_state || !draw->element_count ||
+        !draw->instance_count)
+        return 0;
+    g_last_graphics = *draw;
+    if (draw->indexed && g_ordered_buffer_copy_resource &&
+        draw->vertex_buffer_resources[0] == g_ordered_buffer_copy_resource &&
+        draw->index_buffer_resource == g_ordered_buffer_copy_resource) {
+        if (!draw->vertex_buffer_storage[0] ||
+            draw->vertex_buffer_storage_size[0] !=
+                sizeof(g_ordered_vertex_bytes) ||
+            !draw->index_buffer_storage ||
+            draw->index_buffer_storage_size != sizeof(g_ordered_index_bytes) ||
+            memcmp(draw->vertex_buffer_storage[0], g_ordered_vertex_bytes,
+                   sizeof(g_ordered_vertex_bytes)) != 0 ||
+            memcmp(draw->index_buffer_storage, g_ordered_index_bytes,
+                   sizeof(g_ordered_index_bytes)) != 0)
+            return 0;
+        ++g_ordered_buffer_copy_draw_seen;
+    }
+    if (draw->depth_stencil_storage && draw->depth_stencil_storage_size) {
+        g_depth_snapshot_size = draw->depth_stencil_storage_size;
+        if (g_depth_snapshot_size > sizeof(g_depth_snapshot))
+            g_depth_snapshot_size = sizeof(g_depth_snapshot);
+        memcpy(g_depth_snapshot, draw->depth_stencil_storage,
+               g_depth_snapshot_size);
+        if (g_depth_history_count < 4) {
+            g_depth_history_sizes[g_depth_history_count] = g_depth_snapshot_size;
+            memcpy(g_depth_history[g_depth_history_count],
+                   draw->depth_stencil_storage, g_depth_snapshot_size);
+            ++g_depth_history_count;
+        }
+    }
+    if (g_execution_order_count < sizeof(g_execution_order))
+        g_execution_order[g_execution_order_count++] = 'G';
+    if (g_graphics_count < sizeof(g_graphics_defer_history))
+        g_graphics_defer_history[g_graphics_count] =
+            (uint8_t)draw->defer_render_target_publication;
+    ++g_graphics_count;
+    return 1;
+}
+
+static uint32_t test_execute_graphics_batch(
+    const BeerD3D12GraphicsDraw *draw,
+    const BeerD3D12GraphicsArguments *arguments, uint32_t argument_count)
+{
+    ++g_graphics_batch_count;
+    if (!draw || !arguments) return 0;
+    BeerD3D12GraphicsDraw operation = *draw;
+    uint32_t executed = 0;
+    for (uint32_t index = 0; index < argument_count; ++index) {
+        operation.element_count = arguments[index].element_count;
+        operation.instance_count = arguments[index].instance_count;
+        operation.start_element = arguments[index].start_element;
+        operation.base_vertex = arguments[index].base_vertex;
+        operation.start_instance = arguments[index].start_instance;
+        operation.defer_render_target_publication =
+            arguments[index].defer_render_target_publication;
+        executed += test_execute_graphics(&operation) != 0;
+    }
+    return executed;
+}
+
+static int test_graphics_attachment_run_policy(void)
+{
+    uint8_t target_a[4] = {0};
+    uint8_t target_b[4] = {0};
+    uint64_t serial_a = 0;
+    uint64_t serial_b = 0;
+    BeerD3D12GraphicsDraw first;
+    BeerD3D12GraphicsDraw next;
+    memset(&first, 0, sizeof(first));
+    memset(&next, 0, sizeof(next));
+    first.render_target_count = next.render_target_count = 1;
+    first.render_targets[0] = next.render_targets[0] = target_a;
+    first.render_target_storage[0] = next.render_target_storage[0] = target_a;
+    first.render_target_serial_location[0] =
+        next.render_target_serial_location[0] = &serial_a;
+    first.render_target_format[0] = next.render_target_format[0] = 28;
+    first.render_target_width[0] = next.render_target_width[0] = 1;
+    first.render_target_height[0] = next.render_target_height[0] = 1;
+    if (!beer_d3d12_graphics_attachments_match(&first, &next)) return 0;
+
+    next.render_targets[0] = target_b;
+    next.render_target_storage[0] = target_b;
+    next.render_target_serial_location[0] = &serial_b;
+    if (beer_d3d12_graphics_attachments_match(&first, &next)) return 0;
+    next = first;
+    next.render_target_format[0] = 87;
+    if (beer_d3d12_graphics_attachments_match(&first, &next)) return 0;
+    next = first;
+    next.render_target_width[0] = 2;
+    if (beer_d3d12_graphics_attachments_match(&first, &next)) return 0;
+    next = first;
+    next.depth_stencil = target_b;
+    if (beer_d3d12_graphics_attachments_match(&first, &next)) return 0;
+    next = first;
+    next.render_target_count = 0;
+    if (beer_d3d12_graphics_attachments_match(&first, &next)) return 0;
     return 1;
 }
 
@@ -64,6 +224,23 @@ static int test_clear_target(const void *resource,
     return 1;
 }
 
+static void test_forget_resource(const void *resource)
+{
+    g_forgotten_resource = resource;
+    if (g_forget_count < sizeof(g_forget_history) /
+            sizeof(g_forget_history[0]))
+        g_forget_history[g_forget_count] = resource;
+    ++g_forget_count;
+}
+
+static void test_sync_source_resource(const void *resource)
+{
+    if (g_source_sync_count < sizeof(g_source_sync_history) /
+            sizeof(g_source_sync_history[0]))
+        g_source_sync_history[g_source_sync_count] = resource;
+    ++g_source_sync_count;
+}
+
 static void test_signal_event(uint64_t event_handle)
 {
     g_signaled_event = event_handle;
@@ -74,8 +251,9 @@ static int test_present(const void *resource, uint64_t serial,
                         const uint8_t *pixels, int width, int height,
                         int row_pitch)
 {
-    if (!resource || !serial || !pixels) return 0;
+    if (!resource || !pixels) return 0;
     g_present_resource = resource;
+    g_present_serial = serial;
     g_present_width = width;
     g_present_height = height;
     g_present_pitch = row_pitch;
@@ -88,10 +266,129 @@ static int test_present(const void *resource, uint64_t serial,
 
 int main(void)
 {
+    if (!test_graphics_attachment_run_policy()) {
+        fprintf(stderr, "graphics attachment-run policy test failed\n");
+        return 50;
+    }
+    typedef struct TestResourceDesc {
+        uint32_t dimension;
+        uint32_t padding0;
+        uint64_t alignment;
+        uint64_t width;
+        uint32_t height;
+        uint16_t depth_or_array_size;
+        uint16_t mip_levels;
+        uint32_t format;
+        uint32_t sample_count;
+        uint32_t sample_quality;
+        uint32_t layout;
+        uint32_t flags;
+        uint32_t padding1;
+    } TestResourceDesc;
+    typedef struct TestResourceAllocationInfo {
+        uint64_t size_in_bytes;
+        uint64_t alignment;
+    } TestResourceAllocationInfo;
+    typedef TestResourceAllocationInfo *(__attribute__((ms_abi))
+        *GetResourceAllocationInfoFn)(void *, TestResourceAllocationInfo *,
+                                      uint32_t, uint32_t,
+                                      const TestResourceDesc *);
+    uint8_t hazard_storage[16] = {0};
+    int hazard_resource;
+    BeerD3D12ComputeResourceAccess hazard_accesses[4] = {
+        { .resource = &hazard_resource, .storage = hazard_storage,
+          .storage_size = sizeof(hazard_storage),
+          .access = BEER_D3D12_COMPUTE_ACCESS_WRITE },
+        { .resource = &hazard_resource, .storage = hazard_storage,
+          .storage_size = sizeof(hazard_storage),
+          .access = BEER_D3D12_COMPUTE_ACCESS_READ },
+        { .resource = &hazard_resource, .storage = hazard_storage,
+          .storage_size = sizeof(hazard_storage),
+          .access = BEER_D3D12_COMPUTE_ACCESS_WRITE },
+        { .storage = hazard_storage, .storage_size = sizeof(hazard_storage),
+          .access = BEER_D3D12_COMPUTE_ACCESS_READ }
+    };
+    if (beer_d3d12_compute_hazards_before(hazard_accesses, 1, 1) !=
+            BEER_D3D12_COMPUTE_HAZARD_RAW ||
+        beer_d3d12_compute_hazards_before(hazard_accesses, 2, 1) !=
+            (BEER_D3D12_COMPUTE_HAZARD_WAR |
+             BEER_D3D12_COMPUTE_HAZARD_WAW) ||
+        beer_d3d12_compute_hazards_before(hazard_accesses, 3, 1) != 0)
+        return 100;
+    uint8_t staging_other[7] = {0};
+    BeerD3D12ComputeResourceAccess staging_accesses[4] = {
+        { .resource = &hazard_resource, .storage = hazard_storage,
+          .storage_size = sizeof(hazard_storage),
+          .access = BEER_D3D12_COMPUTE_ACCESS_READ },
+        { .resource = &hazard_resource, .storage = hazard_storage,
+          .storage_size = sizeof(hazard_storage),
+          .access = BEER_D3D12_COMPUTE_ACCESS_WRITE },
+        { .storage = staging_other, .storage_size = sizeof(staging_other),
+          .access = BEER_D3D12_COMPUTE_ACCESS_READ },
+        { .access = BEER_D3D12_COMPUTE_ACCESS_READ }
+    };
+    size_t staging_offsets[4] = {0};
+    size_t staging_total = 0;
+    if (!beer_d3d12_compute_plan_staging(staging_accesses, 4, 256,
+                                         staging_offsets, &staging_total) ||
+        staging_offsets[0] != 0 || staging_offsets[1] != 0 ||
+        staging_offsets[2] != 256 || staging_offsets[3] != SIZE_MAX ||
+        staging_total != 512 ||
+        beer_d3d12_compute_plan_staging(staging_accesses, 4, 192,
+                                        staging_offsets, &staging_total))
+        return 101;
+    BeerD3D12ComputeCommand epoch_commands[5] = {
+        { .hazards_before = 0 },
+        { .hazards_before = 0 },
+        { .hazards_before = BEER_D3D12_COMPUTE_HAZARD_RAW },
+        { .hazards_before = 0 },
+        { .hazards_before = BEER_D3D12_COMPUTE_HAZARD_WAW }
+    };
+    uint32_t epochs[5] = {0};
+    uint32_t epoch_count = 0;
+    if (!beer_d3d12_compute_plan_epochs(epoch_commands, 5, epochs,
+                                        &epoch_count) ||
+        epoch_count != 3 || epochs[0] != 0 || epochs[1] != 0 ||
+        epochs[2] != 1 || epochs[3] != 1 || epochs[4] != 2 ||
+        !beer_d3d12_compute_plan_epochs(NULL, 0, NULL, &epoch_count) ||
+        epoch_count != 0 ||
+        beer_d3d12_compute_plan_epochs(epoch_commands, 5, NULL,
+                                       &epoch_count))
+        return 102;
+    BeerD3D12ComputeCommand planned_commands[3] = {
+        { .first_access = 0, .access_count = 2 },
+        { .first_access = 2, .access_count = 1 },
+        { .first_access = 3, .access_count = 1,
+          .hazards_before = BEER_D3D12_COMPUTE_HAZARD_RAW }
+    };
+    uint32_t planned_epochs[3] = {0, 0, 1};
+    BeerD3D12ComputeCommandBatch planned_batch = {
+        .commands = planned_commands, .command_count = 3,
+        .accesses = staging_accesses, .access_count = 4
+    };
+    size_t planned_offsets[4] = {0};
+    size_t planned_sizes[2] = {0};
+    if (!beer_d3d12_compute_plan_epoch_staging(
+            &planned_batch, planned_epochs, 2, 256, 64,
+            planned_offsets, planned_sizes) ||
+        planned_offsets[0] != 0 || planned_offsets[1] != 0 ||
+        planned_offsets[2] != 256 || planned_offsets[3] != SIZE_MAX ||
+        planned_sizes[0] != 640 || planned_sizes[1] != 64 ||
+        beer_d3d12_compute_plan_epoch_staging(
+            &planned_batch, planned_epochs, 1, 256, 64,
+            planned_offsets, planned_sizes))
+        return 103;
     beer_d3d12_set_event_signaler(test_signal_event);
     beer_d3d12_set_presenter(test_present);
     beer_d3d12_set_clear_target(test_clear_target);
+    beer_d3d12_set_resource_forgetter(test_forget_resource);
+    beer_d3d12_set_resource_source_forgetter(test_sync_source_resource);
     beer_d3d12_set_compute_executor(test_execute_compute);
+    beer_d3d12_set_compute_batch_executor(test_execute_compute_batch);
+    beer_d3d12_set_compute_batch_callbacks(test_begin_compute_batch,
+                                           test_end_compute_batch);
+    beer_d3d12_set_graphics_executor(test_execute_graphics);
+    beer_d3d12_set_graphics_batch_executor(test_execute_graphics_batch);
     beer_d3d12_set_submission_observer(test_observe_submission);
     static const uint8_t iid_device[16] = {
         0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b,
@@ -102,6 +399,21 @@ int main(void)
     if (result != 0 || output == NULL) return 1;
 
     void **vtable = *(void ***)output;
+    TestResourceDesc bc1_allocation_desc = {0};
+    bc1_allocation_desc.dimension = 3;
+    bc1_allocation_desc.width = 2048;
+    bc1_allocation_desc.height = 2048;
+    bc1_allocation_desc.depth_or_array_size = 32;
+    bc1_allocation_desc.mip_levels = 1;
+    bc1_allocation_desc.format = 70; /* DXGI_FORMAT_BC1_TYPELESS */
+    bc1_allocation_desc.sample_count = 1;
+    TestResourceAllocationInfo bc1_allocation = {0};
+    if (((GetResourceAllocationInfoFn)vtable[25])(
+            output, &bc1_allocation, 0, 1, &bc1_allocation_desc) !=
+            &bc1_allocation ||
+        bc1_allocation.size_in_bytes != UINT64_C(67108864) ||
+        bc1_allocation.alignment != UINT64_C(65536))
+        return 104;
     typedef uint32_t (__attribute__((ms_abi)) *GetNodeCountFn)(void *);
     typedef uint64_t (__attribute__((ms_abi)) *CreateAllocatorFn)(
         void *, uint32_t, const uint8_t *, void **);
@@ -448,6 +760,7 @@ int main(void)
             &returned_desc || returned_desc.width != buffer_desc.width)
         return 17;
     if (((ReleaseFn)resource_vtable[2])(resource) != 0) return 18;
+    if (g_forget_count != 1 || g_forgotten_resource != resource) return 18;
 
     static const uint8_t iid_heap[16] = {
         0x02, 0x25, 0x3b, 0x6b, 0x51, 0x6e, 0xb3, 0x45,
@@ -527,10 +840,29 @@ int main(void)
         ((uint8_t *)copy_source_data)[32 + index] = (uint8_t)(index + 1);
     typedef void (__attribute__((ms_abi)) *CopyBufferFn)(
         void *, void *, uint64_t, void *, uint64_t, uint64_t);
+    /* CopyBufferRegion is a GPU command, not an immediate CPU memcpy. Freeze
+     * upload bytes at record time, defer destination visibility until submit,
+     * and survive upload-ring reuse before execution. */
+    uint8_t expected_buffer_copy[64];
+    memcpy(expected_buffer_copy, (uint8_t *)copy_source_data + 32,
+           sizeof(expected_buffer_copy));
+    if (memcmp((uint8_t *)copy_destination_data + 80,
+               expected_buffer_copy, sizeof(expected_buffer_copy)) == 0)
+        return 27;
+    /* CopyResource is an ordered GPU command. It must not expose its result
+     * while recording, and it must execute between surrounding dispatch/draw
+     * operations rather than copying stale pre-render host bytes. */
+    typedef void (__attribute__((ms_abi)) *CopyResourceFn)(
+        void *, void *, void *);
+    memset(copy_source_data, 0xa7, 16);
+    memset(copy_destination_data, 0, 16);
+    ((CopyResourceFn)list_vtable[17])(
+        command_list, copy_destination, copy_source);
     ((CopyBufferFn)list_vtable[15])(command_list, copy_destination, 80,
                                    copy_source, 32, 64);
-    if (memcmp((uint8_t *)copy_destination_data + 80,
-               (uint8_t *)copy_source_data + 32, 64) != 0)
+    memset((uint8_t *)copy_source_data + 32, 0xee,
+           sizeof(expected_buffer_copy));
+    if (memcmp(copy_destination_data, copy_source_data, 16) == 0)
         return 27;
     /* Command-list state/query methods are void contracts and must update the
      * CPU-backed resource/query model without returning HRESULT garbage. */
@@ -592,21 +924,89 @@ int main(void)
     ((SetRootDescriptorFn)list_vtable[41])(
         command_list, 7, UINT64_C(0x32345000));
     ((DispatchFn)list_vtable[14])(command_list, 8, 4, 1);
+    typedef void (__attribute__((ms_abi)) *SetGraphicsRootFn)(void *, void *);
+    typedef void (__attribute__((ms_abi)) *SetRootConstantFn)(
+        void *, uint32_t, uint32_t, uint32_t);
+    typedef void (__attribute__((ms_abi)) *SetTopologyFn)(void *, uint32_t);
+    typedef void (__attribute__((ms_abi)) *SetViewportsFn)(
+        void *, uint32_t, const void *);
+    typedef void (__attribute__((ms_abi)) *SetScissorsFn)(
+        void *, uint32_t, const void *);
+    typedef void (__attribute__((ms_abi)) *SetVertexBuffersFn)(
+        void *, uint32_t, uint32_t, const BeerD3D12BufferView *);
+    typedef void (__attribute__((ms_abi)) *SetIndexBufferFn)(
+        void *, const BeerD3D12BufferView *);
+    ((SetGraphicsRootFn)list_vtable[30])(
+        command_list, compute_root_signature);
+    ((SetRootTableFn)list_vtable[32])(command_list, 0, gpu_handle);
+    ((SetRootConstantFn)list_vtable[34])(command_list, 1, 0x44, 0);
+    ((SetRootConstantsFn)list_vtable[36])(
+        command_list, 2, 3, root_constants, 1);
+    uint64_t graphics_cbv_address =
+        ((GetGpuAddressFn)copy_source_vtable[11])(copy_source);
+    ((uint8_t *)copy_source_data)[0] = 0x6a;
+    ((SetRootDescriptorFn)list_vtable[38])(
+        command_list, 3, graphics_cbv_address);
+    ((SetRootDescriptorFn)list_vtable[40])(
+        command_list, 4, UINT64_C(0x52345000));
+    ((SetRootDescriptorFn)list_vtable[42])(
+        command_list, 5, UINT64_C(0x62345000));
+    ((SetTopologyFn)list_vtable[20])(command_list, 4);
+    const float test_viewport[6] = {1.0f, 2.0f, 640.0f, 480.0f, 0.0f, 1.0f};
+    const int32_t test_scissor[4] = {3, 4, 603, 404};
+    ((SetViewportsFn)list_vtable[21])(command_list, 1, test_viewport);
+    ((SetScissorsFn)list_vtable[22])(command_list, 1, test_scissor);
+    uint64_t test_vertex_address =
+        ((GetGpuAddressFn)copy_source_vtable[11])(copy_source);
+    uint64_t test_index_address =
+        ((GetGpuAddressFn)copy_destination_vtable[11])(copy_destination);
+    BeerD3D12BufferView test_vertex = {test_vertex_address + 16, 128, 16};
+    BeerD3D12BufferView test_index = {test_index_address + 32, 64, 57};
+    memset((uint8_t *)copy_source_data + 16, 0x91, test_vertex.size);
+    memset((uint8_t *)copy_destination_data + 32, 0x53, test_index.size);
+    ((SetVertexBuffersFn)list_vtable[44])(
+        command_list, 0, 1, &test_vertex);
+    ((SetIndexBufferFn)list_vtable[43])(command_list, &test_index);
     typedef void (__attribute__((ms_abi)) *DrawInstancedFn)(
         void *, uint32_t, uint32_t, uint32_t, uint32_t);
     typedef void (__attribute__((ms_abi)) *DrawIndexedInstancedFn)(
         void *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
     typedef void (__attribute__((ms_abi)) *SetRenderTargetsFn)(
         void *, uint32_t, const uint64_t *, uint32_t, const uint64_t *);
-    uint64_t telemetry_rtv = UINT64_C(0x12340000);
-    uint64_t telemetry_dsv = UINT64_C(0x56780000);
-    ((SetRenderTargetsFn)list_vtable[47])(
-        command_list, 1, &telemetry_rtv, 1, &telemetry_dsv);
-    ((DrawInstancedFn)list_vtable[11])(command_list, 3, 2, 0, 0);
-    ((DrawIndexedInstancedFn)list_vtable[12])(
+    typedef void (__attribute__((ms_abi)) *CreateRenderViewFn)(
+        void *, void *, const void *, uint64_t);
+    uint8_t telemetry_rtv_descriptor[32] = {0};
+    uint64_t telemetry_rtv =
+        (uint64_t)(uintptr_t)telemetry_rtv_descriptor;
+    ((CreateRenderViewFn)vtable[20])(
+        output, copy_destination, NULL, telemetry_rtv);
+    ((SetRenderTargetsFn)list_vtable[46])(
+        command_list, 1, &telemetry_rtv, 1, NULL);
+    /* Slot 47 is ClearDepthStencilView. It is a seven-argument void method;
+     * routing it through a six-argument HRESULT fallback corrupts Win64 calls. */
+    typedef void (__attribute__((ms_abi)) *ClearDepthStencilFn)(
+        void *, uint64_t, uint32_t, float, uint8_t, uint32_t, const void *);
+    uint8_t depth_descriptor[32] = {0};
+    typedef void (__attribute__((ms_abi)) *CreateDepthViewFn)(
+        void *, void *, const void *, uint64_t);
+    ((CreateDepthViewFn)vtable[21])(
+        output, copy_destination, NULL, (uint64_t)(uintptr_t)depth_descriptor);
+    ((ClearDepthStencilFn)list_vtable[47])(
+        command_list, (uint64_t)(uintptr_t)depth_descriptor, 3, 1.0f, 0, 0,
+        NULL);
+    ((DrawInstancedFn)list_vtable[12])(command_list, 3, 2, 0, 0);
+    ((DrawIndexedInstancedFn)list_vtable[13])(
         command_list, 6, 1, 0, 0, 0);
+    /* Dynamic rings may be reused before queue submission. Recorded draws must
+     * own the exact vertex/index bytes visible when each draw was recorded. */
+    memset((uint8_t *)copy_source_data + 16, 0x22, test_vertex.size);
+    memset((uint8_t *)copy_destination_data + 32, 0x44, test_index.size);
+    /* CBVs are consumed when the command list executes, not when Draw is
+     * recorded. Reusing a mapped constant ring before submission must expose
+     * the latest bytes to graphics just as it does to compute. */
+    ((uint8_t *)copy_source_data)[0] = 0x7b;
     /* Zero-sized draws are legal no-ops and must not inflate telemetry. */
-    ((DrawInstancedFn)list_vtable[11])(command_list, 0, 1, 0, 0);
+    ((DrawInstancedFn)list_vtable[12])(command_list, 0, 1, 0, 0);
     typedef void (__attribute__((ms_abi)) *ExecuteListsFn)(
         void *, uint32_t, void *const *);
     if (((CloseFn)list_vtable[9])(command_list) != 0) return 27;
@@ -619,9 +1019,63 @@ int main(void)
         g_last_submission.dispatch_count != 1 ||
         g_last_submission.executed_dispatch_count != 1 ||
         g_last_submission.rejected_dispatch_count != 0 ||
+        g_last_submission.clear_depth_stencil_count != 1 ||
+        g_last_submission.copy_buffer_count != 1 ||
+        g_last_submission.copy_resource_count != 1 ||
+        memcmp((uint8_t *)copy_destination_data + 80,
+               expected_buffer_copy, sizeof(expected_buffer_copy)) != 0 ||
+        memcmp(copy_destination_data, copy_source_data, 16) != 0 ||
         g_last_submission.render_target_binding_count != 1 ||
         g_last_submission.draw_instanced_count != 1 ||
-        g_last_submission.draw_indexed_instanced_count != 1)
+        g_last_submission.draw_indexed_instanced_count != 1 ||
+        g_last_submission.executed_draw_count != 2 ||
+        g_last_submission.rejected_draw_count != 0 ||
+        g_graphics_count != 2 || !g_last_graphics.indexed ||
+        g_last_graphics.element_count != 6 ||
+        g_last_graphics.instance_count != 1 ||
+        g_last_graphics.root_signature != compute_root_signature ||
+        g_last_graphics.descriptor_heap_count != 2 ||
+        g_last_graphics.bindings[0].kind != 1 ||
+        g_last_graphics.bindings[0].descriptor_table != gpu_handle ||
+        g_last_graphics.render_target_count != 1 ||
+        g_last_graphics.render_targets[0] != copy_destination ||
+        !g_last_graphics.render_target_serial_location[0] ||
+        g_last_graphics.render_target_storage[0] != copy_destination_data ||
+        g_last_graphics.render_target_storage_size[0] != 65536 ||
+        g_last_graphics.render_target_width[0] != 256 ||
+        g_last_graphics.render_target_height[0] != 1 ||
+        g_last_graphics.bindings[1].kind != 2 ||
+        g_last_graphics.bindings[1].constants[0] != 0x44 ||
+        g_last_graphics.bindings[2].kind != 2 ||
+        g_last_graphics.bindings[2].constant_count != 4 ||
+        g_last_graphics.bindings[2].constants[1] != 0x11 ||
+        g_last_graphics.bindings[3].kind != 3 ||
+        g_last_graphics.bindings[3].resource_storage == NULL ||
+        g_last_graphics.bindings[3].resource_storage[0] != 0x7b ||
+        g_last_graphics.bindings[3].resource_storage ==
+            (uint8_t *)copy_source_data ||
+        g_last_graphics.bindings[4].kind != 4 ||
+        g_last_graphics.bindings[5].kind != 5 ||
+        g_last_graphics.primitive_topology != 4 ||
+        g_last_graphics.vertex_buffer_mask != 1 ||
+        g_last_graphics.vertex_buffers[0].address != test_vertex.address ||
+        !g_last_graphics.vertex_buffer_storage[0] ||
+        g_last_graphics.vertex_buffer_storage[0] ==
+            (uint8_t *)copy_source_data + 16 ||
+        g_last_graphics.vertex_buffer_storage_size[0] != test_vertex.size ||
+        g_last_graphics.vertex_buffer_storage[0][0] != 0x91 ||
+        g_last_graphics.vertex_buffer_resources[0] != copy_source ||
+        g_last_graphics.index_buffer.address != test_index.address ||
+        !g_last_graphics.index_buffer_storage ||
+        g_last_graphics.index_buffer_storage ==
+            (uint8_t *)copy_destination_data + 32 ||
+        g_last_graphics.index_buffer_storage[0] != 0x53 ||
+        g_last_graphics.index_buffer_storage_size != test_index.size ||
+        g_last_graphics.index_buffer_resource != copy_destination ||
+        memcmp(g_last_graphics.viewport, test_viewport,
+               sizeof(test_viewport)) != 0 ||
+        memcmp(g_last_graphics.scissor, test_scissor,
+               sizeof(test_scissor)) != 0)
         return 27;
     if (g_compute_count != 1 || g_last_compute.group_count_x != 8 ||
         g_last_compute.group_count_y != 4 || g_last_compute.group_count_z != 1 ||
@@ -648,9 +1102,173 @@ int main(void)
         g_last_compute.bindings[6].kind != 4 ||
         g_last_compute.bindings[7].kind != 5)
         return 27;
+    if (beer_d3d12_snapshot_bytes() == 0)
+        return 27;
     if (((ResetListFn)list_vtable[10])(
             command_list, allocator, compute_pipeline_state) != 0)
         return 27;
+    if (beer_d3d12_snapshot_bytes() != 0 ||
+        beer_d3d12_snapshot_peak_bytes() == 0 ||
+        beer_d3d12_snapshot_peak_bytes() > (size_t)256 * 1024 * 1024)
+        return 27;
+
+    /* A default-heap VB/IB produced by earlier CopyBufferRegion commands must
+     * expose the copied bytes to the later draw, not the destination's stale
+     * command-recording-time contents. This reproduces RE8's GUI upload path. */
+    uint32_t default_heap_properties[5] = {1, 0, 0, 0, 0};
+    void *ordered_destination = NULL;
+    if (((CreateCommittedResourceFn)vtable[27])(
+            output, default_heap_properties, 0, &buffer_desc, 1, NULL,
+            iid_resource, &ordered_destination) != 0 || !ordered_destination)
+        return 91;
+    void **ordered_destination_vtable = *(void ***)ordered_destination;
+    g_ordered_buffer_copy_resource = ordered_destination;
+    memcpy((uint8_t *)copy_source_data + 128, g_ordered_vertex_bytes,
+           sizeof(g_ordered_vertex_bytes));
+    memcpy((uint8_t *)copy_source_data + 160, g_ordered_index_bytes,
+           sizeof(g_ordered_index_bytes));
+    ((CopyBufferFn)list_vtable[15])(
+        command_list, ordered_destination, 0, copy_source, 128,
+        sizeof(g_ordered_vertex_bytes));
+    ((CopyBufferFn)list_vtable[15])(
+        command_list, ordered_destination, 64, copy_source, 160,
+        sizeof(g_ordered_index_bytes));
+    memset((uint8_t *)copy_source_data + 128, 0xcc,
+           sizeof(g_ordered_vertex_bytes));
+    memset((uint8_t *)copy_source_data + 160, 0xdd,
+           sizeof(g_ordered_index_bytes));
+    uint64_t ordered_address =
+        ((GetGpuAddressFn)ordered_destination_vtable[11])(ordered_destination);
+    BeerD3D12BufferView ordered_vertex = {ordered_address, 16, 16};
+    BeerD3D12BufferView ordered_index = {ordered_address + 64, 6, 57};
+    ((SetVertexBuffersFn)list_vtable[44])(
+        command_list, 0, 1, &ordered_vertex);
+    ((SetIndexBufferFn)list_vtable[43])(command_list, &ordered_index);
+    ((DrawIndexedInstancedFn)list_vtable[13])(
+        command_list, 3, 1, 0, 0, 0);
+    if (((CloseFn)list_vtable[9])(command_list) != 0) return 92;
+    void *ordered_lists[1] = {command_list};
+    ((ExecuteListsFn)queue_vtable[10])(queue, 1, ordered_lists);
+    if (g_ordered_buffer_copy_draw_seen != 1) return 93;
+    /* The recorded draw retains the default-heap resource until Reset. */
+    if (((ReleaseFn)ordered_destination_vtable[2])(ordered_destination) == 0)
+        return 94;
+    if (((ResetListFn)list_vtable[10])(
+            command_list, allocator, compute_pipeline_state) != 0)
+        return 95;
+    g_ordered_buffer_copy_resource = NULL;
+
+    /* Legacy and stream PSOs must expose decoded blend, rasterizer, depth and
+     * render-target state to graphics executors. */
+    {
+        uint8_t legacy_state[656];
+        memset(legacy_state, 0, sizeof(legacy_state));
+        uint32_t *words = (uint32_t *)legacy_state;
+        words[120 / 4 + 2] = 1;            /* RT0 BlendEnable */
+        words[120 / 4 + 4] = 5;            /* SrcBlend SRC_ALPHA */
+        words[120 / 4 + 5] = 6;            /* DestBlend INV_SRC_ALPHA */
+        words[120 / 4 + 6] = 1;            /* BlendOp ADD */
+        words[120 / 4 + 7] = 2;            /* SrcBlendAlpha ONE */
+        words[120 / 4 + 8] = 1;            /* DestBlendAlpha ZERO */
+        words[120 / 4 + 9] = 1;            /* BlendOpAlpha ADD */
+        legacy_state[120 + 8 + 36] = 0x7;  /* RT0 write mask RGB */
+        words[448 / 4] = UINT32_MAX;       /* SampleMask */
+        words[568 / 4] = 1;                /* IBStripCutValue 0xffff */
+        words[452 / 4] = 3;                /* FillMode SOLID */
+        words[452 / 4 + 1] = 1;            /* CullMode NONE */
+        words[576 / 4] = 1;                /* NumRenderTargets */
+        words[580 / 4] = 10;               /* RTV[0] R16G16B16A16_FLOAT */
+        words[616 / 4] = 1;                /* SampleDesc.Count */
+        void *legacy_pso = NULL;
+        if (((CreateLegacyPipelineStateFn)vtable[10])(
+                output, legacy_state, iid_pipeline_state, &legacy_pso) != 0 ||
+            !legacy_pso)
+            return 28;
+        ((SetPipelineStateFn)list_vtable[25])(command_list, legacy_pso);
+        ((DrawInstancedFn)list_vtable[12])(command_list, 3, 1, 0, 0);
+        if (((CloseFn)list_vtable[9])(command_list) != 0) return 28;
+        void *state_lists[1] = {command_list};
+        uint32_t before = g_graphics_count;
+        ((ExecuteListsFn)queue_vtable[10])(queue, 1, state_lists);
+        const BeerD3D12PipelineStateInfo *state = &g_last_graphics.pso;
+        if (g_graphics_count != before + 1 || !state->valid ||
+            !state->render_target[0].blend_enable ||
+            state->render_target[0].src_blend != 5 ||
+            state->render_target[0].dest_blend != 6 ||
+            state->render_target[0].src_blend_alpha != 2 ||
+            state->render_target[0].write_mask != 0x7 ||
+            state->sample_mask != UINT32_MAX ||
+            state->index_buffer_strip_cut_value != 1 ||
+            state->fill_mode != 3 ||
+            state->cull_mode != 1 || state->render_target_format_count != 1 ||
+            state->render_target_formats[0] != 10 || state->sample_count != 1)
+            return 28;
+        ((ReleaseFn)(*(void ***)legacy_pso)[2])(legacy_pso);
+
+        /* Stream PSO records use an aligned type/payload layout. Keep strip-cut
+         * (type 13) distinct from primitive-topology type (14): confusing these
+         * disables primitive restart and turns a cut index into real geometry. */
+        uint8_t stream[336 + 48 + 56 + 8 + 8];
+        memset(stream, 0, sizeof(stream));
+        size_t at = 0;
+        uint32_t type = 8;
+        memcpy(stream + at, &type, 4);
+        uint32_t *blend = (uint32_t *)(stream + at + 4);
+        blend[2] = 1; blend[4] = 2; blend[5] = 2; blend[6] = 1;
+        blend[7] = 2; blend[8] = 2; blend[9] = 1;
+        ((uint8_t *)blend)[8 + 36] = 0xf;
+        at += 336;
+        type = 10;
+        memcpy(stream + at, &type, 4);
+        uint32_t *raster = (uint32_t *)(stream + at + 4);
+        raster[0] = 3; raster[1] = 3; raster[2] = 1;
+        at += 48;
+        type = 11;
+        memcpy(stream + at, &type, 4);
+        uint32_t *depth = (uint32_t *)(stream + at + 4);
+        depth[0] = 1; depth[1] = 1; depth[2] = 2;
+        at += 56;
+        type = 13;
+        memcpy(stream + at, &type, 4);
+        uint32_t strip_cut = 1; /* D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF */
+        memcpy(stream + at + 4, &strip_cut, 4);
+        at += 8;
+        type = 14;
+        memcpy(stream + at, &type, 4);
+        uint32_t topology_type = 3; /* D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE */
+        memcpy(stream + at + 4, &topology_type, 4);
+        PipelineStreamDesc stream_desc = {.size = sizeof(stream),
+                                          .stream = stream};
+        void *stream_pso = NULL;
+        void *device2_state = NULL;
+        if (((QueryInterfaceFn)vtable[0])(output, iid_device2,
+                                          &device2_state) != 0 ||
+            ((CreatePipelineStateFn)(*(void ***)device2_state)[47])(
+                device2_state, &stream_desc, iid_pipeline_state,
+                &stream_pso) != 0 || !stream_pso)
+            return 29;
+        ((ReleaseFn)(*(void ***)device2_state)[2])(device2_state);
+        if (((ResetListFn)list_vtable[10])(command_list, allocator,
+                                           stream_pso) != 0)
+            return 29;
+        ((DrawInstancedFn)list_vtable[12])(command_list, 3, 1, 0, 0);
+        if (((CloseFn)list_vtable[9])(command_list) != 0) return 29;
+        before = g_graphics_count;
+        ((ExecuteListsFn)queue_vtable[10])(queue, 1, state_lists);
+        state = &g_last_graphics.pso;
+        if (g_graphics_count != before + 1 || !state->valid ||
+            !state->render_target[0].blend_enable ||
+            state->render_target[0].src_blend != 2 ||
+            state->render_target[0].write_mask != 0xf ||
+            state->index_buffer_strip_cut_value != 1 ||
+            state->cull_mode != 3 || !state->front_counter_clockwise ||
+            !state->depth_enable || state->depth_func != 2)
+            return 29;
+        ((ReleaseFn)(*(void ***)stream_pso)[2])(stream_pso);
+        if (((ResetListFn)list_vtable[10])(
+                command_list, allocator, compute_pipeline_state) != 0)
+            return 29;
+    }
 
     query_desc[1] = 2;
     query_heap = NULL;
@@ -666,6 +1284,199 @@ int main(void)
     if (!resolved_query) return 27;
     void **resolved_query_vtable = *(void ***)query_heap;
     ((ReleaseFn)resolved_query_vtable[2])(query_heap);
+
+    /* ClearUnorderedAccessViewUint and DiscardResource are void command-list
+     * operations. RE8 reaches both immediately after frame pacing starts. */
+    typedef void (__attribute__((ms_abi)) *ClearUavUintFn)(
+        void *, uint64_t, uint64_t, void *, const uint32_t *, uint32_t,
+        const void *);
+    typedef void (__attribute__((ms_abi)) *DiscardResourceFn)(
+        void *, void *, const void *);
+    const uint32_t uav_values[4] = {
+        UINT32_C(0x11223344), UINT32_C(0x55667788),
+        UINT32_C(0x99aabbcc), UINT32_C(0xddeeff00)
+    };
+    ((ClearUavUintFn)list_vtable[49])(
+        command_list, 0, 0, copy_destination, uav_values, 0, NULL);
+    if (memcmp(copy_destination_data, uav_values, sizeof(uav_values)) != 0 ||
+        memcmp((uint8_t *)copy_destination_data + sizeof(uav_values),
+               uav_values, sizeof(uav_values)) != 0)
+        return 27;
+    ((DiscardResourceFn)list_vtable[51])(
+        command_list, copy_destination, NULL);
+    /* Discard preserves allocation/lifetime and leaves contents undefined;
+     * Beer's compatibility model intentionally retains the existing bytes. */
+    if (memcmp(copy_destination_data, uav_values, sizeof(uav_values)) != 0)
+        return 27;
+
+    /* RE8 uploads textures with CopyTextureRegion from a placed upload-buffer
+     * footprint into a texture subresource. The copy must execute in command
+     * order, strip the upload row padding, and preserve compressed blocks. */
+    typedef struct TestTextureCopyLocation {
+        void *resource;
+        uint32_t type;
+        uint32_t padding;
+        union {
+            struct {
+                uint64_t offset;
+                uint32_t format, width, height, depth, row_pitch;
+            } footprint;
+            uint32_t subresource;
+        } value;
+    } TestTextureCopyLocation;
+    typedef void (__attribute__((ms_abi)) *CopyTextureFn)(
+        void *, const TestTextureCopyLocation *, uint32_t, uint32_t, uint32_t,
+        const TestTextureCopyLocation *, const void *);
+    ResourceDesc upload_texture_desc = {0};
+    upload_texture_desc.dimension = 3;
+    upload_texture_desc.width = 4;
+    upload_texture_desc.height = 3;
+    upload_texture_desc.depth_or_array_size = 1;
+    upload_texture_desc.mip_levels = 1;
+    upload_texture_desc.format = 28;
+    upload_texture_desc.sample_count = 1;
+    void *upload_texture = NULL;
+    if (((CreateCommittedResourceFn)vtable[27])(
+            output, heap_properties, 0, &upload_texture_desc, 4, NULL,
+            iid_resource, &upload_texture) != 0 || !upload_texture)
+        return 37;
+    void **upload_texture_vtable = *(void ***)upload_texture;
+    memset(copy_destination_data, 0, 64);
+    memset(copy_source_data, 0, 2048);
+    for (uint32_t row = 0; row < 3; ++row)
+        for (uint32_t column = 0; column < 4; ++column) {
+            uint8_t *pixel = (uint8_t *)copy_source_data + 512 + row * 256 +
+                column * 4;
+            pixel[0] = (uint8_t)(0x10 + row);
+            pixel[1] = (uint8_t)(0x20 + column);
+            pixel[2] = 0x30;
+            pixel[3] = 0xff;
+        }
+    TestTextureCopyLocation rgba_destination = {
+        .resource = upload_texture, .type = 0, .value.subresource = 0
+    };
+    TestTextureCopyLocation rgba_source = {
+        .resource = copy_source, .type = 1,
+        .value.footprint = {512, 28, 4, 3, 1, 256}
+    };
+    uint32_t rgba_box[6] = {1, 1, 0, 4, 3, 1};
+    if (((ResetListFn)list_vtable[10])(
+            command_list, allocator, compute_pipeline_state) != 0)
+        return 37;
+    ((CopyTextureFn)list_vtable[16])(
+        command_list, &rgba_destination, 0, 0, 0, &rgba_source, rgba_box);
+    /* Upload-ring reuse after recording must not alter the recorded payload. */
+    memset((uint8_t *)copy_source_data + 512, 0xee, 768);
+    if (((CloseFn)list_vtable[9])(command_list) != 0) return 37;
+    ((ExecuteListsFn)queue_vtable[10])(queue, 1, compute_lists);
+    if (((ResetListFn)list_vtable[10])(
+            command_list, allocator, compute_pipeline_state) != 0)
+        return 37;
+    ((CopyResourceFn)list_vtable[17])(
+        command_list, copy_destination, upload_texture);
+    if (((CloseFn)list_vtable[9])(command_list) != 0) return 37;
+    ((ExecuteListsFn)queue_vtable[10])(queue, 1, compute_lists);
+    for (uint32_t row = 0; row < 2; ++row)
+        for (uint32_t column = 0; column < 3; ++column) {
+            const uint8_t *pixel = (const uint8_t *)copy_destination_data +
+                row * 16 + column * 4;
+            if (pixel[0] != 0x11 + row || pixel[1] != 0x21 + column ||
+                pixel[2] != 0x30 || pixel[3] != 0xff)
+                return 37;
+        }
+    if (g_last_submission.copy_resource_count != 1) return 37;
+    ((ReleaseFn)upload_texture_vtable[2])(upload_texture);
+
+    ResourceDesc bc_texture_desc = upload_texture_desc;
+    bc_texture_desc.width = 8;
+    bc_texture_desc.height = 8;
+    bc_texture_desc.format = 98; /* BC7_UNORM */
+    void *bc_texture = NULL;
+    if (((CreateCommittedResourceFn)vtable[27])(
+            output, heap_properties, 0, &bc_texture_desc, 4, NULL,
+            iid_resource, &bc_texture) != 0 || !bc_texture)
+        return 37;
+    void **bc_texture_vtable = *(void ***)bc_texture;
+    memset(copy_destination_data, 0, 64);
+    memset(copy_source_data, 0, 2048);
+    for (uint32_t block_row = 0; block_row < 2; ++block_row)
+        for (uint32_t byte = 0; byte < 32; ++byte)
+            ((uint8_t *)copy_source_data)[1024 + block_row * 256 + byte] =
+                (uint8_t)(1 + block_row * 32 + byte);
+    TestTextureCopyLocation bc_destination = {
+        .resource = bc_texture, .type = 0, .value.subresource = 0
+    };
+    TestTextureCopyLocation bc_source = {
+        .resource = copy_source, .type = 1,
+        .value.footprint = {1024, 98, 8, 8, 1, 256}
+    };
+    if (((ResetListFn)list_vtable[10])(
+            command_list, allocator, compute_pipeline_state) != 0)
+        return 37;
+    ((CopyTextureFn)list_vtable[16])(
+        command_list, &bc_destination, 0, 0, 0, &bc_source, NULL);
+    if (((CloseFn)list_vtable[9])(command_list) != 0) return 37;
+    ((ExecuteListsFn)queue_vtable[10])(queue, 1, compute_lists);
+    if (((ResetListFn)list_vtable[10])(
+            command_list, allocator, compute_pipeline_state) != 0)
+        return 37;
+    ((CopyResourceFn)list_vtable[17])(
+        command_list, copy_destination, bc_texture);
+    if (((CloseFn)list_vtable[9])(command_list) != 0) return 37;
+    ((ExecuteListsFn)queue_vtable[10])(queue, 1, compute_lists);
+    for (uint32_t byte = 0; byte < 64; ++byte)
+        if (((uint8_t *)copy_destination_data)[byte] != byte + 1)
+            return 37;
+    ((ReleaseFn)bc_texture_vtable[2])(bc_texture);
+    if (((ResetListFn)list_vtable[10])(
+            command_list, allocator, compute_pipeline_state) != 0)
+        return 37;
+
+    /* Small committed lookup volumes use ID3D12Resource::WriteToSubresource
+     * rather than a copy command list. Preserve row/depth pitch and partial
+     * boxes, then verify the symmetric ReadFromSubresource path. */
+    ResourceDesc write_volume_desc = upload_texture_desc;
+    write_volume_desc.dimension = 4;
+    write_volume_desc.width = 4;
+    write_volume_desc.height = 3;
+    write_volume_desc.depth_or_array_size = 2;
+    void *volume = NULL;
+    if (((CreateCommittedResourceFn)vtable[27])(
+            output, heap_properties, 0, &write_volume_desc, 4, NULL,
+            iid_resource, &volume) != 0 || !volume)
+        return 38;
+    void **volume_vtable = *(void ***)volume;
+    typedef uint64_t (__attribute__((ms_abi)) *WriteSubresourceFn)(
+        void *, uint32_t, const void *, const void *, uint32_t, uint32_t);
+    typedef uint64_t (__attribute__((ms_abi)) *ReadSubresourceFn)(
+        void *, void *, uint32_t, uint32_t, uint32_t, const void *);
+    uint8_t volume_source[2 * 64] = {0};
+    uint8_t volume_readback[2 * 80];
+    memset(volume_readback, 0xcc, sizeof(volume_readback));
+    for (uint32_t z = 0; z < 2; ++z)
+        for (uint32_t y = 0; y < 3; ++y)
+            for (uint32_t x = 0; x < 4; ++x) {
+                uint8_t *pixel = volume_source + z * 64 + y * 20 + x * 4;
+                pixel[0] = (uint8_t)(0x10 + z);
+                pixel[1] = (uint8_t)(0x20 + y);
+                pixel[2] = (uint8_t)(0x30 + x);
+                pixel[3] = 0xff;
+            }
+    if (((WriteSubresourceFn)volume_vtable[14])(
+            volume, 0, NULL, volume_source, 20, 64) != 0)
+        return 38;
+    if (((ReadSubresourceFn)volume_vtable[13])(
+            volume, volume_readback, 24, 80, 0, NULL) != 0)
+        return 38;
+    for (uint32_t z = 0; z < 2; ++z)
+        for (uint32_t y = 0; y < 3; ++y)
+            for (uint32_t x = 0; x < 4; ++x) {
+                const uint8_t *pixel = volume_readback + z * 80 + y * 24 + x * 4;
+                if (pixel[0] != 0x10 + z || pixel[1] != 0x20 + y ||
+                    pixel[2] != 0x30 + x || pixel[3] != 0xff)
+                    return 38;
+            }
+    ((ReleaseFn)volume_vtable[2])(volume);
 
     ((ReleaseFn)copy_source_vtable[2])(copy_source);
     ((ReleaseFn)copy_destination_vtable[2])(copy_destination);
@@ -692,7 +1503,15 @@ int main(void)
     if (((DownlevelPresentFn)downlevel_vtable[3])(
             downlevel_queue, command_list, present_resource, 1, 0) != 0 ||
         g_present_count != 1 || g_present_resource != present_resource ||
-        g_present_width != 4 || g_present_height != 2 || g_present_pitch != 16)
+        g_present_serial != 0 || g_present_width != 4 ||
+        g_present_height != 2 || g_present_pitch != 16)
+        return 28;
+    /* Present only consumes the resource. Repeated presents without an
+     * intervening write must retain the exact content serial so a renderer
+     * mirror produced at that serial remains discoverable. */
+    if (((DownlevelPresentFn)downlevel_vtable[3])(
+            downlevel_queue, command_list, present_resource, 1, 0) != 0 ||
+        g_present_count != 2 || g_present_serial != 0)
         return 28;
     void **present_resource_vtable = *(void ***)present_resource;
     ((ReleaseFn)present_resource_vtable[2])(present_resource);
@@ -714,7 +1533,9 @@ int main(void)
         return 28;
 
     /* ClearRenderTargetView must resolve the opaque RTV descriptor, honor
-     * rectangle bounds, and preserve native RGBA/BGRA channel ordering. */
+     * rectangle bounds, preserve native RGBA/BGRA channel ordering, and defer
+     * all mutation until queue submission so later recorded clears cannot erase
+     * earlier recorded draws. */
     ResourceDesc clear_desc = {0};
     clear_desc.dimension = 3;
     clear_desc.width = 4;
@@ -740,23 +1561,115 @@ int main(void)
     ((ClearRenderTargetFn)list_vtable[48])(
         command_list, (uint64_t)(uintptr_t)clear_descriptor,
         clear_color, 1, &clear_rect);
-    if (g_clear_count != 0) return 28;
-    /* Full-target clears take the registered Vulkan/backend path. */
+    /* A second recorded clear must not mutate the target or invoke the backend
+     * until queue submission. */
     ((ClearRenderTargetFn)list_vtable[48])(
         command_list, (uint64_t)(uintptr_t)clear_descriptor,
         clear_color, 0, NULL);
-    if (g_clear_count != 1) return 28;
+    if (g_clear_count != 0) return 28;
+    if (((CloseFn)list_vtable[9])(command_list) != 0) return 28;
+    void *clear_lists[1] = {command_list};
+    ((ExecuteListsFn)queue_vtable[10])(queue, 1, clear_lists);
+    if (g_clear_count != 1 ||
+        g_last_submission.clear_render_target_count != 2)
+        return 28;
     void **clear_resource_vtable = *(void ***)clear_resource;
     const uint8_t expected_clear[4] = {64, 128, 255, 255};
-    /* Present the cleared texture before release to prove the command-list
-     * operation reaches the application-owned downlevel back buffer. */
+    /* Present the cleared texture after execution to prove the ordered command
+     * reaches the application-owned downlevel back buffer. */
     if (((DownlevelPresentFn)downlevel_vtable[3])(
             downlevel_queue, command_list, clear_resource, 1, 0) != 0 ||
-        g_present_count != 2 ||
+        g_present_count != 3 || g_present_serial == 0 ||
         memcmp(g_present_pixels, expected_clear, 4) != 0 ||
         memcmp(g_present_pixels + (1 * 4 + 1) * 4, expected_clear, 4) != 0)
         return 28;
     ((ReleaseFn)clear_resource_vtable[2])(clear_resource);
+    /* Reusing descriptor storage after the referenced resource dies must not
+     * let clear/OM operations dereference stale descriptor bytes. */
+    ((ClearRenderTargetFn)list_vtable[48])(
+        command_list, (uint64_t)(uintptr_t)clear_descriptor,
+        clear_color, 0, NULL);
+    if (((ResetListFn)list_vtable[10])(
+            command_list, allocator, compute_pipeline_state) != 0)
+        return 28;
+
+    /* ClearDepthStencilView updates the authoritative CPU backing consumed by
+     * later Vulkan depth/stencil attachments. Verify full and rectangular
+     * clears preserve untouched texels and both packed aspects. */
+    ResourceDesc depth_desc = clear_desc;
+    depth_desc.width = 3;
+    depth_desc.height = 2;
+    depth_desc.format = 20; /* D32_FLOAT_S8X24_UINT */
+    void *depth_resource = NULL;
+    if (((CreateCommittedResourceFn)vtable[27])(
+            output, heap_properties, 0, &depth_desc, 4, NULL,
+            iid_resource, &depth_resource) != 0 || !depth_resource)
+        return 29;
+    void **depth_resource_vtable = *(void ***)depth_resource;
+    uint8_t packed_depth_descriptor[32] = {0};
+    ((CreateDepthViewFn)vtable[21])(
+        output, depth_resource, NULL,
+        (uint64_t)(uintptr_t)packed_depth_descriptor);
+    if (((ResetListFn)list_vtable[10])(
+            command_list, allocator, compute_pipeline_state) != 0)
+        return 29;
+    uint64_t packed_depth_handle =
+        (uint64_t)(uintptr_t)packed_depth_descriptor;
+    ((SetRenderTargetsFn)list_vtable[46])(
+        command_list, 0, NULL, 0, &packed_depth_handle);
+    g_depth_history_count = 0;
+    g_execution_order_count = 0;
+    g_compute_batch_begin_count = 0;
+    g_compute_batch_end_count = 0;
+    g_compute_ir_batch_count = 0;
+    g_compute_ir_operation_count = 0;
+    g_compute_ir_access_count = 0;
+    g_compute_ir_hazards = 0;
+    ((ClearDepthStencilFn)list_vtable[47])(
+        command_list, (uint64_t)(uintptr_t)packed_depth_descriptor,
+        3, 1.0f, 7, 0, NULL);
+    ((DrawInstancedFn)list_vtable[12])(command_list, 3, 1, 0, 0);
+    TestRect depth_rect = {1, 0, 3, 1};
+    ((ClearDepthStencilFn)list_vtable[47])(
+        command_list, (uint64_t)(uintptr_t)packed_depth_descriptor,
+        1, 0.25f, 99, 1, &depth_rect);
+    ((SetComputeRootFn)list_vtable[29])(command_list, compute_root_signature);
+    ((SetRootDescriptorFn)list_vtable[41])(
+        command_list, 7, test_index_address);
+    ((DispatchFn)list_vtable[14])(command_list, 1, 1, 1);
+    ((DrawInstancedFn)list_vtable[12])(command_list, 3, 1, 0, 0);
+    if (((CloseFn)list_vtable[9])(command_list) != 0) return 29;
+    void *depth_lists[1] = {command_list};
+    ((ExecuteListsFn)queue_vtable[10])(queue, 1, depth_lists);
+    if (g_depth_history_count != 2 ||
+        g_depth_history_sizes[0] < 48 || g_depth_history_sizes[1] < 48 ||
+        g_execution_order_count != 3 ||
+        memcmp(g_execution_order, "GCG", 3) != 0 ||
+        g_compute_batch_begin_count != 1 ||
+        g_compute_batch_end_count != 1 ||
+        g_compute_ir_batch_count != 1 ||
+        g_compute_ir_operation_count != 1 ||
+        g_compute_ir_hazards != 0)
+        return 29;
+    uint32_t depth_one = 0, depth_quarter = 0;
+    float one = 1.0f, quarter = 0.25f;
+    memcpy(&depth_one, &one, sizeof(depth_one));
+    memcpy(&depth_quarter, &quarter, sizeof(depth_quarter));
+    for (uint32_t texel = 0; texel < 6; ++texel) {
+        uint32_t first_actual = 0, second_actual = 0;
+        memcpy(&first_actual, g_depth_history[0] + texel * 8u,
+               sizeof(first_actual));
+        memcpy(&second_actual, g_depth_history[1] + texel * 8u,
+               sizeof(second_actual));
+        int inside = texel == 1 || texel == 2;
+        if (first_actual != depth_one ||
+            g_depth_history[0][texel * 8u + 4] != 7 ||
+            second_actual != (inside ? depth_quarter : depth_one) ||
+            g_depth_history[1][texel * 8u + 4] != 7)
+            return 29;
+    }
+    ((ReleaseFn)depth_resource_vtable[2])(depth_resource);
+
     memset(descriptor_storage, 0, sizeof(descriptor_storage));
     ((CreateResourceViewFn)vtable[21])(output, copy_destination,
                                       descriptor_data,
@@ -767,7 +1680,7 @@ int main(void)
     memset(descriptor_storage, 0, sizeof(descriptor_storage));
     ((CreateSamplerFn)vtable[22])(output, descriptor_data,
                                  (uint64_t)(uintptr_t)descriptor_storage);
-    if (memcmp(descriptor_storage, descriptor_data, 16) != 0)
+    if (memcmp(descriptor_storage, descriptor_data, 24) != 0)
         return 30;
 
     /* Descriptor copies must preserve opaque descriptor records, including
@@ -832,6 +1745,31 @@ int main(void)
         row_pitch != 256 || total_size != 2304)
         return 25;
 
+    /* A Texture3D has one subresource per mip, and each footprint covers all
+     * depth slices at that mip. TotalBytes must include every slice rather
+     * than only the first 2D plane. */
+    ResourceDesc volume_desc = texture_desc;
+    volume_desc.dimension = 4;
+    volume_desc.width = 8;
+    volume_desc.height = 4;
+    volume_desc.depth_or_array_size = 4;
+    volume_desc.mip_levels = 2;
+    memset(footprint, 0, sizeof(footprint));
+    row_count = 0;
+    row_size = 0;
+    total_size = 0;
+    ((GetFootprintsFn)vtable[38])(output, &volume_desc, 1, 1, 0,
+                                  footprint, &row_count, &row_size, &total_size);
+    uint32_t footprint_height = 0, footprint_depth = 0;
+    memcpy(&footprint_width, footprint + 12, sizeof(footprint_width));
+    memcpy(&footprint_height, footprint + 16, sizeof(footprint_height));
+    memcpy(&footprint_depth, footprint + 20, sizeof(footprint_depth));
+    memcpy(&row_pitch, footprint + 24, sizeof(row_pitch));
+    if (footprint_width != 4 || footprint_height != 2 ||
+        footprint_depth != 2 || row_count != 2 || row_size != 16 ||
+        row_pitch != 256 || total_size != 1024)
+        return 25;
+
     /* Command signatures must be independently owned pageable objects with
      * a retained device relationship and copied argument descriptors. */
     static const uint8_t iid_command_signature[16] = {
@@ -847,7 +1785,10 @@ int main(void)
     } CommandSignatureDesc;
     typedef uint64_t (__attribute__((ms_abi)) *CreateCommandSignatureFn)(
         void *, const CommandSignatureDesc *, void *, const uint8_t *, void **);
-    uint32_t indirect_arguments[4] = {2, 0, 3, 0};
+    uint32_t indirect_arguments[8] = {
+        2, 0, 0, 0,
+        3, 0, 0, 0,
+    };
     CommandSignatureDesc signature_desc = {
         .byte_stride = 20,
         .argument_count = 2,
@@ -868,6 +1809,131 @@ int main(void)
     ((ReleaseFn)vtable[2])(signature_device);
     if (((ReleaseFn)signature_vtable[2])(command_signature) != 0)
         return 33;
+
+    /* ExecuteIndirect must decode standard draw, indexed-draw, and dispatch
+     * records, honor byte strides/offsets, and clamp through a count buffer. */
+    typedef void (__attribute__((ms_abi)) *ExecuteIndirectFn)(
+        void *, void *, uint32_t, void *, uint64_t, void *, uint64_t);
+    /* D3D12_INDIRECT_ARGUMENT_TYPE uses 0=draw, 1=draw-indexed,
+     * 2=dispatch. Keep these values aligned with the public D3D12 ABI; the
+     * former 2/3/4 test values masked enum-decoding regressions. */
+    uint32_t draw_argument_desc[4] = {0, 0, 0, 0};
+    uint32_t indexed_argument_desc[4] = {1, 0, 0, 0};
+    uint32_t dispatch_argument_desc[4] = {2, 0, 0, 0};
+    CommandSignatureDesc draw_signature_desc = {
+        .byte_stride = 20, .argument_count = 1,
+        .arguments = draw_argument_desc, .node_mask = 0,
+    };
+    CommandSignatureDesc indexed_signature_desc = {
+        .byte_stride = 24, .argument_count = 1,
+        .arguments = indexed_argument_desc, .node_mask = 0,
+    };
+    CommandSignatureDesc dispatch_signature_desc = {
+        .byte_stride = 16, .argument_count = 1,
+        .arguments = dispatch_argument_desc, .node_mask = 0,
+    };
+    void *draw_signature = NULL;
+    void *indexed_signature = NULL;
+    void *dispatch_signature = NULL;
+    if (((CreateCommandSignatureFn)vtable[41])(
+            output, &draw_signature_desc, NULL, iid_command_signature,
+            &draw_signature) != 0 || !draw_signature ||
+        ((CreateCommandSignatureFn)vtable[41])(
+            output, &indexed_signature_desc, NULL, iid_command_signature,
+            &indexed_signature) != 0 || !indexed_signature ||
+        ((CreateCommandSignatureFn)vtable[41])(
+            output, &dispatch_signature_desc, NULL, iid_command_signature,
+            &dispatch_signature) != 0 || !dispatch_signature)
+        return 33;
+    if (((ResetListFn)list_vtable[10])(
+            command_list, allocator, compute_pipeline_state) != 0)
+        return 33;
+    buffer_desc.width = 1024;
+    void *indirect_buffer = NULL;
+    if (((CreateCommittedResourceFn)vtable[27])(
+            output, heap_properties, 0, &buffer_desc, 1, NULL,
+            iid_resource, &indirect_buffer) != 0 || !indirect_buffer)
+        return 33;
+    void **indirect_buffer_vtable = *(void ***)indirect_buffer;
+    void *indirect_data = NULL;
+    if (((MapFn)indirect_buffer_vtable[8])(
+            indirect_buffer, 0, NULL, &indirect_data) != 0 || !indirect_data)
+        return 33;
+    uint32_t indirect_draws[10] = {
+        3, 1, 4, 5, 0xcccccccc,
+        6, 2, 7, 8, 0xdddddddd,
+    };
+    uint32_t indirect_indexed[6] = {9, 3, 10, (uint32_t)-2, 11, 0};
+    uint32_t indirect_dispatch[4] = {12, 13, 14, 0};
+    uint32_t indirect_count = 2;
+    memcpy((uint8_t *)indirect_data + 512, indirect_draws,
+           sizeof(indirect_draws));
+    memcpy((uint8_t *)indirect_data + 640, indirect_indexed,
+           sizeof(indirect_indexed));
+    memset((uint8_t *)indirect_data + 704, 0, sizeof(indirect_dispatch));
+    memcpy((uint8_t *)copy_source_data + 256, indirect_dispatch,
+           sizeof(indirect_dispatch));
+    /* Indirect dispatch data is commonly produced by earlier GPU commands.
+     * It must be resolved in queue order, not expanded from stale bytes while
+     * ExecuteIndirect is being recorded. */
+    ((CopyBufferFn)list_vtable[15])(
+        command_list, indirect_buffer, 704, copy_source, 256,
+        sizeof(indirect_dispatch));
+    memset((uint8_t *)copy_source_data + 256, 0xee,
+           sizeof(indirect_dispatch));
+    memcpy((uint8_t *)indirect_data + 768, &indirect_count,
+           sizeof(indirect_count));
+    uint32_t graphics_before_indirect = g_graphics_count;
+    uint32_t compute_before_indirect = g_compute_count;
+    uint32_t source_sync_before_indirect = g_source_sync_count;
+    ((ExecuteIndirectFn)list_vtable[59])(
+        command_list, draw_signature, 4, indirect_buffer, 512,
+        indirect_buffer, 768);
+    ((ExecuteIndirectFn)list_vtable[59])(
+        command_list, indexed_signature, 1, indirect_buffer, 640, NULL, 0);
+    /* A second adjacent indexed expansion reuses the same VB/IB resources.
+     * Queue replay must publish each distinct geometry resource once per
+     * producer boundary, not once per ExecuteIndirect record. */
+    ((ExecuteIndirectFn)list_vtable[59])(
+        command_list, indexed_signature, 1, indirect_buffer, 640, NULL, 0);
+    ((ExecuteIndirectFn)list_vtable[59])(
+        command_list, dispatch_signature, 1, indirect_buffer, 704, NULL, 0);
+    if (((CloseFn)list_vtable[9])(command_list) != 0) return 33;
+    void *indirect_lists[1] = {command_list};
+    ((ExecuteListsFn)queue_vtable[10])(queue, 1, indirect_lists);
+    if (g_graphics_count != graphics_before_indirect + 4 ||
+        g_graphics_batch_count != 2 ||
+        g_compute_count != compute_before_indirect + 1 ||
+        !g_last_graphics.indexed || g_last_graphics.element_count != 9 ||
+        g_last_graphics.instance_count != 3 ||
+        g_last_graphics.start_element != 10 ||
+        g_last_graphics.base_vertex != -2 ||
+        g_last_graphics.start_instance != 11 ||
+        g_last_compute.group_count_x != 12 ||
+        g_last_compute.group_count_y != 13 ||
+        g_last_compute.group_count_z != 14 ||
+        g_graphics_defer_history[graphics_before_indirect] != 1 ||
+        g_graphics_defer_history[graphics_before_indirect + 1] != 0 ||
+        /* The two adjacent indexed records merge into one backend batch: the
+         * first retains GPU-authoritative targets and the final one publishes. */
+        g_graphics_defer_history[graphics_before_indirect + 2] != 1 ||
+        g_graphics_defer_history[graphics_before_indirect + 3] != 0 ||
+        /* Indexed indirect replay must synchronize its retained default-heap
+         * geometry as well as the GPU-generated argument/count buffers. */
+        g_source_sync_count <= source_sync_before_indirect)
+        return 33;
+    /* Adjacent records sharing argument/count/VB/IB state must synchronize
+     * each read-only source once without invoking destructive invalidation. */
+    for (uint32_t i = source_sync_before_indirect;
+         i < g_source_sync_count && i < 64; ++i)
+        for (uint32_t j = i + 1; j < g_source_sync_count && j < 64; ++j)
+            if (g_source_sync_history[i] == g_source_sync_history[j])
+                return 33;
+    ((ReleaseFn)(*(void ***)draw_signature)[2])(draw_signature);
+    ((ReleaseFn)(*(void ***)indexed_signature)[2])(indexed_signature);
+    ((ReleaseFn)(*(void ***)dispatch_signature)[2])(dispatch_signature);
+    ((ReleaseFn)indirect_buffer_vtable[2])(indirect_buffer);
+
     /* Root-signature serialization must return a real ID3DBlob and include
      * pointed-to descriptor state rather than only top-level pointer values.
      * D3D12_VERSIONED_ROOT_SIGNATURE_DESC is 48 bytes on Win64. */
@@ -891,6 +1957,44 @@ int main(void)
     if (!root_bytes || root_size < 24 ||
         memcmp(root_bytes, root_magic, sizeof(root_magic)) != 0)
         return 34;
+
+    /* Version 1.1 descriptor ranges place Flags at byte 16 and
+     * OffsetInDescriptorsFromTableStart at byte 20. Keep them distinct: using
+     * Flags as the table offset binds the wrong CBV/SRV while remaining ABI-
+     * valid, and can turn shader loop bounds into arbitrary resource data. */
+    uint8_t range_v11[24] = {0};
+    uint32_t range_type = 2, range_count = 1, range_register = 1;
+    uint32_t range_flags = 4, range_offset = 7;
+    memcpy(range_v11, &range_type, 4);
+    memcpy(range_v11 + 4, &range_count, 4);
+    memcpy(range_v11 + 8, &range_register, 4);
+    memcpy(range_v11 + 16, &range_flags, 4);
+    memcpy(range_v11 + 20, &range_offset, 4);
+    uint8_t parameter_v11[32] = {0};
+    memcpy(parameter_v11 + 8, &range_count, 4);
+    const void *range_pointer = range_v11;
+    memcpy(parameter_v11 + 16, &range_pointer, sizeof(range_pointer));
+    uint8_t root_desc_v11[48] = {0};
+    root_version = 2;
+    memcpy(root_desc_v11, &root_version, 4);
+    memcpy(root_desc_v11 + 8, &range_count, 4);
+    const void *parameter_pointer = parameter_v11;
+    memcpy(root_desc_v11 + 16, &parameter_pointer, sizeof(parameter_pointer));
+    void *serialized_v11 = NULL;
+    if (beer_d3d12_serialize_versioned_root_signature(
+            root_desc_v11, &serialized_v11, NULL) != 0 || !serialized_v11)
+        return 34;
+    void **v11_blob_vtable = *(void ***)serialized_v11;
+    const uint8_t *v11_bytes =
+        ((GetBufferPointerFn)v11_blob_vtable[3])(serialized_v11);
+    size_t v11_size = ((GetBufferSizeFn)v11_blob_vtable[4])(serialized_v11);
+    uint32_t serialized_flags = 0, serialized_offset = 0;
+    if (!v11_bytes || v11_size < 60) return 34;
+    memcpy(&serialized_flags, v11_bytes + 52, 4);
+    memcpy(&serialized_offset, v11_bytes + 56, 4);
+    if (serialized_flags != range_flags || serialized_offset != range_offset)
+        return 34;
+    ((ReleaseFn)v11_blob_vtable[2])(serialized_v11);
 
     uint8_t second_root_desc[48];
     memcpy(second_root_desc, versioned_root_desc, sizeof(second_root_desc));

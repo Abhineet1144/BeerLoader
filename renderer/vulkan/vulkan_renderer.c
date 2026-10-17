@@ -127,10 +127,14 @@ static uint64_t g_pending_writebacks;
 
 static int wait_for_pending_submission(void)
 {
+    if (beer_vulkan_device_lost()) return 0;
     if (!g_renderer.submission_pending) return 1;
-    if (g_renderer.WaitForFences(g_renderer.device, 1, &g_renderer.fence, VK_TRUE,
-                                 UINT64_MAX) != VK_SUCCESS)
+    VkResult result = g_renderer.WaitForFences(
+        g_renderer.device, 1, &g_renderer.fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        beer_vulkan_record_result(result, "compositor fence wait");
         return 0;
+    }
     g_renderer.submission_pending = 0;
     return 1;
 }
@@ -711,7 +715,10 @@ int vulkan_renderer_composite_rgba8(const void *source_resource,
     VkResult submit_result = g_renderer.QueueSubmit(
         g_renderer.queue, 1, &submit, g_renderer.fence);
     beer_vulkan_queue_unlock();
-    if (submit_result != VK_SUCCESS) goto done;
+    if (submit_result != VK_SUCCESS) {
+        beer_vulkan_record_result(submit_result, "compositor queue submission");
+        goto done;
+    }
     g_renderer.submission_pending = 1;
     output_mirror->serial = target_serial;
     output_mirror->content_valid = 1;

@@ -44,6 +44,42 @@ static inline uint16_t beer_win32_get_key_state(const uint8_t keys[256],
     return (keys[virtual_key] & 0x80u) ? 0x8000u : 0u;
 }
 
+static inline int beer_dinput_can_acquire(int focused,
+                                          uint32_t cooperative_flags)
+{
+    /* DISCL_FOREGROUND devices are unavailable while their window is not the
+     * foreground window. DISCL_BACKGROUND devices remain available. */
+    const uint32_t DISCL_BACKGROUND = 0x00000008u;
+    return focused || (cooperative_flags & DISCL_BACKGROUND) != 0;
+}
+
+/* TranslateMessage posts WM_CHAR only for key-down messages. This deliberately
+ * covers the layout-independent control keys and the common US-ASCII range;
+ * WM_KEYDOWN remains available to applications that use physical controls. */
+static inline uint32_t beer_win32_key_message_character(uint32_t message,
+                                                         uint32_t virtual_key,
+                                                         int shift,
+                                                         int caps_lock)
+{
+    if (message != 0x0100u && message != 0x0104u)
+        return 0;
+    switch (virtual_key) {
+    case 0x08u: return '\b';
+    case 0x09u: return '\t';
+    case 0x0du: return '\r';
+    case 0x1bu: return 0x1bu;
+    case 0x20u: return ' ';
+    default: break;
+    }
+    if (virtual_key >= 'A' && virtual_key <= 'Z') {
+        int uppercase = !!shift ^ !!caps_lock;
+        return uppercase ? virtual_key : virtual_key + ('a' - 'A');
+    }
+    if (virtual_key >= '0' && virtual_key <= '9' && !shift)
+        return virtual_key;
+    return 0;
+}
+
 static inline int beer_win32_message_is_coalescible_motion(uint32_t message)
 {
     return message == 0x0200u; /* WM_MOUSEMOVE */
@@ -59,6 +95,22 @@ static inline uint64_t beer_win32_message_hwnd(int is_thread_message,
     return (is_thread_message || message == 0x0012u) ? 0 : window_handle;
 }
 
+static inline void beer_win32_pointer_motion_delta(int position_valid,
+                                                    int32_t previous_x,
+                                                    int32_t previous_y,
+                                                    int32_t current_x,
+                                                    int32_t current_y,
+                                                    int32_t *delta_x,
+                                                    int32_t *delta_y)
+{
+    if (!delta_x || !delta_y)
+        return;
+    /* The first absolute event establishes the pointer origin. Treating it as
+     * relative motion from zero permanently offsets software cursors. */
+    *delta_x = position_valid ? current_x - previous_x : 0;
+    *delta_y = position_valid ? current_y - previous_y : 0;
+}
+
 static inline int beer_win32_message_is_button_transition(uint32_t message)
 {
     switch (message) {
@@ -69,6 +121,73 @@ static inline int beer_win32_message_is_button_transition(uint32_t message)
     default:
         return 0;
     }
+}
+
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+    uint64_t device;
+    uint64_t parameter;
+} BeerRawInputHeader;
+
+typedef struct {
+    uint16_t make_code;
+    uint16_t flags;
+    uint16_t reserved;
+    uint16_t virtual_key;
+    uint32_t message;
+    uint32_t extra_information;
+} BeerRawKeyboard;
+
+typedef struct {
+    uint16_t flags;
+    uint16_t padding;
+    /* RAWMOUSE's ulButtons union is ULONG-aligned. The button halves begin at
+     * offsets 4 and 6, not immediately after usFlags. */
+    uint16_t button_flags;
+    uint16_t button_data;
+    uint32_t raw_buttons;
+    int32_t last_x;
+    int32_t last_y;
+    uint32_t extra_information;
+} BeerRawMouse;
+
+typedef struct {
+    BeerRawInputHeader header;
+    union {
+        BeerRawMouse mouse;
+        BeerRawKeyboard keyboard;
+    } data;
+} BeerRawInput;
+
+static inline BeerRawInput beer_raw_keyboard_input(uint32_t virtual_key,
+                                                    uint32_t scan_code,
+                                                    int down)
+{
+    BeerRawInput input = {0};
+    input.header.type = 1; /* RIM_TYPEKEYBOARD */
+    input.header.size = sizeof(BeerRawInputHeader) + sizeof(BeerRawKeyboard);
+    input.header.device = 2;
+    input.data.keyboard.make_code = (uint16_t)scan_code;
+    input.data.keyboard.flags = down ? 0 : 1; /* RI_KEY_BREAK */
+    input.data.keyboard.virtual_key = (uint16_t)virtual_key;
+    input.data.keyboard.message = down ? 0x0100u : 0x0101u;
+    return input;
+}
+
+static inline BeerRawInput beer_raw_mouse_input(int32_t dx, int32_t dy,
+                                                 uint16_t button_flags,
+                                                 uint16_t button_data)
+{
+    BeerRawInput input = {0};
+    input.header.type = 0; /* RIM_TYPEMOUSE */
+    input.header.size = sizeof(BeerRawInputHeader) + sizeof(BeerRawMouse);
+    input.header.device = 1;
+    input.data.mouse.button_flags = button_flags;
+    input.data.mouse.button_data = button_data;
+    input.data.mouse.last_x = dx;
+    input.data.mouse.last_y = dy;
+    return input;
 }
 
 #endif

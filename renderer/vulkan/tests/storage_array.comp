@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x = 4, local_size_y = 4) in;
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2DArray target_image;
+layout(set = 0, binding = 1) uniform texture2DArray source_texture;
+layout(set = 0, binding = 2) uniform sampler source_sampler;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    for (int layer = 0; layer < 2; ++layer) {
+        vec3 uv = vec3((vec2(p) + 0.5) / 4.0, float(layer));
+        vec4 c = textureLod(sampler2DArray(source_texture, source_sampler), uv, 0.0);
+        imageStore(target_image, ivec3(p, layer), c.bgra);
+    }
+}

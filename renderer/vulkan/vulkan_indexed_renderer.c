@@ -257,11 +257,15 @@ static int find_memory_type(uint32_t bits, uint32_t *index)
 
 static int wait_for_submission(SubmissionSlot *slot)
 {
+    if (beer_vulkan_device_lost()) return 0;
     if (!slot || !slot->pending) return 1;
-    if (!g_indexed.device || !slot->fence ||
-        g_indexed.WaitForFences(g_indexed.device, 1, &slot->fence,
-                                VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+    if (!g_indexed.device || !slot->fence) return 0;
+    VkResult result = g_indexed.WaitForFences(
+        g_indexed.device, 1, &slot->fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        beer_vulkan_record_result(result, "indexed-renderer fence wait");
         return 0;
+    }
     slot->pending = 0;
     return 1;
 }
@@ -577,7 +581,10 @@ static TargetMirror *acquire_target_mirror(const BeerVulkanIndexedDraw *draw)
         /* The submission ring may still reference this persistent mirror.
          * Drain it before writeback, destruction, or reassignment. */
         if (!wait_for_pending_submission()) return NULL;
-        writeback_target_mirror(candidate);
+        /* Only writeback if we're keeping the same size. If resizing, the old
+         * buffer is discarded, so no need to copy from the GPU. */
+        if (candidate->capacity == draw->target_bytes && candidate->resource == draw->target_resource)
+            writeback_target_mirror(candidate);
         /* Reassigning or resizing a slot discards whatever the device memory
          * held. Never let the next draw treat those bytes as this target's
          * accumulated frame. */
@@ -1062,7 +1069,11 @@ int vulkan_indexed_renderer_draw(const BeerVulkanIndexedDraw *draw)
     VkResult submit_result = g_indexed.QueueSubmit(
         g_indexed.queue, 1, &submit_info, slot->fence);
     beer_vulkan_queue_unlock();
-    if (submit_result != VK_SUCCESS) goto done;
+    if (submit_result != VK_SUCCESS) {
+        beer_vulkan_record_result(submit_result,
+                                  "indexed-renderer queue submission");
+        goto done;
+    }
     slot->pending = 1;
     g_indexed.next_submission =
         (g_indexed.next_submission + 1u) % SUBMISSION_RING_SIZE;
@@ -1254,7 +1265,11 @@ int vulkan_indexed_renderer_clear_target(const void *resource,
     VkResult submit_result = g_indexed.QueueSubmit(
         g_indexed.queue, 1, &submit_info, slot->fence);
     beer_vulkan_queue_unlock();
-    if (submit_result != VK_SUCCESS) goto done;
+    if (submit_result != VK_SUCCESS) {
+        beer_vulkan_record_result(submit_result,
+                                  "indexed-renderer queue submission");
+        goto done;
+    }
 
     slot->pending = 1;
     g_indexed.next_submission =
