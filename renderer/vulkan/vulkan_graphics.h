@@ -127,6 +127,7 @@ typedef struct BeerVulkanGraphicsDepthTarget {
 #define BEER_VULKAN_GRAPHICS_MAX_VERTEX_ATTRIBUTES 16
 
 typedef struct BeerVulkanGraphicsVertexBinding {
+    const void *resource;
     const uint8_t *data;
     size_t size;
     uint32_t stride;
@@ -155,6 +156,7 @@ typedef struct BeerVulkanGraphicsDrawInfo {
         vertex_attributes[BEER_VULKAN_GRAPHICS_MAX_VERTEX_ATTRIBUTES];
     uint32_t vertex_binding_count;
     uint32_t vertex_attribute_count;
+    const void *index_resource;
     const uint8_t *index_data;
     size_t index_size;
     uint32_t index_type;

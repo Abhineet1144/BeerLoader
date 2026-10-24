@@ -1,0 +1,777 @@
+#define _GNU_SOURCE
+#include "bd12.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define BD12_BUFFER_USAGE                                                    \
+    (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |   \
+     VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |                              \
+     VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |                              \
+     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |\
+     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |  \
+     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |                                   \
+     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+
+static int32_t pick_memory_type(const VkPhysicalDeviceMemoryProperties *memory,
+                                uint32_t type_bits,
+                                VkMemoryPropertyFlags required,
+                                VkMemoryPropertyFlags preferred,
+                                VkMemoryPropertyFlags avoid)
+{
+    for (int pass = 0; pass < 3; ++pass) {
+        for (uint32_t i = 0; i < memory->memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags flags = memory->memoryTypes[i].propertyFlags;
+            if (!(type_bits & (1u << i))) continue;
+            if ((flags & required) != required) continue;
+            if (pass < 2 && (flags & avoid)) continue;
+            if (pass < 1 && (flags & preferred) != preferred) continue;
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+BD12Device *bd12_device_create(void)
+{
+    if (!beer_vulkan_context_initialize()) return NULL;
+    const BeerVulkanModern *modern = beer_vulkan_modern();
+    if (!modern->buffer_device_address || !modern->synchronization2 ||
+        !beer_vulkan_timeline_enabled()) {
+        fprintf(stderr, "[BD12] shared device lacks BDA/sync2/timeline\n");
+        return NULL;
+    }
+    BD12Device *device = calloc(1, sizeof(*device));
+    if (!device) return NULL;
+    device->instance = beer_vulkan_instance();
+    device->physical_device = beer_vulkan_physical_device();
+    device->device = beer_vulkan_device();
+    device->queue = beer_vulkan_queue();
+    device->queue_family = beer_vulkan_queue_family();
+    device->modern = modern;
+    pthread_mutex_init(&device->va_lock, NULL);
+    pthread_mutex_init(&device->view_lock, NULL);
+
+    PFN_vkGetDeviceProcAddr get_device = beer_vulkan_get_device_proc_addr();
+    PFN_vkGetInstanceProcAddr get_instance = beer_vulkan_get_instance_proc_addr();
+#define BD12_VK_FN(name)                                                      \
+    device->vk.name = (PFN_vk##name)get_device(device->device, "vk" #name);   \
+    if (!device->vk.name) {                                                   \
+        fprintf(stderr, "[BD12] missing vk" #name "\n");                      \
+        free(device);                                                         \
+        return NULL;                                                          \
+    }
+#include "bd12_vk_functions.h"
+#undef BD12_VK_FN
+
+    PFN_vkGetPhysicalDeviceMemoryProperties get_memory =
+        (PFN_vkGetPhysicalDeviceMemoryProperties)get_instance(
+            device->instance, "vkGetPhysicalDeviceMemoryProperties");
+    PFN_vkGetPhysicalDeviceProperties get_properties =
+        (PFN_vkGetPhysicalDeviceProperties)get_instance(
+            device->instance, "vkGetPhysicalDeviceProperties");
+    get_memory(device->physical_device, &device->memory);
+    VkPhysicalDeviceProperties properties;
+    get_properties(device->physical_device, &properties);
+    snprintf(device->device_name, sizeof(device->device_name), "%s",
+             properties.deviceName);
+    device->min_uniform_alignment =
+        properties.limits.minUniformBufferOffsetAlignment;
+    device->max_uniform_range = properties.limits.maxUniformBufferRange;
+    device->min_uniform_texel_alignment =
+        modern->uniform_texel_buffer_offset_alignment ?
+        modern->uniform_texel_buffer_offset_alignment :
+        properties.limits.minTexelBufferOffsetAlignment;
+    device->min_storage_texel_alignment =
+        modern->storage_texel_buffer_offset_alignment ?
+        modern->storage_texel_buffer_offset_alignment :
+        properties.limits.minTexelBufferOffsetAlignment;
+    device->uniform_texel_single_alignment =
+        modern->uniform_texel_buffer_offset_single_texel;
+    device->storage_texel_single_alignment =
+        modern->storage_texel_buffer_offset_single_texel;
+
+    /* Probe the memory type bits every D3D12 buffer can use. */
+    VkBufferCreateInfo probe_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 65536,
+        .usage = BD12_BUFFER_USAGE,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    VkBuffer probe;
+    if (device->vk.CreateBuffer(device->device, &probe_info, NULL, &probe) !=
+        VK_SUCCESS) {
+        free(device);
+        return NULL;
+    }
+    VkMemoryRequirements requirements;
+    device->vk.GetBufferMemoryRequirements(device->device, probe,
+                                           &requirements);
+    device->vk.DestroyBuffer(device->device, probe, NULL);
+    device->buffer_memory_bits = requirements.memoryTypeBits;
+
+    device->memory_type[BD12_HEAP_DEFAULT] = pick_memory_type(
+        &device->memory, device->buffer_memory_bits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    device->memory_type[BD12_HEAP_UPLOAD] = pick_memory_type(
+        &device->memory, device->buffer_memory_bits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    device->memory_type[BD12_HEAP_READBACK] = pick_memory_type(
+        &device->memory, device->buffer_memory_bits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (device->memory_type[BD12_HEAP_DEFAULT] < 0 ||
+        device->memory_type[BD12_HEAP_UPLOAD] < 0 ||
+        device->memory_type[BD12_HEAP_READBACK] < 0) {
+        fprintf(stderr, "[BD12] no suitable memory types\n");
+        free(device);
+        return NULL;
+    }
+    device->readback_coherent =
+        (device->memory.memoryTypes[device->memory_type[BD12_HEAP_READBACK]]
+             .propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    fprintf(stderr,
+            "[BD12] device %s: memory types default=%d upload=%d readback=%d "
+            "(readback coherent=%d)\n",
+            device->device_name, device->memory_type[BD12_HEAP_DEFAULT],
+            device->memory_type[BD12_HEAP_UPLOAD],
+            device->memory_type[BD12_HEAP_READBACK], device->readback_coherent);
+    return device;
+}
+
+void bd12_device_destroy(BD12Device *device)
+{
+    if (!device) return;
+    for (size_t i = 0; i < device->sampler_count; ++i)
+        device->vk.DestroySampler(device->device, device->samplers[i].sampler,
+                                  NULL);
+    free(device->samplers);
+    free(device->va_table);
+    pthread_mutex_destroy(&device->va_lock);
+    pthread_mutex_destroy(&device->view_lock);
+    free(device);
+}
+
+/* Heaps ----------------------------------------------------------------- */
+
+/* D3D12 heaps are zero-initialised; Vulkan memory is not. Shaders that read
+ * counters or loop bounds from never-written buffers would otherwise run on
+ * recycled garbage (GPU hang). The fill is queued ahead of every later submit
+ * and its resources are released with the heap (already GPU-deferred). */
+static void heap_zero_fill(BD12Heap *heap)
+{
+    BD12Device *device = heap->device;
+    VkBufferCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = heap->size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (device->vk.CreateBuffer(device->device, &info, NULL,
+                                &heap->zero_buffer) != VK_SUCCESS) {
+        heap->zero_buffer = VK_NULL_HANDLE;
+        return;
+    }
+    VkMemoryRequirements requirements;
+    device->vk.GetBufferMemoryRequirements(device->device, heap->zero_buffer,
+                                           &requirements);
+    if (requirements.size > heap->size ||
+        !(requirements.memoryTypeBits & (1u << device->memory_type[heap->type])) ||
+        device->vk.BindBufferMemory(device->device, heap->zero_buffer,
+                                    heap->memory, 0) != VK_SUCCESS)
+        return;
+    VkCommandPoolCreateInfo pool = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        .queueFamilyIndex = device->queue_family
+    };
+    if (device->vk.CreateCommandPool(device->device, &pool, NULL,
+                                     &heap->zero_pool) != VK_SUCCESS) {
+        heap->zero_pool = VK_NULL_HANDLE;
+        return;
+    }
+    VkCommandBufferAllocateInfo allocate = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = heap->zero_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+    VkCommandBuffer cb;
+    if (device->vk.AllocateCommandBuffers(device->device, &allocate, &cb) !=
+        VK_SUCCESS)
+        return;
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    device->vk.BeginCommandBuffer(cb, &begin);
+    device->vk.CmdFillBuffer(cb, heap->zero_buffer, 0,
+                             heap->size & ~(VkDeviceSize)3, 0);
+    VkMemoryBarrier2 barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT |
+                         VK_ACCESS_2_MEMORY_WRITE_BIT
+    };
+    VkDependencyInfo dependency = {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier
+    };
+    device->vk.CmdPipelineBarrier2(cb, &dependency);
+    device->vk.EndCommandBuffer(cb);
+    VkCommandBufferSubmitInfo cb_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .commandBuffer = cb
+    };
+    VkSubmitInfo2 submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &cb_info
+    };
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+    };
+    if (device->vk.CreateFence(device->device, &fence_info, NULL,
+                               &heap->zero_fence) != VK_SUCCESS)
+        heap->zero_fence = VK_NULL_HANDLE;
+    beer_vulkan_queue_lock();
+    VkResult result = device->vk.QueueSubmit2(device->queue, 1, &submit,
+                                              heap->zero_fence);
+    beer_vulkan_queue_unlock();
+    beer_vulkan_record_result(result, "BD12 heap zero fill");
+    if (result != VK_SUCCESS && heap->zero_fence) {
+        device->vk.DestroyFence(device->device, heap->zero_fence, NULL);
+        heap->zero_fence = VK_NULL_HANDLE;
+    }
+}
+
+uint64_t g_bd12_heap_live[4], g_bd12_heap_bytes[4];
+
+BD12Heap *bd12_heap_create(BD12Device *device, BD12HeapType type,
+                           VkDeviceSize size)
+{
+    if (!device || !size || type < BD12_HEAP_DEFAULT || type > BD12_HEAP_READBACK)
+        return NULL;
+    BD12Heap *heap = calloc(1, sizeof(*heap));
+    if (!heap) return NULL;
+    heap->device = device;
+    heap->size = size;
+    heap->type = type;
+    VkMemoryAllocateFlagsInfo flags = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+    VkMemoryAllocateInfo allocate = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &flags,
+        .allocationSize = size,
+        .memoryTypeIndex = (uint32_t)device->memory_type[type]
+    };
+    VkResult result = device->vk.AllocateMemory(device->device, &allocate, NULL,
+                                                &heap->memory);
+    beer_vulkan_record_result(result, "BD12 heap allocation");
+    if (result != VK_SUCCESS) {
+        free(heap);
+        return NULL;
+    }
+    if (type != BD12_HEAP_DEFAULT &&
+        device->vk.MapMemory(device->device, heap->memory, 0, VK_WHOLE_SIZE, 0,
+                             &heap->mapped) != VK_SUCCESS) {
+        device->vk.FreeMemory(device->device, heap->memory, NULL);
+        free(heap);
+        return NULL;
+    }
+    if (type == BD12_HEAP_DEFAULT) heap_zero_fill(heap);
+    __atomic_add_fetch(&g_bd12_heap_live[type], 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_bd12_heap_bytes[type], size, __ATOMIC_RELAXED);
+    return heap;
+}
+
+void bd12_heap_destroy(BD12Heap *heap)
+{
+    if (!heap) return;
+    /* The zero fill is queued outside the retire timeline; it must finish
+     * before its command pool, buffer and the heap memory are released. */
+    if (heap->zero_fence) {
+        heap->device->vk.WaitForFences(heap->device->device, 1,
+                                       &heap->zero_fence, VK_TRUE,
+                                       UINT64_C(10000000000));
+        heap->device->vk.DestroyFence(heap->device->device, heap->zero_fence,
+                                      NULL);
+    }
+    if (heap->mapped)
+        heap->device->vk.UnmapMemory(heap->device->device, heap->memory);
+    if (heap->zero_pool)
+        heap->device->vk.DestroyCommandPool(heap->device->device,
+                                            heap->zero_pool, NULL);
+    if (heap->zero_buffer)
+        heap->device->vk.DestroyBuffer(heap->device->device,
+                                       heap->zero_buffer, NULL);
+    heap->device->vk.FreeMemory(heap->device->device, heap->memory, NULL);
+    __atomic_sub_fetch(&g_bd12_heap_live[heap->type], 1, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&g_bd12_heap_bytes[heap->type], heap->size, __ATOMIC_RELAXED);
+    free(heap);
+}
+
+/* GPU virtual address table ---------------------------------------------- */
+
+static size_t va_lower_bound(const BD12Device *device, uint64_t va)
+{
+    size_t lo = 0, hi = device->va_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (device->va_table[mid].va < va) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+static int va_insert(BD12Device *device, BD12Buffer *buffer)
+{
+    pthread_mutex_lock(&device->va_lock);
+    if (device->va_count == device->va_capacity) {
+        size_t capacity = device->va_capacity ? device->va_capacity * 2 : 256;
+        BD12VaEntry *grown = realloc(device->va_table,
+                                     capacity * sizeof(*grown));
+        if (!grown) {
+            pthread_mutex_unlock(&device->va_lock);
+            return 0;
+        }
+        device->va_table = grown;
+        device->va_capacity = capacity;
+    }
+    size_t index = va_lower_bound(device, buffer->va);
+    memmove(&device->va_table[index + 1], &device->va_table[index],
+            (device->va_count - index) * sizeof(*device->va_table));
+    device->va_table[index] = (BD12VaEntry){ buffer->va, buffer->size, buffer };
+    ++device->va_count;
+    pthread_mutex_unlock(&device->va_lock);
+    return 1;
+}
+
+static void va_remove(BD12Device *device, const BD12Buffer *buffer)
+{
+    pthread_mutex_lock(&device->va_lock);
+    size_t index = va_lower_bound(device, buffer->va);
+    if (index < device->va_count && device->va_table[index].buffer == buffer) {
+        memmove(&device->va_table[index], &device->va_table[index + 1],
+                (device->va_count - index - 1) * sizeof(*device->va_table));
+        --device->va_count;
+    }
+    pthread_mutex_unlock(&device->va_lock);
+}
+
+BD12Buffer *bd12_va_resolve(BD12Device *device, uint64_t va,
+                            VkDeviceSize *offset)
+{
+    BD12Buffer *found = NULL;
+    pthread_mutex_lock(&device->va_lock);
+    size_t index = va_lower_bound(device, va);
+    if (index < device->va_count && device->va_table[index].va == va)
+        ++index;
+    if (index > 0) {
+        const BD12VaEntry *entry = &device->va_table[index - 1];
+        if (va >= entry->va && va - entry->va < entry->size) {
+            found = entry->buffer;
+            if (offset) *offset = va - entry->va;
+        }
+    }
+    pthread_mutex_unlock(&device->va_lock);
+    return found;
+}
+
+/* Buffers ----------------------------------------------------------------- */
+
+BD12Buffer *bd12_buffer_create_placed(BD12Heap *heap, VkDeviceSize offset,
+                                      VkDeviceSize size)
+{
+    if (!heap || !size) return NULL;
+    BD12Device *device = heap->device;
+    BD12Buffer *buffer = calloc(1, sizeof(*buffer));
+    if (!buffer) return NULL;
+    buffer->device = device;
+    buffer->heap = heap;
+    buffer->heap_offset = offset;
+    buffer->size = size;
+    VkBufferCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = BD12_BUFFER_USAGE,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (device->vk.CreateBuffer(device->device, &info, NULL, &buffer->buffer) !=
+        VK_SUCCESS)
+        goto fail;
+    VkMemoryRequirements requirements;
+    device->vk.GetBufferMemoryRequirements(device->device, buffer->buffer,
+                                           &requirements);
+    if ((offset % requirements.alignment) ||
+        offset + requirements.size > heap->size ||
+        !(requirements.memoryTypeBits &
+          (1u << device->memory_type[heap->type])))
+        goto fail_buffer;
+    if (device->vk.BindBufferMemory(device->device, buffer->buffer,
+                                    heap->memory, offset) != VK_SUCCESS)
+        goto fail_buffer;
+    VkBufferDeviceAddressInfo address = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = buffer->buffer
+    };
+    buffer->va = device->vk.GetBufferDeviceAddress(device->device, &address);
+    if (!buffer->va) goto fail_buffer;
+    buffer->cpu = heap->mapped ? (char *)heap->mapped + offset : NULL;
+    if (!va_insert(device, buffer)) goto fail_buffer;
+    return buffer;
+
+fail_buffer:
+    device->vk.DestroyBuffer(device->device, buffer->buffer, NULL);
+fail:
+    free(buffer);
+    return NULL;
+}
+
+BD12Buffer *bd12_buffer_create_committed(BD12Device *device, BD12HeapType type,
+                                         VkDeviceSize size)
+{
+    /* Round up to 64 KiB, the D3D12 placement granularity. */
+    VkDeviceSize heap_size = (size + 65535) & ~(VkDeviceSize)65535;
+    BD12Heap *heap = bd12_heap_create(device, type, heap_size);
+    if (!heap) return NULL;
+    BD12Buffer *buffer = bd12_buffer_create_placed(heap, 0, size);
+    if (!buffer) {
+        bd12_heap_destroy(heap);
+        return NULL;
+    }
+    buffer->owns_heap = 1;
+    return buffer;
+}
+
+void bd12_buffer_destroy(BD12Buffer *buffer)
+{
+    if (!buffer) return;
+    BD12Device *device = buffer->device;
+    va_remove(device, buffer);
+    for (uint32_t i = 0; i < buffer->view_count; ++i)
+        device->vk.DestroyBufferView(device->device, buffer->views[i].view,
+                                     NULL);
+    free(buffer->views);
+    device->vk.DestroyBuffer(device->device, buffer->buffer, NULL);
+    if (buffer->owns_heap) bd12_heap_destroy(buffer->heap);
+    free(buffer);
+}
+
+/* Fences ---------------------------------------------------------------- */
+
+BD12Fence *bd12_fence_create(BD12Device *device, uint64_t initial)
+{
+    BD12Fence *fence = calloc(1, sizeof(*fence));
+    if (!fence) return NULL;
+    fence->device = device;
+    VkSemaphoreTypeCreateInfo type = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        .initialValue = initial
+    };
+    VkSemaphoreCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = &type
+    };
+    if (device->vk.CreateSemaphore(device->device, &info, NULL,
+                                   &fence->semaphore) != VK_SUCCESS) {
+        free(fence);
+        return NULL;
+    }
+    return fence;
+}
+
+void bd12_fence_destroy(BD12Fence *fence)
+{
+    if (!fence) return;
+    fence->device->vk.DestroySemaphore(fence->device->device, fence->semaphore,
+                                       NULL);
+    free(fence);
+}
+
+uint64_t bd12_fence_completed(BD12Fence *fence)
+{
+    uint64_t value = 0;
+    VkResult result = fence->device->vk.GetSemaphoreCounterValue(
+        fence->device->device, fence->semaphore, &value);
+    beer_vulkan_record_result(result, "BD12 fence query");
+    return value;
+}
+
+int bd12_fence_signal_cpu(BD12Fence *fence, uint64_t value)
+{
+    VkSemaphoreSignalInfo info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+        .semaphore = fence->semaphore,
+        .value = value
+    };
+    return fence->device->vk.SignalSemaphore(fence->device->device, &info) ==
+           VK_SUCCESS;
+}
+
+int bd12_fence_wait(BD12Fence *fence, uint64_t value, uint64_t timeout_ns)
+{
+    VkSemaphoreWaitInfo info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .semaphoreCount = 1,
+        .pSemaphores = &fence->semaphore,
+        .pValues = &value
+    };
+    VkResult result = fence->device->vk.WaitSemaphores(fence->device->device,
+                                                       &info, timeout_ns);
+    beer_vulkan_record_result(result, "BD12 fence wait");
+    return result == VK_SUCCESS;
+}
+
+/* Queue ----------------------------------------------------------------- */
+
+BD12Queue *bd12_queue_create(BD12Device *device)
+{
+    BD12Queue *queue = calloc(1, sizeof(*queue));
+    if (!queue) return NULL;
+    queue->device = device;
+    queue->queue = device->queue;
+    return queue;
+}
+
+void bd12_queue_destroy(BD12Queue *queue)
+{
+    if (!queue) return;
+    free(queue);
+}
+
+VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
+                           uint32_t list_count, const BD12FenceOp *waits,
+                           uint32_t wait_count, const BD12FenceOp *signals,
+                           uint32_t signal_count)
+{
+    if (beer_vulkan_device_lost()) return VK_ERROR_DEVICE_LOST;
+    BD12Device *device = queue->device;
+    /* A D3D12 list may have been recorded into several primary command buffers
+     * (segmented dispatches, isolation boundaries). Every recorded segment must
+     * be submitted, in order. Submitting only the list's final segment silently
+     * discarded its copies, barriers and dispatches, which left later shaders
+     * reading uninitialised memory and could hang the GPU. */
+    uint32_t command_count = 0;
+    for (uint32_t i = 0; i < list_count; ++i)
+        command_count += lists[i]->command_buffer_count ?
+                         lists[i]->command_buffer_count : 1u;
+    const uint32_t total = command_count + wait_count + signal_count;
+    /* One allocation holds all three info arrays. */
+    size_t bytes = command_count * sizeof(VkCommandBufferSubmitInfo) +
+                   (wait_count + signal_count) * sizeof(VkSemaphoreSubmitInfo);
+    VkCommandBufferSubmitInfo stack_storage[16];
+    void *storage = total <= 5 ? (void *)stack_storage :
+                    malloc(bytes ? bytes : 1);
+    if (!storage) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    VkCommandBufferSubmitInfo *command_infos = storage;
+    VkSemaphoreSubmitInfo *wait_infos = (VkSemaphoreSubmitInfo *)
+        (command_infos + command_count);
+    VkSemaphoreSubmitInfo *signal_infos = wait_infos + wait_count;
+    uint32_t at = 0;
+    for (uint32_t i = 0; i < list_count; ++i) {
+        const BD12CmdList *list = lists[i];
+        if (!list->command_buffer_count) {
+            command_infos[at++] = (VkCommandBufferSubmitInfo){
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                .commandBuffer = list->command_buffer
+            };
+            continue;
+        }
+        for (uint32_t s = 0; s < list->command_buffer_count; ++s)
+            command_infos[at++] = (VkCommandBufferSubmitInfo){
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                .commandBuffer = list->command_buffers[s]
+            };
+    }
+
+    for (uint32_t i = 0; i < wait_count; ++i)
+        wait_infos[i] = (VkSemaphoreSubmitInfo){
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = waits[i].fence->semaphore,
+            .value = waits[i].value,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+        };
+    for (uint32_t i = 0; i < signal_count; ++i)
+        signal_infos[i] = (VkSemaphoreSubmitInfo){
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = signals[i].fence->semaphore,
+            .value = signals[i].value,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+        };
+    VkSubmitInfo2 submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .waitSemaphoreInfoCount = wait_count,
+        .pWaitSemaphoreInfos = wait_infos,
+        .commandBufferInfoCount = command_count,
+        .pCommandBufferInfos = command_infos,
+
+        .signalSemaphoreInfoCount = signal_count,
+        .pSignalSemaphoreInfos = signal_infos
+    };
+    beer_vulkan_queue_lock();
+    VkResult result = device->vk.QueueSubmit2(queue->queue, 1, &submit,
+                                              VK_NULL_HANDLE);
+    beer_vulkan_queue_unlock();
+    __atomic_add_fetch(&queue->submit_count, 1, __ATOMIC_RELAXED);
+    beer_vulkan_record_result(result, "BD12 queue submit");
+    if (storage != (void *)stack_storage) free(storage);
+    return result;
+}
+
+
+#define _GNU_SOURCE_PROF
+#include <dlfcn.h>
+#include <malloc.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <ucontext.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+/* BEER_BD12_SAMPLE=1: SIGPROF instruction-pointer histogram, printed with the
+ * profile window. Diagnostic only. */
+#define SAMPLE_SLOTS 8192
+static struct { uint64_t rip; uint64_t tid; uint64_t count; } g_samples[SAMPLE_SLOTS];
+
+#define STACK_SLOTS 512
+static struct { void *frames[14]; uint64_t count; } g_stacks[STACK_SLOTS];
+uint64_t g_bd12_render_tid;
+uint64_t g_bd12_render_tid;
+
+static void sample_handler(int sig, siginfo_t *info, void *ctx)
+{
+    (void)sig; (void)info;
+    if ((uint64_t)syscall(SYS_gettid) == g_bd12_render_tid) {
+        void *fr[14]; int n = backtrace(fr, 14);
+        uint64_t key = 1469598103934665603ull;
+        for (int i = 0; i < n; ++i) { key ^= (uint64_t)fr[i]; key *= 1099511628211ull; }
+        uint32_t h = (uint32_t)(key >> 20) % STACK_SLOTS;
+        for (int probe = 0; probe < 32; ++probe, h = (h + 1) % STACK_SLOTS) {
+            if (!g_stacks[h].count) { memcpy(g_stacks[h].frames, fr, sizeof(void *) * n); if (n < 14) g_stacks[h].frames[n] = NULL; g_stacks[h].count = 1; break; }
+            int same = 1;
+            for (int i = 0; i < 14; ++i) { void *f = i < n ? fr[i] : NULL; if (g_stacks[h].frames[i] != f) { same = 0; break; } }
+            if (same) { ++g_stacks[h].count; break; }
+        }
+    }
+    const uint64_t rip = ((ucontext_t *)ctx)->uc_mcontext.gregs[REG_RIP];
+    const uint64_t tid = (uint64_t)syscall(SYS_gettid);
+    uint32_t h = (uint32_t)((rip * 0x9E3779B97F4A7C15ull) >> 40) % SAMPLE_SLOTS;
+    for (int probe = 0; probe < 64; ++probe, h = (h + 1) % SAMPLE_SLOTS) {
+        uint64_t expected = 0;
+        if (__atomic_load_n(&g_samples[h].rip, __ATOMIC_RELAXED) == rip &&
+            g_samples[h].tid == tid) {
+            __atomic_add_fetch(&g_samples[h].count, 1, __ATOMIC_RELAXED);
+            return;
+        }
+        if (__atomic_compare_exchange_n(&g_samples[h].rip, &expected, rip, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            g_samples[h].tid = tid;
+            __atomic_add_fetch(&g_samples[h].count, 1, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+}
+
+static void sample_start(void)
+{
+    struct sigaction sa = { .sa_sigaction = sample_handler,
+                            .sa_flags = SA_SIGINFO | SA_RESTART };
+    sigaction(SIGPROF, &sa, NULL);
+    struct itimerval it = { { 0, 2000 }, { 0, 2000 } };
+    setitimer(ITIMER_PROF, &it, NULL);
+}
+
+static void sample_report(void)
+{
+    for (int n = 0; n < 6; ++n) {
+        int best = -1;
+        for (int i = 0; i < STACK_SLOTS; ++i)
+            if (g_stacks[i].count && (best < 0 || g_stacks[i].count > g_stacks[best].count)) best = i;
+        if (best < 0) break;
+        fprintf(stderr, "[BD12 STACK] count=%llu\n", (unsigned long long)g_stacks[best].count);
+        for (int i = 0; i < 14 && g_stacks[best].frames[i]; ++i) {
+            Dl_info di;
+            const int ok = dladdr(g_stacks[best].frames[i], &di);
+            fprintf(stderr, "[BD12 STACK]   #%d %p off=%llx %s %s\n", i, g_stacks[best].frames[i],
+                    ok ? (unsigned long long)((uintptr_t)g_stacks[best].frames[i] - (uintptr_t)di.dli_fbase) : 0ull,
+                    ok && di.dli_fname ? di.dli_fname : "?", ok && di.dli_sname ? di.dli_sname : "?");
+        }
+        g_stacks[best].count = 0;
+    }
+    memset(g_stacks, 0, sizeof(g_stacks));
+    uint64_t total = 0;
+    for (int i = 0; i < SAMPLE_SLOTS; ++i) total += g_samples[i].count;
+    fprintf(stderr, "[BD12 SAMPLE] total=%llu\n", (unsigned long long)total);
+    for (int n = 0; n < 40; ++n) {
+        int best = -1;
+        for (int i = 0; i < SAMPLE_SLOTS; ++i)
+            if (g_samples[i].count && (best < 0 || g_samples[i].count > g_samples[best].count))
+                best = i;
+        if (best < 0) break;
+        Dl_info di;
+        const int ok = dladdr((void *)g_samples[best].rip, &di);
+        fprintf(stderr, "[BD12 SAMPLE] %5llu tid=%llu rip=%llx off=%llx %s %s\n",
+                (unsigned long long)g_samples[best].count,
+                (unsigned long long)g_samples[best].tid,
+                (unsigned long long)g_samples[best].rip,
+                ok ? (unsigned long long)(g_samples[best].rip - (uint64_t)di.dli_fbase) : 0ull,
+                ok && di.dli_fname ? di.dli_fname : "?", ok && di.dli_sname ? di.dli_sname : "?");
+        g_samples[best].count = 0;
+    }
+    memset(g_samples, 0, sizeof(g_samples));
+}
+
+uint64_t g_bd12_prof_ns[BD12_PROF_COUNT];
+uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
+
+void bd12_prof_report(void)
+{
+    static int enabled = -1;
+    static uint64_t last;
+    static int sampling;
+    if (enabled < 0) {
+        enabled = getenv("BEER_BD12_PROF") != NULL;
+        sampling = getenv("BEER_BD12_SAMPLE") != NULL;
+        if (sampling) sample_start();
+    }
+    if (!enabled && !sampling) return;
+    const uint64_t now = bd12_prof_now();
+    if (!last) last = now;
+    if (now - last < 2000000000ull) return;
+    static const char *names[] = { "execute", "submit", "pso", "resolve",
+                                   "fence-wait", "finish", "present" };
+    fprintf(stderr, "[BD12 PROF] %llu ms window:", (unsigned long long)((now - last) / 1000000));
+    for (int i = 0; i < BD12_PROF_COUNT; ++i) {
+        fprintf(stderr, " %s=%llums/%llu", names[i],
+                (unsigned long long)(g_bd12_prof_ns[i] / 1000000),
+                (unsigned long long)g_bd12_prof_calls[i]);
+        g_bd12_prof_ns[i] = g_bd12_prof_calls[i] = 0;
+    }
+    fprintf(stderr, " heaps(default/upload/readback)=%llu/%llu/%llu live, %llu/%llu/%llu MiB",
+            (unsigned long long)g_bd12_heap_live[0], (unsigned long long)g_bd12_heap_live[1], (unsigned long long)g_bd12_heap_live[2],
+            (unsigned long long)(g_bd12_heap_bytes[0] >> 20), (unsigned long long)(g_bd12_heap_bytes[1] >> 20), (unsigned long long)(g_bd12_heap_bytes[2] >> 20));
+    {
+        extern uint64_t g_beer_vm_live_bytes;
+        struct mallinfo2 mi = mallinfo2();
+        fprintf(stderr, " vm-live=%lluMiB malloc-arena=%lluMiB malloc-mmap=%lluMiB",
+                (unsigned long long)(g_beer_vm_live_bytes >> 20),
+                (unsigned long long)((unsigned long long)mi.arena >> 20),
+                (unsigned long long)((unsigned long long)mi.hblkhd >> 20));
+    }
+    fputc('\n', stderr);
+    if (sampling) sample_report();
+    last = now;
+}

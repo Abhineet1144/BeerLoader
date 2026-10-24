@@ -19,7 +19,19 @@ int vulkan_presenter_present_resource_rgba8(void *display, unsigned long window,
                                             const uint8_t *pixels,
                                             int width, int height, int row_pitch,
                                             int output_width, int output_height);
+/* Presents a GPU image (a VkImage handle) that is in source_layout and is the
+ * same size as width x height. direct_blit blits it as-is (UNORM, any channel
+ * order); otherwise it is copied bytewise to an RGBA8 image first (RGBA8 UNORM
+ * and sRGB sources). The image is returned to source_layout. The function does
+ * not retain or use source_image after it returns, so the caller may release
+ * the backing D3D resource immediately. */
+int vulkan_presenter_present_image(void *display, unsigned long window,
+                                   uint64_t source_image, uint32_t source_layout,
+                                   int width, int height, int direct_blit,
+                                   int output_width, int output_height);
 void vulkan_presenter_destroy(void);
 int vulkan_presenter_is_active(void);
+/* Waits for the last direct-image blit to stop reading its guest source image. */
+int vulkan_presenter_wait_source(void);
 
 #endif

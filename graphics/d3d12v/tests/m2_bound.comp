@@ -1,0 +1,23 @@
+#version 450
+
+// M2 test shader: D3D12-style register bindings in set 0 using Beer's
+// semantic binding namespace (compute stage 0):
+//   SRV buffer t<n> -> binding n
+//   UAV buffer u<n> -> binding 0x4000 + n
+//   CBV b<n>        -> binding 0x8000 + n
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform utextureBuffer t0;
+layout(set = 0, binding = 1) uniform utextureBuffer t1;
+layout(set = 0, binding = 5) uniform utextureBuffer t5; // never bound: null
+layout(set = 0, binding = 16384, r32ui) uniform uimageBuffer u0;
+layout(set = 0, binding = 32768, std140) uniform B0 { uint mul; };
+layout(set = 0, binding = 32769, std140) uniform B1 { uvec4 add; };
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < 4096u)
+        imageStore(u0, int(i),
+                   uvec4(texelFetch(t0, int(i)).x * mul + add.x +
+                         texelFetch(t1, int(i)).x + texelFetch(t5, int(i)).x));
+}

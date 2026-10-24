@@ -1,0 +1,134 @@
+#define _GNU_SOURCE
+#include "bd12.h"
+
+#include <string.h>
+
+/* Clears, resolves and small updates that D3D12 treats as ordinary commands.
+ * Each brackets its transfer with a global memory dependency, because a D3D12
+ * UAV clear/resolve is ordered against shader accesses by the application's
+ * UAV barriers, which carry no Vulkan stage information on their own. */
+
+static void global_barrier(BD12CmdList *list, VkPipelineStageFlags2 src_stage,
+                           VkAccessFlags2 src_access,
+                           VkPipelineStageFlags2 dst_stage,
+                           VkAccessFlags2 dst_access)
+{
+    VkMemoryBarrier2 barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = src_stage,
+        .srcAccessMask = src_access,
+        .dstStageMask = dst_stage,
+        .dstAccessMask = dst_access
+    };
+    VkDependencyInfo dependency = {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier
+    };
+    list->device->vk.CmdPipelineBarrier2(list->command_buffer, &dependency);
+}
+
+static const VkAccessFlags2 k_all_access =
+    VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+
+void bd12_cmd_global_barrier(BD12CmdList *list)
+{
+    bd12_cmd_end_rendering(list);
+    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access);
+}
+
+void bd12_cmd_clear_uav_buffer(BD12CmdList *list, BD12Buffer *buffer,
+                               VkDeviceSize offset, VkDeviceSize size,
+                               uint32_t value)
+{
+    if (!buffer || offset >= buffer->size) return;
+    bd12_cmd_end_rendering(list);
+    if (size == VK_WHOLE_SIZE || offset + size > buffer->size)
+        size = buffer->size - offset;
+    size &= ~(VkDeviceSize)3;
+    if (!size) return;
+    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access,
+                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    bd12_cmd_record_flight_op(list, BD12_FLIGHT_CLEAR, 0, size, 0, 0, 0);
+    list->device->vk.CmdFillBuffer(list->command_buffer, buffer->buffer,
+                                   offset, size, value);
+    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access);
+}
+
+void bd12_cmd_clear_uav_image(BD12CmdList *list, const BD12Descriptor *uav,
+                              const VkClearColorValue *color)
+{
+    if (!uav || uav->kind != BD12_DESC_UAV_IMAGE || !uav->image) return;
+    bd12_cmd_end_rendering(list);
+    bd12_image_ensure_initialized(list, uav->image);
+    const VkImageSubresourceRange range = {
+        VK_IMAGE_ASPECT_COLOR_BIT, uav->view_mip, 1, uav->view_base_layer,
+        uav->view_layers ? uav->view_layers : VK_REMAINING_ARRAY_LAYERS
+    };
+    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access,
+                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    bd12_cmd_record_flight_op(list, BD12_FLIGHT_CLEAR, 0,
+        (uint64_t)uav->width * uav->height * uav->layer_count,
+        uav->width, uav->height, uav->layer_count);
+    list->device->vk.CmdClearColorImage(list->command_buffer, uav->image->image,
+                                        VK_IMAGE_LAYOUT_GENERAL, color, 1,
+                                        &range);
+    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access);
+}
+
+void bd12_cmd_resolve_image(BD12CmdList *list, BD12Image *dst,
+                            uint32_t dst_subresource, BD12Image *src,
+                            uint32_t src_subresource)
+{
+    bd12_cmd_end_rendering(list);
+    bd12_image_ensure_initialized(list, dst);
+    bd12_image_ensure_initialized(list, src);
+    const uint32_t dst_mips = dst->desc.mip_levels ? dst->desc.mip_levels : 1;
+    const uint32_t src_mips = src->desc.mip_levels ? src->desc.mip_levels : 1;
+    bd12_cmd_record_flight_op(list, BD12_FLIGHT_RESOLVE, 0,
+        (uint64_t)src->desc.width * src->desc.height,
+        src->desc.width, src->desc.height, 1);
+    VkImageResolve region = {
+        .srcSubresource = { src->aspect & VK_IMAGE_ASPECT_COLOR_BIT ?
+                                VK_IMAGE_ASPECT_COLOR_BIT : src->aspect,
+                            src_subresource % src_mips,
+                            src_subresource / src_mips, 1 },
+        .dstSubresource = { dst->aspect & VK_IMAGE_ASPECT_COLOR_BIT ?
+                                VK_IMAGE_ASPECT_COLOR_BIT : dst->aspect,
+                            dst_subresource % dst_mips,
+                            dst_subresource / dst_mips, 1 },
+        .extent = { src->desc.width >> (src_subresource % src_mips) ?
+                        src->desc.width >> (src_subresource % src_mips) : 1,
+                    src->desc.height >> (src_subresource % src_mips) ?
+                        src->desc.height >> (src_subresource % src_mips) : 1,
+                    1 }
+    };
+    list->device->vk.CmdResolveImage(list->command_buffer, src->image,
+                                     VK_IMAGE_LAYOUT_GENERAL,
+                                     dst->image,
+                                     VK_IMAGE_LAYOUT_GENERAL, 1,
+                                     &region);
+}
+
+void bd12_cmd_update_buffer(BD12CmdList *list, BD12Buffer *dst,
+                            VkDeviceSize offset, VkDeviceSize size,
+                            const void *data)
+{
+    if (!dst || !size || (size & 3) || (offset & 3) || size > 65536) return;
+    bd12_cmd_end_rendering(list);
+    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access,
+                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    list->device->vk.CmdUpdateBuffer(list->command_buffer, dst->buffer, offset,
+                                     size, data);
+    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access);
+}

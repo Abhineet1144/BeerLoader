@@ -1,0 +1,19 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+// M1 test shader: reads and writes buffers purely by GPU virtual address
+// (push-constant pointers), the same model D3D12 root descriptors use.
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430) readonly buffer Source { uint v[]; };
+layout(buffer_reference, std430) buffer Dest { uint v[]; };
+layout(push_constant, std430) uniform Push {
+    Source src;
+    Dest dst;
+    uint count;
+} p;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < p.count) p.dst.v[i] = p.src.v[i] * 2u + 1u;
+}

@@ -688,6 +688,14 @@ static uint32_t texture_format_bytes_per_pixel(uint32_t format)
         return 2;
     case 61: /* DXGI_FORMAT_R8_UNORM */
         return 1;
+    /* NV12 is a planar YUV 4:2:0 format: Y plane (1 byte/pixel) followed by
+     * interleaved UV plane (0.5 bytes/pixel), total 1.5 bytes per pixel.
+     * We model storage as 1 byte per pixel over height * 3/2 rows so that
+     * row_pitch == video_width and pixel_size == width * height * 3 / 2.
+     * The RE Engine reads the Y plane via Lock2D (pitch == width) then reads
+     * the UV plane at data + stride * height. */
+    case 103: /* DXGI_FORMAT_NV12 */
+        return 1; /* Y-plane stride in bytes per pixel; UV follows Y block */
     default:
         return 0;
     }
@@ -728,8 +736,11 @@ static int resource_allocate_texture2d_storage(BeerD3D11Resource *resource,
     uint32_t mip_levels = texture[2], array_size = texture[3];
     uint32_t bytes_per_pixel = texture_format_bytes_per_pixel(texture[4]);
     uint32_t block_bytes = texture_format_block_bytes(texture[4]);
+    int is_nv12 = (texture[4] == 103);
+    /* NV12 storage uses bytes_per_pixel=1 for the Y plane; treat it as valid
+     * even though bytes_per_pixel alone wouldn't describe its UV plane. */
     if (!width || !height || !mip_levels || !array_size ||
-        (!bytes_per_pixel && !block_bytes) ||
+        (!bytes_per_pixel && !block_bytes && !is_nv12) ||
         mip_levels > UINT32_MAX / array_size)
         return 0;
 
@@ -742,6 +753,12 @@ static int resource_allocate_texture2d_storage(BeerD3D11Resource *resource,
         !resource->subresource_row_pitches || !resource->subresource_rows)
         return 0;
 
+    /* NV12 has a special planar layout: the Y plane occupies width*height bytes
+     * and the interleaved UV plane occupies width*(height/2) bytes immediately
+     * after. We store it as a single allocation with rows = height*3/2 and
+     * row_pitch = width so that UpdateSubresource can copy the whole NV12
+     * buffer in one pass and Lock2D returns the correct Y-plane pointer/pitch. */
+
     size_t total = 0;
     for (uint32_t array = 0; array < array_size; ++array) {
         uint32_t mip_width = width, mip_height = height;
@@ -749,7 +766,12 @@ static int resource_allocate_texture2d_storage(BeerD3D11Resource *resource,
             uint32_t index = array * mip_levels + mip;
             uint32_t rows;
             size_t pitch;
-            if (block_bytes) {
+            if (is_nv12) {
+                /* NV12: Y rows + UV rows (height/2, rounded up).
+                 * pitch = width (1 byte per Y pixel). */
+                rows = mip_height + ((mip_height + 1u) / 2u);
+                pitch = (size_t)mip_width;
+            } else if (block_bytes) {
                 uint32_t blocks_wide = (mip_width + 3u) / 4u;
                 rows = (mip_height + 3u) / 4u;
                 if (!blocks_wide) blocks_wide = 1;
@@ -917,7 +939,7 @@ static HRESULT __attribute__((ms_abi)) device_create_texture2d(ID3D11Device* thi
     uint32_t call = atomic_fetch_add(&calls, 1) + 1;
     const uint32_t *desc = pDesc;
     if (call <= 96 || (desc[0] == 1920 && desc[1] == 1080) ||
-        desc[4] == 61 || desc[4] == 87)
+        desc[4] == 61 || desc[4] == 87 || desc[4] == 103 /* NV12 */)
         fprintf(stderr, "[D3D11 TEXTURE] #%u resource=%p %ux%u mips=%u array=%u format=%u usage=%u bind=0x%x cpu=0x%x misc=0x%x initial=%s pixels=%p bytes=%zu\n",
                 call, (void *)resource, desc[0], desc[1], desc[2], desc[3],
                 desc[4], desc[7], desc[8], desc[9], desc[10],
@@ -1443,6 +1465,14 @@ static HRESULT __attribute__((ms_abi)) device_check_format_support(
                    0x800 /* SHADER_SAMPLE_MONO_TEXT */ |
                    0x1000 /* MIP */ | 0x2000 /* MIP_AUTOGEN */ |
                    0x4000 /* RENDER_TARGET */ | 0x8000 /* BLENDABLE */ |
+                   0x20000 /* CPU_LOCKABLE */;
+        break;
+    case 103: /* DXGI_FORMAT_NV12 — advertise as a video decoder target so RE8
+               * creates the NV12 texture through Beer's D3D11 implementation.
+               * Beer converts NV12 → RGBA8 on the CPU before the draw
+               * (ensure_nv12_cache / d3d11_dxgi_to_vulkan_image). */
+        *support = 0x20 /* TEXTURE2D */ |
+                   0x100 /* SHADER_LOAD */ | 0x200 /* SHADER_SAMPLE */ |
                    0x20000 /* CPU_LOCKABLE */;
         break;
     case 70: case 71: case 72: /* BC1 */
@@ -2520,6 +2550,7 @@ static void pack_rgba(BeerD3D11Resource *resource, size_t pixel,
 static uint32_t d3d11_to_vk_address_mode(uint32_t d3d);
 static int d3d11_dxgi_to_vulkan_image(uint32_t dxgi, uint32_t *vk_format,
                                        uint32_t *bytes_per_pixel);
+static int ensure_nv12_cache(BeerD3D11Resource *texture);
 
 /* Auto-translated path for non-indexed (Draw) calls.  Mirrors the approach of
  * try_auto_translate_indexed_draw but for topology-4 / topology-5 fullscreen
@@ -2529,9 +2560,13 @@ static int try_auto_translate_fullscreen_draw(const BeerD3D11PipelineState *stat
                                               uint32_t start_vertex)
 {
     if (!state || !state->vertex_shader || !state->pixel_shader ||
-        !state->vertex_buffers[0] || !state->render_targets[0] ||
-        state->viewport_count == 0)
+        !state->render_targets[0])
         return 0;
+    /* vertex_buffers[0] may be NULL for procedural fullscreen quads that
+     * generate positions from SV_VertexID (e.g. RE8's NV12 movie compositor).
+     * The vertex-binding section below handles this gracefully.
+     * viewport_count may be 0 when the game relies on D3D11's implicit
+     * fullscreen viewport; we fall back to the render-target dimensions. */
 
     BeerD3D11Shader *vs = state->vertex_shader;
     BeerD3D11Shader *ps = state->pixel_shader;
@@ -2549,13 +2584,44 @@ static int try_auto_translate_fullscreen_draw(const BeerD3D11PipelineState *stat
     const BeerD3D12TranslatedShader *tps =
         beer_d3d12_translate_shader(ps->bytecode, ps->bytecode_size, ps_hash);
     if (!tvs || !tps) {
-        static _Atomic(uint32_t) fail_count;
-        uint32_t fn = atomic_fetch_add(&fail_count, 1);
-        if (fn < 16)
-            fprintf(stderr,
-                    "[D3D11 FS AUTO TRANSLATE FAIL] #%u VS=%08x PS=%08x: %s\n",
-                    fn + 1, (uint32_t)vs_hash, (uint32_t)ps_hash,
-                    beer_d3d12_shader_translation_error());
+        /* Log every unique VS+PS fail pair — deduplicate so the log stays
+         * readable even when the same rejected pair fires every frame. */
+        {
+            static uint64_t failed_pairs[32];
+            static uint32_t failed_count;
+            static pthread_mutex_t flock = PTHREAD_MUTEX_INITIALIZER;
+            uint64_t fkey = vs_hash ^ (ps_hash * 0x9e3779b97f4a7c15ULL);
+            pthread_mutex_lock(&flock);
+            int fseen = 0;
+            for (uint32_t fi = 0; fi < failed_count && fi < 32; ++fi)
+                if (failed_pairs[fi] == fkey) { fseen = 1; break; }
+            if (!fseen && failed_count < 32) failed_pairs[failed_count++] = fkey;
+            pthread_mutex_unlock(&flock);
+            if (!fseen) {
+                fprintf(stderr,
+                        "[D3D11 FS AUTO TRANSLATE FAIL] VS=%08x PS=%08x: %s "
+                        "verts=%u vs-bytes=%zu ps-bytes=%zu\n",
+                        (uint32_t)vs_hash, (uint32_t)ps_hash,
+                        beer_d3d12_shader_translation_error(),
+                        vertex_count, vs->bytecode_size, ps->bytecode_size);
+                /* Dump bytecode to /tmp so it can be inspected offline. */
+                {
+                    char path[128];
+                    snprintf(path, sizeof(path),
+                             "/tmp/beer-fs-fail-vs-%08x.dxbc",
+                             (uint32_t)vs_hash);
+                    FILE *fv = fopen(path, "wb");
+                    if (fv) { fwrite(vs->bytecode, 1, vs->bytecode_size, fv);
+                              fclose(fv); }
+                    snprintf(path, sizeof(path),
+                             "/tmp/beer-fs-fail-ps-%08x.dxbc",
+                             (uint32_t)ps_hash);
+                    FILE *fp = fopen(path, "wb");
+                    if (fp) { fwrite(ps->bytecode, 1, ps->bytecode_size, fp);
+                              fclose(fp); }
+                }
+            }
+        }
         return 0;
     }
 
@@ -2616,12 +2682,21 @@ static int try_auto_translate_fullscreen_draw(const BeerD3D11PipelineState *stat
                 b->kind    = BEER_VULKAN_GRAPHICS_BINDING_SAMPLED_IMAGE;
                 b->resource = res;
                 b->serial   = (const uint64_t *)&res->content_serial;
-                b->data     = res->pixels;
-                b->size     = res->pixel_size;
                 b->format   = vk_fmt;
                 b->width    = rdesc[0];
                 b->height   = rdesc[1];
-                if (bpp == 0) {
+                /* NV12: the raw NV12 pixels are decoded to RGBA8 in
+                 * ensure_nv12_cache(). Bind the decoded plane instead of the
+                 * raw YUV plane so the generic Vulkan sampler path works. */
+                if (rdesc[4] == 103 /* NV12 */) {
+                    if (!ensure_nv12_cache(res)) return 0;
+                    b->data = res->decoded_rgba;
+                    b->size = res->decoded_rgba_size;
+                    b->bytes_per_pixel = 4;
+                    b->row_pitch = rdesc[0] * 4u;
+                } else if (bpp == 0) {
+                    b->data = res->pixels;
+                    b->size = res->pixel_size;
                     uint32_t bpb = (vk_fmt == 131 || vk_fmt == 132 ||
                                     vk_fmt == 139 || vk_fmt == 140) ? 8u : 16u;
                     b->block_width     = 4;
@@ -2631,6 +2706,8 @@ static int try_auto_translate_fullscreen_draw(const BeerD3D11PipelineState *stat
                     uint32_t blocks_wide = (rdesc[0] + 3u) / 4u;
                     b->row_pitch = res->row_pitch ? res->row_pitch : blocks_wide * bpb;
                 } else {
+                    b->data = res->pixels;
+                    b->size = res->pixel_size;
                     b->bytes_per_pixel = bpp;
                     b->row_pitch = res->row_pitch ? res->row_pitch : rdesc[0] * bpp;
                 }
@@ -2652,23 +2729,31 @@ static int try_auto_translate_fullscreen_draw(const BeerD3D11PipelineState *stat
     }
 
     /* ---- Vertex binding (non-indexed, no index buffer) ---- */
-    BeerD3D11Resource *vbuf = validated_resource(state->vertex_buffers[0]);
-    if (!vbuf || !vbuf->pixels) return 0;
+    /* RE8's NV12 movie compositor uses a procedural fullscreen quad with no
+     * bound VB — positions come from SV_VertexID in the vertex shader.
+     * Allow a NULL vertex_buffers[0] and emit zero vertex bindings/attributes
+     * so the Vulkan pipeline uses gl_VertexIndex only. */
+    BeerD3D11Resource *vbuf = state->vertex_buffers[0]
+        ? validated_resource(state->vertex_buffers[0]) : NULL;
 
     BeerVulkanGraphicsVertexBinding  vb[1];
     BeerVulkanGraphicsVertexAttribute va[BEER_VULKAN_GRAPHICS_MAX_VERTEX_ATTRIBUTES];
     memset(vb, 0, sizeof(vb));
     memset(va, 0, sizeof(va));
+    uint32_t vb_count = 0;
 
-    vb[0].data   = vbuf->pixels + state->vertex_offsets[0];
-    vb[0].size   = vbuf->pixel_size > state->vertex_offsets[0]
-                   ? vbuf->pixel_size - state->vertex_offsets[0] : 0;
-    vb[0].stride = state->vertex_strides[0];
-    if (!vb[0].size || !vb[0].stride) return 0;
+    if (vbuf && vbuf->pixels) {
+        vb[0].data   = vbuf->pixels + state->vertex_offsets[0];
+        vb[0].size   = vbuf->pixel_size > state->vertex_offsets[0]
+                       ? vbuf->pixel_size - state->vertex_offsets[0] : 0;
+        vb[0].stride = state->vertex_strides[0];
+        if (vb[0].size && vb[0].stride)
+            vb_count = 1;
+    }
 
     BeerD3D11InputLayout *layout = state->input_layout;
     uint32_t va_count = 0;
-    if (layout && com_get_header(layout)) {
+    if (vb_count && layout && com_get_header(layout)) {
         uint32_t slot_offsets[1] = {0};
         for (uint32_t e = 0; e < layout->element_count &&
              va_count < BEER_VULKAN_GRAPHICS_MAX_VERTEX_ATTRIBUTES; ++e) {
@@ -2689,8 +2774,8 @@ static int try_auto_translate_fullscreen_draw(const BeerD3D11PipelineState *stat
             ++va_count;
         }
     }
-    /* If no input layout is bound (e.g. pure procedural fullscreen quad),
-     * Vulkan allows zero vertex attributes — SPIR-V still reads gl_VertexIndex. */
+    /* Zero vertex bindings and zero attributes = procedural SV_VertexID quad.
+     * Vulkan allows this; the vertex shader reads gl_VertexIndex directly. */
 
     /* ---- Render target ---- */
     BeerD3D11View *rtv = state->render_targets[0];
@@ -2751,8 +2836,8 @@ static int try_auto_translate_fullscreen_draw(const BeerD3D11PipelineState *stat
     /* ---- Draw info ---- */
     BeerVulkanGraphicsDrawInfo di;
     memset(&di, 0, sizeof(di));
-    di.vertex_bindings[0]     = vb[0];
-    di.vertex_binding_count   = 1;
+    if (vb_count) di.vertex_bindings[0] = vb[0];
+    di.vertex_binding_count   = vb_count;
     for (uint32_t i = 0; i < va_count; ++i) di.vertex_attributes[i] = va[i];
     di.vertex_attribute_count = va_count;
     di.indexed                = 0;
@@ -2764,7 +2849,16 @@ static int try_auto_translate_fullscreen_draw(const BeerD3D11PipelineState *stat
     di.base_vertex    = (int32_t)start_vertex;
 
     float viewport[6] = {0};
-    memcpy(viewport, state->viewports[0], sizeof(float)*4);
+    if (state->viewport_count > 0) {
+        memcpy(viewport, state->viewports[0], sizeof(float) * 4);
+    } else {
+        /* No viewport set — use the render-target dimensions as an implicit
+         * fullscreen viewport (D3D11 default behaviour). */
+        viewport[0] = 0.0f;
+        viewport[1] = 0.0f;
+        viewport[2] = (float)target_out.width;
+        viewport[3] = (float)target_out.height;
+    }
     viewport[4] = 0.0f; viewport[5] = 1.0f;
 
     int32_t scissor[4] = {
@@ -2822,8 +2916,9 @@ static int execute_initial_fullscreen_draw(const BeerD3D11PipelineState *state,
                                            uint32_t start_vertex)
 {
     if (!state || !state->vertex_shader || !state->pixel_shader ||
-        !state->vertex_buffers[0] || !state->render_targets[0])
+        !state->render_targets[0])
         return 0;
+    /* vertex_buffers[0] may be NULL for procedural quads (NV12 movie draw). */
 
     /* Auto-translate first — catches all newly observed pairs without needing
      * a manual hash entry.  Falls through to the manual paths on any rejection
@@ -2856,7 +2951,8 @@ static int execute_initial_fullscreen_draw(const BeerD3D11PipelineState *state,
                                        vertex_shader->bytecode_size);
     uint32_t pixel_hash = fnv1a_bytes(pixel_shader->bytecode,
                                       pixel_shader->bytecode_size);
-    BeerD3D11Resource *vertices = validated_resource(state->vertex_buffers[0]);
+    BeerD3D11Resource *vertices = state->vertex_buffers[0]
+        ? validated_resource(state->vertex_buffers[0]) : NULL;
     if (vertex_hash == 0x759406e5 && pixel_hash == 0x39b87d72 &&
         vertex_count == 6 && start_vertex == 0 && state->topology == 4 &&
         state->vertex_strides[0] == 12 && state->viewport_count > 0) {
@@ -3577,6 +3673,82 @@ static int decode_bc7_block(const uint8_t block[16], uint8_t rgba[16][4])
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * NV12 → RGBA8 software conversion cache.
+ *
+ * RE8's Media Foundation movie compositor binds the NV12 texture as an SRV
+ * and reads it with a pixel shader that converts YUV → RGB.  Beer cannot
+ * hand an NV12 buffer to Vulkan as a plain sampled image, so we decode it
+ * into a full RGBA8 plane on the CPU and expose that plane to the generic
+ * Vulkan image path (format 37 = VK_FORMAT_R8G8B8A8_UNORM, 4 bpp).
+ *
+ * The decoded cache is stored in resource->decoded_rgba, exactly as BC7.
+ * The serial gate guarantees the conversion runs at most once per
+ * UpdateSubresource call.
+ * ---------------------------------------------------------------------------*/
+static int ensure_nv12_cache(BeerD3D11Resource *texture)
+{
+    if (!texture || !texture->pixels || texture->desc_size < 20 ||
+        ((const uint32_t *)texture->desc)[4] != 103)
+        return 0;
+    const uint32_t *desc = (const uint32_t *)texture->desc;
+    uint32_t width = desc[0], height = desc[1];
+    if (!width || !height ||
+        (size_t)width > SIZE_MAX / 4u / (size_t)height)
+        return 0;
+
+    uint64_t serial = atomic_load(&texture->content_serial);
+    size_t decoded_size = (size_t)width * height * 4;
+    pthread_mutex_lock(&texture->decoded_lock);
+    if (texture->decoded_rgba && texture->decoded_rgba_size == decoded_size &&
+        texture->decoded_content_serial == serial) {
+        pthread_mutex_unlock(&texture->decoded_lock);
+        return 1;
+    }
+
+    uint8_t *out = realloc(texture->decoded_rgba, decoded_size);
+    if (!out) {
+        pthread_mutex_unlock(&texture->decoded_lock);
+        return 0;
+    }
+    texture->decoded_rgba = out;
+    texture->decoded_rgba_size = decoded_size;
+
+    /* NV12 layout: Y plane  = pixels[0 .. width*height - 1]
+     *              UV plane = pixels[width*height .. width*height*3/2 - 1]
+     *              Each UV pair covers a 2×2 luma block. */
+    const uint8_t *y_plane  = texture->pixels;
+    const uint8_t *uv_plane = texture->pixels + (size_t)width * height;
+
+    for (uint32_t row = 0; row < height; ++row) {
+        uint32_t uv_row = row >> 1;
+        for (uint32_t col = 0; col < width; ++col) {
+            uint32_t uv_col = col & ~1u; /* even column for interleaved UV */
+            int y  = (int)(uint8_t)y_plane[(size_t)row * width + col];
+            int cb = (int)(uint8_t)uv_plane[(size_t)uv_row * width + uv_col];
+            int cr = (int)(uint8_t)uv_plane[(size_t)uv_row * width + uv_col + 1];
+            /* BT.601 limited-range YCbCr → linear RGB (integer fast path) */
+            int c = y  - 16;
+            int d = cb - 128;
+            int e = cr - 128;
+            int r = (298 * c           + 409 * e + 128) >> 8;
+            int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+            int b = (298 * c + 516 * d           + 128) >> 8;
+            if (r < 0) r = 0; if (r > 255) r = 255;
+            if (g < 0) g = 0; if (g > 255) g = 255;
+            if (b < 0) b = 0; if (b > 255) b = 255;
+            uint8_t *dst = out + ((size_t)row * width + col) * 4;
+            dst[0] = (uint8_t)r;
+            dst[1] = (uint8_t)g;
+            dst[2] = (uint8_t)b;
+            dst[3] = 255;
+        }
+    }
+    texture->decoded_content_serial = serial;
+    pthread_mutex_unlock(&texture->decoded_lock);
+    return 1;
+}
+
 static _Atomic(uint32_t) g_bc7_unsupported_blocks;
 
 static int ensure_bc7_cache(BeerD3D11Resource *texture)
@@ -3901,7 +4073,11 @@ static uint32_t d3d11_to_vk_address_mode(uint32_t d3d)
 /* Minimal DXGI-format -> (VkFormat, bytes-per-pixel) needed for D3D11 SRVs.
  * Only uncompressed formats that appear in Sekiro's UI pipeline are listed;
  * BC7 (98) is intentionally absent (the manual path handles that via the
- * software BC7 decoder). */
+ * software BC7 decoder).
+ * NV12 (103) is exposed as RGBA8 (VkFormat 37, 4 bpp) because Beer converts
+ * the YUV planes to RGBA8 in ensure_nv12_cache() before handing the buffer
+ * to Vulkan.  The caller must call ensure_nv12_cache() and substitute
+ * decoded_rgba / decoded_rgba_size instead of pixels / pixel_size. */
 static int d3d11_dxgi_to_vulkan_image(uint32_t dxgi,
                                        uint32_t *vk_format,
                                        uint32_t *bytes_per_pixel)
@@ -3924,6 +4100,11 @@ static int d3d11_dxgi_to_vulkan_image(uint32_t dxgi,
         {26, 122,  4}, /* R11G11B10_FLOAT */
         {54,  76,  2}, /* R16G16_FLOAT */
         {35,  98,  8}, /* R16G16B16A16_FLOAT */
+        /* NV12: decoded to RGBA8 by ensure_nv12_cache(); advertised as
+         * VK_FORMAT_R8G8B8A8_UNORM (37) so the generic SRV path can sample it.
+         * The SRV binding code below checks for format 103 and switches to
+         * decoded_rgba / decoded_rgba_size automatically. */
+        {103,  37,  4}, /* DXGI_FORMAT_NV12 -> RGBA8 after CPU YUV decode */
     };
     for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); ++i) {
         if (table[i].dxgi == dxgi) {
@@ -4054,12 +4235,19 @@ static int try_auto_translate_indexed_draw(const BeerD3D11PipelineState *state,
                 b->kind            = BEER_VULKAN_GRAPHICS_BINDING_SAMPLED_IMAGE;
                 b->resource        = res;
                 b->serial          = (const uint64_t *)&res->content_serial;
-                b->data            = res->pixels;
-                b->size            = res->pixel_size;
                 b->format          = vk_fmt;
                 b->width           = rdesc[0];
                 b->height          = rdesc[1];
-                if (bpp == 0) {
+                /* NV12: bind the CPU-decoded RGBA8 plane rather than raw YUV. */
+                if (rdesc[4] == 103 /* NV12 */) {
+                    if (!ensure_nv12_cache(res)) return 0;
+                    b->data = res->decoded_rgba;
+                    b->size = res->decoded_rgba_size;
+                    b->bytes_per_pixel = 4;
+                    b->row_pitch = rdesc[0] * 4u;
+                } else if (bpp == 0) {
+                    b->data = res->pixels;
+                    b->size = res->pixel_size;
                     /* Block-compressed texture (BC1-BC7).  Determine
                      * bytes-per-block from the VkFormat number:
                      *   BC1/BC4 (131,132,139,140) -> 4x4 block, 8 bytes
@@ -4074,6 +4262,8 @@ static int try_auto_translate_indexed_draw(const BeerD3D11PipelineState *state,
                     uint32_t blocks_wide = (rdesc[0] + 3u) / 4u;
                     b->row_pitch = res->row_pitch ? res->row_pitch : blocks_wide * bpb;
                 } else {
+                    b->data = res->pixels;
+                    b->size = res->pixel_size;
                     b->bytes_per_pixel = bpp;
                     b->row_pitch = res->row_pitch ? res->row_pitch : rdesc[0] * bpp;
                 }
@@ -4709,6 +4899,52 @@ static void apply_update_subresource(
     const uint32_t *desc = (const uint32_t *)dst->desc;
     if (dst->dimension == 3 && dst->subresource_count) {
         if (subresource >= dst->subresource_count) return;
+        /* NV12 plane updates: plane 0 is the Y plane (width*height bytes),
+         * plane 1 is the interleaved UV plane (width*(height/2) bytes).
+         * RE8 uploads each plane via UpdateSubresource with subresource 0 or 1.
+         * The whole NV12 buffer is stored contiguously: UV follows Y. */
+        if (desc[4] == 103 /* NV12 */ && dst->pixels) {
+            uint32_t nv12_width = desc[0], nv12_height = desc[1];
+            size_t y_size = (size_t)nv12_width * nv12_height;
+            size_t uv_size = (size_t)nv12_width * ((nv12_height + 1u) / 2u);
+            if (subresource == 0 && y_size <= dst->pixel_size) {
+                /* Y plane */
+                uint32_t pitch = source_row_pitch ? source_row_pitch : nv12_width;
+                for (uint32_t row = 0; row < nv12_height; ++row) {
+                    size_t dst_off = (size_t)row * nv12_width;
+                    size_t src_off = (size_t)row * pitch;
+                    size_t copy = pitch < nv12_width ? pitch : nv12_width;
+                    if (dst_off + copy <= y_size)
+                        memcpy(dst->pixels + dst_off,
+                               (const uint8_t *)source + src_off, copy);
+                }
+                resource_mark_written(dst);
+                return;
+            } else if (subresource == 1 && y_size + uv_size <= dst->pixel_size) {
+                /* UV plane */
+                uint32_t uv_rows = (nv12_height + 1u) / 2u;
+                uint32_t pitch = source_row_pitch ? source_row_pitch : nv12_width;
+                for (uint32_t row = 0; row < uv_rows; ++row) {
+                    size_t dst_off = y_size + (size_t)row * nv12_width;
+                    size_t src_off = (size_t)row * pitch;
+                    size_t copy = pitch < nv12_width ? pitch : nv12_width;
+                    if (dst_off + copy <= y_size + uv_size)
+                        memcpy(dst->pixels + dst_off,
+                               (const uint8_t *)source + src_off, copy);
+                }
+                resource_mark_written(dst);
+                return;
+            }
+            /* Fallthrough: whole-buffer NV12 upload without subresource split */
+            if (subresource == 0 && !box) {
+                size_t total = y_size + uv_size;
+                if (total <= dst->pixel_size) {
+                    memcpy(dst->pixels, source, total);
+                    resource_mark_written(dst);
+                }
+                return;
+            }
+        }
         uint32_t block_bytes = texture_format_block_bytes(desc[4]);
         if (block_bytes && box) {
             /* Compressed update boxes are specified in texels but copied in

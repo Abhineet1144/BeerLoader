@@ -26,7 +26,11 @@ typedef enum {
     XWAYLAND_EVENT_KEY_UP,
     XWAYLAND_EVENT_BUTTON_DOWN,
     XWAYLAND_EVENT_BUTTON_UP,
-    XWAYLAND_EVENT_POINTER_MOTION
+    XWAYLAND_EVENT_POINTER_MOTION,
+    /* Unaccelerated relative motion (XInput2 raw); x/y carry the whole-pixel
+     * delta. Keeps arriving when the absolute pointer is clamped at a screen
+     * or window edge, which mouse look relies on. */
+    XWAYLAND_EVENT_RAW_MOTION
 } XwaylandEventType;
 
 typedef struct {
@@ -83,10 +87,15 @@ int xwayland_window_set_icon_argb(const uint32_t *pixels, int width, int height)
 int xwayland_window_set_cursor_visible(int visible);
 /* Moves the native pointer to an absolute desktop coordinate. */
 int xwayland_window_set_cursor_position(int root_x, int root_y);
+/* ClipCursor: confine (1) or release (0) the pointer to the window. */
+int xwayland_window_set_pointer_confine(int enable);
+/* Nonzero once XInput2 raw motion is delivering relative deltas. */
+int xwayland_raw_motion_active(void);
 int xwayland_window_get_state(XwaylandWindowState *state);
 /* Returns the physical screen dimensions in pixels via the X11 display
  * connection.  Falls back to 1920x1080 when the display is unavailable. */
 void xwayland_get_screen_size(int *out_width, int *out_height);
+int xwayland_get_screen_refresh(void);
 /* Returns one native lifecycle event at a time. Input events remain reserved for
  * the DirectInput backend; window activation/configuration belongs to USER32. */
 int xwayland_window_poll_event(XwaylandEvent *event);
@@ -98,6 +107,10 @@ int xwayland_window_present_rgba8(const uint8_t *pixels, int width, int height,
 int xwayland_window_present_resource_rgba8(const void *resource, uint64_t serial,
                                            const uint8_t *pixels, int width,
                                            int height, int row_pitch);
+/* Presents a Vulkan image (handle as uint64_t) directly through the Vulkan
+ * presenter; see vulkan_presenter_present_image. No X11 fallback. */
+int xwayland_window_present_image(uint64_t image, uint32_t layout, int width,
+                                  int height, int direct_blit);
 void xwayland_window_destroy(void);
 int xwayland_window_exists(void);
 

@@ -194,6 +194,25 @@ typedef struct {
     int (*DestroyImage)(XImage *);
     int (*Flush)(Display *);
     int (*Sync)(Display *, Bool);
+    int (*GrabPointer)(Display *, Window, Bool, unsigned int, int, int, Window,
+                       Cursor, unsigned long);
+    int (*UngrabPointer)(Display *, unsigned long);
+    int pointer_confine_wanted;   /* ClipCursor active */
+    int win_decorated;            /* last set_style */
+    int focused;
+    /* XInput2 raw motion */
+    int xi_opcode;
+    int xi_active;
+    double xi_carry_x, xi_carry_y;
+    int (*QueryExtension)(Display *, const char *, int *, int *, int *);
+    int (*GetEventData)(Display *, void *);
+    void (*FreeEventData)(Display *, void *);
+    int (*XIQueryVersion)(Display *, int *, int *);
+    int (*XISelectEvents)(Display *, Window, void *, int);
+    int win_resizable;
+    int fullscreen_applied;       /* _NET_WM_STATE_FULLSCREEN requested by move_resize */
+    int cursor_requested_visible; /* what the guest asked for, before the fullscreen rule */
+    int pointer_confined;         /* an XGrabPointer is currently held */
 } XwaylandBackend;
 
 static XwaylandBackend g_x11 = {
@@ -279,6 +298,11 @@ static int initialize_locked(void)
     X11_LOAD(DestroyImage, "XDestroyImage");
     X11_LOAD(Flush, "XFlush");
     X11_LOAD(Sync, "XSync");
+    X11_LOAD(GrabPointer, "XGrabPointer");
+    X11_LOAD(QueryExtension, "XQueryExtension");
+    X11_LOAD(GetEventData, "XGetEventData");
+    X11_LOAD(FreeEventData, "XFreeEventData");
+    X11_LOAD(UngrabPointer, "XUngrabPointer");
 
     g_x11.InitThreads();
     g_x11.display = g_x11.OpenDisplay(NULL);
@@ -298,6 +322,42 @@ fail:
     g_x11.library = NULL;
     return 0;
 }
+
+/* XInput2 raw motion on the root window: relative deltas that do not stop at
+ * the screen edge (XWayland feeds them from the Wayland relative-pointer). */
+static void setup_xi_raw_motion_locked(void)
+{
+    if (g_x11.xi_active || !g_x11.display || !g_x11.QueryExtension ||
+        getenv("BEER_NO_XI2"))
+        return;
+    void *xi = dlopen("libXi.so.6", RTLD_NOW | RTLD_LOCAL);
+    if (!xi) return;
+    g_x11.XIQueryVersion = (int (*)(Display *, int *, int *))dlsym(xi, "XIQueryVersion");
+    g_x11.XISelectEvents = (int (*)(Display *, Window, void *, int))dlsym(xi, "XISelectEvents");
+    if (!g_x11.XIQueryVersion || !g_x11.XISelectEvents || !g_x11.GetEventData ||
+        !g_x11.FreeEventData)
+        return;
+    int opcode = 0, event_base = 0, error_base = 0;
+    if (!g_x11.QueryExtension(g_x11.display, "XInputExtension", &opcode,
+                              &event_base, &error_base))
+        return;
+    int major = 2, minor = 0;
+    if (g_x11.XIQueryVersion(g_x11.display, &major, &minor) != 0) return;
+    struct { int deviceid; int mask_len; unsigned char *mask; } event_mask;
+    unsigned char bits[4] = { 0, 0, 0, 0 };
+    bits[17 >> 3] |= (unsigned char)(1u << (17 & 7)); /* XI_RawMotion */
+    event_mask.deviceid = 1;                          /* XIAllMasterDevices */
+    event_mask.mask_len = sizeof(bits);
+    event_mask.mask = bits;
+    g_x11.XISelectEvents(g_x11.display, g_x11.DefaultRootWindow(g_x11.display),
+                         &event_mask, 1);
+    g_x11.Flush(g_x11.display);
+    g_x11.xi_opcode = opcode;
+    g_x11.xi_active = 1;
+    fprintf(stderr, "[XWAYLAND] XInput2 %d.%d raw motion enabled\n", major, minor);
+}
+
+int xwayland_raw_motion_active(void) { return g_x11.xi_active; }
 
 int xwayland_window_create(int x, int y, int width, int height,
                            const char *title, int initially_visible)
@@ -412,6 +472,7 @@ int xwayland_window_create(int x, int y, int width, int height,
         g_x11.RaiseWindow(g_x11.display, g_x11.window);
         g_x11.Flush(g_x11.display);
     }
+    setup_xi_raw_motion_locked();
     fprintf(stderr, "[XWAYLAND] native window 0x%lx created (%dx%d)\n",
             g_x11.window, width, height);
     pthread_mutex_unlock(&g_x11.lock);
@@ -452,6 +513,8 @@ int xwayland_window_set_style(int decorated, int resizable)
                              (int)(sizeof(hints) / sizeof(long)));
     }
 
+    g_x11.win_decorated = decorated;
+    g_x11.win_resizable = resizable;
     XSizeHints size_hints;
     memset(&size_hints, 0, sizeof(size_hints));
     if (!resizable) {
@@ -503,6 +566,9 @@ int xwayland_window_set_fullscreen(int fullscreen)
     return ok;
 }
 
+static void screen_size_locked(int *out_w, int *out_h);
+static int apply_cursor_locked(void);
+
 int xwayland_window_move_resize(int x, int y, int width, int height,
                                 int move, int resize)
 {
@@ -517,9 +583,53 @@ int xwayland_window_move_resize(int x, int y, int width, int height,
         pthread_mutex_unlock(&g_x11.lock);
         return 0;
     }
+    if (resize && !g_x11.win_resizable) {
+        /* A fixed-size window pins min == max to the old size; the window
+         * manager would ignore the new size, leaving a borderless "fullscreen"
+         * window stuck at its initial 1080p extent. Re-pin to the new size. */
+        XSizeHints size_hints;
+        memset(&size_hints, 0, sizeof(size_hints));
+        size_hints.flags = (1L << 4) | (1L << 5); /* PMinSize | PMaxSize */
+        size_hints.min_width = size_hints.max_width = width;
+        size_hints.min_height = size_hints.max_height = height;
+        g_x11.SetWMNormalHints(g_x11.display, g_x11.window, &size_hints);
+    }
     g_x11.MoveResizeWindow(g_x11.display, g_x11.window, x, y,
                            (unsigned)width, (unsigned)height);
     g_x11.x = x; g_x11.y = y; g_x11.width = width; g_x11.height = height;
+    if (resize) {
+        /* An undecorated window covering the whole desktop is a borderless
+         * fullscreen window: ask the compositor for fullscreen so panels and
+         * decorations do not constrain it. */
+        int sw = 0, sh = 0;
+        screen_size_locked(&sw, &sh);
+        const int covers = !g_x11.win_decorated && sw > 0 && sh > 0 &&
+                           width >= sw && height >= sh;
+        if (covers != g_x11.fullscreen_applied) {
+            Atom wm_state = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE", 0);
+            Atom wm_fs = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE_FULLSCREEN", 0);
+            if (wm_state && wm_fs) {
+                XEvent event;
+                memset(&event, 0, sizeof(event));
+                XClientMessageEvent *client = (XClientMessageEvent *)&event;
+                client->type = 33;
+                client->display = g_x11.display;
+                client->window = g_x11.window;
+                client->message_type = wm_state;
+                client->format = 32;
+                client->data.l[0] = covers ? 1 : 0;
+                client->data.l[1] = (long)wm_fs;
+                client->data.l[3] = 1;
+                Window root = g_x11.DefaultRootWindow(g_x11.display);
+                g_x11.SendEvent(g_x11.display, root, 0,
+                                (1L << 20) | (1L << 19), &event);
+                g_x11.fullscreen_applied = covers;
+                apply_cursor_locked();
+                fprintf(stderr, "[XWAYLAND] borderless %dx%d covers desktop %dx%d -> fullscreen=%d\n",
+                        width, height, sw, sh, covers);
+            }
+        }
+    }
     if (resize) {
         g_x11.client_width = width;
         g_x11.client_height = height;
@@ -662,9 +772,16 @@ int xwayland_window_request_focus(void)
     return ok;
 }
 
-int xwayland_window_set_cursor_visible(int visible)
+static void apply_pointer_confine_locked(void);
+
+/* Applies the effective host cursor state: the guest's request, except that a
+ * fullscreen (desktop-covering) window never shows the host cursor because the
+ * games that run this way draw their own. BEER_HOST_CURSOR=1 disables that
+ * rule. Called with the lock held. */
+static int apply_cursor_locked(void)
 {
-    pthread_mutex_lock(&g_x11.lock);
+    int visible = g_x11.cursor_requested_visible;
+    if (g_x11.fullscreen_applied && !getenv("BEER_HOST_CURSOR")) visible = 0;
     int ok = g_x11.display && g_x11.window;
     if (ok && !!visible != g_x11.cursor_visible) {
         if (visible) {
@@ -692,9 +809,18 @@ int xwayland_window_set_cursor_visible(int visible)
         }
         if (ok) {
             g_x11.cursor_visible = !!visible;
+            apply_pointer_confine_locked();
             g_x11.Flush(g_x11.display);
         }
     }
+    return ok;
+}
+
+int xwayland_window_set_cursor_visible(int visible)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    g_x11.cursor_requested_visible = !!visible;
+    const int ok = apply_cursor_locked();
     pthread_mutex_unlock(&g_x11.lock);
     return ok;
 }
@@ -709,6 +835,46 @@ int xwayland_window_set_cursor_position(int root_x, int root_y)
                                       root_x, root_y) != 0;
         if (ok) g_x11.Flush(g_x11.display);
     }
+    pthread_mutex_unlock(&g_x11.lock);
+    return ok;
+}
+
+/* Grab the pointer and confine it to the window (ClipCursor). XWayland maps a
+ * confining grab to a Wayland confined/locked pointer, and with a hidden cursor
+ * it emulates pointer lock for XWarpPointer-based mouse look. Called with the
+ * lock held. */
+static void apply_pointer_confine_locked(void)
+{
+    if (!g_x11.display || !g_x11.window || !g_x11.GrabPointer) return;
+    /* A hidden cursor means the game draws its own and reads relative motion,
+     * so the host pointer must stay inside the window just like under
+     * ClipCursor; otherwise it escapes to the desktop at the window edge. */
+    const int want = g_x11.pointer_confine_wanted || !g_x11.cursor_visible;
+    if (want && !g_x11.pointer_confined && g_x11.visible) {
+        const unsigned int mask = (1u << 2) | (1u << 3) | (1u << 6) | (1u << 13); /* press, release, motion, ButtonMotion */
+        const int result = g_x11.GrabPointer(g_x11.display, g_x11.window, 1,
+                                             mask, 1, 1, g_x11.window, 0, 0);
+        g_x11.pointer_confined = result == 0;
+        g_x11.Flush(g_x11.display);
+        if (getenv("BEER_INPUT_DIAGNOSTICS"))
+            fprintf(stderr, "[INPUT] XGrabPointer(confine) -> %d\n", result);
+    } else if ((!want || !g_x11.visible) && g_x11.pointer_confined) {
+        g_x11.UngrabPointer(g_x11.display, 0);
+        g_x11.pointer_confined = 0;
+        g_x11.Flush(g_x11.display);
+        if (getenv("BEER_INPUT_DIAGNOSTICS"))
+            fprintf(stderr, "[INPUT] XUngrabPointer\n");
+    }
+}
+
+int xwayland_window_set_pointer_confine(int enable)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    const int changed = g_x11.pointer_confine_wanted != (enable != 0);
+    g_x11.pointer_confine_wanted = enable != 0;
+    if (changed || (enable && !g_x11.pointer_confined))
+        apply_pointer_confine_locked();
+    const int ok = g_x11.display && g_x11.window;
     pthread_mutex_unlock(&g_x11.lock);
     return ok;
 }
@@ -748,10 +914,25 @@ int xwayland_window_get_state(XwaylandWindowState *state)
     return ok;
 }
 
+static void screen_size_locked(int *out_w, int *out_h)
+{
+    int w = 0, h = 0;
+    if (g_x11.display && g_x11.library) {
+        typedef int (*XDisplayDim)(Display *, int);
+        XDisplayDim get_w = (XDisplayDim)dlsym(g_x11.library, "XDisplayWidth");
+        XDisplayDim get_h = (XDisplayDim)dlsym(g_x11.library, "XDisplayHeight");
+        if (get_w && get_h) { w = get_w(g_x11.display, 0); h = get_h(g_x11.display, 0); }
+    }
+    *out_w = w; *out_h = h;
+}
+
 void xwayland_get_screen_size(int *out_width, int *out_height)
 {
     int w = 1920, h = 1080;
     pthread_mutex_lock(&g_x11.lock);
+    /* DXGI and USER32 query the desktop before any window exists; connect now
+     * (the window creation path reuses this connection). */
+    if (!g_x11.initialized) initialize_locked();
     if (g_x11.display) {
         /* XDefaultScreen returns the index of the default screen.
          * WidthOfScreen / HeightOfScreen are macros over the Screen struct,
@@ -773,6 +954,37 @@ void xwayland_get_screen_size(int *out_width, int *out_height)
     pthread_mutex_unlock(&g_x11.lock);
     if (out_width)  *out_width  = w;
     if (out_height) *out_height = h;
+}
+
+/* Current refresh rate of the default screen in Hz (XRandR), 60 if unknown. */
+int xwayland_get_screen_refresh(void)
+{
+    int hz = 60;
+    pthread_mutex_lock(&g_x11.lock);
+    if (!g_x11.initialized) initialize_locked();
+    if (g_x11.display) {
+        void *xrr = dlopen("libXrandr.so.2", RTLD_NOW | RTLD_LOCAL);
+        if (xrr) {
+            typedef void *(*GetInfo)(Display *, Window);
+            typedef short (*CurRate)(void *);
+            typedef void (*Free)(void *);
+            GetInfo get_info = (GetInfo)dlsym(xrr, "XRRGetScreenInfo");
+            CurRate cur_rate = (CurRate)dlsym(xrr, "XRRConfigCurrentRate");
+            Free free_info = (Free)dlsym(xrr, "XRRFreeScreenConfigInfo");
+            if (get_info && cur_rate && free_info) {
+                void *info = get_info(g_x11.display,
+                                      g_x11.DefaultRootWindow(g_x11.display));
+                if (info) {
+                    short rate = cur_rate(info);
+                    if (rate >= 24 && rate <= 1000) hz = rate;
+                    free_info(info);
+                }
+            }
+            dlclose(xrr);
+        }
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    return hz;
 }
 
 int xwayland_window_poll_event(XwaylandEvent *out)
@@ -817,8 +1029,58 @@ int xwayland_window_poll_event(XwaylandEvent *out)
             out->state = motion->state;
             break;
         }
-        case 9: out->type = XWAYLAND_EVENT_FOCUS_IN; break;
-        case 10: out->type = XWAYLAND_EVENT_FOCUS_OUT; break;
+        case 35: { /* GenericEvent: XInput2 raw motion */
+            struct {
+                int type; unsigned long serial; int send_event; Display *display;
+                int extension; int evtype; unsigned long time; int deviceid;
+                int sourceid; int detail; int flags;
+                struct { int mask_len; unsigned char *mask; double *values; } valuators;
+                double *raw_values;
+            } *xi;
+            XEvent *ev = &event;
+            struct { int type; unsigned long serial; int send_event; Display *display;
+                     int extension; int evtype; unsigned int cookie; void *data; } *cookie =
+                (void *)ev;
+            if (g_x11.xi_active && cookie->extension == g_x11.xi_opcode &&
+                g_x11.GetEventData(g_x11.display, cookie) && cookie->data) {
+                xi = cookie->data;
+                if (xi->evtype == 17 && xi->valuators.mask && xi->raw_values) {
+                    double dx = 0, dy = 0;
+                    int index = 0;
+                    for (int bit = 0; bit < xi->valuators.mask_len * 8 && bit < 2; ++bit) {
+                        if (!(xi->valuators.mask[bit >> 3] & (1u << (bit & 7)))) continue;
+                        if (bit == 0) dx = xi->raw_values[index];
+                        else dy = xi->raw_values[index];
+                        ++index;
+                    }
+                    g_x11.xi_carry_x += dx;
+                    g_x11.xi_carry_y += dy;
+                    const int ix = (int)g_x11.xi_carry_x, iy = (int)g_x11.xi_carry_y;
+                    g_x11.xi_carry_x -= ix;
+                    g_x11.xi_carry_y -= iy;
+                    if (ix || iy) {
+                        out->type = XWAYLAND_EVENT_RAW_MOTION;
+                        out->x = ix;
+                        out->y = iy;
+                    }
+                }
+                g_x11.FreeEventData(g_x11.display, cookie);
+            }
+            break;
+        }
+        case 9:
+            g_x11.focused = 1;
+            out->type = XWAYLAND_EVENT_FOCUS_IN;
+            apply_pointer_confine_locked();   /* re-confine after refocus */
+            break;
+        case 10:
+            g_x11.focused = 0;
+            out->type = XWAYLAND_EVENT_FOCUS_OUT;
+            if (g_x11.pointer_confined) {      /* never keep a grab while unfocused */
+                g_x11.UngrabPointer(g_x11.display, 0);
+                g_x11.pointer_confined = 0;
+            }
+            break;
         case 12:
             g_x11.source_hash_valid = 0;
             out->type = XWAYLAND_EVENT_EXPOSE;
@@ -829,6 +1091,7 @@ int xwayland_window_poll_event(XwaylandEvent *out)
             g_x11.source_hash_valid = 0;
             if (g_x11.focus_requested && request_focus_locked())
                 g_x11.focus_requested = 0;
+            apply_pointer_confine_locked();
             out->type = XWAYLAND_EVENT_SHOW;
             break;
         case 22: {
@@ -1040,6 +1303,21 @@ int xwayland_window_present_resource_rgba8(const void *resource, uint64_t serial
 {
     return present_rgba8_internal(resource, serial, pixels,
                                   width, height, row_pitch);
+}
+
+int xwayland_window_present_image(uint64_t image, uint32_t layout, int width,
+                                  int height, int direct_blit)
+{
+    if (width <= 0 || height <= 0) return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    int ok = g_x11.display && g_x11.window && g_x11.presenter != XWAYLAND_PRESENTER_X11;
+    int output_width = g_x11.width > 0 ? g_x11.width : width;
+    int output_height = g_x11.height > 0 ? g_x11.height : height;
+    int result = ok && vulkan_presenter_present_image(
+        g_x11.display, g_x11.window, image, layout, width, height,
+        direct_blit, output_width, output_height);
+    pthread_mutex_unlock(&g_x11.lock);
+    return result;
 }
 
 void xwayland_window_destroy(void)

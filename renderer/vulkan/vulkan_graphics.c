@@ -1,7 +1,32 @@
 #define _GNU_SOURCE
 #include "vulkan_graphics.h"
 #include "vulkan_context.h"
-#include "vulkan_compute.h"
+/* Compute-produced image mirrors and CPU-shadow publication came from the
+ * removed host-snapshot D3D12 bridge; D3D11 rendering has neither, so these
+ * are inert and every image is uploaded from its source. */
+typedef struct BeerVulkanComputeImageMirror {
+    uint64_t image;
+    uint32_t format, width, height, depth, layers, dimension, mip_levels, layout;
+    void *token;
+} BeerVulkanComputeImageMirror;
+static inline void beer_vulkan_compute_sync_buffer_resources(
+    const void *const *resources, uint32_t count)
+{ (void)resources; (void)count; }
+static inline int beer_vulkan_compute_has_image_mirror(
+    const void *resource, uint64_t serial, uint32_t format, uint32_t width,
+    uint32_t height, uint32_t depth, uint32_t layers, uint32_t dimension,
+    uint32_t mip_levels)
+{ (void)resource; (void)serial; (void)format; (void)width; (void)height;
+  (void)depth; (void)layers; (void)dimension; (void)mip_levels; return 0; }
+static inline int beer_vulkan_compute_acquire_image_mirror(
+    const void *resource, uint64_t serial, uint32_t format, uint32_t width,
+    uint32_t height, uint32_t depth, uint32_t layers, uint32_t dimension,
+    uint32_t mip_levels, BeerVulkanComputeImageMirror *mirror)
+{ (void)resource; (void)serial; (void)format; (void)width; (void)height;
+  (void)depth; (void)layers; (void)dimension; (void)mip_levels; (void)mirror;
+  return 0; }
+static inline void beer_vulkan_compute_release_image_mirror(
+    BeerVulkanComputeImageMirror *mirror) { (void)mirror; }
 
 #include <pthread.h>
 #include <dlfcn.h>
@@ -1807,6 +1832,33 @@ int beer_vulkan_graphics_draw_state(
     static const char *unused;
     if (!reason) reason = &unused;
     *reason = "invalid arguments";
+    /* Publish only resident buffers this draw reads on the CPU. Publishing all
+     * dirty DEFAULT buffers at every draw defeated R6 residency and inserted a
+     * readback submission/fence before unrelated graphics work. */
+    const void *read_resources[BEER_VULKAN_GRAPHICS_MAX_VERTEX_BINDINGS +
+                               BEER_VULKAN_GRAPHICS_MAX_BINDINGS + 1];
+    uint32_t read_resource_count = 0;
+    if (draw_info) {
+        for (uint32_t slot = 0;
+             slot < draw_info->vertex_binding_count &&
+             slot < BEER_VULKAN_GRAPHICS_MAX_VERTEX_BINDINGS; ++slot)
+            if (draw_info->vertex_bindings[slot].resource)
+                read_resources[read_resource_count++] =
+                    draw_info->vertex_bindings[slot].resource;
+        if (draw_info->indexed && draw_info->index_resource)
+            read_resources[read_resource_count++] = draw_info->index_resource;
+    }
+    for (uint32_t binding = 0; binding < binding_count; ++binding)
+        if (bindings[binding].resource &&
+            (bindings[binding].kind ==
+                 BEER_VULKAN_GRAPHICS_BINDING_UNIFORM_BUFFER ||
+             bindings[binding].kind ==
+                 BEER_VULKAN_GRAPHICS_BINDING_STORAGE_BUFFER ||
+             bindings[binding].kind ==
+                 BEER_VULKAN_GRAPHICS_BINDING_UNIFORM_TEXEL_BUFFER))
+            read_resources[read_resource_count++] = bindings[binding].resource;
+    beer_vulkan_compute_sync_buffer_resources(read_resources,
+                                               read_resource_count);
     const uint32_t entry_target_count = target_count;
     BeerVulkanGraphicsDepthTarget *const entry_depth = depth;
     BeerVulkanGraphicsState state;
@@ -2983,32 +3035,47 @@ int beer_vulkan_graphics_draw_state(
         .commandBufferCount = 1,
         .pCommandBuffers = &g_graphics.command_buffer
     };
-    if (g_graphics.ResetFences(g_graphics.device, 1, &g_graphics.fence) !=
-        VK_SUCCESS) {
-        failure = "fence reset failed";
-        goto cleanup;
-    }
     profile_submit_ns = monotonic_nanoseconds();
-    beer_vulkan_queue_lock();
-    VkResult submitted = g_graphics.QueueSubmit(g_graphics.queue, 1, &submit,
-                                                 g_graphics.fence);
-    beer_vulkan_queue_unlock();
+    VkResult submitted = VK_SUCCESS;
+    VkResult waited = VK_SUCCESS;
+    if (beer_vulkan_timeline_enabled()) {
+        const uint64_t value = beer_vulkan_timeline_submit(
+            &g_graphics.command_buffer, 1);
+        if (!value)
+            submitted = beer_vulkan_device_lost() ? VK_ERROR_DEVICE_LOST :
+                VK_ERROR_INITIALIZATION_FAILED;
+        else if (!beer_vulkan_timeline_wait(value, UINT64_MAX))
+            waited = beer_vulkan_device_lost() ? VK_ERROR_DEVICE_LOST :
+                VK_TIMEOUT;
+    } else {
+        if (g_graphics.ResetFences(g_graphics.device, 1, &g_graphics.fence) !=
+            VK_SUCCESS) {
+            failure = "fence reset failed";
+            goto cleanup;
+        }
+        beer_vulkan_queue_lock();
+        submitted = g_graphics.QueueSubmit(g_graphics.queue, 1, &submit,
+                                            g_graphics.fence);
+        beer_vulkan_queue_unlock();
+        if (submitted == VK_SUCCESS)
+            waited = g_graphics.WaitForFences(
+                g_graphics.device, 1, &g_graphics.fence, VK_TRUE, UINT64_MAX);
+    }
     if (submitted == VK_SUCCESS) {
         ++g_graphics.queue_submissions;
         g_graphics.draw_commands += recorded_draw_commands;
     }
     if (submitted != VK_SUCCESS) {
         beer_vulkan_record_result(submitted, "graphics queue submission");
-        fprintf(stderr, "[VULKAN GRAPHICS] vkQueueSubmit result=%d\n", submitted);
+        fprintf(stderr, "[VULKAN GRAPHICS] queue submission result=%d\n",
+                submitted);
         failure = "graphics submission failed";
         goto cleanup;
     }
-    VkResult waited = g_graphics.WaitForFences(
-        g_graphics.device, 1, &g_graphics.fence, VK_TRUE, UINT64_MAX);
     ++g_graphics.fence_waits;
     if (waited != VK_SUCCESS) {
-        beer_vulkan_record_result(waited, "graphics fence wait");
-        fprintf(stderr, "[VULKAN GRAPHICS] vkWaitForFences result=%d "
+        beer_vulkan_record_result(waited, "graphics completion wait");
+        fprintf(stderr, "[VULKAN GRAPHICS] completion wait result=%d "
                 "after-ms=%.1f vs=%016llx ps=%016llx elements=%u "
                 "depth=%ux%u ptr=%p depth-test=%u target-count=%u\n", waited,
                 (monotonic_nanoseconds() - profile_submit_ns) / 1e6,

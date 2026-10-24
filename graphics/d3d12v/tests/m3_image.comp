@@ -1,0 +1,17 @@
+#version 450
+
+// M3 test shader. Semantic bindings (compute stage 0):
+//   SRV image t0   -> 1 * 0x2000       = 8192
+//   UAV image u0   -> 3 * 0x2000       = 24576
+//   sampler  s0    -> 5 * 0x2000       = 40960
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 8192) uniform texture2D t0;
+layout(set = 0, binding = 40960) uniform sampler s0;
+layout(set = 0, binding = 24576, rgba8) uniform writeonly image2D u0;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = (vec2(p) + 0.5) / 64.0;
+    imageStore(u0, p, textureLod(sampler2D(t0, s0), uv, 0.0));
+}

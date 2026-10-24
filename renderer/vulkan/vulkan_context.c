@@ -30,11 +30,21 @@ typedef struct {
     int robustness2;
     int pipeline_robustness;
     int sampler_filter_minmax;
+    int timeline_semaphore;
+    int texel_buffer_alignment;
+    BeerVulkanModern modern;
     int device_lost;
+    VkSemaphore timeline;
+    _Atomic uint64_t timeline_next_value;
     PFN_vkCreateDevice CreateDevice;
     PFN_vkDestroyDevice DestroyDevice;
     PFN_vkGetDeviceQueue GetDeviceQueue;
     PFN_vkDeviceWaitIdle DeviceWaitIdle;
+    PFN_vkQueueSubmit QueueSubmit;
+    PFN_vkCreateSemaphore CreateSemaphore;
+    PFN_vkDestroySemaphore DestroySemaphore;
+    PFN_vkWaitSemaphoresKHR WaitSemaphoresKHR;
+    PFN_vkGetSemaphoreCounterValueKHR GetSemaphoreCounterValueKHR;
     int initialized;
     int unavailable;
 } BeerVulkanContext;
@@ -191,13 +201,22 @@ int beer_vulkan_context_initialize(void)
         "VK_KHR_xlib_surface",
         "VK_KHR_get_physical_device_properties2"
     };
+    /* Request Vulkan 1.3 when the loader reports it so the physical device
+     * can expose core 1.2/1.3 features; older stacks stay on 1.0. */
+    uint32_t instance_version = VK_API_VERSION_1_0;
+    PFN_vkEnumerateInstanceVersion enumerate_instance_version =
+        (PFN_vkEnumerateInstanceVersion)g_context.GetInstanceProcAddr(
+            NULL, "vkEnumerateInstanceVersion");
+    if (enumerate_instance_version)
+        enumerate_instance_version(&instance_version);
     VkApplicationInfo application = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "Beer",
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "Beer D3D11 Vulkan",
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-        .apiVersion = VK_API_VERSION_1_0
+        .apiVersion = instance_version >= VK_API_VERSION_1_3 ?
+            VK_API_VERSION_1_3 : VK_API_VERSION_1_0
     };
     VkInstanceCreateInfo instance_info = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -263,7 +282,7 @@ int beer_vulkan_context_initialize(void)
     };
     /* VK_KHR_maintenance1 permits negative viewport heights, which graphics
      * execution uses to preserve D3D's upward-Y clip space. */
-    const char *device_extensions[5] = { "VK_KHR_swapchain" };
+    const char *device_extensions[8] = { "VK_KHR_swapchain" };
     uint32_t device_extension_count = 1;
     {
         uint32_t available_count = 0;
@@ -301,6 +320,23 @@ int beer_vulkan_context_initialize(void)
                 device_extensions[device_extension_count++] =
                     VK_EXT_SAMPLER_FILTER_MINMAX_EXTENSION_NAME;
                 g_context.sampler_filter_minmax = 1;
+            } else if (!g_context.timeline_semaphore &&
+                       strcmp(available[i].extensionName,
+                              VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) == 0) {
+                device_extensions[device_extension_count++] =
+                    VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
+                g_context.timeline_semaphore = 1;
+            } else if (!g_context.texel_buffer_alignment &&
+                       strcmp(available[i].extensionName,
+                              VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME) == 0) {
+                device_extensions[device_extension_count++] =
+                    VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME;
+                g_context.texel_buffer_alignment = 1;
+            } else if (getenv("BEER_VK_CHECKPOINTS") &&
+                       strcmp(available[i].extensionName,
+                              "VK_NV_device_diagnostic_checkpoints") == 0) {
+                device_extensions[device_extension_count++] =
+                    "VK_NV_device_diagnostic_checkpoints";
             }
         }
         free(available);
@@ -314,31 +350,166 @@ int beer_vulkan_context_initialize(void)
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT
     };
-    VkPhysicalDevicePipelineRobustnessFeaturesEXT pipeline_robustness = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT,
-        .pNext = g_context.robustness2 ? &robustness2 : NULL
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES
     };
-    if (g_context.robustness2 || g_context.pipeline_robustness) {
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT pipeline_robustness = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT
+    };
+    VkPhysicalDeviceTexelBufferAlignmentPropertiesEXT texel_alignment = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES_EXT
+    };
+    /* Core 1.2/1.3 feature structs replace the extension-specific timeline
+     * struct (the two must not be chained together). */
+    VkPhysicalDeviceProperties physical_properties;
+    memset(&physical_properties, 0, sizeof(physical_properties));
+    g_context.GetPhysicalDeviceProperties(g_context.physical_device,
+                                          &physical_properties);
+    if (g_context.texel_buffer_alignment) {
+        PFN_vkGetPhysicalDeviceProperties2 get_properties2 =
+            (PFN_vkGetPhysicalDeviceProperties2)g_context.GetInstanceProcAddr(
+                g_context.instance, "vkGetPhysicalDeviceProperties2");
+        if (get_properties2) {
+            VkPhysicalDeviceProperties2 properties2 = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                .pNext = &texel_alignment
+            };
+            get_properties2(g_context.physical_device, &properties2);
+        } else {
+            g_context.texel_buffer_alignment = 0;
+        }
+    }
+    const int core13 = (application.apiVersion >= VK_API_VERSION_1_3 &&
+                        physical_properties.apiVersion >= VK_API_VERSION_1_3);
+    VkPhysicalDeviceVulkan12Features v12_supported = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+    };
+    VkPhysicalDeviceVulkan13Features v13_supported = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .pNext = &v12_supported
+    };
+    VkPhysicalDeviceVulkan12Features v12_enabled = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+    };
+    VkPhysicalDeviceVulkan13Features v13_enabled = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .pNext = &v12_enabled
+    };
+    void *feature_chain = NULL;
+    if (g_context.robustness2) {
+        robustness2.pNext = feature_chain;
+        feature_chain = &robustness2;
+    }
+    if (g_context.pipeline_robustness) {
+        pipeline_robustness.pNext = feature_chain;
+        feature_chain = &pipeline_robustness;
+    }
+    if (g_context.timeline_semaphore && !core13) {
+        timeline_features.pNext = feature_chain;
+        feature_chain = &timeline_features;
+    }
+    if (feature_chain) {
         VkPhysicalDeviceFeatures2 features2 = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-            .pNext = g_context.pipeline_robustness ?
-                (void *)&pipeline_robustness : (void *)&robustness2
+            .pNext = feature_chain
         };
         g_context.GetPhysicalDeviceFeatures2KHR(g_context.physical_device,
                                                 &features2);
     }
     g_context.pipeline_robustness = g_context.pipeline_robustness &&
         pipeline_robustness.pipelineRobustness;
+    if (core13) {
+        VkPhysicalDeviceFeatures2 features2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &v13_supported
+        };
+        g_context.GetPhysicalDeviceFeatures2KHR(g_context.physical_device,
+                                                &features2);
+        const VkPhysicalDeviceVulkan12Features *s12 = &v12_supported;
+        const VkPhysicalDeviceVulkan13Features *s13 = &v13_supported;
+        v12_enabled.timelineSemaphore = s12->timelineSemaphore;
+        v12_enabled.bufferDeviceAddress = s12->bufferDeviceAddress;
+        v12_enabled.scalarBlockLayout = s12->scalarBlockLayout;
+        v12_enabled.hostQueryReset = s12->hostQueryReset;
+        v12_enabled.drawIndirectCount = s12->drawIndirectCount;
+        v12_enabled.descriptorIndexing = s12->descriptorIndexing;
+        v12_enabled.runtimeDescriptorArray = s12->runtimeDescriptorArray;
+        v12_enabled.descriptorBindingPartiallyBound =
+            s12->descriptorBindingPartiallyBound;
+        v12_enabled.descriptorBindingVariableDescriptorCount =
+            s12->descriptorBindingVariableDescriptorCount;
+        v12_enabled.descriptorBindingUpdateUnusedWhilePending =
+            s12->descriptorBindingUpdateUnusedWhilePending;
+        v12_enabled.descriptorBindingSampledImageUpdateAfterBind =
+            s12->descriptorBindingSampledImageUpdateAfterBind;
+        v12_enabled.descriptorBindingStorageImageUpdateAfterBind =
+            s12->descriptorBindingStorageImageUpdateAfterBind;
+        v12_enabled.descriptorBindingStorageBufferUpdateAfterBind =
+            s12->descriptorBindingStorageBufferUpdateAfterBind;
+        v12_enabled.descriptorBindingUniformBufferUpdateAfterBind =
+            s12->descriptorBindingUniformBufferUpdateAfterBind;
+        v12_enabled.descriptorBindingUniformTexelBufferUpdateAfterBind =
+            s12->descriptorBindingUniformTexelBufferUpdateAfterBind;
+        v12_enabled.descriptorBindingStorageTexelBufferUpdateAfterBind =
+            s12->descriptorBindingStorageTexelBufferUpdateAfterBind;
+        v12_enabled.shaderSampledImageArrayNonUniformIndexing =
+            s12->shaderSampledImageArrayNonUniformIndexing;
+        v12_enabled.shaderStorageImageArrayNonUniformIndexing =
+            s12->shaderStorageImageArrayNonUniformIndexing;
+        v12_enabled.shaderStorageBufferArrayNonUniformIndexing =
+            s12->shaderStorageBufferArrayNonUniformIndexing;
+        v12_enabled.shaderUniformBufferArrayNonUniformIndexing =
+            s12->shaderUniformBufferArrayNonUniformIndexing;
+        v12_enabled.shaderUniformTexelBufferArrayNonUniformIndexing =
+            s12->shaderUniformTexelBufferArrayNonUniformIndexing;
+        v12_enabled.shaderStorageTexelBufferArrayNonUniformIndexing =
+            s12->shaderStorageTexelBufferArrayNonUniformIndexing;
+        v13_enabled.synchronization2 = s13->synchronization2;
+        v13_enabled.dynamicRendering = s13->dynamicRendering;
+        v13_enabled.maintenance4 = s13->maintenance4;
+        v13_enabled.shaderDemoteToHelperInvocation =
+            s13->shaderDemoteToHelperInvocation;
+        v12_enabled.pNext = feature_chain;
+        feature_chain = &v13_enabled;
+        g_context.timeline_semaphore = v12_enabled.timelineSemaphore;
+        g_context.modern.api_version = physical_properties.apiVersion;
+        g_context.modern.buffer_device_address =
+            v12_enabled.bufferDeviceAddress;
+        g_context.modern.synchronization2 = v13_enabled.synchronization2;
+        g_context.modern.dynamic_rendering = v13_enabled.dynamicRendering;
+        g_context.modern.descriptor_indexing =
+            v12_enabled.descriptorIndexing &&
+            v12_enabled.runtimeDescriptorArray &&
+            v12_enabled.descriptorBindingPartiallyBound &&
+            v12_enabled.descriptorBindingSampledImageUpdateAfterBind &&
+            v12_enabled.descriptorBindingStorageImageUpdateAfterBind &&
+            v12_enabled.descriptorBindingStorageBufferUpdateAfterBind;
+        g_context.modern.scalar_block_layout = v12_enabled.scalarBlockLayout;
+        g_context.modern.host_query_reset = v12_enabled.hostQueryReset;
+        g_context.modern.maintenance4 = v13_enabled.maintenance4;
+        g_context.modern.demote_to_helper =
+            v13_enabled.shaderDemoteToHelperInvocation;
+    } else {
+        g_context.timeline_semaphore = g_context.timeline_semaphore &&
+            timeline_features.timelineSemaphore;
+    }
+    if (g_context.texel_buffer_alignment) {
+        g_context.modern.uniform_texel_buffer_offset_alignment =
+            texel_alignment.uniformTexelBufferOffsetAlignmentBytes;
+        g_context.modern.storage_texel_buffer_offset_alignment =
+            texel_alignment.storageTexelBufferOffsetAlignmentBytes;
+        g_context.modern.uniform_texel_buffer_offset_single_texel =
+            texel_alignment.uniformTexelBufferOffsetSingleTexelAlignment;
+        g_context.modern.storage_texel_buffer_offset_single_texel =
+            texel_alignment.storageTexelBufferOffsetSingleTexelAlignment;
+    }
     /* D3D requires defined out-of-bounds buffer and image behavior. Core
      * robustness covers buffers, while robustness2 extends this to images and
      * tighter buffer bounds used by translated structured/typed views. */
     g_context.enabled_features.robustBufferAccess =
         supported.robustBufferAccess;
     g_context.enabled_features.samplerAnisotropy = supported.samplerAnisotropy;
-    VkPhysicalDeviceProperties properties;
-    memset(&properties, 0, sizeof(properties));
-    g_context.GetPhysicalDeviceProperties(g_context.physical_device,
-                                          &properties);
+    const VkPhysicalDeviceProperties properties = physical_properties;
     g_context.max_sampler_anisotropy = supported.samplerAnisotropy ?
         (uint32_t)properties.limits.maxSamplerAnisotropy : 1u;
     robustness2.robustBufferAccess2 = robustness2.robustBufferAccess2;
@@ -360,9 +531,35 @@ int beer_vulkan_context_initialize(void)
     g_context.enabled_features.shaderInt16 = supported.shaderInt16;
     g_context.enabled_features.shaderInt64 = supported.shaderInt64;
     g_context.enabled_features.shaderFloat64 = supported.shaderFloat64;
-    const void *device_features = g_context.pipeline_robustness ?
-        (const void *)&pipeline_robustness :
-        g_context.robustness2 ? (const void *)&robustness2 : NULL;
+    /* Features a D3D12-on-Vulkan core needs for full pipeline-state coverage;
+     * each is enabled only when the device supports it. */
+#define BEER_ENABLE_FEATURE(name) \
+    g_context.enabled_features.name = supported.name
+    BEER_ENABLE_FEATURE(independentBlend);
+    BEER_ENABLE_FEATURE(dualSrcBlend);
+    BEER_ENABLE_FEATURE(logicOp);
+    BEER_ENABLE_FEATURE(depthClamp);
+    BEER_ENABLE_FEATURE(depthBiasClamp);
+    BEER_ENABLE_FEATURE(depthBounds);
+    BEER_ENABLE_FEATURE(fillModeNonSolid);
+    BEER_ENABLE_FEATURE(wideLines);
+    BEER_ENABLE_FEATURE(multiDrawIndirect);
+    BEER_ENABLE_FEATURE(drawIndirectFirstInstance);
+    BEER_ENABLE_FEATURE(fullDrawIndexUint32);
+    BEER_ENABLE_FEATURE(geometryShader);
+    BEER_ENABLE_FEATURE(tessellationShader);
+    BEER_ENABLE_FEATURE(shaderClipDistance);
+    BEER_ENABLE_FEATURE(shaderCullDistance);
+    BEER_ENABLE_FEATURE(multiViewport);
+    BEER_ENABLE_FEATURE(textureCompressionBC);
+    BEER_ENABLE_FEATURE(imageCubeArray);
+    BEER_ENABLE_FEATURE(sampleRateShading);
+    BEER_ENABLE_FEATURE(fragmentStoresAndAtomics);
+    BEER_ENABLE_FEATURE(vertexPipelineStoresAndAtomics);
+    BEER_ENABLE_FEATURE(shaderStorageImageMultisample);
+    BEER_ENABLE_FEATURE(occlusionQueryPrecise);
+#undef BEER_ENABLE_FEATURE
+    const void *device_features = feature_chain;
     VkDeviceCreateInfo device_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = device_features,
@@ -378,8 +575,35 @@ int beer_vulkan_context_initialize(void)
     LOAD_DEVICE(DestroyDevice);
     LOAD_DEVICE(GetDeviceQueue);
     LOAD_DEVICE(DeviceWaitIdle);
+    LOAD_DEVICE(QueueSubmit);
+    LOAD_DEVICE(CreateSemaphore);
+    LOAD_DEVICE(DestroySemaphore);
+    if (g_context.timeline_semaphore) {
+        g_context.WaitSemaphoresKHR = (PFN_vkWaitSemaphoresKHR)
+            g_context.GetDeviceProcAddr(g_context.device, "vkWaitSemaphoresKHR");
+        g_context.GetSemaphoreCounterValueKHR =
+            (PFN_vkGetSemaphoreCounterValueKHR)g_context.GetDeviceProcAddr(
+                g_context.device, "vkGetSemaphoreCounterValueKHR");
+        if (!g_context.WaitSemaphoresKHR ||
+            !g_context.GetSemaphoreCounterValueKHR)
+            g_context.timeline_semaphore = 0;
+    }
     g_context.GetDeviceQueue(g_context.device, g_context.queue_family, 0,
                              &g_context.queue);
+    if (g_context.timeline_semaphore) {
+        VkSemaphoreTypeCreateInfo timeline_type = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+            .initialValue = 0
+        };
+        VkSemaphoreCreateInfo semaphore_info = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = &timeline_type
+        };
+        if (g_context.CreateSemaphore(g_context.device, &semaphore_info, NULL,
+                                      &g_context.timeline) != VK_SUCCESS)
+            g_context.timeline_semaphore = 0;
+    }
     g_context.initialized = 1;
     if (getenv("BEER_VULKAN_GPU_KEEPALIVE")) {
         pthread_t keepalive;
@@ -389,12 +613,22 @@ int beer_vulkan_context_initialize(void)
     fprintf(stderr,
             "[VULKAN] shared device initialized (queue family %u, "
             "robust-buffer=%u robust-buffer2=%u robust-image2=%u "
-            "pipeline-robustness=%u)\n",
+            "pipeline-robustness=%u timeline=%u)\n",
             g_context.queue_family,
             g_context.enabled_features.robustBufferAccess,
             g_context.robustness2 ? robustness2.robustBufferAccess2 : 0,
             g_context.robustness2 ? robustness2.robustImageAccess2 : 0,
-            g_context.pipeline_robustness);
+            g_context.pipeline_robustness, g_context.timeline_semaphore);
+    fprintf(stderr,
+            "[VULKAN] core features: api=%u.%u bda=%d sync2=%d dynrender=%d "
+            "descriptor-indexing=%d scalar-layout=%d\n",
+            VK_VERSION_MAJOR(g_context.modern.api_version),
+            VK_VERSION_MINOR(g_context.modern.api_version),
+            g_context.modern.buffer_device_address,
+            g_context.modern.synchronization2,
+            g_context.modern.dynamic_rendering,
+            g_context.modern.descriptor_indexing,
+            g_context.modern.scalar_block_layout);
     pthread_mutex_unlock(&g_context_lock);
     return 1;
 
@@ -419,6 +653,10 @@ uint32_t beer_vulkan_queue_family(void) { return g_context.queue_family; }
 const VkPhysicalDeviceFeatures *beer_vulkan_enabled_features(void)
 {
     return &g_context.enabled_features;
+}
+const BeerVulkanModern *beer_vulkan_modern(void)
+{
+    return &g_context.modern;
 }
 int beer_vulkan_maintenance1_enabled(void)
 {
@@ -460,6 +698,75 @@ PFN_vkGetDeviceProcAddr beer_vulkan_get_device_proc_addr(void)
 void beer_vulkan_queue_lock(void) { pthread_mutex_lock(&g_queue_lock); }
 void beer_vulkan_queue_unlock(void) { pthread_mutex_unlock(&g_queue_lock); }
 
+int beer_vulkan_timeline_enabled(void)
+{
+    return g_context.timeline_semaphore && g_context.timeline;
+}
+
+uint64_t beer_vulkan_timeline_submit(const VkCommandBuffer *commands,
+                                     uint32_t command_count)
+{
+    if (!beer_vulkan_timeline_enabled() || !commands || !command_count ||
+        beer_vulkan_device_lost())
+        return 0;
+    /* Timeline values and queue submission are one externally synchronized
+     * operation. Assigning the value outside the queue lock allowed concurrent
+     * graphics/compute callers to race the monotonically increasing payload. */
+    beer_vulkan_queue_lock();
+    const uint64_t value = atomic_fetch_add_explicit(
+        &g_context.timeline_next_value, 1, memory_order_relaxed) + 1;
+    VkTimelineSemaphoreSubmitInfo timeline_info = {
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &value
+    };
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = &timeline_info,
+        .commandBufferCount = command_count,
+        .pCommandBuffers = commands,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &g_context.timeline
+    };
+    VkResult result = g_context.QueueSubmit(g_context.queue, 1, &submit,
+                                             VK_NULL_HANDLE);
+    beer_vulkan_queue_unlock();
+    beer_vulkan_record_result(result, "timeline queue submission");
+    return result == VK_SUCCESS ? value : 0;
+}
+
+int beer_vulkan_timeline_wait(uint64_t value, uint64_t timeout_ns)
+{
+    if (!value || !beer_vulkan_timeline_enabled()) return 0;
+    VkSemaphoreWaitInfo wait_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .semaphoreCount = 1,
+        .pSemaphores = &g_context.timeline,
+        .pValues = &value
+    };
+    VkResult result = g_context.WaitSemaphoresKHR(
+        g_context.device, &wait_info, timeout_ns);
+    beer_vulkan_record_result(result, "timeline semaphore wait");
+    return result == VK_SUCCESS;
+}
+
+uint64_t beer_vulkan_timeline_completed(void)
+{
+    uint64_t value = 0;
+    if (!beer_vulkan_timeline_enabled() ||
+        g_context.GetSemaphoreCounterValueKHR(g_context.device,
+                                               g_context.timeline,
+                                               &value) != VK_SUCCESS)
+        return 0;
+    return value;
+}
+
+uint64_t beer_vulkan_timeline_last_submitted(void)
+{
+    return beer_vulkan_timeline_enabled() ? atomic_load_explicit(
+        &g_context.timeline_next_value, memory_order_acquire) : 0;
+}
+
 static _Atomic uint64_t g_perf[4];
 
 void beer_vulkan_perf_account(int graphics, uint64_t ns)
@@ -489,6 +796,8 @@ void beer_vulkan_context_destroy(void)
     pthread_mutex_lock(&g_context_lock);
     if (g_context.device && g_context.DeviceWaitIdle)
         g_context.DeviceWaitIdle(g_context.device);
+    if (g_context.device && g_context.timeline && g_context.DestroySemaphore)
+        g_context.DestroySemaphore(g_context.device, g_context.timeline, NULL);
     if (g_context.device && g_context.DestroyDevice)
         g_context.DestroyDevice(g_context.device, NULL);
     if (g_context.instance && g_context.DestroyInstance)
@@ -496,4 +805,88 @@ void beer_vulkan_context_destroy(void)
     if (g_context.library) dlclose(g_context.library);
     memset(&g_context, 0, sizeof(g_context));
     pthread_mutex_unlock(&g_context_lock);
+}
+
+int beer_vulkan_host_gpu_info(BeerHostGpuInfo *out)
+{
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!beer_vulkan_context_initialize() || !g_context.physical_device)
+        return 0;
+    VkPhysicalDeviceProperties props;
+    memset(&props, 0, sizeof(props));
+    g_context.GetPhysicalDeviceProperties(g_context.physical_device, &props);
+    snprintf(out->name, sizeof(out->name), "%s", props.deviceName);
+    out->vendor_id = props.vendorID;
+    out->device_id = props.deviceID;
+    out->luid = ((uint64_t)props.vendorID << 32) | props.deviceID;
+
+    PFN_vkGetPhysicalDeviceMemoryProperties get_memory =
+        (PFN_vkGetPhysicalDeviceMemoryProperties)g_context.GetInstanceProcAddr(
+            g_context.instance, "vkGetPhysicalDeviceMemoryProperties");
+    if (get_memory) {
+        VkPhysicalDeviceMemoryProperties mem;
+        get_memory(g_context.physical_device, &mem);
+        for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+            const uint64_t size = mem.memoryHeaps[i].size;
+            if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                /* A small BAR window heap is also DEVICE_LOCAL; the real VRAM
+                 * heap is the largest one. */
+                if (size > out->dedicated_video_memory)
+                    out->dedicated_video_memory = size;
+            } else if (size > out->shared_system_memory) {
+                out->shared_system_memory = size;
+            }
+        }
+    }
+
+    PFN_vkEnumerateDeviceExtensionProperties enumerate =
+        (PFN_vkEnumerateDeviceExtensionProperties)
+            g_context.GetInstanceProcAddr(
+                g_context.instance, "vkEnumerateDeviceExtensionProperties");
+    PFN_vkGetPhysicalDeviceFeatures2 features2_fn =
+        (PFN_vkGetPhysicalDeviceFeatures2)g_context.GetInstanceProcAddr(
+            g_context.instance, "vkGetPhysicalDeviceFeatures2");
+    if (!enumerate || !features2_fn) return 1;
+    uint32_t count = 0;
+    enumerate(g_context.physical_device, NULL, &count, NULL);
+    VkExtensionProperties *extensions = count ?
+        calloc(count, sizeof(*extensions)) : NULL;
+    int has_rt = 0, has_as = 0, has_rq = 0, has_mesh = 0, has_vrs = 0;
+    if (extensions &&
+        enumerate(g_context.physical_device, NULL, &count, extensions) ==
+            VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const char *n = extensions[i].extensionName;
+            has_rt   |= !strcmp(n, "VK_KHR_ray_tracing_pipeline");
+            has_as   |= !strcmp(n, "VK_KHR_acceleration_structure");
+            has_rq   |= !strcmp(n, "VK_KHR_ray_query");
+            has_mesh |= !strcmp(n, "VK_EXT_mesh_shader");
+            has_vrs  |= !strcmp(n, "VK_KHR_fragment_shading_rate");
+        }
+    }
+    free(extensions);
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rt = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+        .pNext = &rt };
+    VkPhysicalDeviceRayQueryFeaturesKHR rq = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+        .pNext = &as };
+    VkPhysicalDeviceMeshShaderFeaturesEXT mesh = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
+        .pNext = &rq };
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrs = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
+        .pNext = &mesh };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &vrs };
+    features2_fn(g_context.physical_device, &features);
+    out->ray_tracing_pipeline = has_rt && rt.rayTracingPipeline;
+    out->acceleration_structure = has_as && as.accelerationStructure;
+    out->ray_query = has_rq && rq.rayQuery;
+    out->mesh_shader = has_mesh && mesh.meshShader;
+    out->fragment_shading_rate = has_vrs && vrs.pipelineFragmentShadingRate;
+    return 1;
 }

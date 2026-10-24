@@ -29,6 +29,14 @@ static inline void beer_win32_apply_input_message(uint8_t keys[256],
     case 0x0205: vk = 0x02; break;           /* WM_RBUTTONUP */
     case 0x0207: vk = 0x04; down = 1; break; /* WM_MBUTTONDOWN / VK_MBUTTON */
     case 0x0208: vk = 0x04; break;           /* WM_MBUTTONUP */
+    case 0x020b: case 0x020c: {              /* WM_XBUTTONDOWN / WM_XBUTTONUP */
+        /* HIWORD(wParam) selects XBUTTON1 (1) or XBUTTON2 (2). */
+        const uint32_t which = (uint32_t)(wparam >> 16) & 0xffffu;
+        if (which != 1 && which != 2) return;
+        vk = 0x04u + which;                  /* VK_XBUTTON1 0x05 / VK_XBUTTON2 0x06 */
+        down = message == 0x020b;
+        break;
+    }
     default: return;
     }
 
@@ -117,6 +125,7 @@ static inline int beer_win32_message_is_button_transition(uint32_t message)
     case 0x0201u: case 0x0202u: /* left */
     case 0x0204u: case 0x0205u: /* right */
     case 0x0207u: case 0x0208u: /* middle */
+    case 0x020bu: case 0x020cu: /* X buttons */
         return 1;
     default:
         return 0;
@@ -169,7 +178,7 @@ static inline BeerRawInput beer_raw_keyboard_input(uint32_t virtual_key,
     input.header.size = sizeof(BeerRawInputHeader) + sizeof(BeerRawKeyboard);
     input.header.device = 2;
     input.data.keyboard.make_code = (uint16_t)scan_code;
-    input.data.keyboard.flags = down ? 0 : 1; /* RI_KEY_BREAK */
+    input.data.keyboard.flags = down ? 0 : 1; /* RI_KEY_BREAK; RI_KEY_E0 (2) is set by the caller */
     input.data.keyboard.virtual_key = (uint16_t)virtual_key;
     input.data.keyboard.message = down ? 0x0100u : 0x0101u;
     return input;

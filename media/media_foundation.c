@@ -1,8 +1,8 @@
 #include "media_foundation.h"
-
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <time.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -11,6 +11,140 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* -----------------------------------------------------------------------
+ * Active NV12 frame state — converted to RGBA at lock time and retained
+ * until the next frame so dxgi_Present() always reads a valid buffer.
+ *
+ * KEY INVARIANT: the raw NV12 buffer (self->data) is freed when the sample
+ * is released, which happens BEFORE dxgi_Present fires.  We therefore convert
+ * NV12→RGBA eagerly inside beer_mf_notify_lock() and store the result in a
+ * persistent RGBA cache that dxgi_Present reads safely.
+ *
+ * The compositor function pointer is injected by loader.c after the XWayland
+ * window is ready, avoiding a link dependency from media to platform.
+ * ----------------------------------------------------------------------- */
+static pthread_mutex_t  g_mf_frame_lock   = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t         *g_mf_rgba_cache   = NULL;
+static size_t           g_mf_rgba_cache_size = 0;
+static uint32_t         g_mf_rgba_width   = 0;
+static uint32_t         g_mf_rgba_height  = 0;
+static int              g_mf_rgba_ready   = 0;   /* 1 when a decoded frame is waiting */
+static uint64_t         g_mf_rgba_time_ns = 0;
+static uint32_t         g_mf_lock_streak  = 0;   /* consecutive paced locks (playback is live) */   /* CLOCK_MONOTONIC when that frame was cached */
+
+/* Injected by loader.c — pointer to xwayland_window_present_rgba8(). */
+typedef int (*BeerMfPresentFn)(const uint8_t *, int, int, int);
+static BeerMfPresentFn g_mf_present_fn = NULL;
+
+void beer_mf_set_present_fn(void *fn)
+{
+    g_mf_present_fn = (BeerMfPresentFn)fn;
+}
+
+/* Called at IMF2DBuffer::Lock2DSize / IMFMediaBuffer::Lock time.
+ * Converts the NV12 frame to RGBA immediately so the raw buffer pointer
+ * does not need to outlive the sample release. */
+void beer_mf_notify_lock(const uint8_t *nv12_data, uint32_t width,
+                          uint32_t height, int32_t stride)
+{
+    if (!nv12_data || !width || !height || stride <= 0) return;
+
+    size_t rgba_size = (size_t)width * height * 4;
+
+    pthread_mutex_lock(&g_mf_frame_lock);
+
+    /* (Re-)allocate the RGBA cache if the dimensions changed. */
+    if (g_mf_rgba_cache_size < rgba_size) {
+        uint8_t *buf = realloc(g_mf_rgba_cache, rgba_size);
+        if (!buf) { pthread_mutex_unlock(&g_mf_frame_lock); return; }
+        g_mf_rgba_cache      = buf;
+        g_mf_rgba_cache_size = rgba_size;
+    }
+
+    /* BT.601 limited-range NV12 → RGBA8, in-place into the persistent cache. */
+    const uint8_t *y_plane  = nv12_data;
+    const uint8_t *uv_plane = nv12_data + (size_t)stride * height;
+    uint8_t *dst = g_mf_rgba_cache;
+    for (uint32_t row = 0; row < height; ++row) {
+        uint32_t uv_row = row >> 1;
+        for (uint32_t col = 0; col < width; ++col) {
+            uint32_t ucol = col & ~1u;
+            int y  = (int)y_plane [(size_t)row    * (size_t)(uint32_t)stride + col] - 16;
+            int cb = (int)uv_plane[(size_t)uv_row * (size_t)(uint32_t)stride + ucol]     - 128;
+            int cr = (int)uv_plane[(size_t)uv_row * (size_t)(uint32_t)stride + ucol + 1] - 128;
+            int r = (298*y           + 409*cr + 128) >> 8;
+            int g = (298*y - 100*cb - 208*cr + 128) >> 8;
+            int b = (298*y + 516*cb           + 128) >> 8;
+            if (r < 0) r = 0; if (r > 255) r = 255;
+            if (g < 0) g = 0; if (g > 255) g = 255;
+            if (b < 0) b = 0; if (b > 255) b = 255;
+            dst[0] = (uint8_t)r; dst[1] = (uint8_t)g;
+            dst[2] = (uint8_t)b; dst[3] = 255;
+            dst += 4;
+        }
+    }
+
+    g_mf_rgba_width  = width;
+    g_mf_rgba_height = height;
+    g_mf_rgba_ready  = 1;
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        if (getenv("BEER_MF_DIAGNOSTICS"))
+            fprintf(stderr, "[MF COMPOSITE] lock dt=%llu us\n",
+                    (unsigned long long)(g_mf_rgba_time_ns ? (now - g_mf_rgba_time_ns) / 1000 : 0));
+        /* The game pre-rolls a handful of frames in one burst, then waits (the
+         * logo movie sat idle for ~11 s) before real playback. Only a run of
+         * frames locked without a long gap counts as playback. */
+        if (g_mf_rgba_time_ns && now - g_mf_rgba_time_ns < 250000000ull)
+            ++g_mf_lock_streak;
+        else
+            g_mf_lock_streak = 1;
+        g_mf_rgba_time_ns = now;
+    }
+
+    pthread_mutex_unlock(&g_mf_frame_lock);
+
+    if (getenv("BEER_MF_DIAGNOSTICS"))
+        fprintf(stderr, "[MF COMPOSITE] NV12->RGBA cached %ux%u stride=%d\n",
+                width, height, stride);
+}
+
+void beer_mf_notify_unlock(void) { /* nothing — RGBA cache is already written */ }
+
+int beer_mf_composite_pending_frame(void)
+{
+    if (!g_mf_present_fn) return 0;
+
+    pthread_mutex_lock(&g_mf_frame_lock);
+    int      ready  = g_mf_rgba_ready;
+    uint32_t width  = g_mf_rgba_width;
+    uint32_t height = g_mf_rgba_height;
+    uint8_t *rgba   = (ready && g_mf_rgba_cache) ? g_mf_rgba_cache : NULL;
+    const uint64_t cached_at = g_mf_rgba_time_ns;
+    /* Pre-roll bursts are at most ~6 frames; require more before showing. */
+    if (g_mf_lock_streak < 10) rgba = NULL;
+    pthread_mutex_unlock(&g_mf_frame_lock);
+
+    /* The cache holds the last decoded frame forever. Only composite it while
+     * frames are still being consumed; once playback stops (the game stops
+     * locking buffers) the game's own output must show again. */
+    if (rgba) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        if (now - cached_at > 250000000ull) rgba = NULL;
+    }
+
+    if (!rgba || !width || !height) return 0;
+
+    int ok = g_mf_present_fn(rgba, (int)width, (int)height, (int)width * 4);
+    if (getenv("BEER_MF_DIAGNOSTICS"))
+        fprintf(stderr, "[MF COMPOSITE] present %ux%u ok=%d\n", width, height, ok);
+    return ok;
+}
 
 #define BEER_S_OK          UINT64_C(0)
 #define BEER_E_NOTIMPL     UINT64_C(0x80004001)
@@ -885,6 +1019,8 @@ mf_media_buffer_lock_2d(BeerMfMediaBuffer *self, uint8_t **scanline,
     *scanline = self->data;
     *pitch = self->stride;
     self->locked = 1;
+    /* Convert NV12→RGBA eagerly so dxgi_Present can composite it. */
+    beer_mf_notify_lock(self->data, self->width, self->height, self->stride);
     return BEER_S_OK;
 }
 
@@ -958,6 +1094,8 @@ mf_media_buffer_lock_2d_size(BeerMfMediaBuffer *self, uint32_t flags,
     *buffer_start = self->data;
     *buffer_length = self->contiguous_length;
     self->locked = 1;
+    /* Notify the compositor so dxgi_Present() can blit this frame directly. */
+    beer_mf_notify_lock(self->data, self->width, self->height, self->stride);
     return BEER_S_OK;
 }
 
@@ -1588,9 +1726,11 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
                 self->video_rate_denominator : 1u;
             int64_t frame_duration =
                 (INT64_C(10000000) * denominator + numerator / 2u) / numerator;
-            BeerMfSample *decoded = mf_sample_create(
+            BeerMfSample *decoded = mf_sample_create_ex(
                 self->frame_data, self->frame_size,
-                self->next_video_timestamp, frame_duration);
+                self->next_video_timestamp, frame_duration,
+                self->video_width, self->video_height,
+                (int32_t)self->video_width);
             if (!decoded) return BEER_E_NOTIMPL;
             if (stream_flags) *stream_flags = 0;
             if (timestamp) *timestamp = decoded->timestamp;
@@ -1607,9 +1747,10 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
              * IMFSourceReaderCallback when the caller supplied one. */
             if (self->async_callback && g_async_on_read_sample) {
                 void *cb_sample = sample ? *sample : NULL;
-                if (cb_sample) mf_media_buffer_add_ref(((BeerMfSample *)cb_sample)->buffer);
-                if (cb_sample) atomic_fetch_add_explicit(
-                    &((BeerMfSample *)cb_sample)->references, 1, memory_order_relaxed);
+                /* Callee holds one reference to the sample on our behalf.
+                 * AddRef the sample once; do NOT separately AddRef the buffer
+                 * (the sample already owns a buffer reference). */
+                if (cb_sample) mf_sample_add_ref(cb_sample);
                 g_async_on_read_sample(self->async_callback,
                                        BEER_S_OK, resolved_stream, 0,
                                        decoded->timestamp, cb_sample);
@@ -1666,9 +1807,9 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
             atomic_store_explicit(&self->terminal_eos, 0, memory_order_release);
             if (self->async_callback && g_async_on_read_sample) {
                 void *cb_sample = sample ? *sample : NULL;
-                if (cb_sample) mf_media_buffer_add_ref(((BeerMfSample *)cb_sample)->buffer);
-                if (cb_sample) atomic_fetch_add_explicit(
-                    &((BeerMfSample *)cb_sample)->references, 1, memory_order_relaxed);
+                /* One AddRef for the callee's reference; buffer ref is owned
+                 * by the sample and must not be separately incremented. */
+                if (cb_sample) mf_sample_add_ref(cb_sample);
                 g_async_on_read_sample(self->async_callback,
                                        BEER_S_OK, resolved_stream, 0,
                                        decoded->timestamp, cb_sample);
