@@ -87,13 +87,33 @@ void beer_win32_shared_data_initialize(void *memory, size_t size)
     put_u32(data, 0x26c, 10);    /* NtMajorVersion */
     put_u32(data, 0x270, 0);     /* NtMinorVersion */
 
-    /* Common x86-64 processor feature bits. The array begins at 0x274. */
-    data[0x274 + 0] = 1;  /* PF_FLOATING_POINT_PRECISION_ERRATA (compatible) */
-    data[0x274 + 6] = 1;  /* PF_MMX_INSTRUCTIONS_AVAILABLE */
-    data[0x274 + 10] = 1; /* PF_XMMI_INSTRUCTIONS_AVAILABLE */
-    data[0x274 + 13] = 1; /* PF_XMMI64_INSTRUCTIONS_AVAILABLE */
-    data[0x274 + 17] = 1; /* PF_NX_ENABLED */
-    data[0x274 + 21] = 1; /* PF_SSE3_INSTRUCTIONS_AVAILABLE */
+    /* ProcessorFeatures[] (0x274) uses winnt.h PF_* numbering and must agree with IsProcessorFeaturePresent: runtime
+     * libraries read the array directly. Values come from the host CPU. */
+    __builtin_cpu_init();
+    static const struct { uint8_t pf; const char *cpu; } features[] = {
+        { 2, NULL }, { 3, "mmx" }, { 6, "sse" }, { 8, NULL }, { 9, NULL }, { 10, "sse2" }, { 12, NULL },
+        { 13, "sse3" }, { 14, NULL }, { 17, "xsave" }, { 22, NULL }, { 28, "rdrnd" }, { 32, NULL },
+        { 36, "ssse3" }, { 37, "sse4.1" }, { 38, "sse4.2" }, { 39, "avx" }, { 40, "avx2" }, { 41, "avx512f" },
+    };
+    for (size_t i = 0; i < sizeof(features) / sizeof(features[0]); ++i)
+        data[0x274 + features[i].pf] = !features[i].cpu || __builtin_cpu_supports(features[i].cpu) ? 1 : 0;
+
+    put_u16(data, 0x02c, 0x014c); /* ImageNumberLow: IMAGE_FILE_MACHINE_I386 (WOW64 range) */
+    put_u16(data, 0x02e, 0x8664); /* ImageNumberHigh: IMAGE_FILE_MACHINE_AMD64 */
+
+    /* XSTATE_CONFIGURATION (0x3d8): what GetEnabledXStateFeatures / RtlGetEnabledExtendedFeatures report. x87 + SSE,
+     * plus AVX when the host has it; area offsets follow the standard XSAVE layout. */
+    {
+        const int avx = __builtin_cpu_supports("avx") != 0;
+        const uint64_t enabled = 0x3u | (avx ? 0x4u : 0u);
+        put_u64(data, 0x3d8, enabled);                       /* EnabledFeatures */
+        put_u64(data, 0x3e0, enabled);                       /* EnabledVolatileFeatures */
+        put_u32(data, 0x3e8, avx ? 832u : 576u);             /* Size of the XSAVE area */
+        put_u32(data, 0x3ec, 0);                             /* ControlFlags */
+        put_u32(data, 0x3f0, 0);   put_u32(data, 0x3f4, 160);  /* x87: offset 0, size 160 */
+        put_u32(data, 0x3f8, 160); put_u32(data, 0x3fc, 256);  /* SSE: offset 160, size 256 */
+        if (avx) { put_u32(data, 0x400, 576); put_u32(data, 0x404, 256); }   /* AVX: offset 576, size 256 */
+    }
 
     /* Modern CRTs and protected bootstraps consume these fields directly.
      * Zero physical pages describes an impossible Windows machine and can keep
