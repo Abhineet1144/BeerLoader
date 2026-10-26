@@ -651,6 +651,12 @@ static void do_copy(B11Context *ctx, B11Obj *dst_o, uint32_t dst_sub, uint32_t d
         bd12_cmd_host_visibility(cmd, d->staging);
         d->last_use_serial = dev->serial + 1;
     } else if (d->image && s->staging) {            /* staging -> GPU */
+        if (getenv("BEER_BD11_TEXLOG")) {
+            size_t nz = 0;
+            const uint8_t *m = s->staging->cpu ? (const uint8_t *)s->staging->cpu + s->sub_offset[src_sub] : NULL;
+            for (size_t b = 0; m && b < 4096; ++b) nz += m[b] != 0;
+            fprintf(stderr, "[BD11 TEX] staging->gpu %ux%u fmt=%u dst_sub=%u src_sub=%u nonzero-in-first-4K=%zu\n", w, h, d->desc.format, dst_sub, src_sub, nz);
+        }
         b11_texture_use(ctx, d, BD12_STATE_COPY_DEST);
         bd12_cmd_copy_buffer_to_image(cmd, d->image, (BD12ImagePoint){ dst_sub, (int32_t)dx, (int32_t)dy, (int32_t)dz },
                                       s->staging, s->sub_offset[src_sub], s->sub_pitch[src_sub], w, h, depth);
@@ -701,6 +707,11 @@ static void do_update(B11Context *ctx, const B11Op *op)
         for (uint32_t r = 0; r < rows; ++r)
             memcpy((uint8_t *)stage->cpu + ((uint64_t)z * rows + r) * row_bytes,
                    src + (uint64_t)z * op->c + (uint64_t)r * op->b, row_bytes);
+    if (getenv("BEER_BD11_TEXLOG")) {
+        size_t nz = 0;
+        for (size_t b = 0; b < 4096 && b < (size_t)row_bytes * rows; ++b) nz += ((uint8_t *)stage->cpu)[b] != 0;
+        fprintf(stderr, "[BD11 TEX] update %ux%u fmt=%u sub=%u bytes=%zu nonzero-in-first-4K=%zu\n", w, h, t->desc.format, sub, (size_t)row_bytes * rows, nz);
+    }
     b11_texture_use(ctx, t, BD12_STATE_COPY_DEST);
     bd12_cmd_copy_buffer_to_image(cmd, t->image, (BD12ImagePoint){ sub, (int32_t)x0, (int32_t)y0, (int32_t)z0 },
                                   stage, 0, row_bytes, w, h, d);

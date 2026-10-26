@@ -90,13 +90,26 @@ void beer_win32_shared_data_initialize(void *memory, size_t size)
     /* ProcessorFeatures[] (0x274) uses winnt.h PF_* numbering and must agree with IsProcessorFeaturePresent: runtime
      * libraries read the array directly. Values come from the host CPU. */
     __builtin_cpu_init();
-    static const struct { uint8_t pf; const char *cpu; } features[] = {
-        { 2, NULL }, { 3, "mmx" }, { 6, "sse" }, { 8, NULL }, { 9, NULL }, { 10, "sse2" }, { 12, NULL },
-        { 13, "sse3" }, { 14, NULL }, { 17, "xsave" }, { 22, NULL }, { 28, "rdrnd" }, { 32, NULL },
-        { 36, "ssse3" }, { 37, "sse4.1" }, { 38, "sse4.2" }, { 39, "avx" }, { 40, "avx2" }, { 41, "avx512f" },
-    };
-    for (size_t i = 0; i < sizeof(features) / sizeof(features[0]); ++i)
-        data[0x274 + features[i].pf] = !features[i].cpu || __builtin_cpu_supports(features[i].cpu) ? 1 : 0;
+    /* __builtin_cpu_supports needs string literals, so each feature is spelled out. */
+    data[0x274 + 2] = 1;                                              /* CMPXCHG8B */
+    data[0x274 + 3] = __builtin_cpu_supports("mmx") != 0;
+    data[0x274 + 6] = __builtin_cpu_supports("sse") != 0;
+    data[0x274 + 8] = 1;                                              /* RDTSC */
+    data[0x274 + 9] = 1;                                              /* PAE */
+    data[0x274 + 10] = __builtin_cpu_supports("sse2") != 0;
+    data[0x274 + 12] = 1;                                             /* NX */
+    data[0x274 + 13] = __builtin_cpu_supports("sse3") != 0;
+    data[0x274 + 14] = 1;                                             /* CMPXCHG16B */
+    data[0x274 + 17] = __builtin_cpu_supports("xsave") != 0;
+    data[0x274 + 22] = 1;                                             /* RDWRFSGSBASE */
+    data[0x274 + 28] = __builtin_cpu_supports("rdrnd") != 0;
+    data[0x274 + 32] = 1;                                             /* RDTSCP */
+    data[0x274 + 36] = __builtin_cpu_supports("ssse3") != 0;
+    data[0x274 + 37] = __builtin_cpu_supports("sse4.1") != 0;
+    data[0x274 + 38] = __builtin_cpu_supports("sse4.2") != 0;
+    data[0x274 + 39] = __builtin_cpu_supports("avx") != 0;
+    data[0x274 + 40] = __builtin_cpu_supports("avx2") != 0;
+    data[0x274 + 41] = __builtin_cpu_supports("avx512f") != 0;
 
     put_u16(data, 0x02c, 0x014c); /* ImageNumberLow: IMAGE_FILE_MACHINE_I386 (WOW64 range) */
     put_u16(data, 0x02e, 0x8664); /* ImageNumberHigh: IMAGE_FILE_MACHINE_AMD64 */

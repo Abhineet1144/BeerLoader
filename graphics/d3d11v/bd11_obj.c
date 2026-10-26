@@ -427,6 +427,12 @@ static void texture_upload_init(B11Device *dev, B11Texture *t, const B11SubData 
             sub_geometry(t, mip, &w, &h, &dp, &rb, &rows);
             const uint32_t idx = mip + layer * t->desc.mips;
             const uint64_t size = (uint64_t)rb * rows * dp;
+            if (getenv("BEER_BD11_TEXLOG") && mip == 0) {
+                size_t nz = 0;
+                const uint8_t *m = init[idx].mem;
+                for (size_t b = 0; m && b < 4096 && b < size; ++b) nz += m[b] != 0;
+                fprintf(stderr, "[BD11 TEX] init %ux%u fmt=%u mips=%u layer=%u data=%s nonzero-in-first-4K=%zu\n", w, h, t->desc.format, t->desc.mips, layer, m ? "yes" : "NO", nz);
+            }
             if (init[idx].mem) {
                 const uint8_t *src = init[idx].mem;
                 for (uint32_t z = 0; z < dp; ++z)
