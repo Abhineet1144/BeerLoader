@@ -410,6 +410,12 @@ static void record_overlay(VkImage destination)
 static int recreate_swapchain(int requested_width, int requested_height,
                               int source_width, int source_height)
 {
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) fprintf(stderr, "[VULKAN] recreating swapchain (requested %dx%d, source %dx%d)\n", requested_width, requested_height, source_width, source_height);
+    /* Hand the old swapchain to the new one (oldSwapchain) instead of destroying it first: with the NVIDIA driver on
+     * XWayland a surface that briefly has no swapchain is detached from the compositor, which drops the window's
+     * focus and input. */
+    VkSwapchainKHR retired = g_vk.swapchain;
+    g_vk.swapchain = VK_NULL_HANDLE;
     destroy_swapchain();
     VkSurfaceCapabilitiesKHR capabilities;
     if (g_vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(
@@ -512,11 +518,12 @@ static int recreate_swapchain(int requested_width, int requested_height,
         .preTransform = capabilities.currentTransform,
         .compositeAlpha = composite,
         .presentMode = present_mode,
-        .clipped = VK_TRUE
+        .clipped = VK_TRUE,
+        .oldSwapchain = retired
     };
-    if (g_vk.CreateSwapchainKHR(g_vk.device, &info, NULL,
-                                &g_vk.swapchain) != VK_SUCCESS)
-        return 0;
+    const VkResult swapchain_result = g_vk.CreateSwapchainKHR(g_vk.device, &info, NULL, &g_vk.swapchain);
+    if (retired && g_vk.DestroySwapchainKHR) g_vk.DestroySwapchainKHR(g_vk.device, retired, NULL);
+    if (swapchain_result != VK_SUCCESS) return 0;
     g_vk.format = chosen.format;
     g_vk.extent = extent;
     g_vk.GetSwapchainImagesKHR(g_vk.device, g_vk.swapchain,

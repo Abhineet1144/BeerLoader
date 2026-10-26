@@ -4,6 +4,7 @@
 #include "bd11.h"
 #include "../d3d12v/bd12_com.h"
 
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -191,6 +192,10 @@ static B11HR B11_MS sc_present(B11Swap *s, uint32_t sync, uint32_t flags)
     bd12_trace_frame_advance();
     dev->frame++;
     s->present_count++;
+    {   /* BEER_BD11_TRACE_FILE=<path>: creating the file traces the next frame (and the file is removed). */
+        const char *trace_file = getenv("BEER_BD11_TRACE_FILE");
+        if (trace_file && unlink(trace_file) == 0) g_b11_trace_frame = (long)dev->frame;
+    }
     {
         extern uint64_t g_b11_stats[16];
         static int stats = -1;
@@ -202,6 +207,15 @@ static B11HR B11_MS sc_present(B11Swap *s, uint32_t sync, uint32_t flags)
             if (g_b11_stats[0] != last_draws || s->present_count % 60 == 0)
                 fprintf(stderr, "[BD11 FRAME] %u draws=%llu\n", s->present_count, (unsigned long long)(g_b11_stats[0] - last_draws));
             last_draws = g_b11_stats[0];
+        }
+        if (s->present_count % 300 == 0) {       /* BD12 counts every draw it could not record */
+            uint64_t total = 0;
+            for (int i = 0; i < BD12_DROP_COUNT; ++i) total += g_bd12_drops[i];
+            if (total)
+                fprintf(stderr, "[BD11 DROPS] draw(no-state)=%llu draw(no-descriptors)=%llu dispatch=%llu/%llu exec-indirect=%llu/%llu pso-failed=%llu\n",
+                        (unsigned long long)g_bd12_drops[BD12_DROP_DRAW_NO_STATE], (unsigned long long)g_bd12_drops[BD12_DROP_DRAW_NO_DESCRIPTORS],
+                        (unsigned long long)g_bd12_drops[BD12_DROP_DISPATCH_NO_STATE], (unsigned long long)g_bd12_drops[BD12_DROP_DISPATCH_NO_DESCRIPTORS],
+                        (unsigned long long)g_bd12_drops[4], (unsigned long long)g_bd12_drops[5], (unsigned long long)g_bd12_drops[BD12_DROP_PSO_FAILED]);
         }
         if (stats && s->present_count % 120 == 0)
             fprintf(stderr, "[BD11 STATS] frame=%u draws=%llu skipped=%llu clearRTV=%llu clearDSV=%llu update=%llu bufwrite=%llu lists=%llu ops=%llu\n",

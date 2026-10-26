@@ -7,6 +7,7 @@
 typedef void (*BeerAudioDoneFn)(void *opaque);
 
 int beer_audio_init(unsigned rate, unsigned channels);
+int beer_audio_submit_nowait(const void *pcm, size_t bytes);
 int beer_audio_submit(const void *pcm, size_t bytes, BeerAudioDoneFn done, void *opaque);
 void beer_audio_reset(void);
 void beer_audio_shutdown(void);

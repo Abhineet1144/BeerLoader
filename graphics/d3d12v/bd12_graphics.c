@@ -316,7 +316,8 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
         .layout = gp->layout
     };
     VkResult result = device->vk.CreateGraphicsPipelines(
-        device->device, VK_NULL_HANDLE, 1, &info, NULL, &gp->pipeline);
+        device->device, device->pipeline_cache, 1, &info, NULL, &gp->pipeline);
+    if (result == VK_SUCCESS) bd12_pipeline_cache_note_new(device);
     beer_vulkan_record_result(result, "BD12 graphics pipeline");
     if (result != VK_SUCCESS) goto fail;
     for (int i = 0; i < 2; ++i)
@@ -611,6 +612,7 @@ static int prepare_draw(BD12CmdList *list)
     BD12GraphicsPipeline *gp = g->pipeline;
     if (!gp || (!list->graphics.root_signature && !list->resolve_hook)) {
         BD12_DROP(BD12_DROP_DRAW_NO_STATE);
+        { static unsigned logged; if (logged++ < 5) fprintf(stderr, "[BD12] draw dropped: pipeline=%p root_signature=%p resolve_hook=%p\n", (void *)gp, (void *)list->graphics.root_signature, (void *)(uintptr_t)list->resolve_hook); }
         return 0;
     }
     if (bd12_debug_sync_all()) bd12_cmd_global_barrier(list);

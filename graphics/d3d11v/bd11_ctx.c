@@ -4,6 +4,8 @@
  * (deferred). ExecuteCommandList replays the recorded ops through the immediate path. */
 
 #include "bd11.h"
+#include <sys/mman.h>
+#include <stdatomic.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +168,11 @@ static void apply_state(B11Context *ctx, const B11Op *op)
 
 /* ---- texture state ------------------------------------------------------------------------- */
 
+static int bd12_format_has_stencil(uint32_t dxgi)
+{
+    return (dxgi >= 19 && dxgi <= 22) || (dxgi >= 44 && dxgi <= 47);
+}
+
 void b11_texture_use(B11Context *ctx, B11Texture *t, uint32_t state)
 {
     if (!t->image || t->state == state) return;
@@ -192,7 +199,6 @@ static const uint8_t *shader_code(B11Obj *s, size_t *size)
 static BD12GraphicsPipeline *get_pso(B11Context *ctx)
 {
     B11Device *dev = ctx->obj.dev;
-    b11_flush(dev, 1);
     B11PipelineState *s = &ctx->st;
     B11Shader *vs = (B11Shader *)s->shader[B11_STAGE_VS], *ps = (B11Shader *)s->shader[B11_STAGE_PS];
     if (!vs) return NULL;
@@ -242,11 +248,13 @@ static BD12GraphicsPipeline *get_pso(B11Context *ctx)
         for (int i = 0; i < 8; ++i) {
             const uint32_t *r = w + 2 + i * 8;
             pso.blend[i] = (BD12PsoBlend){ r[0], 0, r[1], r[2], r[3], r[4], r[5], r[6], 4, r[7] & 0xf };
+            if (getenv("BEER_BD11_NO_BLEND")) pso.blend[i].enable = 0;     /* diagnostic: opaque output */
         }
     }
     if (depth) {
         const uint32_t *w = (const uint32_t *)depth->desc;
         pso.depth_enable = w[0]; pso.depth_write_mask = w[1]; pso.depth_func = w[2]; pso.stencil_enable = w[3];
+        if (getenv("BEER_BD11_NO_STENCIL")) pso.stencil_enable = 0;       /* diagnostic */
         pso.stencil_read_mask = depth->desc[16]; pso.stencil_write_mask = depth->desc[17];
         pso.stencil_front = (BD12PsoStencil){ w[5], w[6], w[7], w[8] };
         pso.stencil_back = (BD12PsoStencil){ w[9], w[10], w[11], w[12] };
@@ -345,6 +353,11 @@ VkDescriptorSet b11_resolve_hook(BD12CmdList *list, void *user, const BD12Shader
                 .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
                 .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                 .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = VK_LOD_CLAMP_NONE };
+            if (getenv("BEER_BD11_FORCE_NEAREST")) {          /* diagnostic: filtering a depth image may be what breaks depth reads */
+                info.magFilter = info.minFilter = VK_FILTER_NEAREST;
+                info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                info.anisotropyEnable = VK_FALSE;
+            }
             image_infos[wn] = (VkDescriptorImageInfo){ bd12_sampler_get(bd, &info), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
             w->pImageInfo = &image_infos[wn];
             break;
@@ -446,7 +459,10 @@ static int prepare_draw(B11Context *ctx)
     if (s->dsv) {
         B11View *v = (B11View *)s->dsv;
         if (v->desc) {
-            const uint32_t ro = (v->flags & 1) ? BD12_STATE_DEPTH_READ : BD12_STATE_DEPTH_WRITE;
+            const int has_stencil = v->resource && v->resource->kind == B11_TEXTURE &&
+                                    bd12_format_has_stencil(((B11Texture *)v->resource)->desc.format);
+            const uint32_t ro = !(v->flags & 1) ? BD12_STATE_DEPTH_WRITE :
+                                (has_stencil && !(v->flags & 2)) ? BD12_STATE_DEPTH_READ_STENCIL_WRITE : BD12_STATE_DEPTH_READ;
             if (v->resource && v->resource->kind == B11_TEXTURE) b11_texture_use(ctx, (B11Texture *)v->resource, ro);
             dsv = *v->desc;
             dsv_ptr = &dsv;
@@ -538,32 +554,130 @@ static void after_draw(B11Context *ctx)
     if (split < 0) split = getenv("BEER_BD11_SPLIT_DRAWS") != NULL;
     if (split) bd12_cmd_end_rendering(b11_cmd(ctx->obj.dev));
     /* BEER_BD11_DUMP_DRAWS=<dir> with BEER_BD11_TRACE=<frame>: write RT0 after every draw of that frame as PPM. */
-    if (getenv("BEER_BD11_DUMP_DRAWS") && getenv("BEER_BD11_TRACE") && (long)ctx->obj.dev->frame == strtol(getenv("BEER_BD11_TRACE"), NULL, 10) &&
+    if (getenv("BEER_BD11_DUMP_DRAWS") && g_b11_trace_frame >= 0 && (long)ctx->obj.dev->frame == g_b11_trace_frame &&
         ctx->st.rtv_count && ctx->st.rtv[0]) {
         B11Device *dev = ctx->obj.dev;
-        B11View *v = (B11View *)ctx->st.rtv[0];
-        B11Texture *t = v->resource && v->resource->kind == B11_TEXTURE ? (B11Texture *)v->resource : NULL;
+        const unsigned rtv_pick = getenv("BEER_BD11_DUMP_RTV") ? (unsigned)atoi(getenv("BEER_BD11_DUMP_RTV")) : 0;
         static unsigned n;
-        if (t && t->image && (t->desc.format == 28 || t->desc.format == 24)) {
+        static unsigned every;
+        if (!every) every = getenv("BEER_BD11_DUMP_EVERY") ? (unsigned)atoi(getenv("BEER_BD11_DUMP_EVERY")) : 1;
+        static unsigned seen;
+        const unsigned from = getenv("BEER_BD11_DUMP_FROM") ? (unsigned)atoi(getenv("BEER_BD11_DUMP_FROM")) : 0;
+        const unsigned to = getenv("BEER_BD11_DUMP_TO") ? (unsigned)atoi(getenv("BEER_BD11_DUMP_TO")) : ~0u;
+        const unsigned my = seen++;
+        int pick = my >= from && my <= to && (my % every) == 0;
+        if (getenv("BEER_BD11_DUMP_PS")) {          /* comma-separated pixel shader hash prefixes: dump only those draws */
+            pick = 0;
+            B11Shader *dps = (B11Shader *)ctx->st.shader[B11_STAGE_PS];
+            char hs[24]; snprintf(hs, sizeof(hs), "%016llx", (unsigned long long)(dps ? dps->hash : 0));
+            char list[256]; snprintf(list, sizeof(list), "%s", getenv("BEER_BD11_DUMP_PS"));
+            for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ","))
+                if (!strncmp(hs, tok, strlen(tok))) pick = 1;
+        }
+        /* BEER_BD11_DUMP_SRV="6,7,8": also dump those pixel-shader SRV textures (labelled by slot) */
+        int slots[9], nslots = 0;
+        slots[nslots++] = -1;                       /* -1 = the render target */
+        if (getenv("BEER_BD11_DUMP_SRV")) {
+            const char *q = getenv("BEER_BD11_DUMP_SRV");
+            while (*q && nslots < 9) { slots[nslots++] = atoi(q); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
+        }
+        for (int si = 0; si < nslots; ++si) {
+        B11Texture *t = NULL;
+        if (slots[si] < 0) {
+            B11View *v = (B11View *)ctx->st.rtv[rtv_pick < ctx->st.rtv_count ? rtv_pick : 0];
+            t = v->resource && v->resource->kind == B11_TEXTURE ? (B11Texture *)v->resource : NULL;
+        } else if (slots[si] < B11_MAX_SRV && ctx->st.srv[B11_STAGE_PS][slots[si]]) {
+            B11View *v = (B11View *)ctx->st.srv[B11_STAGE_PS][slots[si]];
+            t = v->resource && v->resource->kind == B11_TEXTURE ? (B11Texture *)v->resource : NULL;
+        }
+        if (pick && t && t->image && (t->desc.format == 28 || t->desc.format == 24 || t->desc.format == 26 || t->desc.format == 10)) {
             const uint32_t w = t->desc.width, h = t->desc.height;
-            BD12Buffer *rb = bd12_buffer_create_committed(dev->bd, BD12_HEAP_READBACK, (size_t)w * h * 4);
+            const uint32_t bpp = t->desc.format == 10 ? 8 : 4;
+            const uint32_t slices = t->desc.dimension == 3 ? t->desc.depth : 1;
+            BD12Buffer *rb = bd12_buffer_create_committed(dev->bd, BD12_HEAP_READBACK, (size_t)w * h * bpp * slices);
             if (rb) {
                 BD12ImagePoint origin = {0};
                 const uint32_t old = t->state;
                 b11_texture_use(ctx, t, BD12_STATE_COPY_SOURCE);
                 bd12_cmd_global_barrier(b11_cmd(dev));
-                bd12_cmd_copy_image_to_buffer(b11_cmd(dev), rb, 0, w * 4, t->image, origin, w, h, 1);
+                bd12_cmd_copy_image_to_buffer(b11_cmd(dev), rb, 0, w * bpp, t->image, origin, w, h, slices);
                 b11_texture_use(ctx, t, old);
                 b11_flush(dev, 1);
                 char path[600];
-                snprintf(path, sizeof(path), "%s/draw%02u_%ux%u_f%u.ppm", getenv("BEER_BD11_DUMP_DRAWS"), n++, w, h, t->desc.format);
+                snprintf(path, sizeof(path), "%s/draw%03u_s%d_%ux%u_f%u.ppm", getenv("BEER_BD11_DUMP_DRAWS"), n++, slots[si], w, h, t->desc.format);
+                if (getenv("BEER_BD11_DUMP_NOFILE")) snprintf(path, sizeof(path), "/dev/null");
                 FILE *f = fopen(path, "wb");
                 if (f) {
                     fprintf(f, "P6\n%u %u\n255\n", w, h);
                     const uint32_t *px = rb->cpu;
+                    {   /* statistics including alpha: a cleared target is opaque black, so alpha shows the readback works */
+                        uint64_t rgb_pixels = 0, alpha_sum = 0, raw_nonzero = 0;
+                        for (size_t i = 0; i < (size_t)w * h; ++i) {
+                            if (px[i]) ++raw_nonzero;
+                            if (t->desc.format == 28) { if (px[i] & 0x00ffffffu) ++rgb_pixels; alpha_sum += px[i] >> 24; }
+                        }
+                        fprintf(stderr, "[BD11 DUMP] draw %u: %llu non-black pixels, %llu non-zero words, mean alpha %.1f\n", n - 1,
+                                (unsigned long long)rgb_pixels, (unsigned long long)raw_nonzero, (double)(alpha_sum / ((uint64_t)w * h)));
+                    }
+                    if (t->desc.format == 10 && slices > 1) {             /* 3D volumes: per-slice mean RGBA */
+                        const uint16_t *hv = (const uint16_t *)rb->cpu;
+                        for (uint32_t z = 0; z < slices; z += (slices > 8 ? slices / 8 : 1)) {
+                            double acc[4] = {0}; size_t cnt = 0;
+                            for (size_t i = 0; i < (size_t)w * h; i += 3, ++cnt)
+                                for (int c = 0; c < 4; ++c) {
+                                    const uint16_t q = hv[((size_t)z * w * h + i) * 4 + c]; const int e = (q >> 10) & 31;
+                                    float v = e == 0 ? 0.0f : (1.0f + (q & 1023) / 1024.0f) * (e >= 15 ? (float)(1 << (e - 15)) : 1.0f / (float)(1 << (15 - e)));
+                                    if (q & 0x8000) v = -v;
+                                    acc[c] += v;
+                                }
+                            fprintf(stderr, "[BD11 VOL] slice %u/%u mean rgba=(%g %g %g %g)\n", z, slices, acc[0] / cnt, acc[1] / cnt, acc[2] / cnt, acc[3] / cnt);
+                        }
+                    }
+                    if (t->desc.format == 10 || t->desc.format == 26) {   /* HDR targets: linear-light statistics */
+                        double sum[3] = {0}, mx = 0; size_t pos = 0;
+                        for (size_t i = 0; i < (size_t)w * h * slices; i += 7) {
+                            float v[3];
+                            if (t->desc.format == 10) {
+                                const uint16_t *hp = (const uint16_t *)rb->cpu + i * 4;
+                                for (int c = 0; c < 3; ++c) {
+                                    const uint16_t hv = hp[c]; const int e = (hv >> 10) & 31;
+                                    v[c] = e == 0 ? 0.0f : (1.0f + (hv & 1023) / 1024.0f) * (e >= 15 ? (float)(1 << (e - 15)) : 1.0f / (float)(1 << (15 - e)));
+                                }
+                            } else {
+                                const uint32_t u = px[i]; const uint32_t m[3] = { u & 0x7ff, (u >> 11) & 0x7ff, (u >> 22) & 0x3ff };
+                                for (int c = 0; c < 3; ++c) {
+                                    const int mb = c == 2 ? 5 : 6; const uint32_t e = m[c] >> mb, mant = m[c] & ((1u << mb) - 1);
+                                    v[c] = e == 0 ? 0.0f : (1.0f + mant / (float)(1u << mb)) * (e >= 15 ? (float)(1 << (e - 15)) : 1.0f / (float)(1 << (15 - e)));
+                                }
+                            }
+                            for (int c = 0; c < 3; ++c) { sum[c] += v[c]; if (v[c] > mx) mx = v[c]; }
+                            ++pos;
+                        }
+                        fprintf(stderr, "[BD11 HDR] draw %u: mean=(%g %g %g) max=%g\n", n - 1, sum[0] / pos, sum[1] / pos, sum[2] / pos, mx);
+                    }
                     for (size_t i = 0; i < (size_t)w * h; ++i) {
                         uint8_t rgb[3];
-                        if (t->desc.format == 28) { rgb[0] = px[i] & 255; rgb[1] = (px[i] >> 8) & 255; rgb[2] = (px[i] >> 16) & 255; }
+                        if (t->desc.format == 10) {
+                            const uint16_t *hp = (const uint16_t *)rb->cpu + i * 4;
+                            for (int c = 0; c < 3; ++c) {
+                                const uint16_t hv = hp[c];
+                                const int e = (hv >> 10) & 31;
+                                float v = e == 0 ? (hv & 1023) / 1024.0f / 16384.0f : (1.0f + (hv & 1023) / 1024.0f) * (e >= 15 ? (float)(1 << (e - 15)) : 1.0f / (float)(1 << (15 - e)));
+                                if (hv & 0x8000) v = 0;
+                                v = v / (1.0f + v);
+                                rgb[c] = (uint8_t)(v * 255.0f + 0.5f);
+                            }
+                        } else if (t->desc.format == 26) {
+                            const uint32_t u = px[i];
+                            const uint32_t m[3] = { u & 0x7ff, (u >> 11) & 0x7ff, (u >> 22) & 0x3ff };
+                            for (int c = 0; c < 3; ++c) {
+                                const int mb = c == 2 ? 5 : 6;
+                                const uint32_t e = m[c] >> mb, mant = m[c] & ((1u << mb) - 1);
+                                float v = e == 0 ? 0.0f : (1.0f + mant / (float)(1u << mb)) * (e >= 15 ? (float)(1 << (e - 15)) : 1.0f / (float)(1 << (15 - e)));
+                                v = v / (1.0f + v);
+                                rgb[c] = (uint8_t)(v * 255.0f + 0.5f);
+                            }
+                        } else if (t->desc.format == 28) { rgb[0] = px[i] & 255; rgb[1] = (px[i] >> 8) & 255; rgb[2] = (px[i] >> 16) & 255; }
                         else { rgb[0] = ((px[i] & 1023) >> 2); rgb[1] = (((px[i] >> 10) & 1023) >> 2); rgb[2] = (((px[i] >> 20) & 1023) >> 2); }
                         fwrite(rgb, 1, 3, f);
                     }
@@ -572,7 +686,66 @@ static void after_draw(B11Context *ctx)
                 bd12_buffer_destroy(rb);
             }
         }
+        }
     }
+    /* BEER_BD11_DUMP_DEPTH=<dir> with BEER_BD11_TRACE_FILE: depth plane of the bound DSV after each draw (min/max + PGM). */
+    if (getenv("BEER_BD11_DUMP_DEPTH") && g_b11_trace_frame >= 0 && (long)ctx->obj.dev->frame == g_b11_trace_frame &&
+        (ctx->st.dsv || getenv("BEER_BD11_DUMP_DEPTH_SRV"))) {
+        B11Device *dev = ctx->obj.dev;
+        B11View *dv = (B11View *)ctx->st.dsv;
+        if (getenv("BEER_BD11_DUMP_DEPTH_SRV")) dv = (B11View *)ctx->st.srv[B11_STAGE_PS][atoi(getenv("BEER_BD11_DUMP_DEPTH_SRV"))];
+        if (!dv) goto skip_depth_dump;
+        B11Texture *dt = dv->resource && dv->resource->kind == B11_TEXTURE ? (B11Texture *)dv->resource : NULL;
+        static unsigned dn;
+        const unsigned from = getenv("BEER_BD11_DUMP_FROM") ? (unsigned)atoi(getenv("BEER_BD11_DUMP_FROM")) : 0;
+        const unsigned to = getenv("BEER_BD11_DUMP_TO") ? (unsigned)atoi(getenv("BEER_BD11_DUMP_TO")) : ~0u;
+        const unsigned my = dn++;
+        if (dt && dt->image && my >= from && my <= to && (my % 4) == 0 && (dt->desc.format == 19 || dt->desc.format == 20)) {
+            const uint32_t w = dt->desc.width, h = dt->desc.height;
+            BD12Buffer *rb = bd12_buffer_create_committed(dev->bd, BD12_HEAP_READBACK, (size_t)w * h * 4);
+            if (rb) {
+                BD12ImagePoint origin = {0};
+                const uint32_t old = dt->state;
+                b11_texture_use(ctx, dt, BD12_STATE_COPY_SOURCE);
+                bd12_cmd_global_barrier(b11_cmd(dev));
+                bd12_cmd_copy_image_to_buffer(b11_cmd(dev), rb, 0, w * 4, dt->image, origin, w, h, 1);
+                b11_texture_use(ctx, dt, old);
+                b11_flush(dev, 1);
+                const float *z = rb->cpu;
+                float mn = 1e30f, mx = -1e30f; size_t nz = 0;
+                for (size_t i = 0; i < (size_t)w * h; ++i) { if (z[i] < mn) mn = z[i]; if (z[i] > mx) mx = z[i]; if (z[i] != 0.0f) ++nz; }
+                fprintf(stderr, "[BD11 DEPTH] after dump-draw %u: min=%g max=%g nonzero=%zu of %zu\n", my, mn, mx, nz, (size_t)w * h);
+                char path[600];
+                snprintf(path, sizeof(path), "%s/depth%03u.pgm", getenv("BEER_BD11_DUMP_DEPTH"), my);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fprintf(f, "P5\n%u %u\n255\n", w, h);
+                    for (size_t i = 0; i < (size_t)w * h; ++i) { float v = mx > mn ? (z[i] - mn) / (mx - mn) : 0.0f; fputc((int)(v * 255.0f), f); }
+                    fclose(f);
+                }
+                bd12_buffer_destroy(rb);
+            }
+            /* stencil plane (plane 1 of the subresource numbering) */
+            BD12Buffer *sb = bd12_buffer_create_committed(dev->bd, BD12_HEAP_READBACK, (size_t)w * h);
+            if (sb) {
+                BD12ImagePoint origin = { .subresource = dt->desc.mips * dt->desc.array_size };
+                const uint32_t old = dt->state;
+                b11_texture_use(ctx, dt, BD12_STATE_COPY_SOURCE);
+                bd12_cmd_global_barrier(b11_cmd(dev));
+                bd12_cmd_copy_image_to_buffer(b11_cmd(dev), sb, 0, w, dt->image, origin, w, h, 1);
+                b11_texture_use(ctx, dt, old);
+                b11_flush(dev, 1);
+                const uint8_t *st = sb->cpu;
+                size_t hist[256] = {0};
+                for (size_t i = 0; i < (size_t)w * h; ++i) hist[st[i]]++;
+                fprintf(stderr, "[BD11 STENCIL] after dump-draw %u:", my);
+                for (int v = 0; v < 256; ++v) if (hist[v]) fprintf(stderr, " %02x:%zu", v, hist[v]);
+                fprintf(stderr, "\n");
+                bd12_buffer_destroy(sb);
+            }
+        }
+    }
+skip_depth_dump:
     static int sync = -1;
     if (sync < 0) sync = getenv("BEER_BD11_SYNC_DRAWS") != NULL;
     if (sync) b11_flush(ctx->obj.dev, 1);
@@ -587,9 +760,38 @@ static void do_clear_rtv(B11Context *ctx, const B11Op *op)
     if (v->resource && v->resource->kind == B11_TEXTURE) b11_texture_use(ctx, (B11Texture *)v->resource, BD12_STATE_RENDER_TARGET);
     float color[4];
     memcpy(color, op->data, 16);
-    if (getenv("BEER_BD11_TRACE") && (long)ctx->obj.dev->frame == strtol(getenv("BEER_BD11_TRACE"), NULL, 10))
+    if (g_b11_trace_frame >= 0 && (long)ctx->obj.dev->frame == g_b11_trace_frame)
         fprintf(stderr, "[BD11 CLEAR] rtv res=%p %g %g %g %g\n", (void *)v->resource, color[0], color[1], color[2], color[3]);
     bd12_cmd_clear_rtv(b11_cmd(ctx->obj.dev), v->desc, color, 0, NULL);
+}
+
+/* ClearUnorderedAccessViewUint/Float. Games clear accumulation volumes/buffers before compute passes add into them;
+ * without this they start from uninitialised memory. */
+static void do_clear_uav(B11Context *ctx, const B11Op *op, int is_float)
+{
+    B11View *v = (B11View *)op->obj[0];
+    if (!v || !v->desc || !op->data) return;
+    BD12CmdList *cmd = b11_cmd(ctx->obj.dev);
+    if (v->resource && v->resource->kind == B11_TEXTURE) {
+        B11Texture *t = (B11Texture *)v->resource;
+        b11_texture_use(ctx, t, BD12_STATE_UNORDERED_ACCESS);
+        VkClearColorValue color;
+        const VkFormat vf = b11_vk_format(v->format ? v->format : t->desc.format);
+        const int integer = vf != VK_FORMAT_UNDEFINED && ((vf >= VK_FORMAT_R8_UINT && vf <= VK_FORMAT_A2B10G10R10_SINT_PACK32 &&
+                              (vf == VK_FORMAT_R8_UINT || vf == VK_FORMAT_R8_SINT || vf == VK_FORMAT_R8G8_UINT || vf == VK_FORMAT_R8G8_SINT ||
+                               vf == VK_FORMAT_R8G8B8A8_UINT || vf == VK_FORMAT_R8G8B8A8_SINT || vf == VK_FORMAT_A2B10G10R10_UINT_PACK32)) ||
+                              (vf >= VK_FORMAT_R16_UINT && vf <= VK_FORMAT_R16G16B16A16_SINT && ((vf - VK_FORMAT_R16_UINT) % 7) < 2) ||
+                              (vf >= VK_FORMAT_R32_UINT && vf <= VK_FORMAT_R32G32B32A32_SINT));
+        if (is_float && !integer) memcpy(color.float32, op->data, 16);
+        else if (!is_float && !integer) { for (int k = 0; k < 4; ++k) { uint32_t u; memcpy(&u, (const uint8_t *)op->data + 4 * k, 4); color.float32[k] = (float)u; } }
+        else memcpy(color.uint32, op->data, 16);
+        bd12_cmd_clear_uav_image(cmd, v->desc, &color);
+    } else if (v->resource && v->resource->kind == B11_BUFFER && v->desc->source_buffer) {
+        uint32_t value;
+        memcpy(&value, op->data, 4);
+        bd12_cmd_clear_uav_buffer(cmd, v->desc->source_buffer, v->desc->offset, v->desc->range, value);
+        buffer_mark_used((B11Buffer *)v->resource);
+    }
 }
 
 static void do_clear_dsv(B11Context *ctx, const B11Op *op)
@@ -619,6 +821,10 @@ static void do_copy(B11Context *ctx, B11Obj *dst_o, uint32_t dst_sub, uint32_t d
     B11Device *dev = ctx->obj.dev;
     BD12CmdList *cmd = b11_cmd(dev);
     if (!dst_o || !src_o) return;
+    if (g_b11_trace_frame >= 0 && (long)dev->frame == g_b11_trace_frame && dst_o->kind == B11_TEXTURE && src_o->kind == B11_TEXTURE)
+        fprintf(stderr, "[BD11 COPY] dst=%p fmt=%u %ux%u sub=%u <- src=%p fmt=%u %ux%u sub=%u whole=%d box=%d\n", (void *)dst_o,
+                ((B11Texture *)dst_o)->desc.format, ((B11Texture *)dst_o)->desc.width, ((B11Texture *)dst_o)->desc.height, dst_sub,
+                (void *)src_o, ((B11Texture *)src_o)->desc.format, ((B11Texture *)src_o)->desc.width, ((B11Texture *)src_o)->desc.height, src_sub, whole, box != NULL);
     if (dst_o->kind == B11_BUFFER && src_o->kind == B11_BUFFER) {
         B11Buffer *d = (B11Buffer *)dst_o, *s = (B11Buffer *)src_o;
         BD12Buffer *db = b11_buffer_write_backing(d, 0), *sb = b11_buffer_current(s);
@@ -675,6 +881,19 @@ static void do_update(B11Context *ctx, const B11Op *op)
         B11Buffer *b = (B11Buffer *)op->obj[0];
         const uint32_t off = box ? box[0] : 0;
         const uint32_t size = box ? box[3] - box[0] : b->desc.byte_width;
+        if (getenv("BEER_BD11_MAPLOG") && b->desc.byte_width > 1000000) {
+            fprintf(stderr, "[BD11 UPDBIG] buf=%p off=%u size=%u box=%d first:", (void *)b, off, size, box != NULL);
+            for (int k = 0; k < 8 && (uint32_t)k * 4 + 4 <= size; ++k) { uint32_t w; memcpy(&w, src + k * 4, 4); fprintf(stderr, " %08x", w); }
+            fprintf(stderr, "\n");
+        }
+        if (getenv("BEER_BD11_TEXLOG")) {
+            static unsigned logged;
+            if (logged++ < 40) {
+                unsigned nz = 0;
+                for (uint32_t k = 0; k < size && k < 4096; ++k) nz += src[k] != 0;
+                fprintf(stderr, "[BD11 UPD] buffer %p bind=%u usage=%u size=%u offset=%u box=%d nonzero4K=%u\n", (void *)b, b->desc.bind, b->desc.usage, size, off, box != NULL, nz);
+            }
+        }
         BD12Buffer *bk = b11_buffer_write_backing(b, 0);
         if (b->host_visible && bk->cpu) { memcpy((uint8_t *)bk->cpu + off, src, size); buffer_mark_used(b); return; }
         if (size <= 65536 && (off & 3) == 0 && (size & 3) == 0) bd12_cmd_update_buffer(cmd, bk, off, size, src);
@@ -724,16 +943,117 @@ static void do_buffer_write(B11Context *ctx, const B11Op *op)
     B11Buffer *b = (B11Buffer *)op->obj[0];
     if (!b || !op->data) return;
     BD12Buffer *bk = b11_buffer_write_backing(b, op->a != 0);
-    if (bk && bk->cpu) memcpy((uint8_t *)bk->cpu + op->b, op->data, op->data_size);
+    if (bk && bk->cpu) {
+        memcpy((uint8_t *)bk->cpu + op->b, op->data, op->data_size);
+        /* A discarded Map hands the game a fresh buffer: what it did not write (trailing zeros were trimmed when the
+         * map was recorded) must read back as zero, not as stale data from the recycled backing. */
+        if (op->a) {
+            const size_t end = (size_t)op->b + op->data_size;
+            if (op->b) memset(bk->cpu, 0, op->b);
+            if (end < b->desc.byte_width) memset((uint8_t *)bk->cpu + end, 0, b->desc.byte_width - end);
+        }
+    }
     buffer_mark_used(b);
+}
+
+/* BEER_BD11_TRACE_CS with a traced frame: mean RGBA of every float16 texture a compute dispatch left bound as a UAV. */
+static void b11_trace_cs_outputs(B11Context *ctx, B11Shader *cs, uint32_t gx, uint32_t gy, uint32_t gz)
+{
+    B11Device *dev = ctx->obj.dev;
+    fprintf(stderr, "[BD11 CS] cs=%016llx groups=%u,%u,%u\n", (unsigned long long)cs->hash, gx, gy, gz);
+    for (int i = 0; i < B11_MAX_UAV; ++i) {
+        B11View *v = (B11View *)ctx->st.uav[B11_STAGE_CS][i];
+        B11Texture *t = v && v->resource && v->resource->kind == B11_TEXTURE ? (B11Texture *)v->resource : NULL;
+        if (!t || !t->image) continue;
+        if (t->desc.format != 10) {                 /* other formats: report size/format and whether anything non-zero was written */
+            const uint32_t bw = bd12_dxgi_bytes(t->desc.format);
+            const uint32_t w2 = t->desc.width, h2 = t->desc.height, sl2 = t->desc.dimension == 3 ? t->desc.depth : 1;
+            if (!bw || (size_t)w2 * h2 * sl2 * bw > (64u << 20)) { fprintf(stderr, "    u%d fmt=%u %ux%ux%u (skipped)\n", i, t->desc.format, w2, h2, sl2); continue; }
+            BD12Buffer *rb2 = bd12_buffer_create_committed(dev->bd, BD12_HEAP_READBACK, (size_t)w2 * h2 * sl2 * bw);
+            if (!rb2) continue;
+            BD12ImagePoint o2 = {0};
+            const uint32_t old2 = t->state;
+            b11_texture_use(ctx, t, BD12_STATE_COPY_SOURCE);
+            bd12_cmd_global_barrier(b11_cmd(dev));
+            bd12_cmd_copy_image_to_buffer(b11_cmd(dev), rb2, 0, w2 * bw, t->image, o2, w2, h2, sl2);
+            b11_texture_use(ctx, t, old2);
+            b11_flush(dev, 1);
+            const uint32_t *wd = rb2->cpu;
+            size_t nz = 0, total = (size_t)w2 * h2 * sl2 * bw / 4;
+            for (size_t k = 0; k < total; ++k) nz += wd[k] != 0;
+            fprintf(stderr, "    u%d fmt=%u %ux%ux%u: %zu/%zu non-zero words, first %08x %08x %08x %08x\n", i, t->desc.format, w2, h2, sl2, nz, total, wd[0], wd[1], wd[2], wd[3]);
+            bd12_buffer_destroy(rb2);
+            continue;
+        }
+        const uint32_t w = t->desc.width, h = t->desc.height, slices = t->desc.dimension == 3 ? t->desc.depth : 1;
+        BD12Buffer *rb = bd12_buffer_create_committed(dev->bd, BD12_HEAP_READBACK, (size_t)w * h * 8 * slices);
+        if (!rb) continue;
+        BD12ImagePoint origin = {0};
+        const uint32_t old = t->state;
+        b11_texture_use(ctx, t, BD12_STATE_COPY_SOURCE);
+        bd12_cmd_global_barrier(b11_cmd(dev));
+        bd12_cmd_copy_image_to_buffer(b11_cmd(dev), rb, 0, w * 8, t->image, origin, w, h, slices);
+        b11_texture_use(ctx, t, old);
+        b11_flush(dev, 1);
+        const uint16_t *hv = rb->cpu;
+        fprintf(stderr, "    u%d %ux%ux%u:", i, w, h, slices);
+        for (uint32_t z = 0; z < slices; z += (slices > 4 ? slices / 4 : 1)) {
+            double acc[4] = {0}; size_t cnt = 0;
+            for (size_t k = 0; k < (size_t)w * h; k += 5, ++cnt)
+                for (int c = 0; c < 4; ++c) {
+                    const uint16_t q = hv[((size_t)z * w * h + k) * 4 + c]; const int e = (q >> 10) & 31;
+                    float x = e == 0 ? 0.0f : (1.0f + (q & 1023) / 1024.0f) * (e >= 15 ? (float)(1 << (e - 15)) : 1.0f / (float)(1 << (15 - e)));
+                    if (q & 0x8000) x = -x;
+                    acc[c] += x;
+                }
+            fprintf(stderr, " z%u(%.3g %.3g %.3g %.3g)", z, acc[0] / cnt, acc[1] / cnt, acc[2] / cnt, acc[3] / cnt);
+        }
+        fprintf(stderr, "\n");
+        bd12_buffer_destroy(rb);
+    }
 }
 
 static void do_dispatch(B11Context *ctx, uint32_t x, uint32_t y, uint32_t z)
 {
-    (void)x; (void)y; (void)z;
-    static int warned;
-    if (!warned++) fprintf(stderr, "[BD11] compute dispatch not implemented yet\n");
-    (void)ctx;
+    B11Device *dev = ctx->obj.dev;
+    B11Shader *cs = (B11Shader *)ctx->st.shader[B11_STAGE_CS];
+    if (!cs || !x || !y || !z) return;
+    BD12CmdList *cmd = b11_cmd(dev);
+    if (ctx->generation != dev->cmd_generation) {
+        ctx->generation = dev->cmd_generation;
+        ctx->dirty = B11_DIRTY_ALL;
+        memset(ctx->bound_vb_va, 0, sizeof(ctx->bound_vb_va));
+        ctx->bound_ib_va = 0;
+    }
+    cmd->resolve_user = ctx;
+    const uint64_t key = cs->hash * 0x9e3779b97f4a7c15ull + 0x5bd1e995ull;
+    B11PsoEntry *e = dev->pso[key & 4095];
+    for (; e; e = e->next) if (e->key == key && e->compute) break;
+    if (!e) {
+        BD12ComputePipeline *pipeline = bd12_compute_pipeline_create_dxbc(dev->bd, cs->bytecode, cs->size, cs->hash);
+        if (!pipeline) fprintf(stderr, "[BD11] compute pipeline creation failed (cs=%016llx)\n", (unsigned long long)cs->hash);
+        e = calloc(1, sizeof(*e));
+        if (!e) return;
+        e->key = key; e->compute = pipeline;
+        e->next = dev->pso[key & 4095];
+        dev->pso[key & 4095] = e;
+    }
+    if (!e->compute) return;
+    bd12_cmd_end_rendering(cmd);                  /* resource transitions cannot happen inside a rendering scope */
+    use_srvs(ctx, 1);
+    for (int i = 0; i < B11_MAX_UAV; ++i) {
+        B11View *v = (B11View *)ctx->st.uav[B11_STAGE_CS][i];
+        if (v && v->resource && v->resource->kind == B11_BUFFER) buffer_mark_used((B11Buffer *)v->resource);
+    }
+    bd12_cmd_global_barrier(cmd);                 /* earlier draws/copies may feed or read the UAVs */
+    bd12_cmd_set_pipeline(cmd, e->compute);
+    if (bd12_cmd_dispatch_bound(cmd, x, y, z)) bd12_cmd_global_barrier(cmd);
+    else {
+        static int warned;
+        if (warned++ < 5) fprintf(stderr, "[BD11] dispatch dropped (cs=%016llx)\n", (unsigned long long)cs->hash);
+    }
+    if (g_b11_trace_frame >= 0 && (long)dev->frame == g_b11_trace_frame && getenv("BEER_BD11_TRACE_CS")) b11_trace_cs_outputs(ctx, cs, x, y, z);
+    ctx->dirty |= B11_DIRTY_ALL;                  /* graphics state must be re-applied after compute work */
 }
 
 
@@ -741,9 +1061,7 @@ static void do_dispatch(B11Context *ctx, uint32_t x, uint32_t y, uint32_t z)
 static void trace_draw(B11Context *ctx, const char *kind, const B11Op *op)
 {
     B11Device *dev = ctx->obj.dev;
-    static long want = -2;
-    if (want == -2) { const char *e = getenv("BEER_BD11_TRACE"); want = e ? strtol(e, NULL, 10) : -1; }
-    if (want < 0 || (long)dev->frame != want) return;
+    if (g_b11_trace_frame < 0 || (long)dev->frame != g_b11_trace_frame) return;
     B11PipelineState *s = &ctx->st;
     B11Shader *vs = (B11Shader *)s->shader[B11_STAGE_VS], *ps = (B11Shader *)s->shader[B11_STAGE_PS];
     fprintf(stderr, "[BD11 DRAW] %s a=%u b=%u c=%u d=%u vs=%016llx ps=%016llx topo=%u rt=%u fmt0=%u vp=%u(%.0f,%.0f %.0fx%.0f z %.2f-%.2f)\n",
@@ -754,7 +1072,14 @@ static void trace_draw(B11Context *ctx, const char *kind, const B11Op *op)
     for (int i = 0; i < B11_MAX_SRV; ++i) if (s->srv[4][i]) fprintf(stderr, "    srv4[%d] res=%p\n", i, (void *)((B11View *)s->srv[4][i])->resource);
     const B11State *bl = (const B11State *)s->blend, *dp = (const B11State *)s->depth, *rs = (const B11State *)s->raster;
     if (bl) { const uint32_t *w = (const uint32_t *)bl->desc; fprintf(stderr, "    blend: en=%u src=%u dst=%u op=%u a:%u/%u/%u mask=%x\n", w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]); }
-    if (dp) { const uint32_t *w = (const uint32_t *)dp->desc; fprintf(stderr, "    depth: en=%u write=%u func=%u stencil=%u\n", w[0], w[1], w[2], w[3]); }
+    if (dp) {
+        const uint32_t *w = (const uint32_t *)dp->desc;
+        fprintf(stderr, "    depth: en=%u write=%u func=%u stencil=%u\n", w[0], w[1], w[2], w[3]);
+        fprintf(stderr, "    stencil: ref=%u rmask=%02x wmask=%02x front{fail=%u zfail=%u pass=%u func=%u} back{fail=%u zfail=%u pass=%u func=%u} dsv=%p dsvfmt=%u\n",
+                s->stencil_ref, dp->desc[16], dp->desc[17], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12],
+                (void *)s->dsv, s->dsv ? ((B11View *)s->dsv)->format : 0);
+        if (s->dsv) fprintf(stderr, "    dsv-resource=%p flags=%u\n", (void *)((B11View *)s->dsv)->resource, ((B11View *)s->dsv)->flags);
+    }
     if (rs) { const uint32_t *w = (const uint32_t *)rs->desc; fprintf(stderr, "    raster: fill=%u cull=%u ccw=%u clip=%u scissor=%u\n", w[0], w[1], w[2], w[6], w[7]); }
     for (int st = B11_STAGE_VS; st <= B11_STAGE_PS; ++st) {
         for (int i = 0; i < B11_MAX_SRV; ++i) {
@@ -796,8 +1121,33 @@ static void trace_draw(B11Context *ctx, const char *kind, const B11Op *op)
                 fprintf(stderr, " [");
                 const uint8_t *p = (const uint8_t *)vbk->cpu + s->vb_offset[0] + (size_t)((int32_t)op->c + i) * stride;
                 for (uint32_t k = 0; k < stride; ++k) fprintf(stderr, "%02x", p[k]);
+                if (stride >= 12) { float ff[2]; memcpy(ff, p + 4, 8); fprintf(stderr, " xy@4=%g,%g", ff[0], ff[1]); }
                 fprintf(stderr, "]");
             }
+            if (getenv("BEER_BD11_VBDUMP")) {
+                FILE *f = fopen(getenv("BEER_BD11_VBDUMP"), "wb");
+                if (f) { fwrite(vbk->cpu, 1, vb->desc.byte_width, f); fclose(f); }
+                f = fopen("/tmp/d11i/ib.bin", "wb");
+                if (f) { fwrite(ibk->cpu, 1, ib->desc.byte_width, f); fclose(f); }
+            }
+            fprintf(stderr, "\n    vbraw:");
+            for (uint32_t i = 0; i < 40; ++i) {
+                uint32_t w; memcpy(&w, (const uint8_t *)vbk->cpu + s->vb_offset[0] + i * 4, 4);
+                fprintf(stderr, " %08x", w);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    if (getenv("BEER_BD11_TRACE_PSCB")) {
+        for (int slot = 0; slot < B11_MAX_CBV; ++slot) {
+            B11Buffer *cb = (B11Buffer *)s->cb[B11_STAGE_PS][slot];
+            if (!cb) continue;
+            BD12Buffer *ck = b11_buffer_current(cb);
+            if (!ck || !ck->cpu) continue;
+            const float *f = ck->cpu;
+            fprintf(stderr, "    pscb%d(%u):", slot, cb->desc.byte_width);
+            const uint32_t lim = slot == 8 ? 300 : 48;
+            for (uint32_t k = 0; k < lim && k * 4 < cb->desc.byte_width; ++k) fprintf(stderr, " %.9g", f[k]);
             fprintf(stderr, "\n");
         }
     }
@@ -808,6 +1158,14 @@ static void trace_draw(B11Context *ctx, const char *kind, const B11Op *op)
             fprintf(stderr, "    vscb0:");
             for (int i = 0; i < 24; ++i) fprintf(stderr, " %g", f[i]);
             fprintf(stderr, "\n");
+            if (getenv("BEER_BD11_TRACE_CBALL")) {      /* every non-zero float4 of the buffer, with its index */
+                const uint32_t n = ((B11Buffer *)s->cb[B11_STAGE_VS][0])->desc.byte_width / 16;
+                fprintf(stderr, "    vscb0-all(%u float4):", n);
+                for (uint32_t v = 0; v < n; ++v)
+                    if (f[v * 4] != 0 || f[v * 4 + 1] != 0 || f[v * 4 + 2] != 0 || f[v * 4 + 3] != 0)
+                        fprintf(stderr, " [%u: %g %g %g %g]", v, f[v * 4], f[v * 4 + 1], f[v * 4 + 2], f[v * 4 + 3]);
+                fprintf(stderr, "\n");
+            }
         }
     }
     B11Layout *ly = (B11Layout *)s->layout;
@@ -841,6 +1199,8 @@ static void execute(B11Context *ctx, const B11Op *op)
         break;
     case B11_OP_DISPATCH: do_dispatch(ctx, op->a, op->b, op->c); break;
     case B11_OP_CLEAR_RTV: g_b11_stats[ST_CLEAR_RTV]++; do_clear_rtv(ctx, op); break;
+    case B11_OP_CLEAR_UAV_UINT: do_clear_uav(ctx, op, 0); break;
+    case B11_OP_CLEAR_UAV_FLOAT: do_clear_uav(ctx, op, 1); break;
     case B11_OP_CLEAR_DSV: g_b11_stats[ST_CLEAR_DSV]++; do_clear_dsv(ctx, op); break;
     case B11_OP_COPY_RESOURCE: do_copy(ctx, op->obj[0], 0, 0, 0, 0, op->obj[1], 0, NULL, 1); break;
     case B11_OP_COPY_REGION:
@@ -1111,8 +1471,22 @@ static void B11_MS ctx_clear_dsv(B11Context *c, B11Obj *dsv, uint32_t flags, flo
     B11Op op = op_new(B11_OP_CLEAR_DSV); op.obj[0] = dsv; op.a = flags; memcpy(&op.b, &depth, 4); op.c = stencil;
     ctx_emit(c, &op);
 }
-static void B11_MS ctx_clear_uav(B11Context *c, B11Obj *uav, const uint32_t *values)
-{ (void)c; (void)uav; (void)values; }
+static void B11_MS ctx_clear_uav_uint(B11Context *c, B11Obj *uav, const uint32_t *values)
+{
+    if (!uav || !values) return;
+    B11Op op = op_new(B11_OP_CLEAR_UAV_UINT); op.obj[0] = uav; op.data = malloc(16);
+    if (!op.data) return;
+    memcpy(op.data, values, 16);
+    ctx_emit(c, &op);
+}
+static void B11_MS ctx_clear_uav_float(B11Context *c, B11Obj *uav, const float *values)
+{
+    if (!uav || !values) return;
+    B11Op op = op_new(B11_OP_CLEAR_UAV_FLOAT); op.obj[0] = uav; op.data = malloc(16);
+    if (!op.data) return;
+    memcpy(op.data, values, 16);
+    ctx_emit(c, &op);
+}
 
 static void B11_MS ctx_copy_resource(B11Context *c, B11Obj *dst, B11Obj *src)
 {
@@ -1152,7 +1526,11 @@ static void B11_MS ctx_update(B11Context *c, B11Obj *dst, uint32_t sub, const ui
     uint8_t *payload = malloc(24 + size);
     if (!payload) return;
     if (box) memcpy(payload, box, 24);
-    memcpy(payload + (box ? 24 : 0), data, size);
+    /* D3D11 runtime quirk: for a buffer on a deferred context the source pointer addresses the start of the whole
+     * destination range, so the bytes of a boxed update are read at pSrcData + box.left. */
+    const uint8_t *src_bytes = data;
+    if (box && dst->kind == B11_BUFFER && c->type == 1 && !getenv("BEER_BD11_NO_SRC_OFFSET")) src_bytes += box[0];
+    memcpy(payload + (box ? 24 : 0), src_bytes, size);
     B11Op op = op_new(B11_OP_UPDATE); op.obj[0] = dst; op.a = sub; op.b = row_pitch; op.c = slice_pitch;
     op.d = box != NULL; op.data = payload; op.data_size = size;
     ctx_emit(c, &op);
@@ -1174,6 +1552,160 @@ static void B11_MS ctx_resolve(B11Context *c, B11Obj *dst, uint32_t dsub, B11Obj
 
 /* Map / Unmap ------------------------------------------------------------------------------ */
 
+/* ---- lazily populated scratch for deferred buffer maps ----------------------------------------
+ * A Map on a deferred context hands the game a buffer-sized scratch. Sekiro maps multi-megabyte streaming buffers
+ * hundreds of times per frame and writes a few hundred bytes each time, so copying the old contents in and
+ * diffing everything out cost seconds per frame. The scratch is PROT_NONE; the first touch of a page faults, the
+ * loader's fault handler calls b11_lazy_fault() which fills the page (from the live buffer, or zeros for a discard)
+ * and marks it dirty, and Unmap only looks at dirty pages. */
+extern int (*g_beer_lazy_fault_hook)(void *addr);
+#define B11_MAX_LAZY 512
+typedef struct {
+    _Atomic uintptr_t start, end;
+    const uint8_t *base;               /* live buffer contents, NULL for a discard (zero fill) */
+    size_t base_size;
+    uint8_t *dirty;
+    size_t pages;
+} B11Lazy;
+static B11Lazy g_b11_lazy[B11_MAX_LAZY];
+
+static int b11_lazy_fault(void *addr)
+{
+    const uintptr_t a = (uintptr_t)addr;
+    for (int i = 0; i < B11_MAX_LAZY; ++i) {
+        const uintptr_t st = atomic_load_explicit(&g_b11_lazy[i].start, memory_order_acquire);
+        if (!st || a < st || a >= g_b11_lazy[i].end) continue;
+        const size_t page = (a - st) >> 12;
+        uint8_t *p = (uint8_t *)st + (page << 12);
+        if (mprotect(p, 4096, PROT_READ | PROT_WRITE) != 0) return 0;
+        const size_t off = page << 12;
+        if (g_b11_lazy[i].base && g_b11_lazy[i].base_size > off) {
+            const size_t n = g_b11_lazy[i].base_size - off < 4096 ? g_b11_lazy[i].base_size - off : 4096;
+            memcpy(p, g_b11_lazy[i].base + off, n);
+        }
+        g_b11_lazy[i].dirty[page] = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* Returns the scratch (or NULL) and the registry slot + 1 in *slot. */
+static uint8_t *b11_lazy_alloc(size_t size, const uint8_t *base, int *slot)
+{
+    const size_t pages = (size + 4095) >> 12;
+    uint8_t *dirty = calloc(pages, 1);
+    void *mem = mmap(NULL, pages << 12, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (!dirty || mem == MAP_FAILED) { free(dirty); if (mem != MAP_FAILED) munmap(mem, pages << 12); return NULL; }
+    static _Atomic int hint;
+    for (int tries = 0; tries < B11_MAX_LAZY; ++tries) {
+        const int i = (atomic_fetch_add(&hint, 1) & 0x7fffffff) % B11_MAX_LAZY;
+        uintptr_t expected = 0;
+        if (atomic_load(&g_b11_lazy[i].start) != 0) continue;
+        g_b11_lazy[i].base = base; g_b11_lazy[i].base_size = size; g_b11_lazy[i].dirty = dirty; g_b11_lazy[i].pages = pages;
+        g_b11_lazy[i].end = (uintptr_t)mem + (pages << 12);
+        if (atomic_compare_exchange_strong(&g_b11_lazy[i].start, &expected, (uintptr_t)mem)) {
+            g_beer_lazy_fault_hook = b11_lazy_fault;
+            *slot = i + 1;
+            return mem;
+        }
+    }
+    free(dirty); munmap(mem, pages << 12);
+    return NULL;
+}
+
+static void b11_lazy_free(int slot)
+{
+    B11Lazy *l = &g_b11_lazy[slot - 1];
+    const uintptr_t st = l->start;
+    atomic_store(&l->start, 0);
+    munmap((void *)st, l->pages << 12);
+    free(l->dirty);
+    l->dirty = NULL;
+}
+
+/* Word-at-a-time scans for the lazy map collector (these run over multi-megabyte buffers hundreds of times a frame). */
+static size_t b11_first_diff(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t x, y; memcpy(&x, a + i, 8); memcpy(&y, b + i, 8); if (x != y) break; }
+    while (i < n && a[i] == b[i]) ++i;
+    return i;
+}
+static size_t b11_last_diff_end(const uint8_t *a, const uint8_t *b, size_t lo, size_t n)
+{
+    size_t e = n;
+    for (; e >= lo + 8; e -= 8) { uint64_t x, y; memcpy(&x, a + e - 8, 8); memcpy(&y, b + e - 8, 8); if (x != y) break; }
+    while (e > lo && a[e - 1] == b[e - 1]) --e;
+    return e;
+}
+static size_t b11_trim_zero_end(const uint8_t *m, size_t lo, size_t e)
+{
+    for (; e >= lo + 8; e -= 8) { uint64_t x; memcpy(&x, m + e - 8, 8); if (x) break; }
+    while (e > lo && m[e - 1] == 0) --e;
+    return e;
+}
+
+/* Emits one BUFFER_WRITE op per run of consecutive written pages (so a ring buffer written at two far-apart places does
+ * not copy everything in between). The first op of a discarded map carries the "rename + zero the rest" flag. */
+static void b11_lazy_emit(B11Context *c, B11Obj *res, int slot, int discard, size_t total)
+{
+    B11Lazy *l = &g_b11_lazy[slot - 1];
+    const uint8_t *mem = (const uint8_t *)atomic_load(&l->start);
+    int first_op = 1;
+    size_t pg = 0;
+    /* a discard drops the old contents: without any written page it still has to rename the backing */
+    while (pg < l->pages) {
+        if (!l->dirty[pg]) { ++pg; continue; }
+        size_t run_first = (size_t)-1, run_last = 0, end_pg = pg;
+        for (; end_pg < l->pages && l->dirty[end_pg]; ++end_pg) {
+            const size_t off = end_pg << 12, n = total - off < 4096 ? total - off : 4096;
+            size_t a = 0, e = n;
+            if (!discard) {
+                if (!memcmp(mem + off, l->base + off, n)) continue;
+                a = b11_first_diff(mem + off, l->base + off, n);
+                e = b11_last_diff_end(mem + off, l->base + off, a, n);
+            }
+            if (off + a < run_first) run_first = off + a;
+            if (off + e > run_last) run_last = off + e;
+        }
+        if (run_first != (size_t)-1 && run_last > run_first) {
+            size_t f = run_first, e = run_last;
+            if (discard) {
+                f = pg << 12;
+                e = b11_trim_zero_end(mem, f, e);                 /* the rest reads as zero anyway */
+                e = (e + 15u) & ~(size_t)15u;
+                if (e > total) e = total;
+            }
+            if (e > f) {
+                uint8_t *out = malloc(e - f);
+                if (out) {
+                    for (size_t o = f; o < e; ) {
+                        const size_t p2 = o >> 12, stop = (p2 + 1) << 12 < e ? (p2 + 1) << 12 : e;
+                        if (l->dirty[p2]) memcpy(out + (o - f), mem + o, stop - o);
+                        else if (discard) memset(out + (o - f), 0, stop - o);
+                        else memcpy(out + (o - f), l->base + o, stop - o);
+                        o = stop;
+                    }
+                    B11Op op = op_new(B11_OP_BUFFER_WRITE);
+                    op.obj[0] = res;
+                    op.a = discard && first_op;
+                    op.b = (uint32_t)f;
+                    op.data_size = e - f;
+                    op.data = out;
+                    ctx_emit(c, &op);
+                    first_op = 0;
+                }
+            }
+        }
+        pg = end_pg;
+    }
+    if (discard && first_op) {                                    /* all-zero discard: still renames to a cleared buffer */
+        B11Op op = op_new(B11_OP_BUFFER_WRITE);
+        op.obj[0] = res; op.a = 1; op.b = 0; op.data_size = 16; op.data = calloc(1, 16);
+        if (op.data) ctx_emit(c, &op);
+    }
+}
+
 static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t type, uint32_t flags, uint8_t *mapped)
 {
     (void)flags;
@@ -1183,15 +1715,19 @@ static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t t
     void *data = NULL;
     uint32_t row_pitch = 0, depth_pitch = 0;
     size_t map_size = 0;
+    int lazy_slot = 0;
     if (res->kind == B11_BUFFER) {
         B11Buffer *b = (B11Buffer *)res;
         map_size = b->desc.byte_width;
         if (c->type == 1) {                        /* deferred: scratch the unmap turns into an op */
-            data = calloc(1, map_size);
-            if (!data) return B11_E_OUTOFMEMORY;
-            if (type != B11_MAP_WRITE_DISCARD) {
-                BD12Buffer *bk = b11_buffer_current(b);
-                if (bk && bk->cpu) memcpy(data, bk->cpu, map_size);
+            BD12Buffer *bk = b11_buffer_current(b);
+            if (type == B11_MAP_WRITE_DISCARD || ((type == B11_MAP_WRITE_NO_OVERWRITE || type == B11_MAP_WRITE) && bk && bk->cpu)) {
+                data = b11_lazy_alloc(map_size, type == B11_MAP_WRITE_DISCARD ? NULL : bk->cpu, &lazy_slot);
+            }
+            if (!data) {
+                data = calloc(1, map_size);
+                if (!data) return B11_E_OUTOFMEMORY;
+                if (type != B11_MAP_WRITE_DISCARD && bk && bk->cpu) memcpy(data, bk->cpu, map_size);
             }
         } else {
             pthread_mutex_lock(&dev->lock);
@@ -1231,6 +1767,7 @@ static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t t
     c->mapped[slot].map_type = type;
     c->mapped[slot].data = data;
     c->mapped[slot].size = map_size;
+    c->mapped[slot].lazy_slot = lazy_slot;
     memcpy(mapped, &data, 8);
     memcpy(mapped + 8, &row_pitch, 4);
     memcpy(mapped + 12, &depth_pitch, 4);
@@ -1245,6 +1782,12 @@ static void B11_MS ctx_unmap(B11Context *c, B11Obj *res, uint32_t sub)
             B11Buffer *b = (B11Buffer *)res;
             uint8_t *data = c->mapped[i].data;
             size_t first = 0, last = b->desc.byte_width;
+            if (c->mapped[i].lazy_slot) {
+                b11_lazy_emit(c, res, c->mapped[i].lazy_slot, c->mapped[i].map_type == B11_MAP_WRITE_DISCARD, b->desc.byte_width);
+                b11_lazy_free(c->mapped[i].lazy_slot);
+                memset(&c->mapped[i], 0, sizeof(c->mapped[i]));
+                return;
+            }
             if (c->mapped[i].map_type == B11_MAP_WRITE_DISCARD) {
                 while (last > 0 && data[last - 1] == 0) --last;
                 last = (last + 15u) & ~(size_t)15u;
@@ -1256,6 +1799,11 @@ static void B11_MS ctx_unmap(B11Context *c, B11Obj *res, uint32_t sub)
                     while (first < last && data[first] == base[first]) ++first;
                     while (last > first && data[last - 1] == base[last - 1]) --last;
                 }
+            }
+            if (getenv("BEER_BD11_MAPLOG")) {
+                fprintf(stderr, "[BD11 MAP] ctx=%p buf=%p bytes=%u type=%u range=%zu..%zu first:", (void *)c, (void *)b, b->desc.byte_width, c->mapped[i].map_type, first, last);
+                for (size_t k = 0; k < 8 && first + k * 4 + 4 <= last; ++k) { uint32_t w; memcpy(&w, data + first + k * 4, 4); fprintf(stderr, " %08x", w); }
+                fprintf(stderr, "\n");
             }
             if (last > first) {
                 B11Op op = op_new(B11_OP_BUFFER_WRITE);
@@ -1334,7 +1882,9 @@ static B11HR B11_MS ctx_finish_list(B11Context *c, uint32_t restore, void **out)
     c->ops = NULL; c->op_count = c->op_capacity = 0;
     if (!restore) b11_state_clear(c);
     for (int i = 0; i < 64; ++i) {                       /* unmatched deferred maps are dropped */
-        if (c->mapped[i].resource && c->mapped[i].resource->kind == B11_BUFFER && c->type == 1) free(c->mapped[i].data);
+        if (c->mapped[i].resource && c->mapped[i].resource->kind == B11_BUFFER && c->type == 1) {
+            if (c->mapped[i].lazy_slot) b11_lazy_free(c->mapped[i].lazy_slot); else free(c->mapped[i].data);
+        }
         memset(&c->mapped[i], 0, sizeof(c->mapped[i]));
     }
     if (out) *out = l; else b11_release(&l->obj);
@@ -1383,7 +1933,7 @@ void b11_context_init_vtable(void)
     v[41] = (void *)ctx_dispatch;
     v[43] = (void *)ctx_rs_state; v[44] = (void *)ctx_rs_viewports; v[45] = (void *)ctx_rs_scissors;
     v[46] = (void *)ctx_copy_region; v[47] = (void *)ctx_copy_resource; v[48] = (void *)ctx_update;
-    v[50] = (void *)ctx_clear_rtv; v[51] = (void *)ctx_clear_uav; v[52] = (void *)ctx_clear_uav;
+    v[50] = (void *)ctx_clear_rtv; v[51] = (void *)ctx_clear_uav_uint; v[52] = (void *)ctx_clear_uav_float;
     v[53] = (void *)ctx_clear_dsv; v[54] = (void *)ctx_generate_mips; v[55] = (void *)ctx_set_min_lod;
     v[56] = (void *)ctx_get_min_lod; v[57] = (void *)ctx_resolve; v[58] = (void *)ctx_execute_list;
     v[59] = (void *)ctx_hs_srv; v[60] = (void *)ctx_hs_shader; v[61] = (void *)ctx_hs_samp; v[62] = (void *)ctx_hs_cb;

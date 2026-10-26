@@ -64,6 +64,7 @@ int xwayland_window_create(int x, int y, int width, int height,
 int xwayland_window_show(int visible);
 /* Requests native keyboard focus for the guest's top-level XWayland window. */
 int xwayland_window_request_focus(void);
+int xwayland_window_focus_lost_by_user(void);
 /* Applies the guest Win32 frame policy to the native XWayland window. */
 int xwayland_window_set_style(int decorated, int resizable);
 /* Requests compositor-managed fullscreen through EWMH. Under Wayland this is

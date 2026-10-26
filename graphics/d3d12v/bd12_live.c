@@ -76,6 +76,9 @@ uint32_t bd12_live_serial(void)
 
 int bd12_descriptor_alive(const BD12Descriptor *d)
 {
+    static int off = -1;
+    if (off < 0) off = getenv("BEER_BD12_NO_ALIVE") != NULL;     /* diagnostic: trust every descriptor */
+    if (off) return 1;
     if (d->source_buffer && !(bd12_live_has(d->source_buffer) && d->source_buffer->serial == d->buffer_serial)) return 0;
     if (d->image && !(bd12_live_has(d->image) && d->image->serial == d->image_serial)) return 0;
     return 1;

@@ -1359,6 +1359,28 @@ beer_trace_log(u64 idx, u64 a, u64 b, u64 c, u64 d)
 {
     static _Atomic(u32) n;
     u32 k = atomic_fetch_add(&n, 1);
+    {   /* BEER_API_STATS=1 (with BEER_API_TRACE=1): instead of a log, print the busiest guest->host calls every 400000 calls. */
+        static int stats = -1;
+        static _Atomic(u32) counts[MAX_STUBS];
+        if (stats < 0) stats = getenv("BEER_API_STATS") != NULL;
+        if (stats) {
+            if (idx < MAX_STUBS) atomic_fetch_add(&counts[idx], 1);
+            if (k % 400000 == 399999) {
+                fprintf(stderr, "[API STATS] last 400000 calls:");
+                for (int top = 0; top < 22; ++top) {
+                    u32 best = 0, best_i = 0;
+                    for (u32 i = 0; i < MAX_STUBS; ++i) { u32 v = atomic_load(&counts[i]); if (v > best) { best = v; best_i = i; } }
+                    if (!best) break;
+                    fprintf(stderr, " %s=%u", g_snames[best_i] ? g_snames[best_i] : "?", best);
+                    atomic_store(&counts[best_i], 0);
+                }
+                fprintf(stderr, "\n");
+                for (u32 i = 0; i < MAX_STUBS; ++i) atomic_store(&counts[i], 0);
+            }
+            t_trace_logged = 0;
+            return 0;
+        }
+    }
     static u32 from = 0xffffffffu;
     if (from == 0xffffffffu) from = getenv("BEER_API_TRACE_FROM") ? (u32)strtoul(getenv("BEER_API_TRACE_FROM"), NULL, 0) : 0;
     t_trace_logged = 0;
@@ -4156,9 +4178,9 @@ beer_dsb_unlock(BeerDirectSoundBuffer *buffer, void *part1, u32 bytes1,
         u32 ring_peak = 0;
         beer_pcm_measure(buffer->data, buffer->size, &ring_nonzero, &ring_peak);
         int submitted = 1;
-        if (part1 && bytes1) submitted = beer_audio_submit(part1, bytes1, NULL, NULL);
+        if (part1 && bytes1) submitted = beer_audio_submit_nowait(part1, bytes1);
         if (submitted && part2 && bytes2)
-            submitted = beer_audio_submit(part2, bytes2, NULL, NULL);
+            submitted = beer_audio_submit_nowait(part2, bytes2);
         if (!submitted) return BEER_DSERR_INVALIDPARAM;
         static _Atomic(u32) unlocks;
         static _Atomic(u64) nonzero_samples;
@@ -6174,7 +6196,7 @@ extern int b11_is_device(const void *object);
 static int beer_use_bd11(void)
 {
     static int cached = -1;
-    if (cached < 0) cached = getenv("BEER_D3D11_BD11") != NULL;   /* BD11 is opt-in until it renders correctly */
+    if (cached < 0) cached = !getenv("BEER_D3D11_LEGACY");   /* BD11 is the default; BEER_D3D11_LEGACY=1 selects the old path */
     return cached;
 }
 
@@ -6980,8 +7002,8 @@ static u64 __attribute__((ms_abi)) impl_InterlockedCompareExchange64(volatile u6
  * artificial limit made CreateEvent fail and triggered an intentional
  * DLPlainConditionSignal panic. Keep a bounded implementation, but size it well
  * above the observed workload like a normal process handle table. */
-#define MAX_EVENTS 16384
-#define MAX_SEMS   4096
+#define MAX_EVENTS 131072
+#define MAX_SEMS   65536
 
 typedef struct {
     int used;
@@ -7003,6 +7025,8 @@ static u32 g_sem_max[MAX_SEMS];
 static pthread_mutex_t g_sem_mtx[MAX_SEMS];
 static pthread_cond_t  g_sem_cv[MAX_SEMS];
 static int g_sem_cnt = 1;
+static u8 g_sem_used[MAX_SEMS];
+static int g_sem_free_hint;           /* most recently closed semaphore slot, reused first */
 
 static int event_id_from_handle(u64 h)
 {
@@ -7019,7 +7043,7 @@ static int sem_id_from_handle(u64 h)
     u32 hv = (u32)h;
     if ((hv & 0xF0000000u) != 0xC0000000u) return -1;
     int id = (int)(hv - 0xC0000000u);
-    if (id <= 0 || id >= g_sem_cnt) return -1;
+    if (id <= 0 || id >= g_sem_cnt || !g_sem_used[id]) return -1;
     return id;
 }
 
@@ -7048,6 +7072,7 @@ static u64 event_alloc(int manual, int initial)
     if (!id) {
         if (g_event_cnt >= MAX_EVENTS) {
             pthread_mutex_unlock(&g_event_table_mtx);
+            fprintf(stderr, "[SYNC] event table exhausted (%d)\n", MAX_EVENTS);
             g_last_error = 4; /* ERROR_TOO_MANY_OPEN_FILES */
             return 0;
         }
@@ -7065,14 +7090,23 @@ static u64 event_alloc(int manual, int initial)
     return (u64)(0xE0000000u + (u32)id);
 }
 
+static pthread_mutex_t g_sem_table_mtx = PTHREAD_MUTEX_INITIALIZER;
 static u64 sem_alloc(u32 init, u32 max)
 {
-    if (g_sem_cnt >= MAX_SEMS) return 0;
-    int id = g_sem_cnt++;
+    pthread_mutex_lock(&g_sem_table_mtx);
+    int id = 0;
+    if (g_sem_free_hint > 0 && !g_sem_used[g_sem_free_hint]) id = g_sem_free_hint;
+    g_sem_free_hint = 0;
+    if (!id) {
+        if (g_sem_cnt >= MAX_SEMS) { fprintf(stderr, "[SYNC] semaphore table exhausted (%d)\n", MAX_SEMS); g_last_error = 4; pthread_mutex_unlock(&g_sem_table_mtx); return 0; }
+        id = g_sem_cnt++;
+    }
+    g_sem_used[id] = 1;
     g_sem_val[id] = init;
     g_sem_max[id] = max ? max : 0x7FFFFFFFu;
     pthread_mutex_init(&g_sem_mtx[id], NULL);
     pthread_cond_init(&g_sem_cv[id], NULL);
+    pthread_mutex_unlock(&g_sem_table_mtx);
     return (u64)(0xC0000000u + (u32)id);
 }
 
@@ -7183,6 +7217,63 @@ impl_PulseEvent(u64 h)
     return 1;
 }
 
+/* Win32 mutexes: recursive, owned by the acquiring guest thread. */
+#define MAX_WIN_MUTEXES 65536
+typedef struct { int used; u32 owner; u32 count; pthread_mutex_t mtx; pthread_cond_t cv; } WinMutex;
+static WinMutex g_win_mutexes[MAX_WIN_MUTEXES];
+static int g_win_mutex_cnt = 1;
+static int g_win_mutex_free;          /* most recently closed slot, reused first */
+static pthread_mutex_t g_win_mutex_table = PTHREAD_MUTEX_INITIALIZER;
+static int win_mutex_id(u64 h)
+{
+    u32 hv = (u32)h;
+    if ((hv & 0xF0000000u) != 0xA0000000u) return -1;
+    int id = (int)(hv - 0xA0000000u);
+    if (id <= 0 || id >= g_win_mutex_cnt || !g_win_mutexes[id].used) return -1;
+    return id;
+}
+static u64 win_mutex_alloc(int initial_owner)
+{
+    if (getenv("BEER_OLD_MUTEX")) return 0xA0000001u;
+    pthread_mutex_lock(&g_win_mutex_table);
+    int id = 0;
+    if (g_win_mutex_free > 0 && !g_win_mutexes[g_win_mutex_free].used) id = g_win_mutex_free;
+    g_win_mutex_free = 0;
+    if (!id) {
+        if (g_win_mutex_cnt >= MAX_WIN_MUTEXES) { pthread_mutex_unlock(&g_win_mutex_table); g_last_error = 4; return 0; }
+        id = g_win_mutex_cnt++;
+    }
+    WinMutex *m = &g_win_mutexes[id];
+    pthread_mutex_init(&m->mtx, NULL);
+    pthread_cond_init(&m->cv, NULL);
+    m->owner = initial_owner ? (u32)current_windows_thread_id() : 0;
+    m->count = initial_owner ? 1 : 0;
+    m->used = 1;
+    pthread_mutex_unlock(&g_win_mutex_table);
+    if (getenv("BEER_MUTEX_LOG")) fprintf(stderr, "[MUTEX] create id=%d caller=0x%llx\n", id, (unsigned long long)g_dispatch_incoming_return);
+    return 0xA0000000u + (u32)id;
+}
+static u64 win_mutex_wait(int id, u32 ms)
+{
+    WinMutex *m = &g_win_mutexes[id];
+    const u32 me = (u32)current_windows_thread_id();
+    int rc = 0;
+    if (getenv("BEER_MUTEX_LOG")) fprintf(stderr, "[MUTEX] wait id=%d ms=%u owner=%u count=%u me=%u caller=0x%llx\n", id, ms, m->owner, m->count, me, (unsigned long long)g_dispatch_incoming_return);
+    pthread_mutex_lock(&m->mtx);
+    if (m->count && m->owner != me) {
+        if (ms == 0) rc = ETIMEDOUT;
+        else if (ms == 0xFFFFFFFFu) { while (m->count) pthread_cond_wait(&m->cv, &m->mtx); }
+        else {
+            struct timespec ts;
+            if (calc_abs_deadline(&ts, ms) != 0) rc = ETIMEDOUT;
+            while (!rc && m->count) rc = pthread_cond_timedwait(&m->cv, &m->mtx, &ts);
+        }
+    }
+    if (!rc) { m->owner = me; m->count++; }
+    pthread_mutex_unlock(&m->mtx);
+    return rc == ETIMEDOUT ? 0x102u : 0u;
+}
+
 static u64 __attribute__((ms_abi))
 beer_wait_single_raw(u64 h, u32 ms)
 {
@@ -7201,6 +7292,9 @@ beer_wait_single_raw(u64 h, u32 ms)
     g_dbg_wait_kind = 2; g_dbg_wait_handle = h; g_dbg_wait_ms = ms;
     u64 trc = thread_wait_handle(h, ms);
     if (trc != (u64)-2) { g_dbg_wait_kind = 0; return trc; }
+
+    int mid = win_mutex_id(h);
+    if (mid >= 0) { u64 r = win_mutex_wait(mid, ms); g_dbg_wait_kind = 0; return r; }
 
     int eid = event_id_from_handle(h);
     if (eid >= 0) {
@@ -7519,11 +7613,25 @@ impl_WaitForMultipleObjectsEx(u32 n, const u64 *handles, u32 all, u32 ms,
 /* ---- CreateMutex ---- */
 static u64 __attribute__((ms_abi))
 impl_CreateMutexA(u64 sa, u32 own, const char *name)
-    { (void)sa;(void)own;(void)name; return 0xA0000001; }
+    { (void)sa;(void)name; return win_mutex_alloc((int)own); }
 static u64 __attribute__((ms_abi))
 impl_CreateMutexW(u64 sa, u32 own, u64 name)
-    { (void)sa;(void)own;(void)name; return 0xA0000001; }
-static u64 __attribute__((ms_abi)) impl_ReleaseMutex(u64 h) { (void)h; return 1; }
+    { (void)sa;(void)name; return win_mutex_alloc((int)own); }
+static u64 __attribute__((ms_abi)) impl_ReleaseMutex(u64 h)
+{
+    int id = win_mutex_id(h);
+    if (id < 0) return 1;
+    WinMutex *m = &g_win_mutexes[id];
+    int ok = 0;
+    if (getenv("BEER_MUTEX_LOG")) fprintf(stderr, "[MUTEX] release id=%d owner=%u count=%u me=%u caller=0x%llx\n", id, m->owner, m->count, (u32)current_windows_thread_id(), (unsigned long long)g_dispatch_incoming_return);
+    pthread_mutex_lock(&m->mtx);
+    if (m->count && m->owner == (u32)current_windows_thread_id()) {
+        ok = 1;
+        if (--m->count == 0) { m->owner = 0; pthread_cond_signal(&m->cv); }
+    } else g_last_error = 288;   /* ERROR_NOT_OWNER */
+    pthread_mutex_unlock(&m->mtx);
+    return ok;
+}
 static u64 __attribute__((ms_abi)) impl_OpenMutexA(u32 a, u32 b, const char *n)
     { (void)a;(void)b;(void)n; return 0; }
 
@@ -9764,6 +9872,17 @@ impl_CloseHandle(u64 h)
         return 1;
     }
 
+    int mutex_id = win_mutex_id(h);
+    if (mutex_id >= 0) {
+        pthread_mutex_lock(&g_win_mutex_table);
+        g_win_mutexes[mutex_id].used = 0;
+        g_win_mutex_free = mutex_id;
+        pthread_mutex_destroy(&g_win_mutexes[mutex_id].mtx);
+        pthread_cond_destroy(&g_win_mutexes[mutex_id].cv);
+        pthread_mutex_unlock(&g_win_mutex_table);
+        return 1;
+    }
+
     int eid = event_id_from_handle(h);
     if (eid >= 0) {
         pthread_mutex_lock(&g_event_table_mtx);
@@ -9779,6 +9898,8 @@ impl_CloseHandle(u64 h)
     if (sid >= 0) {
         pthread_mutex_destroy(&g_sem_mtx[sid]);
         pthread_cond_destroy(&g_sem_cv[sid]);
+        g_sem_used[sid] = 0;
+        g_sem_free_hint = sid;
         g_sem_val[sid] = 0;
         g_sem_max[sid] = 0;
         return 1;
@@ -10892,7 +11013,7 @@ impl_ShowCursor(s32 show)
                                        atomic_load(&g_current_cursor) != 0);
     static _Atomic(u32) logs;
     u32 log = atomic_fetch_add(&logs, 1);
-    if (log < 16)
+    if (log < 16 || (getenv("BEER_INPUT_DIAGNOSTICS") && value < 2 && log < 400))
         fprintf(stderr, "[USER32] ShowCursor(%d) -> %d\n", show != 0, value);
     return (u32)value;
 }
@@ -10913,6 +11034,10 @@ typedef struct {
     u8 mouse_latch[8];
     u8 dik_latch[256];
     u8 pointer_position_valid;
+    /* Virtual cursor: after SetCursorPos the guest's idea of the position is the warp target, and later motion is
+     * applied to it as host-relative deltas, whether or not the compositor honours the warp (XWayland often does not). */
+    u8 virt_valid, host_prev_valid, warp_pending;
+    s32 virt_x, virt_y, host_prev_x, host_prev_y, warp_x, warp_y;
 } BEER_INPUT_STATE;
 
 typedef struct {
@@ -11130,6 +11255,20 @@ static u64 __attribute__((ms_abi))
 impl_SetCursorPos(s32 x, s32 y)
 {
     int result = xwayland_window_set_cursor_position(x, y);
+    {
+        XwaylandWindowState ws = {0};
+        xwayland_window_get_state(&ws);
+        s32 gx = x - ws.x, gy = y - ws.y;
+        native_to_guest_client(x - ws.x, y - ws.y, &gx, &gy);
+        pthread_mutex_lock(&g_input_mutex);
+        g_input.virt_valid = 1;
+        g_input.virt_x = x; g_input.virt_y = y;
+        g_input.warp_x = x; g_input.warp_y = y; g_input.warp_pending = 1;
+        g_input.root_x = x; g_input.root_y = y;
+        g_input.client_x = gx; g_input.client_y = gy;
+        g_input.pointer_position_valid = 1;
+        pthread_mutex_unlock(&g_input_mutex);
+    }
     if (getenv("BEER_INPUT_DIAGNOSTICS")) {
         static _Atomic(u32) logs;
         u32 log = atomic_fetch_add(&logs, 1);
@@ -11564,6 +11703,11 @@ impl_SetFocus(u64 hw)
 {
     if (hw && hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     u64 previous = g_window_focused ? FAKE_HWND : 0;
+    if (hw == FAKE_HWND && xwayland_window_focus_lost_by_user()) {
+        /* Like Windows, SetFocus cannot pull a window back to the foreground once the user switched away;
+         * the guest learns about focus from the real FOCUS_IN. */
+        return previous;
+    }
     if (hw == FAKE_HWND) {
         /* Guest focus and compositor focus are separate. Reporting WM_SETFOCUS
          * without focusing the native XWayland window leaves keyboard events
@@ -12060,6 +12204,27 @@ static void collect_native_window_events(void)
             }
             case XWAYLAND_EVENT_POINTER_MOTION: {
                 s32 guest_x, guest_y;
+                pthread_mutex_lock(&g_input_mutex);
+                if (g_input.virt_valid) {
+                    XwaylandWindowState ws = {0};
+                    xwayland_window_get_state(&ws);
+                    const s32 hx = event.root_x, hy = event.root_y;
+                    const s32 ddx = hx - g_input.host_prev_x, ddy = hy - g_input.host_prev_y;
+                    const int jump = g_input.warp_pending &&
+                                     ((hx == g_input.warp_x && hy == g_input.warp_y) || ddx > 200 || ddx < -200 || ddy > 200 || ddy < -200);
+                    if (jump) g_input.warp_pending = 0;               /* the compositor honoured our warp: not user movement */
+                    else if (g_input.host_prev_valid) {
+                        g_input.virt_x += ddx; g_input.virt_y += ddy;
+                        if (g_input.virt_x < ws.x) g_input.virt_x = ws.x;
+                        if (g_input.virt_y < ws.y) g_input.virt_y = ws.y;
+                        if (g_input.virt_x >= ws.x + ws.width) g_input.virt_x = ws.x + ws.width - 1;
+                        if (g_input.virt_y >= ws.y + ws.height) g_input.virt_y = ws.y + ws.height - 1;
+                    }
+                    g_input.host_prev_x = hx; g_input.host_prev_y = hy; g_input.host_prev_valid = 1;
+                    event.root_x = g_input.virt_x; event.root_y = g_input.virt_y;
+                    event.x = g_input.virt_x - ws.x; event.y = g_input.virt_y - ws.y;
+                }
+                pthread_mutex_unlock(&g_input_mutex);
                 native_to_guest_client(event.x, event.y, &guest_x, &guest_y);
                 pthread_mutex_lock(&g_input_mutex);
                 s32 previous_x = g_input.client_x;
@@ -20273,6 +20438,28 @@ beer_rtl_unwind_helper(u8 *ctx, u64 target_frame, u64 target_ip,
     if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
         fprintf(stderr, "[UNWIND] RtlUnwind(target=0x%lx ip=0x%lx) could not reach the target frame\n",
                 target_frame, target_ip);
+    /* longjmp whose setjmp frame lives on another stack (Beer runs some guest callbacks on the host-call stack):
+     * the frames cannot be walked across stacks, but the jump buffer holds the whole register state, so restore it
+     * directly. Skipped handlers are the cost; the alternative is returning into code that never expects it. */
+    if (record->code == 0x80000026u && record->parameter_count >= 1 && record->information[0] > 0x10000) {
+        const u8 *jb = (const u8 *)(uintptr_t)record->information[0];
+        u8 restore[0x4d0] __attribute__((aligned(16)));
+        memcpy(restore, ctx, sizeof(restore));
+        memcpy(restore + 0x90, jb + 0x08, 8);     /* Rbx */
+        memcpy(restore + 0x98, jb + 0x10, 8);     /* Rsp */
+        memcpy(restore + 0xa0, jb + 0x18, 8);     /* Rbp */
+        memcpy(restore + 0xa8, jb + 0x20, 8);     /* Rsi */
+        memcpy(restore + 0xb0, jb + 0x28, 8);     /* Rdi */
+        memcpy(restore + 0xd8, jb + 0x30, 8);     /* R12 */
+        memcpy(restore + 0xe0, jb + 0x38, 8);     /* R13 */
+        memcpy(restore + 0xe8, jb + 0x40, 8);     /* R14 */
+        memcpy(restore + 0xf0, jb + 0x48, 8);     /* R15 */
+        memcpy(restore + 0xf8, jb + 0x50, 8);     /* Rip */
+        for (int i = 0; i < 10; ++i) memcpy(restore + 0x200 + i * 16, jb + 0x60 + i * 16, 16);   /* Xmm6-15 */
+        *(u64 *)(restore + 0x78) = return_value;  /* Rax */
+        fprintf(stderr, "[UNWIND] longjmp across stacks: restoring jmp_buf %p directly (rip=0x%lx)\n", (const void *)jb, *(u64 *)(restore + 0xf8));
+        beer_restore_context_asm(restore);        /* no return */
+    }
 }
 
 static u64 __attribute__((ms_abi, used))
@@ -20458,6 +20645,8 @@ static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
     g_cycle_hist_n = 0;
     return 1;
 }
+
+int (*g_beer_lazy_fault_hook)(void *addr);   /* BD11's lazily populated deferred-map scratch pages */
 
 static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
 {
@@ -22773,6 +22962,25 @@ generic_alloc_skip:
         }
     }
 
+    /* Guest return addresses found on the faulting stack (cheap backtrace). */
+    if (g_img) {
+        u64 buf[1024];
+        struct iovec local = { buf, sizeof(buf) }, remote = { (void *)rsp, sizeof(buf) };
+        ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        if (got > 0) {
+            fprintf(stderr, "  Stack words:");
+            for (ssize_t i = 0; i < 40 && i < got / 8; ++i) fprintf(stderr, " %llx", (unsigned long long)buf[i]);
+            fputs("\n", stderr);
+            fprintf(stderr, "  Stack RVAs:");
+            int shown = 0;
+            for (ssize_t i = 0; i < got / 8 && shown < 40; ++i)
+                if (buf[i] > (u64)g_img + 0x1000 && buf[i] < (u64)g_img + 0x2929000) {
+                    fprintf(stderr, " %llx", (unsigned long long)(buf[i] - (u64)g_img));
+                    ++shown;
+                }
+            fputs("\n", stderr);
+        }
+    }
     fputs("────────────────────────────────────────\n", stderr);
     _exit(1);
 }
@@ -22854,6 +23062,7 @@ static void on_dump_stacks(int sig, siginfo_t *info, void *uctx)
 
 static void on_crash(int sig, siginfo_t *si, void *uctx)
 {
+    if (sig == SIGSEGV && g_beer_lazy_fault_hook && g_beer_lazy_fault_hook(si->si_addr)) return;
     on_crash_impl(sig, si, uctx);
 
     ucontext_t *uc  = (ucontext_t *)uctx;

@@ -237,6 +237,7 @@ struct B11Context {
         uint32_t subresource, map_type;
         void *data;
         size_t size;
+        int lazy_slot;            /* lazy scratch registry slot + 1, 0 when data is plain heap memory */
     } mapped[64];
     /* immediate execution state */
     uint32_t dirty;
@@ -262,6 +263,7 @@ struct B11Context {
 typedef struct B11PsoEntry {
     uint64_t key;
     BD12GraphicsPipeline *pipeline;
+    BD12ComputePipeline *compute;      /* set instead of pipeline for compute shaders */
     struct B11PsoEntry *next;
 } B11PsoEntry;
 
@@ -347,5 +349,6 @@ VkFormat b11_vk_format(uint32_t dxgi);
 uint64_t b11_hash(const void *data, size_t size);
 BD12Image *b11_texture_image(B11Texture *tex);
 extern int g_b11_trace;
+extern long g_b11_trace_frame;   /* frame being traced (BEER_BD11_TRACE=<n>, or the frame after BEER_BD11_TRACE_FILE appears); -1 = none */
 
 #endif

@@ -9,6 +9,7 @@
 #include <string.h>
 
 int g_b11_trace;
+long g_b11_trace_frame = -1;
 
 #define IIDB(...) { __VA_ARGS__ }
 typedef struct { uint8_t b[16]; } Guid;
@@ -296,6 +297,11 @@ static B11HR B11_MS dev_create_buffer(B11Device *dev, const B11BufferDesc *desc,
     B11Buffer *b = b11_obj_new(dev, B11_BUFFER, sizeof(*b), vt_buffer, buffer_destroy);
     if (!b) return B11_E_OUTOFMEMORY;
     b->desc = *desc;
+    if (getenv("BEER_BD11_MAPLOG") && desc->byte_width > 100000) {
+        fprintf(stderr, "[BD11 NEWBUF] %p bytes=%u usage=%u bind=%u init=%p:", (void *)b, desc->byte_width, desc->usage, desc->bind, (const void *)init);
+        for (int k = 0; init && k < 16; ++k) { uint32_t w; memcpy(&w, init + 1104 + k * 4, 4); fprintf(stderr, " %08x", w); }
+        fprintf(stderr, "\n");
+    }
     b->host_visible = desc->usage == B11_USAGE_DYNAMIC || desc->usage == B11_USAGE_STAGING || hostbuf_debug();
     b->backing = calloc(4, sizeof(*b->backing));
     b->backing_serial = calloc(4, sizeof(*b->backing_serial));
@@ -446,6 +452,33 @@ static void texture_upload_init(B11Device *dev, B11Texture *t, const B11SubData 
         }
     bd12_cmd_transition_image(cmd, t->image, BD12_ALL_SUBRESOURCES, BD12_STATE_COPY_DEST, BD12_STATE_COMMON);
     pthread_mutex_unlock(&dev->lock);
+    if (getenv("BEER_BD11_TEXVERIFY")) {       /* read mip 0 back from the GPU image and compare with what the game gave us */
+        static unsigned checked;
+        if (checked++ < 60 && init[0].mem) {
+            uint32_t w, h, dp, rb, rows;
+            sub_geometry(t, 0, &w, &h, &dp, &rb, &rows);
+            const uint64_t size = (uint64_t)rb * rows * dp;
+            BD12Buffer *back = bd12_buffer_create_committed(dev->bd, BD12_HEAP_READBACK, size ? size : 256);
+            if (back && back->cpu) {
+                pthread_mutex_lock(&dev->lock);
+                BD12CmdList *cmd2 = b11_cmd(dev);
+                bd12_cmd_transition_image(cmd2, t->image, BD12_ALL_SUBRESOURCES, BD12_STATE_COMMON, BD12_STATE_COPY_SOURCE);
+                bd12_cmd_copy_image_to_buffer(cmd2, back, 0, rb, t->image, (BD12ImagePoint){ 0, 0, 0, 0 }, w, h, dp);
+                bd12_cmd_transition_image(cmd2, t->image, BD12_ALL_SUBRESOURCES, BD12_STATE_COPY_SOURCE, BD12_STATE_COMMON);
+                pthread_mutex_unlock(&dev->lock);
+                b11_flush(dev, 1);
+                uint64_t mismatch = 0, nonzero_back = 0;
+                for (uint32_t r = 0; r < rows * dp; ++r)
+                    for (uint32_t x = 0; x < rb; ++x) {
+                        const uint8_t a = ((const uint8_t *)init[0].mem)[(uint64_t)r * init[0].pitch + x], b = ((const uint8_t *)back->cpu)[(uint64_t)r * rb + x];
+                        mismatch += a != b; nonzero_back += b != 0;
+                    }
+                fprintf(stderr, "[BD11 TEXVERIFY] %ux%u fmt=%u: %llu of %llu bytes differ after upload (GPU copy has %llu non-zero bytes)\n", w, h, t->desc.format,
+                        (unsigned long long)mismatch, (unsigned long long)size, (unsigned long long)nonzero_back);
+            }
+            if (back) bd12_buffer_destroy(back);
+        }
+    }
     b11_defer(dev, free_buffer_fn, stage);
 }
 
@@ -488,6 +521,8 @@ B11HR b11_texture_create(B11Device *dev, const B11TextureDesc *in, const uint8_t
     };
     if (d->bind & B11_BIND_DSV) id.format = bd12_dxgi_resource_to_vk(d->format, 1);
     else id.format = bd12_dxgi_resource_to_vk(d->format, 0);
+    /* A depth copy that is only ever sampled (typeless depth-stencil without a DSV bind) holds just the depth plane. */
+    if (!(d->bind & B11_BIND_DSV) && d->format == 19 && !getenv("BEER_BD11_KEEP_DS_COPY")) id.format = VK_FORMAT_D32_SFLOAT;
     if (id.format == VK_FORMAT_UNDEFINED) {
         fprintf(stderr, "[BD11] unsupported texture format %u\n", d->format);
         texture_destroy(&t->obj);
@@ -651,7 +686,11 @@ static B11HR create_view(B11Device *dev, uint32_t kind, B11Obj *res, const uint3
             if (layers == 0xffffffffu || layer + layers > res_layers) layers = res_layers - layer;
             if (dim == 8) { layer = 0; layers = 1; }
             v->base_mip = mip; v->mip_count = mips; v->base_layer = layer; v->layer_count = layers;
-            ok = bd12_descriptor_write_image_srv(v->heap, 0, t->image, vt, vf, mip, mips, layer, layers);
+            /* X32_TYPELESS_G8X24_UINT (22) and X24_TYPELESS_G8_UINT (47) read the stencil plane of a depth-stencil image. */
+            if (format == 22 || format == 47)
+                ok = bd12_descriptor_write_image_srv_aspect(v->heap, 0, t->image, vt, vf, mip, mips, layer, layers, VK_IMAGE_ASPECT_STENCIL_BIT);
+            else
+                ok = bd12_descriptor_write_image_srv(v->heap, 0, t->image, vt, vf, mip, mips, layer, layers);
         } else if (kind == B11_UAV) {
             VkImageViewType vt = dim == 2 ? VK_IMAGE_VIEW_TYPE_1D : dim == 3 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY :
                                  dim == 4 ? VK_IMAGE_VIEW_TYPE_2D : dim == 5 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY :
@@ -966,7 +1005,8 @@ void b11_init_vtables(void)
     static int done;
     if (done) return;
     done = 1;
-    g_b11_trace = getenv("BEER_BD11_TRACE") != NULL;
+    g_b11_trace = getenv("BEER_BD11_TRACE") != NULL || getenv("BEER_BD11_TRACE_FILE") != NULL;
+    if (getenv("BEER_BD11_TRACE")) g_b11_trace_frame = strtol(getenv("BEER_BD11_TRACE"), NULL, 10);
     CHILD_SLOTS(vt_child);
     CHILD_SLOTS(vt_state);
     vt_state[7] = (void *)state_get_desc;

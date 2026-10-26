@@ -54,11 +54,11 @@ void bd12_state_sync(uint32_t state, int is_source,
         a |= VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
     }
-    if (state & (BD12_STATE_DEPTH_WRITE | BD12_STATE_DEPTH_READ)) {
+    if (state & (BD12_STATE_DEPTH_WRITE | BD12_STATE_DEPTH_READ | BD12_STATE_DEPTH_READ_STENCIL_WRITE)) {
         s |= VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
         a |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-        if (state & BD12_STATE_DEPTH_WRITE)
+        if (state & (BD12_STATE_DEPTH_WRITE | BD12_STATE_DEPTH_READ_STENCIL_WRITE))
             a |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     }
     if (state & BD12_STATE_NON_PIXEL_SHADER_RESOURCE) {
@@ -400,7 +400,8 @@ BD12ComputePipeline *bd12_compute_pipeline_build(
         .layout = pipeline->layout
     };
     VkResult result = device->vk.CreateComputePipelines(
-        device->device, VK_NULL_HANDLE, 1, &info, NULL, &pipeline->pipeline);
+        device->device, device->pipeline_cache, 1, &info, NULL, &pipeline->pipeline);
+    if (result == VK_SUCCESS) bd12_pipeline_cache_note_new(device);
     device->vk.DestroyShaderModule(device->device, module, NULL);
     if (result != VK_SUCCESS) {
         device->vk.DestroyPipelineLayout(device->device, pipeline->layout, NULL);

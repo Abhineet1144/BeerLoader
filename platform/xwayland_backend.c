@@ -12,6 +12,7 @@ int beer_vulkan_device_lost(void);
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 typedef struct _XDisplay Display;
 typedef struct _XVisual Visual;
@@ -39,6 +40,17 @@ typedef struct {
     int format;
     union { char b[20]; short s[10]; long l[5]; } data;
 } XClientMessageEvent;
+
+typedef struct {
+    int type;
+    unsigned long serial;
+    Bool send_event;
+    Display *display;
+    Window window;
+    Atom atom;
+    unsigned long time;
+    int state;
+} XPropertyEventLocal;
 
 typedef struct {
     int type;
@@ -212,6 +224,11 @@ typedef struct {
     int pointer_confine_wanted;   /* ClipCursor active */
     int win_decorated;            /* last set_style */
     int focused;
+    int focus_lost;               /* FOCUS_OUT after a stable focus and no FOCUS_IN since: the user went elsewhere */
+    uint64_t focus_in_ms;         /* when the window last gained focus */
+    unsigned long user_time;      /* X server time at window creation: _NET_WM_USER_TIME / activation timestamp */
+    uint64_t activate_try_ms;     /* last startup activation attempt */
+    int activate_tries;
     /* XInput2 raw motion */
     int xi_opcode;
     int xi_active;
@@ -374,6 +391,30 @@ static void setup_xi_raw_motion_locked(void)
 
 int xwayland_raw_motion_active(void) { return g_x11.xi_active; }
 
+/* Current X server time, obtained from the PropertyNotify of a zero-length property append. 0 on failure. */
+static unsigned long server_time_locked(void)
+{
+    Atom prop = g_x11.InternAtom(g_x11.display, "_BEER_TIME", 0);
+    Atom str = g_x11.InternAtom(g_x11.display, "STRING", 0);
+    if (!prop || !str) return 0;
+    g_x11.ChangeProperty(g_x11.display, g_x11.window, prop, str, 8, 2 /* PropModeAppend */,
+                         (const unsigned char *)"", 0);
+    g_x11.Flush(g_x11.display);
+    for (int i = 0; i < 150; ++i) {
+        while (g_x11.Pending(g_x11.display) > 0) {
+            XEvent e;
+            memset(&e, 0, sizeof(e));
+            g_x11.NextEvent(g_x11.display, &e);
+            if (e.type == 28 /* PropertyNotify */) {
+                const XPropertyEventLocal *pe = (const XPropertyEventLocal *)&e;
+                if (pe->atom == prop) return pe->time;
+            }
+        }
+        usleep(2000);
+    }
+    return 0;
+}
+
 int xwayland_window_create(int x, int y, int width, int height,
                            const char *title, int initially_visible)
 {
@@ -474,7 +515,17 @@ int xwayland_window_create(int x, int y, int width, int height,
                       (1L << 1)  | /* KeyReleaseMask */
                       (1L << 2)  | /* ButtonPressMask */
                       (1L << 3)  | /* ButtonReleaseMask */
-                      (1L << 6));  /* PointerMotionMask */
+                      (1L << 6)  | /* PointerMotionMask */
+                      (1L << 22));  /* PropertyChangeMask: needed once to read the server time */
+    {   /* A window stamped with the current server time is treated by the compositor as freshly user-launched. */
+        g_x11.user_time = server_time_locked();
+        Atom user_time_atom = g_x11.InternAtom(g_x11.display, "_NET_WM_USER_TIME", 0);
+        Atom cardinal = g_x11.InternAtom(g_x11.display, "CARDINAL", 0);
+        unsigned long stamp = g_x11.user_time;
+        if (stamp && user_time_atom && cardinal)
+            g_x11.ChangeProperty(g_x11.display, g_x11.window, user_time_atom, cardinal, 32, 0,
+                                 (const unsigned char *)&stamp, 1);
+    }
     if (initially_visible) {
         g_x11.MapRaised(g_x11.display, g_x11.window);
         g_x11.visible = 1;
@@ -501,7 +552,8 @@ int xwayland_window_show(int visible)
         pthread_mutex_unlock(&g_x11.lock);
         return 0;
     }
-    if (visible) g_x11.MapRaised(g_x11.display, g_x11.window);
+    /* ShowWindow(SW_SHOW) on an already visible window must not raise it: games call it repeatedly. */
+    if (visible) { if (!g_x11.visible || !g_x11.viewable) g_x11.MapRaised(g_x11.display, g_x11.window); }
     else g_x11.UnmapWindow(g_x11.display, g_x11.window);
     g_x11.visible = !!visible;
     g_x11.Flush(g_x11.display);
@@ -545,14 +597,29 @@ int xwayland_window_set_style(int decorated, int resizable)
     return 1;
 }
 
+static void screen_size_locked(int *out_w, int *out_h);
+
 int xwayland_window_set_fullscreen(int fullscreen)
 {
+    if (getenv("BEER_NO_COMPOSITOR_FULLSCREEN")) return 1;     /* experiment: borderless window only */
     pthread_mutex_lock(&g_x11.lock);
     if (!g_x11.display || !g_x11.window) {
         pthread_mutex_unlock(&g_x11.lock);
         return 0;
     }
-
+    {   /* Games flip DXGI fullscreen off and on as they lose and regain activation. Each compositor fullscreen change
+         * moves focus, which makes the game flip again. A window that already covers the screen stays fullscreen,
+         * and repeating the current state does nothing. */
+        static int last_requested = -1;
+        int sw = 0, sh = 0;
+        screen_size_locked(&sw, &sh);
+        const int covers = sw > 0 && sh > 0 && g_x11.width >= sw && g_x11.height >= sh;
+        if (last_requested == !!fullscreen || (!fullscreen && covers)) {
+            pthread_mutex_unlock(&g_x11.lock);
+            return 1;
+        }
+        last_requested = !!fullscreen;
+    }
     Atom wm_state = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE", 0);
     Atom wm_fullscreen = g_x11.InternAtom(
         g_x11.display, "_NET_WM_STATE_FULLSCREEN", 0);
@@ -753,9 +820,17 @@ static int beer_x_error_handler(Display *display, XErrorEvent *error)
     return 0;
 }
 
+static uint64_t backend_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
 static int request_focus_locked(void)
 {
     if (!g_x11.display || !g_x11.window) return 0;
+    if (getenv("BEER_NO_FOCUS_REQUESTS")) return 1;        /* experiment: leave focus entirely to the compositor */
 
     /* XWayland is managed by the Wayland compositor. XSetInputFocus alone is
      * commonly ignored (or targets a mapped-but-inactive X11 surface), while
@@ -772,20 +847,35 @@ static int request_focus_locked(void)
         message.message_type = active;
         message.format = 32;
         message.data.l[0] = 1; /* application-originated activation */
-        message.data.l[1] = 0; /* CurrentTime */
+        message.data.l[1] = (long)g_x11.user_time; /* window creation time; 0 = CurrentTime */
         g_x11.SendEvent(g_x11.display, root, 0,
                         (1L << 19) | (1L << 20), (XEvent *)&message);
     }
-    g_x11.RaiseWindow(g_x11.display, g_x11.window);
-    int ok = g_x11.SetInputFocus(g_x11.display, g_x11.window, 1, 0) != 0;
+    /* Only the EWMH activation request: forcing X input focus (XSetInputFocus) or raising the window by hand fights
+     * the compositor, which hands focus straight back and makes the window flicker between focused and not. */
     g_x11.Flush(g_x11.display);
-    return ok;
+    return 1;
+}
+
+int xwayland_window_focus_lost_by_user(void)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    int lost = g_x11.focus_lost;
+    pthread_mutex_unlock(&g_x11.lock);
+    return lost;
 }
 
 int xwayland_window_request_focus(void)
 {
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window;
+    /* The game calls SetFocus/SetForegroundWindow very often; an already focused window needs nothing, and an
+     * unfocused one is asked at most every 2 s. */
+    if (ok && (g_x11.focused || backend_now_ms() - g_x11.activate_try_ms < 2000)) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 1;
+    }
+    if (ok) g_x11.activate_try_ms = backend_now_ms();
     if (ok) {
         g_x11.focus_requested = 1;
         /* XMapWindow is asynchronous. Apply focus immediately only after a
@@ -855,6 +945,12 @@ int xwayland_window_set_cursor_position(int root_x, int root_y)
 {
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window;
+    /* Mouse-look games re-centre the pointer every frame; when the window is not focused the pointer belongs to the
+     * user (another window), so the warp must not drag it back. */
+    if (ok && !g_x11.focused) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 1;
+    }
     if (ok) {
         Window root = g_x11.DefaultRootWindow(g_x11.display);
         ok = root && g_x11.WarpPointer(g_x11.display, 0, root, 0, 0, 0, 0,
@@ -872,6 +968,7 @@ int xwayland_window_set_cursor_position(int root_x, int root_y)
 static void apply_pointer_confine_locked(void)
 {
     if (!g_x11.display || !g_x11.window || !g_x11.GrabPointer) return;
+    if (getenv("BEER_NO_POINTER_GRAB")) return;                   /* experiment */
     /* A hidden cursor means the game draws its own and reads relative motion,
      * so the host pointer must stay inside the window just like under
      * ClipCursor; otherwise it escapes to the desktop at the window edge. */
@@ -1018,6 +1115,14 @@ int xwayland_window_poll_event(XwaylandEvent *out)
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     pthread_mutex_lock(&g_x11.lock);
+    /* Startup: the compositor may decline the first activation request (focus-stealing rules, launcher timing). Keep
+     * asking for a few seconds until the window really has focus; after that, focus is the user's to move. */
+    if (g_x11.display && g_x11.window && g_x11.viewable && !g_x11.focused && !g_x11.focus_lost &&
+        g_x11.activate_tries < 4 && backend_now_ms() - g_x11.activate_try_ms > 1500) {
+        g_x11.activate_try_ms = backend_now_ms();
+        g_x11.activate_tries++;
+        request_focus_locked();
+    }
     if (!g_x11.display || !g_x11.window || g_x11.Pending(g_x11.display) <= 0) {
         pthread_mutex_unlock(&g_x11.lock);
         return 0;
@@ -1096,11 +1201,15 @@ int xwayland_window_poll_event(XwaylandEvent *out)
         }
         case 9:
             g_x11.focused = 1;
+            g_x11.focus_lost = 0;
+            g_x11.focus_in_ms = backend_now_ms();
             out->type = XWAYLAND_EVENT_FOCUS_IN;
             apply_pointer_confine_locked();   /* re-confine after refocus */
             break;
         case 10:
             g_x11.focused = 0;
+            /* A focus loss right after startup is the compositor settling, not the user switching away. */
+            g_x11.focus_lost = g_x11.focus_in_ms && backend_now_ms() - g_x11.focus_in_ms > 3000;
             out->type = XWAYLAND_EVENT_FOCUS_OUT;
             if (g_x11.pointer_confined) {      /* never keep a grab while unfocused */
                 g_x11.UngrabPointer(g_x11.display, 0);

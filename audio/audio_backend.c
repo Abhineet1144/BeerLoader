@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <unistd.h>
 #include "audio_backend.h"
 
 #include <dlfcn.h>
@@ -62,7 +63,10 @@ static struct {
     AudioPacket *tail;
     size_t queued_bytes;
     size_t max_queued_bytes;
+    size_t piece_bytes;
     atomic_uint_fast64_t bytes_played;
+    atomic_uint_fast64_t write_started_ms;   /* 0 while no pa_simple_write is in flight */
+    pthread_t watchdog;
     int initialized;
     int running;
     int failed;
@@ -74,6 +78,39 @@ static void audio_finish_packet(AudioPacket *packet)
     if (packet->done) packet->done(packet->opaque);
     free(packet->data);
     free(packet);
+}
+
+static uint64_t audio_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* A pa_simple_write that makes no progress for over a second means the server stopped asking for data; a flush
+ * restarts the request flow, and the game's audio thread (which can hold game locks while it waits) goes on. */
+static void *audio_watchdog_main(void *unused)
+{
+    (void)unused;
+    while (g_audio.running) {
+        usleep(250000);
+        const uint64_t started = atomic_load(&g_audio.write_started_ms);
+        if (getenv("BEER_AUDIO_DIAGNOSTICS")) {
+            static unsigned tick;
+            if (++tick % 8 == 0)
+                fprintf(stderr, "[AUDIO] watch: write age=%llu ms played=%llu queued=%zu\n",
+                        (unsigned long long)(started ? audio_now_ms() - started : 0),
+                        (unsigned long long)atomic_load(&g_audio.bytes_played), g_audio.queued_bytes);
+        }
+        if (started && audio_now_ms() - started > 1000) {
+            int error = 0;
+            fprintf(stderr, "[AUDIO] sound server stopped taking data for %llu ms; flushing the stream\n",
+                    (unsigned long long)(audio_now_ms() - started));
+            g_audio.simple_flush(g_audio.stream, &error);
+            atomic_store(&g_audio.write_started_ms, audio_now_ms());
+        }
+    }
+    return NULL;
 }
 
 static void *audio_thread_main(void *unused)
@@ -102,6 +139,7 @@ static void *audio_thread_main(void *unused)
             int lerr = 0;
             const uint64_t latency_us = g_audio.simple_latency(g_audio.stream, &lerr);
             ++writes;
+            if (writes % 50 == 0) fprintf(stderr, "[AUDIO] write #%u latency=%llu us queued=%zu played=%llu\n", writes, (unsigned long long)latency_us, g_audio.queued_bytes, (unsigned long long)atomic_load(&g_audio.bytes_played));
             if (latency_us < 2000) {
                 ++underruns;
                 struct timespec now;
@@ -110,8 +148,22 @@ static void *audio_thread_main(void *unused)
                         (long long)now.tv_sec, now.tv_nsec / 1000000, writes, (unsigned long long)latency_us, g_audio.queued_bytes);
             }
         }
-        if (!g_audio.failed && g_audio.simple_write(g_audio.stream, packet->data,
-                                                    packet->size, &error) == 0) {
+        /* Write in ~20 ms pieces: a single pa_simple_write larger than the stream's maxlength (Bink hands over
+         * ~600 ms at once) can stall against the server's buffer target and never return. */
+        int write_ok = !g_audio.failed;
+        atomic_store(&g_audio.write_started_ms, audio_now_ms());
+        const size_t piece = (size_t)g_audio.piece_bytes ? (size_t)g_audio.piece_bytes : 4096;
+        for (size_t done = 0; write_ok && done < packet->size; ) {
+            size_t n = packet->size - done < piece ? packet->size - done : piece;
+            const uint64_t t_before = audio_now_ms();
+            if (g_audio.simple_write(g_audio.stream, (const uint8_t *)packet->data + done, n, &error) != 0) write_ok = 0;
+            if (getenv("BEER_AUDIO_DIAGNOSTICS") && audio_now_ms() - t_before > 100)
+                fprintf(stderr, "[AUDIO] slow write: %zu bytes took %llu ms (queued %zu)\n", n, (unsigned long long)(audio_now_ms() - t_before), g_audio.queued_bytes);
+            done += n;
+            atomic_store(&g_audio.write_started_ms, audio_now_ms());
+        }
+        atomic_store(&g_audio.write_started_ms, 0);
+        if (!g_audio.failed && write_ok) {
             atomic_fetch_add_explicit(&g_audio.bytes_played, packet->size,
                                       memory_order_relaxed);
         } else if (!g_audio.failed) {
@@ -149,7 +201,7 @@ int beer_audio_init(unsigned rate, unsigned channels)
     pa_buffer_attr attr = {
         .maxlength = bytes_per_second * 2u / 5u, /* 400 ms hard ceiling */
         .tlength = bytes_per_second * 7u / 50u, /* target about 140 ms: headroom for a stalled mixer thread */
-        .prebuf = UINT32_MAX,               /* server default */
+        .prebuf = 0,                        /* start immediately; an underrun must not re-enter prebuffering and stall */
         .minreq = bytes_per_second / 100u, /* 10 ms refill granularity */
         .fragsize = UINT32_MAX,
     };
@@ -166,11 +218,14 @@ int beer_audio_init(unsigned rate, unsigned channels)
     /* Bound copied PCM to roughly 250 ms. This keeps the FMOD mixer thread
      * decoupled from PipeWire without allowing unbounded latency/memory growth. */
     g_audio.max_queued_bytes = (size_t)rate * channels * sizeof(int16_t) * 2u / 5u;
+    g_audio.piece_bytes = (size_t)rate * channels * sizeof(int16_t) / 50u;   /* 20 ms */
+    g_audio.piece_bytes -= g_audio.piece_bytes % (channels * sizeof(int16_t));
     g_audio.initialized = 1;
     if (pthread_create(&g_audio.thread, NULL, audio_thread_main, NULL) != 0) {
         g_audio.running = 0;
         goto load_failed;
     }
+    pthread_create(&g_audio.watchdog, NULL, audio_watchdog_main, NULL);
     fprintf(stderr, "[AUDIO] PipeWire/Pulse output initialized: %u Hz, %u channels, S16LE\n",
             rate, channels);
     return 1;
@@ -185,7 +240,7 @@ load_failed:
     return 0;
 }
 
-int beer_audio_submit(const void *pcm, size_t bytes, BeerAudioDoneFn done, void *opaque)
+static int audio_submit(const void *pcm, size_t bytes, BeerAudioDoneFn done, void *opaque, int block)
 {
     if (!pcm || !bytes || !g_audio.initialized || g_audio.failed || !g_audio.running)
         return 0;
@@ -202,7 +257,7 @@ int beer_audio_submit(const void *pcm, size_t bytes, BeerAudioDoneFn done, void 
      * submits a block larger than the latency target. Otherwise that producer
      * waits forever for queued_bytes to shrink below zero. Subsequent packets
      * still observe the configured back-pressure limit. */
-    while (g_audio.running && !g_audio.failed && g_audio.max_queued_bytes &&
+    while (block && g_audio.running && !g_audio.failed && g_audio.max_queued_bytes &&
            g_audio.queued_bytes != 0 &&
            g_audio.queued_bytes + bytes > g_audio.max_queued_bytes)
         pthread_cond_wait(&g_audio.condition, &g_audio.mutex);
@@ -218,6 +273,18 @@ int beer_audio_submit(const void *pcm, size_t bytes, BeerAudioDoneFn done, void 
     pthread_cond_signal(&g_audio.condition);
     pthread_mutex_unlock(&g_audio.mutex);
     return 1;
+}
+
+int beer_audio_submit(const void *pcm, size_t bytes, BeerAudioDoneFn done, void *opaque)
+{
+    return audio_submit(pcm, bytes, done, opaque, 1);
+}
+
+/* For DirectSound ring buffers: Unlock never blocks on real hardware, and the game's audio thread often holds
+ * game-wide locks while it calls it. The ring size already bounds how far ahead the game can write. */
+int beer_audio_submit_nowait(const void *pcm, size_t bytes)
+{
+    return audio_submit(pcm, bytes, NULL, NULL, 0);
 }
 
 void beer_audio_reset(void)
@@ -247,6 +314,7 @@ void beer_audio_shutdown(void)
         pthread_cond_broadcast(&g_audio.condition);
         pthread_mutex_unlock(&g_audio.mutex);
         pthread_join(g_audio.thread, NULL);
+        pthread_join(g_audio.watchdog, NULL);
     }
     if (g_audio.stream) {
         int error = 0;

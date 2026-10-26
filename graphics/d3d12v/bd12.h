@@ -39,6 +39,7 @@ enum {
     BD12_STATE_COPY_SOURCE = 0x800,
     BD12_STATE_RESOLVE_DEST = 0x1000,
     BD12_STATE_RESOLVE_SOURCE = 0x2000,
+    BD12_STATE_DEPTH_READ_STENCIL_WRITE = 0x4000,   /* BD11: read-only depth (sampleable) with a writable stencil */
     BD12_STATE_GENERIC_READ = 0xac3,
     BD12_STATE_PRESENT = 0
 };
@@ -64,6 +65,10 @@ struct BD12Device {
     VkDevice device;
     VkQueue queue;
     uint32_t queue_family;
+    VkPipelineCache pipeline_cache;      /* persisted under ~/.cache/beer between runs */
+    char pipeline_cache_path[512];
+    uint32_t pipeline_cache_new;         /* pipelines built since the last save */
+    uint64_t pipeline_cache_saved_ms;
     const BeerVulkanModern *modern;
     VkPhysicalDeviceMemoryProperties memory;
     char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
@@ -571,6 +576,8 @@ typedef struct BD12CmdList {
 
 /* Device ------------------------------------------------------------- */
 BD12Device *bd12_device_create(void);
+void bd12_pipeline_cache_note_new(BD12Device *device);
+void bd12_pipeline_cache_save(BD12Device *device);
 void bd12_device_destroy(BD12Device *device);
 
 /* Heaps and buffers ---------------------------------------------------- */
@@ -862,6 +869,12 @@ void bd12_cmd_copy_image(BD12CmdList *list, BD12Image *dst, BD12ImagePoint at,
                          uint32_t height, uint32_t depth);
 
 /* Image and sampler descriptors. */
+int bd12_descriptor_write_image_srv_aspect(BD12DescriptorHeap *heap, uint32_t index,
+                                           BD12Image *image, VkImageViewType type,
+                                           VkFormat format, uint32_t base_mip,
+                                           uint32_t mip_count, uint32_t base_layer,
+                                           uint32_t layer_count,
+                                           VkImageAspectFlags aspect);
 int bd12_descriptor_write_image_srv(BD12DescriptorHeap *heap, uint32_t index,
                                     BD12Image *image, VkImageViewType type,
                                     VkFormat format, uint32_t base_mip,

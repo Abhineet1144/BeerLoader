@@ -1,9 +1,19 @@
 #define _GNU_SOURCE
 #include "bd12.h"
 
+#include <pthread.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static BD12Device *g_pc_device;
+static void pc_atexit(void)
+{
+    if (g_pc_device && g_pc_device->pipeline_cache_new) bd12_pipeline_cache_save(g_pc_device);
+}
 
 #define BD12_BUFFER_USAGE                                                    \
     (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |   \
@@ -104,6 +114,41 @@ BD12Device *bd12_device_create(void)
     device->storage_texel_single_alignment =
         modern->storage_texel_buffer_offset_single_texel;
 
+
+    /* Persistent pipeline cache: driver pipeline compiles dominate first-run loading. */
+    {
+        const char *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+        char dir[400];
+        if (xdg && *xdg) snprintf(dir, sizeof(dir), "%s/beer", xdg);
+        else snprintf(dir, sizeof(dir), "%s/.cache/beer", home ? home : "/tmp");
+        mkdir(dir, 0700);
+        snprintf(device->pipeline_cache_path, sizeof(device->pipeline_cache_path), "%s/pipelines-%04x-%04x-%08x.bin",
+                 dir, properties.vendorID, properties.deviceID, properties.driverVersion);
+        void *blob = NULL;
+        size_t blob_size = 0;
+        FILE *f = getenv("BEER_NO_PIPELINE_CACHE") ? NULL : fopen(device->pipeline_cache_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0 && n < (256l << 20) && (blob = malloc((size_t)n)) && fread(blob, 1, (size_t)n, f) == (size_t)n) blob_size = (size_t)n;
+            else { free(blob); blob = NULL; }
+            fclose(f);
+        }
+        VkPipelineCacheCreateInfo cache_info = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                                 .initialDataSize = blob_size, .pInitialData = blob };
+        if (device->vk.CreatePipelineCache(device->device, &cache_info, NULL, &device->pipeline_cache) != VK_SUCCESS) {
+            cache_info.initialDataSize = 0; cache_info.pInitialData = NULL;
+            if (device->vk.CreatePipelineCache(device->device, &cache_info, NULL, &device->pipeline_cache) != VK_SUCCESS)
+                device->pipeline_cache = VK_NULL_HANDLE;
+        }
+        if (blob_size) fprintf(stderr, "[BD12] pipeline cache: loaded %zu bytes from %s\n", blob_size, device->pipeline_cache_path);
+        free(blob);
+        device->pipeline_cache_saved_ms = 0;
+        g_pc_device = device;
+        atexit(pc_atexit);
+    }
+
     /* Probe the memory type bits every D3D12 buffer can use. */
     VkBufferCreateInfo probe_info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -160,9 +205,53 @@ BD12Device *bd12_device_create(void)
     return device;
 }
 
+static uint64_t pc_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+void bd12_pipeline_cache_save(BD12Device *device)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    if (!device || !device->pipeline_cache || !device->pipeline_cache_path[0]) return;
+    pthread_mutex_lock(&lock);
+    size_t size = 0;
+    if (device->vk.GetPipelineCacheData(device->device, device->pipeline_cache, &size, NULL) == VK_SUCCESS && size) {
+        void *blob = malloc(size);
+        if (blob && device->vk.GetPipelineCacheData(device->device, device->pipeline_cache, &size, blob) == VK_SUCCESS) {
+            char tmp[560];
+            snprintf(tmp, sizeof(tmp), "%s.tmp", device->pipeline_cache_path);
+            FILE *f = fopen(tmp, "wb");
+            if (f) {
+                const int ok = fwrite(blob, 1, size, f) == size;
+                fclose(f);
+                if (ok) rename(tmp, device->pipeline_cache_path); else unlink(tmp);
+            }
+        }
+        free(blob);
+    }
+    device->pipeline_cache_new = 0;
+    device->pipeline_cache_saved_ms = pc_now_ms();
+    pthread_mutex_unlock(&lock);
+}
+
+/* Called after every pipeline build: save in the background of normal work, but not on every pipeline. */
+void bd12_pipeline_cache_note_new(BD12Device *device)
+{
+    if (!device || !device->pipeline_cache) return;
+    const uint32_t fresh = __atomic_add_fetch(&device->pipeline_cache_new, 1, __ATOMIC_RELAXED);
+    if (fresh >= 25 && pc_now_ms() - device->pipeline_cache_saved_ms > 20000) bd12_pipeline_cache_save(device);
+}
+
 void bd12_device_destroy(BD12Device *device)
 {
     if (!device) return;
+    if (device->pipeline_cache) {
+        if (device->pipeline_cache_new) bd12_pipeline_cache_save(device);
+        device->vk.DestroyPipelineCache(device->device, device->pipeline_cache, NULL);
+    }
     for (size_t i = 0; i < device->sampler_count; ++i)
         device->vk.DestroySampler(device->device, device->samplers[i].sampler,
                                   NULL);

@@ -78,7 +78,11 @@ void bd12_format_block(VkFormat f, VkImageAspectFlags aspect,
 
 VkImageLayout bd12_layout_for_state(uint32_t state, int ds)
 {
+    static int all_general = -1;
+    if (all_general < 0) all_general = getenv("BEER_BD12_ALL_GENERAL") != NULL;
+    if (all_general) return VK_IMAGE_LAYOUT_GENERAL;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (state & BD12_STATE_DEPTH_READ_STENCIL_WRITE) return VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL;
 #define MERGE(l)                                                             \
     do {                                                                     \
         if (layout == VK_IMAGE_LAYOUT_UNDEFINED) layout = (l);               \
@@ -558,17 +562,17 @@ void bd12_cmd_copy_image(BD12CmdList *list, BD12Image *dst, BD12ImagePoint at,
 
 /* Image and sampler descriptors ----------------------------------------------------- */
 
-static int write_image(BD12DescriptorHeap *heap, uint32_t index,
-                       BD12DescriptorKind kind, BD12Image *image,
-                       VkImageViewType type, VkFormat format, uint32_t base_mip,
-                       uint32_t mip_count, uint32_t base_layer,
-                       uint32_t layer_count)
+static int write_image_aspect(BD12DescriptorHeap *heap, uint32_t index,
+                              BD12DescriptorKind kind, BD12Image *image,
+                              VkImageViewType type, VkFormat format, uint32_t base_mip,
+                              uint32_t mip_count, uint32_t base_layer,
+                              uint32_t layer_count, VkImageAspectFlags aspect)
 {
     if (index >= heap->count) return 0;
     BD12Descriptor *d = &heap->descriptors[index];
     memset(d, 0, sizeof(*d));
     if (!image) return 1;                      /* null descriptor */
-    VkImageView view = bd12_image_view(image, type, format, 0, base_mip,
+    VkImageView view = bd12_image_view(image, type, format, aspect, base_mip,
                                        mip_count, base_layer, layer_count);
     if (!view) return 0;
     d->kind = kind;
@@ -582,6 +586,28 @@ static int write_image(BD12DescriptorHeap *heap, uint32_t index,
         bd12_layout_for_state(BD12_STATE_PIXEL_SHADER_RESOURCE,
                               image_is_ds(image));
     return 1;
+}
+
+static int write_image(BD12DescriptorHeap *heap, uint32_t index,
+                       BD12DescriptorKind kind, BD12Image *image,
+                       VkImageViewType type, VkFormat format, uint32_t base_mip,
+                       uint32_t mip_count, uint32_t base_layer,
+                       uint32_t layer_count)
+{
+    return write_image_aspect(heap, index, kind, image, type, format, base_mip,
+                              mip_count, base_layer, layer_count, 0);
+}
+
+/* Sampled view of one plane of a depth-stencil image (aspect = DEPTH or STENCIL). */
+int bd12_descriptor_write_image_srv_aspect(BD12DescriptorHeap *heap, uint32_t index,
+                                           BD12Image *image, VkImageViewType type,
+                                           VkFormat format, uint32_t base_mip,
+                                           uint32_t mip_count, uint32_t base_layer,
+                                           uint32_t layer_count,
+                                           VkImageAspectFlags aspect)
+{
+    return write_image_aspect(heap, index, BD12_DESC_SRV_IMAGE, image, type, format,
+                              base_mip, mip_count, base_layer, layer_count, aspect);
 }
 
 int bd12_descriptor_write_image_srv(BD12DescriptorHeap *heap, uint32_t index,
@@ -682,6 +708,9 @@ static int write_attachment(BD12DescriptorHeap *heap, uint32_t index,
                             VkFormat format, uint32_t mip, uint32_t base_layer,
                             uint32_t layer_count, VkImageLayout layout)
 {
+    static int all_general = -1;
+    if (all_general < 0) all_general = getenv("BEER_BD12_ALL_GENERAL") != NULL;     /* diagnostic: layout bugs show as a changed picture */
+    if (all_general) layout = VK_IMAGE_LAYOUT_GENERAL;
     if (index >= heap->count) return 0;
     BD12Descriptor *d = &heap->descriptors[index];
     memset(d, 0, sizeof(*d));
@@ -730,5 +759,7 @@ int bd12_descriptor_write_dsv(BD12DescriptorHeap *heap, uint32_t index,
                             base_layer, layer_count,
                             read_only ?
                                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL :
+                            (read_only_depth && image && (image->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) ?
+                                VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL :
                                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 }

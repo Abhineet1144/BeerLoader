@@ -20,8 +20,9 @@ import time
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import storage  # noqa: E402
@@ -47,7 +48,7 @@ LAUNCH_FLAGS = [
     ("renderer_vulkan", "--renderer=vulkan", None, None, "Select the Vulkan renderer explicitly (the only one today)"),
     ("no_rt", "Disable ray tracing", "BEER_NO_RT", "1", "Never enable the Vulkan ray tracing extensions"),
     ("no_post", "Disable final-image passes", "BEER_NO_POST", "1", "No effects, overlay blending or screenshots; the overlay falls back to opaque boxes"),
-    ("bd11", "Use BD11 for D3D11 games", "BEER_D3D11_BD11", "1", "Experimental D3D11-on-BD12 renderer instead of the legacy one"),
+    ("legacy_d3d11", "Use the legacy D3D11 path", "BEER_D3D11_LEGACY", "1", "Old D3D11 renderer instead of BD11 (the default)"),
     ("hide_steam_registry", "Hide the fake Steam registry keys", "BEER_FAKE_STEAM_REGISTRY", "0", "For games that behave differently when Steam looks installed"),
     ("exe_tls", "Run the exe's TLS callbacks", "BEER_EXECUTABLE_TLS", "1", "Needed by some protected executables"),
     ("known_patches", "Enable known guest-code patches", "BEER_ENABLE_KNOWN_TARGET_PATCHES", "1", ""),
