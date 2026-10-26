@@ -29,6 +29,11 @@
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <spawn.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -56,6 +61,7 @@
 #include "beer_control.h"
 #include "beer_overlay.h"
 #include "beer_post.h"
+#include "vulkan_bridge.h"
 #include "win32_nt_section.h"
 #include "win32_virtual_memory.h"
 #include "win32_vectored_exception.h"
@@ -203,6 +209,7 @@ typedef struct {
 static GuestDll g_guest_dlls[MAX_GUEST_DLLS];
 static int g_guest_dll_count;
 static GuestDll *g_loading_guest_dll;
+static int g_loading_ucrtbase;
 /* Real bundled FMOD is the normal audio path. The compatibility object graph
  * remains available only as an explicit --audio=compat troubleshooting mode. */
 static int g_use_guest_fmod = 1;
@@ -242,6 +249,17 @@ static u64 g_real_fmod_internal_event_start;
 static GuestDll *guest_dll_load(const char *name);
 static u64 guest_dll_export(GuestDll *dll, const char *name);
 static int resolve_windows_host_path(const char *name, char *output, size_t output_size);
+
+/* Child processes, Toolhelp snapshots and named pipes (platform/win32_process.inc). */
+static int beer_is_vulkan_module(const char *lname);
+static u64 beer_proc_wait(u64 h, u32 ms);
+static int beer_proc_poll(u64 h);
+static int beer_proc_terminate(u64 h, u32 code);
+static int beer_proc_close(u64 h);
+static int beer_pipe_is_pipe(u64 h);
+static int beer_pipe_ensure_connected(u64 h);
+static u64 beer_pipe_open_client(const char *name);
+static void beer_pipe_released(u32 id);
 
 /* Forward declarations: these are fully declared later (g_tramp/g_trampsz
  * in the stub infrastructure section, image_addr_is_exec near the PE
@@ -1977,6 +1995,18 @@ static const char *g_exe_host_path = NULL;  /* canonical Linux path */
 static char g_exe_path_storage[4096];
 static char g_exe_host_path_storage[4096];
 static u16 g_exe_path_w[4096];
+/* Full guest command line when the process was started with --cmdline= (children made by CreateProcess). */
+static char g_cmdline_a_storage[8192];
+static u16 g_cmdline_w_storage[8192];
+static int g_cmdline_set;
+static void beer_set_command_line(const char *line)
+{
+    size_t n = strnlen(line, sizeof(g_cmdline_a_storage) - 1);
+    memcpy(g_cmdline_a_storage, line, n);
+    g_cmdline_a_storage[n] = 0;
+    for (size_t i = 0; i <= n; ++i) g_cmdline_w_storage[i] = (u8)g_cmdline_a_storage[i];
+    g_cmdline_set = 1;
+}
 static u16 *g_guest_argv_w[2] = {g_exe_path_w, NULL};
 
 static char g_prefix_path[PATH_MAX];
@@ -2457,6 +2487,7 @@ static int build_guest_dll_path(const char *name, char *out, size_t out_size)
 
 /* Fake handles for Windows system DLLs we emulate */
 #define HMOD_EXE     ((u64)g_img)
+#define HMOD_VULKAN  0x14F000000ULL   /* built-in vulkan-1.dll (renderer/vulkan/vulkan_bridge.c) */
 #define HMOD_K32     ((u64)0xFEED0000)
 #define HMOD_USER32  ((u64)0xFEF10000)
 #define HMOD_NTDLL   ((u64)0xFEF50000)
@@ -2614,6 +2645,7 @@ static u64 dll_name_to_handle(const char *lname) {
         u64 steam = steam_client_module();
         if (steam) return steam;
     }
+    if (beer_is_vulkan_module(lname) && !getenv("BEER_ALLOW_GUEST_VULKAN")) return HMOD_VULKAN;
     if (!strncmp(lname, "api-ms-", 7) || !strncmp(lname, "ext-ms-", 7)) {
         /* API-set contract: CRT contracts live in the bundled ucrtbase image, the rest in kernel32. */
         GuestDll *ucrt = !strncmp(lname, "api-ms-win-crt-", 15) ? guest_dll_find("ucrtbase.dll") : NULL;
@@ -2750,6 +2782,11 @@ static u64 __attribute__((ms_abi))
 impl_GetProcAddress(u64 hmod, const char *procname)
 {
     if (!procname) return 0;
+    if (hmod == HMOD_VULKAN) {
+        u64 address = (u64)beer_vkbridge_get_proc(procname);
+        if (!address) g_last_error = 127;
+        return address;
+    }
     {
         u64 exported = fake_pe_export_address(hmod, procname);
         if (exported) return exported;
@@ -3416,12 +3453,31 @@ static int prefer_emulated_module(const char *lower_name)
 }
 
 static u64 virtual_fs_load_library(const char *name);
+
+/* vulkan-1.dll (and the versioned copies some engines probe for, e.g. vulkan-1-1-1-70-1.dll) is a built-in
+ * module: the shipped Khronos loader would need a Windows ICD, so the guest talks to the host's libvulkan through
+ * renderer/vulkan/vulkan_bridge.c.  BEER_GUEST_VULKAN=0 hides Vulkan entirely, BEER_ALLOW_GUEST_VULKAN=1 loads
+ * the game's own copy of the DLL instead. */
+static int beer_is_vulkan_module(const char *lname) { return !strncmp(lname, "vulkan-1", 8); }
+static int beer_native_dll_unsupported(const char *lname)
+{
+    if (!beer_is_vulkan_module(lname)) return 0;
+    const char *allow = getenv("BEER_ALLOW_GUEST_VULKAN");
+    if (allow && *allow && strcmp(allow, "0")) return 0;
+    const char *bridge = getenv("BEER_GUEST_VULKAN");
+    if ((!bridge || strcmp(bridge, "0")) && beer_vkbridge_available()) return 0;
+    fprintf(stderr, "[IMPL] LoadLibrary(\"%s\") -> not found (no usable host Vulkan)\n", lname);
+    return 1;
+}
+
 static u64 __attribute__((ms_abi))
 impl_LoadLibraryA(const char *name)
 {
     if (!name) { g_last_error = 126; return 0; }
     char lname[64];
     lowercase_dll_basename(name, lname, sizeof(lname));
+    if (beer_native_dll_unsupported(lname)) { g_last_error = 126; return 0; }
+    if (beer_is_vulkan_module(lname) && !getenv("BEER_ALLOW_GUEST_VULKAN")) return HMOD_VULKAN;
     if (!strcmp(lname, "steamclient64.dll")) g_steam_client_loaded = 1;
     if (prefer_emulated_module(lname)) {
         u64 handle = dll_name_to_handle(lname);
@@ -3454,6 +3510,8 @@ impl_LoadLibraryW(const u16 *name)
     narrow[i] = 0;
     char lname[64];
     lowercase_dll_basename(narrow, lname, sizeof(lname));
+    if (beer_native_dll_unsupported(lname)) { g_last_error = 126; return 0; }
+    if (beer_is_vulkan_module(lname) && !getenv("BEER_ALLOW_GUEST_VULKAN")) return HMOD_VULKAN;
     if (!strcmp(lname, "steamclient64.dll")) g_steam_client_loaded = 1;
     if (prefer_emulated_module(lname)) {
         u64 handle = dll_name_to_handle(lname);
@@ -5992,6 +6050,14 @@ static const char *beer_csidl_path(s32 csidl)
         return beer_roaming_appdata_path();
     case 0x1c: /* CSIDL_LOCAL_APPDATA */
         return beer_local_appdata_path();
+    case 0x05: /* CSIDL_PERSONAL (My Documents) */
+        return g_documents;
+    case 0x28: /* CSIDL_PROFILE */
+        return g_user_profile;
+    case 0x23: /* CSIDL_COMMON_APPDATA */
+        return g_program_data;
+    case 0x24: /* CSIDL_WINDOWS */
+        return g_windows_dir;
     default:
         return beer_roaming_appdata_path();
     }
@@ -7286,6 +7352,8 @@ beer_wait_single_raw(u64 h, u32 ms)
     g_dbg_wait_kind = 2; g_dbg_wait_handle = h; g_dbg_wait_ms = ms;
     u64 trc = thread_wait_handle(h, ms);
     if (trc != (u64)-2) { g_dbg_wait_kind = 0; return trc; }
+    u64 prc = beer_proc_wait(h, ms);
+    if (prc != (u64)-2) { g_dbg_wait_kind = 0; return prc; }
 
     int mid = win_mutex_id(h);
     if (mid >= 0) { u64 r = win_mutex_wait(mid, ms); g_dbg_wait_kind = 0; return r; }
@@ -7497,6 +7565,9 @@ static int wait_handle_poll(u64 handle, int consume)
         pthread_mutex_unlock(&g_sem_mtx[sid]);
         return signaled;
     }
+
+    int process_state = beer_proc_poll(handle);
+    if (process_state != -2) return process_state;
 
     g_last_error = 6; /* ERROR_INVALID_HANDLE */
     return -1;
@@ -8028,6 +8099,27 @@ impl_RegisterClassExA(const WIN_WNDCLASSEX *window_class)
 static u64 __attribute__((ms_abi))
 impl_RegisterClassExW(const WIN_WNDCLASSEX *window_class)
     { return register_window_class(window_class, "RegisterClassExW"); }
+/* WNDCLASSA/W (72 bytes, no cbSize and no small icon) is the same registration as RegisterClassEx. */
+static u64 register_plain_window_class(const u8 *window_class, const char *api)
+{
+    if (!window_class) { g_last_error = 87; return 0; }
+    WIN_WNDCLASSEX ex = { .cbSize = sizeof(ex) };
+    ex.style = *(const u32 *)(window_class + 0);
+    ex.lpfnWndProc = *(const u64 *)(window_class + 8);
+    ex.cbClsExtra = *(const s32 *)(window_class + 16);
+    ex.cbWndExtra = *(const s32 *)(window_class + 20);
+    ex.hInstance = *(const u64 *)(window_class + 24);
+    ex.hIcon = *(const u64 *)(window_class + 32);
+    ex.hCursor = *(const u64 *)(window_class + 40);
+    ex.hbrBackground = *(const u64 *)(window_class + 48);
+    ex.lpszMenuName = *(const u64 *)(window_class + 56);
+    ex.lpszClassName = *(const u64 *)(window_class + 64);
+    return register_window_class(&ex, api);
+}
+static u64 __attribute__((ms_abi))
+impl_RegisterClassA(const u8 *window_class) { return register_plain_window_class(window_class, "RegisterClassA"); }
+static u64 __attribute__((ms_abi))
+impl_RegisterClassW(const u8 *window_class) { return register_plain_window_class(window_class, "RegisterClassW"); }
 static u64 __attribute__((ms_abi))
 impl_GetDesktopWindow(void) { return FAKE_HWND; }
 static u64 __attribute__((ms_abi))
@@ -9367,6 +9459,7 @@ static int fh_close(u64 h) {
     }
     pthread_mutex_unlock(&g_fh_mtx);
     if (fd < 0) return 0;
+    beer_pipe_released(id);
     close(fd);
     return 1;
 }
@@ -9779,6 +9872,9 @@ impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
         return INVALID_HANDLE_VALUE64;
     }
 
+    if (name[0] == '\\' && name[1] == '\\' && strncasecmp(name + 4, "pipe\\", 5) == 0)
+        return beer_pipe_open_client(name);
+
     char host_path[PATH_MAX];
     if (!resolve_windows_host_path(name, host_path, sizeof(host_path))) {
         g_last_error = 206;
@@ -9903,6 +9999,11 @@ impl_CloseHandle(u64 h)
         return 1;
     }
 
+    if (beer_proc_close(h)) {
+        g_last_error = 0;
+        return 1;
+    }
+
     if (beer_nt_section_close(h)) {
         g_last_error = 0;
         return 1;
@@ -9936,6 +10037,23 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
     }
 
     ssize_t received;
+    const int pipe_handle = beer_pipe_is_pipe(h);
+    if (pipe_handle) {
+        if (!beer_pipe_ensure_connected(h)) { if (done) *done = 0; return 0; }
+        fd = fh_get(h);     /* adopting a client replaces the descriptor */
+        /* Pipes have no file position: overlapped reads complete synchronously. */
+        do { received = read(fd, buf, n); } while (received < 0 && errno == EINTR);
+        if (overlapped) {
+            overlapped->Internal = received < 0 ? (u64)(u32)errno : 0;
+            overlapped->InternalHigh = received < 0 ? 0 : (u64)received;
+            if (received >= 0 && overlapped->hEvent) impl_SetEvent(overlapped->hEvent);
+        }
+        if (done) *done = (u32)(received < 0 ? 0 : received);
+        if (received == 0 && n) { g_last_error = 109; return 0; }   /* ERROR_BROKEN_PIPE: peer closed */
+        if (received < 0) { g_last_error = 109; return 0; }
+        g_last_error = 0;
+        return 1;
+    }
     if (overlapped) {
         /* An OVERLAPPED read has its own absolute file position. RE8 issues
          * archive reads concurrently against shared handles; treating these as
@@ -13324,6 +13442,14 @@ impl_RtlPcToFileHeader(u64 pc, u64 **base_out)
         if (base_out) *base_out = (u64 *)base;
         return base;
     }
+    /* Guest DLLs (runtime libraries, game plugins): C++ EH records carry RVAs relative to this base. */
+    for (int i = 0; i < g_guest_dll_count; ++i) {
+        const GuestDll *dll = &g_guest_dlls[i];
+        if (dll->image && pc >= (u64)dll->image && pc < (u64)dll->image + dll->image_size) {
+            if (base_out) *base_out = (u64 *)dll->image;
+            return (u64)dll->image;
+        }
+    }
     if (base_out) *base_out = NULL;
     return 0;
 }
@@ -13511,9 +13637,10 @@ impl_GetEnvironmentVariableW(const u16 *name, u16 *buffer, u32 size)
     return length;
 }
 static u64 __attribute__((ms_abi))
-impl_GetCommandLineA(void) { return (u64)(g_exe_path ? g_exe_path : ""); }
+impl_GetCommandLineA(void)
+    { return g_cmdline_set ? (u64)g_cmdline_a_storage : (u64)(g_exe_path ? g_exe_path : ""); }
 static u64 __attribute__((ms_abi))
-impl_GetCommandLineW(void) { return (u64)g_exe_path_w; }
+impl_GetCommandLineW(void) { return g_cmdline_set ? (u64)g_cmdline_w_storage : (u64)g_exe_path_w; }
 
 static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
     /* ExitProcess never returns on real Windows; a stubbed no-op return leaves
@@ -13594,7 +13721,7 @@ static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
     _exit((int)code);
 }
 static u64 __attribute__((ms_abi)) impl_TerminateProcess(u64 h, u32 code)
-    { (void)h; fprintf(stderr, "[IMPL] TerminateProcess(%u) -> terminating loader\n", code); dbg_dump_guest_callchain("TerminateProcess"); fflush(stderr); _exit((int)code); }
+    { if (beer_proc_terminate(h, code)) return 1; fprintf(stderr, "[IMPL] TerminateProcess(%u) -> terminating loader\n", code); dbg_dump_guest_callchain("TerminateProcess"); fflush(stderr); _exit((int)code); }
 /* Anti-debug probes that protection stubs run: a normal, undebugged Windows machine answers these
  * with "no debugger", success and zero. */
 static u64 __attribute__((ms_abi)) impl_CheckRemoteDebuggerPresent(u64 process, u32 *present)
@@ -13660,7 +13787,12 @@ impl_WriteFile(u64 h, const void *buf, u32 n, u32 *written, u64 ov)
     else if (h == (u64)(int64_t)-12 || h == (u64)(int64_t)-0xC) fd = STDERR_FILENO;
     else { fd = fh_get(h); }
     if (fd < 0) { if (written) *written = 0; return 0; }
+    if (beer_pipe_is_pipe(h)) {
+        if (!beer_pipe_ensure_connected(h)) { if (written) *written = 0; return 0; }
+        fd = fh_get(h);
+    }
     ssize_t r = write(fd, buf, n);
+    if (r < 0 && beer_pipe_is_pipe(h)) g_last_error = 232;      /* ERROR_NO_DATA: the other end is closing */
     if (written) *written = (u32)(r < 0 ? 0 : r);
     return r >= 0 ? 1 : 0;
 }
@@ -16786,8 +16918,25 @@ impl___acrt_iob_func(u32 index)
 }
 
 /* ---- Impl dispatch table ---- */
+#include "platform/win32_process.inc"
+#include "platform/win32_d3d9.inc"
+#include "platform/win32_display_config.inc"
+#include "platform/win32_nvapi.inc"
 #include "platform/win32_file_search.inc"
 #include "platform/win32_missing_exports.inc"
+static u64 __attribute__((ms_abi))
+impl_RegGetValueA(u64 key, const char *subkey, const char *value, u32 flags, u32 *type, void *data, u32 *size)
+{
+    return reg_get_value(key, subkey, value, flags, type, data, size, 0);
+}
+static u64 __attribute__((ms_abi))
+impl_RegGetValueW(u64 key, const u16 *subkey, const u16 *value, u32 flags, u32 *type, void *data, u32 *size)
+{
+    char sk[192], vn[96];
+    reg_narrow(subkey, sk, sizeof(sk));
+    reg_narrow(value, vn, sizeof(vn));
+    return reg_get_value(key, subkey ? sk : NULL, value ? vn : NULL, flags, type, data, size, 1);
+}
 typedef struct { const char *name; ImplFn fn; } ImplEntry;
 
 static ImplEntry g_impls[] = {
@@ -16954,6 +17103,8 @@ static ImplEntry g_impls[] = {
     {"RegQueryValueExA",                       (ImplFn)impl_RegQueryValueExA},
     {"RegQueryValueExW",                       (ImplFn)impl_RegQueryValueExW},
     {"RegCloseKey",                            (ImplFn)impl_RegCloseKey},
+    {"RegGetValueA",                           (ImplFn)impl_RegGetValueA},
+    {"RegGetValueW",                           (ImplFn)impl_RegGetValueW},
     /* Security */
     {"InitializeSecurityDescriptor",          (ImplFn)impl_InitializeSecurityDescriptor},
     {"SetSecurityDescriptorDacl",             (ImplFn)impl_SetSecurityDescriptorDacl},
@@ -17047,6 +17198,42 @@ static ImplEntry g_impls[] = {
     {"SetupDiGetDeviceRegistryPropertyW",     (ImplFn)impl_SetupDiGetDeviceRegistryPropertyW},
     {"SetupDiDestroyDeviceInfoList",          (ImplFn)impl_SetupDiDestroyDeviceInfoList},
     {"GlobalMemoryStatusEx",                  (ImplFn)impl_GlobalMemoryStatusEx},
+    {"Direct3DCreate9",                       (ImplFn)impl_Direct3DCreate9},
+    {"Direct3DCreate9Ex",                     (ImplFn)impl_Direct3DCreate9Ex},
+    {"CreateProcessA",                        (ImplFn)beer_CreateProcessA},
+    {"K32EnumProcessModules", (ImplFn)beer_K32EnumProcessModules},
+    {"EnumProcessModules", (ImplFn)beer_K32EnumProcessModules},
+    {"K32EnumProcessModulesEx", (ImplFn)beer_K32EnumProcessModulesEx},
+    {"EnumProcessModulesEx", (ImplFn)beer_K32EnumProcessModulesEx},
+    {"K32GetModuleFileNameExA", (ImplFn)beer_K32GetModuleFileNameExA},
+    {"GetModuleFileNameExA", (ImplFn)beer_K32GetModuleFileNameExA},
+    {"K32GetModuleFileNameExW", (ImplFn)beer_K32GetModuleFileNameExW},
+    {"GetModuleFileNameExW", (ImplFn)beer_K32GetModuleFileNameExW},
+    {"K32GetModuleBaseNameA", (ImplFn)beer_K32GetModuleBaseNameA},
+    {"GetModuleBaseNameA", (ImplFn)beer_K32GetModuleBaseNameA},
+    {"K32GetModuleBaseNameW", (ImplFn)beer_K32GetModuleBaseNameW},
+    {"GetModuleBaseNameW", (ImplFn)beer_K32GetModuleBaseNameW},
+    {"QueryFullProcessImageNameA", (ImplFn)beer_QueryFullProcessImageNameA},
+    {"QueryFullProcessImageNameW", (ImplFn)beer_QueryFullProcessImageNameW},
+    {"K32GetProcessImageFileNameA", (ImplFn)beer_K32GetProcessImageFileNameA},
+    {"GetProcessImageFileNameA", (ImplFn)beer_K32GetProcessImageFileNameA},
+    {"K32GetProcessImageFileNameW", (ImplFn)beer_K32GetProcessImageFileNameW},
+    {"GetProcessImageFileNameW", (ImplFn)beer_K32GetProcessImageFileNameW},
+    {"CreateProcessW",                        (ImplFn)beer_CreateProcessW},
+    {"GetProcessId",                          (ImplFn)beer_GetProcessId},
+    {"CreateToolhelp32Snapshot",              (ImplFn)beer_CreateToolhelp32Snapshot},
+    {"Process32First",                        (ImplFn)beer_Process32First},
+    {"Process32Next",                         (ImplFn)beer_Process32Next},
+    {"Process32FirstW",                       (ImplFn)beer_Process32FirstW},
+    {"Process32NextW",                        (ImplFn)beer_Process32NextW},
+    {"CreateNamedPipeA",                      (ImplFn)beer_CreateNamedPipeA},
+    {"CreateNamedPipeW",                      (ImplFn)beer_CreateNamedPipeW},
+    {"ConnectNamedPipe",                      (ImplFn)beer_ConnectNamedPipe},
+    {"DisconnectNamedPipe",                   (ImplFn)beer_DisconnectNamedPipe},
+    {"WaitNamedPipeA",                        (ImplFn)beer_WaitNamedPipeA},
+    {"WaitNamedPipeW",                        (ImplFn)beer_WaitNamedPipeW},
+    {"PeekNamedPipe",                         (ImplFn)beer_PeekNamedPipe},
+    {"SetNamedPipeHandleState",               (ImplFn)beer_SetNamedPipeHandleState},
     {"GetPhysicallyInstalledSystemMemory",    (ImplFn)impl_GetPhysicallyInstalledSystemMemory},
     {"GetTimeZoneInformation",               (ImplFn)impl_GetTimeZoneInformation},
     /* Time */
@@ -17240,6 +17427,8 @@ static ImplEntry g_impls[] = {
     {"FormatMessageW",                        (ImplFn)impl_FormatMessageW},
     /* Window placeholders */
     {"RegisterClassExA",                      (ImplFn)impl_RegisterClassExA},
+    {"RegisterClassA",                        (ImplFn)impl_RegisterClassA},
+    {"RegisterClassW",                        (ImplFn)impl_RegisterClassW},
     {"RegisterClassExW",                      (ImplFn)impl_RegisterClassExW},
     {"RegisterDeviceNotificationA",           (ImplFn)impl_RegisterDeviceNotificationA},
     {"RegisterDeviceNotificationW",           (ImplFn)impl_RegisterDeviceNotificationW},
@@ -17442,6 +17631,12 @@ static ImplEntry g_impls[] = {
     {"GetWindowDisplayAffinity",              (ImplFn)impl_GetWindowDisplayAffinity},
     {"EnumDisplayMonitors",                   (ImplFn)impl_EnumDisplayMonitors},
     {"EnumDisplayDevicesW",                   (ImplFn)impl_EnumDisplayDevicesW},
+    {"GetDisplayConfigBufferSizes",           (ImplFn)impl_GetDisplayConfigBufferSizes},
+    {"QueryDisplayConfig",                    (ImplFn)impl_QueryDisplayConfig},
+    {"DisplayConfigGetDeviceInfo",            (ImplFn)impl_DisplayConfigGetDeviceInfo},
+    {"DisplayConfigSetDeviceInfo",            (ImplFn)impl_DisplayConfigSetDeviceInfo},
+    {"GetDpiForMonitor",                      (ImplFn)impl_GetDpiForMonitor},
+    {"nvapi_QueryInterface",                  (ImplFn)impl_nvapi_QueryInterface},
     {"EnumDisplayDevicesA",                   (ImplFn)impl_EnumDisplayDevicesA},
     {"EnumDisplaySettingsW",                  (ImplFn)impl_EnumDisplaySettingsW},
     {"EnumDisplaySettingsA",                  (ImplFn)impl_EnumDisplaySettingsA},
@@ -17994,8 +18189,15 @@ static void guest_dll_resolve_imports(GuestDll *dll)
             GuestDll *dependency_dll = NULL;
             if (api_set_contract) {
                 if (!implementation && !strncmp(dependency_lower,
-                                                "api-ms-win-crt-", 15))
+                                                "api-ms-win-crt-", 15)) {
                     dependency_dll = guest_dll_find("ucrtbase.dll");
+                    /* A bundled C++ runtime pulled in by a game DLL (not by the exe) needs its UCRT too. */
+                    if (!dependency_dll && !g_loading_ucrtbase) {
+                        g_loading_ucrtbase = 1;
+                        dependency_dll = guest_dll_load("ucrtbase.dll");
+                        g_loading_ucrtbase = 0;
+                    }
+                }
             } else {
                 dependency_dll = guest_dll_find(dependency);
                 if (!dependency_dll)
@@ -18300,34 +18502,57 @@ static void guest_dll_notify_thread(u32 reason)
     }
 }
 
-static void guest_dll_initialize_all(void)
+static void guest_dll_initialize_one(GuestDll *dll);
+
+/* DllMain runs dependencies first, as the Windows loader does: a game DLL whose static initialisers use the
+ * C++ runtime must not attach before that runtime has. */
+static void guest_dll_initialize_dependencies(GuestDll *dll)
 {
-    for (int i = 0; i < g_guest_dll_count; ++i) {
-        GuestDll *dll = &g_guest_dlls[i];
-        if (dll->entry_called || dll->initializing) continue;
-        NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
-        dll->initializing = 1;
-        if (!nt->opt.entry_rva) {
-            dll->entry_called = 1;
-            dll->initializing = 0;
-            continue;
-        }
-        if (dll->tls_callbacks) {
-            typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
-            TlsCallback *callbacks = (TlsCallback *)dll->tls_callbacks;
-            for (size_t n = 0; n < 64 && callbacks[n]; ++n)
-                callbacks[n](dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
-        }
-        typedef int __attribute__((ms_abi)) (*DllEntry)(void *, u32, void *);
-        DllEntry entry = (DllEntry)(dll->image + nt->opt.entry_rva);
-        int result = entry(dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
+    NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
+    DataDir *dir = &nt->opt.dirs[DIR_IMPORT];
+    if (!dir->rva || !dir->size) return;
+    for (ImportDesc *d = (ImportDesc *)(dll->image + dir->rva); d->name_rva; ++d) {
+        char lower[64];
+        lowercase_dll_basename((const char *)(dll->image + d->name_rva), lower, sizeof(lower));
+        GuestDll *dependency = !strncmp(lower, "api-ms-win-crt-", 15) ? guest_dll_find("ucrtbase.dll")
+                                                                      : guest_dll_find(lower);
+        if (dependency && dependency != dll && !dependency->entry_called && !dependency->initializing)
+            guest_dll_initialize_one(dependency);
+    }
+}
+
+static void guest_dll_initialize_one(GuestDll *dll)
+{
+    if (dll->entry_called || dll->initializing) return;
+    NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
+    dll->initializing = 1;
+    guest_dll_initialize_dependencies(dll);
+    if (!nt->opt.entry_rva) {
         dll->entry_called = 1;
         dll->initializing = 0;
-        fprintf(stderr, "[PE DLL] %s process attach -> %d\n", dll->name, result);
-        if (!result)
-            fprintf(stderr, "[PE DLL] warning: %s rejected DLL_PROCESS_ATTACH; exports may be unavailable\n",
-                    dll->name);
+        return;
     }
+    if (dll->tls_callbacks) {
+        typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
+        TlsCallback *callbacks = (TlsCallback *)dll->tls_callbacks;
+        for (size_t n = 0; n < 64 && callbacks[n]; ++n)
+            callbacks[n](dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
+    }
+    typedef int __attribute__((ms_abi)) (*DllEntry)(void *, u32, void *);
+    DllEntry entry = (DllEntry)(dll->image + nt->opt.entry_rva);
+    int result = entry(dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
+    dll->entry_called = 1;
+    dll->initializing = 0;
+    fprintf(stderr, "[PE DLL] %s process attach -> %d\n", dll->name, result);
+    if (!result)
+        fprintf(stderr, "[PE DLL] warning: %s rejected DLL_PROCESS_ATTACH; exports may be unavailable\n",
+                dll->name);
+}
+
+static void guest_dll_initialize_all(void)
+{
+    for (int i = 0; i < g_guest_dll_count; ++i)
+        guest_dll_initialize_one(&g_guest_dlls[i]);
 }
 
 /* ── Import resolution ──────────────────────────────────────────── */
@@ -18366,7 +18591,9 @@ static void pe_imports(void)
         const char *dll_name = rva_ptr(d->name_rva);
         char lower[64];
         lowercase_dll_basename(dll_name, lower, sizeof(lower));
-        int required = !strcmp(lower, "oo2core_6_win64.dll");
+        /* Oodle (any 2.x build: oo2core_5/6/7/8/9_win64.dll) carries the games' data decompression. */
+        int required = !strncmp(lower, "oo2core_", 8) && strlen(lower) > 18 &&
+                       !strcmp(lower + strlen(lower) - 10, "_win64.dll");
         int real_bink = !strcmp(lower, "bink2w64.dll");
         int real_fmod = g_use_guest_fmod &&
                         (!strcmp(lower, "fmodex64.dll") ||
@@ -18505,18 +18732,20 @@ static void pe_imports(void)
             if (!guest && crt_api_set)
                 guest = guest_dll_find("ucrtbase.dll");
             u64 guest_export = (guest && fn_only) ? guest_dll_export(guest, fn_only) : 0;
+            if (!guest && fn_only && beer_is_vulkan_module(import_lower) && !getenv("BEER_ALLOW_GUEST_VULKAN"))
+                guest_export = (u64)beer_vkbridge_get_proc(fn_only);   /* statically linked vulkan-1.lib */
             /* Prefer the bundled UCRT for its API-set surface even when Beer
              * has a same-named fallback. This keeps CRT callback execution on
              * the guest stack and gives one coherent CRT heap/locale/runtime
              * state to RE8 and its private MSVC redistributables. */
             if (crt_api_set && guest_export)
                 real = NULL;
-            if (guest_export && fn_only && !strcmp(guest->name, "oo2core_6_win64.dll") &&
+            if (guest_export && fn_only && guest && !strncmp(guest->name, "oo2core_", 8) &&
                 !strcmp(fn_only, "OodleLZ_Decompress")) {
                 g_oodle_decompress = (void *)guest_export;
                 guest_export = (u64)guest_oodle_decompress_trace;
             }
-            if (guest_export && fn_only && !strcmp(guest->name, "bink2w64.dll")) {
+            if (guest_export && fn_only && guest && !strcmp(guest->name, "bink2w64.dll")) {
                 if (!strcmp(fn_only, "BinkOpen"))
                     guest_export = (u64)impl_BinkOpen_dispatch;
                 else if (!strcmp(fn_only, "BinkClose"))
@@ -18985,6 +19214,13 @@ static void setup_teb_peb(void)
     params->ImagePathName.MaximumLength = path_bytes + sizeof(u16);
     params->ImagePathName.Buffer = (u64)(uintptr_t)g_exe_path_w;
     params->CommandLine = params->ImagePathName;
+    if (g_cmdline_set) {
+        size_t chars = 0;
+        while (g_cmdline_w_storage[chars]) ++chars;
+        params->CommandLine.Length = (u16)(chars * 2);
+        params->CommandLine.MaximumLength = (u16)(chars * 2 + 2);
+        params->CommandLine.Buffer = (u64)(uintptr_t)g_cmdline_w_storage;
+    }
     params->Environment = (u64)(uintptr_t)beer_win32_environment_block_w(environ);
 
     peb->Ldr = (u64)(uintptr_t)ldr;
@@ -23282,6 +23518,8 @@ int main(int argc, char **argv)
     XwaylandPresenter presenter = XWAYLAND_PRESENTER_AUTO;
     BeerD3D11Renderer renderer = BEER_D3D11_RENDERER_VULKAN;
     const char *exe_arg = NULL;
+    const char *cmdline_arg = NULL;
+    beer_proc_save_args(argc, argv);
     const char *prefix_arg = NULL;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
@@ -23313,6 +23551,8 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--prefix requires a non-empty path\n");
                 return 2;
             }
+        } else if (strncmp(arg, "--cmdline=", 10) == 0) {
+            cmdline_arg = arg + 10;       /* full guest command line (set by CreateProcess for child loaders) */
         } else if (strncmp(arg, "--audio=", 8) == 0) {
             const char *value = arg + 8;
             if (!strcmp(value, "compat")) g_use_guest_fmod = 0;
@@ -23354,6 +23594,7 @@ int main(int argc, char **argv)
     const char *exe = configure_guest_process_path(exe_arg);
     if (!exe)
         die("cannot configure guest process path '%s': %s", exe_arg, strerror(errno));
+    if (cmdline_arg && *cmdline_arg) beer_set_command_line(cmdline_arg);
     {
         const char *base = strrchr(exe, '/');
         base = base ? base + 1 : exe;
@@ -23396,6 +23637,7 @@ int main(int argc, char **argv)
     if (!beer_win32_shared_data_map())
         return 2;
     pe_load(exe);
+    beer_proc_register();
     beer_overlay_init();
     beer_post_init(exe_arg);
     beer_control_start(exe_arg);

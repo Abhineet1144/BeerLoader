@@ -34,7 +34,7 @@ typedef struct {
 static Setting settings[] = {
     { "time_scale", "Game speed", "Multiplier for the clocks the game sees (0.05 = very slow, 10 = ten times faster).",
       SET_FLOAT, 50, 10000, 1000, 1000 },
-    { "fps_limit", "Frame cap", "Maximum frames per second the game may present (0 = no cap). Applies to D3D12 games.",
+    { "fps_limit", "Frame cap", "Maximum frames per second the game may present (0 = no cap). Applies to D3D12 and Vulkan games.",
       SET_INT, 0, 1000, 0, 0 },
     { "paused", "Pause game time", "Freezes the clocks the game sees. Rendering and input keep running.",
       SET_BOOL, 0, 1, 0, 0 },

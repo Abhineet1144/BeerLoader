@@ -1456,6 +1456,15 @@ int xwayland_window_present_image(uint64_t image, uint32_t layout, int width,
     return result;
 }
 
+int xwayland_window_native(void **display, unsigned long *window)
+{
+    pthread_mutex_lock(&g_x11.lock);
+    int ok = g_x11.display && g_x11.window;
+    if (ok) { *display = g_x11.display; *window = (unsigned long)g_x11.window; }
+    pthread_mutex_unlock(&g_x11.lock);
+    return ok;
+}
+
 void xwayland_window_destroy(void)
 {
     pthread_mutex_lock(&g_x11.lock);

@@ -53,7 +53,6 @@ static u64 __attribute__((ms_abi)) stub_DeviceIoControl(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FindClose(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_MulDiv(s32 a, s32 b, s32 c){ if(!c) return (u64)(s64)-1; return (u64)(s64)(s32)(((int64_t)a*b + (c/2))/c); }
 static u64 __attribute__((ms_abi)) stub_FileTimeToDosDateTime(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_PeekNamedPipe(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_MapViewOfFile(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_UnmapViewOfFile(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VirtualLock(void){ return 0; }
@@ -67,10 +66,6 @@ static u64 __attribute__((ms_abi)) stub_PostQueuedCompletionStatus(void){ return
 static u64 __attribute__((ms_abi)) stub_SetThreadContext(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetProcessIdOfThread(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetThreadId(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateToolhelp32Snapshot(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Process32FirstW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Process32NextW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Process32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Module32First(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Module32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DebugBreak(void){ return 0; }
@@ -91,7 +86,6 @@ static u64 __attribute__((ms_abi)) stub_VariantCopy(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VariantInit(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharUpperBuffW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharLowerBuffW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RegisterClassA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_UnregisterClassA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassInfoA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RegisterClipboardFormatA(void){ return 0; }
@@ -111,7 +105,6 @@ static u64 __attribute__((ms_abi)) stub_FindWindowA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassNameA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_LoadBitmapA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_LoadImageA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RegisterClassW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_UnregisterClassW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassInfoW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_InsertMenuItemW(void){ return 0; }
@@ -381,6 +374,4 @@ static u64 __attribute__((ms_abi)) stub_ImageList_DragMove(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_DragShowNolock(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub__TrackMouseEvent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumProcesses(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_EnumProcessModules(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetModuleFileNameExW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetThreadDescription(void){ return 0; }

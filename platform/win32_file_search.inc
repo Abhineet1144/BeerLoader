@@ -628,11 +628,21 @@ static u64 __attribute__((ms_abi)) beer_OpenProcess(u32 access, u32 inherit, u32
 {
     (void)access; (void)inherit;
     if (pid == (u32)impl_GetCurrentProcessId()) return BEER_OWN_PROCESS_HANDLE;
+    if (pid && kill((pid_t)pid, 0) == 0) {                  /* another live process (guest children included) */
+        u64 handle = beer_proc_alloc((pid_t)pid, 0);
+        if (handle) return handle;
+        return 0;
+    }
     g_last_error = 87;                                      /* ERROR_INVALID_PARAMETER: no such process */
     return 0;
 }
 static u64 __attribute__((ms_abi)) beer_GetExitCodeProcess(u64 process, u32 *code)
 {
+    BeerProc *p = beer_proc_from_handle(process);
+    if (p) {
+        if (code) *code = beer_proc_exited(p) ? p->exit_code : 259u;   /* STILL_ACTIVE */
+        return 1;
+    }
     if (process != BEER_OWN_PROCESS_HANDLE && process != (u64)-1) { g_last_error = 6; return 0; }
     if (code) *code = 259;                                  /* STILL_ACTIVE */
     return 1;

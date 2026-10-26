@@ -2,6 +2,7 @@
 #define BEER_VULKAN_CONTEXT_H
 
 #define VK_NO_PROTOTYPES
+#include <stddef.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 
@@ -26,6 +27,9 @@ typedef struct {
     int fragment_shading_rate;         /* VK_KHR_fragment_shading_rate usable */
 } BeerHostGpuInfo;
 int beer_vulkan_host_gpu_info(BeerHostGpuInfo *out);
+/* BEER_SPOOF_GPU_NAME / _VENDOR / _DEVICE (hex) / _VRAM_MB: writes only the fields whose variable is set and returns
+ * a mask (1 name, 2 vendor, 4 device, 8 vram).  Any pointer may be NULL. */
+int beer_vulkan_gpu_spoof(char *name, size_t name_size, uint32_t *vendor, uint32_t *device, uint64_t *vram_bytes);
 VkInstance beer_vulkan_instance(void);
 VkPhysicalDevice beer_vulkan_physical_device(void);
 VkDevice beer_vulkan_device(void);

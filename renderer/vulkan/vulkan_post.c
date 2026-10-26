@@ -92,17 +92,46 @@ static int make_pipeline(const uint32_t *code, size_t bytes, VkPipeline *pipelin
     return r == VK_SUCCESS;
 }
 
+/* A guest-created device (the Vulkan mapper) can take the place of the shared device; bind before the first frame. */
+static struct {
+    int set;
+    VkInstance instance;
+    VkPhysicalDevice physical;
+    VkDevice device;
+    PFN_vkGetInstanceProcAddr get_instance;
+    PFN_vkGetDeviceProcAddr get_device;
+} B;
+
+int vulkan_post_bind_device(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+                            PFN_vkGetInstanceProcAddr get_instance, PFN_vkGetDeviceProcAddr get_device)
+{
+    if (P.tried) return P.ready && P.device == device;
+    B.set = 1;
+    B.instance = instance;
+    B.physical = physical;
+    B.device = device;
+    B.get_instance = get_instance;
+    B.get_device = get_device;
+    return 1;
+}
+
+int vulkan_post_screenshot_waiting(void)
+{
+    return P.shot_waiting;
+}
+
 static int init(void)
 {
     if (P.tried) return P.ready;
     P.tried = 1;
     if (getenv("BEER_NO_POST")) return 0;
-    P.device = beer_vulkan_device();
-    P.physical = beer_vulkan_physical_device();
-    PFN_vkGetDeviceProcAddr get = beer_vulkan_get_device_proc_addr();
-    PFN_vkGetInstanceProcAddr get_instance = beer_vulkan_get_instance_proc_addr();
+    VkInstance instance = B.set ? B.instance : beer_vulkan_instance();
+    P.device = B.set ? B.device : beer_vulkan_device();
+    P.physical = B.set ? B.physical : beer_vulkan_physical_device();
+    PFN_vkGetDeviceProcAddr get = B.set ? B.get_device : beer_vulkan_get_device_proc_addr();
+    PFN_vkGetInstanceProcAddr get_instance = B.set ? B.get_instance : beer_vulkan_get_instance_proc_addr();
     if (!P.device || !P.physical || !get || !get_instance) return 0;
-    P.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)get_instance(beer_vulkan_instance(), "vkGetPhysicalDeviceMemoryProperties");
+    P.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)get_instance(instance, "vkGetPhysicalDeviceMemoryProperties");
     if (!P.GetPhysicalDeviceMemoryProperties) return 0;
     LOAD(CreateShaderModule); LOAD(DestroyShaderModule); LOAD(CreateDescriptorSetLayout); LOAD(CreatePipelineLayout);
     LOAD(CreateComputePipelines); LOAD(CreateDescriptorPool); LOAD(AllocateDescriptorSets); LOAD(UpdateDescriptorSets);

@@ -14,6 +14,8 @@ PLATFORM_SRCS = platform/xwayland_backend.c platform/win32_environment.c platfor
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
                renderer/vulkan/vulkan_post.c \
+               renderer/vulkan/vulkan_bridge.c \
+               renderer/vulkan/vulkan_map.c \
                renderer/vulkan/vulkan_renderer.c \
                renderer/vulkan/vulkan_graphics.c \
                renderer/vulkan/vulkan_indexed_renderer.c

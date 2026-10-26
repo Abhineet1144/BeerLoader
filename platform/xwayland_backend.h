@@ -112,6 +112,8 @@ int xwayland_window_present_resource_rgba8(const void *resource, uint64_t serial
  * presenter; see vulkan_presenter_present_image. No X11 fallback. */
 int xwayland_window_present_image(uint64_t image, uint32_t layout, int width,
                                   int height, int direct_blit);
+/* Native handles of the guest window (Display* and X11 Window) for guest-side Vulkan WSI; 0 when no window. */
+int xwayland_window_native(void **display, unsigned long *window);
 void xwayland_window_destroy(void);
 int xwayland_window_exists(void);
 
