@@ -42,6 +42,16 @@ typedef struct {
 
 typedef struct {
     int type;
+    Display *display;
+    unsigned long resourceid;
+    unsigned long serial;
+    unsigned char error_code;
+    unsigned char request_code;
+    unsigned char minor_code;
+} XErrorEvent;
+
+typedef struct {
+    int type;
     unsigned long serial;
     Bool send_event;
     Display *display;
@@ -130,6 +140,7 @@ typedef struct {
     int client_width;
     int client_height;
     int visible;
+    int viewable;          /* set only by MapNotify: XSetInputFocus on an unviewable window is a BadMatch */
     int focus_requested;
     int initialized;
     XImage *present_image;
@@ -194,6 +205,7 @@ typedef struct {
     int (*DestroyImage)(XImage *);
     int (*Flush)(Display *);
     int (*Sync)(Display *, Bool);
+    int (*(*SetErrorHandler)(int (*)(Display *, XErrorEvent *)))(Display *, XErrorEvent *);
     int (*GrabPointer)(Display *, Window, Bool, unsigned int, int, int, Window,
                        Cursor, unsigned long);
     int (*UngrabPointer)(Display *, unsigned long);
@@ -244,6 +256,7 @@ int xwayland_set_presenter(XwaylandPresenter presenter)
     return 1;
 }
 
+static int beer_x_error_handler(Display *display, XErrorEvent *error);
 #define X11_LOAD(field, symbol) do { \
     *(void **)(&g_x11.field) = dlsym(g_x11.library, symbol); \
     if (!g_x11.field) { \
@@ -298,6 +311,7 @@ static int initialize_locked(void)
     X11_LOAD(DestroyImage, "XDestroyImage");
     X11_LOAD(Flush, "XFlush");
     X11_LOAD(Sync, "XSync");
+    X11_LOAD(SetErrorHandler, "XSetErrorHandler");
     X11_LOAD(GrabPointer, "XGrabPointer");
     X11_LOAD(QueryExtension, "XQueryExtension");
     X11_LOAD(GetEventData, "XGetEventData");
@@ -305,6 +319,7 @@ static int initialize_locked(void)
     X11_LOAD(UngrabPointer, "XUngrabPointer");
 
     g_x11.InitThreads();
+    g_x11.SetErrorHandler(beer_x_error_handler);
     g_x11.display = g_x11.OpenDisplay(NULL);
     if (!g_x11.display) {
         fprintf(stderr, "[XWAYLAND] cannot open DISPLAY=%s\n",
@@ -727,6 +742,17 @@ int xwayland_window_set_icon_argb(const uint32_t *pixels, int width, int height)
     return ok;
 }
 
+/* Xlib's default error handler terminates the process. Focus/raise requests race with the compositor
+ * (a window can become unviewable between request and delivery) and are best effort, so report and
+ * continue instead of killing the guest. */
+static int beer_x_error_handler(Display *display, XErrorEvent *error)
+{
+    (void)display;
+    fprintf(stderr, "[XWAYLAND] ignored X error: code=%d request=%d minor=%d resource=0x%lx\n",
+            error->error_code, error->request_code, error->minor_code, error->resourceid);
+    return 0;
+}
+
 static int request_focus_locked(void)
 {
     if (!g_x11.display || !g_x11.window) return 0;
@@ -765,7 +791,7 @@ int xwayland_window_request_focus(void)
         /* XMapWindow is asynchronous. Apply focus immediately only after a
          * MapNotify has made the window viewable; otherwise poll_event will
          * fulfill this request when that notification arrives. */
-        if (g_x11.visible && request_focus_locked())
+        if (g_x11.viewable && request_focus_locked())
             g_x11.focus_requested = 0;
     }
     pthread_mutex_unlock(&g_x11.lock);
@@ -1085,9 +1111,10 @@ int xwayland_window_poll_event(XwaylandEvent *out)
             g_x11.source_hash_valid = 0;
             out->type = XWAYLAND_EVENT_EXPOSE;
             break;
-        case 18: g_x11.visible = 0; out->type = XWAYLAND_EVENT_HIDE; break;
+        case 18: g_x11.visible = 0; g_x11.viewable = 0; out->type = XWAYLAND_EVENT_HIDE; break;
         case 19:
             g_x11.visible = 1;
+            g_x11.viewable = 1;
             g_x11.source_hash_valid = 0;
             if (g_x11.focus_requested && request_focus_locked())
                 g_x11.focus_requested = 0;

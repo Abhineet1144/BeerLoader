@@ -22,8 +22,10 @@ static inline void beer_dinput_write_standard_mouse_state(
 
 static inline uint32_t beer_dinput_button_count(int kind)
 {
+    /* The host mapping exposes left/right/middle plus two X buttons. Keep the
+     * advertised object count consistent with GetSystemMetrics and Raw Input. */
+    if (kind == 1) return 5;
     /* DirectInput models keyboard keys as 256 button objects. */
-    if (kind == 1) return 8;
     if (kind == 2) return 256;
     return 0;
 }

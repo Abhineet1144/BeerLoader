@@ -19,6 +19,10 @@ int main(void)
     assert(BEER_STEAM_REMOTE_STORAGE_READ_RESULT_SIZE == 24u);
     assert(BEER_STEAM_REMOTE_STORAGE_READ_RESULT_OFFSET_OFFSET == 12u);
     assert(BEER_STEAM_REMOTE_STORAGE_READ_RESULT_BYTES_OFFSET == 16u);
+    assert(beer_steam_call_result_finishes_request(
+        BEER_STEAM_REMOTE_STORAGE_WRITE_CALLBACK_ID));
+    assert(!beer_steam_call_result_finishes_request(
+        BEER_STEAM_REMOTE_STORAGE_READ_CALLBACK_ID));
 
     char path[128];
     assert(beer_steam_storage_normalize_path("./win64_save/data00-1.bin",

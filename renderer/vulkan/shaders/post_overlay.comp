@@ -1,0 +1,24 @@
+#version 450
+// Blends one overlay box (straight-alpha BGRA, packed in a storage buffer) into the final image.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 1, rgba8) uniform image2D uDst;
+layout(binding = 2) readonly buffer Overlay { uint pixels[]; } ov;
+layout(push_constant) uniform Params {
+    ivec4 rect;        // destination x, y, w, h in final-image pixels
+    ivec2 box;         // overlay bitmap width, height
+    int offset;        // first pixel of this box inside the buffer (in uints)
+    int opacity;       // 0..1000, scales the box alpha
+} p;
+
+void main()
+{
+    ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+    if (local.x >= p.rect.z || local.y >= p.rect.w) return;
+    ivec2 xy = p.rect.xy + local;
+    ivec2 bxy = ivec2(local.x * p.box.x / p.rect.z, local.y * p.box.y / p.rect.w);
+    uint v = ov.pixels[p.offset + bxy.y * p.box.x + bxy.x];
+    vec4 o = vec4(float((v >> 16) & 255u), float((v >> 8) & 255u), float(v & 255u), float(v >> 24)) / 255.0;
+    o.a *= float(p.opacity) * 0.001;
+    vec4 d = imageLoad(uDst, xy);
+    imageStore(uDst, xy, vec4(mix(d.rgb, o.rgb, o.a), 1.0));
+}

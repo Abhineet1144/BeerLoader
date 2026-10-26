@@ -1,0 +1,11 @@
+/* Ray tracing entry points, loaded only when the shared device enabled
+ * VK_KHR_acceleration_structure / ray_tracing_pipeline. */
+BD12_VK_RT_FN(CreateAccelerationStructureKHR)
+BD12_VK_RT_FN(DestroyAccelerationStructureKHR)
+BD12_VK_RT_FN(GetAccelerationStructureBuildSizesKHR)
+BD12_VK_RT_FN(GetAccelerationStructureDeviceAddressKHR)
+BD12_VK_RT_FN(CmdBuildAccelerationStructuresKHR)
+BD12_VK_RT_FN(CmdCopyAccelerationStructureKHR)
+BD12_VK_RT_FN(CreateRayTracingPipelinesKHR)
+BD12_VK_RT_FN(GetRayTracingShaderGroupHandlesKHR)
+BD12_VK_RT_FN(CmdTraceRaysKHR)

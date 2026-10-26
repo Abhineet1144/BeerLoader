@@ -169,6 +169,69 @@ typedef struct {
     } data;
 } BeerRawInput;
 
+typedef struct {
+    uint64_t device;
+    uint32_t type;
+    uint32_t padding;
+} BeerRawInputDeviceList;
+
+typedef struct {
+    uint32_t size;
+    uint32_t type;
+    union {
+        struct {
+            uint32_t id;
+            uint32_t button_count;
+            uint32_t sample_rate;
+            uint32_t has_horizontal_wheel;
+        } mouse;
+        struct {
+            uint32_t type;
+            uint32_t subtype;
+            uint32_t keyboard_mode;
+            uint32_t function_key_count;
+            uint32_t indicator_count;
+            uint32_t total_key_count;
+        } keyboard;
+    } data;
+} BeerRawInputDeviceInfo;
+
+#define BEER_RAW_MOUSE_HANDLE UINT64_C(1)
+#define BEER_RAW_KEYBOARD_HANDLE UINT64_C(2)
+#define BEER_INPUT_MOUSE_BUTTON_COUNT UINT32_C(5)
+#define BEER_RAW_MOUSE_DEVICE_NAME_A \
+    "\\\\?\\HID#VID_1209&PID_BE01&MI_00#BEER_MOUSE#{378de44c-56ef-11d1-bc8c-00a0c91405dd}"
+#define BEER_RAW_KEYBOARD_DEVICE_NAME_A \
+    "\\\\?\\HID#VID_1209&PID_BE02&MI_00#BEER_KEYBOARD#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}"
+
+static inline uint32_t beer_raw_device_type(uint64_t device)
+{
+    if (device == BEER_RAW_MOUSE_HANDLE) return 0; /* RIM_TYPEMOUSE */
+    if (device == BEER_RAW_KEYBOARD_HANDLE) return 1; /* RIM_TYPEKEYBOARD */
+    return UINT32_MAX;
+}
+
+static inline BeerRawInputDeviceInfo beer_raw_device_info(uint64_t device)
+{
+    BeerRawInputDeviceInfo info = {0};
+    info.size = sizeof(info);
+    info.type = beer_raw_device_type(device);
+    if (device == BEER_RAW_MOUSE_HANDLE) {
+        info.data.mouse.id = 0x1209be01u;
+        info.data.mouse.button_count = BEER_INPUT_MOUSE_BUTTON_COUNT;
+        info.data.mouse.sample_rate = 125;
+        info.data.mouse.has_horizontal_wheel = 1;
+    } else if (device == BEER_RAW_KEYBOARD_HANDLE) {
+        info.data.keyboard.type = 4; /* IBM enhanced (101/102-key) */
+        info.data.keyboard.subtype = 0;
+        info.data.keyboard.keyboard_mode = 1;
+        info.data.keyboard.function_key_count = 12;
+        info.data.keyboard.indicator_count = 3;
+        info.data.keyboard.total_key_count = 101;
+    }
+    return info;
+}
+
 static inline BeerRawInput beer_raw_keyboard_input(uint32_t virtual_key,
                                                     uint32_t scan_code,
                                                     int down)
@@ -197,6 +260,23 @@ static inline BeerRawInput beer_raw_mouse_input(int32_t dx, int32_t dy,
     input.data.mouse.last_x = dx;
     input.data.mouse.last_y = dy;
     return input;
+}
+
+static inline int beer_raw_mouse_is_button_transition(const BeerRawInput *input)
+{
+    /* Wheel flags also occupy button_flags, but they are not button state
+     * transitions and must not displace a press/release in a full queue. */
+    const uint16_t transition_flags = 0x0001u | 0x0002u | 0x0004u | 0x0008u |
+                                      0x0010u | 0x0020u | 0x0040u | 0x0080u |
+                                      0x0100u | 0x0200u;
+    return input && input->header.type == 0 &&
+           (input->data.mouse.button_flags & transition_flags) != 0;
+}
+
+static inline int beer_raw_mouse_is_coalescible_motion(const BeerRawInput *input)
+{
+    return input && input->header.type == 0 &&
+           input->data.mouse.button_flags == 0;
 }
 
 #endif

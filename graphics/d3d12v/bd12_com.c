@@ -25,6 +25,13 @@ static const uint8_t iid_device1[16] = IID(0x80, 0xce, 0xac, 0x77, 0x8e, 0x63,
     0x65, 0x4e, 0x88, 0x95, 0xc1, 0xf2, 0x33, 0x86, 0x86, 0x3e);
 static const uint8_t iid_device2[16] = IID(0x1e, 0xa4, 0xba, 0x30, 0x5b, 0xb1,
     0x5c, 0x47, 0xa0, 0xbb, 0x1a, 0xf5, 0xc5, 0xb6, 0x43, 0x28);
+/* ID3D12Device3..5: exposed only when acceleration structures work. */
+static const uint8_t iid_device3[16] = IID(0x15, 0xdc, 0xda, 0x81, 0xad, 0x2b,
+    0x92, 0x43, 0x93, 0xc5, 0x10, 0x13, 0x45, 0xc4, 0xaa, 0x98);
+static const uint8_t iid_device4[16] = IID(0x17, 0xdf, 0x65, 0xe8, 0xee, 0xa9,
+    0xf6, 0x46, 0xa4, 0x63, 0x30, 0x98, 0x31, 0x5a, 0xa2, 0xe5);
+static const uint8_t iid_device5[16] = IID(0x3b, 0x17, 0x4f, 0x8b, 0xea, 0x2f,
+    0x80, 0x4b, 0x8f, 0x58, 0x43, 0x07, 0x19, 0x1a, 0xb9, 0x5d);
 static const uint8_t iid_device_downlevel[16] = IID(0x3f, 0xee, 0xea, 0x74,
     0x4b, 0x2f, 0x6d, 0x47, 0x82, 0xba, 0x2b, 0x85, 0xcb, 0x49, 0xe3, 0x10);
 static const uint8_t iid_queue[16] = IID(0xa6, 0x70, 0xc8, 0x0e, 0x7e, 0x5d,
@@ -85,8 +92,14 @@ HR com_obj_query(ComObj *self, const uint8_t *riid, void **out,
     if (!riid || !self) return HR_E_NOINTERFACE;
     if (!com_iid_equal(riid, com_iid_iunknown) &&
         !com_iid_equal(riid, own_iid) &&
-        !(extra_iid && com_iid_equal(riid, extra_iid)))
+        !(extra_iid && com_iid_equal(riid, extra_iid))) {
+        if (getenv("BEER_COM_DIAGNOSTICS")) {
+            fprintf(stderr, "[BD12 QI] refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+                    riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6],
+                    riid[8], riid[9], riid[10], riid[11], riid[12], riid[13], riid[14], riid[15]);
+        }
         return HR_E_NOINTERFACE;
+    }
     com_add_ref(self);
     *out = self;
     return HR_OK;
@@ -185,7 +198,9 @@ void com_defer(ComDevice *dev, void (*fn)(ComDevice *, void *), void *ptr)
 }
 
 static void dump_dispatch_flight(ComDevice *dev, uint64_t serial,
-                                 BD12CmdList *const *lists, uint32_t count)
+                                 BD12CmdList *const *lists, uint32_t count,
+                                 const BD12FenceOp *waits, uint32_t wait_count,
+                                 const BD12FenceOp *signals, uint32_t signal_count)
 {
     const char *directory = getenv("BEER_BD12_FLIGHT_RECORDER");
     if (!directory || !*directory) return;
@@ -195,6 +210,10 @@ static void dump_dispatch_flight(ComDevice *dev, uint64_t serial,
         &dev->flight[serial % COM_FLIGHT_SUBMISSIONS];
     memset(current, 0, sizeof(*current));
     current->serial = serial;
+    current->wait_count = wait_count;
+    current->signal_count = signal_count;
+    memcpy(current->waits, waits, wait_count * sizeof(*waits));
+    memcpy(current->signals, signals, signal_count * sizeof(*signals));
     for (uint32_t l = 0; l < count; ++l) {
         const BD12CmdList *list = lists[l];
         if (!list) continue;
@@ -248,6 +267,12 @@ static void dump_dispatch_flight(ComDevice *dev, uint64_t serial,
                 (unsigned long long)submission->total_dispatch_count,
                 submission->op_count,
                 (unsigned long long)submission->total_op_count);
+        for (uint32_t w = 0; w < submission->wait_count; ++w)
+            fprintf(out, " submit=%llu wait fence=%p value=%llu%s\n", (unsigned long long)s, (void *)submission->waits[w].fence,
+                    (unsigned long long)submission->waits[w].value, submission->waits[w].fence == dev->retire ? " (retire)" : "");
+        for (uint32_t w = 0; w < submission->signal_count; ++w)
+            fprintf(out, " submit=%llu signal fence=%p value=%llu%s\n", (unsigned long long)s, (void *)submission->signals[w].fence,
+                    (unsigned long long)submission->signals[w].value, submission->signals[w].fence == dev->retire ? " (retire)" : "");
         for (uint32_t d = 0; d < submission->dispatch_count; ++d) {
             const BD12DispatchFlight *entry = &submission->dispatches[d];
             fprintf(out,
@@ -299,12 +324,19 @@ VkResult com_submit(ComDevice *dev, BD12CmdList *const *lists, uint32_t count,
     if (previous)
         all_waits[total_waits++] = (BD12FenceOp){ dev->retire, previous };
     all_signals[total_signals++] = (BD12FenceOp){ dev->retire, serial };
-    dump_dispatch_flight(dev, serial, lists, count);
+    for (uint32_t i = 0; i < total_waits; ++i) __atomic_store_n(&all_waits[i].fence->last_use, serial, __ATOMIC_RELEASE);
+    for (uint32_t i = 0; i < total_signals; ++i) __atomic_store_n(&all_signals[i].fence->last_use, serial, __ATOMIC_RELEASE);
+    dump_dispatch_flight(dev, serial, lists, count, all_waits, total_waits, all_signals, total_signals);
     VkResult result = bd12_queue_submit(dev->queue, lists, count, all_waits,
                                         total_waits, all_signals,
                                         total_signals);
     if (result == VK_SUCCESS) ++dev->serial;
     pthread_mutex_unlock(&dev->submit_lock);
+    { /* Diagnostic: BEER_BD12_SYNC_SUBMIT=1 drains the GPU after every submit. */
+        static int drain = -1;
+        if (drain < 0) drain = getenv("BEER_BD12_SYNC_SUBMIT") != NULL;
+        if (drain && result == VK_SUCCESS) bd12_fence_wait(dev->retire, serial, UINT64_MAX);
+    }
     com_reap(dev);
     BD12_PROF_END(BD12_PROF_SUBMIT);
     return result;
@@ -382,8 +414,15 @@ static void add_waiter(ComDevice *dev, ComFence *fence, uint64_t value,
 
 static void fence_free(ComDevice *dev, void *ptr)
 {
-    (void)dev;
     ComFence *f = ptr;
+    /* The semaphore must outlive every submission that signals or waits on it; a GPU signal into a destroyed
+     * semaphore faults (NVIDIA Xid 31, write to address 0) and hangs the game. */
+    const uint64_t use = __atomic_load_n(&f->fence->last_use, __ATOMIC_ACQUIRE);
+    if (use > bd12_fence_completed(dev->retire)) {
+        fprintf(stderr, "[BD12] fence %p released while submission %llu still uses it (completed %llu); waiting\n",
+                (void *)f->fence, (unsigned long long)use, (unsigned long long)bd12_fence_completed(dev->retire));
+        bd12_fence_wait(dev->retire, use, UINT64_MAX);
+    }
     bd12_fence_destroy(f->fence);
     free(f);
 }
@@ -430,6 +469,7 @@ typedef struct ComQueue {
 
 static Bd12ImagePresenter g_presenter;
 void bd12_com_set_image_presenter(Bd12ImagePresenter p) { g_presenter = p; }
+Bd12ImagePresenter bd12_com_get_image_presenter(void) { return g_presenter; }
 
 static void queue_destroy(ComObj *o) { free(o); }
 
@@ -538,9 +578,33 @@ static HR MS dl_present(void *iface, ComObj *list, ComResource *texture,
     (void)window; (void)flags;
     ComQueue *q = queue_from_downlevel(iface);
     ComDevice *dev = q->obj.dev;
-    if (!list || !texture || !texture->image) return HR_E_INVALIDARG;
+    if (!list || !texture || !texture->image) {
+        bd12_trace_frame_advance();
+        return HR_E_INVALIDARG;
+    }
     BD12CmdList *recorded = com_list_finish(list);
     if (recorded) com_submit(dev, &recorded, 1, NULL, 0, NULL, 0);
+    if (getenv("BEER_BD12_TS_LOG")) {
+        extern BD12Buffer *g_ts_dst; extern VkDeviceSize g_ts_offset; extern uint32_t g_ts_count;
+        static unsigned frame;
+        if (g_ts_dst && g_ts_dst->cpu && (++frame % 30) == 0) {
+            bd12_fence_wait(dev->retire, dev->serial, UINT64_MAX);
+            const uint64_t *t = (const uint64_t *)((char *)g_ts_dst->cpu + g_ts_offset);
+            fprintf(stderr, "[TS] count=%u t0=%llu t1=%llu delta_ns=%lld\n", g_ts_count,
+                    (unsigned long long)t[0], (unsigned long long)(g_ts_count > 1 ? t[1] : 0),
+                    (long long)(g_ts_count > 1 ? (long long)(t[1] - t[0]) : 0));
+        }
+    }
+    bd12_device_advance_epoch(dev->bd);
+    if (bd12_capture_rb_pending()) {
+        bd12_fence_wait(dev->retire, dev->serial, UINT64_MAX);
+        bd12_capture_rb_flush();
+    }
+    if (bd12_capture_pending()) {      /* traced frame: drain, then write files */
+        bd12_fence_wait(dev->retire, dev->serial, UINT64_MAX);
+        bd12_capture_flush();
+    }
+    bd12_trace_frame_advance();
     if (!g_presenter) return HR_OK;
     BD12_PROF_BEGIN();
     const int presented = g_presenter(texture->image->image,
@@ -820,12 +884,15 @@ fail:
 
 /* Descriptor heaps ----------------------------------------------------------- */
 
-static void desc_heap_destroy(ComObj *o)
+/* Recorded work reads the heap's mirror descriptor sets (and the pool they come from) until the GPU is done. */
+static void desc_heap_free(ComDevice *dev, void *ptr)
 {
-    ComDescHeap *h = (ComDescHeap *)o;
+    (void)dev;
+    ComDescHeap *h = ptr;
     bd12_descriptor_heap_destroy(h->heap);
     free(h);
 }
+static void desc_heap_destroy(ComObj *o) { com_defer(o->dev, desc_heap_free, o); }
 static HR MS desc_heap_query(ComObj *s, const uint8_t *r, void **o)
 { return com_obj_query(s, r, o, iid_descriptor_heap, NULL); }
 static void *MS desc_heap_get_desc(ComDescHeap *h, void *result)
@@ -852,12 +919,15 @@ static void *desc_heap_vtable[11] = {
 
 /* Root signatures -------------------------------------------------------------- */
 
-static void root_sig_destroy(ComObj *o)
+/* Lists that were recorded but not yet submitted (or still executing) refer to the signature's parameters. */
+static void root_sig_free(ComDevice *dev, void *ptr)
 {
-    ComRootSig *r = (ComRootSig *)o;
+    (void)dev;
+    ComRootSig *r = ptr;
     bd12_root_signature_destroy(r->rs);
     free(r);
 }
+static void root_sig_destroy(ComObj *o) { com_defer(o->dev, root_sig_free, o); }
 static HR MS root_sig_query(ComObj *s, const uint8_t *r, void **o)
 { return com_obj_query(s, r, o, iid_root_signature, NULL); }
 static void *root_sig_vtable[8] = {
@@ -957,7 +1027,8 @@ done:
 
 /* Command signatures ----------------------------------------------------------- */
 
-static void signature_destroy(ComObj *o) { free(o); }
+static void signature_free(ComDevice *dev, void *ptr) { (void)dev; free(ptr); }
+static void signature_destroy(ComObj *o) { com_defer(o->dev, signature_free, o); }
 static HR MS signature_query(ComObj *s, const uint8_t *r, void **o)
 { return com_obj_query(s, r, o, iid_command_signature, NULL); }
 static void *signature_vtable[8] = {
@@ -968,7 +1039,16 @@ static void *signature_vtable[8] = {
 
 /* Query heaps (timestamps and occlusion are not modelled yet) -------------------- */
 
-static void query_heap_destroy(ComObj *o) { free(o); }
+static void query_heap_free(ComDevice *dev, void *ptr)
+{
+    ComQueryHeap *h = ptr;
+    if (h->pool)
+        dev->bd->vk.DestroyQueryPool(dev->bd->device, h->pool, NULL);
+    free(h->written);
+    free(h);
+}
+/* The GPU may still be writing the pool: release it on the retire timeline. */
+static void query_heap_destroy(ComObj *o) { com_defer(o->dev, query_heap_free, o); }
 static HR MS query_heap_query(ComObj *s, const uint8_t *r, void **o)
 { return com_obj_query(s, r, o, iid_query_heap, NULL); }
 static void *query_heap_vtable[8] = {
@@ -989,9 +1069,21 @@ static VkSamplerAddressMode address_mode(uint32_t m)
     }
 }
 
+static const VkSamplerReductionModeCreateInfo k_reduction_min = {
+    .sType = VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO,
+    .reductionMode = VK_SAMPLER_REDUCTION_MODE_MIN
+};
+static const VkSamplerReductionModeCreateInfo k_reduction_max = {
+    .sType = VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO,
+    .reductionMode = VK_SAMPLER_REDUCTION_MODE_MAX
+};
+
 static VkSamplerCreateInfo sampler_from_desc(const uint8_t *d, int is_static)
 {
     uint32_t filter = rd32(d);
+    /* D3D12_FILTER bits 7-8 are the reduction type: 1 comparison, 2 minimum,
+     * 3 maximum. Only the comparison type enables depth comparison. */
+    const uint32_t reduction = (filter >> 7) & 3u;
     VkSamplerCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter = (filter & 4) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
@@ -1004,7 +1096,9 @@ static VkSamplerCreateInfo sampler_from_desc(const uint8_t *d, int is_static)
         .mipLodBias = rdf(d + 16),
         .anisotropyEnable = (filter & 0x40) != 0,
         .maxAnisotropy = (float)rd32(d + 20),
-        .compareEnable = (filter & 0x80) != 0,
+        .compareEnable = reduction == 1,
+        .pNext = reduction == 2 ? &k_reduction_min :
+                 reduction == 3 ? &k_reduction_max : NULL,
         .compareOp = (VkCompareOp)(rd32(d + 24) ? rd32(d + 24) - 1 : 0),
     };
     if (info.maxAnisotropy < 1.0f) info.maxAnisotropy = 1.0f;
@@ -1040,7 +1134,11 @@ static HR MS dev_query(ComDevice *self, const uint8_t *riid, void **out)
                   !com_iid_equal(riid, iid_device) &&
                   !com_iid_equal(riid, iid_device1) &&
                   !com_iid_equal(riid, iid_device2) &&
-                  !com_iid_equal(riid, iid_device_downlevel)))
+                  !com_iid_equal(riid, iid_device_downlevel) &&
+                  !(self->bd->rt_enabled &&
+                    (com_iid_equal(riid, iid_device3) ||
+                     com_iid_equal(riid, iid_device4) ||
+                     com_iid_equal(riid, iid_device5)))))
         return HR_E_NOINTERFACE;
     com_add_ref(&self->obj);
     *out = self;
@@ -1120,6 +1218,40 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
         if (size >= 24) fields[4] = 0xb000;
         return HR_OK;
     }
+    /* BEER_DXR_PROBE=1: advertise DXR 1.1 and shader model 6.6 and log what the
+     * application then asks for. Experimental; the DXR pipeline is not built yet. */
+    if (self->bd->rt_enabled && (getenv("BEER_DXR_PROBE") || getenv("BEER_DXR"))) {
+        if (feature == 27 && size >= 12) {          /* OPTIONS5 */
+            memset(data, 0, size);
+            ((uint32_t *)data)[2] = 11;             /* RAYTRACING_TIER_1_1 */
+            return HR_OK;
+        }
+        if (getenv("BEER_DXR_FEATURES")) {
+            /* Report what the GPU really supports, so a game picks its full ray tracing paths. */
+            uint32_t *f = data;
+            if (feature == 0 && size >= 60) {              /* OPTIONS */
+                memset(data, 0, size);
+                f[0] = 1; f[2] = 0; f[3] = 3; f[4] = 3; f[5] = 1; f[6] = 1; f[7] = 1; f[8] = 3; f[9] = 40; f[14] = 2;
+                return HR_OK;
+            }
+            if (feature == 8 && size >= 24) {              /* OPTIONS1: wave ops, 64-bit integers */
+                memset(data, 0, size);
+                f[0] = 1; f[1] = 32; f[2] = 32; f[3] = 0x2800; f[4] = 1; f[5] = 1;
+                return HR_OK;
+            }
+            if (feature == 12 && size >= 4) { f[0] = 2; return HR_OK; }   /* ROOT_SIGNATURE: 1.1 */
+            if (feature == 18 && size >= 8) { memset(data, 0, size); f[0] = 1; return HR_OK; }   /* OPTIONS2 */
+            if (feature == 21 && size >= 20) {             /* OPTIONS3 */
+                memset(data, 0, size);
+                f[0] = 1; f[1] = 1; f[2] = 0xf; f[3] = 1; f[4] = 1;
+                return HR_OK;
+            }
+        }
+        if (feature == 7 && size >= 4 && getenv("BEER_DXR_PROBE_SM")) {
+            *(uint32_t *)data = (uint32_t)strtoul(getenv("BEER_DXR_PROBE_SM"), NULL, 16);
+            return HR_OK;                           /* SHADER_MODEL, e.g. 66 */
+        }
+    }
     switch (feature) {
     case 7: case 8: case 12: case 18: case 19:
     case 21: case 23: case 27: case 30: case 32:
@@ -1139,6 +1271,8 @@ static HR MS dev_create_descriptor_heap(ComDevice *self, const uint32_t *desc,
         !com_iid_equal(riid, com_iid_iunknown))
         return HR_E_NOINTERFACE;
     uint32_t type = desc[0], count = desc[1];
+    if (getenv("BEER_BD12_HEAP_LOG"))
+        fprintf(stderr, "[BD12] descriptor heap type=%u count=%u flags=%u\n", type, count, desc[2]);
     if (type > 1 && type != 2 && type != 3) return HR_E_INVALIDARG;
     ComDescHeap *h = calloc(1, sizeof(*h));
     if (!h) return HR_E_OUTOFMEMORY;
@@ -1147,6 +1281,11 @@ static HR MS dev_create_descriptor_heap(ComDevice *self, const uint32_t *desc,
     h->heap = bd12_descriptor_heap_create(self->bd, type == 1 ? 1 : 0,
                                           count ? count : 1);
     if (!h->heap) { free(h); return HR_E_OUTOFMEMORY; }
+    /* Shader-visible CBV/SRV/UAV heaps get a bindless mirror up front when
+     * shader model 6 is exposed (BEER_DXR_PROBE_SM), so every later write is
+     * mirrored. */
+    if (type == 0 && (desc[2] & 1) && count >= 1024 && getenv("BEER_DXR_PROBE_SM"))
+        bd12_mirror_enable(h->heap);
     memcpy(h->desc, desc, sizeof(h->desc));
     com_obj_init(&h->obj, COM_DESC_HEAP, desc_heap_vtable, self, desc_heap_destroy);
     *out = h;
@@ -1248,11 +1387,17 @@ static void write_buffer_view(ComDevice *self, ComResource *r,
     heap.descriptors[0].range = size;
 }
 
-static void MS dev_create_srv(ComDevice *self, ComResource *r,
+static void MS dev_create_srv_impl(ComDevice *self, ComResource *r,
                               const uint8_t *desc, uint64_t dest)
 {
     if (!dest) return;
     clear_descriptor(dest);
+    if (desc && !r && rd32(desc + 4) == 11) {          /* D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE */
+        BD12Descriptor *d = (BD12Descriptor *)(uintptr_t)dest;
+        d->kind = BD12_DESC_SRV_AS;
+        d->offset = rd64(desc + 16);
+        return;
+    }
     if (!r) return;
     uint32_t dim = desc ? rd32(desc + 4) : 0;
     if (r->buffer) {
@@ -1295,7 +1440,8 @@ static void MS dev_create_srv(ComDevice *self, ComResource *r,
                 mip = rd32(desc + 16); mips = rd32(desc + 20); count = 6; break;
         case 10: type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
                 mip = rd32(desc + 16); mips = rd32(desc + 20);
-                first = rd32(desc + 24) * 6; count = rd32(desc + 28) * 6; break;
+                /* First2DArrayFace is already a face index, NumCubes counts cubes. */
+                first = rd32(desc + 24); count = rd32(desc + 28) * 6; break;
         default: return;
         }
     }
@@ -1305,7 +1451,7 @@ static void MS dev_create_srv(ComDevice *self, ComResource *r,
                                     first, count);
 }
 
-static void MS dev_create_uav(ComDevice *self, ComResource *r, ComResource *counter,
+static void MS dev_create_uav_impl(ComDevice *self, ComResource *r, ComResource *counter,
                               const uint8_t *desc, uint64_t dest)
 {
     (void)counter;
@@ -1344,6 +1490,20 @@ static void MS dev_create_uav(ComDevice *self, ComResource *r, ComResource *coun
     if (count == UINT32_MAX) count = r->depth_or_layers - first;
     bd12_descriptor_write_image_uav(&heap, 0, r->image, type, format, mip, first,
                                     count);
+}
+
+/* Descriptor writes also refresh the bindless heap mirror, if one exists. */
+static void MS dev_create_srv(ComDevice *self, ComResource *r,
+                              const uint8_t *desc, uint64_t dest)
+{
+    dev_create_srv_impl(self, r, desc, dest);
+    bd12_mirror_note((const void *)(uintptr_t)dest, 1);
+}
+static void MS dev_create_uav(ComDevice *self, ComResource *r, ComResource *counter,
+                              const uint8_t *desc, uint64_t dest)
+{
+    dev_create_uav_impl(self, r, counter, desc, dest);
+    bd12_mirror_note((const void *)(uintptr_t)dest, 1);
 }
 
 static void MS dev_create_rtv(ComDevice *self, ComResource *r,
@@ -1415,6 +1575,7 @@ static void MS dev_copy_descriptors_simple(ComDevice *self, uint32_t count,
     if (!count || !dest || !src) return;
     memmove((void *)(uintptr_t)dest, (const void *)(uintptr_t)src,
             (size_t)count * sizeof(BD12Descriptor));
+    bd12_mirror_note((const void *)(uintptr_t)dest, count);
 }
 
 static void MS dev_copy_descriptors(ComDevice *self, uint32_t dest_ranges,
@@ -1437,6 +1598,7 @@ static void MS dev_copy_descriptors(ComDevice *self, uint32_t dest_ranges,
         memmove((BD12Descriptor *)(uintptr_t)dest_starts[dr] + doff,
                 (const BD12Descriptor *)(uintptr_t)src_starts[sr] + soff,
                 (size_t)n * sizeof(BD12Descriptor));
+        bd12_mirror_note((BD12Descriptor *)(uintptr_t)dest_starts[dr] + doff, n);
         doff += n;
         soff += n;
     }
@@ -1613,16 +1775,34 @@ static void MS dev_get_footprints(ComDevice *self, const uint8_t *desc,
 static HR MS dev_create_query_heap(ComDevice *self, const uint32_t *desc,
                                    const uint8_t *riid, void **out)
 {
-    (void)desc;
-    if (!out) return HR_E_INVALIDARG;
+    if (!out || !desc) return HR_E_INVALIDARG;
     *out = NULL;
     if (!com_iid_equal(riid, iid_query_heap) &&
         !com_iid_equal(riid, com_iid_iunknown))
         return HR_E_NOINTERFACE;
-    ComObj *o = calloc(1, sizeof(*o));
-    if (!o) return HR_E_OUTOFMEMORY;
-    com_obj_init(o, COM_QUERY_HEAP, query_heap_vtable, self, query_heap_destroy);
-    *out = o;
+    ComQueryHeap *h = calloc(1, sizeof(*h));
+    if (!h) return HR_E_OUTOFMEMORY;
+    h->heap_type = desc[0];
+    h->count = desc[1];
+    h->written = calloc(h->count ? h->count : 1, 1);
+    /* Occlusion and timestamp heaps are real Vulkan pools; pipeline and
+     * stream-output statistics keep the zero-filled behaviour. */
+    if (h->written && h->count && (h->heap_type == 0 || h->heap_type == 1)) {
+        VkQueryPoolCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = h->heap_type == 0 ? VK_QUERY_TYPE_OCCLUSION
+                                           : VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = h->count
+        };
+        if (self->bd->vk.CreateQueryPool(self->bd->device, &info, NULL,
+                                         &h->pool) == VK_SUCCESS)
+            self->bd->vk.ResetQueryPool(self->bd->device, h->pool, 0, h->count);
+        else
+            h->pool = VK_NULL_HANDLE;
+    }
+    if (!h->written) { free(h); return HR_E_OUTOFMEMORY; }
+    com_obj_init(&h->obj, COM_QUERY_HEAP, query_heap_vtable, self, query_heap_destroy);
+    *out = h;
     return HR_OK;
 }
 
@@ -1660,7 +1840,275 @@ static uint64_t *MS dev_get_luid(ComDevice *self, uint64_t *result)
     return result;
 }
 
-static void *device_vtable[48] = {
+/* BEER_DXR_DUMP=<dir>: writes every state object as text (subobjects, exports, hit groups, associations) and each
+ * distinct DXIL library as lib_<hash>.dxil, so translation can be studied and tested offline. */
+static void dxr_ascii(const uint8_t *wide, char *out, size_t size)
+{
+    size_t i = 0;
+    for (; wide && i + 1 < size; ++i) {
+        uint16_t c;
+        memcpy(&c, wide + i * 2, 2);
+        if (!c) break;
+        out[i] = c < 128 ? (char)c : '?';
+    }
+    out[i] = 0;
+}
+
+static void dxr_dump_state_object(const uint8_t *desc)
+{
+    const char *dir = getenv("BEER_DXR_DUMP");
+    static unsigned counter;
+    if (!dir || !*dir || counter > 400) return;
+    const uint32_t count = rd32(desc + 4);
+    const uint8_t *subs = (const uint8_t *)(uintptr_t)rd64(desc + 8);
+    char path[600];
+    snprintf(path, sizeof(path), "%s/so%04u.txt", dir, counter++);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "state object type=%u subobjects=%u\n", rd32(desc), count);
+    for (uint32_t i = 0; subs && i < count && i < 64; ++i) {
+        const uint32_t st = rd32(subs + i * 16);
+        const uint8_t *sd = (const uint8_t *)(uintptr_t)rd64(subs + i * 16 + 8);
+        fprintf(f, "[%u] type=%u at %p", i, st, (const void *)(subs + i * 16));
+        char a[160], b[160], c[160], d[160];
+        if (st == 5 && sd) {
+            const uint8_t *code = (const uint8_t *)(uintptr_t)rd64(sd);
+            const uint64_t bytes = rd64(sd + 8);
+            uint64_t h = 1469598103934665603ull;
+            for (uint64_t k = 0; code && k < bytes; ++k) { h ^= code[k]; h *= 1099511628211ull; }
+            fprintf(f, " DXIL_LIBRARY bytes=%llu hash=%016llx exports=%u\n", (unsigned long long)bytes, (unsigned long long)h, rd32(sd + 16));
+            const uint8_t *exports = (const uint8_t *)(uintptr_t)rd64(sd + 24);
+            for (uint32_t k = 0; exports && k < rd32(sd + 16) && k < 64; ++k) {
+                dxr_ascii((const uint8_t *)(uintptr_t)rd64(exports + k * 24), a, sizeof(a));
+                dxr_ascii((const uint8_t *)(uintptr_t)rd64(exports + k * 24 + 8), b, sizeof(b));
+                fprintf(f, "      export \"%s\" rename-from \"%s\"\n", a, b);
+            }
+            snprintf(path, sizeof(path), "%s/lib_%016llx.dxil", dir, (unsigned long long)h);
+            if (code && access(path, F_OK) != 0) {
+                FILE *lib = fopen(path, "wb");
+                if (lib) { fwrite(code, 1, (size_t)bytes, lib); fclose(lib); }
+            }
+        } else if (st == 11 && sd) {
+            dxr_ascii((const uint8_t *)(uintptr_t)rd64(sd), a, sizeof(a));
+            dxr_ascii((const uint8_t *)(uintptr_t)rd64(sd + 16), b, sizeof(b));
+            dxr_ascii((const uint8_t *)(uintptr_t)rd64(sd + 24), c, sizeof(c));
+            dxr_ascii((const uint8_t *)(uintptr_t)rd64(sd + 32), d, sizeof(d));
+            fprintf(f, " HIT_GROUP \"%s\" type=%u any=\"%s\" closest=\"%s\" intersection=\"%s\"\n", a, rd32(sd + 8), b, c, d);
+        } else if (st == 9 && sd) {
+            fprintf(f, " SHADER_CONFIG payload=%u attributes=%u\n", rd32(sd), rd32(sd + 4));
+        } else if (st == 10 && sd) {
+            fprintf(f, " PIPELINE_CONFIG max recursion=%u\n", rd32(sd));
+        } else if ((st == 1 || st == 2) && sd) {
+            ComRootSig *crs = (ComRootSig *)(uintptr_t)rd64(sd);
+            fprintf(f, " %s_ROOT_SIGNATURE object=%p\n", st == 1 ? "GLOBAL" : "LOCAL", (void *)crs);
+            const BD12RootSignature *rs = crs ? crs->rs : NULL;
+            for (uint32_t k = 0; rs && k < rs->parameter_count; ++k) {
+                const BD12RootParameter *rp = &rs->parameters[k];
+                static const char *const type_names[] = { "TABLE", "CONSTANTS", "CBV", "SRV", "UAV" };
+                fprintf(f, "      param %u %s vis=%u reg=%u space=%u dwords=%u ranges=%u", k, rp->type < 5 ? type_names[rp->type] : "?",
+                        rp->visibility, rp->shader_register, rp->space, rp->dword_count, rp->range_count);
+                for (uint32_t r = 0; r < rp->range_count; ++r)
+                    fprintf(f, " [type%u n=%d base=%u space=%u off=%d]", rp->ranges[r].type, (int)rp->ranges[r].count,
+                            rp->ranges[r].base_register, rp->ranges[r].space, (int)rp->ranges[r].offset);
+                fprintf(f, "\n");
+            }
+            for (uint32_t k = 0; rs && k < rs->static_count; ++k)
+                fprintf(f, "      static sampler reg=%u space=%u\n", rs->statics[k].reg, rs->statics[k].space);
+        } else if (st == 7 && sd) {
+            const uint8_t *target = (const uint8_t *)(uintptr_t)rd64(sd);
+            fprintf(f, " ASSOCIATION to subobject at %p (type %u) exports:", (const void *)target, target ? rd32(target) : 0);
+            const uint8_t *names = (const uint8_t *)(uintptr_t)rd64(sd + 16);
+            for (uint32_t k = 0; names && k < rd32(sd + 8) && k < 64; ++k) {
+                dxr_ascii((const uint8_t *)(uintptr_t)rd64(names + k * 8), a, sizeof(a));
+                fprintf(f, " \"%s\"", a);
+            }
+            fprintf(f, "\n");
+        } else fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
+/* ID3D12StateObject / ID3D12StateObjectProperties ---------------------------------- */
+static const uint8_t iid_state_object[16] = IID(0x43, 0x69, 0x01, 0x47, 0xa8, 0xfc, 0x94, 0x45,
+    0x93, 0xea, 0xaf, 0x25, 0x8b, 0x55, 0x34, 0x6d);
+static const uint8_t iid_state_props[16] = IID(0x27, 0xa8, 0x5f, 0xde, 0xf9, 0x9b, 0x26, 0x4f,
+    0x89, 0xff, 0xd7, 0xf5, 0x6f, 0xde, 0x38, 0x60);
+
+static void so_free(ComDevice *dev, void *ptr)
+{
+    (void)dev;
+    ComStateObject *so = ptr;
+    bd12_rt_pipeline_destroy(so->rt);
+    if (so->global_rs) com_release(so->global_rs);
+    free(so);
+}
+static void so_destroy(ComObj *o) { com_defer(o->dev, so_free, o); }
+
+static HR MS so_query(ComObj *s, const uint8_t *r, void **o)
+{
+    ComStateObject *so = (ComStateObject *)s;
+    if (r && com_iid_equal(r, iid_state_props)) {
+        if (!o) return HR_E_INVALIDARG;
+        com_add_ref(s);
+        *o = &so->props_vtable;
+        return HR_OK;
+    }
+    return com_obj_query(s, r, o, iid_state_object, NULL);
+}
+#define SO_FROM_PROPS(p) ((ComStateObject *)((uint8_t *)(p) - offsetof(ComStateObject, props_vtable)))
+static HR MS sop_query(void **p, const uint8_t *r, void **o)
+{
+    ComStateObject *so = SO_FROM_PROPS(p);
+    if (r && com_iid_equal(r, iid_state_props)) {
+        if (!o) return HR_E_INVALIDARG;
+        com_add_ref(&so->obj);
+        *o = p;
+        return HR_OK;
+    }
+    return so_query(&so->obj, r, o);
+}
+static uint32_t MS sop_add_ref(void **p) { return com_add_ref(&SO_FROM_PROPS(p)->obj); }
+static uint32_t MS sop_release(void **p) { return com_release(&SO_FROM_PROPS(p)->obj); }
+static const void *MS sop_identifier(void **p, const uint16_t *name)
+{
+    char ascii[128];
+    dxr_ascii((const uint8_t *)name, ascii, sizeof(ascii));
+    return bd12_rt_pipeline_identifier(SO_FROM_PROPS(p)->rt, ascii);
+}
+static uint64_t MS sop_shader_stack(void **p, const uint16_t *name) { (void)p; (void)name; return 2048; }
+static uint64_t MS sop_pipeline_stack(void **p) { (void)p; return 8192; }
+static void MS sop_set_pipeline_stack(void **p, uint64_t size) { (void)p; (void)size; }
+static void *so_props_vtable[7] = {
+    [0] = sop_query, [1] = sop_add_ref, [2] = sop_release, [3] = sop_identifier,
+    [4] = sop_shader_stack, [5] = sop_pipeline_stack, [6] = sop_set_pipeline_stack,
+};
+static void *so_vtable[7] = {
+    [0] = so_query, [1] = com_add_ref, [2] = com_release,
+    [3] = com_obj_get_private, [4] = com_obj_set_private, [5] = com_obj_set_private_iface,
+    [6] = com_obj_set_name,
+};
+/* GetDevice is slot 7; the state object has no methods of its own beyond ID3D12Object. */
+static void *so_vtable8[8];
+
+static HR MS dev_create_state_object(ComDevice *self, const uint8_t *desc,
+                                     const uint8_t *riid, void **out)
+{
+    if (out) *out = NULL;
+    if (!desc || !out) return HR_E_INVALIDARG;
+    if (!self->bd->rt_enabled) return HR_E_NOTIMPL;
+    dxr_dump_state_object(desc);
+    const uint32_t count = rd32(desc + 4);
+    const uint8_t *subs = (const uint8_t *)(uintptr_t)rd64(desc + 8);
+    BD12RtDesc d;
+    memset(&d, 0, sizeof(d));
+    d.max_recursion = 1;
+    ComObj *global_rs = NULL;
+    d.libraries = calloc(count ? count : 1, sizeof(*d.libraries));
+    d.hit_groups = calloc(count ? count : 1, sizeof(*d.hit_groups));
+    if (!d.libraries || !d.hit_groups) goto fail;
+    for (uint32_t i = 0; subs && i < count; ++i) {
+        const uint32_t st = rd32(subs + i * 16);
+        const uint8_t *sd = (const uint8_t *)(uintptr_t)rd64(subs + i * 16 + 8);
+        if (!sd) continue;
+        if (st == 5) {
+            const uint8_t *code = (const uint8_t *)(uintptr_t)rd64(sd);
+            const uint64_t bytes = rd64(sd + 8);
+            BD12RtLibrary *lib = &d.libraries[d.library_count];
+            lib->code = code ? bd12_rt_intern_blob(code, (size_t)bytes) : NULL;
+            lib->size = (size_t)bytes;
+            if (!lib->code) goto fail;
+            const uint32_t n = rd32(sd + 16);
+            const uint8_t *exports = (const uint8_t *)(uintptr_t)rd64(sd + 24);
+            if (n && exports) {
+                lib->exports = calloc(n, sizeof(*lib->exports));
+                if (!lib->exports) goto fail;
+                lib->export_count = n;
+                for (uint32_t k = 0; k < n; ++k) {
+                    dxr_ascii((const uint8_t *)(uintptr_t)rd64(exports + k * 24), lib->exports[k].name, 128);
+                    dxr_ascii((const uint8_t *)(uintptr_t)rd64(exports + k * 24 + 8), lib->exports[k].rename_from, 128);
+                }
+            }
+            d.library_count++;
+        } else if (st == 11) {
+            BD12RtHitGroup *hg = &d.hit_groups[d.hit_group_count++];
+            dxr_ascii((const uint8_t *)(uintptr_t)rd64(sd), hg->name, 128);
+            hg->type = rd32(sd + 8);
+            dxr_ascii((const uint8_t *)(uintptr_t)rd64(sd + 16), hg->any_hit, 128);
+            dxr_ascii((const uint8_t *)(uintptr_t)rd64(sd + 24), hg->closest_hit, 128);
+            dxr_ascii((const uint8_t *)(uintptr_t)rd64(sd + 32), hg->intersection, 128);
+        } else if (st == 9) {
+            d.max_payload = rd32(sd);
+            d.max_attributes = rd32(sd + 4);
+        } else if (st == 10) {
+            d.max_recursion = rd32(sd);
+        } else if (st == 1) {
+            ComRootSig *crs = (ComRootSig *)(uintptr_t)rd64(sd);
+            if (crs) { global_rs = &crs->obj; d.global_root_signature = crs->rs; }
+        } else if (st == 2) {
+            ComRootSig *crs = (ComRootSig *)(uintptr_t)rd64(sd);
+            if (crs && crs->rs && crs->rs->parameter_count)
+                fprintf(stderr, "[BD12 RT] local root signature with %u parameters is not supported yet\n", crs->rs->parameter_count);
+        }
+    }
+    if (!d.library_count) goto fail;
+    ComStateObject *so = calloc(1, sizeof(*so));
+    if (!so) goto fail;
+    so->rt = bd12_rt_pipeline_create(self->bd, &d);
+    if (!so->rt) { free(so); goto fail; }
+    if (global_rs) { com_add_ref(global_rs); so->global_rs = global_rs; }
+    if (!so_vtable8[0]) {
+        memcpy(so_vtable8, so_vtable, sizeof(so_vtable));
+        so_vtable8[7] = (void *)com_obj_get_device;
+    }
+    so->props_vtable = so_props_vtable;
+    com_obj_init(&so->obj, COM_PSO, so_vtable8, self, so_destroy);
+    if (riid && !com_iid_equal(riid, iid_state_object) && !com_iid_equal(riid, iid_state_props) &&
+        !com_iid_equal(riid, com_iid_iunknown)) {
+        com_release(&so->obj);
+        return HR_E_NOINTERFACE;
+    }
+    HR hr = so_query(&so->obj, riid ? riid : iid_state_object, out);
+    com_release(&so->obj);
+    {   static unsigned created;
+        if (++created % 500 == 0 || created == 1) fprintf(stderr, "[DXR] CreateStateObject: %u created so far\n", created);
+    }
+    return hr;
+fail:
+    {   static unsigned failed;
+        if (failed++ < 10) fprintf(stderr, "[DXR] CreateStateObject FAILED (#%u): libraries=%u hit_groups=%u subobjects=%u\n", failed, d.library_count, d.hit_group_count, count);
+    }
+    for (uint32_t i = 0; i < d.library_count; ++i) free(d.libraries[i].exports);
+    free(d.libraries);
+    free(d.hit_groups);
+    return HR_E_FAIL;
+}
+static HR MS dev_create_committed1(ComDevice *self, const uint8_t *props,
+                                   uint32_t flags, const uint8_t *desc,
+                                   uint32_t state, const void *clear,
+                                   const void *session, const uint8_t *riid,
+                                   void **out)
+{
+    (void)session;
+    return dev_create_committed(self, props, flags, desc, state, clear, riid, out);
+}
+static HR MS dev_create_heap1(ComDevice *self, const uint8_t *desc,
+                              const void *session, const uint8_t *riid,
+                              void **out)
+{
+    (void)session;
+    return dev_create_heap(self, desc, riid, out);
+}
+/* ID3D12Device5::GetRaytracingAccelerationStructurePrebuildInfo */
+static void MS dev_rt_prebuild(ComDevice *self, const void *inputs, uint64_t *info)
+{
+    uint64_t sizes[3] = { 0, 0, 0 };
+    bd12_rt_prebuild(self->bd, inputs, sizes);
+    memcpy(info, sizes, sizeof(sizes));
+}
+static uint32_t MS dev_check_matching_identifier(void) { return 0; /* compatible */ }
+static void MS dev_remove_device(void) {}
+
+static void *device_vtable[65] = {
     [0] = dev_query, [1] = dev_add_ref, [2] = dev_release,
     [3] = com_obj_get_private, [4] = com_obj_set_private, [5] = com_obj_set_private_iface,
     [6] = com_obj_set_name, [7] = dev_node_count, [8] = dev_create_queue,
@@ -1680,6 +2128,14 @@ static void *device_vtable[48] = {
     [41] = dev_create_command_signature, [42] = dev_get_resource_tiling,
     [43] = dev_get_luid, [44] = obj_notimpl, [45] = obj_notimpl,
     [46] = obj_ok, [47] = dev_create_pso,
+    /* Device3 */ [48] = obj_notimpl, [49] = obj_notimpl, [50] = obj_ok,
+    /* Device4 */ [51] = obj_notimpl, [52] = obj_notimpl,
+    [53] = dev_create_committed1, [54] = dev_create_heap1,
+    [55] = obj_notimpl, [56] = obj_notimpl,
+    /* Device5 */ [57] = obj_notimpl, [58] = dev_remove_device,
+    [59] = obj_notimpl, [60] = obj_notimpl, [61] = obj_notimpl,
+    [62] = dev_create_state_object, [63] = dev_rt_prebuild,
+    [64] = dev_check_matching_identifier,
 };
 
 uint64_t MS beer_bd12_create_device(const uint8_t *riid, void **out)

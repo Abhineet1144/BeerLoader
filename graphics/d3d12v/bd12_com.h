@@ -39,6 +39,8 @@ typedef struct {
     uint64_t total_op_count;
     uint32_t dispatch_count;
     uint32_t op_count;
+    uint32_t wait_count, signal_count;
+    BD12FenceOp waits[9], signals[8];
     BD12DispatchFlight dispatches[BD12_FLIGHT_DISPATCHES];
     BD12FlightOp ops[BD12_FLIGHT_OPS];
 } ComFlightSubmission;
@@ -116,6 +118,18 @@ typedef struct ComHeap {
     uint8_t desc[48];
 } ComHeap;
 
+/* ID3D12QueryHeap: a Vulkan query pool. D3D12 heap types: 0 occlusion,
+ * 1 timestamp, 2 pipeline statistics, 3 stream-output statistics. `written`
+ * records (at record time) which queries were ended, so resolving a query that
+ * never ran writes zero instead of waiting forever for its availability. */
+typedef struct ComQueryHeap {
+    ComObj obj;
+    VkQueryPool pool;
+    uint32_t heap_type;
+    uint32_t count;
+    uint8_t *written;
+} ComQueryHeap;
+
 typedef struct ComResource {
     ComObj obj;
     BD12Buffer *buffer;
@@ -146,6 +160,14 @@ typedef struct ComFence {
     BD12Fence *fence;
 } ComFence;
 
+/* ID3D12StateObject (+ ID3D12StateObjectProperties as an embedded second interface). */
+typedef struct ComStateObject {
+    ComObj obj;
+    void **props_vtable;
+    BD12RtPipeline *rt;
+    ComObj *global_rs;
+} ComStateObject;
+
 typedef struct ComSignature {
     ComObj obj;
     uint32_t stride;
@@ -173,6 +195,7 @@ typedef int (*Bd12ImagePresenter)(VkImage image, VkImageLayout layout,
                                   uint32_t width, uint32_t height,
                                   uint32_t dxgi_format);
 void bd12_com_set_image_presenter(Bd12ImagePresenter presenter);
+Bd12ImagePresenter bd12_com_get_image_presenter(void);
 
 uint64_t MS beer_bd12_create_device(const uint8_t *riid, void **device);
 

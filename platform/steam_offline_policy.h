@@ -26,6 +26,15 @@
 #define BEER_STEAM_REMOTE_STORAGE_READ_RESULT_OFFSET_OFFSET      12u
 #define BEER_STEAM_REMOTE_STORAGE_READ_RESULT_BYTES_OFFSET       16u
 
+/* FileReadAsync has two completion phases. GetAPICallResult consumes the
+ * callback payload, but the request's path/range must remain alive until
+ * FileReadAsyncComplete copies the bytes into the caller's buffer. Other
+ * asynchronous results are complete once their callback payload is read. */
+static inline int beer_steam_call_result_finishes_request(uint32_t callback_id)
+{
+    return callback_id != BEER_STEAM_REMOTE_STORAGE_READ_CALLBACK_ID;
+}
+
 static inline int beer_steam_storage_normalize_path(const char *name,
                                                      char *path,
                                                      size_t capacity)

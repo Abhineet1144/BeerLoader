@@ -1,0 +1,29 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// DXR test shader: traces two rays against a TLAS given by device address.
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430) buffer Dest { uint v[]; };
+layout(push_constant, std430) uniform Push {
+    uint64_t tlas;
+    Dest dst;
+} p;
+
+void main()
+{
+    for (uint i = 0; i < 2; ++i) {
+        rayQueryEXT rq;
+        // Ray 0 passes through the triangle, ray 1 misses it.
+        vec3 origin = vec3(i == 0 ? 0.25 : 5.0, 0.25, -1.0);
+        rayQueryInitializeEXT(rq, accelerationStructureEXT(p.tlas), gl_RayFlagsOpaqueEXT, 0xFF, origin, 0.001,
+                              vec3(0.0, 0.0, 1.0), 100.0);
+        while (rayQueryProceedEXT(rq)) {}
+        bool hit = rayQueryGetIntersectionTypeEXT(rq, true) !=
+                   gl_RayQueryCommittedIntersectionNoneEXT;
+        p.dst.v[i * 2] = hit ? 1u : 0u;
+        p.dst.v[i * 2 + 1] = hit ? floatBitsToUint(
+            rayQueryGetIntersectionTEXT(rq, true)) : 0u;
+    }
+}

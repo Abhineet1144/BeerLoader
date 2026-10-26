@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "win32_shared_data.h"
+#include "beer_time.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -113,15 +114,10 @@ static void *shared_data_update_thread(void *opaque)
     (void)opaque;
     while (atomic_load_explicit(&shared_data_updater_running,
                                 memory_order_relaxed)) {
-        struct timespec realtime = {0};
-        struct timespec monotonic = {0};
-        clock_gettime(CLOCK_REALTIME, &realtime);
-        clock_gettime(CLOCK_MONOTONIC, &monotonic);
-        uint64_t unix_100ns = (uint64_t)realtime.tv_sec * 10000000u +
-                              (uint64_t)realtime.tv_nsec / 100u;
+        /* Guest-visible clocks follow the manager's game-speed multiplier. */
+        uint64_t unix_100ns = beer_time_realtime_ns_for(BEER_CLOCK_KUSER) / 100u;
         uint64_t windows_100ns = unix_100ns + 116444736000000000ull;
-        uint64_t interrupt_100ns = (uint64_t)monotonic.tv_sec * 10000000u +
-                                   (uint64_t)monotonic.tv_nsec / 100u;
+        uint64_t interrupt_100ns = beer_time_monotonic_ns_for(BEER_CLOCK_KUSER) / 100u;
         beer_win32_shared_data_refresh(shared_data_mapping,
                                        BEER_WIN32_SHARED_DATA_SIZE,
                                        windows_100ns, interrupt_100ns);

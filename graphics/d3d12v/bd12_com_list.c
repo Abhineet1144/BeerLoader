@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <time.h>
 /* BD12 COM shim, part 2: command allocators, command lists and pipeline
  * states. Every command list method records straight into a VkCommandBuffer
  * through the BD12 core. */
@@ -14,6 +15,15 @@ static const uint8_t iid_allocator[16] = { 0xe4, 0xde, 0x02, 0x61, 0x59, 0xaf,
     0x09, 0x4b, 0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24 };
 static const uint8_t iid_list[16] = { 0x0f, 0x0d, 0x16, 0x5b, 0x1b, 0xac, 0x85,
     0x41, 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55 };
+/* ID3D12GraphicsCommandList1..4 */
+static const uint8_t iid_list1[16] = { 0xfb, 0x03, 0x31, 0x55, 0xe7, 0x1f, 0x57,
+    0x45, 0xbb, 0x38, 0x94, 0x6d, 0x7d, 0x0e, 0x7c, 0xa7 };
+static const uint8_t iid_list2[16] = { 0x85, 0xe5, 0xc3, 0x38, 0x17, 0xff, 0x2c,
+    0x41, 0x91, 0x50, 0x4f, 0xc6, 0xf9, 0xd7, 0x2a, 0x28 };
+static const uint8_t iid_list3[16] = { 0xa7, 0x83, 0xda, 0x6f, 0x4c, 0xb8, 0x38,
+    0x4e, 0x9a, 0xc8, 0xc7, 0xbd, 0x22, 0x01, 0x6b, 0x3d };
+static const uint8_t iid_list4[16] = { 0x8e, 0x31, 0x54, 0x87, 0xa9, 0xd3, 0x41,
+    0x45, 0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74 };
 static const uint8_t iid_command_list[16] = { 0x1c, 0xd9, 0x16, 0x71, 0xe4,
     0xe7, 0xce, 0x47, 0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5 };
 static const uint8_t iid_pso[16] = { 0xf3, 0x30, 0x5a, 0x76, 0x24, 0xf6, 0x6f,
@@ -362,6 +372,10 @@ static HR MS list_query(ComObj *s, const uint8_t *r, void **o)
 {
     if (r && com_iid_equal(r, iid_command_list))
         return com_obj_query(s, r, o, iid_command_list, NULL);
+    if (r && s->dev->bd->rt_enabled &&
+        (com_iid_equal(r, iid_list1) || com_iid_equal(r, iid_list2) ||
+         com_iid_equal(r, iid_list3) || com_iid_equal(r, iid_list4)))
+        return com_obj_query(s, r, o, r, NULL);
     return com_obj_query(s, r, o, iid_list, NULL);
 }
 
@@ -405,6 +419,13 @@ static void list_set_pso(ComList *l, ComPso *p)
         p->last_gen = a->gen;
     }
     pso_wait(p);
+    if (!(p->compute ? (void *)p->cmp : (void *)p->gfx)) {
+        BD12_DROP(BD12_DROP_PSO_FAILED);
+        static unsigned failures;
+        if (failures++ < 8)
+            fprintf(stderr, "[BD12] %s pipeline %016llx failed to compile; its draws/dispatches are dropped\n",
+                    p->compute ? "compute" : "graphics", (unsigned long long)p->hash);
+    }
     if (p->compute) bd12_cmd_set_pipeline(c, p->cmp);
     else bd12_cmd_set_graphics_pipeline(c, p->gfx);
 }
@@ -458,7 +479,7 @@ HR com_create_list(ComDevice *dev, uint32_t type, ComObj *allocator,
     if (!l) return HR_E_OUTOFMEMORY;
     l->type = type;
     com_obj_init(&l->obj, COM_LIST, NULL, dev, list_destroy);
-    extern void *com_list_vtable_[60];
+    extern void *com_list_vtable_[77];
     l->obj.vtable = com_list_vtable_;
     if (!list_start(l, (ComAllocator *)allocator, (ComPso *)pso)) {
         com_release(&l->obj);
@@ -481,8 +502,8 @@ BD12CmdList *com_list_finish(ComObj *obj)
     return l->cur;
 }
 
-#define LIST_CUR(l) BD12CmdList *c = (l)->open ? (l)->cur : NULL; if (!c) return
-#define LIST_CUR_V(l, v) BD12CmdList *c = (l)->open ? (l)->cur : NULL; if (!c) return (v)
+#define LIST_CUR(l) bd12_canary_check(__func__); BD12CmdList *c = (l)->open ? (l)->cur : NULL; if (!c) return
+#define LIST_CUR_V(l, v) bd12_canary_check(__func__); BD12CmdList *c = (l)->open ? (l)->cur : NULL; if (!c) return (v)
 
 static uint32_t MS cl_get_type(ComList *l) { return l->type; }
 
@@ -520,6 +541,9 @@ static void MS cl_draw_indexed(ComList *l, uint32_t ic, uint32_t inst,
                                uint32_t si, int32_t bv, uint32_t sinst)
 {
     LIST_CUR(l);
+    if (bd12_trace_active() && c->gfx.pipeline)
+        fprintf(stderr, "[DRAW] indexed pso=%016llx indices=%u instances=%u start=%u base=%d\n",
+                (unsigned long long)c->gfx.pipeline->shader_hash, ic, inst, si, bv);
     bd12_cmd_draw_indexed(c, ic, inst, si, bv, sinst);
 }
 
@@ -886,9 +910,23 @@ static void MS cl_clear_dsv(ComList *l, uint64_t handle, uint32_t flags,
 {
     LIST_CUR(l);
     VkRect2D r[32];
+    if (bd12_trace_active() && getenv("BEER_BD12_COPY_LOG")) {
+        const BD12Descriptor *dd = (const BD12Descriptor *)(uintptr_t)handle;
+        fprintf(stderr, "[CLEARDSV] %ux%u layers=%u base=%u flags=%u depth=%g rects=%u (kept %u)\n",
+                dd ? dd->width : 0, dd ? dd->height : 0, dd ? dd->layer_count : 0,
+                dd ? dd->view_base_layer : 0, flags, depth, n, n > 16 ? 16 : n);
+        for (uint32_t i = 0; rects && i < n && i < 40; ++i)
+            fprintf(stderr, "[CLEARDSV]   rect %d,%d..%d,%d\n", rects[i*4], rects[i*4+1], rects[i*4+2], rects[i*4+3]);
+    }
     uint32_t count = rects ? convert_rects(rects, n, r) : 0;
+    /* D3D12_CLEAR_FLAGS (DEPTH=1, STENCIL=2) are not Vulkan aspect bits (DEPTH=2,
+     * STENCIL=4); passing them through cleared nothing for depth-only clears (shadow
+     * maps stayed stale forever) and left stencil untouched. */
+    const VkImageAspectFlags clear_aspects =
+        ((flags & 1) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+        ((flags & 2) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     bd12_cmd_clear_dsv(c, (const BD12Descriptor *)(uintptr_t)handle,
-                       flags & 3, depth, stencil, count, count ? r : NULL);
+                       clear_aspects, depth, stencil, count, count ? r : NULL);
 }
 
 static void MS cl_clear_rtv(ComList *l, uint64_t handle, const float *color,
@@ -905,6 +943,18 @@ static void clear_uav(BD12CmdList *c, uint64_t cpu_handle, ComResource *r,
                       const uint32_t values[4], int is_float)
 {
     const BD12Descriptor *d = (const BD12Descriptor *)(uintptr_t)cpu_handle;
+    if (getenv("BEER_BD12_CLEAR_LOG")) {
+        static unsigned logged;
+        if (logged++ < 4000)
+            fprintf(stderr, "[CLEAR] uav %s kind=%u res=%s %s %ux%ux%u fmt=%d%s\n",
+                    is_float ? "float" : "uint", d ? d->kind : 99,
+                    r ? (r->buffer ? "buffer" : r->image ? "image" : "none") : "null",
+                    d && d->kind == BD12_DESC_UAV_IMAGE ? "image" : "",
+                    d ? d->width : 0, d ? d->height : 0, d ? d->layer_count : 0,
+                    d ? (int)d->format : 0,
+                    (d && d->kind != BD12_DESC_UAV_BUFFER && d->kind != BD12_DESC_UAV_IMAGE) ?
+                        "  <-- SKIPPED (not a UAV descriptor)" : "");
+    }
     if (!d) return;
     if (d->kind == BD12_DESC_UAV_BUFFER) {
         if (r && r->buffer)
@@ -936,19 +986,115 @@ static void MS cl_clear_uav_float(ComList *l, uint64_t gpu, uint64_t cpu,
     clear_uav(c, cpu, r, v, 1);
 }
 
+/* BeginQuery/EndQuery/ResolveQueryData. D3D12 query types: 0 occlusion,
+ * 1 binary occlusion, 2 timestamp, 3 pipeline statistics, 4+ stream output. */
+static void MS cl_begin_query(ComList *l, ComObj *heap, uint32_t type,
+                              uint32_t index)
+{
+    LIST_CUR(l);
+    ComQueryHeap *h = (ComQueryHeap *)heap;
+    { static unsigned seen; if (seen++ < 3) fprintf(stderr, "[BD12] BeginQuery type=%u heap-type=%u index=%u\n", type, h ? h->heap_type : 99u, index); }
+    if (!h || !h->pool || index >= h->count || type > 1) return;
+    bd12_cmd_begin_query(c, h->pool, index);
+}
+
+static void MS cl_end_query(ComList *l, ComObj *heap, uint32_t type,
+                            uint32_t index)
+{
+    LIST_CUR(l);
+    ComQueryHeap *h = (ComQueryHeap *)heap;
+    if (!h || !h->pool || index >= h->count) return;
+    if (type <= 1) bd12_cmd_end_query(c, h->pool, index);
+    else if (type == 2) bd12_cmd_write_timestamp(c, h->pool, index);
+    else return;
+    h->written[index] = 1;
+}
+
 static void MS cl_resolve_query(ComList *l, ComObj *heap, uint32_t type,
                                 uint32_t start, uint32_t count,
                                 ComResource *dst, uint64_t offset)
 {
-    (void)heap; (void)type; (void)start;
     LIST_CUR(l);
-    if (dst && dst->buffer && count)
+    if (!dst || !dst->buffer || !count) return;
+    ComQueryHeap *h = (ComQueryHeap *)heap;
+    { static unsigned seen; if (seen++ < 3) fprintf(stderr, "[BD12] ResolveQueryData type=%u heap-type=%u start=%u count=%u\n", type, h ? h->heap_type : 99u, start, count); }
+    if (!h || !h->pool || start >= h->count) {
         bd12_cmd_clear_uav_buffer(c, dst->buffer, offset, (uint64_t)count * 8, 0);
+        return;
+    }
+    if (count > h->count - start) count = h->count - start;
+    /* Copy contiguous runs of queries that were ended; zero the rest. */
+    uint32_t i = 0;
+    while (i < count) {
+        const int ended = h->written[start + i];
+        uint32_t run = 1;
+        while (i + run < count && h->written[start + i + run] == ended) ++run;
+        if (ended)
+            bd12_cmd_copy_query_results(c, h->pool, start + i, run, dst->buffer,
+                                        offset + (uint64_t)i * 8);
+        else
+            bd12_cmd_clear_uav_buffer(c, dst->buffer, offset + (uint64_t)i * 8,
+                                      (uint64_t)run * 8, 0);
+        i += run;
+    }
 }
 
 static void MS cl_marker(ComList *l, uint32_t a, const void *b, uint32_t c)
 { (void)l; (void)a; (void)b; (void)c; }
 static void MS cl_end_event(ComList *l) { (void)l; }
+
+
+/* Diagnostic: BEER_BD12_INDIRECT_LOG=1 copies each ExecuteIndirect count
+ * value to a readback ring and reports, per max_count, how many draws the
+ * GPU-side culling actually kept. */
+#define IND_RING 4096u
+static struct { uint32_t max_count, type; } g_ind_meta[IND_RING];
+static BD12Buffer *g_ind_rb;
+static uint32_t g_ind_slot;
+static uint64_t g_ind_last_ns;
+
+static void indirect_log(ComList *l, BD12CmdList *c, uint32_t type,
+                         uint32_t max_count, BD12Buffer *cb, uint64_t count_off,
+                         BD12Buffer *ab, uint64_t arg_off)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("BEER_BD12_INDIRECT_LOG") != NULL;
+    if (!enabled || !cb) return;
+    if (!g_ind_rb)
+        g_ind_rb = bd12_buffer_create_committed(c->device, BD12_HEAP_READBACK,
+                                                IND_RING * 32);
+    if (!g_ind_rb || !g_ind_rb->cpu) return;
+    uint32_t slot = g_ind_slot++ % IND_RING;
+    g_ind_meta[slot].max_count = max_count;
+    g_ind_meta[slot].type = type;
+    bd12_cmd_global_barrier(c);
+    bd12_cmd_copy_buffer(c, g_ind_rb, slot * 32u, cb, count_off, 4);
+    if (ab && arg_off + 20 <= ab->size)
+        bd12_cmd_copy_buffer(c, g_ind_rb, slot * 32u + 4, ab, arg_off, 20);
+    bd12_cmd_global_barrier(c);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    if (now - g_ind_last_ns < 2000000000ull || g_ind_slot < 3000) return;
+    g_ind_last_ns = now;
+    struct { uint32_t max, type, n, zero; uint64_t sum; uint32_t peak; } b[16] = {0};
+    uint32_t nb = 0;
+    for (uint32_t k = 1000; k < 3000; ++k) {
+        uint32_t sl = (g_ind_slot - k) % IND_RING;
+        uint32_t m = g_ind_meta[sl].max_count, t = g_ind_meta[sl].type;
+        uint32_t v = ((volatile uint32_t *)g_ind_rb->cpu)[sl * 8], i;
+        if (k < 1040 && v) { volatile uint32_t *q = (volatile uint32_t *)g_ind_rb->cpu + sl * 8; fprintf(stderr, "[BD12 INDARG] max=%u count=%u idx=%u inst=%u first=%u base=%d fi=%u (off argbuf)\n", m, v, q[1], q[2], q[3], (int)q[4], q[5]); }
+        for (i = 0; i < nb; ++i) if (b[i].max == m && b[i].type == t) break;
+        if (i == nb) { if (nb == 16) continue; b[nb++] = (typeof(b[0])){ .max = m, .type = t }; }
+        b[i].n++; b[i].sum += v; if (!v) b[i].zero++;
+        if (v > b[i].peak) b[i].peak = v;
+    }
+    for (uint32_t i = 0; i < nb; ++i)
+        fprintf(stderr, "[BD12 IND] type=%u max=%u calls=%u avg=%llu peak=%u zero=%u\n",
+                b[i].type, b[i].max, b[i].n,
+                (unsigned long long)(b[i].sum / b[i].n), b[i].peak, b[i].zero);
+    (void)l;
+}
 
 static void MS cl_execute_indirect(ComList *l, ComSignature *sig,
                                    uint32_t max_count, ComResource *args,
@@ -958,14 +1104,38 @@ static void MS cl_execute_indirect(ComList *l, ComSignature *sig,
     LIST_CUR(l);
     if (!sig || !args || !args->buffer) return;
     if (sig->arg_count != 1) {
-        static int warned;
-        if (warned++ < 4)
-            fprintf(stderr, "[BD12] ExecuteIndirect with %u arguments (first=%u) "
-                    "is not supported\n", sig->arg_count, sig->arg_types[0]);
+        BD12_DROP(BD12_DROP_INDIRECT_MULTI_ARG);
+        static uint32_t seen_masks[8];
+        uint32_t key = sig->arg_count;
+        for (uint32_t i = 0; i < sig->arg_count && i < 8; ++i)
+            key = key * 31u + sig->arg_types[i];
+        int known = 0;
+        for (uint32_t i = 0; i < 8; ++i) known |= seen_masks[i] == key;
+        if (!known) {
+            for (uint32_t i = 0; i < 8; ++i)
+                if (!seen_masks[i]) { seen_masks[i] = key; break; }
+            fprintf(stderr, "[BD12] ExecuteIndirect signature with %u arguments (types:",
+                    sig->arg_count);
+            for (uint32_t i = 0; i < sig->arg_count && i < 8; ++i)
+                fprintf(stderr, " %u", sig->arg_types[i]);
+            fprintf(stderr, ", stride %u) is not supported; its work is dropped\n",
+                    sig->stride);
+        }
         return;
     }
     uint32_t stride = sig->stride;
     BD12Buffer *cb = count_res ? count_res->buffer : NULL;
+    { static int force = -1; if (force < 0) force = getenv("BEER_BD12_INDIRECT_FORCE") != NULL; if (force) cb = NULL; }
+    if (bd12_trace_active())
+        fprintf(stderr, "[TRACE] execute_indirect type=%u max=%u args=%llx+%llx count=%llx+%llx\n",
+                sig->arg_types[0], max_count,
+                (unsigned long long)args->buffer->va, (unsigned long long)arg_off,
+                (unsigned long long)(cb ? cb->va : 0), (unsigned long long)count_off);
+    if (sig->arg_types[0] <= 1 && c->gfx.pipeline)
+        bd12_capture_indirect(c, c->gfx.pipeline->shader_hash, sig->arg_types[0],
+                              args->buffer, arg_off, cb, count_off, max_count, stride);
+    if (sig->arg_types[0] <= 1)
+        indirect_log(l, c, sig->arg_types[0], max_count, cb, count_off, args->buffer, arg_off);
     switch (sig->arg_types[0]) {
     case 0:
         if (cb) bd12_cmd_draw_indirect_count(c, args->buffer, arg_off, cb,
@@ -979,6 +1149,7 @@ static void MS cl_execute_indirect(ComList *l, ComSignature *sig,
                                             stride);
         break;
     case 2:
+        if (cb) BD12_DROP(BD12_DROP_INDIRECT_DISPATCH_COUNT);
         for (uint32_t i = 0; i < max_count; ++i)
             bd12_cmd_dispatch_indirect_bound(c, args->buffer,
                                              arg_off + (uint64_t)i * stride);
@@ -988,7 +1159,61 @@ static void MS cl_execute_indirect(ComList *l, ComSignature *sig,
     }
 }
 
-void *com_list_vtable_[60] = {
+/* ID3D12GraphicsCommandList4 raytracing methods. */
+typedef struct { uint64_t dest; uint32_t type; } RtPostbuild;
+static void MS cl_rt_build(ComList *l, const void *desc, uint32_t post_count,
+                           const RtPostbuild *post)
+{
+    LIST_CUR(l);
+    bd12_cmd_build_as(c, desc);
+    const uint64_t dest_va = *(const uint64_t *)desc;
+    for (uint32_t i = 0; i < post_count; ++i)
+        bd12_cmd_emit_as_info(c, post[i].dest, post[i].type, 1, &dest_va);
+}
+static void MS cl_rt_emit(ComList *l, const RtPostbuild *post, uint32_t count,
+                          const uint64_t *sources)
+{
+    LIST_CUR(l);
+    bd12_cmd_emit_as_info(c, post->dest, post->type, count, sources);
+}
+unsigned g_dxr_set_calls;
+static void MS cl_rt_set_pso1(ComList *l, ComStateObject *state)
+{
+    LIST_CUR(l);
+    __atomic_add_fetch(&g_dxr_set_calls, 1, __ATOMIC_RELAXED);
+    c->rt_pipeline = state ? state->rt : NULL;
+    if (getenv("BEER_DXR_PROBE")) {
+        static unsigned calls;
+        static void *seen[64];
+        static unsigned seen_count;
+        ++calls;
+        unsigned known = 0;
+        for (unsigned i = 0; i < seen_count; ++i) known |= seen[i] == (void *)state;
+        if (!known && seen_count < 64) {
+            seen[seen_count++] = (void *)state;
+            fprintf(stderr, "[DXR] SetPipelineState1 #%u: new state object %p (rt pipeline %p), %u distinct so far\n", calls, (void *)state, state ? (void *)state->rt : NULL, seen_count);
+        }
+    }
+}
+static void MS cl_rt_dispatch_rays(ComList *l, const uint8_t *desc)
+{
+    LIST_CUR(l);
+    static unsigned total, skipped;
+    const int done = bd12_cmd_dispatch_rays(c, c->rt_pipeline, desc);
+    ++total;
+    if (!done) ++skipped;
+    if (total <= 3 || !(total % 1000) || (!done && skipped <= 5))
+        fprintf(stderr, "[DXR] DispatchRays #%u (SetPipelineState1 calls: %u) %ux%ux%u %s (skipped so far: %u)\n", total, g_dxr_set_calls,
+                desc ? *(const uint32_t *)(desc + 88) : 0, desc ? *(const uint32_t *)(desc + 92) : 0,
+                desc ? *(const uint32_t *)(desc + 96) : 0, done ? "recorded" : "SKIPPED", skipped);
+}
+static void MS cl_rt_copy(ComList *l, uint64_t dst, uint64_t src, uint32_t mode)
+{
+    LIST_CUR(l);
+    bd12_cmd_copy_as(c, dst, src, mode);
+}
+
+void *com_list_vtable_[77] = {
     [0] = list_query, [1] = com_add_ref, [2] = com_release,
     [3] = com_obj_get_private, [4] = com_obj_set_private,
     [5] = com_obj_set_private_iface, [6] = com_obj_set_name,
@@ -1010,7 +1235,13 @@ void *com_list_vtable_[60] = {
     [43] = cl_set_index_buffer, [44] = cl_set_vertex_buffers,
     [45] = cl_noop, [46] = cl_set_render_targets, [47] = cl_clear_dsv,
     [48] = cl_clear_rtv, [49] = cl_clear_uav_uint, [50] = cl_clear_uav_float,
-    [51] = cl_noop, [52] = cl_noop, [53] = cl_noop, [54] = cl_resolve_query,
+    [51] = cl_noop, [52] = cl_begin_query, [53] = cl_end_query, [54] = cl_resolve_query,
     [55] = cl_noop, [56] = cl_marker, [57] = cl_marker, [58] = cl_end_event,
     [59] = cl_execute_indirect,
+    /* List1 */ [60] = cl_noop, [61] = cl_noop, [62] = cl_noop, [63] = cl_noop,
+    [64] = cl_noop, [65] = cl_noop,
+    /* List2, List3 */ [66] = cl_noop, [67] = cl_noop,
+    /* List4 */ [68] = cl_noop, [69] = cl_noop, [70] = cl_noop, [71] = cl_noop,
+    [72] = cl_rt_build, [73] = cl_rt_emit, [74] = cl_rt_copy,
+    [75] = cl_rt_set_pso1, [76] = cl_rt_dispatch_rays,
 };

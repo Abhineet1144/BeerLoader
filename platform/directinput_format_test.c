@@ -25,7 +25,7 @@ int main(void)
     assert(beer_dinput_format_offset(0, 12, axes, buttons, keys) == UINT32_MAX);
 
     assert(beer_dinput_button_count(0) == 0);
-    assert(beer_dinput_button_count(1) == 8);
+    assert(beer_dinput_button_count(1) == 5);
     assert(beer_dinput_button_count(2) == 256);
 
     assert(beer_dinput_type_is_axis(0x00000101u)); /* DIDFT_RELAXIS, instance 1 */
@@ -139,6 +139,20 @@ int main(void)
     assert(offsetof(BeerRawMouse, last_x) == 12);
     assert(raw_key.header.type == 1);
     assert(raw_key.header.size == 40);
+    assert(sizeof(BeerRawInputDeviceList) == 16);
+    assert(sizeof(BeerRawInputDeviceInfo) == 32);
+    assert(beer_raw_device_type(BEER_RAW_MOUSE_HANDLE) == 0);
+    assert(beer_raw_device_type(BEER_RAW_KEYBOARD_HANDLE) == 1);
+    assert(beer_raw_device_type(99) == UINT32_MAX);
+    BeerRawInputDeviceInfo mouse_info = beer_raw_device_info(BEER_RAW_MOUSE_HANDLE);
+    assert(mouse_info.size == sizeof(mouse_info));
+    assert(mouse_info.type == 0);
+    assert(mouse_info.data.mouse.button_count == BEER_INPUT_MOUSE_BUTTON_COUNT);
+    assert(mouse_info.data.mouse.has_horizontal_wheel == 1);
+    BeerRawInputDeviceInfo keyboard_info = beer_raw_device_info(BEER_RAW_KEYBOARD_HANDLE);
+    assert(keyboard_info.type == 1);
+    assert(keyboard_info.data.keyboard.function_key_count == 12);
+    assert(keyboard_info.data.keyboard.total_key_count == 101);
     assert(raw_key.data.keyboard.virtual_key == 0x0d);
     assert(raw_key.data.keyboard.make_code == 0x1c);
     assert(raw_key.data.keyboard.message == 0x0100);
@@ -153,6 +167,14 @@ int main(void)
     assert(raw_mouse.data.mouse.last_y == 9);
     assert(raw_mouse.data.mouse.button_flags == 0x0400);
     assert(raw_mouse.data.mouse.button_data == 120);
+    assert(!beer_raw_mouse_is_button_transition(&raw_mouse));
+    assert(!beer_raw_mouse_is_coalescible_motion(&raw_mouse));
+    raw_mouse = beer_raw_mouse_input(4, -2, 0, 0);
+    assert(beer_raw_mouse_is_coalescible_motion(&raw_mouse));
+    assert(!beer_raw_mouse_is_button_transition(&raw_mouse));
+    raw_mouse = beer_raw_mouse_input(0, 0, 0x0004, 0);
+    assert(beer_raw_mouse_is_button_transition(&raw_mouse));
+    assert(!beer_raw_mouse_is_coalescible_motion(&raw_mouse));
 
     /* Verify Win32 mouse-button message constants match the Windows ABI.
      * messages[i][0] = down message, messages[i][1] = up message.

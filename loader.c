@@ -50,6 +50,12 @@
 #include "x64_fault_emulation.h"
 #include "win32_environment.h"
 #include "win32_shared_data.h"
+#include "win32_bcrypt.h"
+#include "win32_version.h"
+#include "beer_time.h"
+#include "beer_control.h"
+#include "beer_overlay.h"
+#include "beer_post.h"
 #include "win32_nt_section.h"
 #include "win32_virtual_memory.h"
 #include "win32_vectored_exception.h"
@@ -1009,6 +1015,8 @@ static void cycle_hist_push(u64 rip)
 static const char *g_snames[MAX_STUBS];
 static int         g_nstubs  = 0;
 static u8         *g_tramp   = NULL;
+static volatile int g_hook_lazy_go;
+static void install_hook_logs(void);
 static size_t      g_trampsz = 0;
 
 /*
@@ -1055,7 +1063,12 @@ __thread u64 g_saved_guest_rsp;
 __thread u64 g_dispatch_import_index;
 __thread u64 g_dispatch_incoming_rsp;
 __thread u64 g_dispatch_incoming_return;
+__thread u64 g_dbg_wait_handle;     /* what this thread is blocked on (diagnostics: kill -USR1) */
+__thread u32 g_dbg_wait_ms, g_dbg_wait_kind;   /* 1 = Sleep, 2 = WaitForSingleObject */
 static u64 g_impl_targets[MAX_STUBS];
+static u64 g_impl_real[MAX_STUBS];           /* real target when BEER_API_TRACE wraps g_impl_targets */
+extern void beer_trace_wrap(void);
+static int g_api_trace = -1;
 
 static int is_current_host_call_stack_rsp(u64 rsp)
 {
@@ -1320,7 +1333,9 @@ static void emit_thunk(int idx)
 static void emit_impl_thunk(int idx, u64 fn_ptr)
 {
     u8 *p = g_tramp + idx * THUNK_SZ;
-    g_impl_targets[idx] = fn_ptr;
+    if (g_api_trace < 0) g_api_trace = getenv("BEER_API_TRACE") != NULL;
+    g_impl_real[idx] = fn_ptr;
+    g_impl_targets[idx] = g_api_trace ? (u64)beer_trace_wrap : fn_ptr;
 
     u32 idx32 = (u32)idx;
     u64 tramp = (u64)beer_dispatch_trampoline;
@@ -1334,6 +1349,155 @@ static void emit_impl_thunk(int idx, u64 fn_ptr)
     p[16] = 0xFF; p[17] = 0xE0;      /* jmp rax (back to original JMP) */
     memset(p + 18, 0x90, 6);         /* nop pad */
 }
+
+/* BEER_API_TRACE=1: every guest->host API call is logged (name + first four arguments). The wrapper
+ * sits between the dispatcher and the real implementation, preserving all argument registers. */
+static __thread int t_trace_logged;
+static u64 __attribute__((ms_abi)) beer_trace_ret(u64 idx, u64 value);
+static u64 __attribute__((ms_abi))
+beer_trace_log(u64 idx, u64 a, u64 b, u64 c, u64 d)
+{
+    static _Atomic(u32) n;
+    u32 k = atomic_fetch_add(&n, 1);
+    static u32 from = 0xffffffffu;
+    if (from == 0xffffffffu) from = getenv("BEER_API_TRACE_FROM") ? (u32)strtoul(getenv("BEER_API_TRACE_FROM"), NULL, 0) : 0;
+    t_trace_logged = 0;
+    static const char *filter = (const char *)1;
+    if (filter == (const char *)1) filter = getenv("BEER_API_TRACE_FILTER");   /* comma-separated name substrings */
+    static u32 span;
+    if (!span) span = getenv("BEER_API_TRACE_COUNT") ? (u32)strtoul(getenv("BEER_API_TRACE_COUNT"), NULL, 0) : 6000;
+    int pass = k >= from && k < from + span;
+    if (filter) {
+        const char *nm = idx < MAX_STUBS && g_snames[idx] ? g_snames[idx] : "?";
+        char list[256]; snprintf(list, sizeof(list), "%s", filter);
+        pass = 0;
+        for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ","))
+            if (strstr(nm, tok)) { pass = 1; break; }
+    }
+    if (pass) {
+        t_trace_logged = 1;
+        const char *name = idx < MAX_STUBS && g_snames[idx] ? g_snames[idx] : "?";
+        fprintf(stderr, "[API %u] %s(%lx, %lx, %lx, %lx)", k, name, a, b, c, d);
+        int win_args = strstr(name, "CreateWindowEx") != NULL ||
+                       strstr(name, "DrawText") || strstr(name, "TextOut") ||
+                       strstr(name, "SetWindowText") || strstr(name, "MessageBox") ||
+                       strstr(name, "SetDlgItemText");
+        if ((a > 0x10000 && (strstr(name, "GetModuleHandle") || strstr(name, "LoadLibrary") ||
+                            strstr(name, "GetProcAddress") || strstr(name, "GetFileVersion") ||
+                            strstr(name, "CreateFile") || strstr(name, "RtlDosPath") ||
+                            strstr(name, "GetFileAttributes") || strstr(name, "FindFirstFile"))) || win_args) {
+            const char *str = (const char *)(uintptr_t)a;
+            if (strstr(name, "GetProcAddress")) str = (const char *)(uintptr_t)b;
+            if (win_args) {
+                for (int which = 0; which < 2; ++which) {
+                    const char *w = (const char *)(uintptr_t)(which ? c : b);
+                    char t2[96]; size_t m = 0;
+                    if ((uintptr_t)w > 0x10000 && w[0] && !w[1])
+                        for (; m < sizeof(t2) - 1 && w[m * 2]; ++m) t2[m] = w[m * 2];
+                    else if ((uintptr_t)w > 0x10000)
+                        for (; m < sizeof(t2) - 1 && w[m] >= 32 && w[m] < 127; ++m) t2[m] = w[m];
+                    t2[m] = 0;
+                    fprintf(stderr, " %s=\"%s\"", which ? "str3" : "str2", t2);
+                }
+                if (getenv("BEER_API_TRACE_NEARBY") && c > 0x10000) {
+                    /* Dump printable UTF-16 runs in the 6 KiB around the title: dialog texts live next to it. */
+                    const u16 *base = (const u16 *)(uintptr_t)(c & ~1ull) - 0x600;
+                    int run = 0; char buf[256]; fputc('\n', stderr);
+                    for (int i = 0; i < 0xC00; ++i) {
+                        u16 ch = base[i];
+                        if (ch >= 32 && ch < 127) { if (run < 255) buf[run++] = (char)ch; }
+                        else { if (run >= 6) { buf[run] = 0; fprintf(stderr, "        nearby: \"%s\"\n", buf); } run = 0; }
+                    }
+                }
+                str = NULL;
+            }
+            char text[96]; size_t n = 0;
+            if (str && (uintptr_t)str > 0x10000 && str[0] && !str[1])   /* UTF-16 */
+                for (; n < sizeof(text) - 1 && str[n * 2]; ++n) text[n] = str[n * 2];
+            else if ((uintptr_t)str > 0x10000)
+                for (; n < sizeof(text) - 1 && str[n] >= 32 && str[n] < 127; ++n) text[n] = str[n];
+            text[n] = 0;
+            if (str) fprintf(stderr, " \"%s\"", text);
+        }
+        {   /* Native-API and registry strings: ANSI_STRING / UNICODE_STRING / OBJECT_ATTRIBUTES / key names. */
+            char t3[128]; size_t m = 0; t3[0] = 0;
+            const u8 *us = NULL; int ansi = 0;
+            if (strstr(name, "LdrGetProcedureAddress") && b > 0x10000) { us = (const u8 *)(uintptr_t)b; ansi = 1; }
+            else if ((strstr(name, "LdrLoadDll") || strstr(name, "LdrGetDllHandle")) && c > 0x10000) us = (const u8 *)(uintptr_t)c;
+            else if ((strstr(name, "ZwCreateFile") || strstr(name, "NtCreateFile") ||
+                      strstr(name, "ZwOpenFile") || strstr(name, "NtOpenFile")) && c > 0x10000) {
+                us = *(const u8 *const *)(uintptr_t)(c + 16);
+                if ((uintptr_t)us < 0x10000) us = NULL;
+            }
+            if (us) {
+                u16 length = *(const u16 *)us;
+                const char *bytes = *(const char *const *)(us + 8);
+                if ((uintptr_t)bytes > 0x10000) {
+                    if (ansi) for (; m < sizeof(t3) - 1 && m < length; ++m) t3[m] = bytes[m];
+                    else for (; m < sizeof(t3) - 1 && m < length / 2u; ++m) t3[m] = (char)((const u16 *)bytes)[m];
+                }
+                t3[m] = 0;
+                fprintf(stderr, " \"%s\"", t3);
+            } else if ((strstr(name, "ZwProtectVirtualMemory") || strstr(name, "NtProtectVirtualMemory")) && b > 0x10000 && c > 0x10000) {
+                fprintf(stderr, " region=0x%lx+0x%lx", *(const u64 *)(uintptr_t)b, *(const u64 *)(uintptr_t)c);
+            } else if ((strstr(name, "RegOpenKey") || strstr(name, "RegQueryValue") || strstr(name, "RegCreateKey") ||
+                        strstr(name, "RegGetValue")) && b > 0x10000) {
+                const char *w = (const char *)(uintptr_t)b;
+                if (w[0] && !w[1]) for (; m < sizeof(t3) - 1 && w[m * 2]; ++m) t3[m] = w[m * 2];
+                else for (; m < sizeof(t3) - 1 && w[m] >= 32 && w[m] < 127; ++m) t3[m] = w[m];
+                t3[m] = 0;
+                fprintf(stderr, " key=\"%s\"", t3);
+            }
+        }
+        fputc('\n', stderr);
+    }
+    return 0;
+}
+static u64 __attribute__((ms_abi)) beer_trace_ret(u64 idx, u64 value)
+{
+    (void)idx;
+    if (t_trace_logged) fprintf(stderr, "        -> %lx\n", value);
+    return 0;
+}
+__asm__(
+    ".text\n"
+    ".global beer_trace_wrap\n"
+    "beer_trace_wrap:\n"
+    "    push %rcx\n"
+    "    push %rdx\n"
+    "    push %r8\n"
+    "    push %r9\n"
+    "    sub $0x28, %rsp\n"
+    "    mov %fs:g_dispatch_import_index@tpoff, %rcx\n"
+    "    mov 0x40(%rsp), %rdx\n"
+    "    mov 0x38(%rsp), %r8\n"
+    "    mov 0x30(%rsp), %r9\n"
+    "    mov 0x28(%rsp), %rax\n"
+    "    mov %rax, 0x20(%rsp)\n"
+    "    call beer_trace_log\n"
+    "    add $0x28, %rsp\n"
+    "    pop %r9\n"
+    "    pop %r8\n"
+    "    pop %rdx\n"
+    "    pop %rcx\n"
+    "    sub $0x98, %rsp\n"
+    "    mov %fs:g_dispatch_import_index@tpoff, %r10\n"
+    "    mov %r10, 0x80(%rsp)\n"
+    ".irp off,0,8,16,24,32,40,48,56,64,72,80,88\n"
+    "    mov 0xc0+\\off(%rsp), %rax\n"
+    "    mov %rax, 0x20+\\off(%rsp)\n"
+    ".endr\n"
+    "    lea g_impl_real(%rip), %r11\n"
+    "    mov (%r11,%r10,8), %rax\n"
+    "    call *%rax\n"
+    "    mov %rax, 0x88(%rsp)\n"
+    "    mov 0x80(%rsp), %rcx\n"
+    "    mov %rax, %rdx\n"
+    "    call beer_trace_ret\n"
+    "    mov 0x88(%rsp), %rax\n"
+    "    add $0x98, %rsp\n"
+    "    ret\n"
+);
 
 /* ── Real implementations (Windows x64 ABI) ────────────────────── */
 #include <time.h>
@@ -2092,13 +2256,19 @@ static int configure_guest_prefix(const char *requested)
     } else {
         configured = getenv("BEER_PREFIX");
         if (configured && *configured) return configure_guest_prefix(configured);
+        /* Default prefix: ~/.beer/prefixes/default. A prefix that already exists under the old
+         * XDG location keeps being used until it is migrated (the manager offers that). */
         const char *data_home = getenv("XDG_DATA_HOME");
         const char *home = getenv("HOME");
+        char legacy[PATH_MAX];
+        snprintf(candidate, sizeof(candidate), "%s/.beer/prefixes/default", home && *home ? home : "/tmp");
         if (data_home && *data_home)
-            snprintf(candidate, sizeof(candidate), "%s/beer/prefixes/default", data_home);
+            snprintf(legacy, sizeof(legacy), "%s/beer/prefixes/default", data_home);
         else
-            snprintf(candidate, sizeof(candidate), "%s/.local/share/beer/prefixes/default",
-                     home && *home ? home : "/tmp");
+            snprintf(legacy, sizeof(legacy), "%s/.local/share/beer/prefixes/default", home && *home ? home : "/tmp");
+        struct stat prefix_stat;
+        if (stat(candidate, &prefix_stat) != 0 && stat(legacy, &prefix_stat) == 0)
+            snprintf(candidate, sizeof(candidate), "%s", legacy);
     }
 
     char canonical[PATH_MAX];
@@ -2255,20 +2425,108 @@ static int build_guest_dll_path(const char *name, char *out, size_t out_size)
     memcpy(candidate + directory_length, "/Win64/", sizeof("/Win64/") - 1);
     strcpy(candidate + directory_length + sizeof("/Win64/") - 1, name);
     if (realpath(candidate, out)) return 1;
-    if (candidate[0] == '/') return resolve_windows_host_path(candidate, out, out_size);
-    char cwd[PATH_MAX];
-    if (!getcwd(cwd, sizeof(cwd)) ||
-        snprintf(absolute_candidate, sizeof(absolute_candidate), "%s/%s", cwd, candidate) >=
-            (int)sizeof(absolute_candidate)) return 0;
-    return resolve_windows_host_path(absolute_candidate, out, out_size);
+    if (candidate[0] == '/') {
+        if (resolve_windows_host_path(candidate, out, out_size) && access(out, R_OK) == 0) return 1;
+    } else {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) &&
+            snprintf(absolute_candidate, sizeof(absolute_candidate), "%s/%s", cwd, candidate) <
+                (int)sizeof(absolute_candidate) &&
+            resolve_windows_host_path(absolute_candidate, out, out_size) &&
+            access(out, R_OK) == 0) return 1;
+    }
+
+    /* Shared runtime directories (BEER_DLL_PATH, colon separated; default
+     * ~/.local/share/beer/runtime): redistributables a game expects from the system
+     * (UCRT, VC++ runtime) when it does not ship them privately. */
+    const char *search = getenv("BEER_DLL_PATH");
+    char fallback[PATH_MAX];
+    if (!search || !*search) {
+        const char *home = getenv("HOME");
+        if (!home || snprintf(fallback, sizeof(fallback), "%s/.local/share/beer/runtime", home) >= (int)sizeof(fallback))
+            return 0;
+        search = fallback;
+    }
+    char list[PATH_MAX * 2];
+    snprintf(list, sizeof(list), "%s", search);
+    for (char *save = NULL, *dir = strtok_r(list, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+        if (snprintf(candidate, sizeof(candidate), "%s/%s", dir, name) >= (int)sizeof(candidate)) continue;
+        if (realpath(candidate, out)) return 1;
+        if (resolve_windows_host_path(candidate, out, out_size) && access(out, R_OK) == 0) return 1;
+    }
+    return 0;
 }
 
 /* Fake handles for Windows system DLLs we emulate */
 #define HMOD_EXE     ((u64)g_img)
-#define HMOD_K32     ((u64)0xFEED0001)
-#define HMOD_USER32  ((u64)0xFEED0002)
-#define HMOD_NTDLL   ((u64)0xFEED0003)
-#define HMOD_ADVAPI  ((u64)0xFEED0004)
+#define HMOD_K32     ((u64)0xFEED0000)
+#define HMOD_USER32  ((u64)0xFEF10000)
+#define HMOD_NTDLL   ((u64)0xFEF50000)
+#define HMOD_ADVAPI  ((u64)0xFEF90000)
+#define FAKE_PE_SIZE 0x40000u
+#define FAKE_PE_STUB_SLOT 32u
+
+/* Runtimes and protectors read these handles as real HMODULEs (MZ header, e_lfanew, export
+ * directory). Back each emulated system-module handle with a minimal valid PE header page. */
+static void fake_pe_header_init(u64 base, const char *name)
+{
+    u8 *p = mmap((void *)base, FAKE_PE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p == MAP_FAILED) return;
+    memset(p, 0, 0x1000);
+    p[0] = 'M'; p[1] = 'Z';
+    *(u32 *)(p + 0x3c) = 0x80;
+    u8 *nt = p + 0x80;
+    memcpy(nt, "PE\0\0", 4);
+    *(u16 *)(nt + 4) = 0x8664;          /* AMD64 */
+    *(u16 *)(nt + 6) = 0;               /* no sections */
+    *(u16 *)(nt + 20) = 0xF0;           /* SizeOfOptionalHeader */
+    *(u16 *)(nt + 22) = 0x2022;         /* DLL | EXECUTABLE | LARGE_ADDRESS_AWARE */
+    u8 *opt = nt + 24;
+    *(u16 *)opt = 0x20b;
+    *(u64 *)(opt + 24) = base;          /* ImageBase */
+    *(u32 *)(opt + 32) = 0x1000;        /* SectionAlignment */
+    *(u32 *)(opt + 36) = 0x200;         /* FileAlignment */
+    *(u16 *)(opt + 40) = 6; *(u16 *)(opt + 48) = 6;
+    *(u32 *)(opt + 56) = FAKE_PE_SIZE;  /* SizeOfImage */
+    *(u32 *)(opt + 60) = 0x400;         /* SizeOfHeaders */
+    *(u16 *)(opt + 68) = 3;             /* console subsystem */
+    *(u32 *)(opt + 108) = 16;           /* NumberOfRvaAndSizes */
+    /* Export directory at RVA 0x400 (empty, but well formed). */
+    u8 *exp = p + 0x400;
+    *(u32 *)(exp + 12) = 0x500;         /* Name */
+    *(u32 *)(exp + 16) = 1;             /* Base */
+    strncpy((char *)p + 0x500, name, 0x40);
+    *(u32 *)(opt + 112) = 0x400;        /* DataDirectory[EXPORT].VirtualAddress */
+    *(u32 *)(opt + 116) = 0x28;
+}
+static void fake_pe_exports_build(void);
+static const char **g_fake_pe_names;        /* sorted export names, identical for every fake system module */
+static size_t g_fake_pe_count;
+static u32 g_fake_pe_stub_offset;
+static volatile int g_fake_pe_ready;
+/* Address of the export-table entry for `name` in a fake system module, or 0. Protectors hook the
+ * first bytes of API entry points as exported by the module, so callers must receive these
+ * addresses (not private thunks) for the hooks to take effect. */
+static u64 fake_pe_export_address(u64 module, const char *name)
+{
+    if (!g_fake_pe_ready || (module != HMOD_K32 && module != HMOD_USER32 && module != HMOD_NTDLL && module != HMOD_ADVAPI))
+        return 0;
+    size_t low = 0, high = g_fake_pe_count;
+    while (low < high) {
+        size_t mid = (low + high) / 2;
+        int order = strcmp(name, g_fake_pe_names[mid]);
+        if (!order) return module + g_fake_pe_stub_offset + mid * FAKE_PE_STUB_SLOT;
+        if (order < 0) high = mid; else low = mid + 1;
+    }
+    return 0;
+}
+__attribute__((constructor)) static void fake_pe_headers_init(void)
+{
+    fake_pe_header_init(HMOD_K32, "kernel32.dll");
+    fake_pe_header_init(HMOD_USER32, "user32.dll");
+    fake_pe_header_init(HMOD_NTDLL, "ntdll.dll");
+    fake_pe_header_init(HMOD_ADVAPI, "advapi32.dll");
+}
 
 static int wcscmp_ascii(const u16 *w, const char *s) {
     while (*s && *w == (u8)*s) { w++; s++; }
@@ -2283,15 +2541,85 @@ static int wcscmp_ascii(const u16 *w, const char *s) {
 static struct {
     char name[64];
     u64 handle;
-} g_fake_dll_cache[32];
+} g_fake_dll_cache[128];
 static int g_fake_dll_count = 0;
 
+/* The Steamworks client library verifies the steamclient64.dll it loaded against the file on
+ * disk (module header vs. file contents, signed blob). Beer never executes that DLL: it maps the
+ * genuine file from the user's Steam installation (BEER_STEAM_CLIENT_DLL overrides) as a plain
+ * data image so the module handle, path and headers are the real ones, while every export
+ * resolves to Beer's own Steam emulation. The file is also linked into the prefix at the path the
+ * registry advertises. */
+static u64 g_steam_client_module;
+static int g_steam_client_loaded;   /* GetModuleHandle only sees it after a LoadLibrary, like Windows */
+static u64 steam_client_module(void)
+{
+    static int tried;
+    if (tried) return g_steam_client_module;
+    tried = 1;
+    char fallback[PATH_MAX];
+    const char *src = getenv("BEER_STEAM_CLIENT_DLL");
+    if (!src || !*src) {
+        const char *home = getenv("HOME");
+        if (!home || snprintf(fallback, sizeof(fallback), "%s/.local/share/Steam/steamclient64.dll", home) >= (int)sizeof(fallback))
+            return 0;
+        src = fallback;
+    }
+    int fd = open(src, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 0x400) { close(fd); return 0; }
+    void *image = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (image == MAP_FAILED) return 0;
+    /* Give the guest its own read-only copy at the advertised path. A symlink would let any
+     * write through the guest's file API reach the user's real Steam installation. */
+    char dir[PATH_MAX], copy[PATH_MAX];
+    if (snprintf(dir, sizeof(dir), "%s/Program Files (x86)/Steam", g_drive_c_path) < (int)sizeof(dir) &&
+        mkdir_tree(dir) &&
+        snprintf(copy, sizeof(copy), "%s/steamclient64.dll", dir) < (int)sizeof(copy)) {
+        struct stat existing;
+        int need_copy = lstat(copy, &existing) != 0 || S_ISLNK(existing.st_mode) ||
+                        existing.st_size != st.st_size;
+        if (need_copy) {
+            unlink(copy);
+            int out = open(copy, O_WRONLY | O_CREAT | O_EXCL, 0444);
+            if (out >= 0) {
+                const u8 *bytes = image;
+                size_t left = (size_t)st.st_size;
+                while (left) {
+                    ssize_t n = write(out, bytes, left > (1u << 20) ? (1u << 20) : left);
+                    if (n <= 0) break;
+                    bytes += n; left -= (size_t)n;
+                }
+                close(out);
+                if (left) { unlink(copy); fprintf(stderr, "[STEAMCLIENT] could not copy %s into the prefix\n", src); }
+            } else fprintf(stderr, "[STEAMCLIENT] could not create %s: %s\n", copy, strerror(errno));
+        }
+    }
+    g_steam_client_module = (u64)image;
+    fprintf(stderr, "[STEAMCLIENT] steamclient64.dll mapped from %s at 0x%lx\n", src, g_steam_client_module);
+    return g_steam_client_module;
+}
+
 static u64 dll_name_to_handle(const char *lname) {
+    int system_module = !strcmp(lname,"kernel32.dll") || !strcmp(lname,"kernelbase.dll") ||
+                        !strcmp(lname,"user32.dll") || !strcmp(lname,"ntdll.dll") || !strcmp(lname,"advapi32.dll");
+    if (system_module) fake_pe_exports_build();
     if (!strcmp(lname,"kernel32.dll")||!strcmp(lname,"kernelbase.dll")) return HMOD_K32;
     if (!strcmp(lname,"user32.dll"))   return HMOD_USER32;
     if (!strcmp(lname,"ntdll.dll"))    return HMOD_NTDLL;
     if (!strcmp(lname,"advapi32.dll")) return HMOD_ADVAPI;
 
+    if (!strcmp(lname, "steamclient64.dll") && g_steam_client_loaded) {
+        u64 steam = steam_client_module();
+        if (steam) return steam;
+    }
+    if (!strncmp(lname, "api-ms-", 7) || !strncmp(lname, "ext-ms-", 7)) {
+        /* API-set contract: CRT contracts live in the bundled ucrtbase image, the rest in kernel32. */
+        GuestDll *ucrt = !strncmp(lname, "api-ms-win-crt-", 15) ? guest_dll_find("ucrtbase.dll") : NULL;
+        return ucrt ? (u64)ucrt->image : HMOD_K32;
+    }
     GuestDll *guest = guest_dll_find(lname);
     if (guest) return (u64)guest->image;
 
@@ -2302,7 +2630,7 @@ static u64 dll_name_to_handle(const char *lname) {
     }
     
     /* Create a new fake handle: use 0x140000000 + (index * 0x100000) */
-    if (g_fake_dll_count < 32) {
+    if (g_fake_dll_count < 128) {
         u64 fake_h = 0x140000000ULL + ((u64)g_fake_dll_count << 20);
         strncpy(g_fake_dll_cache[g_fake_dll_count].name, lname, 63);
         g_fake_dll_cache[g_fake_dll_count].handle = fake_h;
@@ -2336,12 +2664,20 @@ impl_GetModuleHandleW(const u16 *name)
     return h;
 }
 
+static const char *module_file_name(u64 hmod)
+{
+    if (g_steam_client_module && hmod == g_steam_client_module) return "c:\\program files (x86)\\steam\\steamclient64.dll";
+    if (hmod == HMOD_K32) return "C:\\Windows\\System32\\kernel32.dll";
+    if (hmod == HMOD_USER32) return "C:\\Windows\\System32\\user32.dll";
+    if (hmod == HMOD_NTDLL) return "C:\\Windows\\System32\\ntdll.dll";
+    if (hmod == HMOD_ADVAPI) return "C:\\Windows\\System32\\advapi32.dll";
+    return g_exe_path ? g_exe_path : "";
+}
 static u64 __attribute__((ms_abi))
 impl_GetModuleFileNameA(u64 hmod, char *buf, u32 sz)
 {
-    (void)hmod;
     if (!buf || !sz) return 0;
-    strncpy(buf, g_exe_path ? g_exe_path : "", sz - 1);
+    strncpy(buf, module_file_name(hmod), sz - 1);
     buf[sz-1] = 0;
     return (u64)strlen(buf);
 }
@@ -2352,10 +2688,79 @@ static ImplFn find_impl(const char *name);  /* defined later */
 static __thread u32 g_last_error;
 
 /* GetProcAddress – look up in our stub name table, then impl table */
+static u64 __attribute__((ms_abi)) win_export_stub_zero(void)     { return 0; }
+static u64 __attribute__((ms_abi)) win_export_stub_ntstatus(void)  { return 0xC0000002ull; } /* STATUS_NOT_IMPLEMENTED */
+static u64 __attribute__((ms_abi)) win_export_stub_hresult(void)   { return 0x80004001ull; } /* E_NOTIMPL */
+
+#include "platform/win32_kernel32_export_names.inc"
+static int is_real_kernel32_export(const char *name)
+{
+    size_t low = 0, high = sizeof(g_kernel32_export_names) / sizeof(*g_kernel32_export_names);
+    while (low < high) {
+        size_t mid = (low + high) / 2;
+        int order = strcmp(name, g_kernel32_export_names[mid]);
+        if (!order) return 1;
+        if (order < 0) high = mid; else low = mid + 1;
+    }
+    return 0;
+}
+
+/* Legacy msvcrt.dll resolves into the bundled UCRT; the v*printf entry points that UCRT only
+ * provides inline are bridged to __stdio_common_vsprintf with small guest-side thunks. */
+static u64 msvcrt_export(const char *name)
+{
+    GuestDll *ucrt = guest_dll_find("ucrtbase.dll");
+    if (!ucrt) return 0;
+    u64 direct = guest_dll_export(ucrt, name);
+    if (direct) return direct;
+    int sized = !strcmp(name, "_vsnprintf") || !strcmp(name, "vsnprintf");
+    if (!sized && strcmp(name, "vsprintf")) return 0;
+    u64 common = guest_dll_export(ucrt, "__stdio_common_vsprintf");
+    if (!common) return 0;
+    static u8 *page; static size_t used;
+    if (!page) {
+        page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) { page = NULL; return 0; }
+    }
+    if (used + 96 > 4096) return 0;
+    u8 *c = page + used;
+    u8 *w = c;
+    /* sub rsp,0x38 */ *w++ = 0x48; *w++ = 0x83; *w++ = 0xEC; *w++ = 0x38;
+    if (sized) {                       /* (buffer rcx, count rdx, format r8, arglist r9) */
+        /* mov rax, r9      */ *w++ = 0x4C; *w++ = 0x89; *w++ = 0xC8;
+        /* mov r9, r8       */ *w++ = 0x4D; *w++ = 0x89; *w++ = 0xC1;
+        /* mov r8, rdx      */ *w++ = 0x49; *w++ = 0x89; *w++ = 0xD0;
+    } else {                           /* vsprintf(buffer rcx, format rdx, arglist r8) */
+        /* mov rax, r8      */ *w++ = 0x4C; *w++ = 0x89; *w++ = 0xC0;
+        /* mov r9, rdx      */ *w++ = 0x49; *w++ = 0x89; *w++ = 0xD1;
+        /* mov r8, -1       */ *w++ = 0x49; *w++ = 0xC7; *w++ = 0xC0; *w++ = 0xFF; *w++ = 0xFF; *w++ = 0xFF; *w++ = 0xFF;
+    }
+    /* mov rdx, rcx (buffer) */ *w++ = 0x48; *w++ = 0x89; *w++ = 0xCA;
+    /* mov ecx, options   */ *w++ = 0xB9; u32 options = !sized ? 1u : (name[0] == '_' ? 0u : 2u); memcpy(w, &options, 4); w += 4;
+    /* mov qword [rsp+0x20], 0 */ *w++ = 0x48; *w++ = 0xC7; *w++ = 0x44; *w++ = 0x24; *w++ = 0x20; memset(w, 0, 4); w += 4;
+    /* mov [rsp+0x28], rax */ *w++ = 0x48; *w++ = 0x89; *w++ = 0x44; *w++ = 0x24; *w++ = 0x28;
+    /* mov rax, imm64     */ *w++ = 0x48; *w++ = 0xB8; memcpy(w, &common, 8); w += 8;
+    /* call rax           */ *w++ = 0xFF; *w++ = 0xD0;
+    /* add rsp,0x38       */ *w++ = 0x48; *w++ = 0x83; *w++ = 0xC4; *w++ = 0x38;
+    /* ret                */ *w++ = 0xC3;
+    used += (size_t)(w - c + 15) & ~(size_t)15;
+    return (u64)c;
+}
+
 static u64 __attribute__((ms_abi))
 impl_GetProcAddress(u64 hmod, const char *procname)
 {
     if (!procname) return 0;
+    {
+        u64 exported = fake_pe_export_address(hmod, procname);
+        if (exported) return exported;
+    }
+    for (int i = 0; i < g_fake_dll_count; ++i)
+        if (g_fake_dll_cache[i].handle == hmod && !strcmp(g_fake_dll_cache[i].name, "msvcrt.dll")) {
+            u64 address = msvcrt_export(procname);
+            if (address) return address;
+            break;
+        }
     GuestDll *guest = guest_dll_from_handle(hmod);
     if (guest) {
         u64 address = guest_dll_export(guest, procname);
@@ -2388,6 +2793,46 @@ impl_GetProcAddress(u64 hmod, const char *procname)
                 !strncmp(procname, "waveOut", 7))
                 fprintf(stderr, "[AUDIO] GetProcAddress(0x%lx, %s) -> new thunk\n",
                         hmod, procname);
+            return addr;
+        }
+    }
+
+    /* Real Windows system DLLs export far more than Beer implements. Applications (notably
+     * Delphi/Free Pascal and MSVC runtimes) probe a whole group of optional exports and then call
+     * members without re-checking, so for emulated *system* modules a missing export resolves to a
+     * harmless failing stub (FALSE / E_NOTIMPL / STATUS_NOT_IMPLEMENTED) instead of NULL. kernel32
+     * and game-owned modules keep returning NULL so feature probes still see "not present". */
+    {
+        const char *mod = NULL;
+        if (hmod == HMOD_K32 && is_real_kernel32_export(procname)) mod = "kernel32.dll";
+        else if (hmod == HMOD_USER32) mod = "user32.dll";
+        else if (hmod == HMOD_NTDLL) mod = "ntdll.dll";
+        else if (hmod == HMOD_ADVAPI) mod = "advapi32.dll";
+        else for (int i = 0; i < g_fake_dll_count; ++i)
+            if (g_fake_dll_cache[i].handle == hmod) { mod = g_fake_dll_cache[i].name; break; }
+        static const char *const system_modules[] = {
+            "kernel32.dll", "user32.dll", "ntdll.dll", "advapi32.dll", "gdi32.dll", "shell32.dll", "ole32.dll",
+            "oleaut32.dll", "comctl32.dll", "uxtheme.dll", "dwmapi.dll", "msimg32.dll",
+            "shlwapi.dll", "shfolder.dll", "version.dll", "setupapi.dll", "win32u.dll",
+            "comdlg32.dll", "imm32.dll", "winmm.dll", "hid.dll", "crypt32.dll", "psapi.dll" };
+        int is_system = 0;
+        for (size_t i = 0; mod && i < sizeof(system_modules) / sizeof(*system_modules); ++i)
+            if (!strcmp(mod, system_modules[i])) is_system = 1;
+        if (is_system && g_nstubs < MAX_STUBS) {
+            u64 (__attribute__((ms_abi)) *fn)(void) = win_export_stub_zero;
+            if ((!strcmp(mod, "ntdll.dll") && (!strncmp(procname, "Zw", 2) || !strncmp(procname, "Nt", 2))) ||
+                !strncmp(procname, "D3DKMT", 6))    /* graphics-kernel thunks: NTSTATUS failure, never "success" */
+                fn = win_export_stub_ntstatus;
+            else if (!strcmp(mod, "ole32.dll") || !strcmp(mod, "oleaut32.dll") ||
+                     !strcmp(mod, "dwmapi.dll") ||
+                     (!strcmp(mod, "shell32.dll") && !strncmp(procname, "SHCreate", 8)))
+                fn = win_export_stub_hresult;   /* HRESULT APIs: report failure, not success */
+            g_snames[g_nstubs] = strdup(procname);
+            emit_impl_thunk(g_nstubs, (u64)fn);
+            u64 addr = (u64)(g_tramp + g_nstubs * THUNK_SZ);
+            g_nstubs++;
+            fprintf(stderr, "[IMPL] GetProcAddress(%s, \"%s\") -> failing stub (system export not implemented)\n",
+                    mod, procname);
             return addr;
         }
     }
@@ -2514,7 +2959,13 @@ static void *heap_guard_alloc(size_t size, int zero)
          * mmap/mprotect/munmap syscalls during startup. Normal runs use the
          * host allocator while retaining Beer’s size table; fault-isolation
          * runs can opt back in with BEER_HEAP_GUARDS=1. */
-        void *user_ptr = zero ? calloc(1, want) : malloc(want);
+        void *user_ptr;
+        if (getenv("BEER_HEAP_ALIGN") && want >= 65536) {   /* experiment */
+            if (posix_memalign(&user_ptr, 65536, want)) user_ptr = NULL;
+            if (user_ptr && zero) memset(user_ptr, 0, want);
+        } else {
+            user_ptr = zero ? calloc(1, want) : malloc(want);
+        }
         if (user_ptr) heap_guard_insert(user_ptr, user_ptr, 0, want);
         return user_ptr;
     }
@@ -2546,9 +2997,17 @@ impl_HeapAlloc(u64 heap, u32 flags, u64 size)
         fprintf(stderr, "[IMPL] HeapAlloc huge size=%lu, fallback 4K\n", (unsigned long)size);
         return (u64)heap_guard_alloc(4096, 1);
     }
+    if (getenv("BEER_HOOK_LAZY") && !g_hook_lazy_go) { g_hook_lazy_go = 1; install_hook_logs(); }
     int zero_mem = (flags & 0x8) != 0; /* HEAP_ZERO_MEMORY */
+    if (getenv("BEER_HEAP_ZERO")) zero_mem = 1;   /* experiment */
     void *p = heap_guard_alloc((size_t)size, zero_mem);
     if (!p) fprintf(stderr, "[IMPL] HeapAlloc(%lu) OOM/mmap-failed\n", (unsigned long)size);
+    if (getenv("BEER_VM_LOG")) {
+        static _Atomic(u32) logs;
+        if (atomic_fetch_add(&logs, 1) < 300)
+            fprintf(stderr, "[VM] HeapAlloc(heap=%lx flags=0x%x size=%lu) -> %p\n",
+                    (unsigned long)heap, flags, (unsigned long)size, p);
+    }
     return (u64)p;
 }
 
@@ -2624,7 +3083,11 @@ impl_HeapSize(u64 heap, u32 flags, void *ptr)
 static u64 __attribute__((ms_abi))
 impl_VirtualAlloc(void *addr, u64 size, u32 type, u32 protect)
 {
-    return (u64)(uintptr_t)beer_virtual_alloc(addr, (size_t)size, type, protect);
+    void *result = beer_virtual_alloc(addr, (size_t)size, type, protect);
+    if (getenv("BEER_VM_LOG"))
+        fprintf(stderr, "[VM] VirtualAlloc(addr=%p size=0x%lx type=0x%x prot=0x%x) -> %p\n",
+                addr, (u64)size, type, protect, result);
+    return (u64)(uintptr_t)result;
 }
 
 static u64 __attribute__((ms_abi))
@@ -2663,9 +3126,11 @@ impl_GetCurrentThreadId(void)
 static u64 __attribute__((ms_abi))
 impl_GetSystemTimeAsFileTime(u64 *ft)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    u64 val = (u64)ts.tv_sec * 10000000ULL + ts.tv_nsec / 100 + EPOCH_DIFF;
+    /* GetSystemTimeAsFileTime stays on the real wall clock: scaling it deadlocked RE8 after a pause (see beer_time.c). */
+    struct timespec wall;
+    clock_gettime(CLOCK_REALTIME, &wall);
+    const u64 now_ns = (u64)wall.tv_sec * 1000000000ull + (u64)wall.tv_nsec;
+    u64 val = now_ns / 100 + EPOCH_DIFF;
     if (ft) *ft = val;
     return 0;
 }
@@ -2673,9 +3138,7 @@ impl_GetSystemTimeAsFileTime(u64 *ft)
 static u64 __attribute__((ms_abi))
 impl_QueryPerformanceCounter(u64 *out)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    if (out) *out = (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    if (out) *out = beer_time_monotonic_ns_for(BEER_CLOCK_QPC);
     return 1;
 }
 
@@ -2690,8 +3153,32 @@ static u64 __attribute__((ms_abi)) impl_SetLastError(u32 e) { g_last_error = e; 
 /* ---- Misc ---- */
 static u64 __attribute__((ms_abi)) impl_IsDebuggerPresent(void)    { return 0; }
 static u64 __attribute__((ms_abi)) impl_IsProcessorFeaturePresent(u32 f) {
-    /* PF_FLOATING_POINT_EMULATED=0 → false (we have real FP) */
-    (void)f; return 0;
+    /* Report the host CPU's real features (winnt.h PF_* numbering); engines
+     * refuse to start when SSE4.2/AVX/AVX2 look absent. Unlisted features are
+     * false, and FP emulation is never present. */
+    __builtin_cpu_init();
+    switch (f) {
+    case 2:  return 1;                                   /* CMPXCHG8B */
+    case 3:  return __builtin_cpu_supports("mmx") != 0;
+    case 6:  return __builtin_cpu_supports("sse") != 0;
+    case 8:  return 1;                                   /* RDTSC */
+    case 9:  return 1;                                   /* PAE */
+    case 10: return __builtin_cpu_supports("sse2") != 0;
+    case 12: return 1;                                   /* NX */
+    case 13: return __builtin_cpu_supports("sse3") != 0;
+    case 14: return 1;                                   /* CMPXCHG16B */
+    case 17: return __builtin_cpu_supports("xsave") != 0;
+    case 22: return 1;                                   /* RDWRFSGSBASE */
+    case 28: return __builtin_cpu_supports("rdrnd") != 0;
+    case 32: return 1;                                   /* RDTSCP */
+    case 36: return __builtin_cpu_supports("ssse3") != 0;
+    case 37: return __builtin_cpu_supports("sse4.1") != 0;
+    case 38: return __builtin_cpu_supports("sse4.2") != 0;
+    case 39: return __builtin_cpu_supports("avx") != 0;
+    case 40: return __builtin_cpu_supports("avx2") != 0;
+    case 41: return __builtin_cpu_supports("avx512f") != 0;
+    default: return 0;
+    }
 }
 /* Diagnostic helper: scan the current (guest) stack for return-address-shaped
  * values that fall inside the mapped guest image, to reconstruct an
@@ -2929,18 +3416,24 @@ static int prefer_emulated_module(const char *lower_name)
     return lower_name && !strcmp(lower_name, "steam_api64.dll");
 }
 
+static u64 virtual_fs_load_library(const char *name);
 static u64 __attribute__((ms_abi))
 impl_LoadLibraryA(const char *name)
 {
     if (!name) { g_last_error = 126; return 0; }
     char lname[64];
     lowercase_dll_basename(name, lname, sizeof(lname));
+    if (!strcmp(lname, "steamclient64.dll")) g_steam_client_loaded = 1;
     if (prefer_emulated_module(lname)) {
         u64 handle = dll_name_to_handle(lname);
         g_last_error = handle ? 0 : 126;
         return handle;
     }
     GuestDll *guest = guest_dll_find(lname);
+    if (!guest) {
+        u64 virtual_module = virtual_fs_load_library(name);
+        if (virtual_module) return virtual_module;
+    }
     if (!guest) guest = guest_dll_load(name);
     if (guest) return (u64)guest->image;
     u64 h = dll_name_to_handle(lname);
@@ -2962,12 +3455,17 @@ impl_LoadLibraryW(const u16 *name)
     narrow[i] = 0;
     char lname[64];
     lowercase_dll_basename(narrow, lname, sizeof(lname));
+    if (!strcmp(lname, "steamclient64.dll")) g_steam_client_loaded = 1;
     if (prefer_emulated_module(lname)) {
         u64 handle = dll_name_to_handle(lname);
         g_last_error = handle ? 0 : 126;
         return handle;
     }
     GuestDll *guest = guest_dll_find(lname);
+    if (!guest) {
+        u64 virtual_module = virtual_fs_load_library(narrow);
+        if (virtual_module) return virtual_module;
+    }
     if (!guest) guest = guest_dll_load(narrow);
     if (guest) return (u64)guest->image;
     u64 h = dll_name_to_handle(lname);
@@ -2991,6 +3489,8 @@ static u64 __attribute__((ms_abi)) impl_FreeLibrary(u64 h) { (void)h; return 1; 
 static u32 win_processor_count(void)
 {
     long count = sysconf(_SC_NPROCESSORS_ONLN);
+    const char *spoofed = getenv("BEER_SPOOF_CPU_THREADS");   /* what the guest is told, not what runs */
+    if (spoofed && atol(spoofed) > 0) count = atol(spoofed);
     if (count < 1) count = 1;
     if (count > 64) count = 64;
     return (u32)count;
@@ -3036,6 +3536,26 @@ static u64 fill_windows_version(WIN_OSVERSIONINFOEXW *info)
 }
 static u64 __attribute__((ms_abi)) impl_RtlGetVersion(WIN_OSVERSIONINFOEXW *info)
     { return fill_windows_version(info); }
+static u64 __attribute__((ms_abi)) impl_GetVersionExW(WIN_OSVERSIONINFOEXW *info)
+{
+    if (!info || (info->size != 276 && info->size != 284)) { g_last_error = 87; return 0; }
+    fill_windows_version(info);
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_GetVersionExA(u8 *info)
+{
+    u32 size;
+    if (!info) { g_last_error = 87; return 0; }
+    memcpy(&size, info, 4);
+    if (size != 148 && size != 156) { g_last_error = 87; return 0; }
+    memset(info, 0, size);
+    u32 fields[5] = { size, 10, 0, 19045, 2 };
+    memcpy(info, fields, sizeof(fields));
+    if (size == 156) info[154] = 1;   /* wProductType: workstation */
+    g_last_error = 0;
+    return 1;
+}
 static u64 __attribute__((ms_abi)) impl_VerSetConditionMask(u64 mask, u32 type, u8 condition)
 {
     if (!type || !condition) return mask;
@@ -3067,8 +3587,7 @@ impl_GetAdaptersAddresses(u32 family, u32 flags, void *reserved, void *addresses
 
 /* ---- WINMM timing ---- */
 static u64 __attribute__((ms_abi)) impl_timeGetTime(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (u64)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return beer_time_monotonic_ns_for(BEER_CLOCK_TICK) / 1000000u;
 }
 static u64 __attribute__((ms_abi)) impl_timeBeginPeriod(u32 p) { (void)p; return 0; }
 static u64 __attribute__((ms_abi)) impl_timeEndPeriod(u32 p)   { (void)p; return 0; }
@@ -3079,41 +3598,57 @@ static u64 __attribute__((ms_abi)) impl_timeEndPeriod(u32 p)   { (void)p; return
  * the documented "not found" result and initialize every output defensively. */
 #define BEER_ERROR_FILE_NOT_FOUND 2u
 #define BEER_ERROR_INVALID_HANDLE 6u
+#include "platform/win32_registry.inc"
 static u64 __attribute__((ms_abi))
 impl_RegOpenKeyExA(u64 key, const char *subkey, u32 options, u32 access, u64 *result)
 {
-    (void)key; (void)subkey; (void)options; (void)access;
-    if (result) *result = 0;
-    return BEER_ERROR_FILE_NOT_FOUND;
+    (void)options; (void)access;
+    return reg_open(key, subkey, result);
 }
 static u64 __attribute__((ms_abi))
 impl_RegOpenKeyExW(u64 key, const u16 *subkey, u32 options, u32 access, u64 *result)
 {
-    (void)key; (void)subkey; (void)options; (void)access;
-    if (result) *result = 0;
-    return BEER_ERROR_FILE_NOT_FOUND;
+    (void)options; (void)access;
+    char narrow[192]; reg_narrow(subkey, narrow, sizeof(narrow));
+    return reg_open(key, narrow, result);
+}
+static u64 __attribute__((ms_abi))
+impl_RegOpenKeyA(u64 key, const char *subkey, u64 *result)
+{
+    return reg_open(key, subkey, result);
+}
+static u64 __attribute__((ms_abi))
+impl_RegOpenKeyW(u64 key, const u16 *subkey, u64 *result)
+{
+    char narrow[192]; reg_narrow(subkey, narrow, sizeof(narrow));
+    return reg_open(key, narrow, result);
 }
 static u64 __attribute__((ms_abi))
 impl_RegQueryValueExA(u64 key, const char *name, u32 *reserved, u32 *type,
                       void *data, u32 *size)
 {
-    (void)key; (void)name; (void)reserved; (void)data;
+    (void)reserved;
     if (type) *type = 0;
-    if (size) *size = 0;
-    return BEER_ERROR_FILE_NOT_FOUND;
+    u32 zero = 0;
+    u64 status = reg_query(key, name, type, data, size ? size : &zero, 0);
+    if (status && size && !data) *size = 0;
+    return status;
 }
 static u64 __attribute__((ms_abi))
 impl_RegQueryValueExW(u64 key, const u16 *name, u32 *reserved, u32 *type,
                       void *data, u32 *size)
 {
-    (void)key; (void)name; (void)reserved; (void)data;
+    (void)reserved;
     if (type) *type = 0;
-    if (size) *size = 0;
-    return BEER_ERROR_FILE_NOT_FOUND;
+    char narrow[96]; reg_narrow(name, narrow, sizeof(narrow));
+    u32 zero = 0;
+    u64 status = reg_query(key, narrow, type, data, size ? size : &zero, 1);
+    if (status && size && !data) *size = 0;
+    return status;
 }
 static u64 __attribute__((ms_abi)) impl_RegCloseKey(u64 key)
 {
-    return key ? 0u : BEER_ERROR_INVALID_HANDLE;
+    return reg_close(key);
 }
 
 /* ---- WINMM wave output --------------------------------------------------
@@ -3785,6 +4320,7 @@ static u64 __attribute__((ms_abi)) impl_SteamAPI_RunCallbacks(void);
 static u64 __attribute__((ms_abi)) impl_SteamAPI_IsSteamRunning(void) { return 1; }
 
 static u64 __attribute__((ms_abi)) impl_SteamApps(void);
+static u64 steam_appticket_interface(void);
 static u64 __attribute__((ms_abi)) impl_SteamClient(void);
 static u64 __attribute__((ms_abi)) impl_SteamUtils(void);
 static u64 __attribute__((ms_abi)) impl_SteamUser(void);
@@ -3810,6 +4346,7 @@ impl_SteamInternal_CreateInterface(const char *version)
      * modern SDKs (for example STEAMAPPS_INTERFACE_VERSION008). Match the
      * semantic interface name, not the spelling used by one SDK generation. */
     if (strstr(lower, "steamclient"))        return impl_SteamClient();
+    if (strstr(lower, "appticket"))          return steam_appticket_interface();
     if (strstr(lower, "steamuserstats"))     return impl_SteamUserStats();
     if (strstr(lower, "steamuser"))          return impl_SteamUser();
     if (strstr(lower, "steamfriends"))       return impl_SteamFriends();
@@ -3826,6 +4363,28 @@ impl_SteamInternal_CreateInterface(const char *version)
         return 0;
     }
     fprintf(stderr, "[STEAM] unsupported interface %s\n", version);
+    return 0;
+}
+
+/* steamclient64.dll surface used by the Steamworks client library (SteamAPI_Init loads it via
+ * the ActiveProcess registry values and talks to Steam through these exports). */
+static u64 __attribute__((ms_abi))
+impl_SteamClient_CreateInterface(const char *version, int *result)
+{
+    u64 object = impl_SteamInternal_CreateInterface(version);
+    fprintf(stderr, "[STEAMCLIENT] CreateInterface(\"%s\") -> %s\n", version ? version : "(null)", object ? "ok" : "unavailable");
+    if (result) *result = object ? 0 : 1;
+    return object;
+}
+static u64 __attribute__((ms_abi)) impl_Steam_BGetCallback(u32 pipe, void *message) { (void)pipe; (void)message; return 0; }
+static u64 __attribute__((ms_abi)) impl_Steam_FreeLastCallback(u32 pipe) { (void)pipe; return 1; }
+static u64 __attribute__((ms_abi)) impl_Steam_GetAPICallResult(u32 pipe, u64 call, void *buffer, u32 size, u32 id, u8 *failed)
+    { (void)pipe; (void)call; (void)buffer; (void)size; (void)id; if (failed) *failed = 0; return 0; }
+static u64 __attribute__((ms_abi)) impl_Steam_ReleaseThreadLocalMemory(u32 thread_exit) { (void)thread_exit; return 0; }
+static u64 __attribute__((ms_abi)) impl_Steam_NotifyMissingInterface(u32 pipe, const char *version)
+{
+    (void)pipe;
+    fprintf(stderr, "[STEAMCLIENT] missing interface %s\n", version ? version : "(null)");
     return 0;
 }
 
@@ -3912,6 +4471,164 @@ steam_user_get_steam_id(u64 self, u64 *steam_id)
     *steam_id = beer_steam_local_user_id();
     return (u64)steam_id;
 }
+
+/* ---- Steam ownership / DLC (ISteamApps) -------------------------------
+ * The game decides which content it owns (extra perspectives, difficulties,
+ * options, costumes) from ISteamApps.  Beer has no Steam client, so ownership
+ * comes from the files that ship next to the game for exactly this purpose:
+ * steam_emu.ini [DLC] (RUNE/CODEX style), steam_settings/DLC.txt and
+ * steam_settings/configs.app.ini [app::dlcs] (Goldberg style), steam_appid.txt.
+ */
+#define BEER_STEAM_MAX_DLC 128
+static u32  g_steam_dlc_ids[BEER_STEAM_MAX_DLC];
+static char g_steam_dlc_names[BEER_STEAM_MAX_DLC][96];
+static u32  g_steam_dlc_count;
+static int  g_steam_dlc_unlock_all;
+static u32  g_steam_own_appid;
+static pthread_once_t g_steam_dlc_once = PTHREAD_ONCE_INIT;
+
+static void steam_dlc_add(u32 id, const char *name)
+{
+    if (!id) return;
+    for (u32 i = 0; i < g_steam_dlc_count; ++i)
+        if (g_steam_dlc_ids[i] == id) return;
+    if (g_steam_dlc_count >= BEER_STEAM_MAX_DLC) return;
+    g_steam_dlc_ids[g_steam_dlc_count] = id;
+    snprintf(g_steam_dlc_names[g_steam_dlc_count], sizeof(g_steam_dlc_names[0]),
+             "%s", name && *name ? name : "DLC");
+    ++g_steam_dlc_count;
+}
+
+static void steam_dlc_parse(const char *path, int kind /*0 emu.ini 1 DLC.txt 2 configs.app.ini*/)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[512], section[64] = "";
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\xef' || *p == '\xbb' || *p == '\xbf') ++p;
+        size_t len = strlen(p);
+        while (len && (p[len - 1] == '\n' || p[len - 1] == '\r' || p[len - 1] == ' ')) p[--len] = 0;
+        if (!*p || *p == '#' || *p == ';') continue;
+        if (*p == '[') {
+            char *e = strchr(p, ']');
+            if (e) { *e = 0; snprintf(section, sizeof(section), "%s", p + 1); }
+            continue;
+        }
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *key = p, *val = eq + 1;
+        size_t kl = strlen(key);
+        while (kl && (key[kl - 1] == ' ' || key[kl - 1] == '\t')) key[--kl] = 0;
+        while (*val == ' ' || *val == '\t') ++val;
+        int in_dlc = kind == 1 || (kind == 0 && !strcasecmp(section, "DLC")) ||
+                     (kind == 2 && !strcasecmp(section, "app::dlcs"));
+        if (kind == 0 && !strcasecmp(section, "Settings") && !strcasecmp(key, "AppId"))
+            g_steam_own_appid = (u32)strtoul(val, NULL, 10);
+        if (in_dlc && (!strcasecmp(key, "DLCUnlockall") || !strcasecmp(key, "unlock_all"))) {
+            if (atoi(val)) g_steam_dlc_unlock_all = 1;
+            continue;
+        }
+        if (in_dlc && key[0] >= '0' && key[0] <= '9')
+            steam_dlc_add((u32)strtoul(key, NULL, 10), val);
+    }
+    fclose(f);
+}
+
+static void steam_dlc_load_once(void)
+{
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%s", g_exe_host_path ? g_exe_host_path : "");
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = 0; else snprintf(dir, sizeof(dir), ".");
+    char path[4608];
+    snprintf(path, sizeof(path), "%s/steam_emu.ini", dir);
+    steam_dlc_parse(path, 0);
+    snprintf(path, sizeof(path), "%s/steam_settings/DLC.txt", dir);
+    steam_dlc_parse(path, 1);
+    snprintf(path, sizeof(path), "%s/steam_settings/configs.app.ini", dir);
+    steam_dlc_parse(path, 2);
+    if (!g_steam_own_appid) {
+        snprintf(path, sizeof(path), "%s/steam_appid.txt", dir);
+        FILE *f = fopen(path, "r");
+        if (f) { char b[32]; if (fgets(b, sizeof(b), f)) g_steam_own_appid = (u32)strtoul(b, NULL, 10); fclose(f); }
+    }
+    fprintf(stderr, "[STEAM] ownership: appid=%u dlc_listed=%u unlock_all=%d\n",
+            g_steam_own_appid, g_steam_dlc_count, g_steam_dlc_unlock_all);
+}
+
+static int steam_owns(u32 appid)
+{
+    pthread_once(&g_steam_dlc_once, steam_dlc_load_once);
+    if (g_steam_dlc_unlock_all) return 1;
+    if (appid && appid == g_steam_own_appid) return 1;
+    for (u32 i = 0; i < g_steam_dlc_count; ++i)
+        if (g_steam_dlc_ids[i] == appid) return 1;
+    return 0;
+}
+
+#define STEAM_APPS_LOG(...) do { if (getenv("BEER_STEAM_DIAGNOSTICS")) { \
+    fprintf(stderr, "[STEAM] ISteamApps " __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
+static u64 __attribute__((ms_abi)) steam_apps_is_subscribed(u64 self)
+{ (void)self; STEAM_APPS_LOG("BIsSubscribed -> 1"); return 1; }
+static u64 __attribute__((ms_abi)) steam_apps_is_subscribed_app(u64 self, u32 appid)
+{ (void)self; int r = steam_owns(appid); STEAM_APPS_LOG("BIsSubscribedApp(%u) -> %d", appid, r); return (u64)r; }
+static u64 __attribute__((ms_abi)) steam_apps_is_dlc_installed(u64 self, u32 appid)
+{
+    (void)self;
+    int r = steam_owns(appid) && appid != g_steam_own_appid;
+    STEAM_APPS_LOG("BIsDlcInstalled(%u) -> %d", appid, r);
+    return (u64)r;
+}
+static u64 __attribute__((ms_abi)) steam_apps_purchase_time(u64 self, u32 appid)
+{ (void)self; STEAM_APPS_LOG("GetEarliestPurchaseUnixTime(%u)", appid); return steam_owns(appid) ? 1620000000u : 0; }
+static u64 __attribute__((ms_abi)) steam_apps_dlc_count(u64 self)
+{
+    (void)self;
+    pthread_once(&g_steam_dlc_once, steam_dlc_load_once);
+    STEAM_APPS_LOG("GetDLCCount -> %u", g_steam_dlc_count);
+    return g_steam_dlc_count;
+}
+static u64 __attribute__((ms_abi))
+steam_apps_dlc_data(u64 self, s32 index, u32 *appid, u8 *available, char *name, s32 name_len)
+{
+    (void)self;
+    pthread_once(&g_steam_dlc_once, steam_dlc_load_once);
+    if (index < 0 || (u32)index >= g_steam_dlc_count) return 0;
+    if (appid) *appid = g_steam_dlc_ids[index];
+    if (available) *available = 1;
+    if (name && name_len > 0) snprintf(name, (size_t)name_len, "%s", g_steam_dlc_names[index]);
+    STEAM_APPS_LOG("BGetDLCDataByIndex(%d) -> %u", index, g_steam_dlc_ids[index]);
+    return 1;
+}
+static u64 __attribute__((ms_abi)) steam_apps_is_app_installed(u64 self, u32 appid)
+{ (void)self; int r = steam_owns(appid); STEAM_APPS_LOG("BIsAppInstalled(%u) -> %d", appid, r); return (u64)r; }
+static u64 __attribute__((ms_abi))
+steam_apps_install_dir(u64 self, u32 appid, char *folder, u32 size)
+{
+    (void)self; (void)appid;
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%s", g_exe_host_path ? g_exe_host_path : "");
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = 0;
+    if (!folder || !size) return 0;
+    snprintf(folder, size, "%s", dir);
+    STEAM_APPS_LOG("GetAppInstallDir(%u) -> %s", appid, folder);
+    return (u64)strlen(folder) + 1;
+}
+/* Slots without a real implementation log which method the game asked for. */
+#define STEAM_APPS_LOGGED_STUB(N) \
+static u64 __attribute__((ms_abi)) steam_apps_stub_##N(u64 a, u64 b, u64 c, u64 d) \
+{ (void)a; (void)b; (void)c; (void)d; STEAM_APPS_LOG("slot %d (unimplemented) -> 0", N); return 0; }
+STEAM_APPS_LOGGED_STUB(1) STEAM_APPS_LOGGED_STUB(2) STEAM_APPS_LOGGED_STUB(3)
+STEAM_APPS_LOGGED_STUB(9) STEAM_APPS_LOGGED_STUB(12) STEAM_APPS_LOGGED_STUB(13)
+STEAM_APPS_LOGGED_STUB(14) STEAM_APPS_LOGGED_STUB(15) STEAM_APPS_LOGGED_STUB(16)
+STEAM_APPS_LOGGED_STUB(17) STEAM_APPS_LOGGED_STUB(20) STEAM_APPS_LOGGED_STUB(21)
+STEAM_APPS_LOGGED_STUB(22) STEAM_APPS_LOGGED_STUB(23) STEAM_APPS_LOGGED_STUB(24)
+STEAM_APPS_LOGGED_STUB(25) STEAM_APPS_LOGGED_STUB(26) STEAM_APPS_LOGGED_STUB(27)
+STEAM_APPS_LOGGED_STUB(28) STEAM_APPS_LOGGED_STUB(29)
 
 static u64  g_steam_vtab[STEAM_VTAB_SZ];
 static u64  g_steam_apps_vtab[STEAM_VTAB_SZ];
@@ -4380,7 +5097,14 @@ steam_utils_get_api_call_result(u64 self, u64 call_handle, void *callback,
                 (u32)callback_size == call->result_size;
     if (valid) {
         memcpy(callback, call->result, call->result_size);
-        call->used = 0;
+        /* A RemoteStorageFileReadAsyncComplete_t only reports that the range
+         * is ready. Steam keeps the underlying request valid until
+         * FileReadAsyncComplete performs the actual transfer. Clearing it here
+         * made that mandatory second call fail, so RE8 could miss persisted
+         * settings (including action/keybind data) while sync save reads and
+         * UI mouse hit-testing continued to work. */
+        if (beer_steam_call_result_finishes_request(call->callback_id))
+            call->used = 0;
     }
     pthread_mutex_unlock(&g_steam_call_mutex);
     if (!valid && failed) *failed = 1;
@@ -4390,6 +5114,67 @@ steam_utils_get_api_call_result(u64 self, u64 call_handle, void *callback,
                 (unsigned long long)call_handle, expected_id, callback_size,
                 valid, failed ? *failed : 0u);
     return valid;
+}
+
+/* ISteamUtils007 (first slots) and per-slot call logging for ISteamUtils/ISteamUser. */
+#define BEER_SLOT_LOGGER(prefix, iface, n) \
+    static u64 __attribute__((ms_abi)) prefix##_slot_##n(u64 a, u64 b, u64 c) \
+    { (void)a; (void)b; (void)c; static int seen; if (!seen) { seen = 1; fprintf(stderr, "[STEAM] " iface " slot %d -> 0 (logged once)\n", n); } return 0; }
+BEER_SLOT_LOGGER(su, "ISteamUtils", 0) BEER_SLOT_LOGGER(su, "ISteamUtils", 1) BEER_SLOT_LOGGER(su, "ISteamUtils", 5)
+BEER_SLOT_LOGGER(su, "ISteamUtils", 6) BEER_SLOT_LOGGER(su, "ISteamUtils", 7) BEER_SLOT_LOGGER(su, "ISteamUtils", 8)
+BEER_SLOT_LOGGER(su, "ISteamUtils", 10) BEER_SLOT_LOGGER(su, "ISteamUtils", 12) BEER_SLOT_LOGGER(su, "ISteamUtils", 13)
+BEER_SLOT_LOGGER(su, "ISteamUtils", 15) BEER_SLOT_LOGGER(su, "ISteamUtils", 16) BEER_SLOT_LOGGER(su, "ISteamUtils", 17)
+BEER_SLOT_LOGGER(su, "ISteamUtils", 18) BEER_SLOT_LOGGER(su, "ISteamUtils", 19) BEER_SLOT_LOGGER(su, "ISteamUtils", 20)
+static u64 __attribute__((ms_abi)) su_connected_universe(u64 self)
+{ (void)self; fprintf(stderr, "[STEAM] ISteamUtils::GetConnectedUniverse -> 1 (Public)\n"); return 1; }
+static u64 __attribute__((ms_abi)) su_server_real_time(u64 self)
+{ (void)self; u32 t = (u32)time(NULL); fprintf(stderr, "[STEAM] ISteamUtils::GetServerRealTime -> %u\n", t); return t; }
+static u64 __attribute__((ms_abi)) su_ip_country(u64 self)
+{ (void)self; fprintf(stderr, "[STEAM] ISteamUtils::GetIPCountry -> US\n"); return (u64)"US"; }
+static u64 __attribute__((ms_abi)) su_app_id(u64 self)
+{
+    (void)self;
+    steam_owns(0);
+    fprintf(stderr, "[STEAM] ISteamUtils::GetAppID -> %u\n", g_steam_own_appid);
+    return g_steam_own_appid;
+}
+
+/* ISteamAppTicket (STEAMAPPTICKET_INTERFACE_VERSION001): one method, the ownership ticket for the
+ * running app. Beer builds an unsigned local ticket; the signature region is zero-filled. */
+static u64 __attribute__((ms_abi))
+steam_appticket_get(u64 self, u32 appid, u8 *buffer, u32 capacity, u32 *out_appid_offset,
+                    u32 *out_steamid_offset, u32 *out_signature_offset, u32 *out_signature_size)
+{
+    (void)self;
+    enum { TICKET = 256, SIGNATURE_AT = 128, SIGNATURE_LEN = 128 };
+    steam_owns(0);
+    if (!appid) appid = g_steam_own_appid;
+    if (buffer && capacity >= TICKET) {
+        memset(buffer, 0, TICKET);
+        u32 version = 4, size = TICKET;
+        u64 id = beer_steam_local_user_id();
+        memcpy(buffer + 0, &size, 4);
+        memcpy(buffer + 4, &version, 4);
+        memcpy(buffer + 8, &id, 8);
+        memcpy(buffer + 16, &appid, 4);
+    }
+    if (out_steamid_offset) *out_steamid_offset = 8;
+    if (out_appid_offset) *out_appid_offset = 16;
+    if (out_signature_offset) *out_signature_offset = SIGNATURE_AT;
+    if (out_signature_size) *out_signature_size = SIGNATURE_LEN;
+    fprintf(stderr, "[STEAM] ISteamAppTicket::GetAppOwnershipTicketData(app=%u, capacity=%u) -> %d\n",
+            appid, capacity, buffer && capacity >= TICKET ? TICKET : 0);
+    return buffer && capacity >= TICKET ? TICKET : 0;
+}
+static u64 g_steam_appticket_vtab[8];
+static u64 g_steam_appticket_obj;
+static u64 steam_appticket_interface(void)
+{
+    if (!g_steam_appticket_obj) {
+        g_steam_appticket_vtab[0] = (u64)steam_appticket_get;
+        g_steam_appticket_obj = (u64)g_steam_appticket_vtab;
+    }
+    return (u64)&g_steam_appticket_obj;
 }
 
 static void init_steam_fake(void) {
@@ -4428,12 +5213,52 @@ static void init_steam_fake(void) {
     g_steam_remote_storage_vtab[2] = (u64)steam_storage_file_write_async;
     g_steam_remote_storage_vtab[3] = (u64)steam_storage_file_read_async;
     g_steam_remote_storage_vtab[4] = (u64)steam_storage_file_read_async_complete;
+    g_steam_utils_vtab[0] = (u64)su_slot_0;   g_steam_utils_vtab[1] = (u64)su_slot_1;
+    g_steam_utils_vtab[2] = (u64)su_connected_universe;
+    g_steam_utils_vtab[3] = (u64)su_server_real_time;
+    g_steam_utils_vtab[4] = (u64)su_ip_country;
+    g_steam_utils_vtab[5] = (u64)su_slot_5;   g_steam_utils_vtab[6] = (u64)su_slot_6;
+    g_steam_utils_vtab[7] = (u64)su_slot_7;   g_steam_utils_vtab[8] = (u64)su_slot_8;
+    g_steam_utils_vtab[9] = (u64)su_app_id;
+    g_steam_utils_vtab[10] = (u64)su_slot_10; g_steam_utils_vtab[12] = (u64)su_slot_12;
+    g_steam_utils_vtab[13] = (u64)su_slot_13; g_steam_utils_vtab[15] = (u64)su_slot_15;
+    g_steam_utils_vtab[16] = (u64)su_slot_16; g_steam_utils_vtab[17] = (u64)su_slot_17;
+    g_steam_utils_vtab[18] = (u64)su_slot_18; g_steam_utils_vtab[19] = (u64)su_slot_19;
+    g_steam_utils_vtab[20] = (u64)su_slot_20;
     /* ISteamUtils009: IsAPICallCompleted and GetAPICallResult. */
     g_steam_utils_vtab[11] = (u64)steam_utils_is_api_call_completed;
     g_steam_utils_vtab[14] = (u64)steam_utils_get_api_call_result;
     /* ISteamApps vtable[4]=GetCurrentGameLanguage, [5]=GetAvailableGameLanguages. */
+    g_steam_apps_vtab[0] = (u64)steam_apps_is_subscribed;
+    g_steam_apps_vtab[1] = (u64)steam_apps_stub_1;
+    g_steam_apps_vtab[2] = (u64)steam_apps_stub_2;
+    g_steam_apps_vtab[3] = (u64)steam_apps_stub_3;
     g_steam_apps_vtab[4] = (u64)steam_vfn_english;
     g_steam_apps_vtab[5] = (u64)steam_vfn_english;
+    g_steam_apps_vtab[6] = (u64)steam_apps_is_subscribed_app;
+    g_steam_apps_vtab[7] = (u64)steam_apps_is_dlc_installed;
+    g_steam_apps_vtab[8] = (u64)steam_apps_purchase_time;
+    g_steam_apps_vtab[9] = (u64)steam_apps_stub_9;
+    g_steam_apps_vtab[10] = (u64)steam_apps_dlc_count;
+    g_steam_apps_vtab[11] = (u64)steam_apps_dlc_data;
+    g_steam_apps_vtab[12] = (u64)steam_apps_stub_12;
+    g_steam_apps_vtab[13] = (u64)steam_apps_stub_13;
+    g_steam_apps_vtab[14] = (u64)steam_apps_stub_14;
+    g_steam_apps_vtab[15] = (u64)steam_apps_stub_15;
+    g_steam_apps_vtab[16] = (u64)steam_apps_stub_16;
+    g_steam_apps_vtab[17] = (u64)steam_apps_stub_17;
+    g_steam_apps_vtab[18] = (u64)steam_apps_install_dir;
+    g_steam_apps_vtab[19] = (u64)steam_apps_is_app_installed;
+    g_steam_apps_vtab[20] = (u64)steam_apps_stub_20;
+    g_steam_apps_vtab[21] = (u64)steam_apps_stub_21;
+    g_steam_apps_vtab[22] = (u64)steam_apps_stub_22;
+    g_steam_apps_vtab[23] = (u64)steam_apps_stub_23;
+    g_steam_apps_vtab[24] = (u64)steam_apps_stub_24;
+    g_steam_apps_vtab[25] = (u64)steam_apps_stub_25;
+    g_steam_apps_vtab[26] = (u64)steam_apps_stub_26;
+    g_steam_apps_vtab[27] = (u64)steam_apps_stub_27;
+    g_steam_apps_vtab[28] = (u64)steam_apps_stub_28;
+    g_steam_apps_vtab[29] = (u64)steam_apps_stub_29;
     /* ISteamFriends vtable[0]=GetPersonaName. */
     g_steam_friends_vtab[0] = (u64)steam_friends_get_persona_name;
     /* Beer has no connected Steam client session. Keep BLoggedOn false while
@@ -4455,7 +5280,55 @@ static void init_steam_fake(void) {
 }
 
 static u64 __attribute__((ms_abi)) impl_SteamApps(void)     { return (u64)&g_steam_apps_obj; }
-static u64 __attribute__((ms_abi)) impl_SteamClient(void)   { return (u64)g_steam_obj; }
+/* ISteamClient (SteamClient014..017 share the first 19 slots): pipes/users are fixed handles, the
+ * getters hand out Beer's emulated interface objects. Every call is logged. */
+static u64 __attribute__((ms_abi)) sc_log(const char *what) { fprintf(stderr, "[STEAMCLIENT] ISteamClient::%s\n", what); return 0; }
+static u64 __attribute__((ms_abi)) sc_create_pipe(void *self) { (void)self; sc_log("CreateSteamPipe"); return 1; }
+static u64 __attribute__((ms_abi)) sc_release_pipe(void *self, u32 pipe) { (void)self; (void)pipe; sc_log("BReleaseSteamPipe"); return 1; }
+static u64 __attribute__((ms_abi)) sc_connect_user(void *self, u32 pipe) { (void)self; (void)pipe; sc_log("ConnectToGlobalUser"); return 1; }
+static u64 __attribute__((ms_abi)) sc_create_local_user(void *self, u32 *pipe, u32 type) { (void)self; (void)type; if (pipe) *pipe = 1; sc_log("CreateLocalUser"); return 1; }
+static u64 __attribute__((ms_abi)) sc_noop(void *self) { (void)self; return 0; }
+static u64 __attribute__((ms_abi)) sc_true(void *self) { (void)self; return 1; }
+static u64 __attribute__((ms_abi)) sc_release_user(void *self, u32 pipe, u32 user) { (void)self; (void)pipe; (void)user; sc_log("ReleaseUser"); return 0; }
+static u64 __attribute__((ms_abi)) sc_get_user(void *self, u32 user, u32 pipe, const char *v) { (void)self; (void)user; (void)pipe; fprintf(stderr, "[STEAMCLIENT] GetISteamUser(%s)\n", v ? v : ""); return impl_SteamUser(); }
+static u64 __attribute__((ms_abi)) sc_get_friends(void *self, u32 user, u32 pipe, const char *v) { (void)self; (void)user; (void)pipe; fprintf(stderr, "[STEAMCLIENT] GetISteamFriends(%s)\n", v ? v : ""); return impl_SteamFriends(); }
+static u64 __attribute__((ms_abi)) sc_get_utils(void *self, u32 pipe, const char *v) { (void)self; (void)pipe; fprintf(stderr, "[STEAMCLIENT] GetISteamUtils(%s)\n", v ? v : ""); return impl_SteamUtils(); }
+static u64 __attribute__((ms_abi)) sc_get_generic(void *self, u32 user, u32 pipe, const char *v) { (void)self; (void)user; (void)pipe; fprintf(stderr, "[STEAMCLIENT] GetISteamGenericInterface(%s)\n", v ? v : ""); return impl_SteamInternal_CreateInterface(v); }
+static u64 __attribute__((ms_abi)) sc_get_apps(void *self, u32 user, u32 pipe, const char *v) { (void)self; (void)user; (void)pipe; fprintf(stderr, "[STEAMCLIENT] GetISteamApps(%s)\n", v ? v : ""); return impl_SteamApps(); }
+static u64 __attribute__((ms_abi)) sc_get_stats(void *self, u32 user, u32 pipe, const char *v) { (void)self; (void)user; (void)pipe; fprintf(stderr, "[STEAMCLIENT] GetISteamUserStats(%s)\n", v ? v : ""); return impl_SteamUserStats(); }
+static u64 __attribute__((ms_abi)) sc_get_remote_storage(void *self, u32 user, u32 pipe, const char *v) { (void)self; (void)user; (void)pipe; fprintf(stderr, "[STEAMCLIENT] GetISteamRemoteStorage(%s)\n", v ? v : ""); return impl_SteamRemoteStorage(); }
+static u64 __attribute__((ms_abi)) sc_get_unavailable(void *self, u32 user, u32 pipe, const char *v) { (void)self; (void)user; (void)pipe; fprintf(stderr, "[STEAMCLIENT] interface request unavailable: %s\n", v ? v : ""); return 0; }
+static u64 g_steam_client_vtab[64];
+static u64 *g_steam_client_obj_ptr;
+static u64 __attribute__((ms_abi)) impl_SteamClient(void)
+{
+    if (!g_steam_client_obj_ptr) {
+        for (int i = 0; i < 64; ++i) g_steam_client_vtab[i] = (u64)sc_noop;
+        g_steam_client_vtab[0] = (u64)sc_create_pipe;
+        g_steam_client_vtab[1] = (u64)sc_release_pipe;
+        g_steam_client_vtab[2] = (u64)sc_connect_user;
+        g_steam_client_vtab[3] = (u64)sc_create_local_user;
+        g_steam_client_vtab[4] = (u64)sc_release_user;
+        g_steam_client_vtab[5] = (u64)sc_get_user;
+        g_steam_client_vtab[6] = (u64)sc_get_unavailable;     /* game server */
+        g_steam_client_vtab[8] = (u64)sc_get_friends;
+        g_steam_client_vtab[9] = (u64)sc_get_utils;
+        g_steam_client_vtab[10] = (u64)sc_get_unavailable;    /* matchmaking */
+        g_steam_client_vtab[11] = (u64)sc_get_unavailable;    /* matchmaking servers */
+        g_steam_client_vtab[12] = (u64)sc_get_generic;
+        g_steam_client_vtab[13] = (u64)sc_get_stats;
+        g_steam_client_vtab[14] = (u64)sc_get_unavailable;    /* game server stats */
+        g_steam_client_vtab[15] = (u64)sc_get_apps;
+        g_steam_client_vtab[16] = (u64)sc_get_unavailable;    /* networking */
+        g_steam_client_vtab[17] = (u64)sc_get_remote_storage;
+        g_steam_client_vtab[18] = (u64)sc_get_unavailable;    /* screenshots */
+        g_steam_client_vtab[22] = (u64)sc_true;               /* BShutdownIfAllPipesClosed */
+        static u64 object[2];
+        object[0] = (u64)g_steam_client_vtab;
+        g_steam_client_obj_ptr = object;
+    }
+    return (u64)g_steam_client_obj_ptr;
+}
 static u64 __attribute__((ms_abi)) impl_SteamUtils(void)    { return (u64)&g_steam_utils_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamUser(void)     { return (u64)&g_steam_user_obj; }
 static u64 __attribute__((ms_abi)) impl_SteamFriends(void)  { return (u64)&g_steam_friends_obj; }
@@ -4525,6 +5398,14 @@ static const u8 k_iid_idxgi_adapter1[16] = {
     0x05,0xaa,0x00,0x29,0x59,0xc9,0x90,0x4a,
     0xb8,0x99,0x7f,0x0d,0x56,0x6f,0xb6,0x7a
 };
+static const u8 k_iid_idxgi_adapter2[16] = {  /* 0AA1AE0A-FA0E-4B84-8644-E05FF8E5ACB5 */
+    0x0a,0xae,0xa1,0x0a,0x0e,0xfa,0x84,0x4b,
+    0x86,0x44,0xe0,0x5f,0xf8,0xe5,0xac,0xb5
+};
+static const u8 k_iid_idxgi_adapter3[16] = {  /* 645967A4-1392-4310-A798-8053CE3E93FD */
+    0xa4,0x67,0x59,0x64,0x92,0x13,0x10,0x43,
+    0xa7,0x98,0x80,0x53,0xce,0x3e,0x93,0xfd
+};
 static const u8 k_iid_idxgi_output[16] = {
     0xae,0x02,0xae,0xae,0x4f,0xed,0x35,0x4a,
     0x8d,0x42,0x5d,0xc8,0x39,0xa5,0xf6,0x4c
@@ -4538,7 +5419,10 @@ dxgi_factory_QueryInterface(u64 *obj, const u8 *riid, void **pp)
     if (!dxgi_iid_equal(riid, k_iid_iunknown) &&
         !dxgi_iid_equal(riid, k_iid_idxgi_factory) &&
         !dxgi_iid_equal(riid, k_iid_idxgi_factory1))
-        return E_NOINTERFACE;
+        {
+            if (getenv("BEER_COM_DIAGNOSTICS") && riid) fprintf(stderr, "[DXGI QI] %s refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n", "dxgi_factory_QueryInterface", riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6], riid[8], riid[9], riid[10], riid[11], riid[12], riid[13], riid[14], riid[15]); 
+            return E_NOINTERFACE;
+        }
     *pp = obj;
     dxgi_AddRef(obj);
     return S_OK;
@@ -4551,8 +5435,13 @@ dxgi_adapter_QueryInterface(u64 *obj, const u8 *riid, void **pp)
     *pp = NULL;
     if (!dxgi_iid_equal(riid, k_iid_iunknown) &&
         !dxgi_iid_equal(riid, k_iid_idxgi_adapter) &&
-        !dxgi_iid_equal(riid, k_iid_idxgi_adapter1))
-        return E_NOINTERFACE;
+        !dxgi_iid_equal(riid, k_iid_idxgi_adapter1) &&
+        !dxgi_iid_equal(riid, k_iid_idxgi_adapter2) &&
+        !dxgi_iid_equal(riid, k_iid_idxgi_adapter3))
+        {
+            if (getenv("BEER_COM_DIAGNOSTICS") && riid) fprintf(stderr, "[DXGI QI] %s refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n", "dxgi_adapter_QueryInterface", riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6], riid[8], riid[9], riid[10], riid[11], riid[12], riid[13], riid[14], riid[15]); 
+            return E_NOINTERFACE;
+        }
     *pp = obj;
     dxgi_AddRef(obj);
     return S_OK;
@@ -4565,7 +5454,10 @@ dxgi_output_QueryInterface(u64 *obj, const u8 *riid, void **pp)
     *pp = NULL;
     if (!dxgi_iid_equal(riid, k_iid_iunknown) &&
         !dxgi_iid_equal(riid, k_iid_idxgi_output))
-        return E_NOINTERFACE;
+        {
+            if (getenv("BEER_COM_DIAGNOSTICS") && riid) fprintf(stderr, "[DXGI QI] %s refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n", "dxgi_output_QueryInterface", riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6], riid[8], riid[9], riid[10], riid[11], riid[12], riid[13], riid[14], riid[15]); 
+            return E_NOINTERFACE;
+        }
     *pp = obj;
     dxgi_AddRef(obj);
     return S_OK;
@@ -4794,6 +5686,36 @@ impl_inet_pton(s32 family, const char *source, void *destination)
     if (result < 0) g_wsa_last_error = winsock_error_from_errno(errno);
     else g_wsa_last_error = 0;
     return (u32)result;
+}
+
+static u64 __attribute__((ms_abi))
+impl_inet_ntop(s32 family, const void *source, char *destination, u64 size)
+{
+    if (!winsock_ready()) return 0;
+    if (!source || !destination) { g_wsa_last_error = 10014; return 0; }
+    /* Winsock AF_INET6 is 23; Linux AF_INET6 is 10. */
+    const int host_family = family == 23 ? AF_INET6 : family == 2 ? AF_INET : -1;
+    if (host_family < 0) { g_wsa_last_error = 10047; return 0; }
+    if (!inet_ntop(host_family, source, destination, (socklen_t)size)) {
+        g_wsa_last_error = errno == ENOSPC ? 10014 : winsock_error_from_errno(errno);
+        return 0;
+    }
+    g_wsa_last_error = 0;
+    return (u64)(uintptr_t)destination;
+}
+
+static u64 __attribute__((ms_abi))
+impl_gethostname(char *name, s32 length)
+{
+    if (!winsock_ready()) return (u32)-1;
+    if (!name || length <= 0) { g_wsa_last_error = 10014; return (u32)-1; }
+    char host[256];
+    if (gethostname(host, sizeof(host)) != 0) snprintf(host, sizeof(host), "BEER-PC");
+    host[sizeof(host) - 1] = 0;
+    if ((size_t)length <= strlen(host)) { g_wsa_last_error = 10040; return (u32)-1; }   /* WSAEMSGSIZE */
+    memcpy(name, host, strlen(host) + 1);
+    g_wsa_last_error = 0;
+    return 0;
 }
 
 /* ---- Native NT memory/section APIs ---- */
@@ -5245,6 +6167,16 @@ impl_CoCreateInstance(const u8 *rclsid, u64 outer, u32 ctx,
 static ID3D11Device *g_d3d11_device   = NULL;
 static ID3D11DeviceContext *g_d3d11_context  = NULL;
 static IDXGISwapChain *g_dxgi_swapchain = NULL;
+/* BD11: D3D11 on the BD12 core (graphics/d3d11v). BEER_D3D11_LEGACY=1 selects the old path. */
+extern int32_t b11_device_create_for_loader(void **device, void **context);
+extern int32_t b11_swapchain_create_for_loader(void *device, const void *desc, void **out);
+extern int b11_is_device(const void *object);
+static int beer_use_bd11(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = getenv("BEER_D3D11_BD11") != NULL;   /* BD11 is opt-in until it renders correctly */
+    return cached;
+}
 
 static u64 __attribute__((ms_abi))
 d3d11_fail(u64 a, u64 b, u64 c, u64 d)
@@ -5307,6 +6239,16 @@ impl_D3D11CreateDevice(u64 adapter, u32 driver_type, u64 software,
     (void)feature_levels;(void)n_levels;(void)sdk_ver;
     if (ppDevice) *ppDevice = NULL;
     if (ppContext) *ppContext = NULL;
+    if (beer_use_bd11()) {
+        void *device = NULL, *context = NULL;
+        if (b11_device_create_for_loader(&device, &context) != 0) return (u64)0x80004005;
+        g_api_createdevice = 1;
+        fprintf(stderr, "[D3D11] CreateDevice -> BD11 device=%p context=%p\n", device, context);
+        if (ppDevice) *ppDevice = (u64 *)device; else d3d11_retain_com_output(NULL);
+        if (pFeatureLevel) *pFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+        if (ppContext) *ppContext = (u64 *)context;
+        return S_OK;
+    }
     if (!g_d3d11_device || !g_d3d11_context) return (u64)0x8007000e;
     g_api_createdevice = 1;
     if (getenv("BEER_D3D11_DIAGNOSTICS"))
@@ -5337,6 +6279,17 @@ impl_D3D11CreateDeviceAndSwapChain(u64 adapter, u32 dtype, u64 sw, u32 flags,
     if (ppDevice) *ppDevice = NULL;
     if (ppCtx) *ppCtx = NULL;
     if (ppSwap) *ppSwap = NULL;
+    if (beer_use_bd11() && swdesc && ppSwap) {
+        void *device = NULL, *context = NULL, *swap = NULL;
+        if (b11_device_create_for_loader(&device, &context) != 0) return (u64)0x80004005;
+        int32_t hr = b11_swapchain_create_for_loader(device, swdesc, &swap);
+        if (hr != 0) return (u64)(uint32_t)hr;
+        if (ppDevice) *ppDevice = (u64 *)device;
+        if (pFL) *pFL = D3D_FEATURE_LEVEL_11_0;
+        if (ppCtx) *ppCtx = (u64 *)context;
+        *ppSwap = (u64 *)swap;
+        return S_OK;
+    }
     if (!swdesc || !ppSwap || !g_dxgi_swapchain ||
         !g_d3d11_device || !g_d3d11_context)
         return (u64)0x80070057;
@@ -5370,6 +6323,13 @@ dxgi_CreateSwapChain(u64 *obj, u64 *device, u64 *desc, u64 **ppSwap)
     }
     if (!ppSwap) return (u64)0x80070057; /* E_INVALIDARG */
     *ppSwap = NULL;
+    if (device && desc && b11_is_device(device)) {
+        void *swap = NULL;
+        int32_t hr = b11_swapchain_create_for_loader(device, desc, &swap);
+        if (hr != 0) return (u64)(uint32_t)hr;
+        *ppSwap = (u64 *)swap;
+        return S_OK;
+    }
     if (!device || !desc || !g_dxgi_swapchain) return E_FAIL;
     HRESULT hr = dxgi_swapchain_configure(g_dxgi_swapchain,
         (ID3D11Device *)device, (const BeerDxgiSwapChainDesc *)desc);
@@ -5405,6 +6365,17 @@ dxgi_ResizeBuffers(u64 *obj, u32 n, u32 w, u32 h, u32 fmt, u32 flags)
 static u64  g_dxgi_vtab2[DXGI_VTAB2_SZ];
 static u64  g_dxgi_output_vtab[32];
 static u64 *g_dxgi_adapter = NULL;
+/* Used by BD11's IDXGIDevice / IDXGISwapChain::GetParent. Returned with a reference. */
+void *beer_dxgi_adapter(void)
+{
+    if (g_dxgi_adapter) { d3d11_retain_com_output(g_dxgi_adapter); }
+    return g_dxgi_adapter;
+}
+void *beer_dxgi_factory(void)
+{
+    if (g_dxgi_factory) { d3d11_retain_com_output(g_dxgi_factory); }
+    return g_dxgi_factory;
+}
 static u64 *g_dxgi_output = NULL;
 
 static u64 __attribute__((ms_abi))
@@ -5486,6 +6457,80 @@ dxgi_adapter_GetDesc1(u64 *obj, u8 *desc)
                 (unsigned long long)(*(u64 *)(desc + 272) >> 20)); }
     return S_OK;
 }
+
+/* IDXGIAdapter2::GetDesc2 adds preemption granularities to the Desc1 layout. */
+static u64 __attribute__((ms_abi))
+dxgi_adapter_GetDesc2(u64 *obj, u8 *desc)
+{
+    (void)obj;
+    if (!desc) return E_FAIL;
+    memset(desc, 0, 320);
+    dxgi_fill_adapter_desc(desc, 1);
+    *(u32 *)(desc + 308) = 3;  /* DXGI_GRAPHICS_PREEMPTION_PIXEL_BOUNDARY */
+    *(u32 *)(desc + 312) = 4;  /* DXGI_COMPUTE_PREEMPTION_INSTRUCTION_BOUNDARY */
+    return S_OK;
+}
+
+/* IDXGIAdapter3: video memory budget. Streaming systems size their texture
+ * pools from QueryVideoMemoryInfo every frame; refusing the interface left the
+ * game without a budget. Local = device memory (live DEFAULT heaps), non-local
+ * = system memory (UPLOAD/READBACK heaps). */
+extern uint64_t g_bd12_heap_bytes[4];
+static u64 g_dxgi_reservation[2];
+
+static u64 __attribute__((ms_abi))
+dxgi_adapter_QueryVideoMemoryInfo(u64 *obj, u32 node, u32 group, u64 *info)
+{
+    (void)obj;
+    if (!info || node != 0 || group > 1) return (u64)0x80070057;
+    u8 desc[312];
+    dxgi_fill_adapter_desc(desc, 1);
+    u64 budget, usage;
+    if (group == 0) {
+        budget = *(u64 *)(desc + 272) / 10 * 9;
+        usage = __atomic_load_n(&g_bd12_heap_bytes[1], __ATOMIC_RELAXED);
+    } else {
+        budget = *(u64 *)(desc + 288);
+        usage = __atomic_load_n(&g_bd12_heap_bytes[2], __ATOMIC_RELAXED) +
+                __atomic_load_n(&g_bd12_heap_bytes[3], __ATOMIC_RELAXED);
+    }
+    info[0] = budget;                         /* Budget */
+    info[1] = usage;                          /* CurrentUsage */
+    info[2] = budget / 2;                     /* AvailableForReservation */
+    info[3] = g_dxgi_reservation[group];      /* CurrentReservation */
+    return S_OK;
+}
+
+static u64 __attribute__((ms_abi))
+dxgi_adapter_SetVideoMemoryReservation(u64 *obj, u32 node, u32 group, u64 bytes)
+{
+    (void)obj;
+    if (node != 0 || group > 1) return (u64)0x80070057;
+    g_dxgi_reservation[group] = bytes;
+    return S_OK;
+}
+
+static u64 __attribute__((ms_abi))
+dxgi_adapter_RegisterVideoMemoryBudgetChangeNotificationEvent(u64 *obj, u64 event,
+                                                              u32 *cookie)
+{
+    (void)obj; (void)event;   /* the budget never changes asynchronously here */
+    if (cookie) *cookie = 1;
+    return S_OK;
+}
+
+static u64 __attribute__((ms_abi))
+dxgi_adapter_RegisterHardwareContentProtectionTeardownStatusEvent(u64 *obj,
+                                                                  u64 event,
+                                                                  u32 *cookie)
+{
+    (void)obj; (void)event;
+    if (cookie) *cookie = 0;
+    return (u64)0x887a0004; /* DXGI_ERROR_UNSUPPORTED */
+}
+
+static void __attribute__((ms_abi)) dxgi_adapter_unregister(u64 *obj, u32 cookie)
+{ (void)obj; (void)cookie; }
 
 static u64 __attribute__((ms_abi))
 dxgi_output_GetDesc(u64 *obj, u8 *desc)
@@ -5626,6 +6671,13 @@ static void init_dxgi_adapter_fake(void) {
     g_dxgi_vtab2[7] = (u64)dxgi_adapter_EnumOutputs;
     g_dxgi_vtab2[8] = (u64)dxgi_adapter_GetDesc;
     g_dxgi_vtab2[10] = (u64)dxgi_adapter_GetDesc1;
+    g_dxgi_vtab2[11] = (u64)dxgi_adapter_GetDesc2;
+    g_dxgi_vtab2[12] = (u64)dxgi_adapter_RegisterHardwareContentProtectionTeardownStatusEvent;
+    g_dxgi_vtab2[13] = (u64)dxgi_adapter_unregister;
+    g_dxgi_vtab2[14] = (u64)dxgi_adapter_QueryVideoMemoryInfo;
+    g_dxgi_vtab2[15] = (u64)dxgi_adapter_SetVideoMemoryReservation;
+    g_dxgi_vtab2[16] = (u64)dxgi_adapter_RegisterVideoMemoryBudgetChangeNotificationEvent;
+    g_dxgi_vtab2[17] = (u64)dxgi_adapter_unregister;
 
     g_dxgi_output_vtab[0] = (u64)dxgi_output_QueryInterface;
     g_dxgi_output_vtab[1] = (u64)dxgi_AddRef;
@@ -5896,9 +6948,8 @@ static u64 __attribute__((ms_abi)) impl_IsValidCodePage(u32 cp)
 /* ---- Module file names ---- */
 static u64 __attribute__((ms_abi))
 impl_GetModuleFileNameW(u64 hmod, u16 *buf, u32 size) {
-    (void)hmod;
     if (!buf || !size) return 0;
-    const char *p = g_exe_path ? g_exe_path : "";
+    const char *p = module_file_name(hmod);
     u32 i;
     for (i = 0; i < size - 1 && p[i]; i++) buf[i] = (u8)p[i];
     buf[i] = 0;
@@ -6147,8 +7198,9 @@ beer_wait_single_raw(u64 h, u32 ms)
                     (unsigned long long)g_dispatch_incoming_return);
     }
     /* WAIT_OBJECT_0=0, WAIT_TIMEOUT=0x102, WAIT_FAILED=0xFFFFFFFF */
+    g_dbg_wait_kind = 2; g_dbg_wait_handle = h; g_dbg_wait_ms = ms;
     u64 trc = thread_wait_handle(h, ms);
-    if (trc != (u64)-2) return trc;
+    if (trc != (u64)-2) { g_dbg_wait_kind = 0; return trc; }
 
     int eid = event_id_from_handle(h);
     if (eid >= 0) {
@@ -6243,9 +7295,10 @@ impl_WaitForSingleObject(u64 h, u32 ms)
 {
     static int diag = -1;
     if (diag < 0) diag = getenv("BEER_WAIT_DIAGNOSTICS") != NULL;
-    if (!diag) return beer_wait_single_raw(h, ms);
+    if (!diag) { const u64 r0 = beer_wait_single_raw(h, ms); g_dbg_wait_kind = 0; return r0; }
     u64 t0 = beer_wait_now_ms();
     u64 r = beer_wait_single_raw(h, ms);
+    g_dbg_wait_kind = 0;
     u64 dt = beer_wait_now_ms() - t0;
     static _Atomic(u32) logs;
     if (dt >= 100 && atomic_fetch_add(&logs, 1) < 100000)
@@ -6475,7 +7528,14 @@ static u64 __attribute__((ms_abi)) impl_OpenMutexA(u32 a, u32 b, const char *n)
     { (void)a;(void)b;(void)n; return 0; }
 
 /* ---- Sleep / Timing ---- */
+static u64 __attribute__((ms_abi)) impl_Sleep_inner(u32 ms);
 static u64 __attribute__((ms_abi)) impl_Sleep(u32 ms) {
+    g_dbg_wait_kind = 1; g_dbg_wait_ms = ms;
+    const u64 r = impl_Sleep_inner(ms);
+    g_dbg_wait_kind = 0;
+    return r;
+}
+static u64 __attribute__((ms_abi)) impl_Sleep_inner(u32 ms) {
     if (getenv("BEER_MAIN_THREAD_DIAGNOSTICS") && g_window_thread_id &&
         current_windows_thread_id() == g_window_thread_id) {
         static _Atomic(u32) main_sleep_logs;
@@ -6510,8 +7570,7 @@ static u64 __attribute__((ms_abi)) impl_SleepEx(u32 ms, u32 alertable) {
     return 0;
 }
 static u64 __attribute__((ms_abi)) impl_GetTickCount(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (u64)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return beer_time_monotonic_ns_for(BEER_CLOCK_TICK) / 1000000u;
 }
 static u64 __attribute__((ms_abi)) impl_GetTickCount64(void) { return impl_GetTickCount(); }
 
@@ -7242,12 +8301,50 @@ impl_UpdateWindow(u64 hw) {
 }
 
 /* ---- HMODULE GetModuleHandleExA/W ---- */
+/* Module that owns an address: thunks resolve by export name (steamclient exports belong to the
+ * steam client image, everything else to kernel32), guest DLL images and the executable by range. */
+static u64 module_from_address(u64 address)
+{
+    if (g_tramp && address >= (u64)g_tramp && address < (u64)g_tramp + g_trampsz) {
+        size_t index = (size_t)((address - (u64)g_tramp) / THUNK_SZ);
+        const char *name = index < MAX_STUBS ? g_snames[index] : NULL;
+        if (name && (!strcmp(name, "CreateInterface") || !strncmp(name, "Steam_", 6))) {
+            u64 steam = steam_client_module();
+            if (steam) return steam;
+        }
+        return HMOD_K32;
+    }
+    for (int i = 0; i < g_guest_dll_count; ++i)
+        if (address >= (u64)g_guest_dlls[i].image && address < (u64)g_guest_dlls[i].image + g_guest_dlls[i].image_size)
+            return (u64)g_guest_dlls[i].image;
+    return (u64)g_img;
+}
 static u64 __attribute__((ms_abi))
 impl_GetModuleHandleExW(u32 flags, u64 name, u64 *out)
-    { (void)flags;(void)name; if(out)*out=(u64)g_img; return 1; }
+{
+    u64 module;
+    if (flags & 4u) module = module_from_address(name);                 /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */
+    else if (!name) module = (u64)g_img;
+    else {
+        const u16 *w = (const u16 *)(uintptr_t)name;
+        char narrow[128]; size_t i = 0;
+        for (; w[i] && i + 1 < sizeof(narrow); ++i) narrow[i] = (char)(w[i] > 0x7f ? '?' : w[i]);
+        narrow[i] = 0;
+        module = impl_GetModuleHandleA(narrow);
+    }
+    if (out) *out = module;
+    return module ? 1 : 0;
+}
 static u64 __attribute__((ms_abi))
 impl_GetModuleHandleExA(u32 flags, u64 name, u64 *out)
-    { (void)flags;(void)name; if(out)*out=(u64)g_img; return 1; }
+{
+    u64 module;
+    if (flags & 4u) module = module_from_address(name);
+    else if (!name) module = (u64)g_img;
+    else module = impl_GetModuleHandleA((const char *)(uintptr_t)name);
+    if (out) *out = module;
+    return module ? 1 : 0;
+}
 
 /* ---- Condition variables (CONDITION_VARIABLE = pointer-sized opaque) ----
  * Windows stores condition-variable state in one pointer-sized word. Keep the
@@ -7432,7 +8529,39 @@ impl_SleepConditionVariableCS(u64 *cv, WIN_CS *cs, u32 ms)
 
 typedef struct {
     pthread_rwlock_t lock;
+    volatile long owner_tid;        /* diagnostics (kill -USR1): exclusive holder and where it acquired */
+    volatile u64 owner_rip;
+    volatile int readers;
+    volatile u64 reader_rip;
 } WinSrwLock;
+__thread WinSrwLock *g_dbg_srw_wait;   /* lock this thread is blocked acquiring */
+
+static void srw_wrlock_dbg(WinSrwLock *e)
+{
+    if (pthread_rwlock_trywrlock(&e->lock) != 0) {
+        g_dbg_srw_wait = e;
+        pthread_rwlock_wrlock(&e->lock);
+        g_dbg_srw_wait = NULL;
+    }
+    e->owner_tid = syscall(SYS_gettid);
+    e->owner_rip = g_dispatch_incoming_return;
+}
+static void srw_rdlock_dbg(WinSrwLock *e)
+{
+    if (pthread_rwlock_tryrdlock(&e->lock) != 0) {
+        g_dbg_srw_wait = e;
+        pthread_rwlock_rdlock(&e->lock);
+        g_dbg_srw_wait = NULL;
+    }
+    __atomic_add_fetch(&e->readers, 1, __ATOMIC_RELAXED);
+    e->reader_rip = g_dispatch_incoming_return;
+}
+static void srw_unlock_dbg(WinSrwLock *e, int exclusive)
+{
+    if (exclusive) e->owner_tid = 0;
+    else __atomic_sub_fetch(&e->readers, 1, __ATOMIC_RELAXED);
+    pthread_rwlock_unlock(&e->lock);
+}
 
 static WinSrwLock *srw_lock_get(u64 *address, int create)
 {
@@ -7477,7 +8606,7 @@ static u64 __attribute__((ms_abi)) impl_InitializeSRWLock(u64 *lock)
 static u64 __attribute__((ms_abi)) impl_AcquireSRWLockExclusive(u64 *lock)
 {
     WinSrwLock *entry = srw_lock_get(lock, 1);
-    if (entry) pthread_rwlock_wrlock(&entry->lock);
+    if (entry) srw_wrlock_dbg(entry);
     return 0;
 }
 
@@ -7490,14 +8619,14 @@ static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockExclusive(u64 *lock)
 static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockExclusive(u64 *lock)
 {
     WinSrwLock *entry = srw_lock_get(lock, 0);
-    if (entry) pthread_rwlock_unlock(&entry->lock);
+    if (entry) srw_unlock_dbg(entry, 1);
     return 0;
 }
 
 static u64 __attribute__((ms_abi)) impl_AcquireSRWLockShared(u64 *lock)
 {
     WinSrwLock *entry = srw_lock_get(lock, 1);
-    if (entry) pthread_rwlock_rdlock(&entry->lock);
+    if (entry) srw_rdlock_dbg(entry);
     return 0;
 }
 
@@ -7510,7 +8639,7 @@ static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockShared(u64 *lock)
 static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockShared(u64 *lock)
 {
     WinSrwLock *entry = srw_lock_get(lock, 0);
-    if (entry) pthread_rwlock_unlock(&entry->lock);
+    if (entry) srw_unlock_dbg(entry, 0);
     return 0;
 }
 
@@ -7543,7 +8672,7 @@ impl_SleepConditionVariableSRW(u64 *cv, u64 *lock, u32 ms, u32 flags)
                     (unsigned long long)g_dispatch_incoming_return,
                     (unsigned long long)condition->last_waker_rip);
     }
-    pthread_rwlock_unlock(&srw->lock);
+    srw_unlock_dbg(srw, !(flags & CONDITION_VARIABLE_LOCKMODE_SHARED));
 
     int rc = 0;
     if (ms == 0) {
@@ -7562,9 +8691,9 @@ impl_SleepConditionVariableSRW(u64 *cv, u64 *lock, u32 ms, u32 flags)
     pthread_mutex_unlock(&condition->mutex);
 
     if (flags & CONDITION_VARIABLE_LOCKMODE_SHARED)
-        pthread_rwlock_rdlock(&srw->lock);
+        srw_rdlock_dbg(srw);
     else
-        pthread_rwlock_wrlock(&srw->lock);
+        srw_wrlock_dbg(srw);
 
     if (rc == ETIMEDOUT) {
         g_last_error = 1460; /* ERROR_TIMEOUT */
@@ -8524,12 +9653,25 @@ impl_GetDiskFreeSpaceExW(const u16 *directory, u64 *free_available,
     return impl_GetDiskFreeSpaceExA(narrow, free_available, total_bytes, total_free);
 }
 
+static int stat_ok_probe(const char *p) { struct stat st; return stat(p, &st); }
 static u64 __attribute__((ms_abi))
 impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
                   u32 creation, u32 attrs, u64 tmpl)
 {
     (void)sa; (void)attrs; (void)tmpl; (void)share;
     if (!name) return INVALID_HANDLE_VALUE64;
+
+    /* Win32 device namespace (\\.\NAME): Beer exposes no device objects. Probes such as
+     * \\.\SMARTVSD, \\.\SICE or \\.\NTICE (debugger/driver detection) must see
+     * ERROR_FILE_NOT_FOUND exactly like a clean Windows machine, not a host file lookup. */
+    if (name[0] == '\\' && name[1] == '\\' && (name[2] == '.' || name[2] == '?') && name[3] == '\\' &&
+        strncasecmp(name + 4, "pipe\\", 5) != 0 && strncasecmp(name + 4, "GLOBALROOT", 10) != 0 &&
+        !(name[2] == '?' && name[4] && name[5] == ':')) {
+        g_last_error = 2;
+        if (getenv("BEER_FILE_DIAGNOSTICS"))
+            fprintf(stderr, "[FILE] device open %s -> ERROR_FILE_NOT_FOUND\n", name);
+        return INVALID_HANDLE_VALUE64;
+    }
 
     char host_path[PATH_MAX];
     if (!resolve_windows_host_path(name, host_path, sizeof(host_path))) {
@@ -8564,8 +9706,14 @@ impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
         }
         if (getenv("BEER_FILE_DIAGNOSTICS"))
             fprintf(stderr, "[FILE] CreateFile failed guest=%s host=%s access=0x%x "
-                    "creation=%u errno=%d winerr=%u\n", name, host_path, access,
-                    creation, errno, g_last_error);
+                    "creation=%u flags=0x%x errno=%d winerr=%u\n", name, host_path, access,
+                    creation, flags, errno, g_last_error);
+        if (getenv("BEER_FILE_DIAGNOSTICS")) {
+            size_t hl = strlen(host_path);
+            fprintf(stderr, "[FILE]   host path len=%zu tail bytes:", hl);
+            for (size_t k = hl > 6 ? hl - 6 : 0; k <= hl; ++k) fprintf(stderr, " %02x", (u8)host_path[k]);
+            fprintf(stderr, " stat=%d\n", (int)(stat_ok_probe(host_path)));
+        }
         return INVALID_HANDLE_VALUE64;
     }
     u64 handle = fh_alloc(fd, name, host_path);
@@ -8808,6 +9956,29 @@ impl_SetFilePointer(u64 h, s32 lo, s32 *hi, u32 method) {
     if (hi) *hi = (s32)(r>>32);
     g_last_error = 0;
     return (u64)(u32)r;
+}
+
+static u64 __attribute__((ms_abi))
+impl_SetFilePointerEx(u64 h, s64 distance, s64 *new_position, u32 method)
+{
+    int fd = fh_get(h);
+    if (fd < 0) { g_last_error = 6; return 0; }
+    if (method > 2) { g_last_error = 87; return 0; }
+    const int whence = method == 0 ? SEEK_SET : method == 1 ? SEEK_CUR : SEEK_END;
+    const off_t current = lseek(fd, 0, SEEK_CUR);
+    off_t target = distance;
+    if (whence == SEEK_CUR && current >= 0) target = current + distance;
+    else if (whence == SEEK_END) {
+        struct stat st;
+        if (fstat(fd, &st) != 0) { g_last_error = (u32)errno; return 0; }
+        target = (off_t)st.st_size + distance;
+    }
+    if (target < 0) { g_last_error = 131; return 0; }   /* ERROR_NEGATIVE_SEEK */
+    const off_t result = lseek(fd, target, SEEK_SET);
+    if (result < 0) { g_last_error = (u32)errno; return 0; }
+    if (new_position) *new_position = (s64)result;
+    g_last_error = 0;
+    return 1;
 }
 
 static u64 __attribute__((ms_abi))
@@ -9077,6 +10248,87 @@ static u64 __attribute__((ms_abi))
 impl_SetFileAttributesA(const char *p, u32 a) { (void)p;(void)a; return 1; }
 static u64 __attribute__((ms_abi))
 impl_SetFileAttributesW(const u16 *p, u32 a) { (void)p;(void)a; return 1; }
+
+/* ---- version.dll: version resource of PE files ---- */
+static int wide_to_host_path(const u16 *path, char *out, size_t size)
+{
+    char narrow[1024];
+    size_t i = 0;
+    for (; path && path[i] && i < sizeof(narrow) - 1; ++i) narrow[i] = (char)(path[i] < 0x80 ? path[i] : '?');
+    narrow[i] = 0;
+    return path && resolve_windows_host_path(narrow, out, size);
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetFileVersionInfoSizeW(const u16 *path, u32 *handle)
+{
+    char host[1024];
+    u8 *data = NULL;
+    u32 size = 0;
+    if (handle) *handle = 0;
+    if (!wide_to_host_path(path, host, sizeof(host))) { g_last_error = 2; fprintf(stderr, "[VERSION] cannot resolve path\n"); return 0; }
+    if (!beer_pe_version_resource(host, &data, &size)) { g_last_error = 1813; fprintf(stderr, "[VERSION] no version resource in %s\n", host); return 0; }   /* ERROR_RESOURCE_TYPE_NOT_FOUND */
+    free(data);
+    return size;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetFileVersionInfoSizeA(const char *path, u32 *handle)
+{
+    u16 wide[1024];
+    size_t i = 0;
+    for (; path && path[i] && i < 1023; ++i) wide[i] = (u8)path[i];
+    wide[i] = 0;
+    return impl_GetFileVersionInfoSizeW(wide, handle);
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetFileVersionInfoW(const u16 *path, u32 handle, u32 length, u8 *buffer)
+{
+    (void)handle;
+    char host[1024];
+    u8 *data = NULL;
+    u32 size = 0;
+    if (!buffer || !wide_to_host_path(path, host, sizeof(host))) { g_last_error = 2; return 0; }
+    if (!beer_pe_version_resource(host, &data, &size)) { g_last_error = 1813; return 0; }
+    memcpy(buffer, data, size < length ? size : length);
+    free(data);
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetFileVersionInfoA(const char *path, u32 handle, u32 length, u8 *buffer)
+{
+    u16 wide[1024];
+    size_t i = 0;
+    for (; path && path[i] && i < 1023; ++i) wide[i] = (u8)path[i];
+    wide[i] = 0;
+    return impl_GetFileVersionInfoW(wide, handle, length, buffer);
+}
+
+static u64 __attribute__((ms_abi))
+impl_VerQueryValueW(const u8 *block, const u16 *sub_block, const void **value, u32 *length)
+{
+    if (!block) { g_last_error = 87; return 0; }
+    u16 total;
+    memcpy(&total, block, 2);
+    const void *found = NULL;
+    u32 found_length = 0;
+    if (!beer_version_query(block, total, sub_block, &found, &found_length)) { g_last_error = 1813; return 0; }
+    if (value) *value = found;
+    if (length) *length = found_length;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_VerQueryValueA(const u8 *block, const char *sub_block, const void **value, u32 *length)
+{
+    u16 wide[256];
+    size_t i = 0;
+    for (; sub_block && sub_block[i] && i < 255; ++i) wide[i] = (u8)sub_block[i];
+    wide[i] = 0;
+    return impl_VerQueryValueW(block, wide, value, length);
+}
 
 /* SetThreadAffinityMask */
 static u64 __attribute__((ms_abi))
@@ -9699,7 +10951,6 @@ static pthread_mutex_t g_win_message_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_win_message_ready = PTHREAD_COND_INITIALIZER;
 static u8 g_win_message_keys[256];
 static _Atomic(u32) g_input_event_logs;
-
 typedef struct {
     u16 usage_page;
     u16 usage;
@@ -9711,12 +10962,17 @@ _Static_assert(sizeof(BEER_RAW_INPUT_DEVICE) == 16,
 
 #define BEER_RAW_INPUT_CAPACITY 256
 static BeerRawInput g_raw_inputs[BEER_RAW_INPUT_CAPACITY];
+/* GetRawInputData receives an opaque handle. Keep each handle stable until the
+ * matching WM_INPUT is removed; a modulo overwrite here used to let the 1 kHz
+ * host pump replace an unread click with later motion before RE8 consumed it. */
+static u8 g_raw_input_in_use[BEER_RAW_INPUT_CAPACITY];
 static u32 g_raw_input_next;
 static pthread_mutex_t g_raw_input_mutex = PTHREAD_MUTEX_INITIALIZER;
 static BEER_RAW_INPUT_DEVICE g_raw_mouse_registration;
 static BEER_RAW_INPUT_DEVICE g_raw_keyboard_registration;
 static int g_raw_mouse_registered;
 static int g_raw_keyboard_registered;
+static void release_raw_input(u64 handle);
 
 /* Low-level hooks execute on the installing/message thread on Windows. Native
  * events are therefore translated into queued messages first, and callbacks
@@ -10060,6 +11316,100 @@ impl_GetRegisteredRawInputDevices(BEER_RAW_INPUT_DEVICE *devices,
 }
 
 static u64 __attribute__((ms_abi))
+impl_GetRawInputDeviceList(BeerRawInputDeviceList *devices, u32 *count,
+                           u32 size)
+{
+    const u32 available = 2;
+    if (!count || size != sizeof(BeerRawInputDeviceList)) {
+        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
+        return (u64)UINT32_MAX;
+    }
+    if (!devices) {
+        *count = available;
+        g_last_error = 0;
+        return 0;
+    }
+    if (*count < available) {
+        *count = available;
+        g_last_error = 122; /* ERROR_INSUFFICIENT_BUFFER */
+        return (u64)UINT32_MAX;
+    }
+    devices[0] = (BeerRawInputDeviceList){BEER_RAW_MOUSE_HANDLE, 0, 0};
+    devices[1] = (BeerRawInputDeviceList){BEER_RAW_KEYBOARD_HANDLE, 1, 0};
+    *count = available;
+    g_last_error = 0;
+    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[INPUT] GetRawInputDeviceList -> mouse+keyboard\n");
+    return available;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetRawInputDeviceInfoW(u64 device, u32 command, void *data, u32 *size)
+{
+    const u32 type = beer_raw_device_type(device);
+    if (!size || type == UINT32_MAX ||
+        (command != 0x2000000bu && command != 0x2000000eu)) {
+        g_last_error = 87;
+        return (u64)UINT32_MAX;
+    }
+
+    if (command == 0x2000000bu) { /* RIDI_DEVICEINFO */
+        const u32 required = sizeof(BeerRawInputDeviceInfo);
+        if (!data) { *size = required; g_last_error = 0; return 0; }
+        if (*size < required || *(const u32 *)data < required) {
+            *size = required;
+            g_last_error = 122;
+            return (u64)UINT32_MAX;
+        }
+        BeerRawInputDeviceInfo info = beer_raw_device_info(device);
+        memcpy(data, &info, required);
+        *size = required;
+        g_last_error = 0;
+        return required;
+    }
+
+    const char *name = type == 0 ? BEER_RAW_MOUSE_DEVICE_NAME_A
+                                 : BEER_RAW_KEYBOARD_DEVICE_NAME_A;
+    u32 required = (u32)strlen(name) + 1;
+    if (!data) { *size = required; g_last_error = 0; return 0; }
+    if (*size < required) {
+        *size = required;
+        g_last_error = 122;
+        return (u64)UINT32_MAX;
+    }
+    u16 *wide = data;
+    for (u32 i = 0; i < required; ++i) wide[i] = (u16)(u8)name[i];
+    *size = required;
+    g_last_error = 0;
+    return required - 1; /* character count excluding the terminator */
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetRawInputDeviceInfoA(u64 device, u32 command, void *data, u32 *size)
+{
+    const u32 type = beer_raw_device_type(device);
+    if (command == 0x2000000bu)
+        return impl_GetRawInputDeviceInfoW(device, command, data, size);
+    if (!size || type == UINT32_MAX || command != 0x2000000eu) {
+        g_last_error = 87;
+        return (u64)UINT32_MAX;
+    }
+    const char *name = type == 0 ? BEER_RAW_MOUSE_DEVICE_NAME_A
+                                 : BEER_RAW_KEYBOARD_DEVICE_NAME_A;
+    u32 required = (u32)strlen(name) + 1;
+    if (!data) { *size = required; g_last_error = 0; return 0; }
+    if (*size < required) {
+        *size = required;
+        g_last_error = 122;
+        return (u64)UINT32_MAX;
+    }
+    memcpy(data, name, required);
+    *size = required;
+    g_last_error = 0;
+    return required - 1;
+}
+
+static u64 __attribute__((ms_abi))
 impl_GetRawInputData(u64 handle, u32 command, void *data,
                      u32 *size, u32 header_size)
 {
@@ -10085,6 +11435,12 @@ impl_GetRawInputData(u64 handle, u32 command, void *data,
     }
     memcpy(data, &input, required);
     *size = required;
+    /* A successful RID_INPUT copy completes this packet's lifetime. RE8 reads
+     * every WM_INPUT once; retaining slots until ring wrap let unread motion
+     * overwrite button packets, while releasing at PeekMessage time would be
+     * too early because the read happens while processing the removed message. */
+    if (command == 0x10000003u)
+        release_raw_input(handle);
     if (getenv("BEER_INPUT_DIAGNOSTICS")) {
         static _Atomic(u32) logs;
         u32 log = atomic_fetch_add(&logs, 1);
@@ -10184,9 +11540,25 @@ static void __attribute__((ms_abi)) impl_XInputEnable(u32 enabled)
 }
 
 static u64 __attribute__((ms_abi))
-impl_SetCapture(u64 hw) { return hw == FAKE_HWND ? FAKE_HWND : 0; }
+impl_SetCapture(u64 hw)
+{
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        static _Atomic(u32) logs;
+        if (atomic_fetch_add(&logs, 1) < 40)
+            fprintf(stderr, "[INPUT] SetCapture(0x%llx)\n", (unsigned long long)hw);
+    }
+    return hw == FAKE_HWND ? FAKE_HWND : 0;
+}
 static u64 __attribute__((ms_abi))
-impl_ReleaseCapture(void) { return 1; }
+impl_ReleaseCapture(void)
+{
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        static _Atomic(u32) logs;
+        if (atomic_fetch_add(&logs, 1) < 40)
+            fprintf(stderr, "[INPUT] ReleaseCapture()\n");
+    }
+    return 1;
+}
 static u64 __attribute__((ms_abi))
 impl_SetFocus(u64 hw)
 {
@@ -10381,13 +11753,29 @@ static int queue_window_message(u32 message, u64 wparam, u64 lparam)
     return queue_message_for_thread(owner, FAKE_HWND, message, wparam, lparam);
 }
 
+static void release_raw_input(u64 handle)
+{
+    if (!handle || handle > BEER_RAW_INPUT_CAPACITY) return;
+    pthread_mutex_lock(&g_raw_input_mutex);
+    g_raw_input_in_use[(u32)handle - 1] = 0;
+    pthread_mutex_unlock(&g_raw_input_mutex);
+}
+
 static u64 store_raw_input(const BeerRawInput *input)
 {
+    u64 handle = 0;
     pthread_mutex_lock(&g_raw_input_mutex);
-    u32 index = g_raw_input_next++ % BEER_RAW_INPUT_CAPACITY;
-    g_raw_inputs[index] = *input;
+    for (u32 attempt = 0; attempt < BEER_RAW_INPUT_CAPACITY; ++attempt) {
+        u32 index = (g_raw_input_next + attempt) % BEER_RAW_INPUT_CAPACITY;
+        if (g_raw_input_in_use[index]) continue;
+        g_raw_inputs[index] = *input;
+        g_raw_input_in_use[index] = 1;
+        g_raw_input_next = (index + 1) % BEER_RAW_INPUT_CAPACITY;
+        handle = (u64)index + 1;
+        break;
+    }
     pthread_mutex_unlock(&g_raw_input_mutex);
-    return (u64)index + 1;
+    return handle;
 }
 
 static void queue_raw_input(const BeerRawInput *input, int keyboard)
@@ -10402,12 +11790,47 @@ static void queue_raw_input(const BeerRawInput *input, int keyboard)
     pthread_mutex_unlock(&g_raw_input_mutex);
     if (!registered) return;
     u64 handle = store_raw_input(input);
-    /* RIDEV_INPUTSINK permits delivery without focus; wParam distinguishes
-     * sink (1) from normal foreground (0) delivery. */
-    queue_message_for_thread(g_window_thread_id ? g_window_thread_id :
-                                                  (u32)current_windows_thread_id(),
-                             target ? target : FAKE_HWND, 0x00ff,
-                             (flags & 0x00000100u) ? 1 : 0, handle);
+    if (!handle) {
+        /* Never sacrifice an action transition to high-rate relative motion.
+         * Motion is state-like and a later packet supersedes it; button and key
+         * transitions are edge-like. Reclaim the oldest queued pure-motion
+         * WM_INPUT, then retry the transition allocation. */
+        if (beer_raw_mouse_is_coalescible_motion(input)) return;
+        pthread_mutex_lock(&g_win_message_mutex);
+        for (u32 i = 0; i < g_win_message_count; ++i) {
+            u32 index = (g_win_message_head + i) % WIN_MESSAGE_CAPACITY;
+            if (g_win_messages[index].message != 0x00ffu) continue;
+            u64 candidate = g_win_messages[index].lParam;
+            int motion = 0;
+            pthread_mutex_lock(&g_raw_input_mutex);
+            if (candidate && candidate <= BEER_RAW_INPUT_CAPACITY &&
+                g_raw_input_in_use[(u32)candidate - 1])
+                motion = beer_raw_mouse_is_coalescible_motion(
+                    &g_raw_inputs[(u32)candidate - 1]);
+            pthread_mutex_unlock(&g_raw_input_mutex);
+            if (!motion) continue;
+            remove_window_message_locked(i);
+            release_raw_input(candidate);
+            break;
+        }
+        pthread_mutex_unlock(&g_win_message_mutex);
+        handle = store_raw_input(input);
+        if (!handle) {
+            if (getenv("BEER_INPUT_DIAGNOSTICS"))
+                fprintf(stderr, "[INPUT] raw-input slots full; no motion packet available to reclaim\n");
+            return;
+        }
+    }
+    /* RIDEV_INPUTSINK permits delivery without focus; wParam is RIM_INPUT (0)
+     * while the window is foreground and RIM_INPUTSINK (1) only when it is
+     * not. Reporting sink for a focused window made RE8 treat every raw
+     * mouse message as background input. */
+    if (!queue_message_for_thread(g_window_thread_id ? g_window_thread_id :
+                                                       (u32)current_windows_thread_id(),
+                                  target ? target : FAKE_HWND, 0x00ff,
+                                  ((flags & 0x00000100u) && !g_window_focused) ? 1 : 0,
+                                  handle))
+        release_raw_input(handle);
 }
 
 /* Windows asks the window under the pointer for its cursor (WM_SETCURSOR) before
@@ -10420,6 +11843,11 @@ static void post_wm_setcursor(u32 mouse_message)
     const u64 now = monotonic_milliseconds();
     if (mouse_message == 0x0200 && now - last_ms < 40) return;
     last_ms = now;
+    /* Windows sends WM_NCHITTEST with the screen position before WM_SETCURSOR/mouse messages;
+     * RE8 records "cursor is over the client area" (DefWindowProc == HTCLIENT) from it and
+     * rejects every mouse action while that flag is false. */
+    queue_window_message(0x0084, 0,
+                         (u64)((u16)g_input.root_x) | ((u64)(u16)g_input.root_y << 16));
     queue_window_message(0x0020, FAKE_HWND, 1u | ((u64)mouse_message << 16)); /* HTCLIENT */
 }
 
@@ -10436,6 +11864,9 @@ static void collect_native_window_events(void)
             case XWAYLAND_EVENT_KEY_DOWN:
             case XWAYLAND_EVENT_KEY_UP: {
                 int down = event.type == XWAYLAND_EVENT_KEY_DOWN;
+                /* The overlay hotkey (set in the manager) toggles the overlay and never reaches the game. */
+                if (beer_overlay_hotkey_event(event.keysym, event.state, down)) break;
+                if (beer_post_hotkey_event(event.keysym, event.state, down)) break;
                 u32 vk = x11_keycode_to_vk(event.keycode);
                 if (!vk) vk = x11_keysym_to_vk(event.keysym);
                 u8 dik = x11_keycode_to_dik(event.keycode);
@@ -10507,23 +11938,27 @@ static void collect_native_window_events(void)
                     static const u32 vks[3] = {0x01, 0x04, 0x02};
                     s32 guest_x, guest_y;
                     native_to_guest_client(event.x, event.y, &guest_x, &guest_y);
+                    /* DirectInput numbers mouse buttons left, RIGHT, middle, while
+                     * X11 numbers them left, middle, right: store by DirectInput index. */
+                    static const u32 di_index[3] = {0, 2, 1};
+                    const u32 di_button = di_index[event.button - 1];
                     pthread_mutex_lock(&g_input_mutex);
                     u32 vk = vks[event.button - 1];
                     if (down && !(g_input.keys[vk] & 0x80))
                         g_input.pressed[vk] = 1;
-                    g_input.mouse_buttons[event.button - 1] = down ? 0x80 : 0;
-                    if (down) g_input.mouse_latch[event.button - 1] = 1;
+                    g_input.mouse_buttons[di_button] = down ? 0x80 : 0;
+                    if (down) g_input.mouse_latch[di_button] = 1;
                     g_input.keys[vk] = down ? 0x80 : 0;
                     if (top_level)
-                        queue_dinput_event_locked(1, 12u + event.button - 1,
+                        queue_dinput_event_locked(1, 12u + di_button,
                                                    down ? 0x80u : 0u);
                     g_input.client_x = guest_x; g_input.client_y = guest_y;
                     g_input.root_x = event.root_x; g_input.root_y = event.root_y;
                     g_input.pointer_position_valid = 1;
                     u64 button_flags = 0;
                     if (g_input.mouse_buttons[0] & 0x80) button_flags |= 0x0001; /* MK_LBUTTON */
-                    if (g_input.mouse_buttons[1] & 0x80) button_flags |= 0x0010; /* MK_MBUTTON */
-                    if (g_input.mouse_buttons[2] & 0x80) button_flags |= 0x0002; /* MK_RBUTTON */
+                    if (g_input.mouse_buttons[1] & 0x80) button_flags |= 0x0002; /* MK_RBUTTON */
+                    if (g_input.mouse_buttons[2] & 0x80) button_flags |= 0x0010; /* MK_MBUTTON */
                     if (g_input.mouse_buttons[3] & 0x80) button_flags |= 0x0020; /* MK_XBUTTON1 */
                     if (g_input.mouse_buttons[4] & 0x80) button_flags |= 0x0040; /* MK_XBUTTON2 */
                     pthread_mutex_unlock(&g_input_mutex);
@@ -10570,8 +12005,8 @@ static void collect_native_window_events(void)
                     g_input.pointer_position_valid = 1;
                     u64 button_flags = 0;
                     if (g_input.mouse_buttons[0] & 0x80) button_flags |= 0x0001;
-                    if (g_input.mouse_buttons[1] & 0x80) button_flags |= 0x0010;
-                    if (g_input.mouse_buttons[2] & 0x80) button_flags |= 0x0002;
+                    if (g_input.mouse_buttons[1] & 0x80) button_flags |= 0x0002;
+                    if (g_input.mouse_buttons[2] & 0x80) button_flags |= 0x0010;
                     if (g_input.mouse_buttons[3] & 0x80) button_flags |= 0x0020;
                     if (g_input.mouse_buttons[4] & 0x80) button_flags |= 0x0040;
                     pthread_mutex_unlock(&g_input_mutex);
@@ -10899,7 +12334,7 @@ static int take_window_message(WIN_MSG *message, u32 min, u32 max, int remove)
     if (found && getenv("BEER_MESSAGE_DIAGNOSTICS")) {
         static _Atomic(u32) take_logs;
         u32 trace = atomic_fetch_add(&take_logs, 1);
-        if (trace < 512)
+        if (trace < 512 || (message && message->message >= 0x201 && message->message <= 0x20e))
             fprintf(stderr,
                     "[MESSAGE] take id=0x%x remove=%d remaining=%u thread=%u "
                     "caller=0x%llx\n",
@@ -11195,6 +12630,19 @@ impl_DefWindowProcW(u64 hw, u32 msg, u64 wp, u64 lp)
             return 0;
         case 0x0086: /* WM_NCACTIVATE — return 1 to allow default title draw */
             return 1;
+        case 0x0084: { /* WM_NCHITTEST: lParam is the screen position; answer where it lies in the window */
+            WIN_RECT outer;
+            if (!impl_GetWindowRect(hw, &outer)) return 0;                       /* HTERROR */
+            const s32 x = (int16_t)(lp & 0xffff), y = (int16_t)((lp >> 16) & 0xffff);
+            if (x < outer.left || x >= outer.right || y < outer.top || y >= outer.bottom)
+                return 0;                                                          /* HTNOWHERE */
+            if (beer_window_style_is_decorated((u32)g_window_style)) {
+                if (y < outer.top + BEER_WINDOW_FRAME_TOP) return 2;               /* HTCAPTION */
+                if (x < outer.left + BEER_WINDOW_FRAME_LEFT || x >= outer.right - BEER_WINDOW_FRAME_RIGHT ||
+                    y >= outer.bottom - BEER_WINDOW_FRAME_BOTTOM) return 18;       /* HTBORDER */
+            }
+            return 1;                                                              /* HTCLIENT */
+        }
         default:
             (void)wp; (void)lp;
             return 0;
@@ -11466,6 +12914,72 @@ impl_EnumDisplaySettingsW(const u16 *device, u32 mode_num, u8 *devmode)
     *(u32*)(devmode + 120) = hz;
     return 1;
 }
+/* DISPLAY_DEVICEW: one adapter (\\.\DISPLAY1, the host GPU) with one monitor. */
+static void display_device_text(u16 *dest, size_t capacity, const char *text)
+{
+    size_t i = 0;
+    for (; text[i] && i + 1 < capacity; ++i) dest[i] = (u8)text[i];
+    dest[i] = 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_EnumDisplayDevicesW(const u16 *device, u32 index, u8 *info, u32 flags)
+{
+    (void)flags;
+    if (!info) { g_last_error = 87; return 0; }
+    u32 cb;
+    memcpy(&cb, info, 4);
+    if (cb < 840) { g_last_error = 87; return 0; }
+    if (index != 0) { g_last_error = 87; return 0; }
+    u16 *name = (u16 *)(info + 4), *string = (u16 *)(info + 68), *id = (u16 *)(info + 328), *key = (u16 *)(info + 584);
+    u32 *state = (u32 *)(info + 324);
+    memset(info + 4, 0, 836);
+    if (!device) {
+        BeerHostGpuInfo gpu;
+        const int have = beer_vulkan_host_gpu_info(&gpu);
+        char text[160];
+        display_device_text(name, 32, "\\\\.\\DISPLAY1");
+        display_device_text(string, 128, have ? gpu.name : "Beer Virtual D3D11 Adapter");
+        snprintf(text, sizeof(text), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_%02X",
+                 have ? gpu.vendor_id : 0x1414u, have ? gpu.device_id : 1u, have ? gpu.revision : 0u);
+        display_device_text(id, 128, text);
+        display_device_text(key, 128, "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Video\\{BEER0001-0000-0000-0000-000000000000}\\0000");
+        *state = 0x5;   /* ATTACHED_TO_DESKTOP | PRIMARY_DEVICE */
+    } else {
+        display_device_text(name, 32, "\\\\.\\DISPLAY1\\Monitor0");
+        display_device_text(string, 128, "Generic PnP Monitor");
+        display_device_text(id, 128, "MONITOR\\BEER0000\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0001");
+        display_device_text(key, 128, "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Class\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0001");
+        *state = 0x3;   /* ACTIVE | ATTACHED */
+    }
+    g_last_error = 0;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_EnumDisplayDevicesA(const char *device, u32 index, u8 *info, u32 flags)
+{
+    /* Narrow variant: build the wide result, then narrow the text fields in place (A layout is 424 bytes). */
+    u8 wide[840];
+    u32 cb;
+    if (!info) { g_last_error = 87; return 0; }
+    memcpy(&cb, info, 4);
+    if (cb < 424) { g_last_error = 87; return 0; }
+    memset(wide, 0, sizeof(wide));
+    cb = 840;
+    memcpy(wide, &cb, 4);
+    if (!impl_EnumDisplayDevicesW(device ? (const u16 *)u"x" : NULL, index, wide, flags)) return 0;
+    const u16 *name = (const u16 *)(wide + 4), *string = (const u16 *)(wide + 68), *id = (const u16 *)(wide + 328), *key = (const u16 *)(wide + 584);
+    u8 *out_name = info + 4, *out_string = info + 36, *out_id = info + 168, *out_key = info + 296;
+    memset(info + 4, 0, 420);
+    for (int i = 0; i < 31 && name[i]; ++i) out_name[i] = (u8)name[i];
+    for (int i = 0; i < 127 && string[i]; ++i) out_string[i] = (u8)string[i];
+    memcpy(info + 164, wide + 324, 4);
+    for (int i = 0; i < 127 && id[i]; ++i) out_id[i] = (u8)id[i];
+    for (int i = 0; i < 127 && key[i]; ++i) out_key[i] = (u8)key[i];
+    return 1;
+}
+
 static u64 __attribute__((ms_abi))
 impl_EnumDisplaySettingsA(u64 device, u32 mode_num, u8 *devmode)
     { return impl_EnumDisplaySettingsW((const u16*)(uintptr_t)device, mode_num, devmode); }
@@ -11474,6 +12988,8 @@ static u64 __attribute__((ms_abi))
 impl_SetWindowsHookExW(s32 type, u64 fn, u64 mod, u32 tid)
 {
     (void)mod;
+    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[INPUT] SetWindowsHookExW type=%d fn=0x%lx tid=%u\n", type, fn, tid);
     if (!fn || (tid && tid != (u32)current_windows_thread_id())) {
         g_last_error = 87;
         return 0;
@@ -11517,12 +13033,55 @@ impl_GetSystemMetrics(u32 n) {
     /* Query actual screen dimensions from the X11 display rather than
      * returning hardcoded 1920×1080 (issue G). */
     xwayland_get_screen_size(&sw, &sh);
+    if (getenv("BEER_INPUT_DIAGNOSTICS") && n < 256) {
+        static u8 seen[256];
+        if (!seen[n]) {
+            seen[n] = 1;
+            fprintf(stderr, "[USER32] GetSystemMetrics(%u) first queried\n", n);
+        }
+    }
+    /* Values of a stock 96-DPI Windows 10 desktop with a mouse and one monitor.
+     * Games key behaviour off SM_MOUSEPRESENT / SM_CMOUSEBUTTONS and similar. */
     switch(n) {
         case 0:  return (u64)sw;  /* SM_CXSCREEN */
         case 1:  return (u64)sh;  /* SM_CYSCREEN */
+        case 2: case 3: case 20: case 21: return 17; /* scroll bar sizes */
+        case 4:  return 23;       /* SM_CYCAPTION */
+        case 5: case 6: return 1; /* SM_CXBORDER, SM_CYBORDER */
+        case 7: case 8: return 3; /* SM_CXDLGFRAME, SM_CYDLGFRAME */
+        case 9: case 10: return 17; /* thumb sizes */
+        case 11: case 12: return 32; /* SM_CXICON, SM_CYICON */
+        case 13: case 14: return 32; /* SM_CXCURSOR, SM_CYCURSOR */
+        case 15: return 20;       /* SM_CYMENU */
+        case 16: return (u64)sw;  /* SM_CXFULLSCREEN */
+        case 17: return (u64)sh;  /* SM_CYFULLSCREEN */
+        case 19: return 1;        /* SM_MOUSEPRESENT */
+        case 23: return 0;        /* SM_SWAPBUTTON */
+        case 28: case 34: return 136; /* SM_CXMIN, SM_CXMINTRACK */
+        case 29: case 35: return 39;  /* SM_CYMIN, SM_CYMINTRACK */
+        case 30: return 36; case 31: return 22; /* SM_CXSIZE, SM_CYSIZE */
+        case 32: case 33: return 4;   /* SM_CXFRAME, SM_CYFRAME */
+        case 36: case 37: return 4;   /* double-click rectangle */
+        case 43: return BEER_INPUT_MOUSE_BUTTON_COUNT; /* SM_CMOUSEBUTTONS */
+        case 45: case 46: return 2;   /* SM_CXEDGE, SM_CYEDGE */
+        case 49: case 50: return 16;  /* SM_CXSMICON, SM_CYSMICON */
+        case 59: return (u64)sw;  /* SM_CXMAXTRACK */
+        case 60: return (u64)sh;  /* SM_CYMAXTRACK */
+        case 61: return (u64)sw;  /* SM_CXMAXIMIZED */
+        case 62: return (u64)sh;  /* SM_CYMAXIMIZED */
+        case 63: return 3;        /* SM_NETWORK */
+        case 68: case 69: return 4;   /* SM_CXDRAG, SM_CYDRAG */
+        case 71: case 72: return 15;  /* menu check size */
+        case 75: return 1;        /* SM_MOUSEWHEELPRESENT */
+        case 76: case 77: return 0;   /* SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN */
         case 78: return (u64)sw;  /* SM_CXVIRTUALSCREEN */
         case 79: return (u64)sh;  /* SM_CYVIRTUALSCREEN */
-        case 11: case 12: return 16; /* SM_CXICON, SM_CYICON */
+        case 80: return 1;        /* SM_CMONITORS */
+        case 81: return 1;        /* SM_SAMEDISPLAYFORMAT */
+        case 82: return 1;        /* SM_IMMENABLED */
+        case 83: case 84: return 1;   /* focus border */
+        case 91: return 1;        /* SM_MOUSEHORIZONTALWHEELPRESENT */
+        case 92: return 4;        /* SM_CXPADDEDBORDER */
     }
     return 0;
 }
@@ -11804,11 +13363,93 @@ static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
      * safely by the cycle detector instead of hanging -- but it's still just
      * masking, not fixing, the real early fatal-exit bug.) */
     fprintf(stderr, "[IMPL] ExitProcess(%u) -> terminating loader\n", code);
+    {   /* Where did the guest decide to quit? Dump the code around the caller. */
+        const char *dir = getenv("BEER_EXIT_DUMP");
+        u64 grsp = 0;
+        __asm__ volatile("mov %%gs:0xA0, %0" : "=r"(grsp));
+        const u64 *gsp = (const u64 *)grsp;
+        u64 ret = (u64)__builtin_return_address(0);
+        if (grsp > 0x10000) {
+            fprintf(stderr, "[IMPL]   guest stack: %lx %lx %lx %lx %lx %lx\n", gsp[0], gsp[1],
+                    gsp[2], gsp[3], gsp[4], gsp[5]);
+            for (int i = 0; i < 8; ++i)
+                if (gsp[i] >= (u64)g_img && gsp[i] < (u64)g_img + g_img_size) { ret = gsp[i]; break; }
+            if (getenv("BEER_EXIT_STACK_PTRS")) {   /* dereference pointer-looking stack words */
+                for (int i = 0; i < 160; ++i) {
+                    u64 v = gsp[i];
+                    if (v < 0x10000 || v > 0x7fffffffffffull) continue;
+                    u8 buf[48];
+                    struct iovec local = { buf, sizeof(buf) }, remote = { (void *)(uintptr_t)v, sizeof(buf) };
+                    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(buf)) continue;
+                    fprintf(stderr, "[IMPL]   stack[%d] = %lx ->", i, (unsigned long)v);
+                    for (int k = 0; k < 48; ++k) fprintf(stderr, "%s%02x", (k % 8) ? "" : " ", buf[k]);
+                    fputc('\n', stderr);
+                }
+            }
+            if (getenv("BEER_EXIT_STACK")) {
+                for (int i = 0; i < 64; ++i)
+                    if (gsp[i] >= (u64)g_img && gsp[i] < (u64)g_img + g_img_size)
+                        fprintf(stderr, "[IMPL]   stack[%d] = image+%lx (%lx)\n", i,
+                                (unsigned long)(gsp[i] - (u64)g_img), (unsigned long)gsp[i]);
+            }
+        }
+        fprintf(stderr, "[IMPL]   called from %lx (image %lx..%lx)\n", ret, (u64)g_img,
+                (u64)g_img + g_img_size);
+        if (dir && getenv("BEER_EXIT_DUMP_ADDR")) {   /* "hexaddr,hexlen" of guest memory */
+            unsigned long long a = 0, l = 0;
+            if (sscanf(getenv("BEER_EXIT_DUMP_ADDR"), "%llx,%llx", &a, &l) == 2 && l <= (64u << 20)) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/exit_mem.bin", dir);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite((void *)(uintptr_t)a, 1, (size_t)l, f); fclose(f); }
+            }
+        }
+        if (dir && g_img && grsp > 0x10000) {
+            int n = 0;
+            for (int i = 0; i < 24 && n < 4; ++i) {
+                const u64 r = gsp[i];
+                if (r < (u64)g_img + 0x1000 || r >= (u64)g_img + g_img_size) continue;
+                char path[512];
+                snprintf(path, sizeof(path), "%s/exit_code_%d.bin", dir, n);
+                FILE *f = fopen(path, "wb");
+                if (!f) continue;
+                u64 before = 0x800, total = 0x840;
+                if (getenv("BEER_EXIT_DUMP_SPAN")) {   /* bytes before the return address */
+                    before = strtoull(getenv("BEER_EXIT_DUMP_SPAN"), NULL, 0);
+                    total = before + 0x40;
+                    if (r - before < (u64)g_img) { before = r - (u64)g_img; total = before + 0x40; }
+                }
+                const u64 from = r - before;
+                fwrite((void *)from, 1, total, f);
+                fclose(f);
+                fprintf(stderr, "[IMPL]   frame %d: return %lx dumped from %lx\n", n, r, from);
+                ++n;
+            }
+        }
+    }
     fflush(stderr);
     _exit((int)code);
 }
 static u64 __attribute__((ms_abi)) impl_TerminateProcess(u64 h, u32 code)
-    { (void)h; fprintf(stderr, "[IMPL] TerminateProcess(%u) -> terminating loader\n", code); fflush(stderr); _exit((int)code); }
+    { (void)h; fprintf(stderr, "[IMPL] TerminateProcess(%u) -> terminating loader\n", code); dbg_dump_guest_callchain("TerminateProcess"); fflush(stderr); _exit((int)code); }
+/* Anti-debug probes that protection stubs run: a normal, undebugged Windows machine answers these
+ * with "no debugger", success and zero. */
+static u64 __attribute__((ms_abi)) impl_CheckRemoteDebuggerPresent(u64 process, u32 *present)
+{ (void)process; if (present) *present = 0; return 1; }
+static u64 __attribute__((ms_abi)) impl_GetErrorMode(void) { return 0; }
+static u64 __attribute__((ms_abi)) impl_Wow64GetSetThreadContext(u64 thread, void *context)
+{ (void)thread; (void)context; g_last_error = 87; return 0; }      /* FALSE: not a WOW64 thread */
+static u64 __attribute__((ms_abi)) impl_NtSetInformationThread(u64 thread, u32 info_class, void *info, u32 size)
+{ (void)thread; (void)info_class; (void)info; (void)size; return 0; }   /* STATUS_SUCCESS (also ThreadHideFromDebugger) */
+static u64 __attribute__((ms_abi)) impl_FatalAppExitA(u32 action, const char *message)
+{
+    (void)action;
+    fprintf(stderr, "[IMPL] FatalAppExitA: %s\n", message ? message : "(null)");
+    dbg_dump_guest_callchain("FatalAppExitA");
+    fflush(stderr);
+    _exit(1);
+}
+
 static u64 __attribute__((ms_abi)) impl_CorExitProcess(u32 code)
     { fprintf(stderr, "[IMPL] CorExitProcess(%u) -> terminating loader\n", code); dbg_dump_guest_callchain("CorExitProcess"); fflush(stderr); _exit((int)code); }
 static u64 __attribute__((ms_abi)) impl_FatalAppExitW(u32 action, const u16 *message)
@@ -12250,6 +13891,30 @@ impl_CreateDirectoryW(const u16 *path, void *security_attributes)
     return impl_CreateDirectoryA(narrow, security_attributes);
 }
 
+/* SHCreateDirectoryExW: creates the whole path; returns a Win32 error code (0 = created). */
+static u64 __attribute__((ms_abi))
+impl_SHCreateDirectoryExW(void *window, const u16 *path, void *security_attributes)
+{
+    (void)window; (void)security_attributes;
+    if (!path || !*path) return 123;   /* ERROR_INVALID_NAME */
+    char narrow[4096], host_path[PATH_MAX];
+    size_t i = 0;
+    for (; path[i] && i + 1 < sizeof(narrow); i++) narrow[i] = (char)(path[i] & 0x7f);
+    if (path[i]) return 206;
+    narrow[i] = 0;
+    if (!resolve_windows_host_path(narrow, host_path, sizeof(host_path))) return 206;
+    struct stat st;
+    if (stat(host_path, &st) == 0) return S_ISDIR(st.st_mode) ? 183u : 80u;   /* ALREADY_EXISTS / FILE_EXISTS */
+    for (char *c = host_path + 1; *c; ++c) {
+        if (*c != '/') continue;
+        *c = 0;
+        if (mkdir(host_path, 0777) != 0 && errno != EEXIST) { *c = '/'; return errno == EACCES ? 5u : 3u; }
+        *c = '/';
+    }
+    if (mkdir(host_path, 0777) != 0 && errno != EEXIST) return errno == EACCES ? 5u : 3u;
+    return 0;
+}
+
 /* ---- CompareStringEx / GetLocaleInfoEx / LCMapStringEx ---- */
 static u64 __attribute__((ms_abi))
 impl_CompareStringEx(u64 locale, u32 flags, const u16 *s1, int n1,
@@ -12369,6 +14034,97 @@ impl_FileTimeToSystemTime(const u64 *ft, u64 *st)
 /* ---- GetSystemDefaultLangID / GetSystemDirectory ---- */
 static u64 __attribute__((ms_abi))
 impl_GetSystemDefaultLangID(void) { return 0x0409; /* en-US */ }
+
+/* ---- OLEAUT32 BSTR ------------------------------------------------------
+ * A BSTR points at UTF-16 data preceded by a 32-bit byte length and followed by a
+ * 16-bit NUL.  Pascal, Delphi and COM code allocate every wide string through these. */
+static u16 *bstr_alloc(const u16 *src, u32 chars, int copy)
+{
+    size_t bytes = (size_t)chars * 2;
+    u8 *base = malloc(16 + bytes + 2 + 16);
+    if (!base) return NULL;
+    u16 *str = (u16 *)(base + 16);
+    memcpy(base, &base, sizeof(base));                   /* header: original malloc pointer */
+    u32 length = (u32)bytes;
+    memcpy((u8 *)str - 4, &length, 4);
+    if (copy && src) memcpy(str, src, bytes);
+    else memset(str, 0, bytes);
+    str[chars] = 0;
+    return str;
+}
+
+static u64 __attribute__((ms_abi)) impl_SysAllocStringLen(const u16 *src, u32 chars)
+{
+    return (u64)(uintptr_t)bstr_alloc(src, chars, src != NULL);
+}
+
+static u64 __attribute__((ms_abi)) impl_SysAllocString(const u16 *src)
+{
+    if (!src) return 0;
+    u32 n = 0;
+    while (src[n]) ++n;
+    return (u64)(uintptr_t)bstr_alloc(src, n, 1);
+}
+
+static u64 __attribute__((ms_abi)) impl_SysAllocStringByteLen(const char *src, u32 bytes)
+{
+    u16 *str = bstr_alloc(NULL, (bytes + 1) / 2, 0);
+    if (!str) return 0;
+    u32 length = bytes;
+    memcpy((u8 *)str - 4, &length, 4);
+    if (src) memcpy(str, src, bytes);
+    ((u8 *)str)[bytes] = 0;
+    if (bytes & 1) ((u8 *)str)[bytes + 1] = 0;
+    return (u64)(uintptr_t)str;
+}
+
+static u64 __attribute__((ms_abi)) impl_SysFreeString(u16 *str)
+{
+    if (!str) return 0;
+    u8 *base;
+    memcpy(&base, (u8 *)str - 16, sizeof(base));
+    free(base);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_SysStringLen(const u16 *str)
+{
+    if (!str) return 0;
+    u32 bytes;
+    memcpy(&bytes, (const u8 *)str - 4, 4);
+    return bytes / 2;
+}
+
+static u64 __attribute__((ms_abi)) impl_SysStringByteLen(const u16 *str)
+{
+    if (!str) return 0;
+    u32 bytes;
+    memcpy(&bytes, (const u8 *)str - 4, 4);
+    return bytes;
+}
+
+static u64 __attribute__((ms_abi)) impl_SysReAllocStringLen(u16 **slot, const u16 *src, u32 chars)
+{
+    if (!slot) return 0;
+    u16 *fresh = bstr_alloc(NULL, chars, 0);
+    if (!fresh) return 0;
+    if (src) memcpy(fresh, src, (size_t)chars * 2);
+    else if (*slot) {
+        u32 old = (u32)impl_SysStringLen(*slot);
+        memcpy(fresh, *slot, (size_t)(old < chars ? old : chars) * 2);
+    }
+    fresh[chars] = 0;
+    if (*slot) impl_SysFreeString(*slot);
+    *slot = fresh;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi)) impl_SysReAllocString(u16 **slot, const u16 *src)
+{
+    u32 n = 0;
+    while (src && src[n]) ++n;
+    return impl_SysReAllocStringLen(slot, src, n);
+}
 
 static u64 __attribute__((ms_abi))
 impl_GetSystemDirectoryW(u16 *buffer, u32 size)
@@ -13536,6 +15292,136 @@ beer_dinput_device_ok(BeerDirectInputDevice *self, u64 a, u64 b, u64 c)
     return self ? DI_OK : DIERR_INVALIDPARAM;
 }
 
+#define BEER_DI_LOGGED_STUB(NAME, LABEL) \
+static u64 __attribute__((ms_abi)) \
+NAME(BeerDirectInputDevice *self, u64 a, u64 b, u64 c) \
+{ \
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) \
+        fprintf(stderr, "[DINPUT] stub call %s kind=%d args=%llx,%llx,%llx\n", LABEL, \
+                self ? self->kind : -1, (unsigned long long)a, (unsigned long long)b, \
+                (unsigned long long)c); \
+    return self ? DI_OK : DIERR_INVALIDPARAM; \
+}
+/* DIDEVICEOBJECTINSTANCEW (DirectInput 8): 576 bytes. */
+typedef struct {
+    u32 size;
+    u8 guid_type[16];
+    u32 offset;
+    u32 type;
+    u32 flags;
+    u16 name[260];
+    u32 ff_max_force;
+    u32 ff_force_resolution;
+    u16 collection_number;
+    u16 designator_index;
+    u16 usage_page;
+    u16 usage;
+    u32 dimension;
+    u16 exponent;
+    u16 reserved;
+} BEER_DIDEVICEOBJECTINSTANCEW;
+_Static_assert(sizeof(BEER_DIDEVICEOBJECTINSTANCEW) == 576, "DIDEVICEOBJECTINSTANCEW");
+
+static void
+beer_di_set_name(BEER_DIDEVICEOBJECTINSTANCEW *obj, const char *name)
+{
+    size_t i = 0;
+    for (; name[i] && i < 259; ++i) obj->name[i] = (u16)(u8)name[i];
+    obj->name[i] = 0;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_EnumObjects(BeerDirectInputDevice *self, u64 callback,
+                               u64 ref, u32 flags)
+{
+    if (!self || !callback) return DIERR_INVALIDPARAM;
+    typedef u32 __attribute__((ms_abi)) (*ObjectCallback)(const void *, void *);
+    /* GUID_XAxis/YAxis/ZAxis/Button/Key share the 0000-11CF-BFC7-444553540000 tail. */
+    static const u8 tail[8] = {0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00};
+    BEER_DIDEVICEOBJECTINSTANCEW obj;
+    struct item { u32 d1; u16 d2; u16 d3; u32 type; u32 flags; u32 offset; const char *name; };
+    struct item items[272]; u32 count = 0;
+    static char names[272][16];
+    if (self->kind == 1) {
+        static const char *const axis_names[3] = {"X-axis", "Y-axis", "Wheel"};
+        static const u32 axis_guid[3] = {0xa36d02e0u, 0xa36d02e1u, 0xa36d02e2u};
+        for (u32 i = 0; i < 3; ++i) {
+            u32 off = self->data_size ? self->axis_offsets[i] : i * 4u;
+            if (off == UINT32_MAX) continue;
+            items[count++] = (struct item){axis_guid[i], 0xc9f3, 0x11cf,
+                0x1u | (i << 8), 0x100u, off, axis_names[i]};
+        }
+        for (u32 i = 0; i < beer_dinput_button_count(self->kind); ++i) {
+            u32 off = self->data_size ? self->button_offsets[i] : 12u + i;
+            if (off == UINT32_MAX) continue;
+            snprintf(names[i], sizeof(names[i]), "Button %u", i);
+            items[count++] = (struct item){0xa36d02f0u, 0xc9f3, 0x11cf,
+                0x4u | (i << 8), 0, off, names[i]};
+        }
+    } else {
+        for (u32 i = 1; i < 0xeeu; ++i) {
+            u32 off = self->data_size ? self->key_offsets[i] : i;
+            if (off == UINT32_MAX) continue;
+            snprintf(names[i], sizeof(names[i]), "Key %02x", i);
+            items[count++] = (struct item){0x55728220u, 0xd33c, 0x11cf,
+                0x4u | (i << 8), 0, off, names[i]};
+        }
+    }
+    u32 delivered = 0;
+    for (u32 i = 0; i < count; ++i) {
+        if (flags && !(items[i].type & flags & 0xffu)) continue;
+        memset(&obj, 0, sizeof(obj));
+        obj.size = sizeof(obj);
+        memcpy(obj.guid_type, &items[i].d1, 4);
+        memcpy(obj.guid_type + 4, &items[i].d2, 2);
+        memcpy(obj.guid_type + 6, &items[i].d3, 2);
+        memcpy(obj.guid_type + 8, tail, 8);
+        obj.offset = items[i].offset;
+        obj.type = items[i].type;
+        obj.flags = items[i].flags;
+        obj.dimension = 0;
+        beer_di_set_name(&obj, items[i].name);
+        ++delivered;
+        if (!((ObjectCallback)(uintptr_t)callback)(&obj, (void *)(uintptr_t)ref))
+            break; /* DIENUM_STOP */
+    }
+    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[DINPUT] EnumObjects kind=%d flags=0x%x delivered=%u of %u\n",
+                self->kind, flags, delivered, count);
+    return DI_OK;
+}
+
+static u64 __attribute__((ms_abi))
+beer_dinput_device_GetProperty(BeerDirectInputDevice *self, u64 property,
+                               BEER_DIPROPHEADER *header)
+{
+    if (!self || !header) return DIERR_INVALIDPARAM;
+    if (property == 12) { /* DIPROP_GUIDANDPATH: header, GUID, WCHAR path[260] */
+        u8 *base = (u8 *)header;
+        if (header->size >= sizeof(*header) + 16 + 2 * 260) {
+            memset(base + sizeof(*header), 0, header->size - sizeof(*header));
+            static const u8 sysmouse[16] = {0x60,0x2b,0x1d,0x6f,0xa0,0xd5,0xcf,0x11,
+                                            0xbf,0xc7,0x44,0x45,0x53,0x54,0x00,0x00};
+            static const u8 syskeyboard[16] = {0x61,0x2b,0x1d,0x6f,0xa0,0xd5,0xcf,0x11,
+                                               0xbf,0xc7,0x44,0x45,0x53,0x54,0x00,0x00};
+            memcpy(base + sizeof(*header), self->kind == 1 ? sysmouse : syskeyboard, 16);
+            const char *path = self->kind == 1
+                ? BEER_RAW_MOUSE_DEVICE_NAME_A
+                : BEER_RAW_KEYBOARD_DEVICE_NAME_A;
+            u16 *dst = (u16 *)(base + sizeof(*header) + 16);
+            for (size_t i = 0; path[i] && i < 259; ++i) dst[i] = (u16)(u8)path[i];
+        }
+    }
+    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[DINPUT] GetProperty kind=%d property=%llu size=%u\n",
+                self->kind, (unsigned long long)property, header->size);
+    return DI_OK;
+}
+BEER_DI_LOGGED_STUB(beer_dinput_device_SetEventNotification, "SetEventNotification")
+BEER_DI_LOGGED_STUB(beer_dinput_device_GetObjectInfo, "GetObjectInfo")
+BEER_DI_LOGGED_STUB(beer_dinput_device_GetDeviceInfo, "GetDeviceInfo")
+BEER_DI_LOGGED_STUB(beer_dinput_device_Initialize, "Initialize")
+
 static u64 __attribute__((ms_abi))
 beer_dinput_device_GetCapabilities(BeerDirectInputDevice *self,
                                    BEER_DIDEVCAPS *caps)
@@ -13545,7 +15431,9 @@ beer_dinput_device_GetCapabilities(BeerDirectInputDevice *self,
     u32 caller_size = caps->size;
     memset(caps, 0, sizeof(*caps));
     caps->size = caller_size;
-    caps->device_type = self->kind == 1 ? 0x12u : 0x13u;
+    caps->flags = 0x1u; /* DIDC_ATTACHED */
+    /* DI8DEVTYPE_MOUSE|TRADITIONAL, DI8DEVTYPE_KEYBOARD|PCENH */
+    caps->device_type = self->kind == 1 ? 0x0112u : 0x0413u;
     caps->axes = self->kind == 1 ? 3u : 0u;
     caps->buttons = beer_dinput_button_count(self->kind);
     if (getenv("BEER_INPUT_DIAGNOSTICS"))
@@ -13625,6 +15513,16 @@ beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
                                   void *state)
 {
     if (!self || !state || size == 0) return DIERR_INVALIDPARAM;
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        static _Atomic(u32) sz_logs;
+        if (atomic_fetch_add(&sz_logs, 1) < 12)
+            fprintf(stderr, "[DINPUT] GetDeviceState kind=%d size=%u data_size=%u caller=%p\n",
+                    self->kind, size, self->data_size, __builtin_return_address(0));
+    }
+    /* Real DirectInput rejects a cbData that differs from the data format
+     * size. RE8 probes every enumerated device with a gamepad-sized (272 byte)
+     * buffer and treats success as a connected pad. */
+    if (self->data_size && size != self->data_size) return DIERR_INVALIDPARAM;
     collect_native_window_events();
     /* Polling before an explicit Acquire is common. Once a foreground window
      * is focused, expose the same acquisition state that Acquire would grant. */
@@ -13668,7 +15566,9 @@ beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
         int any = 0;
         for (int b = 0; b < 8; ++b) any |= g_input.mouse_buttons[b] & 0x80;
         static _Atomic(u32) button_logs;
-        if (any && atomic_fetch_add(&button_logs, 1) < 200)
+        int non_left = 0;
+        for (int b = 1; b < 8; ++b) non_left |= g_input.mouse_buttons[b] & 0x80;
+        if (any && (non_left || atomic_fetch_add(&button_logs, 1) < 200))
             fprintf(stderr, "[DINPUT] mouse buttons held: %02x %02x %02x %02x %02x %02x %02x %02x (data_size=%u offs=%u,%u,%u,%u,%u)\n",
                     g_input.mouse_buttons[0], g_input.mouse_buttons[1], g_input.mouse_buttons[2],
                     g_input.mouse_buttons[3], g_input.mouse_buttons[4], g_input.mouse_buttons[5],
@@ -13728,6 +15628,14 @@ beer_dinput_device_SetDataFormat(BeerDirectInputDevice *self,
             self->button_offsets[instance] = object->offset;
     }
     self->data_size = format->data_size;
+    if (getenv("BEER_INPUT_DIAGNOSTICS") && self->kind == 1) {
+        for (u32 i = 0; i < format->object_count; ++i) {
+            const BEER_DIOBJECTDATAFORMAT *o =
+                (const BEER_DIOBJECTDATAFORMAT *)((const u8 *)format->objects + (size_t)i * format->object_size);
+            fprintf(stderr, "[DINPUT]   mouse format object %u: ofs=%u type=0x%08x flags=0x%x guid=%s\n",
+                    i, o->offset, o->type, o->flags, o->guid ? "set" : "null");
+        }
+    }
     if (getenv("BEER_INPUT_DIAGNOSTICS")) {
         u32 mapped = 0;
         if (self->kind == 1) {
@@ -13813,20 +15721,20 @@ static void *g_dinput_device_vtable[32] = {
     (void *)beer_dinput_device_AddRef,
     (void *)beer_dinput_device_Release,
     (void *)beer_dinput_device_GetCapabilities,
-    (void *)beer_dinput_device_ok, /* EnumObjects */
-    (void *)beer_dinput_device_ok, /* GetProperty */
+    (void *)beer_dinput_device_EnumObjects,
+    (void *)beer_dinput_device_GetProperty,
     (void *)beer_dinput_device_SetProperty,
     (void *)beer_dinput_device_Acquire,
     (void *)beer_dinput_device_Unacquire,
     (void *)beer_dinput_device_GetDeviceState,
     (void *)beer_dinput_device_GetDeviceData,
     (void *)beer_dinput_device_SetDataFormat,
-    (void *)beer_dinput_device_ok, /* SetEventNotification */
+    (void *)beer_dinput_device_SetEventNotification,
     (void *)beer_dinput_device_SetCooperativeLevel,
-    (void *)beer_dinput_device_ok, /* GetObjectInfo */
-    (void *)beer_dinput_device_ok, /* GetDeviceInfo */
+    (void *)beer_dinput_device_GetObjectInfo,
+    (void *)beer_dinput_device_GetDeviceInfo,
     (void *)beer_dinput_device_ok, /* RunControlPanel */
-    (void *)beer_dinput_device_ok, /* Initialize */
+    (void *)beer_dinput_device_Initialize,
     (void *)beer_dinput_device_ok, (void *)beer_dinput_device_ok,
     (void *)beer_dinput_device_ok, (void *)beer_dinput_device_ok,
     (void *)beer_dinput_device_ok, (void *)beer_dinput_device_ok,
@@ -14715,9 +16623,12 @@ impl___acrt_iob_func(u32 index)
 }
 
 /* ---- Impl dispatch table ---- */
+#include "platform/win32_file_search.inc"
+#include "platform/win32_missing_exports.inc"
 typedef struct { const char *name; ImplFn fn; } ImplEntry;
 
 static ImplEntry g_impls[] = {
+#include "platform/win32_missing_exports_table.inc"
     /* UCRT/VCRUNTIME primitives */
     {"memcpy",                                  (ImplFn)impl_memcpy},
     {"memmove",                                 (ImplFn)impl_memmove},
@@ -14766,6 +16677,8 @@ static ImplEntry g_impls[] = {
     {"VerSetConditionMask",                     (ImplFn)impl_VerSetConditionMask},
     {"VerifyVersionInfoW",                      (ImplFn)impl_VerifyVersionInfoW},
     {"RtlGetVersion",                           (ImplFn)impl_RtlGetVersion},
+    {"GetVersionExW",                           (ImplFn)impl_GetVersionExW},
+    {"GetVersionExA",                           (ImplFn)impl_GetVersionExA},
     {"WinHttpCheckPlatform",                    (ImplFn)impl_WinHttpCheckPlatform},
     {"GetAdaptersAddresses",                    (ImplFn)impl_GetAdaptersAddresses},
     /* Critical sections */
@@ -14788,6 +16701,14 @@ static ImplEntry g_impls[] = {
     {"GetModuleFileNameA",                    (ImplFn)impl_GetModuleFileNameA},
     {"GetProcAddress",                        (ImplFn)impl_GetProcAddress},
     {"GetSystemDirectoryA",                   (ImplFn)impl_GetSystemDirectoryA},
+    {"SysAllocString",                        (ImplFn)impl_SysAllocString},
+    {"SysAllocStringLen",                     (ImplFn)impl_SysAllocStringLen},
+    {"SysAllocStringByteLen",                 (ImplFn)impl_SysAllocStringByteLen},
+    {"SysReAllocString",                      (ImplFn)impl_SysReAllocString},
+    {"SysReAllocStringLen",                   (ImplFn)impl_SysReAllocStringLen},
+    {"SysFreeString",                         (ImplFn)impl_SysFreeString},
+    {"SysStringLen",                          (ImplFn)impl_SysStringLen},
+    {"SysStringByteLen",                      (ImplFn)impl_SysStringByteLen},
     {"GetSystemDirectoryW",                   (ImplFn)impl_GetSystemDirectoryW},
     {"GetWindowsDirectoryA",                  (ImplFn)impl_GetWindowsDirectoryA},
     {"GetWindowsDirectoryW",                  (ImplFn)impl_GetWindowsDirectoryW},
@@ -14813,6 +16734,13 @@ static ImplEntry g_impls[] = {
     {"GetLastError",                          (ImplFn)impl_GetLastError},
     {"SetLastError",                          (ImplFn)impl_SetLastError},
     /* Misc */
+    {"CheckRemoteDebuggerPresent",            (ImplFn)impl_CheckRemoteDebuggerPresent},
+    {"GetErrorMode",                          (ImplFn)impl_GetErrorMode},
+    {"Wow64GetThreadContext",                 (ImplFn)impl_Wow64GetSetThreadContext},
+    {"Wow64SetThreadContext",                 (ImplFn)impl_Wow64GetSetThreadContext},
+    {"NtSetInformationThread",                (ImplFn)impl_NtSetInformationThread},
+    {"ZwSetInformationThread",                (ImplFn)impl_NtSetInformationThread},
+    {"FatalAppExitA",                         (ImplFn)impl_FatalAppExitA},
     {"IsDebuggerPresent",                     (ImplFn)impl_IsDebuggerPresent},
     {"IsProcessorFeaturePresent",             (ImplFn)impl_IsProcessorFeaturePresent},
     {"AddVectoredExceptionHandler",            (ImplFn)impl_AddVectoredExceptionHandler},
@@ -14875,6 +16803,16 @@ static ImplEntry g_impls[] = {
     {"CryptGetHashParam",                     (ImplFn)impl_CryptGetHashParam},
     {"CryptDestroyHash",                      (ImplFn)impl_CryptDestroyHash},
     {"SystemFunction036",                     (ImplFn)impl_SystemFunction036},
+    {"BCryptOpenAlgorithmProvider", (ImplFn)beer_BCryptOpenAlgorithmProvider},
+    {"BCryptCloseAlgorithmProvider", (ImplFn)beer_BCryptCloseAlgorithmProvider},
+    {"BCryptGetProperty", (ImplFn)beer_BCryptGetProperty},
+    {"BCryptCreateHash", (ImplFn)beer_BCryptCreateHash},
+    {"BCryptHashData", (ImplFn)beer_BCryptHashData},
+    {"BCryptFinishHash", (ImplFn)beer_BCryptFinishHash},
+    {"BCryptDuplicateHash", (ImplFn)beer_BCryptDuplicateHash},
+    {"BCryptDestroyHash", (ImplFn)beer_BCryptDestroyHash},
+    {"BCryptHash", (ImplFn)beer_BCryptHash},
+    {"BCryptGenRandom", (ImplFn)beer_BCryptGenRandom},
     /* Steam */
     {"SteamAPI_Init",                         (ImplFn)impl_SteamAPI_Init},
     {"SteamAPI_RestartAppIfNecessary",        (ImplFn)impl_SteamAPI_RestartAppIfNecessary},
@@ -14882,6 +16820,12 @@ static ImplEntry g_impls[] = {
     {"SteamAPI_RunCallbacks",                 (ImplFn)impl_SteamAPI_RunCallbacks},
     {"SteamAPI_IsSteamRunning",               (ImplFn)impl_SteamAPI_IsSteamRunning},
     {"SteamInternal_ContextInit",              (ImplFn)impl_SteamInternal_ContextInit},
+    {"CreateInterface",                        (ImplFn)impl_SteamClient_CreateInterface},
+    {"Steam_BGetCallback",                     (ImplFn)impl_Steam_BGetCallback},
+    {"Steam_FreeLastCallback",                 (ImplFn)impl_Steam_FreeLastCallback},
+    {"Steam_GetAPICallResult",                 (ImplFn)impl_Steam_GetAPICallResult},
+    {"Steam_ReleaseThreadLocalMemory",         (ImplFn)impl_Steam_ReleaseThreadLocalMemory},
+    {"Steam_NotifyMissingInterface",           (ImplFn)impl_Steam_NotifyMissingInterface},
     {"SteamInternal_CreateInterface",         (ImplFn)impl_SteamInternal_CreateInterface},
     {"SteamInternal_FindOrCreateUserInterface", (ImplFn)impl_SteamInternal_FindOrCreateUserInterface},
     {"SteamInternal_FindOrCreateGameServerInterface", (ImplFn)impl_SteamInternal_FindOrCreateGameServerInterface},
@@ -14920,8 +16864,13 @@ static ImplEntry g_impls[] = {
     {"closesocket",                             (ImplFn)impl_closesocket},
     {"getsockname",                             (ImplFn)impl_getsockname},
     {"inet_pton",                               (ImplFn)impl_inet_pton},
+    {"inet_ntop",                               (ImplFn)impl_inet_ntop},
+    {"gethostname",                             (ImplFn)impl_gethostname},
     /* NTDLL */
     {"NtCreateSection",                      (ImplFn)impl_NtCreateSection},
+    {"ZwCreateSection",                      (ImplFn)impl_NtCreateSection},
+    {"ZwMapViewOfSection",                   (ImplFn)impl_NtMapViewOfSection},
+    {"ZwUnmapViewOfSection",                 (ImplFn)impl_NtUnmapViewOfSection},
     {"NtMapViewOfSection",                   (ImplFn)impl_NtMapViewOfSection},
     {"NtUnmapViewOfSection",                 (ImplFn)impl_NtUnmapViewOfSection},
     {"NtQuerySystemInformation",              (ImplFn)impl_NtQuerySystemInformation},
@@ -15202,6 +17151,7 @@ static ImplEntry g_impls[] = {
     {"GetFileSize",                           (ImplFn)impl_GetFileSize},
     {"GetFileSizeEx",                         (ImplFn)impl_GetFileSizeEx},
     {"SetFilePointer",                        (ImplFn)impl_SetFilePointer},
+    {"SetFilePointerEx",                      (ImplFn)impl_SetFilePointerEx},
     {"SetEndOfFile",                          (ImplFn)impl_SetEndOfFile},
     {"CopyFileA",                             (ImplFn)impl_CopyFileA},
     {"CopyFileW",                             (ImplFn)impl_CopyFileW},
@@ -15211,6 +17161,12 @@ static ImplEntry g_impls[] = {
     {"ReplaceFileW",                          (ImplFn)impl_ReplaceFileW},
     {"GetFileAttributesA",                    (ImplFn)impl_GetFileAttributesA},
     {"GetFileAttributesW",                    (ImplFn)impl_GetFileAttributesW},
+    {"GetFileVersionInfoSizeW",               (ImplFn)impl_GetFileVersionInfoSizeW},
+    {"GetFileVersionInfoSizeA",               (ImplFn)impl_GetFileVersionInfoSizeA},
+    {"GetFileVersionInfoW",                   (ImplFn)impl_GetFileVersionInfoW},
+    {"GetFileVersionInfoA",                   (ImplFn)impl_GetFileVersionInfoA},
+    {"VerQueryValueW",                        (ImplFn)impl_VerQueryValueW},
+    {"VerQueryValueA",                        (ImplFn)impl_VerQueryValueA},
     {"PathFileExistsA",                       (ImplFn)impl_PathFileExistsA},
     {"PathFileExistsW",                       (ImplFn)impl_PathFileExistsW},
     {"GetPrivateProfileStringW",              (ImplFn)impl_GetPrivateProfileStringW},
@@ -15271,6 +17227,9 @@ static ImplEntry g_impls[] = {
     {"GetMessageExtraInfo",                   (ImplFn)impl_GetMessageExtraInfo},
     {"RegisterRawInputDevices",               (ImplFn)impl_RegisterRawInputDevices},
     {"GetRegisteredRawInputDevices",          (ImplFn)impl_GetRegisteredRawInputDevices},
+    {"GetRawInputDeviceList",                 (ImplFn)impl_GetRawInputDeviceList},
+    {"GetRawInputDeviceInfoA",                (ImplFn)impl_GetRawInputDeviceInfoA},
+    {"GetRawInputDeviceInfoW",                (ImplFn)impl_GetRawInputDeviceInfoW},
     {"GetRawInputData",                       (ImplFn)impl_GetRawInputData},
     {"SendInput",                             (ImplFn)impl_SendInput},
     {"XInputGetState",                        (ImplFn)impl_XInputDisconnected},
@@ -15318,6 +17277,8 @@ static ImplEntry g_impls[] = {
     {"SetWindowDisplayAffinity",              (ImplFn)impl_SetWindowDisplayAffinity},
     {"GetWindowDisplayAffinity",              (ImplFn)impl_GetWindowDisplayAffinity},
     {"EnumDisplayMonitors",                   (ImplFn)impl_EnumDisplayMonitors},
+    {"EnumDisplayDevicesW",                   (ImplFn)impl_EnumDisplayDevicesW},
+    {"EnumDisplayDevicesA",                   (ImplFn)impl_EnumDisplayDevicesA},
     {"EnumDisplaySettingsW",                  (ImplFn)impl_EnumDisplaySettingsW},
     {"EnumDisplaySettingsA",                  (ImplFn)impl_EnumDisplaySettingsA},
     {"EnumDisplaySettingsExW",                (ImplFn)impl_EnumDisplaySettingsW},
@@ -15396,6 +17357,7 @@ static ImplEntry g_impls[] = {
     {"LCMapStringEx",                         (ImplFn)impl_LCMapStringEx},
     /* Directory */
     {"CreateDirectoryW",                      (ImplFn)impl_CreateDirectoryW},
+    {"SHCreateDirectoryExW",                  (ImplFn)impl_SHCreateDirectoryExW},
     {"CreateDirectoryA",                      (ImplFn)impl_CreateDirectoryA},
     {"GetCurrentDirectoryW",                  (ImplFn)impl_GetCurrentDirectoryW},
     {"GetCurrentDirectoryA",                  (ImplFn)impl_GetCurrentDirectoryA},
@@ -15423,6 +17385,79 @@ static ImplFn find_impl(const char *fn_name)
         if (strcmp(g_impls[i].name, fn_name) == 0)
             return g_impls[i].fn;
     return NULL;
+}
+
+/* Populate each fake system module's export directory with every implemented function, so guests
+ * that walk the PE export table themselves (protectors, custom import resolvers) find them. Each
+ * export points at a small jmp stub that forwards to the normal implementation thunk. */
+static int fake_pe_name_cmp(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static void fake_pe_exports_build(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    static const struct { u64 base; const char *name; } modules[] = {
+        { HMOD_K32, "kernel32.dll" }, { HMOD_USER32, "user32.dll" },
+        { HMOD_NTDLL, "ntdll.dll" }, { HMOD_ADVAPI, "advapi32.dll" } };
+    size_t count = 0;
+    while (g_impls[count].name) ++count;
+    g_fake_pe_ready = 0;
+    const char **names = malloc(count * sizeof(*names));
+    u64 *targets = malloc(count * sizeof(*targets));
+    if (!names || !targets) { free(names); free(targets); return; }
+    size_t used = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const char *n = g_impls[i].name;
+        int dup = 0;
+        for (size_t j = 0; j < used && !dup; ++j) dup = !strcmp(names[j], n);
+        if (!dup) names[used++] = n;
+    }
+    qsort(names, used, sizeof(*names), fake_pe_name_cmp);
+    g_fake_pe_names = names;
+    for (size_t i = 0; i < used; ++i) targets[i] = impl_GetProcAddress(HMOD_K32, names[i]);
+    for (size_t m = 0; m < sizeof(modules) / sizeof(*modules); ++m) {
+        u8 *p = (u8 *)modules[m].base;
+        if (mprotect(p, FAKE_PE_SIZE, PROT_READ | PROT_WRITE) != 0) continue;
+        u32 off = 0x1000;
+        u32 funcs = off;  off += (u32)(used * 4);
+        u32 name_rvas = off;  off += (u32)(used * 4);
+        u32 ordinals = off;  off += (u32)((used * 2 + 15) & ~(size_t)15);
+        u32 stubs = off;  off += (u32)(used * FAKE_PE_STUB_SLOT);
+        g_fake_pe_stub_offset = stubs;
+        u32 strings = off;
+        for (size_t i = 0; i < used; ++i) {
+            size_t len = strlen(names[i]) + 1;
+            if ((size_t)strings + len + 0x10 > FAKE_PE_SIZE) { used = i; break; }
+            memcpy(p + strings, names[i], len);
+            *(u32 *)(p + name_rvas + i * 4) = strings;
+            *(u16 *)(p + ordinals + i * 2) = (u16)i;
+            u8 *stub = p + stubs + i * FAKE_PE_STUB_SLOT;
+            memset(stub, 0xCC, FAKE_PE_STUB_SLOT);
+            stub[0] = 0x48; stub[1] = 0xB8; *(u64 *)(stub + 2) = targets[i];   /* mov rax, imm64 */
+            stub[10] = 0xFF; stub[11] = 0xE0;                                  /* jmp rax */
+            *(u32 *)(p + funcs + i * 4) = stubs + (u32)(i * FAKE_PE_STUB_SLOT);
+            strings += (u32)len;
+        }
+        u8 *exp = p + 0x400;
+        *(u32 *)(exp + 20) = (u32)used;       /* NumberOfFunctions */
+        *(u32 *)(exp + 24) = (u32)used;       /* NumberOfNames */
+        *(u32 *)(exp + 28) = funcs;
+        *(u32 *)(exp + 32) = name_rvas;
+        *(u32 *)(exp + 36) = ordinals;
+        /* Export data lives past the header page: point the directory at its own size. */
+        u8 *nt = p + 0x80, *opt = nt + 24;
+        *(u32 *)(opt + 116) = 0x28;
+        mprotect(p, 0x1000, PROT_READ);
+        mprotect(p + 0x1000, FAKE_PE_SIZE - 0x1000, PROT_READ | PROT_EXEC);
+    }
+    g_fake_pe_count = used;
+    g_fake_pe_ready = 1;
+    fprintf(stderr, "[PE] fake system modules: %zu exports each\n", used);
+    free(targets);
 }
 
 /* ── Utilities ──────────────────────────────────────────────────── */
@@ -15834,11 +17869,17 @@ static void guest_dll_resolve_imports(GuestDll *dll)
     }
 }
 
+static GuestDll *guest_dll_finish(GuestDll *dll);
 static GuestDll *guest_dll_load(const char *name)
 {
     GuestDll *existing = guest_dll_find(name);
     if (existing) return existing;
     if (g_guest_dll_count >= MAX_GUEST_DLLS || !g_tramp) return NULL;
+    {   /* API-set contracts forward into the runtime; never map their stub images (fixed-base collisions). */
+        char lower_name[64];
+        lowercase_dll_basename(name, lower_name, sizeof(lower_name));
+        if (!strncmp(lower_name, "api-ms-", 7) || !strncmp(lower_name, "ext-ms-", 7)) return NULL;
+    }
 
     char path[PATH_MAX];
     if (!build_guest_dll_path(name, path, sizeof(path))) return NULL;
@@ -15867,7 +17908,13 @@ static GuestDll *guest_dll_load(const char *name)
     strncpy(dll->path, path, sizeof(dll->path) - 1);
     dll->image_size = nt->opt.sz_image;
     dll->preferred_base = nt->opt.imagebase;
-    dll->image = mmap((void *)dll->preferred_base, dll->image_size,
+    /* 0x180000000 is the default image base of most MSVC x64 DLLs, including packed/embedded ones
+     * that a protector maps itself at their preferred base. On Windows this range is free because
+     * system DLLs sit at high ASLR addresses, so never occupy it with our own DLL images. */
+    const int reserved_default_base = !getenv("BEER_ALLOW_180_BASE") && dll->preferred_base >= 0x180000000ull &&
+                                      dll->preferred_base < 0x190000000ull;
+    dll->image = reserved_default_base ? MAP_FAILED :
+                 mmap((void *)dll->preferred_base, dll->image_size,
                       PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (dll->image == MAP_FAILED)
@@ -15890,7 +17937,14 @@ static GuestDll *guest_dll_load(const char *name)
     }
     munmap(file, (size_t)st.st_size);
     ++g_guest_dll_count; /* publish before resolving recursive dependencies */
+    return guest_dll_finish(dll);
+}
 
+static GuestDll *guest_dll_finish(GuestDll *dll)
+{
+    /* An image mapped by someone else (a protector serving a virtual file) arrives with its final
+     * section protections; relocations and imports need it writable until the end of this function. */
+    mprotect((void *)dll->image, (dll->image_size + 0xfff) & ~(size_t)0xfff, PROT_READ | PROT_WRITE);
     NtHdrs64 *mapped_nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
     if (dll->delta) {
         DataDir *relocations = &mapped_nt->opt.dirs[DIR_RELOC];
@@ -15958,6 +18012,109 @@ static GuestDll *guest_dll_load(const char *name)
     fprintf(stderr, "[PE DLL] loaded %s at %p (delta=%#lx)\n",
             dll->name, (void *)dll->image, dll->delta);
     return dll;
+}
+
+static int fh_get(u64 handle);
+static u64 __attribute__((ms_abi)) beer_NtClose(u64 h);
+/* ---- Virtual file system of protectors (hooked ntdll file functions) ----
+ * Protectors such as Enigma Protector embed files and serve them by hooking the ntdll file entry
+ * points (the export entries of the fake ntdll). On Windows every kernel32 file/LoadLibrary call
+ * ends in those entry points; Beer's kernel32 layer is host code, so LoadLibrary asks the hooked
+ * entry points whether the module is a virtual file and, if so, maps it through the section calls
+ * exactly like the Windows loader does. */
+typedef u64 (__attribute__((ms_abi)) *GuestNtCall)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+
+/* Host code calling into guest code that may itself call back into the dispatcher from a different
+ * stack (protector hooks do): such a call is "outermost" for the trampoline, so it would reset the
+ * host stack to its fixed top over this frame and clear SavedGuestRsp. Move the host-stack top
+ * below the current frame for the duration and restore both TEB fields afterwards. */
+static u64 call_guest_nested(GuestNtCall fn, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
+                             u64 a6, u64 a7, u64 a8, u64 a9, u64 a10)
+{
+    u64 saved_top, saved_guest, sp;
+    __asm__ volatile("mov %%gs:0xB0, %0\n\tmov %%gs:0xA0, %1\n\tmov %%rsp, %2"
+                     : "=r"(saved_top), "=r"(saved_guest), "=r"(sp));
+    const u64 new_top = (sp - 0x4000) & ~(u64)0xf;
+    __asm__ volatile("mov %0, %%gs:0xB0" :: "r"(new_top) : "memory");
+    u64 result = fn(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+    __asm__ volatile("mov %0, %%gs:0xB0\n\tmov %1, %%gs:0xA0" :: "r"(saved_top), "r"(saved_guest) : "memory");
+    return result;
+}
+
+static GuestNtCall hooked_ntdll(const char *name)
+{
+    u64 address = fake_pe_export_address(HMOD_NTDLL, name);
+    if (!address || *(const u8 *)address == 0x48) return NULL;   /* unmodified stub starts with mov rax,imm64 */
+    return (GuestNtCall)(uintptr_t)address;
+}
+
+static u64 virtual_fs_load_library(const char *name)
+{
+    {   /* Real files on the host load through the normal loader; the virtual layer is only for modules
+         * that exist solely inside the protected executable (not on disk). */
+        char host_path[PATH_MAX];
+        if (name && build_guest_dll_path(name, host_path, sizeof(host_path))) return 0;
+    }
+    {   /* The Steam client library is only ever mapped as a data image (never executed). */
+        char base[64];
+        lowercase_dll_basename(name, base, sizeof(base));
+        if (!strcmp(base, "steamclient64.dll")) return 0;
+    }
+    GuestNtCall create_file = hooked_ntdll("ZwCreateFile");
+    GuestNtCall create_section = hooked_ntdll("ZwCreateSection");
+    GuestNtCall map_view = hooked_ntdll("ZwMapViewOfSection");
+    GuestNtCall close_handle = hooked_ntdll("ZwClose");
+    if (!create_file || !create_section || !map_view || !close_handle || !name) return 0;
+
+    char dos[1024];
+    if (strchr(name, ':') || name[0] == '\\') snprintf(dos, sizeof(dos), "%s", name);
+    else {
+        const char *exe = g_exe_path ? g_exe_path : "";
+        const char *slash = strrchr(exe, '\\');
+        snprintf(dos, sizeof(dos), "%.*s\\%s", slash ? (int)(slash - exe) : 0, exe, name);
+    }
+    u16 wide[1100];
+    size_t n = 0;
+    static const char prefix[] = "\\??\\";
+    for (size_t i = 0; prefix[i]; ++i) wide[n++] = (u8)prefix[i];
+    for (const char *c = dos; *c && n + 1 < sizeof(wide) / sizeof(*wide); ++c) wide[n++] = (u8)(*c == '/' ? '\\' : *c);
+    wide[n] = 0;
+
+    struct { u16 length, maximum; u32 pad; u64 buffer; } unicode = { (u16)(n * 2), (u16)(n * 2 + 2), 0, (u64)(uintptr_t)wide };
+    struct { u32 length; u32 pad0; u64 root; u64 name; u32 attributes; u32 pad1; u64 descriptor; u64 qos; } oa =
+        { 0x30, 0, 0, (u64)(uintptr_t)&unicode, 0x40, 0, 0, 0 };
+    u64 iosb[2] = { 0, 0 };
+    u64 file = 0;
+    u64 status = call_guest_nested(create_file, (u64)(uintptr_t)&file, 0x80100080u, (u64)(uintptr_t)&oa,
+                                   (u64)(uintptr_t)iosb, 0, 0, 7, 1 /* FILE_OPEN */, 0x60, 0, 0);
+    if (((u32)status >> 30) == 3) return 0;
+    u64 section = 0, base = 0, view = 0;
+    status = call_guest_nested(create_section, (u64)(uintptr_t)&section, 0xF001F, 0, 0, 2 /* PAGE_READONLY */,
+                               0x1000000 /* SEC_IMAGE */, file, 0, 0, 0, 0);
+    if (((u32)status >> 30) != 3)
+        status = call_guest_nested(map_view, section, (u64)-1, (u64)(uintptr_t)&base, 0, 0, 0,
+                                   (u64)(uintptr_t)&view, 1, 0, 2, 0);
+    if (section) call_guest_nested(close_handle, section, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    call_guest_nested(close_handle, file, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    fprintf(stderr, "[VFS] %s -> virtual file, section status=%#x base=%#lx view=%#lx\n", dos, (u32)status, base, view);
+    if (((u32)status >> 30) == 3 || !base) return 0;     /* NT_SUCCESS: informational 0x4... (not at base) is fine */
+
+    const DosHdr *dos_header = (const DosHdr *)(uintptr_t)base;
+    if (dos_header->magic != MZ_MAGIC) { fprintf(stderr, "[VFS] mapped view has no MZ header\n"); return 0; }
+    NtHdrs64 *nt = (NtHdrs64 *)(uintptr_t)(base + dos_header->lfanew);
+    if (nt->sig != PE_SIG || nt->opt.magic != PE32PLUS) { fprintf(stderr, "[VFS] mapped view is not a PE32+ image\n"); return 0; }
+    if (g_guest_dll_count >= MAX_GUEST_DLLS) return 0;
+    GuestDll *dll = &g_guest_dlls[g_guest_dll_count];
+    memset(dll, 0, sizeof(*dll));
+    lowercase_dll_basename(name, dll->name, sizeof(dll->name));
+    snprintf(dll->path, sizeof(dll->path), "%s", dos);
+    dll->image = (u8 *)(uintptr_t)base;
+    dll->image_size = nt->opt.sz_image;
+    dll->preferred_base = nt->opt.imagebase;
+    dll->delta = base - dll->preferred_base;
+    ++g_guest_dll_count;
+    GuestDll *loaded = guest_dll_finish(dll);
+    return loaded ? (u64)(uintptr_t)loaded->image : 0;
 }
 
 static void guest_dll_notify_thread(u32 reason)
@@ -16172,6 +18329,7 @@ static void pe_imports(void)
                 else if (ordinal == 4) real = (ImplFn)impl_connect;
                 else if (ordinal == 6) real = (ImplFn)impl_getsockname;
                 else if (ordinal == 23) real = (ImplFn)impl_socket;
+                else if (ordinal == 57) real = (ImplFn)impl_gethostname;
                 else if (ordinal == 111) real = (ImplFn)impl_WSAGetLastError;
                 else if (ordinal == 115) real = (ImplFn)impl_WSAStartup;
                 else if (ordinal == 116) real = (ImplFn)impl_WSACleanup;
@@ -17034,6 +19192,72 @@ static int patch_transaction_assertions(void)
     return patched;
 }
 
+/* Diagnostic function-entry logging hook.  BEER_HOOK_LOG="hexaddr:displaced_bytes;..." patches the
+ * first `displaced_bytes` (an instruction boundary, >= 14, no rip-relative instructions) of a guest
+ * function with a jump to a trampoline that saves registers, calls impl_hook_log(id, rcx, rdx, r8,
+ * return_address) on the host and then runs the displaced instructions. */
+static u64 __attribute__((ms_abi))
+impl_hook_log(u64 id, u64 a, u64 b, u64 c, u64 ret)
+{
+    static _Atomic(u32) counts[16];
+    if (id < 16 && atomic_fetch_add(&counts[id], 1) < 400)
+        fprintf(stderr, "[HOOK %lu] rcx=%lx rdx=%lx r8=%lx ret=%lx\n", id, a, b, c, ret);
+    return 0;
+}
+
+static void install_hook_logs(void)
+{
+    const char *env = getenv("BEER_HOOK_LOG");
+    if (!env || !g_img) return;
+    static int installed;
+    if (installed) return;
+    if (getenv("BEER_HOOK_LAZY") && !g_hook_lazy_go) return;   /* wait for the lazy trigger */
+    installed = 1;
+    if (g_nstubs >= MAX_STUBS) return;
+    g_snames[g_nstubs] = strdup("__beer_hook_log");
+    emit_impl_thunk(g_nstubs, (u64)impl_hook_log);
+    const u64 thunk = (u64)(g_tramp + g_nstubs * THUNK_SZ);
+    g_nstubs++;
+    char *spec = strdup(env);
+    int id = 0;
+    for (char *tok = strtok(spec, ";"); tok && id < 16; tok = strtok(NULL, ";"), ++id) {
+        unsigned long long addr = strtoull(tok, NULL, 16);
+        const char *colon = strchr(tok, ':');
+        size_t n = colon ? (size_t)strtoul(colon + 1, NULL, 0) : 0;
+        if (!addr || n < 14 || n > 40) continue;
+        u8 *t = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (t == MAP_FAILED) continue;
+        size_t o = 0;
+        #define EMIT(...) do { const u8 b_[] = { __VA_ARGS__ }; memcpy(t + o, b_, sizeof(b_)); o += sizeof(b_); } while (0)
+        EMIT(0x9c, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53);
+        EMIT(0x48, 0x83, 0xEC, 0x38);                    /* sub rsp,0x38 */
+        EMIT(0x48, 0x8B, 0x44, 0x24, 0x78);              /* mov rax,[rsp+0x78]  (return address) */
+        EMIT(0x48, 0x89, 0x44, 0x24, 0x20);              /* mov [rsp+0x20],rax */
+        EMIT(0x4D, 0x89, 0xC1);                          /* mov r9,r8 */
+        EMIT(0x49, 0x89, 0xD0);                          /* mov r8,rdx */
+        EMIT(0x48, 0x89, 0xCA);                          /* mov rdx,rcx */
+        EMIT(0xB9, (u8)id, 0, 0, 0);                     /* mov ecx,id */
+        EMIT(0x48, 0xB8); memcpy(t + o, &thunk, 8); o += 8; /* mov rax,thunk */
+        EMIT(0xFF, 0xD0);                                /* call rax */
+        EMIT(0x48, 0x83, 0xC4, 0x38);                    /* add rsp,0x38 */
+        EMIT(0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58, 0x9D);
+        memcpy(t + o, (void *)(uintptr_t)addr, n); o += n;   /* displaced instructions */
+        EMIT(0xFF, 0x25, 0, 0, 0, 0);
+        u64 back = addr + n; memcpy(t + o, &back, 8); o += 8;
+        #undef EMIT
+        u8 patch[40]; memset(patch, 0x90, sizeof(patch));
+        patch[0] = 0xFF; patch[1] = 0x25;
+        memset(patch + 2, 0, 4);                         /* jmp [rip+0] */
+        u64 to = (u64)(uintptr_t)t; memcpy(patch + 6, &to, 8);
+        uintptr_t page = (uintptr_t)addr & ~4095ull;
+        mprotect((void *)page, 8192, PROT_READ | PROT_WRITE | PROT_EXEC);
+        memcpy((void *)(uintptr_t)addr, patch, n);
+        fprintf(stderr, "[HOOK] installed id=%d at %llx (%zu bytes displaced)\n", id, addr, n);
+    }
+    free(spec);
+}
+
 /* Install tiny failure stubs for known bad indirect-call targets that the
  * game reads from writable data pages as code pointers.
  * Stub bytes: xor eax,eax ; ret
@@ -17042,6 +19266,40 @@ static void patch_known_bad_targets(void)
 {
     if (!g_img) return;
 
+    /* Diagnostic: BEER_PATCH_BYTES="hexaddr:hexbytes;hexaddr:hexbytes" patches guest code
+     * before it runs (used to step past a check and see what comes next). */
+    if (getenv("BEER_PATCH_BYTES")) {
+        char *spec = strdup(getenv("BEER_PATCH_BYTES"));
+        for (char *tok = strtok(spec, ";"); tok; tok = strtok(NULL, ";")) {
+            unsigned long long addr = strtoull(tok, NULL, 16);
+            const char *colon = strchr(tok, ':');
+            if (!addr || !colon) continue;
+            u8 bytes[64]; size_t n = 0;
+            for (const char *h = colon + 1; h[0] && h[1] && n < sizeof(bytes); h += 2) {
+                char pair[3] = { h[0], h[1], 0 };
+                bytes[n++] = (u8)strtoul(pair, NULL, 16);
+            }
+            uintptr_t page = (uintptr_t)addr & ~4095ull;
+            mprotect((void *)page, 8192, PROT_READ | PROT_WRITE | PROT_EXEC);
+            memcpy((void *)(uintptr_t)addr, bytes, n);
+            fprintf(stderr, "[PATCH] diagnostic patch %llx (%zu bytes)\n", addr, n);
+        }
+        free(spec);
+    }
+    install_hook_logs();
+    if (getenv("BEER_SLOT_NAMES")) {   /* diagnostic: name the import behind IAT slots (hex addresses, comma separated) */
+        char *spec = strdup(getenv("BEER_SLOT_NAMES"));
+        for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
+            unsigned long long slot = strtoull(tok, NULL, 16);
+            u64 value = *(u64 *)(uintptr_t)slot;
+            long idx = -1;
+            if (g_tramp && value >= (u64)g_tramp && value < (u64)g_tramp + (u64)g_nstubs * THUNK_SZ)
+                idx = (long)((value - (u64)g_tramp) / THUNK_SZ);
+            fprintf(stderr, "[SLOT] %llx -> %lx (%s)\n", slot, (unsigned long)value,
+                    idx >= 0 && g_snames[idx] ? g_snames[idx] : "not a thunk");
+        }
+        free(spec);
+    }
     const int aggressive = getenv("BEER_ENABLE_HARD_PATCHES") != NULL;
     if (!aggressive && !getenv("BEER_ENABLE_KNOWN_TARGET_PATCHES")) {
         fprintf(stderr,
@@ -19021,6 +21279,22 @@ generic_alloc_skip:
                     (u64)uc->uc_mcontext.gregs[REG_RCX],
                     (u64)uc->uc_mcontext.gregs[REG_RAX],
                     (u64)uc->uc_mcontext.gregs[REG_RDX]);
+            {   /* Who called through a null pointer: the return address. */
+                const u64 *sp = (const u64 *)rsp;
+                fprintf(stderr, "[DBG]   stack: %lx %lx %lx %lx  rbx=%lx rsi=%lx rdi=%lx rbp=%lx r8=%lx r9=%lx\n",
+                        sp[0], sp[1], sp[2], sp[3],
+                        (u64)uc->uc_mcontext.gregs[REG_RBX], (u64)uc->uc_mcontext.gregs[REG_RSI],
+                        (u64)uc->uc_mcontext.gregs[REG_RDI], (u64)uc->uc_mcontext.gregs[REG_RBP],
+                        (u64)uc->uc_mcontext.gregs[REG_R8], (u64)uc->uc_mcontext.gregs[REG_R9]);
+                if (g_img && sp[0] >= (u64)g_img + 0x100 && sp[0] < (u64)g_img + g_img_size) {
+                    /* Hex dump of the code just before the return address: decode with
+                     * objdump -D -b binary -mi386:x86-64 --adjust-vma=<printed address>. */
+                    const u8 *code = (const u8 *)(sp[0] - 64);
+                    fprintf(stderr, "[DBG]   caller code from %lx:", (unsigned long)(sp[0] - 64));
+                    for (int k = 0; k < 96; ++k) fprintf(stderr, " %02x", code[k]);
+                    fputc('\n', stderr);
+                }
+            }
         }
 
         if (g_lowrip_rsp_hits >= 6) {
@@ -20523,6 +22797,61 @@ generic_alloc_skip:
  * decision was invalid — stop immediately with a diagnostic instead of
  * letting it cycle further.
  */
+/* Hang diagnostics: `kill -USR1 <pid>` makes every thread print its host call chain (module offsets, resolve with
+ * `addr2line -f -e loader <offset>`) and the guest address of its last API call (RVA inside the exe). */
+extern void bd12_ckpt_dump(void);
+static void on_dump_stacks(int sig, siginfo_t *info, void *uctx)
+{
+    (void)sig; (void)uctx;
+    if (info && info->si_code == SI_USER) {   /* from outside: fan out to every thread */
+        bd12_ckpt_dump();                       /* last GPU checkpoints (BEER_VK_CHECKPOINTS=1) */
+        DIR *dir = opendir("/proc/self/task");
+        struct dirent *entry;
+        while (dir && (entry = readdir(dir))) {
+            const int tid = atoi(entry->d_name);
+            if (tid > 0) syscall(SYS_tgkill, getpid(), tid, SIGUSR1);
+        }
+        if (dir) closedir(dir);
+        return;
+    }
+    char out[4096];
+    size_t used = 0;
+    const u64 ret = g_dispatch_incoming_return;
+    used += (size_t)snprintf(out + used, sizeof(out) - used, "[STACKS] tid=%ld guest-ret=0x%llx rva=0x%llx wait=%s handle=0x%llx ms=%u\n", (long)syscall(SYS_gettid),
+                             (unsigned long long)ret, (unsigned long long)(g_img && ret >= (u64)g_img ? ret - (u64)g_img : 0),
+                             g_dbg_wait_kind == 1 ? "Sleep" : g_dbg_wait_kind == 2 ? "WaitForSingleObject" : "-",
+                             (unsigned long long)g_dbg_wait_handle, g_dbg_wait_ms);
+    if (g_dbg_wait_kind == 2) {
+        const int eid = event_id_from_handle(g_dbg_wait_handle);
+        if (eid > 0) {
+            const WinEvent *ev = &g_events[eid];
+            const u64 base = (u64)g_img;
+            used += (size_t)snprintf(out + used, sizeof(out) - used,
+                                     "[STACKS]   event%d %s signaled=%d waiters=%u created@rva=0x%llx last-set@rva=0x%llx\n",
+                                     eid, ev->manual_reset ? "manual" : "auto", (int)ev->signaled, (unsigned)ev->waiter_count,
+                                     (unsigned long long)(ev->creator_rip >= base ? ev->creator_rip - base : 0),
+                                     (unsigned long long)(ev->last_signaler_rip >= base ? ev->last_signaler_rip - base : 0));
+        }
+    }
+    if (g_dbg_srw_wait)
+        used += (size_t)snprintf(out + used, sizeof(out) - used, "[STACKS]   blocked on SRWLOCK %p: exclusive owner tid=%ld (acquired from rva=0x%llx), readers=%d (last reader rva=0x%llx)\n",
+                                 (void *)g_dbg_srw_wait, (long)g_dbg_srw_wait->owner_tid,
+                                 (unsigned long long)(g_dbg_srw_wait->owner_rip >= (u64)g_img ? g_dbg_srw_wait->owner_rip - (u64)g_img : 0),
+                                 g_dbg_srw_wait->readers,
+                                 (unsigned long long)(g_dbg_srw_wait->reader_rip >= (u64)g_img ? g_dbg_srw_wait->reader_rip - (u64)g_img : 0));
+    void *frames[20];
+    const int depth = backtrace(frames, 20);
+    for (int f = 0; f < depth && used + 100 < sizeof(out); ++f) {
+        Dl_info fi;
+        const int known = dladdr(frames[f], &fi) && fi.dli_fbase;
+        const u64 off = known ? (u64)frames[f] - (u64)fi.dli_fbase : (u64)frames[f];
+        const char *module = known && fi.dli_fname ? strrchr(fi.dli_fname, '/') : NULL;
+        used += (size_t)snprintf(out + used, sizeof(out) - used, "[STACKS]   #%d %s +0x%llx %s\n", f, module ? module + 1 : "?",
+                                 (unsigned long long)off, fi.dli_sname ? fi.dli_sname : "");
+    }
+    if (write(2, out, used) < 0) return;
+}
+
 static void on_crash(int sig, siginfo_t *si, void *uctx)
 {
     on_crash_impl(sig, si, uctx);
@@ -20582,6 +22911,8 @@ static int beer_present_bd12_image(uint64_t image, uint32_t layout,
     /* Movies are played by the game through a separate (stubbed) D3D11 device;
      * its decoded NV12 frames reach us as a cached RGBA frame. While frames are
      * flowing, show that frame instead of the game's (blank) D3D12 backbuffer. */
+    beer_control_note_frame();
+    beer_control_frame_limit_wait();
     if (beer_mf_composite_pending_frame()) return 1;
     static uint64_t window_start_ns;
     static uint32_t window_frames;
@@ -20832,9 +23163,19 @@ int main(int argc, char **argv)
     if (!beer_win32_shared_data_map())
         return 2;
     pe_load(exe);
+    beer_overlay_init();
+    beer_post_init(exe_arg);
+    beer_control_start(exe_arg);
     if (getenv("BEER_PROF_SAMPLE")) prof_start();
 
     sigaction(SIGSEGV, &sa, NULL);
+    {
+        struct sigaction dump;
+        memset(&dump, 0, sizeof(dump));
+        dump.sa_sigaction = on_dump_stacks;
+        dump.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigaction(SIGUSR1, &dump, NULL);
+    }
     sigaction(SIGBUS,  &sa, NULL);
     sigaction(SIGILL,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);

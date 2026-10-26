@@ -14,6 +14,17 @@
      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |                                   \
      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
 
+/* Ray tracing buffer usages exist only when the extensions are enabled. */
+#define BD12_BUFFER_USAGE_RT                                                 \
+    (VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |                \
+     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |  \
+     VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR)
+static VkBufferUsageFlags buffer_usage(void)
+{
+    return BD12_BUFFER_USAGE |
+           (beer_vulkan_ray_tracing_enabled() ? BD12_BUFFER_USAGE_RT : 0);
+}
+
 static int32_t pick_memory_type(const VkPhysicalDeviceMemoryProperties *memory,
                                 uint32_t type_bits,
                                 VkMemoryPropertyFlags required,
@@ -52,6 +63,7 @@ BD12Device *bd12_device_create(void)
     device->modern = modern;
     pthread_mutex_init(&device->va_lock, NULL);
     pthread_mutex_init(&device->view_lock, NULL);
+    pthread_mutex_init(&device->zero_lock, NULL);
 
     PFN_vkGetDeviceProcAddr get_device = beer_vulkan_get_device_proc_addr();
     PFN_vkGetInstanceProcAddr get_instance = beer_vulkan_get_instance_proc_addr();
@@ -96,7 +108,7 @@ BD12Device *bd12_device_create(void)
     VkBufferCreateInfo probe_info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = 65536,
-        .usage = BD12_BUFFER_USAGE,
+        .usage = buffer_usage(),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
     VkBuffer probe;
@@ -142,6 +154,9 @@ BD12Device *bd12_device_create(void)
             device->device_name, device->memory_type[BD12_HEAP_DEFAULT],
             device->memory_type[BD12_HEAP_UPLOAD],
             device->memory_type[BD12_HEAP_READBACK], device->readback_coherent);
+    bd12_rt_load(device);
+    fprintf(stderr, "[BD12] ray tracing %s\n", device->rt_enabled ? "available" : "unavailable");
+    bd12_canary_arm(device);
     return device;
 }
 
@@ -186,78 +201,129 @@ static void heap_zero_fill(BD12Heap *heap)
         device->vk.BindBufferMemory(device->device, heap->zero_buffer,
                                     heap->memory, 0) != VK_SUCCESS)
         return;
-    VkCommandPoolCreateInfo pool = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-        .queueFamilyIndex = device->queue_family
-    };
-    if (device->vk.CreateCommandPool(device->device, &pool, NULL,
-                                     &heap->zero_pool) != VK_SUCCESS) {
-        heap->zero_pool = VK_NULL_HANDLE;
-        return;
+    /* Recorded into the shared batch; bd12_zero_flush submits it before the next queue submit. */
+    pthread_mutex_lock(&device->zero_lock);
+    if (!device->zero_pool) {
+        VkCommandPoolCreateInfo pool = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = device->queue_family
+        };
+        VkSemaphoreTypeCreateInfo type = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE
+        };
+        VkSemaphoreCreateInfo sem = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type };
+        if (device->vk.CreateCommandPool(device->device, &pool, NULL, &device->zero_pool) != VK_SUCCESS ||
+            device->vk.CreateSemaphore(device->device, &sem, NULL, &device->zero_sem) != VK_SUCCESS) {
+            device->zero_pool = VK_NULL_HANDLE;
+            pthread_mutex_unlock(&device->zero_lock);
+            return;
+        }
     }
-    VkCommandBufferAllocateInfo allocate = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = heap->zero_pool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1
-    };
-    VkCommandBuffer cb;
-    if (device->vk.AllocateCommandBuffers(device->device, &allocate, &cb) !=
-        VK_SUCCESS)
-        return;
-    VkCommandBufferBeginInfo begin = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    };
-    device->vk.BeginCommandBuffer(cb, &begin);
-    device->vk.CmdFillBuffer(cb, heap->zero_buffer, 0,
-                             heap->size & ~(VkDeviceSize)3, 0);
-    VkMemoryBarrier2 barrier = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT |
-                         VK_ACCESS_2_MEMORY_WRITE_BIT
-    };
-    VkDependencyInfo dependency = {
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &barrier
-    };
-    device->vk.CmdPipelineBarrier2(cb, &dependency);
-    device->vk.EndCommandBuffer(cb);
-    VkCommandBufferSubmitInfo cb_info = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-        .commandBuffer = cb
-    };
-    VkSubmitInfo2 submit = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .commandBufferInfoCount = 1,
-        .pCommandBufferInfos = &cb_info
-    };
-    VkFenceCreateInfo fence_info = {
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
-    };
-    if (device->vk.CreateFence(device->device, &fence_info, NULL,
-                               &heap->zero_fence) != VK_SUCCESS)
-        heap->zero_fence = VK_NULL_HANDLE;
-    beer_vulkan_queue_lock();
-    VkResult result = device->vk.QueueSubmit2(device->queue, 1, &submit,
-                                              heap->zero_fence);
-    beer_vulkan_queue_unlock();
-    beer_vulkan_record_result(result, "BD12 heap zero fill");
-    if (result != VK_SUCCESS && heap->zero_fence) {
-        device->vk.DestroyFence(device->device, heap->zero_fence, NULL);
-        heap->zero_fence = VK_NULL_HANDLE;
+    if (!device->zero_cb) {
+        if (device->zero_inflight_count == 16) {          /* wait for the oldest batch to retire */
+            VkSemaphoreWaitInfo wait = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                         .pSemaphores = &device->zero_sem, .pValues = &device->zero_inflight_value[0] };
+            device->vk.WaitSemaphores(device->device, &wait, UINT64_C(10000000000));
+        }
+        uint64_t done = 0;
+        device->vk.GetSemaphoreCounterValue(device->device, device->zero_sem, &done);
+        uint32_t keep = 0;
+        for (uint32_t i = 0; i < device->zero_inflight_count; ++i) {
+            if (device->zero_inflight_value[i] <= done) {
+                device->vk.FreeCommandBuffers(device->device, device->zero_pool, 1, &device->zero_inflight[i]);
+            } else {
+                device->zero_inflight[keep] = device->zero_inflight[i];
+                device->zero_inflight_value[keep++] = device->zero_inflight_value[i];
+            }
+        }
+        device->zero_inflight_count = keep;
+        VkCommandBufferAllocateInfo allocate = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = device->zero_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1
+        };
+        VkCommandBufferBeginInfo begin = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        };
+        if (device->vk.AllocateCommandBuffers(device->device, &allocate, &device->zero_cb) != VK_SUCCESS) {
+            device->zero_cb = VK_NULL_HANDLE;
+            pthread_mutex_unlock(&device->zero_lock);
+            return;
+        }
+        device->vk.BeginCommandBuffer(device->zero_cb, &begin);
+        device->zero_recorded = device->zero_submitted + 1;
     }
+    device->vk.CmdFillBuffer(device->zero_cb, heap->zero_buffer, 0, heap->size & ~(VkDeviceSize)3, 0);
+    heap->zero_value = device->zero_recorded;
+    pthread_mutex_unlock(&device->zero_lock);
+}
+
+/* Submits the pending zero-fill batch. Must run before any other submission that could touch the filled memory. */
+void bd12_zero_flush(BD12Device *device)
+{
+    if (!__atomic_load_n(&device->zero_cb, __ATOMIC_ACQUIRE)) return;
+    pthread_mutex_lock(&device->zero_lock);
+    VkCommandBuffer cb = device->zero_cb;
+    if (cb) {
+        VkMemoryBarrier2 barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT
+        };
+        VkDependencyInfo dependency = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &barrier };
+        device->vk.CmdPipelineBarrier2(cb, &dependency);
+        device->vk.EndCommandBuffer(cb);
+        VkCommandBufferSubmitInfo cb_info = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb };
+        VkSemaphoreSubmitInfo signal = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = device->zero_sem,
+                                         .value = device->zero_recorded, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
+        VkSubmitInfo2 submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cb_info,
+                                 .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &signal };
+        beer_vulkan_queue_lock();
+        VkResult result = device->vk.QueueSubmit2(device->queue, 1, &submit, VK_NULL_HANDLE);
+        beer_vulkan_queue_unlock();
+        beer_vulkan_record_result(result, "BD12 heap zero fill");
+        device->zero_submitted = device->zero_recorded;
+        device->zero_inflight[device->zero_inflight_count] = cb;
+        device->zero_inflight_value[device->zero_inflight_count++] = device->zero_recorded;
+        __atomic_store_n(&device->zero_cb, VK_NULL_HANDLE, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&device->zero_lock);
 }
 
 uint64_t g_bd12_heap_live[4], g_bd12_heap_bytes[4];
 
+static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
+                                  VkDeviceSize size, int zero);
+
 BD12Heap *bd12_heap_create(BD12Device *device, BD12HeapType type,
                            VkDeviceSize size)
+{
+    BD12_PROF_BEGIN();
+    BD12Heap *heap = heap_create_impl(device, type, size, 1);
+    BD12_PROF_END(BD12_PROF_HEAP_CREATE);
+    return heap;
+}
+
+/* Image memory is never read before the application writes it, and a buffer
+ * fill of optimally tiled image memory has no defined texel meaning, so a
+ * committed image skips the per-allocation zero-fill submission. */
+BD12Heap *bd12_heap_create_unzeroed(BD12Device *device, BD12HeapType type,
+                                    VkDeviceSize size)
+{
+    BD12_PROF_BEGIN();
+    BD12Heap *heap = heap_create_impl(device, type, size, 0);
+    BD12_PROF_END(BD12_PROF_HEAP_CREATE);
+    return heap;
+}
+
+static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
+                                  VkDeviceSize size, int zero)
 {
     if (!device || !size || type < BD12_HEAP_DEFAULT || type > BD12_HEAP_READBACK)
         return NULL;
@@ -290,29 +356,33 @@ BD12Heap *bd12_heap_create(BD12Device *device, BD12HeapType type,
         free(heap);
         return NULL;
     }
-    if (type == BD12_HEAP_DEFAULT) heap_zero_fill(heap);
+    if (type == BD12_HEAP_DEFAULT && zero) heap_zero_fill(heap);
     __atomic_add_fetch(&g_bd12_heap_live[type], 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&g_bd12_heap_bytes[type], size, __ATOMIC_RELAXED);
     return heap;
 }
 
+static void heap_destroy_impl(BD12Heap *heap);
 void bd12_heap_destroy(BD12Heap *heap)
 {
+    BD12_PROF_BEGIN();
+    heap_destroy_impl(heap);
+    BD12_PROF_END(BD12_PROF_HEAP_DESTROY);
+}
+
+static void heap_destroy_impl(BD12Heap *heap)
+{
     if (!heap) return;
-    /* The zero fill is queued outside the retire timeline; it must finish
-     * before its command pool, buffer and the heap memory are released. */
-    if (heap->zero_fence) {
-        heap->device->vk.WaitForFences(heap->device->device, 1,
-                                       &heap->zero_fence, VK_TRUE,
-                                       UINT64_C(10000000000));
-        heap->device->vk.DestroyFence(heap->device->device, heap->zero_fence,
-                                      NULL);
+    /* The zero fill runs on its own timeline; it must finish before the buffer and the heap memory are released. */
+    if (heap->zero_value) {
+        BD12Device *device = heap->device;
+        bd12_zero_flush(device);
+        VkSemaphoreWaitInfo wait = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                     .pSemaphores = &device->zero_sem, .pValues = &heap->zero_value };
+        device->vk.WaitSemaphores(device->device, &wait, UINT64_C(10000000000));
     }
     if (heap->mapped)
         heap->device->vk.UnmapMemory(heap->device->device, heap->memory);
-    if (heap->zero_pool)
-        heap->device->vk.DestroyCommandPool(heap->device->device,
-                                            heap->zero_pool, NULL);
     if (heap->zero_buffer)
         heap->device->vk.DestroyBuffer(heap->device->device,
                                        heap->zero_buffer, NULL);
@@ -404,7 +474,7 @@ BD12Buffer *bd12_buffer_create_placed(BD12Heap *heap, VkDeviceSize offset,
     VkBufferCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = size,
-        .usage = BD12_BUFFER_USAGE,
+        .usage = buffer_usage(),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
     if (device->vk.CreateBuffer(device->device, &info, NULL, &buffer->buffer) !=
@@ -429,6 +499,8 @@ BD12Buffer *bd12_buffer_create_placed(BD12Heap *heap, VkDeviceSize offset,
     if (!buffer->va) goto fail_buffer;
     buffer->cpu = heap->mapped ? (char *)heap->mapped + offset : NULL;
     if (!va_insert(device, buffer)) goto fail_buffer;
+    buffer->serial = bd12_live_serial();
+    bd12_live_add(buffer);
     return buffer;
 
 fail_buffer:
@@ -458,11 +530,14 @@ void bd12_buffer_destroy(BD12Buffer *buffer)
 {
     if (!buffer) return;
     BD12Device *device = buffer->device;
+    bd12_live_remove(buffer);
     va_remove(device, buffer);
+    bd12_rt_buffer_release(buffer);
     for (uint32_t i = 0; i < buffer->view_count; ++i)
         device->vk.DestroyBufferView(device->device, buffer->views[i].view,
                                      NULL);
     free(buffer->views);
+    free(buffer->view_hash);
     device->vk.DestroyBuffer(device->device, buffer->buffer, NULL);
     if (buffer->owns_heap) bd12_heap_destroy(buffer->heap);
     free(buffer);
@@ -556,6 +631,8 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
                            uint32_t wait_count, const BD12FenceOp *signals,
                            uint32_t signal_count)
 {
+    bd12_zero_flush(queue->device);
+    bd12_canary_check("queue submit");
     if (beer_vulkan_device_lost()) return VK_ERROR_DEVICE_LOST;
     BD12Device *device = queue->device;
     /* A D3D12 list may have been recorded into several primary command buffers
@@ -626,6 +703,7 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
     beer_vulkan_queue_unlock();
     __atomic_add_fetch(&queue->submit_count, 1, __ATOMIC_RELAXED);
     beer_vulkan_record_result(result, "BD12 queue submit");
+    if (result == VK_ERROR_DEVICE_LOST) bd12_ckpt_dump();
     if (storage != (void *)stack_storage) free(storage);
     return result;
 }
@@ -734,11 +812,36 @@ static void sample_report(void)
     memset(g_samples, 0, sizeof(g_samples));
 }
 
+uint64_t g_bd12_drops[BD12_DROP_COUNT];
+static void bd12_report_drops(void)
+{
+    static uint64_t last_report, last_total;
+    const uint64_t now = bd12_prof_now();
+    if (!last_report) last_report = now;
+    if (now - last_report < 5000000000ull) return;
+    last_report = now;
+    static const char *names[BD12_DROP_COUNT] = {
+        "draw(no pipeline/root signature)", "draw(descriptor resolve failed)",
+        "dispatch(no pipeline/root signature)", "dispatch(descriptor resolve failed)",
+        "ExecuteIndirect(multi-argument signature)",
+        "ExecuteIndirect dispatch(count buffer ignored)", "PSO(compile failed)" };
+    uint64_t total = 0;
+    for (int i = 0; i < BD12_DROP_COUNT; ++i) total += g_bd12_drops[i];
+    if (total == last_total) return;
+    last_total = total;
+    fprintf(stderr, "[BD12 DROP] cumulative:");
+    for (int i = 0; i < BD12_DROP_COUNT; ++i)
+        if (g_bd12_drops[i])
+            fprintf(stderr, " %s=%llu", names[i], (unsigned long long)g_bd12_drops[i]);
+    fputc('\n', stderr);
+}
+
 uint64_t g_bd12_prof_ns[BD12_PROF_COUNT];
 uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
 
 void bd12_prof_report(void)
 {
+    bd12_report_drops();
     static int enabled = -1;
     static uint64_t last;
     static int sampling;
@@ -752,7 +855,8 @@ void bd12_prof_report(void)
     if (!last) last = now;
     if (now - last < 2000000000ull) return;
     static const char *names[] = { "execute", "submit", "pso", "resolve",
-                                   "fence-wait", "finish", "present" };
+                                   "fence-wait", "finish", "present", "heap-create", "heap-destroy",
+                                   "alloc-set", "update-sets" };
     fprintf(stderr, "[BD12 PROF] %llu ms window:", (unsigned long long)((now - last) / 1000000));
     for (int i = 0; i < BD12_PROF_COUNT; ++i) {
         fprintf(stderr, " %s=%llums/%llu", names[i],

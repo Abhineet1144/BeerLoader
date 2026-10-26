@@ -1601,6 +1601,59 @@ static uint32_t __attribute__((ms_abi)) device_get_exception_mode(ID3D11Device *
     return 0;
 }
 
+/* BEER_D3D11_CALL_STATS=<file>: count how often the guest calls every vtable slot (device, context,
+ * swap chain...), written to <file> every 5 s. Each slot is replaced by a tiny stub that increments a
+ * counter and jumps to the original function (only r11, volatile in both ABIs, is used). */
+#include <sys/mman.h>
+#include <pthread.h>
+#include <unistd.h>
+typedef struct { const char *name; size_t count; volatile uint64_t *counters; } D3D11StatsTable;
+static D3D11StatsTable g_stats_tables[16];
+static int g_stats_table_count;
+static void *d3d11_stats_thread(void *arg)
+{
+    const char *path = arg;
+    for (;;) {
+        sleep(5);
+        FILE *f = fopen(path, "w");
+        if (!f) continue;
+        for (int t = 0; t < g_stats_table_count; ++t)
+            for (size_t i = 0; i < g_stats_tables[t].count; ++i)
+                if (g_stats_tables[t].counters[i])
+                    fprintf(f, "%s %zu %llu\n", g_stats_tables[t].name, i,
+                            (unsigned long long)g_stats_tables[t].counters[i]);
+        fclose(f);
+    }
+    return NULL;
+}
+static void d3d11_stats_wrap(const char *name, void **slots, size_t count)
+{
+    const char *path = getenv("BEER_D3D11_CALL_STATS");
+    if (!path || !*path || g_stats_table_count >= 16) return;
+    volatile uint64_t *counters = calloc(count, sizeof(uint64_t));
+    uint8_t *code = mmap(NULL, count * 48, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (!counters || code == MAP_FAILED) return;
+    for (size_t i = 0; i < count; ++i) {
+        uint8_t *p = code + i * 48;
+        uint64_t counter = (uint64_t)(uintptr_t)&counters[i], orig = (uint64_t)(uintptr_t)slots[i];
+        size_t o = 0;
+        p[o++] = 0x49; p[o++] = 0xBB; memcpy(p + o, &counter, 8); o += 8;     /* mov r11, &counter */
+        p[o++] = 0xF0; p[o++] = 0x49; p[o++] = 0xFF; p[o++] = 0x03;           /* lock inc qword [r11] */
+        p[o++] = 0x49; p[o++] = 0xBB; memcpy(p + o, &orig, 8); o += 8;        /* mov r11, orig */
+        p[o++] = 0x41; p[o++] = 0xFF; p[o++] = 0xE3;                          /* jmp r11 */
+        slots[i] = p;
+    }
+    g_stats_tables[g_stats_table_count++] = (D3D11StatsTable){ name, count, counters };
+    static int thread_started;
+    if (!thread_started) {
+        thread_started = 1;
+        pthread_t t;
+        pthread_create(&t, NULL, d3d11_stats_thread, (void *)path);
+        pthread_detach(t);
+    }
+}
+
 static ID3D11Device_VTable g_device_vtable;
 
 static void init_device_vtable(void) {
@@ -1642,6 +1695,7 @@ static void init_device_vtable(void) {
     g_device_vtable.slots[D3D11_DEVICE_SLOT_GET_IMMEDIATE_CONTEXT] = (void *)device_get_immediate_context;
     g_device_vtable.slots[D3D11_DEVICE_SLOT_SET_EXCEPTION_MODE] = (void *)device_set_exception_mode;
     g_device_vtable.slots[D3D11_DEVICE_SLOT_GET_EXCEPTION_MODE] = (void *)device_get_exception_mode;
+    d3d11_stats_wrap("device", g_device_vtable.slots, D3D11_DEVICE_VTABLE_SLOTS);
 }
 
 ID3D11Device* d3d11_device_create(void) {
@@ -5984,6 +6038,7 @@ static void init_context_vtable(void)
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_GET_TYPE] = (void *)context_get_type;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_GET_CONTEXT_FLAGS] = (void *)context_get_context_flags;
     g_context_vtable.slots[D3D11_CONTEXT_SLOT_FINISH_COMMAND_LIST] = (void *)context_finish_command_list;
+    d3d11_stats_wrap("context", g_context_vtable.slots, D3D11_CONTEXT_VTABLE_SLOTS);
 }
 
 static ID3D11DeviceContext *d3d11_device_context_create_typed(

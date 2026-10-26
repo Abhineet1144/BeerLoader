@@ -30,6 +30,7 @@ typedef struct {
     int robustness2;
     int pipeline_robustness;
     int sampler_filter_minmax;
+    int ray_tracing;
     int timeline_semaphore;
     int texel_buffer_alignment;
     BeerVulkanModern modern;
@@ -282,7 +283,8 @@ int beer_vulkan_context_initialize(void)
     };
     /* VK_KHR_maintenance1 permits negative viewport heights, which graphics
      * execution uses to preserve D3D's upward-Y clip space. */
-    const char *device_extensions[8] = { "VK_KHR_swapchain" };
+    const char *device_extensions[16] = { "VK_KHR_swapchain" };
+    int rt_ext_as = 0, rt_ext_rtp = 0, rt_ext_rq = 0, rt_ext_dho = 0;
     uint32_t device_extension_count = 1;
     {
         uint32_t available_count = 0;
@@ -296,6 +298,11 @@ int beer_vulkan_context_initialize(void)
                 available) != VK_SUCCESS)
             available_count = 0;
         for (uint32_t i = 0; available && i < available_count; ++i) {
+            const char *ext = available[i].extensionName;
+            rt_ext_as  |= !strcmp(ext, "VK_KHR_acceleration_structure");
+            rt_ext_rtp |= !strcmp(ext, "VK_KHR_ray_tracing_pipeline");
+            rt_ext_rq  |= !strcmp(ext, "VK_KHR_ray_query");
+            rt_ext_dho |= !strcmp(ext, "VK_KHR_deferred_host_operations");
             if (!g_context.maintenance1 &&
                 strcmp(available[i].extensionName,
                        "VK_KHR_maintenance1") == 0) {
@@ -340,6 +347,41 @@ int beer_vulkan_context_initialize(void)
             }
         }
         free(available);
+    }
+    /* DXR needs acceleration structures, ray tracing pipelines and ray query
+     * together (plus deferred host operations, which acceleration structures
+     * depend on). Enable them as a set and only when every feature is real. */
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR rt_as_features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR
+    };
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rt_pipeline_features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
+        .pNext = &rt_as_features
+    };
+    VkPhysicalDeviceRayQueryFeaturesKHR rt_query_features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+        .pNext = &rt_pipeline_features
+    };
+    if (rt_ext_as && rt_ext_rtp && rt_ext_rq && rt_ext_dho &&
+        !getenv("BEER_NO_RT")) {
+        VkPhysicalDeviceFeatures2 query = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &rt_query_features
+        };
+        g_context.GetPhysicalDeviceFeatures2KHR(g_context.physical_device,
+                                                &query);
+        if (rt_as_features.accelerationStructure &&
+            rt_pipeline_features.rayTracingPipeline &&
+            rt_query_features.rayQuery) {
+            device_extensions[device_extension_count++] =
+                "VK_KHR_acceleration_structure";
+            device_extensions[device_extension_count++] =
+                "VK_KHR_ray_tracing_pipeline";
+            device_extensions[device_extension_count++] = "VK_KHR_ray_query";
+            device_extensions[device_extension_count++] =
+                "VK_KHR_deferred_host_operations";
+            g_context.ray_tracing = 1;
+        }
     }
     /* Translated D3D shaders need typed storage-image access and wider scalar
      * types. Enable only the optional features the device reports; the
@@ -396,6 +438,24 @@ int beer_vulkan_context_initialize(void)
         .pNext = &v12_enabled
     };
     void *feature_chain = NULL;
+    if (g_context.ray_tracing) {
+        const VkBool32 traversal = rt_query_features.rayQuery;
+        rt_as_features = (VkPhysicalDeviceAccelerationStructureFeaturesKHR){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+            .accelerationStructure = VK_TRUE
+        };
+        rt_pipeline_features = (VkPhysicalDeviceRayTracingPipelineFeaturesKHR){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
+            .pNext = &rt_as_features,
+            .rayTracingPipeline = VK_TRUE
+        };
+        rt_query_features = (VkPhysicalDeviceRayQueryFeaturesKHR){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+            .pNext = &rt_pipeline_features,
+            .rayQuery = traversal
+        };
+        feature_chain = &rt_query_features;
+    }
     if (g_context.robustness2) {
         robustness2.pNext = feature_chain;
         feature_chain = &robustness2;
@@ -662,6 +722,10 @@ int beer_vulkan_maintenance1_enabled(void)
 {
     return g_context.maintenance1;
 }
+int beer_vulkan_ray_tracing_enabled(void)
+{
+    return g_context.ray_tracing;
+}
 int beer_vulkan_sampler_filter_minmax_enabled(void)
 {
     return g_context.sampler_filter_minmax;
@@ -807,7 +871,7 @@ void beer_vulkan_context_destroy(void)
     pthread_mutex_unlock(&g_context_lock);
 }
 
-int beer_vulkan_host_gpu_info(BeerHostGpuInfo *out)
+static int host_gpu_info_real(BeerHostGpuInfo *out)
 {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
@@ -888,5 +952,24 @@ int beer_vulkan_host_gpu_info(BeerHostGpuInfo *out)
     out->ray_query = has_rq && rq.rayQuery;
     out->mesh_shader = has_mesh && mesh.meshShader;
     out->fragment_shading_rate = has_vrs && vrs.pipelineFragmentShadingRate;
+    return 1;
+}
+
+/* What the guest is told about the GPU. BEER_SPOOF_GPU_NAME / _VENDOR / _DEVICE (hex) / _VRAM_MB override
+ * the identity DXGI and the display-device APIs report; the real Vulkan device still does the rendering. */
+int beer_vulkan_host_gpu_info(BeerHostGpuInfo *out)
+{
+    const int have = host_gpu_info_real(out);
+    if (!have) return 0;
+    const char *name = getenv("BEER_SPOOF_GPU_NAME");
+    const char *vendor = getenv("BEER_SPOOF_GPU_VENDOR");
+    const char *device = getenv("BEER_SPOOF_GPU_DEVICE");
+    const char *vram = getenv("BEER_SPOOF_GPU_VRAM_MB");
+    if (name && *name) snprintf(out->name, sizeof(out->name), "%s", name);
+    if (vendor && *vendor) out->vendor_id = (uint32_t)strtoul(vendor, NULL, 16);
+    if (device && *device) out->device_id = (uint32_t)strtoul(device, NULL, 16);
+    if (vram && *vram) out->dedicated_video_memory = strtoull(vram, NULL, 10) * 1024ull * 1024ull;
+    if ((vendor && *vendor) || (device && *device))
+        out->luid = ((uint64_t)out->vendor_id << 32) | out->device_id;
     return 1;
 }

@@ -1,30 +1,36 @@
 CC     = gcc
-CFLAGS = -O0 -Wall -Wextra -m64 -g -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan
+CFLAGS = -O0 -Wall -Wextra -m64 -g -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan -Ithird_party/dxil-spirv
 RENDER_CFLAGS = $(filter-out -O0,$(CFLAGS)) -O3 -march=native
-LDFLAGS = -lpthread -ldl
+LDFLAGS = -lpthread -ldl -lcrypto -lz -lm
 TARGET = loader
 .DEFAULT_GOAL := $(TARGET)
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
 MEDIA_SRCS = media/media_foundation.c
-PLATFORM_SRCS = platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c \
+PLATFORM_SRCS = platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_bcrypt.c platform/win32_version.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
                 platform/win32_nt_section.c platform/win32_virtual_memory.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
                 platform/win32_seh.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
+               renderer/vulkan/vulkan_post.c \
                renderer/vulkan/vulkan_renderer.c \
                renderer/vulkan/vulkan_graphics.c \
                renderer/vulkan/vulkan_indexed_renderer.c
 GRAPHICS_SRCS = graphics/d3d11/d3d11_impl.c \
                 graphics/d3d12/d3d12_api.c \
                 graphics/d3d12/d3d12_shader_translator.c \
+                graphics/d3d12/d3d12_dxil_translator.c \
                 graphics/d3d12v/bd12_device.c graphics/d3d12v/bd12_cmd.c \
                 graphics/d3d12v/bd12_descriptors.c graphics/d3d12v/bd12_bind.c \
                 graphics/d3d12v/bd12_image.c graphics/d3d12v/bd12_graphics.c \
                 graphics/d3d12v/bd12_extra.c graphics/d3d12v/bd12_formats.c \
                 graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c \
-                graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c
+                graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c \
+                graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_mirror.c graphics/d3d12v/bd12_rtpipe.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_live.c \
+                graphics/d3d12v/bd12_capture.c graphics/d3d12v/bd12_cbtweak.c \
+                graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c \
+                graphics/d3d11v/bd11_swap.c
 SRCS = loader.c $(AUDIO_SRCS) $(MEDIA_SRCS) $(PLATFORM_SRCS) $(VULKAN_SRCS) $(GRAPHICS_SRCS)
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
@@ -47,6 +53,14 @@ D3D12_ABI_CFLAGS = $(filter-out -O0 -mno-sse -mno-sse2 -mno-avx -mno-mmx,$(CFLAG
 # floating-point parameters, so it needs SSE like the compat object.
 graphics/d3d12v/%.o: graphics/d3d12v/%.c
 	$(CC) $(D3D12_ABI_CFLAGS) -Igraphics/d3d12v -idirafter $(VULKAN_HEADERS) -c $< -o $@
+
+# BD11 (D3D11 on the BD12 core): same Win64-ABI/SSE needs as BD12.
+graphics/d3d11v/%.o: graphics/d3d11v/%.c graphics/d3d11v/bd11.h
+	$(CC) $(D3D12_ABI_CFLAGS) -fno-strict-aliasing -Igraphics/d3d12v -Igraphics/d3d11v -idirafter $(VULKAN_HEADERS) -c $< -o $@
+
+# Memory accessor handles floats (strtod/strtof), which the SSE-less loader flags cannot compile.
+platform/beer_memory.o: platform/beer_memory.c platform/beer_memory.h platform/beer_control.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
 
 graphics/d3d12/d3d12_shader_translator.o: graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_shader_translator.h
 	$(CC) $(RENDER_CFLAGS) -c $< -o $@
@@ -85,7 +99,7 @@ renderer/vulkan/vulkan_indexed_renderer.o: renderer/vulkan/vulkan_indexed_render
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-.PHONY: clean smoke-cli test-audio test-d3d11 test-d3d12 test-d3d12v test-media test-renderer test-input
+.PHONY: test-bd12-rt dxil-spirv clean smoke-cli test-audio test-d3d11 test-d3d12 test-d3d12v test-media test-renderer test-input
 
 test-d3d11: $(filter-out loader.o,$(OBJS))
 	$(CC) -O2 -Wall -Wextra -pthread -Igraphics/d3d11 \
@@ -152,10 +166,16 @@ test-renderer:
 D3D12V_SRCS = graphics/d3d12v/bd12_device.c graphics/d3d12v/bd12_cmd.c \
               graphics/d3d12v/bd12_descriptors.c graphics/d3d12v/bd12_bind.c \
               graphics/d3d12v/bd12_image.c graphics/d3d12v/bd12_graphics.c \
-              graphics/d3d12v/bd12_extra.c
+              graphics/d3d12v/bd12_extra.c graphics/d3d12v/bd12_mirror.c \
+              graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_capture.c
 D3D12V_CFLAGS = -O2 -g -Wall -Wextra -pthread -Igraphics/d3d12v -Irenderer/vulkan -idirafter $(VULKAN_HEADERS)
 
 # Standalone tests for the GPU-resident D3D12-on-Vulkan core (no game needed).
+test-bd12-rt:
+	$(VULKAN_GLSLC) --target-env=vulkan1.3 graphics/d3d12v/tests/rt_trace.comp -o /tmp/bd12-rt.spv
+	$(CC) $(D3D12V_CFLAGS) graphics/d3d12v/bd12_rt_test.c $(D3D12V_SRCS) graphics/d3d12v/bd12_formats.c renderer/vulkan/vulkan_context.c $(LDFLAGS) -o /tmp/bd12-rt-test
+	/tmp/bd12-rt-test /tmp/bd12-rt.spv
+
 test-d3d12v:
 	$(VULKAN_GLSLC) --target-env=vulkan1.3 graphics/d3d12v/tests/m1_va_double.comp -o /tmp/bd12-m1.spv
 	$(VULKAN_GLSLC) --target-env=vulkan1.3 graphics/d3d12v/tests/m2_bound.comp -o /tmp/bd12-m2.spv
@@ -211,6 +231,16 @@ smoke-cli: $(TARGET)
 	test -L "/tmp/beer-cli-prefix/dosdevices/c:"; \
 	rm -rf /tmp/beer-cli-prefix; \
 	echo "Strict Vulkan CLI and prefix smoke tests passed"
+
+# DXIL -> SPIR-V translator used for DXR shader libraries (loaded with dlopen).
+DXIL_SPIRV_DIR := third_party/dxil-spirv
+DXIL_SPIRV_LIB := $(DXIL_SPIRV_DIR)/build/libdxil-spirv-c-shared.so
+
+dxil-spirv: $(DXIL_SPIRV_LIB)
+
+$(DXIL_SPIRV_LIB):
+	cmake -S $(DXIL_SPIRV_DIR) -B $(DXIL_SPIRV_DIR)/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+	ninja -C $(DXIL_SPIRV_DIR)/build dxil-spirv-c-shared
 
 clean:
 	rm -f $(TARGET) $(OBJS) $(DEPS) $(VULKAN_SPV)

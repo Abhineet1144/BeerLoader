@@ -3,6 +3,8 @@
 #include "vulkan_renderer.h"
 #include "vulkan_indexed_renderer.h"
 #include "vulkan_context.h"
+#include "../../platform/beer_overlay.h"
+#include "vulkan_post.h"
 
 #include <dlfcn.h>
 #include <stdio.h>
@@ -97,6 +99,10 @@ typedef struct {
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
     PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
     PFN_vkCmdBlitImage CmdBlitImage;
+    VkBuffer overlay_buffer;
+    VkDeviceMemory overlay_memory;
+    uint8_t *overlay_map;
+    uint64_t overlay_serial[2];
     PFN_vkCmdCopyImage CmdCopyImage;
     PFN_vkCreateSemaphore CreateSemaphore;
     PFN_vkDestroySemaphore DestroySemaphore;
@@ -148,6 +154,7 @@ static void destroy_swapchain(void)
         g_vk.DestroyBuffer(g_vk.device, g_vk.staging_buffer, NULL);
     if (g_vk.staging_memory && g_vk.FreeMemory)
         g_vk.FreeMemory(g_vk.device, g_vk.staging_memory, NULL);
+    vulkan_post_forget_upload();
     if (g_vk.upload_image && g_vk.DestroyImage)
         g_vk.DestroyImage(g_vk.device, g_vk.upload_image, NULL);
     if (g_vk.upload_memory && g_vk.FreeMemory)
@@ -349,6 +356,57 @@ static int find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags required,
     return 0;
 }
 
+/* In-game overlay: the boxes are CPU-rendered (platform/beer_overlay.c) into a persistent host-visible buffer
+ * and copied onto the swapchain image after the frame was blitted into it. Called with the image in
+ * TRANSFER_DST layout. Boxes are opaque; the cost while hidden is one mutex-free branch. */
+#define OVERLAY_REGION_BYTES (4u * 1024u * 1024u)
+static void record_overlay(VkImage destination)
+{
+    BeerOverlayRect rects[2];
+    const int count = beer_overlay_frame((int)g_vk.extent.width, (int)g_vk.extent.height, rects);
+    if (count <= 0) return;
+    if (!g_vk.overlay_buffer) {
+        VkBufferCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = 2u * OVERLAY_REGION_BYTES,
+            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+        };
+        VkMemoryRequirements requirements;
+        uint32_t type = 0;
+        if (g_vk.CreateBuffer(g_vk.device, &info, NULL, &g_vk.overlay_buffer) != VK_SUCCESS) return;
+        g_vk.GetBufferMemoryRequirements(g_vk.device, g_vk.overlay_buffer, &requirements);
+        VkMemoryAllocateInfo allocation = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = requirements.size };
+        if (!find_memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &type) ||
+            (allocation.memoryTypeIndex = type, g_vk.AllocateMemory(g_vk.device, &allocation, NULL, &g_vk.overlay_memory) != VK_SUCCESS) ||
+            g_vk.BindBufferMemory(g_vk.device, g_vk.overlay_buffer, g_vk.overlay_memory, 0) != VK_SUCCESS ||
+            g_vk.MapMemory(g_vk.device, g_vk.overlay_memory, 0, info.size, 0, (void **)&g_vk.overlay_map) != VK_SUCCESS) {
+            g_vk.overlay_buffer = VK_NULL_HANDLE;
+            return;
+        }
+    }
+    for (int i = 0; i < count; ++i) {
+        const BeerOverlayRect *r = &rects[i];
+        const size_t bytes = (size_t)r->w * (size_t)r->h * 4u;
+        if (bytes > OVERLAY_REGION_BYTES || r->w <= 0 || r->h <= 0) continue;
+        const int slot = (int)(r->serial & 1u);   /* box index is encoded in the serial's low bit */
+        uint8_t *region = g_vk.overlay_map + (size_t)slot * OVERLAY_REGION_BYTES;
+        if (g_vk.overlay_serial[slot] != r->serial) {
+            memcpy(region, r->bgra, bytes);
+            g_vk.overlay_serial[slot] = r->serial;
+        }
+        VkBufferImageCopy copy = {
+            .bufferOffset = (VkDeviceSize)slot * OVERLAY_REGION_BYTES,
+            .bufferRowLength = (uint32_t)r->w,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { r->x, r->y, 0 },
+            .imageExtent = { (uint32_t)r->w, (uint32_t)r->h, 1 }
+        };
+        g_vk.CmdCopyBufferToImage(g_vk.command_buffer, g_vk.overlay_buffer, destination,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
+}
+
 static int recreate_swapchain(int requested_width, int requested_height,
                               int source_width, int source_height)
 {
@@ -498,7 +556,9 @@ static int recreate_swapchain(int requested_width, int requested_height,
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 ((rgba_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
+                      ? VK_IMAGE_USAGE_STORAGE_BIT : 0),   /* final-image compute passes (vulkan_post.c) */
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
     };
@@ -622,6 +682,7 @@ static int present_rgba8_staging(void *display, unsigned long window,
         beer_vulkan_record_result(fence_result, "presenter fence wait");
         return 0;
     }
+    vulkan_post_collect();
 
     size_t bytes = (size_t)width * (size_t)height * 4u;
     uint64_t shared_handle = 0;
@@ -748,6 +809,9 @@ static int present_rgba8_staging(void *display, unsigned long window,
     g_vk.CmdCopyBufferToImage(g_vk.command_buffer, frame_buffer,
                               g_vk.upload_image,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    int overlay_blended = 0;
+    VkImage processed = vulkan_post_apply(g_vk.command_buffer, g_vk.upload_image, (uint32_t)width, (uint32_t)height,
+                                          g_vk.extent.width, g_vk.extent.height, &overlay_blended);
     VkImageMemoryBarrier upload_read = barriers[0];
     upload_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     upload_read.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -766,11 +830,12 @@ static int present_rgba8_staging(void *display, unsigned long window,
                         { (int32_t)g_vk.extent.width,
                           (int32_t)g_vk.extent.height, 1 } }
     };
-    g_vk.CmdBlitImage(g_vk.command_buffer, g_vk.upload_image,
+    g_vk.CmdBlitImage(g_vk.command_buffer, processed ? processed : g_vk.upload_image,
                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                       g_vk.images[image_index],
                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                       1, &blit, VK_FILTER_LINEAR);
+    if (!overlay_blended) record_overlay(g_vk.images[image_index]);
     VkImageMemoryBarrier after = barriers[1];
     after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     after.dstAccessMask = 0;
@@ -902,6 +967,7 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
         beer_vulkan_record_result(fence_result, "presenter fence wait");
         return 0;
     }
+    vulkan_post_collect();
     static uint64_t acquire_timeout_ns = UINT64_MAX - 1;
     if (acquire_timeout_ns == UINT64_MAX - 1) {
         const char *env = getenv("BEER_PRESENT_ACQUIRE_TIMEOUT_MS");
@@ -980,6 +1046,7 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, NULL, 0, NULL, 1, &to_read[2]);
 
+    int overlay_blended = 0;
     VkImage blit_source = source;
     VkImageLayout blit_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     if (!direct_blit) {
@@ -991,6 +1058,8 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
         g_vk.CmdCopyImage(g_vk.command_buffer, source,
                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_vk.upload_image,
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        VkImage processed = vulkan_post_apply(g_vk.command_buffer, g_vk.upload_image, (uint32_t)width, (uint32_t)height,
+                                              g_vk.extent.width, g_vk.extent.height, &overlay_blended);
         VkImageMemoryBarrier upload_read = to_read[1];
         upload_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         upload_read.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -1000,7 +1069,7 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                                 0, NULL, 0, NULL, 1, &upload_read);
-        blit_source = g_vk.upload_image;
+        blit_source = processed ? processed : g_vk.upload_image;
     }
     VkImageBlit blit = {
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
@@ -1014,6 +1083,7 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
                       g_vk.images[image_index],
                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                       1, &blit, VK_FILTER_LINEAR);
+    if (!overlay_blended) record_overlay(g_vk.images[image_index]);
     VkImageMemoryBarrier after[2] = { to_read[2], to_read[0] };
     after[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     after[0].dstAccessMask = 0;

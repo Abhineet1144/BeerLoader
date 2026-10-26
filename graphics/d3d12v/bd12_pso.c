@@ -339,7 +339,10 @@ static uint32_t to_bindings(const BeerD3D12TranslatedShader *shader,
             .reg = d->register_index,
             .is_buffer = d->resource_type == BEER_D3D12_SHADER_RESOURCE_BUFFER,
             .count = d->count ? d->count : 1,
-            .binding = d->binding
+            .binding = d->binding,
+            .bindless = d->bindless,
+            .push_word = d->push_word,
+            .heap_class = d->heap_class
         };
     }
     return shader->descriptor_count;
@@ -466,7 +469,15 @@ BD12GraphicsPipeline *bd12_pso_create_graphics(BD12Device *device,
     desc.samples = pso->samples;
     desc.alpha_to_coverage = pso->alpha_to_coverage;
     desc.primitive_restart = pso->strip_cut != 0;
-    return bd12_graphics_pipeline_create(device, &desc);
+    {
+        BD12GraphicsPipeline *created = bd12_graphics_pipeline_create(device, &desc);
+        if (created && getenv("BEER_BD12_PSO_LOG"))
+            fprintf(stderr, "[PSOSHADERS] %016llx vs=%016llx ps=%016llx\n",
+                    (unsigned long long)created->shader_hash,
+                    (unsigned long long)vs->shader_hash,
+                    (unsigned long long)(ps ? ps->shader_hash : 0));
+        return created;
+    }
 }
 
 /* Clone ---------------------------------------------------------------------- */

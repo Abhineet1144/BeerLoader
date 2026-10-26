@@ -1,0 +1,16 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+// Diagnostic: copies indexed indirect draw arguments, forcing instanceCount to 1
+// for every draw that has indices. BEER_BD12_FORCE_INST in bd12_graphics.c.
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430) readonly buffer Src { uint v[]; };
+layout(buffer_reference, std430) buffer Dst { uint v[]; };
+layout(push_constant, std430) uniform Push { Src src; Dst dst; uint count; uint words; } p;
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) return;
+    uint b = i * p.words;
+    for (uint w = 0; w < p.words; ++w) p.dst.v[b + w] = p.src.v[b + w];
+    if (p.src.v[b] != 0u) p.dst.v[b + 1u] = 1u;
+}

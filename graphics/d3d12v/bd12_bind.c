@@ -14,7 +14,7 @@ BD12ComputePipeline *bd12_compute_pipeline_create(BD12Device *device,
                                                   uint32_t push_bytes)
 {
     return bd12_compute_pipeline_build(device, spirv, spirv_bytes, push_bytes,
-                                       VK_NULL_HANDLE);
+                                       VK_NULL_HANDLE, 0);
 }
 
 int bd12_binding_descriptor_type(const BD12ShaderBinding *b,
@@ -23,6 +23,7 @@ int bd12_binding_descriptor_type(const BD12ShaderBinding *b,
     switch (b->type) {
     case BD12_RANGE_CBV: *type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; return 1;
     case BD12_RANGE_SRV:
+        if (b->is_accel) { *type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; return 1; }
         *type = b->is_buffer ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER :
                                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         return 1;
@@ -72,14 +73,29 @@ BD12ComputePipeline *bd12_compute_pipeline_create_bound(
         calloc(binding_count ? binding_count : 1, sizeof(*layout_bindings));
     BD12ShaderBinding *copy = calloc(binding_count ? binding_count : 1,
                                      sizeof(*copy));
+    BD12ShaderBinding *bindless = calloc(binding_count ? binding_count : 1,
+                                         sizeof(*bindless));
+    uint32_t bindless_count = 0, bindless_words = 0;
     VkDescriptorType *types = calloc(binding_count ? binding_count : 1,
                                      sizeof(*types));
     BD12ComputePipeline *pipeline = NULL;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     uint32_t *dense_spirv = NULL;
-    if (!layout_bindings || !copy || !types) goto done;
+    if (!layout_bindings || !copy || !types || !bindless) goto done;
     uint32_t next_binding = 0;
-    for (uint32_t i = 0; i < binding_count; ++i) copy[i] = bindings[i];
+    {   /* Heap-array bindings leave set 0 for the heap mirror (set 1). */
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < binding_count; ++i) {
+            if (bindings[i].bindless) {
+                bindless[bindless_count++] = bindings[i];
+                if (bindings[i].push_word + 1 > bindless_words)
+                    bindless_words = bindings[i].push_word + 1;
+            } else {
+                copy[kept++] = bindings[i];
+            }
+        }
+        binding_count = kept;
+    }
     dense_spirv = bd12_densify_bindings(spirv, spirv_bytes, copy, binding_count,
                                         &next_binding);
     if (!dense_spirv) goto done;
@@ -103,7 +119,7 @@ BD12ComputePipeline *bd12_compute_pipeline_create_bound(
                                              &set_layout) != VK_SUCCESS)
         goto done;
     pipeline = bd12_compute_pipeline_build(device, spirv, spirv_bytes, 0,
-                                           set_layout);
+                                           set_layout, bindless_words);
     if (!pipeline) {
         device->vk.DestroyDescriptorSetLayout(device->device, set_layout, NULL);
         goto done;
@@ -111,9 +127,14 @@ BD12ComputePipeline *bd12_compute_pipeline_create_bound(
     pipeline->bindings = copy;
     pipeline->binding_types = types;
     pipeline->binding_count = binding_count;
+    pipeline->bindless = bindless;
+    pipeline->bindless_count = bindless_count;
+    pipeline->bindless_words = bindless_words;
     copy = NULL;
     types = NULL;
+    bindless = NULL;
 done:
+    free(bindless);
     free(dense_spirv);
     free(layout_bindings);
     free(copy);
@@ -164,6 +185,12 @@ static int scratch_alloc(BD12CmdAllocator *a, VkDeviceSize size,
     }
 }
 
+int bd12_scratch_alloc(BD12CmdAllocator *a, VkDeviceSize size,
+                       BD12Buffer **buffer, VkDeviceSize *offset, void **ptr)
+{
+    return scratch_alloc(a, size, buffer, offset, ptr);
+}
+
 static VkDescriptorSet allocate_set(BD12CmdAllocator *a,
                                     VkDescriptorSetLayout layout)
 {
@@ -208,13 +235,14 @@ static VkDescriptorSet allocate_set(BD12CmdAllocator *a,
             VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
         };
-        VkDescriptorPoolSize sizes[6];
+        VkDescriptorPoolSize sizes[7];
         for (int i = 0; i < 6; ++i)
             sizes[i] = (VkDescriptorPoolSize){ kinds[i], BD12_POOL_DESCRIPTORS };
+        sizes[6] = (VkDescriptorPoolSize){ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 256 };
         VkDescriptorPoolCreateInfo pool_info = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .maxSets = BD12_POOL_SETS,
-            .poolSizeCount = 6,
+            .poolSizeCount = device->rt_enabled ? 7u : 6u,
             .pPoolSizes = sizes
         };
         VkDescriptorPool pool;
@@ -288,6 +316,8 @@ typedef struct {
     VkImageLayout image_layout;
     VkSampler sampler;
     BD12Image *image;
+    uint32_t view_mip, view_base_layer, view_layers;
+    uint64_t as_va;               /* BD12_DESC_SRV_AS */
 } Resolved;
 
 static const BD12Descriptor *table_descriptor(BD12CmdList *list,
@@ -385,6 +415,11 @@ static int resolve_one(BD12CmdList *list, BD12BindState *state,
             if (b->type != want || p->shader_register != reg ||
                 p->space != b->space)
                 break;
+            if (want == BD12_RANGE_SRV && b->is_accel) {   /* root SRV holding an acceleration structure address */
+                out->kind = BD12_DESC_SRV_AS;
+                out->as_va = arg->value;
+                return 1;
+            }
             VkDeviceSize offset = 0;
             BD12Buffer *buffer = arg->value ?
                 bd12_va_resolve(device, arg->value, &offset) : NULL;
@@ -402,6 +437,10 @@ static int resolve_one(BD12CmdList *list, BD12BindState *state,
                 return 1;
             }
             if (!b->is_buffer) return 1;
+            out->source_buffer = buffer;
+            out->buffer = buffer->buffer;
+            out->offset = offset;
+            out->range = range;
             out->view = bd12_buffer_view(buffer, VK_FORMAT_R32_UINT, offset,
                                          range & ~(VkDeviceSize)3,
                                          want == BD12_RANGE_UAV);
@@ -415,15 +454,33 @@ static int resolve_one(BD12CmdList *list, BD12BindState *state,
                 list, p, arg->value, b->type, b->space, reg);
             if (!d) break;
             out->kind = d->kind;
+            if (d->kind == BD12_DESC_SRV_AS) { out->as_va = d->offset; return 1; }
+            /* A descriptor left behind by a destroyed resource acts as a null descriptor. */
+            if (!bd12_descriptor_alive(d)) {
+                memset(out, 0, sizeof(*out));
+                return 1;
+            }
             out->buffer = d->buffer;
             out->offset = d->offset;
             out->range = d->range;
             out->source_buffer = d->source_buffer;
             out->view = d->buffer_view;
+            if ((d->kind == BD12_DESC_SRV_BUFFER || d->kind == BD12_DESC_UAV_BUFFER) &&
+                d->source_buffer && !d->buffer_view) {
+                out->view = bd12_buffer_view(d->source_buffer, d->format, d->offset,
+                                             d->range, d->kind == BD12_DESC_UAV_BUFFER);
+                if (!out->view) {          /* invalid range/alignment: act as a null descriptor */
+                    memset(out, 0, sizeof(*out));
+                    return 1;
+                }
+            }
             out->image_view = d->image_view;
             out->image_layout = d->image_layout;
             out->sampler = d->sampler;
             out->image = d->image;
+            out->view_mip = d->view_mip;
+            out->view_base_layer = d->view_base_layer;
+            out->view_layers = d->view_layers;
             return 1;
         }
         }
@@ -440,7 +497,9 @@ static VkDescriptorSet resolve_set_impl(
 {
     if (!set_layout || !state->root_signature) return VK_NULL_HANDLE;
     BD12Device *device = list->device;
+    BD12_PROF_BEGIN();
     VkDescriptorSet set = allocate_set(list->allocator, set_layout);
+    BD12_PROF_END(BD12_PROF_ALLOC_SET);
     if (!set) return VK_NULL_HANDLE;
 
     enum { MAX_WRITES = 64, MAX_INFOS = 256 };
@@ -448,6 +507,8 @@ static VkDescriptorSet resolve_set_impl(
     VkDescriptorBufferInfo buffer_infos[MAX_INFOS];
     VkBufferView views[MAX_INFOS];
     VkDescriptorImageInfo image_infos[MAX_INFOS];
+    VkAccelerationStructureKHR as_handles[MAX_INFOS];
+    VkWriteDescriptorSetAccelerationStructureKHR as_writes[MAX_WRITES];
     uint32_t write_count = 0, info_count = 0;
     for (uint32_t i = 0; i < binding_count; ++i) {
         const BD12ShaderBinding *b = &bindings[i];
@@ -470,6 +531,44 @@ static VkDescriptorSet resolve_set_impl(
         for (uint32_t e = 0; e < b->count; ++e) {
             Resolved r;
             if (!resolve_one(list, state, b, b->reg + e, &r)) return VK_NULL_HANDLE;
+            if (state == &list->graphics && bd12_trace_active() && getenv("BEER_BD12_BIND_LOG") &&
+                list->gfx.pipeline && r.kind == BD12_DESC_UAV_BUFFER && r.source_buffer)
+                fprintf(stderr, "[BINDG] pso=%016llx u%u va=%llx range=%llu\n",
+                        (unsigned long long)list->gfx.pipeline->shader_hash, b->reg + e,
+                        (unsigned long long)(r.source_buffer->va + r.offset),
+                        (unsigned long long)r.range);
+            if (state == &list->compute && bd12_trace_active() && getenv("BEER_BD12_BIND_LOG") &&
+                list->compute_pipeline &&
+                (r.kind == BD12_DESC_SRV_BUFFER || r.kind == BD12_DESC_UAV_BUFFER) &&
+                r.source_buffer)
+                fprintf(stderr, "[BIND] cs=%016llx %c%u va=%llx range=%llu\n",
+                        (unsigned long long)list->compute_pipeline->shader_hash,
+                        r.kind == BD12_DESC_SRV_BUFFER ? 't' : 'u', b->reg + e,
+                        (unsigned long long)(r.source_buffer->va + r.offset),
+                        (unsigned long long)r.range);
+            if (state == &list->compute && r.kind == BD12_DESC_SRV_IMAGE && r.image &&
+                list->compute_pipeline && bd12_trace_active() && getenv("BEER_BD12_CAPTURE_SRV_DEPTH"))
+                bd12_capture_srv_depth(list, r.image, r.view_mip, r.view_base_layer,
+                                       r.view_layers, list->compute_pipeline->shader_hash,
+                                       b->reg + e);
+            if (__atomic_load_n(&g_bd12_cbt_active, __ATOMIC_RELAXED) && r.kind == BD12_DESC_CBV && r.source_buffer) {
+                const uint64_t pso = state == &list->graphics ? (list->gfx.pipeline ? list->gfx.pipeline->shader_hash : 0)
+                                                              : (list->compute_pipeline ? list->compute_pipeline->shader_hash : 0);
+                bd12_cbt_observe(pso, b->stage, b->space, b->reg + e, r.source_buffer, r.offset, r.range);
+            }
+            if (bd12_capture_enabled() && getenv("BEER_BD12_BIND_LOG"))
+                fprintf(stderr, "[BIND] type=%u space=%u reg=%u+%u binding=%u bindless=%u accel=%u -> kind=%u buf=%p img=%p\n",
+                        b->type, b->space, b->reg, e, b->binding, b->bindless, b->is_accel, r.kind, (void *)(uintptr_t)r.buffer, (void *)r.image);
+            if (bd12_capture_enabled() && r.kind == BD12_DESC_UAV_IMAGE && r.image)
+                bd12_capture_note_image(b->reg + e, b->space, r.image, r.view_mip);
+            if (bd12_capture_enabled()) {
+                if (r.kind == BD12_DESC_CBV)
+                    bd12_capture_note(0, b->space, b->reg + e, r.buffer, r.offset, r.range);
+                else if ((r.kind == BD12_DESC_SRV_BUFFER || r.kind == BD12_DESC_UAV_BUFFER) &&
+                         r.source_buffer)
+                    bd12_capture_note(r.kind == BD12_DESC_SRV_BUFFER ? 1 : 2, b->space,
+                                      b->reg + e, r.source_buffer->buffer, r.offset, r.range);
+            }
             if (type == VK_DESCRIPTOR_TYPE_SAMPLER) {
                 VkSampler sampler = r.sampler;
                 if (!sampler) {
@@ -495,6 +594,9 @@ static VkDescriptorSet resolve_set_impl(
                     (VkDescriptorImageInfo){ VK_NULL_HANDLE, r.image_view,
                                              r.image_view ? r.image_layout :
                                              VK_IMAGE_LAYOUT_UNDEFINED };
+            } else if (type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+                as_handles[info_count + e] = r.kind == BD12_DESC_SRV_AS && r.as_va ?
+                    bd12_rt_as_from_va(device, r.as_va) : VK_NULL_HANDLE;
             } else if (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
                 buffer_infos[info_count + e] = (VkDescriptorBufferInfo){
                     r.kind == BD12_DESC_CBV ? r.buffer : VK_NULL_HANDLE,
@@ -508,15 +610,27 @@ static VkDescriptorSet resolve_set_impl(
             type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
             type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
             w->pImageInfo = &image_infos[info_count];
-        else if (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+        else if (type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+            VkWriteDescriptorSetAccelerationStructureKHR *aw = &as_writes[write_count - 1];
+            *aw = (VkWriteDescriptorSetAccelerationStructureKHR){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+                .accelerationStructureCount = b->count,
+                .pAccelerationStructures = &as_handles[info_count]
+            };
+            w->pNext = aw;
+        } else if (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
             w->pBufferInfo = &buffer_infos[info_count];
         else
             w->pTexelBufferView = &views[info_count];
         info_count += b->count;
     }
-    if (write_count)
+    if (write_count) {
+        const uint64_t t_update = bd12_prof_now();
         device->vk.UpdateDescriptorSets(device->device, write_count, writes, 0,
                                         NULL);
+        g_bd12_prof_ns[BD12_PROF_UPDATE_SETS] += bd12_prof_now() - t_update;
+        ++g_bd12_prof_calls[BD12_PROF_UPDATE_SETS];
+    }
     return set;
 }
 
@@ -527,6 +641,7 @@ static void record_dispatch(BD12CmdList *list, uint32_t x, uint32_t y,
     const uint64_t sequence = list->dispatch_count++;
     BD12DispatchFlight *entry =
         &list->dispatch_flight[sequence % BD12_FLIGHT_DISPATCHES];
+    bd12_ckpt_mark(list, 100u + (indirect != 0), pso ? pso->shader_hash : 0, 0, x, y, z);
     *entry = (BD12DispatchFlight){
         .shader_hash = pso ? pso->shader_hash : 0,
         .x = x, .y = y, .z = z,
@@ -538,11 +653,55 @@ static void record_dispatch(BD12CmdList *list, uint32_t x, uint32_t y,
     };
 }
 
+/* Heap index of the first element of a bindless array: the root table whose
+ * range holds register b->reg. */
+int bd12_bindless_heap_index(BD12CmdList *list, BD12BindState *state,
+                             const BD12ShaderBinding *b, uint32_t *index)
+{
+    BD12DescriptorHeap *heap = list->heaps[b->type == BD12_RANGE_SAMPLER ? 1 : 0];
+    const BD12RootSignature *rs = state->root_signature;
+    if (!heap || !rs) return 0;
+    for (uint32_t i = 0; i < rs->parameter_count; ++i) {
+        const BD12RootParameter *p = &rs->parameters[i];
+        if (p->type != BD12_ROOT_TABLE || !visibility_matches(p->visibility, b->stage))
+            continue;
+        const uint64_t handle = state->arguments[i].value;
+        if (handle < heap->gpu_base ||
+            handle >= heap->gpu_base + (uint64_t)heap->count * BD12_DESCRIPTOR_INCREMENT)
+            continue;
+        const uint32_t base = (uint32_t)((handle - heap->gpu_base) /
+                                         BD12_DESCRIPTOR_INCREMENT);
+        uint32_t running = 0;
+        for (uint32_t r = 0; r < p->range_count; ++r) {
+            const BD12DescriptorRange *range = &p->ranges[r];
+            const uint32_t offset = range->offset == BD12_RANGE_APPEND ? running :
+                                    range->offset;
+            running = offset + (range->count == UINT32_MAX ? 0 : range->count);
+            if (range->type != b->type || range->space != b->space) continue;
+            if (b->reg < range->base_register) continue;
+            const uint32_t rel = b->reg - range->base_register;
+            if (range->count != UINT32_MAX && rel >= range->count) continue;
+            *index = base + offset + rel;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+VkDescriptorSet bd12_allocate_descriptor_set(BD12CmdAllocator *allocator,
+                                             VkDescriptorSetLayout layout)
+{
+    return allocate_set(allocator, layout);
+}
+
 VkDescriptorSet bd12_resolve_descriptor_set(
     BD12CmdList *list, BD12BindState *state, const BD12ShaderBinding *bindings,
     const VkDescriptorType *types, uint32_t binding_count,
     VkDescriptorSetLayout set_layout)
 {
+    if (list->resolve_hook)
+        return list->resolve_hook(list, list->resolve_user, bindings, types, binding_count,
+                                  set_layout, state == &list->compute);
     BD12_PROF_BEGIN();
     VkDescriptorSet set = resolve_set_impl(list, state, bindings, types,
                                            binding_count, set_layout);
@@ -554,20 +713,51 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
                             uint32_t z)
 {
     BD12ComputePipeline *pso = list->compute_pipeline;
-    if (!pso || !pso->set_layout || !list->compute.root_signature) return 0;
+    if (!pso || !pso->set_layout || (!list->compute.root_signature && !list->resolve_hook)) {
+        BD12_DROP(BD12_DROP_DISPATCH_NO_STATE);
+        return 0;
+    }
+    if (bd12_debug_sync_all()) bd12_cmd_global_barrier(list);
     BD12Device *device = list->device;
     bd12_cmd_end_rendering(list);
+    const int capture = bd12_capture_wants(pso->shader_hash) ||
+        (pso->writes_3d_storage_image && getenv("BEER_BD12_CAPTURE_3D") &&
+         getenv("BEER_BD12_CAPTURE_DIR") && bd12_trace_active());
+    if (capture) bd12_capture_begin();
     VkDescriptorSet set = bd12_resolve_descriptor_set(
         list, &list->compute, pso->bindings, pso->binding_types,
         pso->binding_count, pso->set_layout);
-    if (!set) return 0;
+    if (capture) bd12_capture_record(list, 0, pso->shader_hash, x, y, z);
+    if (!set || (pso->bindless_words && !bd12_mirror_prepare(list))) {
+        if (capture) bd12_capture_end();
+        BD12_DROP(BD12_DROP_DISPATCH_NO_DESCRIPTORS);
+        return 0;
+    }
+    if (bd12_trace_active())
+        fprintf(stderr, "[TRACE] dispatch cs=%016llx groups=%u,%u,%u uav3d=%d\n",
+                (unsigned long long)pso->shader_hash, x, y, z, pso->writes_3d_storage_image);
     record_dispatch(list, x, y, z, 0);
     device->vk.CmdBindPipeline(list->command_buffer,
                                VK_PIPELINE_BIND_POINT_COMPUTE, pso->pipeline);
     device->vk.CmdBindDescriptorSets(list->command_buffer,
                                      VK_PIPELINE_BIND_POINT_COMPUTE,
                                      pso->layout, 0, 1, &set, 0, NULL);
+    if (pso->bindless_words)
+        bd12_cmd_bind_bindless(list, &list->compute, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               pso->layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               pso->bindless, pso->bindless_count,
+                               pso->bindless_words);
     device->vk.CmdDispatch(list->command_buffer, x, y, z);
+    if (capture) {
+        bd12_capture_record(list, 1, pso->shader_hash, x, y, z);
+        if (getenv("BEER_BD12_CAPTURE_TWICE")) {
+            /* Determinism check: run the identical dispatch again. */
+            bd12_cmd_global_barrier(list);
+            device->vk.CmdDispatch(list->command_buffer, x, y, z);
+            bd12_capture_record(list, 2, pso->shader_hash, x, y, z);
+        }
+        bd12_capture_end();
+    }
     return 1;
 }
 
@@ -575,19 +765,24 @@ int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
                                      VkDeviceSize offset)
 {
     BD12ComputePipeline *pso = list->compute_pipeline;
-    if (!pso || !pso->set_layout || !list->compute.root_signature) return 0;
+    if (!pso || !pso->set_layout || (!list->compute.root_signature && !list->resolve_hook)) return 0;
     BD12Device *device = list->device;
     bd12_cmd_end_rendering(list);
     VkDescriptorSet set = bd12_resolve_descriptor_set(
         list, &list->compute, pso->bindings, pso->binding_types,
         pso->binding_count, pso->set_layout);
-    if (!set) return 0;
+    if (!set || (pso->bindless_words && !bd12_mirror_prepare(list))) return 0;
     record_dispatch(list, 0, 0, 0, 1);
     device->vk.CmdBindPipeline(list->command_buffer,
                                VK_PIPELINE_BIND_POINT_COMPUTE, pso->pipeline);
     device->vk.CmdBindDescriptorSets(list->command_buffer,
                                      VK_PIPELINE_BIND_POINT_COMPUTE,
                                      pso->layout, 0, 1, &set, 0, NULL);
+    if (pso->bindless_words)
+        bd12_cmd_bind_bindless(list, &list->compute, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               pso->layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               pso->bindless, pso->bindless_count,
+                               pso->bindless_words);
     device->vk.CmdDispatchIndirect(list->command_buffer, args->buffer, offset);
     return 1;
 }

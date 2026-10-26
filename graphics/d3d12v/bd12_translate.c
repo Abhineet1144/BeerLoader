@@ -25,8 +25,12 @@ BD12ComputePipeline *bd12_compute_pipeline_create_dxbc(
             .space = d->register_space,
             .reg = d->register_index,
             .is_buffer = d->resource_type == BEER_D3D12_SHADER_RESOURCE_BUFFER,
+            .is_accel = d->resource_type == BEER_D3D12_SHADER_RESOURCE_ACCEL,
             .count = d->count ? d->count : 1,
-            .binding = d->binding
+            .binding = d->binding,
+            .bindless = d->bindless,
+            .push_word = d->push_word,
+            .heap_class = d->heap_class
         };
     }
     BD12ComputePipeline *pipeline = bd12_compute_pipeline_create_bound(

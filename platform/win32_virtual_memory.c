@@ -99,12 +99,47 @@ void *beer_virtual_alloc(void *address, size_t size, uint32_t allocation_type,
         return NULL;
     }
     if (!(allocation_type & BEER_MEM_COMMIT)) host_protection = PROT_NONE;
+    if (address) {
+        /* Commit (or re-commit) pages inside a region this loader already reserved. */
+        pthread_mutex_lock(&g_allocation_mutex);
+        BeerAllocation *existing = find_allocation_locked((void *)requested);
+        int inside = existing &&
+            requested + mapped_size <= (uintptr_t)existing->base + existing->size;
+        pthread_mutex_unlock(&g_allocation_mutex);
+        if (existing) {
+            if (!inside || !(allocation_type & BEER_MEM_COMMIT) ||
+                (allocation_type & BEER_MEM_RESERVE && !(allocation_type & BEER_MEM_COMMIT))) {
+                errno = EEXIST;
+                return NULL;
+            }
+            if (mprotect((void *)requested, mapped_size, host_protection) != 0) return NULL;
+            return address;
+        }
+    }
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_FIXED_NOREPLACE
     if (address) flags |= MAP_FIXED_NOREPLACE;
 #endif
-    void *mapped = mmap(address ? (void *)requested : NULL, mapped_size,
-                        host_protection, flags, -1, 0);
+    void *mapped;
+    if (!address) {
+        /* Windows reserves in 64 KiB allocation-granularity units and returns
+         * 64 KiB-aligned bases; runtimes and allocators rely on that. */
+        const size_t granularity = 65536;
+        size_t region = align_up_size(mapped_size, granularity);
+        if (!region) { errno = ENOMEM; return NULL; }
+        size_t span = region + granularity;
+        if (span < region) { errno = ENOMEM; return NULL; }
+        void *raw = mmap(NULL, span, host_protection, flags, -1, 0);
+        if (raw == MAP_FAILED) return NULL;
+        uintptr_t base = ((uintptr_t)raw + granularity - 1) & ~(uintptr_t)(granularity - 1);
+        if (base > (uintptr_t)raw) munmap(raw, base - (uintptr_t)raw);
+        uintptr_t tail = base + region, raw_end = (uintptr_t)raw + span;
+        if (raw_end > tail) munmap((void *)tail, raw_end - tail);
+        mapped = (void *)base;
+        mapped_size = region;
+    } else {
+        mapped = mmap((void *)requested, mapped_size, host_protection, flags, -1, 0);
+    }
     if (mapped == MAP_FAILED) return NULL;
 #ifndef MAP_FIXED_NOREPLACE
     if (address && mapped != (void *)requested) {

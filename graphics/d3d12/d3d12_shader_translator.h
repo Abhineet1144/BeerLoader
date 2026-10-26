@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BEER_D3D12_MAX_SHADER_DESCRIPTORS 64
+#define BEER_D3D12_MAX_SHADER_DESCRIPTORS 128
 
 typedef enum BeerD3D12ShaderDescriptorType {
     BEER_D3D12_SHADER_DESCRIPTOR_SRV = 0,
@@ -24,7 +24,8 @@ typedef enum BeerD3D12ShaderResourceType {
     BEER_D3D12_SHADER_RESOURCE_TEXTURE_1D_ARRAY = 7,
     BEER_D3D12_SHADER_RESOURCE_TEXTURE_2D_ARRAY = 8,
     BEER_D3D12_SHADER_RESOURCE_TEXTURE_2D_MS_ARRAY = 9,
-    BEER_D3D12_SHADER_RESOURCE_TEXTURE_CUBE_ARRAY = 10
+    BEER_D3D12_SHADER_RESOURCE_TEXTURE_CUBE_ARRAY = 10,
+    BEER_D3D12_SHADER_RESOURCE_ACCEL = 11          /* ray tracing acceleration structure */
 } BeerD3D12ShaderResourceType;
 
 typedef struct BeerD3D12ShaderDescriptor {
@@ -37,6 +38,14 @@ typedef struct BeerD3D12ShaderDescriptor {
     uint32_t count;
     uint32_t set;
     uint32_t binding;
+    /* Bindless: the resource is an array indexed into the whole descriptor
+     * heap (set 1 of the pipeline layout) instead of owning a set-0 binding.
+     * push_word is the push-constant word that carries the heap index of the
+     * array's first element; heap_class selects the heap-mirror binding
+     * (0 sampled image, 1 storage image, 2 uniform texel, 3 storage texel). */
+    uint32_t bindless;
+    uint32_t push_word;
+    uint32_t heap_class;
 } BeerD3D12ShaderDescriptor;
 
 typedef struct BeerD3D12TranslatedShader {

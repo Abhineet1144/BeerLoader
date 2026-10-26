@@ -202,7 +202,12 @@ static BD12Image *image_create(BD12Device *device, BD12Heap *heap,
             goto fail;
     } else {
         VkDeviceSize size = (requirements.size + 65535) & ~(VkDeviceSize)65535;
-        heap = bd12_heap_create(device, BD12_HEAP_DEFAULT, size);
+        /* D3D12 zero-initializes committed resources. Games lean on it (accumulation
+         * buffers, partially redrawn atlases), and recycled device memory otherwise shows
+         * stale pixels from earlier resources. BEER_BD12_NO_IMAGE_ZERO=1 skips the fill. */
+        heap = getenv("BEER_BD12_NO_IMAGE_ZERO") ?
+               bd12_heap_create_unzeroed(device, BD12_HEAP_DEFAULT, size) :
+               bd12_heap_create(device, BD12_HEAP_DEFAULT, size);
         if (!heap) goto fail;
         image->heap = heap;
         image->owns_heap = 1;
@@ -213,6 +218,8 @@ static BD12Image *image_create(BD12Device *device, BD12Heap *heap,
     if (device->vk.BindImageMemory(device->device, image->image, heap->memory,
                                    offset) != VK_SUCCESS)
         goto fail;
+    image->serial = bd12_live_serial();
+    bd12_live_add(image);
     return image;
 
 fail:
@@ -241,6 +248,8 @@ void bd12_image_destroy(BD12Image *image)
 {
     if (!image) return;
     BD12Device *device = image->device;
+    bd12_live_remove(image);
+    bd12_mirror_forget_image(image);
     for (uint32_t i = 0; i < image->view_count; ++i)
         device->vk.DestroyImageView(device->device, image->views[i].view, NULL);
     free(image->views);
@@ -370,10 +379,11 @@ static VkImageSubresourceRange whole_range(const BD12Image *image)
 /* First command-list use: UNDEFINED -> layout of the creation state. */
 void bd12_image_ensure_initialized(BD12CmdList *list, BD12Image *image)
 {
+    if (__atomic_load_n(&image->initialized, __ATOMIC_ACQUIRE)) return;   /* lock-free fast path */
     BD12Device *device = image->device;
     pthread_mutex_lock(&device->view_lock);
     const int done = image->initialized;
-    image->initialized = 1;
+    __atomic_store_n(&image->initialized, 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&device->view_lock);
     if (done) return;
     VkPipelineStageFlags2 stage;
@@ -501,6 +511,9 @@ void bd12_cmd_copy_image_to_buffer(BD12CmdList *list, BD12Buffer *dst,
                                    uint32_t width, uint32_t height,
                                    uint32_t depth)
 {
+    if (dst->heap && dst->heap->type == BD12_HEAP_READBACK && getenv("BEER_BD12_RB_LOG"))
+        fprintf(stderr, "[RB] image->readback %ux%ux%u fmt=%d\n", width, height, depth,
+                (int)src->desc.format);
     bd12_cmd_end_rendering(list);
     bd12_image_ensure_initialized(list, src);
     const VkBufferImageCopy region = buffer_image_region(
@@ -521,6 +534,12 @@ void bd12_cmd_copy_image(BD12CmdList *list, BD12Image *dst, BD12ImagePoint at,
     bd12_image_ensure_initialized(list, src);
     uint32_t d, unused;
     copy_geometry(src, depth, &d, &unused);
+    if (bd12_trace_active() && getenv("BEER_BD12_COPY_LOG"))
+        fprintf(stderr, "[COPYIMG] dst %ux%u vk%d samples=%u sub=%u at=%d,%d,%d <- src %ux%u vk%d samples=%u sub=%u from=%d,%d,%d size=%ux%ux%u\n",
+                dst->desc.width, dst->desc.height, (int)dst->desc.format, dst->desc.samples,
+                at.subresource, at.x, at.y, at.z,
+                src->desc.width, src->desc.height, (int)src->desc.format, src->desc.samples,
+                from.subresource, from.x, from.y, from.z, width, height, depth);
     bd12_cmd_record_flight_op(list, BD12_FLIGHT_COPY_IMAGE, 0,
         (uint64_t)width * height * d, width, height, d);
     VkImageCopy region = {
@@ -554,6 +573,7 @@ static int write_image(BD12DescriptorHeap *heap, uint32_t index,
     if (!view) return 0;
     d->kind = kind;
     d->image = image;
+    d->image_serial = image->serial;
     d->image_view = view;
     d->view_mip = base_mip;
     d->view_base_layer = base_layer;
@@ -678,6 +698,7 @@ static int write_attachment(BD12DescriptorHeap *heap, uint32_t index,
          image->desc.depth_or_layers) - base_layer : layer_count;
     d->kind = kind;
     d->image = image;
+    d->image_serial = image->serial;
     d->image_view = view;
     d->image_layout = layout;
     d->format = format == VK_FORMAT_UNDEFINED ? image->desc.format : format;

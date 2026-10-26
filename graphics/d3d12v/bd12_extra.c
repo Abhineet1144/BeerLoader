@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
 #define _GNU_SOURCE
 #include "bd12.h"
 
@@ -30,6 +33,44 @@ static void global_barrier(BD12CmdList *list, VkPipelineStageFlags2 src_stage,
 
 static const VkAccessFlags2 k_all_access =
     VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+
+/* Diagnostic: BEER_BD12_SYNC_ALL=1 serializes every draw/dispatch so a missing
+ * dependency can be told apart from a logic fault. */
+/* BEER_BD12_TRACE=<n> prints every dispatch and indirect draw of present #n. */
+static int g_trace_target = -2;
+static int g_trace_frame;
+static int g_trace_manual;
+void bd12_trace_frame_advance(void)
+{
+    if (g_trace_target == -2) {
+        const char *v = getenv("BEER_BD12_TRACE");
+        g_trace_target = v ? atoi(v) : -1;
+        g_trace_manual = !v;
+    }
+    ++g_trace_frame;
+    bd12_cbt_frame_advance();
+    if (g_trace_target >= 0 && g_trace_frame >= g_trace_target - 1 && g_trace_frame <= g_trace_target + 2) fprintf(stderr, "[BD12 TRACE] advance frame=%d target=%d\n", g_trace_frame, g_trace_target);
+    /* Manual trigger: creating the BEER_BD12_TRACE_FILE path traces the next
+     * present, as often as it is created. */
+    if ((g_trace_target == -1 || (g_trace_target >= 0 && g_trace_manual &&
+                                  g_trace_frame > g_trace_target)) &&
+        getenv("BEER_BD12_TRACE_FILE") &&
+        access(getenv("BEER_BD12_TRACE_FILE"), F_OK) == 0) {
+        unlink(getenv("BEER_BD12_TRACE_FILE"));
+        g_trace_target = g_trace_frame + 1;
+    }
+}
+int bd12_trace_active(void)
+{
+    return g_trace_target >= 0 && g_trace_frame == g_trace_target;
+}
+
+int bd12_debug_sync_all(void)
+{
+    static int value = -1;
+    if (value < 0) value = getenv("BEER_BD12_SYNC_ALL") != NULL;
+    return value;
+}
 
 void bd12_cmd_global_barrier(BD12CmdList *list)
 {
@@ -131,4 +172,47 @@ void bd12_cmd_update_buffer(BD12CmdList *list, BD12Buffer *dst,
     global_barrier(list, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                    VK_ACCESS_2_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access);
+}
+
+/* Queries -------------------------------------------------------------------- */
+
+/* Reset, begin and end are recorded outside a rendering scope: Vulkan requires
+ * vkCmdResetQueryPool and vkCmdCopyQueryPoolResults outside one, and an
+ * occlusion query begun outside may stay active across several scopes. */
+void bd12_cmd_begin_query(BD12CmdList *list, VkQueryPool pool, uint32_t index)
+{
+    if (!pool) return;
+    bd12_cmd_end_rendering(list);
+    list->device->vk.CmdResetQueryPool(list->command_buffer, pool, index, 1);
+    list->device->vk.CmdBeginQuery(list->command_buffer, pool, index, 0);
+}
+
+void bd12_cmd_end_query(BD12CmdList *list, VkQueryPool pool, uint32_t index)
+{
+    if (!pool) return;
+    bd12_cmd_end_rendering(list);
+    list->device->vk.CmdEndQuery(list->command_buffer, pool, index);
+}
+
+void bd12_cmd_write_timestamp(BD12CmdList *list, VkQueryPool pool, uint32_t index)
+{
+    if (!pool) return;
+    bd12_cmd_end_rendering(list);
+    list->device->vk.CmdResetQueryPool(list->command_buffer, pool, index, 1);
+    list->device->vk.CmdWriteTimestamp2(list->command_buffer,
+                                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                        pool, index);
+}
+
+BD12Buffer *g_ts_dst; VkDeviceSize g_ts_offset; uint32_t g_ts_count;
+void bd12_cmd_copy_query_results(BD12CmdList *list, VkQueryPool pool,
+                                 uint32_t first, uint32_t count,
+                                 BD12Buffer *dst, VkDeviceSize offset)
+{
+    if (!pool || !count || !dst) return;
+    g_ts_dst = dst; g_ts_offset = offset; g_ts_count = count;
+    bd12_cmd_end_rendering(list);
+    list->device->vk.CmdCopyQueryPoolResults(
+        list->command_buffer, pool, first, count, dst->buffer, offset, 8,
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
 }

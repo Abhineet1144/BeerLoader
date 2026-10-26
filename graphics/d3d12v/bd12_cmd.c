@@ -219,6 +219,7 @@ void bd12_cmd_record_flight_op(BD12CmdList *list, BD12FlightOpType type,
                                uint64_t pipeline_hash, uint64_t amount,
                                uint32_t width, uint32_t height, uint32_t depth)
 {
+    bd12_ckpt_mark(list, (uint32_t)type, amount, pipeline_hash, width, height, depth);
     BD12FlightOp *entry = &list->op_flight[list->op_count++ % BD12_FLIGHT_OPS];
     *entry = (BD12FlightOp){ pipeline_hash, amount, type, width, height, depth,
                              list->command_buffer_count - 1 };
@@ -264,6 +265,12 @@ void bd12_cmd_copy_buffer(BD12CmdList *list, BD12Buffer *dst,
                           VkDeviceSize dst_offset, BD12Buffer *src,
                           VkDeviceSize src_offset, VkDeviceSize size)
 {
+    if (dst->heap && dst->heap->type == BD12_HEAP_READBACK && getenv("BEER_BD12_RB_LOG"))
+        fprintf(stderr, "[RB] buffer->readback bytes=%llu src_va=%llx+%llu\n",
+                (unsigned long long)size, (unsigned long long)src->va,
+                (unsigned long long)src_offset);
+    if (dst->heap && dst->heap->type == BD12_HEAP_READBACK)
+        bd12_capture_readback(dst, dst_offset, size, src->va + src_offset);
     bd12_cmd_end_rendering(list);
     VkBufferCopy region = {
         .srcOffset = src_offset,
@@ -336,12 +343,22 @@ void bd12_cmd_host_visibility(BD12CmdList *list, BD12Buffer *buffer)
 
 BD12ComputePipeline *bd12_compute_pipeline_build(
     BD12Device *device, const uint32_t *spirv, size_t spirv_bytes,
-    uint32_t push_bytes, VkDescriptorSetLayout set_layout)
+    uint32_t push_bytes, VkDescriptorSetLayout set_layout,
+    uint32_t bindless_words)
 {
     BD12ComputePipeline *pipeline = calloc(1, sizeof(*pipeline));
     if (!pipeline) return NULL;
     pipeline->device = device;
     pipeline->push_bytes = push_bytes;
+    pipeline->bindless_words = bindless_words;
+    VkDescriptorSetLayout set_layouts[2] = { set_layout, VK_NULL_HANDLE };
+    uint32_t set_layout_count = set_layout ? 1u : 0u;
+    if (bindless_words) {
+        set_layouts[1] = bd12_mirror_layout(device);
+        if (!set_layouts[1] || !set_layout) goto fail;
+        set_layout_count = 2;
+        push_bytes = bindless_words * 4;
+    }
     pipeline->set_layout = set_layout;
     VkShaderModuleCreateInfo module_info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -361,8 +378,8 @@ BD12ComputePipeline *bd12_compute_pipeline_build(
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .pushConstantRangeCount = push_bytes ? 1u : 0u,
         .pPushConstantRanges = &range,
-        .setLayoutCount = set_layout ? 1u : 0u,
-        .pSetLayouts = &set_layout
+        .setLayoutCount = set_layout_count,
+        .pSetLayouts = set_layouts
     };
     if (device->vk.CreatePipelineLayout(device->device, &layout_info, NULL,
                                         &pipeline->layout) != VK_SUCCESS)
@@ -409,6 +426,7 @@ void bd12_compute_pipeline_destroy(BD12ComputePipeline *pipeline)
         pipeline->device->vk.DestroyDescriptorSetLayout(
             pipeline->device->device, pipeline->set_layout, NULL);
     free(pipeline->bindings);
+    free(pipeline->bindless);
     free(pipeline->binding_types);
     free(pipeline);
 }
