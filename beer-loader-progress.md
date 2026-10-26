@@ -1,6 +1,6 @@
 # Beer Loader — Active Development Context
 
-RE8 Path: /mnt/56A4064AA4062CD5/Games/Resident Evil - Village8/re8.exe
+RDR2 Path: /mnt/wwn-0x5000c500c67d4454-part1/Games/RDR2/Launcher.exe
 Last consolidated: 2026-10-18
 
 This file intentionally contains only active engineering state. Historical run
@@ -914,3 +914,20 @@ Ideas not done: cache candidate root parameters per shader binding (skip scannin
 - Sekiro loading took 2000 ms/frame: `ctx_unmap` byte-scanned multi-MB streaming buffers (and `ctx_map` copied them) on every deferred `Map`, hundreds per frame. Deferred Map(DISCARD/NO_OVERWRITE/WRITE) now hands out a PROT_NONE scratch; first touch faults into `b11_lazy_fault` (hook in `on_crash`, filled from the live buffer or zeros) and Unmap only inspects dirty pages. Frame time 2000 ms -> ~18 ms.
 - Persistent VkPipelineCache (`~/.cache/beer/pipelines-<vendor>-<device>-<driver>.bin`, `BEER_NO_PIPELINE_CACHE=1` disables); saved after 25 new pipelines (>=20 s apart) and at exit.
 - Event/semaphore tables raised (131072/65536), semaphore slots reused: Sekiro panicked with "DLPlainConditionSignal: Failed Create Event" when the old tables filled.
+
+## RDR2 bring-up (started 2026-10-26)
+
+Entry point is `Launcher.exe` (Razor1911 launcher substitute, dynamic MSVC CRT), which is supposed to serve `\\.\pipe\RDR2Launcher_Pipe` and start `RDR2.exe` as a child. `RDR2.exe` itself is a statically linked, Arxan-style self-decrypting exe (file code is encrypted; disassemble from a live dump, e.g. `gdb -batch` with `handle SIGTRAP stop`, `dump binary memory`) plus `1911.dll` (crack, loads and attaches fine). Game uses `12on7\D3D12.DLL` (served by the fake D3D12, BD12 comes up fine on the RTX 2070 SUPER) and `vulkan-1.dll`/FSR/DLSS DLLs that are never touched so far.
+
+Direct `loader RDR2.exe` findings, in the order the game hit them (all fixed generically unless marked):
+- **`\\?\C:\...` paths** (`resolve_windows_host_path`): the Win32 file-namespace prefix was not stripped, so `CreateDirectoryW` of `\\?\C:\Users\Player\AppData\Local\Rockstar Games` failed and the game could not create `exit_file.dat`. `\\?\`, `\\.\` and `\??\` prefixes are now stripped for every caller of the resolver.
+- **`GetPhysicallyInstalledSystemMemory`** was a zero stub; now returns installed RAM in KiB from `sysconf`.
+- **`WSAStartup`** always returned wVersion 2.2. RDR2 asks for 2.0 and demands exactly 2.0 (`cmp al,2` / high byte == 0), otherwise it quits with "Game exited unexpectedly!" (rage fatal error file hash 0x82F6A12F line 0xFD; the same fatal-error dump goes to `%LOCALAPPDATA%\Rockstar Games\Red Dead Redemption 2\exit_file.dat`). wVersion is now the requested version capped at 2.2 (1.x capped at 1.1).
+- The int3/SIGTRAP at RVA 0x25b520d seen in the first runs is just the instruction after the game's `exit(0)` call (the process was already dying), not a trap check.
+- Next failure (open): `ERR_NO_LAUNCHER: Please run Red Dead Redemption 2 from the Rockstar Games Launcher`. The game looks for a launcher process (`WinVerifyTrust`, `CreateToolhelp32Snapshot`/`Process32First`), reads `HKLM\SOFTWARE\WOW6432Node\Rockstar Games\Launcher\InstallFolder` (`RegGetValueW`) and tries `ShellExecuteExW`. Those are zero stubs today, so RDR2 has to be started through `Launcher.exe`.
+
+Diagnostics added: `BEER_DEBUG_CRASH=1` now also prints every stack word that points into the main image as a candidate return address (`stack+0x.. -> image RVA 0x..`), useful for packed games with no unwind data until decrypted.
+
+Launcher.exe status: it imports the dynamic CRT (UCRT api-sets, `VCRUNTIME140`, `VCRUNTIME140_1`, `MSVCP140` iostreams, C++ exceptions), D3D12/DXGI/DComposition and winmm. Without the Microsoft runtime DLLs the loader stubs them to 0 and the process spins in `__C_specific_handler` forever (30M log lines in 30 s). The loader already supports bundled runtime DLLs through `BEER_DLL_PATH` (default `~/.local/share/beer/runtime`, see the RE4 notes above), but that directory does not exist on this machine. Wine's builtin `ucrtbase`/`msvcp140`/`vcruntime140_1` from `~/.wine` were tried and are NOT suitable: they import `__wine_dbg_header`/`__wine_dbg_output` from ntdll and then crash in `EnterCriticalSection` on statically initialised Wine critical sections. Genuine Microsoft copies are needed (RE8's `Win64/` folder has them), then the remaining work is multi-process support (`CreateProcess` of a second loader, named pipes, Toolhelp snapshots, registry values).
+
+Build note: `third_party/` is gitignored; `third_party/dxil-spirv` must be cloned and `make dxil-spirv` run before `make` links (the `.d` files depend on `dxil_spirv_c.h`).

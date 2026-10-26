@@ -5543,8 +5543,13 @@ impl_WSAStartup(u32 version, u8 *wsadata)
         g_wsa_last_error = 10092; /* WSAVERNOTSUPPORTED */
         return 10092;
     }
+    /* wVersion is the version the caller is expected to use: the requested one, capped at
+     * 2.2. Callers check it exactly (RDR2 asks for 2.0 and fails on anything but 2.0). */
+    u16 granted = requested;
+    if ((requested & 0xffu) == 2u && (requested >> 8) > 2u) granted = 0x0202;
+    else if ((requested & 0xffu) == 1u && (requested >> 8) > 1u) granted = 0x0101;
     memset(wsadata, 0, 408);
-    *(u16 *)(wsadata + 0) = 0x0202; /* wVersion */
+    *(u16 *)(wsadata + 0) = granted; /* wVersion */
     *(u16 *)(wsadata + 2) = 0x0202; /* wHighVersion */
     memcpy(wsadata + 4, "Beer Winsock 2.2", 17);
     memcpy(wsadata + 261, "Running", 8);
@@ -6895,6 +6900,18 @@ static u64 __attribute__((ms_abi)) impl_GlobalMemoryStatusEx(WIN_MEMORYSTATUSEX 
     status->available_extended_virtual = 0;
     status->memory_load = status->total_physical
         ? (u32)(100 - status->available_physical * 100 / status->total_physical) : 0;
+    g_last_error = 0;
+    return 1;
+}
+
+/* GetPhysicallyInstalledSystemMemory: installed RAM in KiB (the SMBIOS figure on Windows). */
+static u64 __attribute__((ms_abi))
+impl_GetPhysicallyInstalledSystemMemory(u64 *kilobytes)
+{
+    if (!kilobytes) { g_last_error = 87; return 0; }
+    long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page_size <= 0) { g_last_error = 1; return 0; }
+    *kilobytes = (u64)pages * (u64)page_size / 1024u;
     g_last_error = 0;
     return 1;
 }
@@ -9366,6 +9383,10 @@ static int resolve_windows_host_path(const char *name, char *output,
         normalized[i] = name[i] == '\\' ? '/' : name[i];
 
     const char *input = normalized;
+    /* Win32 file-namespace / device prefixes (\\?\C:\x, \\.\C:\x, \??\C:\x) only switch
+     * off path normalisation; the rest is an ordinary drive path. */
+    if (!strncmp(input, "//?/", 4) || !strncmp(input, "//./", 4)) input += 4;
+    else if (!strncmp(input, "/??/", 4)) input += 4;
     char resolved[PATH_MAX];
     size_t used = 0;
     if (((input[0] >= 'A' && input[0] <= 'Z') ||
@@ -17026,6 +17047,7 @@ static ImplEntry g_impls[] = {
     {"SetupDiGetDeviceRegistryPropertyW",     (ImplFn)impl_SetupDiGetDeviceRegistryPropertyW},
     {"SetupDiDestroyDeviceInfoList",          (ImplFn)impl_SetupDiDestroyDeviceInfoList},
     {"GlobalMemoryStatusEx",                  (ImplFn)impl_GlobalMemoryStatusEx},
+    {"GetPhysicallyInstalledSystemMemory",    (ImplFn)impl_GetPhysicallyInstalledSystemMemory},
     {"GetTimeZoneInformation",               (ImplFn)impl_GetTimeZoneInformation},
     /* Time */
     {"GetLocalTime",                          (ImplFn)impl_GetLocalTime},
@@ -21294,6 +21316,18 @@ generic_alloc_skip:
                             dli.dli_fname ? dli.dli_fname : "?",
                             (u64)dli.dli_fbase, sp0[k] - (u64)dli.dli_fbase);
                 fprintf(stderr, "\n");
+            }
+            /* Poor man's backtrace: every stack word inside the main image is a
+             * candidate return address (self-protected/packed games have no usable
+             * unwind data until their code is decrypted at run time). */
+            if (g_img) {
+                int shown = 0;
+                for (int k = 8; k < 1024 && shown < 40; k++) {
+                    if (sp0[k] >= (u64)g_img && sp0[k] < (u64)g_img + g_img_size) {
+                        fprintf(stderr, "[DBG]   stack+0x%x -> image RVA 0x%lx\n", k * 8, sp0[k] - (u64)g_img);
+                        shown++;
+                    }
+                }
             }
         }
     }
