@@ -357,6 +357,7 @@ BD12RootSignature *bd12_root_signature_create(
     BD12RootSignature *signature = calloc(1, sizeof(*signature));
     if (!signature) return NULL;
     signature->device = device;
+    signature->serial = bd12_live_serial();
     signature->parameter_count = count;
     for (uint32_t i = 0; i < count; ++i) {
         BD12RootParameter *p = &signature->parameters[i];

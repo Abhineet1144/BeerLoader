@@ -312,6 +312,7 @@ typedef struct {
     BD12RootParameter parameters[BD12_MAX_ROOT_PARAMETERS];
     BD12StaticSampler *statics;
     uint32_t static_count;
+    uint32_t serial;              /* unique per root signature (binding candidate caches key on it) */
 } BD12RootSignature;
 
 /* A shader descriptor declaration with its Vulkan binding in set 0; this is
@@ -329,6 +330,10 @@ typedef struct {
     uint32_t push_word;           /* bindless: push-constant word with the heap index */
     uint32_t heap_class;          /* bindless: heap-mirror binding 0..3 */
     uint32_t is_accel;            /* SRV is a ray tracing acceleration structure */
+    /* Root parameters that can satisfy this binding, found once per root signature (resolve_one). */
+    uint32_t cand_serial;         /* root signature serial the list below was built for (0 = none) */
+    uint32_t cand_count;          /* 0xff = too many, scan every parameter */
+    uint8_t cand[12];
 } BD12ShaderBinding;
 
 /* The translator numbers bindings stage*0x10000 + class*0x2000 + register, up

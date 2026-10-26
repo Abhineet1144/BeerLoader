@@ -365,6 +365,43 @@ static int visibility_matches(uint32_t visibility, uint32_t stage)
     }
 }
 
+/* Candidate root parameters for a single-register binding: the same static tests resolve_one applies, in order. */
+static void build_candidates(BD12ShaderBinding *b, const BD12RootSignature *rs)
+{
+    uint32_t found[12], n = 0, overflow = 0;
+    for (uint32_t i = 0; i < rs->parameter_count; ++i) {
+        const BD12RootParameter *p = &rs->parameters[i];
+        if (!visibility_matches(p->visibility, b->stage)) continue;
+        int match = 0;
+        switch (p->type) {
+        case BD12_ROOT_CONSTANTS:
+            match = b->type == BD12_RANGE_CBV && p->shader_register == b->reg && p->space == b->space;
+            break;
+        case BD12_ROOT_CBV: case BD12_ROOT_SRV: case BD12_ROOT_UAV: {
+            const uint32_t want = p->type == BD12_ROOT_CBV ? BD12_RANGE_CBV :
+                                  p->type == BD12_ROOT_SRV ? BD12_RANGE_SRV : BD12_RANGE_UAV;
+            match = b->type == want && p->shader_register == b->reg && p->space == b->space;
+            break;
+        }
+        case BD12_ROOT_TABLE:
+            for (uint32_t r = 0; r < p->range_count && !match; ++r) {
+                const BD12DescriptorRange *range = &p->ranges[r];
+                if (range->type != b->type || range->space != b->space || b->reg < range->base_register) continue;
+                if (range->count != UINT32_MAX && b->reg - range->base_register >= range->count) continue;
+                match = 1;
+            }
+            break;
+        default: match = 1; break;
+        }
+        if (!match) continue;
+        if (n == 12) { overflow = 1; break; }
+        found[n++] = i;
+    }
+    b->cand_count = overflow ? 0xff : n;
+    for (uint32_t i = 0; i < n; ++i) b->cand[i] = (uint8_t)found[i];
+    __atomic_store_n(&b->cand_serial, rs->serial, __ATOMIC_RELEASE);
+}
+
 static int resolve_one(BD12CmdList *list, BD12BindState *state,
                        const BD12ShaderBinding *b, uint32_t reg, Resolved *out)
 {
@@ -380,7 +417,19 @@ static int resolve_one(BD12CmdList *list, BD12BindState *state,
             }
         }
     }
-    for (uint32_t i = 0; i < rs->parameter_count; ++i) {
+    /* Only parameters that can match this slot matter; work them out once per (binding, root signature). */
+    uint32_t scan = rs->parameter_count;
+    const uint8_t *cands = NULL;
+    if (b->count == 1) {
+        if (__atomic_load_n(&b->cand_serial, __ATOMIC_ACQUIRE) != rs->serial)
+            build_candidates((BD12ShaderBinding *)b, rs);
+        if (b->cand_serial == rs->serial && b->cand_count != 0xff) {
+            scan = b->cand_count;
+            cands = b->cand;
+        }
+    }
+    for (uint32_t ci = 0; ci < scan; ++ci) {
+        const uint32_t i = cands ? cands[ci] : ci;
         const BD12RootParameter *p = &rs->parameters[i];
         BD12RootArgument *arg = &state->arguments[i];
         if (!visibility_matches(p->visibility, b->stage)) continue;
