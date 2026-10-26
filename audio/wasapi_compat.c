@@ -72,6 +72,7 @@ struct BeerWasapi {
     uint32_t buffer_frames;
     uint32_t acquired_frames;
     size_t acquired_capacity;
+    int float_staging;            /* the engine mixes floats in place: sticky once seen (a packet's tail can be silent) */
     uint8_t *acquired_buffer;
     atomic_uint_fast64_t submitted_frames;
     atomic_uint_fast64_t event_handle;
@@ -312,9 +313,20 @@ static void *wasapi_event_worker(void *opaque)
 {
     BeerWasapi *owner = opaque;
     const struct timespec period = {0, 10000000}; /* 10 ms device period */
+    struct timespec last_tick;
+    clock_gettime(CLOCK_MONOTONIC, &last_tick);
     while (atomic_load_explicit(&owner->worker_running, memory_order_acquire)) {
         nanosleep(&period, NULL);
+        /* A late tick (busy CPU) must still advance the device clock by the real time that passed. A fixed 10 ms step
+         * made the game believe the buffer was fuller than the sound server's was, so it mixed too little audio and
+         * the stream ran dry (the audible blip when the load rises). */
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        int64_t elapsed_ns = (int64_t)(now_ts.tv_sec - last_tick.tv_sec) * 1000000000ll + (now_ts.tv_nsec - last_tick.tv_nsec);
+        last_tick = now_ts;
         if (!atomic_load_explicit(&owner->started, memory_order_acquire)) continue;
+        if (elapsed_ns < 10000000ll) elapsed_ns = 10000000ll;
+        if (elapsed_ns > 200000000ll) elapsed_ns = 200000000ll;
         /* A render endpoint's clock reports the position consumed from its
          * submitted stream, not wall-clock time since Start. Cap the synthetic
          * device period at the number of frames actually released by the
@@ -324,7 +336,7 @@ static void *wasapi_event_worker(void *opaque)
                                                 memory_order_relaxed);
         uint64_t submitted = atomic_load_explicit(&owner->submitted_frames,
                                                   memory_order_acquire);
-        uint64_t advanced = current + rate / 100u;
+        uint64_t advanced = current + (uint64_t)elapsed_ns * rate / 1000000000ull;
         if (advanced > submitted) advanced = submitted;
         atomic_store_explicit(&owner->clock_frames, advanced,
                               memory_order_release);
@@ -479,7 +491,9 @@ static int convert_float_staging_packet(BeerWasapi *owner, uint32_t frames)
     size_t tail_nonzero = 0;
     for (size_t offset = pcm_bytes; offset < float_bytes; ++offset)
         tail_nonzero += owner->acquired_buffer[offset] != 0;
-    if (!tail_nonzero) return 0;
+    /* The tail only proves the float layout while the sound is playing; the last packet of a short sound has a silent
+     * tail and was mistaken for PCM16, which played raw float bits as a click. Once seen, the layout is sticky. */
+    if (!tail_nonzero && !owner->float_staging) return 0;
 
     size_t finite_unit_samples = 0;
     for (size_t sample = 0; sample < samples; ++sample) {
@@ -493,6 +507,7 @@ static int convert_float_staging_packet(BeerWasapi *owner, uint32_t frames)
     }
     if (finite_unit_samples < samples * 7u / 8u) return 0;
 
+    owner->float_staging = 1;
     for (size_t sample = 0; sample < samples; ++sample) {
         uint32_t bits;
         int16_t pcm;
@@ -576,8 +591,11 @@ static uint64_t __attribute__((ms_abi)) render_release_buffer(void *self,
         return AUDCLNT_E_OUT_OF_ORDER;
     size_t bytes = (size_t)frames * owner->format.block_align;
     diagnose_render_packet(owner, frames, flags, bytes);
-    if (!(flags & 2u) && frames) {
-        convert_float_staging_packet(owner, frames);
+    if (frames) {
+        /* A silent packet still has to reach the sound server as zeros: dropping it starves the stream and the
+         * restart after the gap clicks. */
+        if (flags & 2u) memset(owner->acquired_buffer, 0, bytes);
+        else convert_float_staging_packet(owner, frames);
         if (!beer_audio_submit(owner->acquired_buffer, bytes, NULL, NULL))
             return E_FAIL;
     }

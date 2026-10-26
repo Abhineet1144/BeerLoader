@@ -34,6 +34,7 @@ typedef int (*PaSimpleWriteFn)(pa_simple *, const void *, size_t, int *);
 typedef int (*PaSimpleDrainFn)(pa_simple *, int *);
 typedef int (*PaSimpleFlushFn)(pa_simple *, int *);
 typedef void (*PaSimpleFreeFn)(pa_simple *);
+typedef uint64_t (*PaSimpleLatencyFn)(pa_simple *, int *);
 
 enum { PA_STREAM_PLAYBACK = 1, PA_SAMPLE_S16LE = 3 };
 
@@ -52,6 +53,7 @@ static struct {
     PaSimpleDrainFn simple_drain;
     PaSimpleFlushFn simple_flush;
     PaSimpleFreeFn simple_free;
+    PaSimpleLatencyFn simple_latency;   /* optional: underrun diagnostics */
     pa_simple *stream;
     pthread_t thread;
     pthread_mutex_t mutex;
@@ -94,6 +96,20 @@ static void *audio_thread_main(void *unused)
         pthread_mutex_unlock(&g_audio.mutex);
 
         int error = 0;
+        if (g_audio.simple_latency && getenv("BEER_AUDIO_DIAGNOSTICS")) {
+            /* Latency 0 right before a write means the sound server had run out of data. */
+            static unsigned writes, underruns;
+            int lerr = 0;
+            const uint64_t latency_us = g_audio.simple_latency(g_audio.stream, &lerr);
+            ++writes;
+            if (latency_us < 2000) {
+                ++underruns;
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                fprintf(stderr, "[AUDIO] underrun #%u at t=%lld.%03lds after %u writes (server buffer %llu us, queued %zu bytes)\n", underruns,
+                        (long long)now.tv_sec, now.tv_nsec / 1000000, writes, (unsigned long long)latency_us, g_audio.queued_bytes);
+            }
+        }
         if (!g_audio.failed && g_audio.simple_write(g_audio.stream, packet->data,
                                                     packet->size, &error) == 0) {
             atomic_fetch_add_explicit(&g_audio.bytes_played, packet->size,
@@ -127,11 +143,12 @@ int beer_audio_init(unsigned rate, unsigned channels)
     LOAD(simple_flush, "pa_simple_flush");
     LOAD(simple_free, "pa_simple_free");
 #undef LOAD
+    *(void **)(&g_audio.simple_latency) = dlsym(g_audio.library, "pa_simple_get_latency");
     pa_sample_spec spec = { PA_SAMPLE_S16LE, rate, (uint8_t)channels };
     uint32_t bytes_per_second = rate * channels * (uint32_t)sizeof(int16_t);
     pa_buffer_attr attr = {
-        .maxlength = bytes_per_second / 4u, /* 250 ms hard ceiling */
-        .tlength = bytes_per_second / 10u, /* target about 100 ms */
+        .maxlength = bytes_per_second * 2u / 5u, /* 400 ms hard ceiling */
+        .tlength = bytes_per_second * 7u / 50u, /* target about 140 ms: headroom for a stalled mixer thread */
         .prebuf = UINT32_MAX,               /* server default */
         .minreq = bytes_per_second / 100u, /* 10 ms refill granularity */
         .fragsize = UINT32_MAX,
@@ -148,7 +165,7 @@ int beer_audio_init(unsigned rate, unsigned channels)
     g_audio.running = 1;
     /* Bound copied PCM to roughly 250 ms. This keeps the FMOD mixer thread
      * decoupled from PipeWire without allowing unbounded latency/memory growth. */
-    g_audio.max_queued_bytes = (size_t)rate * channels * sizeof(int16_t) / 4u;
+    g_audio.max_queued_bytes = (size_t)rate * channels * sizeof(int16_t) * 2u / 5u;
     g_audio.initialized = 1;
     if (pthread_create(&g_audio.thread, NULL, audio_thread_main, NULL) != 0) {
         g_audio.running = 0;
