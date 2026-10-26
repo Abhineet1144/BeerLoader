@@ -46,7 +46,7 @@ void beer_win32_shared_data_refresh(void *memory, size_t size,
     put_system_time(data, 0x008, monotonic_100ns); /* InterruptTime */
     put_system_time(data, 0x014, realtime_100ns);  /* SystemTime */
     uint64_t tick_ms = monotonic_100ns / 10000u;
-    put_u32(data, 0x2e4, (uint32_t)tick_ms); /* LastSystemRITEventTickCount */
+    put_u32(data, 0x2ec, (uint32_t)tick_ms); /* LastSystemRITEventTickCount */
     put_system_time(data, 0x320, tick_ms); /* TickCount */
 }
 
@@ -129,14 +129,16 @@ void beer_win32_shared_data_initialize(void *memory, size_t size)
     }
 
     /* Modern CRTs and protected bootstraps consume these fields directly.
-     * Zero physical pages describes an impossible Windows machine and can keep
-     * calibration loops from converging. */
-    put_u16(data, 0x2d6, 64); /* CyclesPerYield */
+     * These are the 64-bit Windows 10 KUSER_SHARED_DATA offsets. Keeping the
+     * older, shifted offsets here is actively harmful: 0x2e8 is
+     * ComPlusPackage, not NumberOfPhysicalPages, and protected startup code
+     * polls this area without going through an API. */
+    put_u16(data, 0x2de, 64); /* CyclesPerYield */
     long physical_pages = sysconf(_SC_PHYS_PAGES);
     if (physical_pages < 1) physical_pages = 1;
     if ((uint64_t)physical_pages > UINT32_MAX) physical_pages = UINT32_MAX;
-    put_u32(data, 0x2e8, (uint32_t)physical_pages); /* NumberOfPhysicalPages */
-    put_u64(data, 0x300, 10000000u); /* QpcFrequency on older layouts */
+    put_u32(data, 0x2f0, (uint32_t)physical_pages); /* NumberOfPhysicalPages */
+    put_u64(data, 0x308, 10000000u); /* QpcFrequency */
 }
 
 static _Atomic int shared_data_updater_running;

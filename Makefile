@@ -123,7 +123,7 @@ test-input:
 	/tmp/beer-steam-offline-policy-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_environment_test.c platform/win32_environment.c -o /tmp/beer-win32-environment-test
 	/tmp/beer-win32-environment-test
-	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_shared_data_test.c platform/win32_shared_data.c -o /tmp/beer-win32-shared-data-test
+	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_shared_data_test.c platform/win32_shared_data.c platform/beer_time.c -lm -o /tmp/beer-win32-shared-data-test
 	/tmp/beer-win32-shared-data-test
 	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_nt_section_test.c platform/win32_nt_section.c -o /tmp/beer-win32-nt-section-test
 	/tmp/beer-win32-nt-section-test

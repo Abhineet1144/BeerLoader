@@ -1122,14 +1122,7 @@ static void host_stack_init_thread(void)
     if (m == MAP_FAILED) { perror("mmap(host_call_stack)"); _exit(2); }
     g_host_call_stack_base = (u64)m;
     g_host_call_stack_top = ((u64)m + HOST_CALL_STACK_SIZE - 256) & ~0xFULL;
-    
-    /* Also update the TEB fields for beer_dispatch_trampoline to use */
-    u64 gs_base = 0;
-    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
-        WinTEB *teb = (WinTEB *)gs_base;
-        teb->HostCallStackBase = g_host_call_stack_base;
-        teb->HostCallStackTop = g_host_call_stack_top;
-    }
+
 }
 
 /*
@@ -1157,29 +1150,12 @@ static void host_stack_init_thread(void)
  * it, instead of resetting to a fixed address.
  */
 
-/* Sync SavedGuestRsp from TEB to __thread variable for C code */
-static inline void sync_saved_guest_rsp_from_teb(void) {
-    u64 gs_base = 0;
-    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
-        WinTEB *teb = (WinTEB *)gs_base;
-        g_saved_guest_rsp = teb->SavedGuestRsp;
-    }
-}
+/* Dispatcher state is private ELF TLS, not guest-visible TEB storage. */
+static inline void sync_saved_guest_rsp_from_teb(void) { }
 
-/* Helper for trampoline return path */
-static u64 __attribute__((ms_abi)) get_saved_guest_rsp_from_teb(void) {
-    u64 gs_base = 0;
-    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
-        WinTEB *teb = (WinTEB *)gs_base;
-        u64 val = teb->SavedGuestRsp;
-        static int call_count = 0;
-        if (call_count++ < 5) {  /* Log first 5 calls only */
-            fprintf(stderr, "[TEB_READ] SavedGuestRsp=%p (from TEB @ %p)\n", (void*)val, (void*)gs_base);
-        }
-        return val;
-    }
-    fprintf(stderr, "[TEB_READ] ERROR: Could not get GS base!\n");
-    return 0;
+static u64 __attribute__((ms_abi, unused)) get_saved_guest_rsp_from_teb(void)
+{
+    return g_saved_guest_rsp;
 }
 
 __asm__(
@@ -1191,11 +1167,11 @@ __asm__(
     "    mov (%rsp), %rax\n"
     "    mov %rax, %fs:g_dispatch_incoming_return@tpoff\n"
     "    mov %rsp, %rax\n"
-    "    sub %gs:0xA8, %rax\n"              /* Subtract HostCallStackBase from TEB @ 0xA8 */
+    "    sub %fs:g_host_call_stack_base@tpoff, %rax\n"              /* Subtract HostCallStackBase from TEB @ 0xA8 */
     "    cmp $" HOST_CALL_STACK_SIZE_STR ", %rax\n"
     "    jb 1f\n"                           /* (rsp - base) < SIZE => already on it */
-    "    mov %rsp, %gs:0xA0\n"              /* Save to TEB SavedGuestRsp @ 0xA0 */
-    "    mov %gs:0xB0, %rsp\n"              /* Switch to HostCallStackTop from TEB @ 0xB0 */
+    "    mov %rsp, %fs:g_saved_guest_rsp@tpoff\n"              /* Save to TEB SavedGuestRsp @ 0xA0 */
+    "    mov %fs:g_host_call_stack_top@tpoff, %rsp\n"              /* Switch to HostCallStackTop from TEB @ 0xB0 */
     "    and $-16, %rsp\n"                  /* Guarantee Windows ABI pre-call alignment */
     "    lea g_impl_targets(%rip), %r11\n"
     "    mov (%r11,%r10,8), %rax\n"
@@ -1213,7 +1189,7 @@ __asm__(
      * qwords (over-copying is harmless). rax/r11 are scratch; the target is
      * parked in r10 (index already consumed). */
     "    mov %rax, %r10\n"
-    "    mov %gs:0xA0, %r11\n"             /* Changed: load from TEB SavedGuestRsp */
+    "    mov %fs:g_saved_guest_rsp@tpoff, %r11\n"             /* Changed: load from TEB SavedGuestRsp */
     /* Windows x64 makes XMM6-XMM15 nonvolatile, while the Linux System V
      * callees reached by impl_* functions may freely clobber every XMM
      * register. Preserve the Windows nonvolatile SIMD bank at the ABI bridge.
@@ -1239,8 +1215,8 @@ __asm__(
      * any observable nonvolatile state. The old helper returned guest RSP in
      * RAX and the subsequent `pop %rax` replaced every API result with the
      * caller's continuation address. */
-    "    mov %gs:0xA0, %rsp\n"
-    "    movq $0, %gs:0xA0\n"              /* No outer dispatch remains active after restore */
+    "    mov %fs:g_saved_guest_rsp@tpoff, %rsp\n"
+    "    movq $0, %fs:g_saved_guest_rsp@tpoff\n"              /* No outer dispatch remains active after restore */
     "    pop %r11\n"
     "    jmp *%r11\n"
     "1:\n"                                /* nested: keep using the current (already-switched) rsp */
@@ -2531,7 +2507,8 @@ static volatile int g_fake_pe_ready;
  * addresses (not private thunks) for the hooks to take effect. */
 static u64 fake_pe_export_address(u64 module, const char *name)
 {
-    if (!g_fake_pe_ready || (module != HMOD_K32 && module != HMOD_USER32 && module != HMOD_NTDLL && module != HMOD_ADVAPI))
+    if (!g_fake_pe_ready || (module != HMOD_K32 && module != HMOD_USER32 &&
+                             module != HMOD_NTDLL && module != HMOD_ADVAPI))
         return 0;
     size_t low = 0, high = g_fake_pe_count;
     while (low < high) {
@@ -13531,7 +13508,7 @@ static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
     {   /* Where did the guest decide to quit? Dump the code around the caller. */
         const char *dir = getenv("BEER_EXIT_DUMP");
         u64 grsp = 0;
-        __asm__ volatile("mov %%gs:0xA0, %0" : "=r"(grsp));
+        __asm__ volatile("mov %%fs:g_saved_guest_rsp@tpoff, %0" : "=r"(grsp));
         const u64 *gsp = (const u64 *)grsp;
         u64 ret = (u64)__builtin_return_address(0);
         if (grsp > 0x10000) {
@@ -18197,12 +18174,12 @@ static u64 call_guest_nested(GuestNtCall fn, u64 a0, u64 a1, u64 a2, u64 a3, u64
                              u64 a6, u64 a7, u64 a8, u64 a9, u64 a10)
 {
     u64 saved_top, saved_guest, sp;
-    __asm__ volatile("mov %%gs:0xB0, %0\n\tmov %%gs:0xA0, %1\n\tmov %%rsp, %2"
+    __asm__ volatile("mov %%fs:g_host_call_stack_top@tpoff, %0\n\tmov %%fs:g_saved_guest_rsp@tpoff, %1\n\tmov %%rsp, %2"
                      : "=r"(saved_top), "=r"(saved_guest), "=r"(sp));
     const u64 new_top = (sp - 0x4000) & ~(u64)0xf;
-    __asm__ volatile("mov %0, %%gs:0xB0" :: "r"(new_top) : "memory");
+    __asm__ volatile("mov %0, %%fs:g_host_call_stack_top@tpoff" :: "r"(new_top) : "memory");
     u64 result = fn(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
-    __asm__ volatile("mov %0, %%gs:0xB0\n\tmov %1, %%gs:0xA0" :: "r"(saved_top), "r"(saved_guest) : "memory");
+    __asm__ volatile("mov %0, %%fs:g_host_call_stack_top@tpoff\n\tmov %1, %%fs:g_saved_guest_rsp@tpoff" :: "r"(saved_top), "r"(saved_guest) : "memory");
     return result;
 }
 
@@ -18746,15 +18723,9 @@ static void *alloc_teb_for_thread(void)
     teb->UniqueThread = (u64)(u32)syscall(SYS_gettid);
     g_cached_windows_thread_id = teb->UniqueThread;
 
-    /* Populate the host call stack TEB fields with THIS thread's stack bounds.
-     * This must happen BEFORE we populate the global variables, to avoid
-     * race conditions when multiple threads are created concurrently. */
-    teb->HostCallStackBase = host_stack_base;
-    teb->HostCallStackTop = host_stack_top;
-
-    /* Also update the globals for backward compatibility.
-     * Note: This is racy if multiple threads call concurrently, but that's
-     * okay since each thread has its own TEB fields now. */
+    /* Keep dispatcher bookkeeping in ELF thread-local storage. Offsets
+     * 0xa0..0xb8 in the TEB are Windows-owned fields and must remain guest
+     * visible rather than being repurposed as host stack pointers. */
     g_host_call_stack_base = host_stack_base;
     g_host_call_stack_top = host_stack_top;
 
@@ -18874,7 +18845,22 @@ static void win_list_append(WinListEntry *head, WinListEntry *link)
 
 static void init_peb_loader_data(WinPebLdrData *ldr)
 {
-    size_t module_count = 1 + (size_t)g_guest_dll_count;
+    /* Custom import resolvers walk PEB->Ldr instead of calling
+     * GetModuleHandle. Publish emulated system modules as well as file-backed
+     * guest DLLs; omitting ntdll/kernel32 leaves their resolver targets NULL
+     * even though the corresponding PE images and exports are mapped. */
+    static const struct {
+        const char *path;
+        u64 base;
+    } emulated_modules[] = {
+        { "C:\\Windows\\System32\\ntdll.dll",    HMOD_NTDLL },
+        { "C:\\Windows\\System32\\kernel32.dll", HMOD_K32 },
+        { "C:\\Windows\\System32\\user32.dll",   HMOD_USER32 },
+        { "C:\\Windows\\System32\\advapi32.dll", HMOD_ADVAPI },
+    };
+    const size_t emulated_count = sizeof(emulated_modules) /
+                                  sizeof(emulated_modules[0]);
+    size_t module_count = 1 + emulated_count + (size_t)g_guest_dll_count;
     WinLdrDataTableEntry *entries = calloc(module_count, sizeof(*entries));
     if (!entries) die("calloc(PEB module list): %s", strerror(errno));
 
@@ -18894,8 +18880,12 @@ static void init_peb_loader_data(WinPebLdrData *ldr)
             image_size = g_img_size;
             NtHdrs64 *nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
             entry_point = image_base + nt->opt.entry_rva;
+        } else if (index <= emulated_count) {
+            full_name = emulated_modules[index - 1].path;
+            image_base = emulated_modules[index - 1].base;
+            image_size = FAKE_PE_SIZE;
         } else {
-            GuestDll *dll = &g_guest_dlls[index - 1];
+            GuestDll *dll = &g_guest_dlls[index - 1 - emulated_count];
             full_name = dll->path[0] ? dll->path : dll->name;
             image_base = (u64)(uintptr_t)dll->image;
             image_size = dll->image_size;
@@ -20332,7 +20322,7 @@ static void beer_context_fix_caller(u8 *ctx)
     const u64 tramp = (u64)(uintptr_t)beer_dispatch_trampoline;
     if (pc < tramp || pc >= tramp + 0x400) return;
     u64 saved = 0;
-    __asm__ volatile("mov %%gs:0xA0, %0" : "=r"(saved));
+    __asm__ volatile("mov %%fs:g_saved_guest_rsp@tpoff, %0" : "=r"(saved));
     if (!saved) return;
     *(u64 *)(ctx + 0xf8) = *(const u64 *)(uintptr_t)saved;
     *(u64 *)(ctx + 0x98) = saved + 8;
@@ -23420,18 +23410,11 @@ int main(int argc, char **argv)
     NtHdrs64 *nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
     u64 entry    = (u64)g_img + nt->opt.entry_rva;
 
-    /* Note: The TEB host stack fields were already populated by alloc_teb_for_thread()
-     * Do NOT override them with the static buffer - that breaks the TEB setup!
-     * The TEB already has the correct mmap'd stack bounds. */
-    
-    /* Instead, just update globals from the TEB for backward compatibility */
     u64 gs_base = 0;
     if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
-        WinTEB *teb_main = (WinTEB *)gs_base;
-        g_host_call_stack_base = teb_main->HostCallStackBase;
-        g_host_call_stack_top = teb_main->HostCallStackTop;
-        fprintf(stderr, "[SETUP] Main thread TEB @ %p: HostCallStackBase=%p, HostCallStackTop=%p\n",
-                (void *)gs_base, (void *)teb_main->HostCallStackBase, (void *)teb_main->HostCallStackTop);
+        fprintf(stderr, "[SETUP] Main thread TEB @ %p; host call stack=%p..%p\n",
+                (void *)gs_base, (void *)g_host_call_stack_base,
+                (void *)g_host_call_stack_top);
     } else {
         fprintf(stderr, "[SETUP] WARNING: Could not get GS base!\n");
     }
@@ -23512,9 +23495,8 @@ int main(int argc, char **argv)
     /* Verify TEB is clean at entry */
     u64 gs_base_check = 0;
     if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base_check) == 0 && gs_base_check) {
-        WinTEB *teb_check = (WinTEB *)gs_base_check;
-        fprintf(stderr, "[SETUP] TEB SavedGuestRsp at entry: 0x%lx (should be 0)\n", 
-                teb_check->SavedGuestRsp);
+        fprintf(stderr, "[SETUP] dispatcher saved guest RSP at entry: 0x%lx (should be 0)\n",
+                g_saved_guest_rsp);
     }
     
     fprintf(stderr, "[ENTRY] Before TLS/entry handoff: entry=%p g_entry_rsp=%p\n",

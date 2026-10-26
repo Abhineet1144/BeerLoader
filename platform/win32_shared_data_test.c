@@ -22,7 +22,8 @@ int main(void)
     assert(read_u32(memory, 0x264) == 1);
     assert(read_u32(memory, 0x26c) == 10);
     assert(read_u32(memory, 0x244) == 0x200000u);
-    assert(read_u32(memory, 0x2e8) > 0);
+    assert(read_u32(memory, 0x2e8) == 0); /* ComPlusPackage */
+    assert(read_u32(memory, 0x2f0) > 0);  /* NumberOfPhysicalPages */
     assert(memory[0x268] == 1);
     assert(memory[0x030] == 'C' && memory[0x031] == 0);
     assert(memory[0x378] == 0); /* Direct reads anywhere in the ABI page are safe. */
@@ -38,7 +39,7 @@ int main(void)
     assert(read_u32(memory, 0x014) == 0x9abcdef0u);
     assert(read_u32(memory, 0x018) == 0x12345678u);
     assert(read_u32(memory, 0x01c) == 0x12345678u);
-    assert(read_u32(memory, 0x2e4) == 0x000d1b72u);
+    assert(read_u32(memory, 0x2ec) == 0x000d1b72u);
     assert(read_u32(memory, 0x320) == 0x000d1b72u);
 
     puts("Win32 shared-data tests passed");
