@@ -79,9 +79,7 @@ static u64 __attribute__((ms_abi)) stub_SafeArrayGetElement(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayPutElement(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayPtrOfIndex(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VariantChangeTypeEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_VariantClear(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VariantCopy(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_VariantInit(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharUpperBuffW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharLowerBuffW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_UnregisterClassA(void){ return 0; }

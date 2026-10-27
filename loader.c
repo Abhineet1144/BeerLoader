@@ -35,6 +35,7 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <spawn.h>
+#include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -2809,6 +2810,7 @@ impl_GetProcAddress(u64 hmod, const char *procname)
     if (guest) {
         u64 address = guest_dll_export(guest, procname);
         if (address) return address;
+        fprintf(stderr, "[IMPL] GetProcAddress(%s, \"%s\") -> NULL (not exported by the module)\n", guest->name, procname);
         g_last_error = 127;
         return 0;
     }
@@ -5616,7 +5618,39 @@ static int win_getaddrinfo_common(const char *node, const char *service, const W
     else if (!strcasecmp(node, "localhost")) ip = htonl(INADDR_LOOPBACK);
     else {
         struct in_addr parsed;
-        if (inet_pton(AF_INET, node, &parsed) != 1) return 11001;   /* WSAHOST_NOT_FOUND */
+        if (inet_pton(AF_INET, node, &parsed) != 1) {
+            /* A name: ask the host resolver (this is how a game finds out its own address from the machine name,
+             * which it treats as "no network" when it fails). IPv4 only; a literal-free numeric lookup of the
+             * service keeps the call from touching the network for ports. */
+            struct addrinfo host_hints = {0}, *found = NULL;
+            host_hints.ai_family = AF_INET;
+            host_hints.ai_socktype = hints && hints->socktype ? hints->socktype : 0;
+            const int rc = getaddrinfo(node, NULL, &host_hints, &found);
+            if (rc != 0 || !found) return 11001;                    /* WSAHOST_NOT_FOUND */
+            WinAddrInfo *head = NULL, **tail = &head;
+            const u16 resolved_port = service ? htons((u16)atoi(service)) : 0;
+            for (struct addrinfo *a = found; a; a = a->ai_next) {
+                if (a->ai_family != AF_INET) continue;
+                if (hints && hints->socktype && a->ai_socktype != hints->socktype) continue;
+                WinAddrInfo *entry = calloc(1, sizeof(*entry));
+                struct sockaddr_in *address = calloc(1, sizeof(*address));
+                if (!entry || !address) { free(entry); free(address); break; }
+                *address = *(struct sockaddr_in *)a->ai_addr;
+                address->sin_port = resolved_port;
+                entry->family = AF_INET;
+                entry->socktype = hints && hints->socktype ? hints->socktype : 1;
+                entry->protocol = entry->socktype == 2 ? 17 : 6;
+                entry->addrlen = sizeof(*address);
+                entry->addr = (u64)(uintptr_t)address;
+                if (hints && (hints->flags & 2) && !head) entry->canonname = (u64)(uintptr_t)strdup(node);
+                *tail = entry;
+                tail = (WinAddrInfo **)&entry->next;
+            }
+            freeaddrinfo(found);
+            if (!head) return 11001;
+            *result = (u64)(uintptr_t)head;
+            return 0;
+        }
         ip = parsed.s_addr;
     }
     u16 port = service ? htons((u16)atoi(service)) : 0;
@@ -6362,12 +6396,21 @@ impl_CoInitializeSecurity(void *security_descriptor, s32 authentication_services
     static _Atomic(u32) initialized;
     return atomic_exchange(&initialized, 1) ? UINT64_C(0x80010119) : 0;
 }
+#include "platform/win32_wmi.inc"
 static u64 __attribute__((ms_abi))
 impl_CoCreateInstance(const u8 *rclsid, u64 outer, u32 ctx,
                       const u8 *riid, void **ppv)
 {
     (void)outer;
     if (ppv) *ppv = NULL;
+    if (ppv && beer_wmi_create_instance(rclsid, riid, ppv)) {
+        fprintf(stderr, "[COM] CoCreateInstance WbemLocator -> %p\n", *ppv);
+        return 0;
+    }
+    if (ppv && beer_fw_create_instance(rclsid, riid, ppv)) {
+        fprintf(stderr, "[COM] CoCreateInstance HNetCfg.FwMgr -> %p\n", *ppv);
+        return 0;
+    }
     u64 wasapi_result = beer_wasapi_create_instance(rclsid, riid, ppv);
     if (wasapi_result == 0) {
         fprintf(stderr, "[COM] CoCreateInstance MMDeviceEnumerator -> %p\n",
@@ -10724,6 +10767,23 @@ impl_GetFileVersionInfoSizeW(const u16 *path, u32 *handle)
     u32 size = 0;
     if (handle) *handle = 0;
     if (!wide_to_host_path(path, host, sizeof(host))) { g_last_error = 2; fprintf(stderr, "[VERSION] cannot resolve path\n"); return 0; }
+    if (access(host, F_OK) != 0) {
+        if (getenv("BEER_HOOK_PROBE")) {
+            /* Experiment: what does the (possibly hooked) guest-visible CreateFileW say about this path? */
+            u64 (__attribute__((ms_abi)) *guest_create_file)(const u16 *, u32, u32, void *, u32, u32, u64) = NULL;
+            for (int i = 0; i < g_nstubs; ++i) {
+                const char *bang = g_snames[i] ? strchr(g_snames[i], '!') : NULL;
+                const char *name = g_snames[i] ? (bang ? bang + 1 : g_snames[i]) : NULL;
+                if (name && !strcmp(name, "CreateFileW") && g_impl_real[i]) { guest_create_file = (void *)(g_tramp + i * THUNK_SZ); break; }
+            }
+            if (guest_create_file) {
+                u64 handle = guest_create_file(path, 0x80000000u, 1u, NULL, 3u, 0x80u, 0);
+                fprintf(stderr, "[HOOKPROBE] CreateFileW(socialclub-ish) via guest thunk %p -> 0x%lx (err %u)\n",
+                        (void *)guest_create_file, handle, g_last_error);
+            }
+        }
+        g_last_error = 2; return 0;                                                  /* ERROR_FILE_NOT_FOUND, as the real API */
+    }
     if (!beer_pe_version_resource(host, &data, &size)) { g_last_error = 1813; fprintf(stderr, "[VERSION] no version resource in %s\n", host); return 0; }   /* ERROR_RESOURCE_TYPE_NOT_FOUND */
     free(data);
     return size;
@@ -10746,7 +10806,7 @@ impl_GetFileVersionInfoW(const u16 *path, u32 handle, u32 length, u8 *buffer)
     char host[1024];
     u8 *data = NULL;
     u32 size = 0;
-    if (!buffer || !wide_to_host_path(path, host, sizeof(host))) { g_last_error = 2; return 0; }
+    if (!buffer || !wide_to_host_path(path, host, sizeof(host)) || access(host, F_OK) != 0) { g_last_error = 2; return 0; }
     if (!beer_pe_version_resource(host, &data, &size)) { g_last_error = 1813; return 0; }
     memcpy(buffer, data, size < length ? size : length);
     free(data);
@@ -17652,6 +17712,7 @@ static ImplEntry g_impls[] = {
     {"CoUninitialize",                        (ImplFn)impl_CoUninitialize},
     {"CoCreateGuid",                          (ImplFn)impl_CoCreateGuid},
     {"CoCreateInstance",                      (ImplFn)impl_CoCreateInstance},
+    {"CoSetProxyBlanket",                         (ImplFn)impl_CoSetProxyBlanket},
     /* Media Foundation: typed, output-clearing boundaries. */
     {"MFStartup",                             (ImplFn)beer_mf_startup},
     {"MFShutdown",                            (ImplFn)beer_mf_shutdown},
