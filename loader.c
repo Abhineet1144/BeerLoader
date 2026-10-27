@@ -2779,10 +2779,17 @@ static u64 msvcrt_export(const char *name)
     return (u64)c;
 }
 
+static u64 guest_dll_export_by_ordinal(GuestDll *dll, u32 ordinal);
 static u64 __attribute__((ms_abi))
 impl_GetProcAddress(u64 hmod, const char *procname)
 {
     if (!procname) return 0;
+    if ((u64)(uintptr_t)procname < 0x10000) {        /* lookup by ordinal */
+        GuestDll *by_ordinal = guest_dll_from_handle(hmod);
+        u64 address = by_ordinal ? guest_dll_export_by_ordinal(by_ordinal, (u32)(uintptr_t)procname) : 0;
+        if (!address) g_last_error = 127;
+        return address;
+    }
     if (hmod == HMOD_VULKAN) {
         u64 address = (u64)beer_vkbridge_get_proc(procname);
         if (!address) g_last_error = 127;
@@ -3499,6 +3506,7 @@ impl_LoadLibraryA(const char *name)
         }
         return h;
     }
+    fprintf(stderr, "[IMPL] LoadLibraryA(\"%s\") -> not found\n", name);
     g_last_error = 126; return 0;
 }
 static u64 __attribute__((ms_abi))
@@ -3533,6 +3541,7 @@ impl_LoadLibraryW(const u16 *name)
         }
         return h;
     }
+    fprintf(stderr, "[IMPL] LoadLibraryW(\"%s\") -> not found\n", narrow);
     g_last_error = 126; return 0;
 }
 static u64 __attribute__((ms_abi))
@@ -6181,6 +6190,24 @@ impl_SHGetSpecialFolderPathA(u64 hwnd, char *buf, s32 csidl, u32 create)
     if (!buf || strlen(path) >= 260) return 0;
     strcpy(buf, path);
     return 1;
+}
+
+static int wide_to_host_path(const u16 *path, char *out, size_t size);
+/* WinVerifyTrust (x64 WINTRUST_DATA: dwUnionChoice @32, pFile @40, dwStateAction @48, hWVTStateData @56;
+ * WINTRUST_FILE_INFO: pcwszFilePath @8). Beer cannot validate Authenticode chains, so a file that exists verifies and a
+ * missing one reports ERROR_FILE_NOT_FOUND the way wintrust does (games probe optional signed DLLs this way). */
+static u64 __attribute__((ms_abi)) impl_WinVerifyTrust(u64 hwnd, const void *action, u8 *data)
+{
+    (void)hwnd; (void)action;
+    if (!data) return 87;
+    const u32 choice = *(u32 *)(data + 32), state_action = *(u32 *)(data + 48);
+    if (state_action == 2) return 0;                                  /* WTD_STATEACTION_CLOSE */
+    if (choice != 1) return 0;                                        /* WTD_CHOICE_FILE only */
+    const u8 *file = *(u8 **)(data + 40);
+    const u16 *path = file ? *(const u16 **)(file + 8) : NULL;
+    char host[PATH_MAX];
+    if (!path || !wide_to_host_path(path, host, sizeof(host))) return 2;
+    return access(host, F_OK) == 0 ? 0 : 2;
 }
 
 /* ShellExecute*: URLs and documents are handed to the desktop (xdg-open), like Windows hands them to the default
@@ -10652,9 +10679,17 @@ impl_GetFileAttributesA(const char *path)
 {
     char host_path[PATH_MAX];
     struct stat st;
+    if (path && getenv("BEER_CALLER_DIAGNOSTICS") && strcasestr(path, getenv("BEER_CALLER_DIAGNOSTICS")))
+        dbg_dump_guest_callchain("GetFileAttributes");
     if (!path || !resolve_windows_host_path(path, host_path, sizeof(host_path)) ||
         stat(host_path, &st) < 0) {
+        /* Windows distinguishes a missing file (2) from a missing directory on the way to it (3). */
         g_last_error = 2;
+        char *slash = path ? strrchr(host_path, '/') : NULL;
+        if (slash && slash != host_path) {
+            *slash = 0;
+            if (stat(host_path, &st) < 0) g_last_error = 3;
+        }
         return 0xFFFFFFFF;
     }
     u32 attr = S_ISDIR(st.st_mode) ? 0x10u : 0x20u;
@@ -17604,6 +17639,7 @@ static ImplEntry g_impls[] = {
     {"SHGetSpecialFolderPathW",               (ImplFn)impl_SHGetSpecialFolderPathW},
     {"SHGetSpecialFolderPathA",               (ImplFn)impl_SHGetSpecialFolderPathA},
     {"SHGetKnownFolderPath",                  (ImplFn)impl_SHGetKnownFolderPath},
+    {"WinVerifyTrust",                        (ImplFn)impl_WinVerifyTrust},
     {"ShellExecuteA",                             (ImplFn)impl_ShellExecuteA},
     {"ShellExecuteW",                             (ImplFn)impl_ShellExecuteW},
     {"ShellExecuteExA",                           (ImplFn)impl_ShellExecuteExA},
@@ -18520,6 +18556,20 @@ guest_oodle_decompress_trace(const void *compressed, s64 compressed_size,
     return result;
 }
 
+static u64 guest_dll_export_by_ordinal(GuestDll *dll, u32 ordinal)
+{
+    if (!dll || !dll->image) return 0;
+    NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
+    DataDir *dir = &nt->opt.dirs[0];
+    if (!dir->size || !guest_dll_rva_valid(dll, dir->rva, sizeof(ExportDir))) return 0;
+    ExportDir *exports = (ExportDir *)(dll->image + dir->rva);
+    if (ordinal < exports->ordinal_base || ordinal - exports->ordinal_base >= exports->function_count) return 0;
+    if (!guest_dll_rva_valid(dll, exports->functions_rva, (size_t)exports->function_count * sizeof(u32))) return 0;
+    u32 rva = ((u32 *)(dll->image + exports->functions_rva))[ordinal - exports->ordinal_base];
+    if (!rva || (rva >= dir->rva && rva < dir->rva + dir->size) || !guest_dll_rva_valid(dll, rva, 1)) return 0;
+    return (u64)(dll->image + rva);
+}
+
 static u64 guest_dll_export(GuestDll *dll, const char *name)
 {
     if (!dll || !dll->image || !name) return 0;
@@ -19246,9 +19296,25 @@ static void pe_imports(void)
                 iat[i] = guest_export;
                 printf("  [DLL ] %s -> 0x%lx\n", buf, guest_export);
             } else if (real) {
-                emit_impl_thunk(g_nstubs, (u64)real);
-                iat[i] = (u64)(g_tramp + g_nstubs * THUNK_SZ);
-                printf("  [REAL] %s\n", buf);
+                /* One function, one address: Windows hands every importer and GetProcAddress the same export
+                 * address, and inline-hooking modules (anti-cheat, cracks) patch that address expecting every
+                 * caller to see it. Reuse the thunk an earlier import or GetProcAddress already created. */
+                int shared = -1;
+                for (int k = 0; k < g_nstubs && shared < 0; ++k) {
+                    const char *bang = g_snames[k] ? strchr(g_snames[k], '!') : NULL;
+                    const char *kn = g_snames[k] ? (bang ? bang + 1 : g_snames[k]) : NULL;
+                    if (kn && g_impl_real[k] == (u64)real && !strcmp(kn, fn_only)) shared = k;
+                }
+                if (shared >= 0) {
+                    iat[i] = (u64)(g_tramp + shared * THUNK_SZ);
+                    free(g_snames[g_nstubs]);
+                    g_snames[g_nstubs] = strdup(buf);
+                    printf("  [REAL] %s (shared)\n", buf);
+                } else {
+                    emit_impl_thunk(g_nstubs, (u64)real);
+                    iat[i] = (u64)(g_tramp + g_nstubs * THUNK_SZ);
+                    printf("  [REAL] %s\n", buf);
+                }
             } else if (guest_export) {
                 iat[i] = guest_export;
                 printf("  [DLL ] %s -> 0x%lx\n", buf, guest_export);
