@@ -36,6 +36,7 @@
 #include <poll.h>
 #include <spawn.h>
 #include <netdb.h>
+#include <linux/futex.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -10433,6 +10434,40 @@ impl_GetFileSize(u64 h, u32 *high) {
     if (high) *high = (u32)(st.st_size >> 32);
     return (u64)(u32)st.st_size;
 }
+/* WaitOnAddress / WakeByAddress*: futex on the aligned 32-bit word holding the watched value. */
+static u64 __attribute__((ms_abi))
+impl_WaitOnAddress(volatile void *address, const void *compare, u64 size, u32 timeout_ms)
+{
+    if (!address || !compare || (size != 1 && size != 2 && size != 4 && size != 8)) { g_last_error = 87; return 0; }
+    uint32_t *word = (uint32_t *)((uintptr_t)address & ~(uintptr_t)3);
+    struct timespec deadline, now;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_ms / 1000; deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    for (;;) {
+        if (memcmp((const void *)address, compare, (size_t)size) != 0) return 1;
+        uint32_t expected = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+        struct timespec relative, *limit = NULL;
+        if (timeout_ms != 0xFFFFFFFFu) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            relative.tv_sec = deadline.tv_sec - now.tv_sec; relative.tv_nsec = deadline.tv_nsec - now.tv_nsec;
+            if (relative.tv_nsec < 0) { relative.tv_sec--; relative.tv_nsec += 1000000000L; }
+            if (relative.tv_sec < 0) { g_last_error = 1460; return 0; }   /* ERROR_TIMEOUT */
+            limit = &relative;
+        }
+        syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, expected, limit, NULL, 0);
+        if (memcmp((const void *)address, compare, (size_t)size) != 0) return 1;
+        if (limit) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) { g_last_error = 1460; return 0; }
+        }
+    }
+}
+static u64 __attribute__((ms_abi)) impl_WakeByAddressSingle(void *address)
+    { if (address) syscall(SYS_futex, (uint32_t *)((uintptr_t)address & ~(uintptr_t)3), FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0); return 0; }
+static u64 __attribute__((ms_abi)) impl_WakeByAddressAll(void *address)
+    { if (address) syscall(SYS_futex, (uint32_t *)((uintptr_t)address & ~(uintptr_t)3), FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0); return 0; }
+
 static u64 __attribute__((ms_abi))
 impl_GetFileSizeEx(u64 h, s64 *size)
 {
@@ -17972,6 +18007,11 @@ static ImplEntry g_impls[] = {
     {"GetFileInformationByHandle",            (ImplFn)impl_GetFileInformationByHandle},
     {"GetFileSize",                           (ImplFn)impl_GetFileSize},
     {"GetFileSizeEx",                         (ImplFn)impl_GetFileSizeEx},
+    {"GetFileInformationByHandleExW",             (ImplFn)impl_GetFileInformationByHandleEx},
+    {"SetFileInformationByHandleW",               (ImplFn)impl_SetFileInformationByHandle},
+    {"WaitOnAddress",                             (ImplFn)impl_WaitOnAddress},
+    {"WakeByAddressSingle",                       (ImplFn)impl_WakeByAddressSingle},
+    {"WakeByAddressAll",                          (ImplFn)impl_WakeByAddressAll},
     {"SetFilePointer",                        (ImplFn)impl_SetFilePointer},
     {"SetFilePointerEx",                      (ImplFn)impl_SetFilePointerEx},
     {"SetEndOfFile",                          (ImplFn)impl_SetEndOfFile},
@@ -19530,6 +19570,11 @@ static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *
     case 26: needed = 8;  break;                 /* ProcessWow64Information */
     case 30: needed = 8;  break;                 /* ProcessDebugObjectHandle */
     case 31: needed = 4;  break;                 /* ProcessDebugFlags */
+    case 3:  needed = 112; break;                /* ProcessVmCounters (VM_COUNTERS) */
+    case 12: needed = 4;  break;                 /* ProcessDefaultHardErrorMode */
+    case 21: needed = 8;  break;                 /* ProcessAffinityMask */
+    case 37: needed = 64; break;                 /* ProcessImageInformation (SECTION_IMAGE_INFORMATION) */
+    case 43: needed = 4;  break;                 /* ProcessTokenVirtualizationEnabled */
     default: return STATUS_INVALID_INFO_CLASS;
     }
     if (returned) *returned = needed;
@@ -19546,6 +19591,15 @@ static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *
         pbi[5] = (u64)getppid();
         break;
     }
+    case 3: {
+        u64 *vm = buffer;
+        vm[0] = 0x7fffffff;                       /* PeakVirtualSize */
+        vm[1] = 0x100000000ull;                   /* VirtualSize */
+        vm[3] = vm[4] = 0x40000000ull;            /* PeakWorkingSetSize / WorkingSetSize */
+        break;
+    }
+    case 21: *(u64 *)buffer = win_processor_mask(); break;
+    case 37: *(u16 *)((u8 *)buffer + 20) = 0x8664; break;   /* Machine */
     case 30: return STATUS_PORT_NOT_SET;
     case 31: *(u32 *)buffer = 1; break;           /* NoDebugInherit clear => 1 */
     default: break;
