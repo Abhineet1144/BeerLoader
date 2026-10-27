@@ -203,7 +203,59 @@ static void beer_proc_utf16_to_utf8(const u16 *w, char *out, size_t cap)
     out[o] = 0;
 }
 
-static u64 beer_create_process(const char *application, const char *command_line, u32 flags, u8 *info)
+static u64 __attribute__((ms_abi)) impl_WriteFile(u64 h, const void *buf, u32 n, u32 *written, u64 ov);
+
+/* Console utilities games shell out to for machine/user fingerprints (whoami, hostname). There is no Windows system directory
+ * to run them from, so they are answered in-process: the text goes to the redirected stdout handle (STARTF_USESTDHANDLES) and
+ * the "process" is born exited with code 0. Returns 0 when <name> is not one of them, -1 on failure, 1 when answered. */
+static int beer_builtin_console_tool(const char *name, const u8 *startup, u8 *info)
+{
+    const char *base = name;
+    for (const char *c = name; *c; ++c) if (*c == '\\' || *c == '/') base = c + 1;
+    char tool[32];
+    size_t n = 0;
+    for (; base[n] && n < sizeof(tool) - 1; ++n) tool[n] = (char)((base[n] >= 'A' && base[n] <= 'Z') ? base[n] + 32 : base[n]);
+    tool[n] = 0;
+    if (n > 4 && !strcmp(tool + n - 4, ".exe")) tool[n - 4] = 0;
+
+    char host[256] = "beer";
+    if (gethostname(host, sizeof(host) - 1) != 0) snprintf(host, sizeof(host), "beer");
+    host[sizeof(host) - 1] = 0;
+    for (char *c = host; *c; ++c) if (*c == '.') { *c = 0; break; }
+
+    char text[600];
+    if (!strcmp(tool, "hostname")) snprintf(text, sizeof(text), "%s\r\n", host);
+    else if (!strcmp(tool, "whoami")) {
+        char lower[256];
+        size_t i = 0;
+        for (; host[i] && i < sizeof(lower) - 1; ++i) lower[i] = (char)((host[i] >= 'A' && host[i] <= 'Z') ? host[i] + 32 : host[i]);
+        lower[i] = 0;
+        snprintf(text, sizeof(text), "%s\\player\r\n", lower);
+    } else return 0;
+
+    const u32 flags = startup ? *(const u32 *)(startup + 60) : 0;
+    if ((flags & 0x100u) && startup) {
+        u64 out = *(const u64 *)(startup + 88);
+        u32 written = 0;
+        if (out && out != (u64)-1) impl_WriteFile(out, text, (u32)strlen(text), &written, 0);
+    }
+    u64 process = beer_proc_alloc(getpid(), 0);
+    u64 thread = event_alloc(1, 1);
+    if (!process) return -1;
+    g_procs[process - BEER_PROC_HANDLE_BASE].exited = 1;
+    if (info) {
+        memcpy(info + 0, &process, 8);
+        memcpy(info + 8, &thread, 8);
+        u32 id = (u32)getpid() + 1;
+        memcpy(info + 16, &id, 4);
+        memcpy(info + 20, &id, 4);
+    }
+    fprintf(stderr, "[PROCESS] %s answered in-process\n", tool);
+    g_last_error = 0;
+    return 1;
+}
+
+static u64 beer_create_process(const char *application, const char *command_line, u32 flags, u8 *info, const u8 *startup)
 {
     char token[PATH_MAX];
     token[0] = 0;
@@ -221,6 +273,10 @@ static u64 beer_create_process(const char *application, const char *command_line
         token[n] = 0;
     }
     if (!token[0]) { g_last_error = 87; return 0; }
+    {
+        int tool = beer_builtin_console_tool(token, startup, info);
+        if (tool) return tool > 0;
+    }
 
     char host[PATH_MAX];
     struct stat st;
@@ -286,7 +342,7 @@ static u64 __attribute__((ms_abi))
 beer_CreateProcessA(const char *application, const char *command_line, void *process_sa, void *thread_sa,
                     u32 inherit, u32 flags, void *environment, const char *directory, void *startup, u8 *info)
 {
-    (void)process_sa; (void)thread_sa; (void)startup;
+    (void)process_sa; (void)thread_sa;
     if (getenv("BEER_PROCESS_DIAGNOSTICS")) {
         fprintf(stderr, "[PROCESS] CreateProcessA inherit=%u flags=0x%x directory=%s environment=%p\n", inherit, flags, directory ? directory : "(null)", environment);
         if (environment) {
@@ -294,18 +350,18 @@ beer_CreateProcessA(const char *application, const char *command_line, void *pro
             for (int k = 0; k < 64 && *e; ++k) { fprintf(stderr, "[PROCESS]   env %s\n", e); e += strlen(e) + 1; }
         }
     }
-    return beer_create_process(application, command_line, flags, info);
+    return beer_create_process(application, command_line, flags, info, startup);
 }
 
 static u64 __attribute__((ms_abi))
 beer_CreateProcessW(const u16 *application, const u16 *command_line, void *process_sa, void *thread_sa,
                     u32 inherit, u32 flags, void *environment, const u16 *directory, void *startup, u8 *info)
 {
-    (void)process_sa; (void)thread_sa; (void)inherit; (void)environment; (void)directory; (void)startup;
+    (void)process_sa; (void)thread_sa; (void)inherit; (void)environment; (void)directory;
     char app[PATH_MAX], cmd[8192];
     beer_proc_utf16_to_utf8(application, app, sizeof(app));
     beer_proc_utf16_to_utf8(command_line, cmd, sizeof(cmd));
-    return beer_create_process(application ? app : NULL, command_line ? cmd : NULL, flags, info);
+    return beer_create_process(application ? app : NULL, command_line ? cmd : NULL, flags, info, startup);
 }
 
 static u64 __attribute__((ms_abi)) beer_GetProcessId(u64 process)

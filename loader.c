@@ -10442,6 +10442,10 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
             impl_SetEvent(overlapped->hEvent);
     } else {
         received = read(fd, buf, n);
+        if (received == 0 && n) {                       /* end of an anonymous pipe: the write end is closed */
+            struct stat pipe_st;
+            if (fstat(fd, &pipe_st) == 0 && S_ISFIFO(pipe_st.st_mode)) { if (done) *done = 0; g_last_error = 109; return 0; }
+        }
     }
 
     if (done) *done = (u32)(received < 0 ? 0 : received);
@@ -11171,6 +11175,7 @@ static u64 __attribute__((ms_abi)) impl_GetCursorInfo(u32 *info)
 }
 static u64 __attribute__((ms_abi)) impl_EventRegister(const void *provider, void *callback, void *context, u64 *handle)
 { (void)provider; (void)callback; (void)context; if (handle) *handle = 0x7E0E0001ull; return 0; }
+#include "platform/win32_advapi_misc.inc"
 
 /* Per-monitor DPI APIs (Windows 10): the desktop runs at 96 dpi, so scaling is the identity. */
 static u64 __attribute__((ms_abi))
@@ -18105,6 +18110,18 @@ static ImplEntry g_impls[] = {
     {"GetFileInformationByHandle",            (ImplFn)impl_GetFileInformationByHandle},
     {"GetFileSize",                           (ImplFn)impl_GetFileSize},
     {"GetFileSizeEx",                         (ImplFn)impl_GetFileSizeEx},
+    {"DuplicateToken",                            (ImplFn)impl_DuplicateToken},
+    {"DuplicateTokenEx",                          (ImplFn)impl_DuplicateTokenEx},
+    {"GetFileSecurityW",                          (ImplFn)impl_GetFileSecurityW},
+    {"GetFileSecurityA",                          (ImplFn)impl_GetFileSecurityA},
+    {"AccessCheck",                               (ImplFn)impl_AccessCheck},
+    {"MapGenericMask",                            (ImplFn)impl_MapGenericMask},
+    {"CreatePipe",                                (ImplFn)impl_CreatePipe},
+    {"SetHandleInformation",                      (ImplFn)impl_SetHandleInformation},
+    {"CreateTimerQueue",                          (ImplFn)impl_CreateTimerQueue},
+    {"CreateTimerQueueTimer",                     (ImplFn)impl_CreateTimerQueueTimer},
+    {"DeleteTimerQueueTimer",                     (ImplFn)impl_DeleteTimerQueueTimer},
+    {"DeleteTimerQueueEx",                        (ImplFn)impl_DeleteTimerQueueEx},
     {"GetOverlappedResult",                       (ImplFn)impl_GetOverlappedResult},
     {"GetOverlappedResultEx",                     (ImplFn)impl_GetOverlappedResultEx},
     {"CancelIo",                                  (ImplFn)impl_CancelIo},

@@ -1096,3 +1096,13 @@ Static findings (1911.dll and the dumped game image):
 - `activationDataThing` (RDR2.exe string at `0x143421700`) is just a field name in the save-game structure, not the ownership check.
 - Next step: find the code that shows the screen's text key (GXT key not present in process memory as text) by breakpointing UI/message-box creation entry points, or compare the thread
   list of a Proton run (the guest worker that runs `whoami`/`hostname` and wakes the main thread through `NtAlertThreadByThreadId`) with `BEER_THREAD_DUMP_AT` output.
+
+### Session 5 addendum 7: security/pipe/timer APIs, title.rgl
+
+- Implemented (platform/win32_advapi_misc.inc): `DuplicateToken(Ex)`, `GetFileSecurityW/A` (empty self-relative descriptor), `AccessCheck` (always granted), `MapGenericMask`,
+  `CreatePipe` (host pipe wrapped in file handles; `ReadFile` reports ERROR_BROKEN_PIPE at EOF), `SetHandleInformation`, `CreateTimerQueue(Timer)`/`DeleteTimerQueue(Timer|Ex)`
+  (host thread with its own TEB that calls the guest callback). `CreateProcess` answers `whoami.exe`/`hostname.exe` in-process (output goes to the redirected stdout handle), since there is no Windows system dir.
+- Result: with all of this in place the crack's hooks (`0x18006f5f0/110/1a0`) and the whoami path (`0x180015620/15ae0/14230`) are still never entered (breakpoints, 75 s), the screen is unchanged.
+  So the divergence is earlier than anything these APIs affect.
+- `title.rgl` (RGLM header, 2000 bytes) and `index.bin` are not opened by the game under Proton either (traced 70 s); they are not part of this check.
+- Proton prefix registry has no Rockstar keys; nothing to copy from compatdata (cfg.dat, Player, ProfileSettings and the Settings XML files were all tried, see addenda 3 and 5).
