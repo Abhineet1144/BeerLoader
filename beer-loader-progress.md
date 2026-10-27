@@ -1064,3 +1064,26 @@ Still different (leads, in order of suspicion):
 
 New diagnostics: `BEER_CALLER_DIAGNOSTICS=<path substring>`, `BEER_PIPE_DIAGNOSTICS=1`, `BEER_NT_DIAGNOSTICS=1`, `BEER_SPIN_DIAGNOSTICS=1`, `BEER_HOOK_PROBE=1`, `BEER_PROCESS_DIAGNOSTICS=1`.
 Note: the Launcher process shows up as comm `exe` (not `loader`), `pkill -x loader` only kills the game.
+
+### Session 5 addendum 5: headless runs, in-process debugging tools, what the activation screen depends on
+
+New run modes and tools (all generic):
+- `BEER_HEADLESS=1`: no X/Wayland session needed. `xwayland_backend.c` answers every window call with a virtual 2560x1440 window, the Vulkan bridge
+  creates `VK_EXT_headless_surface` surfaces and answers surface support/format/present-mode/capability queries itself, and `vulkan_map.c` provides a virtual swapchain
+  (own images, round-robin acquire, present drains the guest semaphores) so overlay, effects and `screenshot` over the control socket keep working. The game runs to its legal
+  screen and the activation screen without a desktop (used while the user's session was logged out).
+- `BEER_BP=0xaddr,...` (+`BEER_BP_DELAY`): one-shot guest breakpoints (int3 written after the delay; first hit logs thread, argument registers and code-looking return addresses).
+- `BEER_THREAD_DUMP_AT=<s>`: every thread prints its host and guest stack code addresses (`[TDUMP]`).
+- Control socket `mem_read`/`mem_regions` is enough to dump the whole decrypted 121 MB RDR2.exe image (`rdr2_img.bin`), which can then be disassembled/searched with objdump.
+- Real overlapped I/O for named pipes (`ReadFile` with OVERLAPPED stays pending, `GetOverlappedResult(Ex)`, `CancelIo(Ex)`); previously `GetOverlappedResult` was a zero-returning stub hit ~6700 times per run.
+
+Static findings (1911.dll and the dumped game image):
+- 1911.dll hooks three game functions through trampolines in a page at `0x13fff0000`: `0x142615114` (signer check) -> 1911 `0x18006f5f0`,
+  `0x1426127cc` -> `0x18006f110`, `0x142616dc0` -> `0x18006f1a0`. The last two are in the game's crypto module (PBKDF2-style: 2000 iterations, 16-byte salt, 32-byte key) -
+  the key derivation/decryption of the offline activation data. `0x18006f1a0` -> `0x18006b830` -> `0x180015ae0` -> `0x180014230` -> `0x180015620`, which runs
+  `whoami.exe`/`hostname.exe` through `CreatePipe` + `CreateProcessA` (machine/user fingerprint) - the process Proton shows the game spawning.
+- Under Beer none of those hooks is ever entered (breakpoints on `0x18006f110/1a0/5f0`, `0x180015ae0/15620/14230` never hit in 100 s), so the fingerprint/activation provisioning never runs.
+  Which game code calls `0x1426127cc` (vtable slot 4 of the class constructed at `0x1426116dd`, vtable `0x14361f2a0`) / `0x142616dc0` (no static caller) is the open question.
+- `1911.dll` also needs `GetFileSecurityW`, `AccessCheck`, `DuplicateToken`, `MapGenericMask`, `CreatePipe`, `SetHandleInformation`, `CreateTimerQueueTimer`,
+  `DeleteTimerQueueTimer` - none of them is implemented in Beer yet (they would be zero-returning stubs when reached).
+- The game's `Settings\*_<profileid>.bin` files are plain XML UI settings, not activation data; `cfg.dat` is identical in both prefixes.

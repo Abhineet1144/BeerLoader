@@ -10278,6 +10278,85 @@ typedef struct {
     u64 hEvent;
 } WIN_OVERLAPPED;
 
+/* ---- Overlapped I/O on named pipes ----
+ * A pipe read issued with an OVERLAPPED that finds no data is left pending (ERROR_IO_PENDING) instead of blocking the
+ * thread; GetOverlappedResult(Ex) completes it once data arrives, reports ERROR_IO_INCOMPLETE until then, and
+ * CancelIo(Ex) abandons it. Games that handshake with a launcher poll this in a loop and carry on after a timeout. */
+typedef struct { WIN_OVERLAPPED *overlapped; u64 handle; void *buffer; u32 length; } BeerPendingRead;
+static BeerPendingRead g_pending_reads[64];
+static pthread_mutex_t g_pending_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void beer_pending_add(WIN_OVERLAPPED *ov, u64 h, void *buf, u32 n)
+{
+    pthread_mutex_lock(&g_pending_mtx);
+    for (size_t i = 0; i < 64; ++i)
+        if (!g_pending_reads[i].overlapped) { g_pending_reads[i] = (BeerPendingRead){ ov, h, buf, n }; break; }
+    pthread_mutex_unlock(&g_pending_mtx);
+}
+/* Tries to finish the pending read of <ov>; returns 1 done (result stored in the OVERLAPPED), 0 still pending, -1 not pending. */
+static int beer_pending_poll(WIN_OVERLAPPED *ov, int wait_ms)
+{
+    BeerPendingRead entry = {0};
+    size_t slot = 64;
+    pthread_mutex_lock(&g_pending_mtx);
+    for (size_t i = 0; i < 64; ++i)
+        if (g_pending_reads[i].overlapped == ov) { entry = g_pending_reads[i]; slot = i; break; }
+    pthread_mutex_unlock(&g_pending_mtx);
+    if (slot == 64) return -1;
+    int fd = fh_get(entry.handle);
+    ssize_t got = -1;
+    if (fd >= 0) {
+        if (wait_ms != 0) {
+            struct pollfd pfd = { fd, POLLIN, 0 };
+            poll(&pfd, 1, wait_ms);
+        }
+        got = recv(fd, entry.buffer, entry.length, MSG_DONTWAIT);
+    }
+    if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && fd >= 0) return 0;
+    pthread_mutex_lock(&g_pending_mtx);
+    if (g_pending_reads[slot].overlapped == ov) g_pending_reads[slot].overlapped = NULL;
+    pthread_mutex_unlock(&g_pending_mtx);
+    if (got > 0) { ov->Internal = 0; ov->InternalHigh = (u64)got; }
+    else { ov->Internal = 0xC000014Bu; ov->InternalHigh = 0; }       /* STATUS_PIPE_BROKEN */
+    if (ov->hEvent) impl_SetEvent(ov->hEvent);
+    return 1;
+}
+static u64 __attribute__((ms_abi))
+impl_GetOverlappedResultEx(u64 h, WIN_OVERLAPPED *ov, u32 *transferred, u32 timeout_ms, u32 alertable)
+{
+    (void)h; (void)alertable;
+    if (!ov) { g_last_error = 87; return 0; }
+    int state = beer_pending_poll(ov, timeout_ms == 0xFFFFFFFFu ? -1 : (int)timeout_ms);
+    if (state == 0 && timeout_ms == 0xFFFFFFFFu) {
+        while ((state = beer_pending_poll(ov, 1000)) == 0) { }
+    }
+    if (state == 0) { if (transferred) *transferred = 0; g_last_error = timeout_ms ? 258u : 996u; return 0; }   /* WAIT_TIMEOUT / ERROR_IO_INCOMPLETE */
+    if (ov->Internal == 0x103u) { if (transferred) *transferred = 0; g_last_error = 996u; return 0; }
+    if (transferred) *transferred = (u32)ov->InternalHigh;
+    if (ov->Internal != 0) { g_last_error = ov->Internal == 0xC000014Bu ? 109u : 1117u; return 0; }
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi))
+impl_GetOverlappedResult(u64 h, WIN_OVERLAPPED *ov, u32 *transferred, u32 wait)
+    { return impl_GetOverlappedResultEx(h, ov, transferred, wait ? 0xFFFFFFFFu : 0u, 0); }
+static u64 __attribute__((ms_abi))
+impl_CancelIoEx(u64 h, WIN_OVERLAPPED *ov)
+{
+    int any = 0;
+    pthread_mutex_lock(&g_pending_mtx);
+    for (size_t i = 0; i < 64; ++i)
+        if (g_pending_reads[i].overlapped && g_pending_reads[i].handle == h && (!ov || g_pending_reads[i].overlapped == ov)) {
+            g_pending_reads[i].overlapped->Internal = 0xC0000120u;        /* STATUS_CANCELLED */
+            g_pending_reads[i].overlapped = NULL; any = 1;
+        }
+    pthread_mutex_unlock(&g_pending_mtx);
+    if (!any) { g_last_error = 1168; return 0; }                          /* ERROR_NOT_FOUND */
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_CancelIo(u64 h) { return impl_CancelIoEx(h, NULL); }
+
 /* BEER_PIPE_DIAGNOSTICS=1: hex-dumps the first bytes of every named-pipe transfer. */
 static void beer_pipe_dump(const char *dir, u64 h, const void *buf, ssize_t n)
 {
@@ -10304,7 +10383,26 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
     if (pipe_handle) {
         if (!beer_pipe_ensure_connected(h)) { if (done) *done = 0; return 0; }
         fd = fh_get(h);     /* adopting a client replaces the descriptor */
-        /* Pipes have no file position: overlapped reads complete synchronously. */
+        if (overlapped) {
+            /* Overlapped read: take what is there; with nothing yet the request stays pending. */
+            overlapped->Internal = 0x103u; overlapped->InternalHigh = 0;
+            do { received = recv(fd, buf, n, MSG_DONTWAIT); } while (received < 0 && errno == EINTR);
+            if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                beer_pending_add(overlapped, h, buf, n);
+                if (done) *done = 0;
+                g_last_error = 997;                                      /* ERROR_IO_PENDING */
+                return 0;
+            }
+            beer_pipe_dump("read", h, buf, received);
+            overlapped->Internal = received > 0 ? 0 : 0xC000014Bu;
+            overlapped->InternalHigh = received > 0 ? (u64)received : 0;
+            if (overlapped->hEvent) impl_SetEvent(overlapped->hEvent);
+            if (done) *done = (u32)(received > 0 ? received : 0);
+            if (received > 0) { g_last_error = 0; return 1; }
+            g_last_error = 109;
+            return 0;
+        }
+        /* Synchronous pipe read: blocks until data or EOF. */
         do { received = read(fd, buf, n); } while (received < 0 && errno == EINTR);
         beer_pipe_dump("read", h, buf, received);
         if (overlapped) {
@@ -18007,6 +18105,10 @@ static ImplEntry g_impls[] = {
     {"GetFileInformationByHandle",            (ImplFn)impl_GetFileInformationByHandle},
     {"GetFileSize",                           (ImplFn)impl_GetFileSize},
     {"GetFileSizeEx",                         (ImplFn)impl_GetFileSizeEx},
+    {"GetOverlappedResult",                       (ImplFn)impl_GetOverlappedResult},
+    {"GetOverlappedResultEx",                     (ImplFn)impl_GetOverlappedResultEx},
+    {"CancelIo",                                  (ImplFn)impl_CancelIo},
+    {"CancelIoEx",                                (ImplFn)impl_CancelIoEx},
     {"GetFileInformationByHandleExW",             (ImplFn)impl_GetFileInformationByHandleEx},
     {"SetFileInformationByHandleW",               (ImplFn)impl_SetFileInformationByHandle},
     {"WaitOnAddress",                             (ImplFn)impl_WaitOnAddress},
@@ -21584,6 +21686,119 @@ static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
 
 int (*g_beer_lazy_fault_hook)(void *addr);   /* BD11's lazily populated deferred-map scratch pages */
 
+/* BEER_BP="0xaddr,0xaddr" (+ BEER_BP_DELAY seconds, default 30): one-shot guest breakpoints for reverse engineering. After the delay an int3 is
+ * written at each address; the first hit restores the byte, logs the thread and the code-looking return addresses on
+ * the stack, and resumes. Lets a running game be asked "does this function ever run, and who calls it?" without a debugger. */
+static struct { u64 address; u8 original; int armed; } g_breakpoints[16];
+static int g_breakpoint_count;
+static int beer_breakpoint_hit(ucontext_t *uc)
+{
+    u64 at = (u64)uc->uc_mcontext.gregs[REG_RIP] - 1;
+    for (int i = 0; i < g_breakpoint_count; ++i) {
+        if (!g_breakpoints[i].armed || g_breakpoints[i].address != at) continue;
+        *(volatile u8 *)(uintptr_t)at = g_breakpoints[i].original;
+        g_breakpoints[i].armed = 0;
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)at;
+        const u64 *stack = (const u64 *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+        fprintf(stderr, "[BP] hit 0x%llx tid %ld rcx=%llx rdx=%llx r8=%llx r9=%llx\n", (unsigned long long)at, (long)syscall(SYS_gettid),
+                (unsigned long long)uc->uc_mcontext.gregs[REG_RCX], (unsigned long long)uc->uc_mcontext.gregs[REG_RDX],
+                (unsigned long long)uc->uc_mcontext.gregs[REG_R8], (unsigned long long)uc->uc_mcontext.gregs[REG_R9]);
+        int shown = 0;
+        for (int k = 0; k < 400 && shown < 24; ++k) {
+            u64 v = stack[k];
+            if ((v >= 0x140000000ull && v < 0x148000000ull) || (v >= 0x7ffff5000000ull && v < 0x7ffff9000000ull)) {
+                fprintf(stderr, "[BP]   [%3d] 0x%llx\n", k, (unsigned long long)v);
+                ++shown;
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+static void *beer_breakpoint_thread(void *unused)
+{
+    (void)unused;
+    const char *delay = getenv("BEER_BP_DELAY");
+    sleep(delay ? (unsigned)atoi(delay) : 30u);
+    for (int i = 0; i < g_breakpoint_count; ++i) {
+        u8 *at = (u8 *)(uintptr_t)g_breakpoints[i].address;
+        int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+        if (fd < 0 || pread(fd, &g_breakpoints[i].original, 1, (off_t)g_breakpoints[i].address) != 1) { if (fd >= 0) close(fd); continue; }
+        u8 trap = 0xCC;
+        if (pwrite(fd, &trap, 1, (off_t)(uintptr_t)at) == 1) { g_breakpoints[i].armed = 1; fprintf(stderr, "[BP] armed 0x%llx\n", (unsigned long long)g_breakpoints[i].address); }
+        close(fd);
+    }
+    return NULL;
+}
+static void beer_breakpoints_start(void)
+{
+    const char *list = getenv("BEER_BP");
+    if (!list || !*list) return;
+    char copy[512]; snprintf(copy, sizeof(copy), "%s", list);
+    for (char *tok = strtok(copy, ","); tok && g_breakpoint_count < 16; tok = strtok(NULL, ","))
+        g_breakpoints[g_breakpoint_count++].address = strtoull(tok, NULL, 0);
+    pthread_t thread;
+    if (g_breakpoint_count && pthread_create(&thread, NULL, beer_breakpoint_thread, NULL) == 0) pthread_detach(thread);
+}
+
+/* BEER_THREAD_DUMP_AT=<seconds>: once, signal every thread of the process and have each print where it is (code-looking
+ * addresses on its stack and on its saved guest stack). Shows which guest thread is blocked in which function. */
+static void beer_thread_dump_handler(int sig, siginfo_t *si, void *uctx)
+{
+    (void)sig; (void)si;
+    ucontext_t *uc = uctx;
+    extern __thread u64 g_saved_guest_rsp;
+    char text[4096];
+    size_t n = (size_t)snprintf(text, sizeof(text), "[TDUMP] tid %ld rip=0x%llx saved_guest_rsp=0x%llx", (long)syscall(SYS_gettid),
+                                (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)g_saved_guest_rsp);
+    const u64 *stacks[2] = { (const u64 *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP], (const u64 *)(uintptr_t)g_saved_guest_rsp };
+    for (int which = 0; which < 2; ++which) {
+        if (!stacks[which]) continue;
+        n += (size_t)snprintf(text + n, sizeof(text) - n, which ? " guest:" : " stack:");
+        int shown = 0;
+        u64 copy[600];
+        size_t got = 0;                                   /* read what is mapped; the stack top may be close */
+        for (size_t want = sizeof(copy); want >= 64 && !got; want /= 2) {
+            struct iovec local = { copy, want }, remote = { (void *)stacks[which], want };
+            ssize_t r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+            if (r > 0) got = (size_t)r;
+        }
+        for (size_t k = 0; k < got / 8 && shown < 24 && n + 24 < sizeof(text); ++k) {
+            u64 v = copy[k];
+            if ((v >= 0x140000000ull && v < 0x148000000ull) || (v >= 0x7ffff5000000ull && v < 0x7ffff9000000ull)) {
+                n += (size_t)snprintf(text + n, sizeof(text) - n, " %llx", (unsigned long long)v);
+                ++shown;
+            }
+        }
+    }
+    text[n++] = '\n';
+    if (write(2, text, n) < 0) { }
+}
+static void *beer_thread_dump_thread(void *arg)
+{
+    sleep((unsigned)(uintptr_t)arg);
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = beer_thread_dump_handler; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGUSR2, &sa, NULL);
+    DIR *dir = opendir("/proc/self/task");
+    struct dirent *entry;
+    while (dir && (entry = readdir(dir))) {
+        long tid = atol(entry->d_name);
+        if (tid <= 0 || tid == syscall(SYS_gettid)) continue;
+        syscall(SYS_tgkill, getpid(), tid, SIGUSR2);
+        usleep(40000);
+    }
+    if (dir) closedir(dir);
+    return NULL;
+}
+static void beer_thread_dump_start(void)
+{
+    const char *at = getenv("BEER_THREAD_DUMP_AT");
+    if (!at || !*at) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, beer_thread_dump_thread, (void *)(uintptr_t)atoi(at)) == 0) pthread_detach(thread);
+}
+
 static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
 {
     ucontext_t *uc = (ucontext_t *)uctx;
@@ -21595,6 +21810,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     /* Windows calls vectored handlers before frame-based/unhandled exception
      * processing. Give registered guest handlers the original machine context;
      * only use Beer's compatibility recovery when every handler searches on. */
+    if (sig == SIGTRAP && beer_breakpoint_hit(uc)) return;
     if (beer_dispatch_signal_to_veh(sig, si, uc)) return;
     if (beer_dispatch_signal_to_seh(sig, si, uc)) return;
 
@@ -24237,6 +24453,8 @@ int main(int argc, char **argv)
     const char *exe_arg = NULL;
     const char *cmdline_arg = NULL;
     beer_proc_save_args(argc, argv);
+    beer_breakpoints_start();
+    beer_thread_dump_start();
     const char *prefix_arg = NULL;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];

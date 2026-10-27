@@ -415,9 +415,26 @@ static unsigned long server_time_locked(void)
     return 0;
 }
 
+/* BEER_HEADLESS=1: no X/Wayland session (CI, remote machine with nobody logged in). Every window call is answered by a
+ * virtual window so the guest runs normally; the Vulkan bridge pairs this with VK_EXT_headless_surface and screenshots
+ * still work because they come from the loader's own final image, not from the screen. */
+static int beer_headless(void)
+{
+    static int value = -1;
+    if (value < 0) {
+        const char *e = getenv("BEER_HEADLESS");
+        value = e && *e && strcmp(e, "0") != 0;
+    }
+    return value;
+}
+static struct { int exists, visible, x, y, width, height, client_width, client_height; } g_virtual = { 0, 0, 0, 0, 2560, 1440, 2560, 1440 };
+int xwayland_headless(void) { return beer_headless(); }
+
 int xwayland_window_create(int x, int y, int width, int height,
                            const char *title, int initially_visible)
 {
+    if (beer_headless()) { (void)title; g_virtual.exists = 1; g_virtual.x = x; g_virtual.y = y; if (width > 0) g_virtual.width = g_virtual.client_width = width; if (height > 0) g_virtual.height = g_virtual.client_height = height; g_virtual.visible = initially_visible; return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     if (!initialize_locked()) {
         pthread_mutex_unlock(&g_x11.lock);
@@ -547,6 +564,8 @@ int xwayland_window_create(int x, int y, int width, int height,
 
 int xwayland_window_show(int visible)
 {
+    if (beer_headless()) { g_virtual.visible = visible; return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     if (!g_x11.display || !g_x11.window) {
         pthread_mutex_unlock(&g_x11.lock);
@@ -563,6 +582,8 @@ int xwayland_window_show(int visible)
 
 int xwayland_window_set_style(int decorated, int resizable)
 {
+    if (beer_headless()) { (void)decorated; (void)resizable; return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     if (!g_x11.display || !g_x11.window) {
         pthread_mutex_unlock(&g_x11.lock);
@@ -601,6 +622,8 @@ static void screen_size_locked(int *out_w, int *out_h);
 
 int xwayland_window_set_fullscreen(int fullscreen)
 {
+    if (beer_headless()) { (void)fullscreen; return 1; }
+
     if (getenv("BEER_NO_COMPOSITOR_FULLSCREEN")) return 1;     /* experiment: borderless window only */
     pthread_mutex_lock(&g_x11.lock);
     if (!g_x11.display || !g_x11.window) {
@@ -654,6 +677,8 @@ static int apply_cursor_locked(void);
 int xwayland_window_move_resize(int x, int y, int width, int height,
                                 int move, int resize)
 {
+    if (beer_headless()) { if (move) { g_virtual.x = x; g_virtual.y = y; } if (resize && width > 0 && height > 0) { g_virtual.width = g_virtual.client_width = width; g_virtual.height = g_virtual.client_height = height; } return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     if (!g_x11.display || !g_x11.window) {
         pthread_mutex_unlock(&g_x11.lock);
@@ -723,6 +748,8 @@ int xwayland_window_move_resize(int x, int y, int width, int height,
 
 int xwayland_window_set_title(const char *title)
 {
+    if (beer_headless()) { (void)title; return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window && title;
     if (ok) {
@@ -735,6 +762,8 @@ int xwayland_window_set_title(const char *title)
 
 int xwayland_window_set_app_id(const char *app_id)
 {
+    if (beer_headless()) { (void)app_id; return 1; }
+
     if (!app_id || !*app_id) return 0;
     size_t length = strnlen(app_id, sizeof(g_x11.app_id));
     if (!length || length >= sizeof(g_x11.app_id)) return 0;
@@ -746,6 +775,8 @@ int xwayland_window_set_app_id(const char *app_id)
 
 int xwayland_window_set_icon_argb(const uint32_t *pixels, int width, int height)
 {
+    if (beer_headless()) { (void)pixels; (void)width; (void)height; return 1; }
+
     if (!pixels || width <= 0 || height <= 0) return 0;
 
     int published_width = width;
@@ -859,6 +890,8 @@ static int request_focus_locked(void)
 
 int xwayland_window_focus_lost_by_user(void)
 {
+    if (beer_headless()) { return 0; }
+
     pthread_mutex_lock(&g_x11.lock);
     int lost = g_x11.focus_lost;
     pthread_mutex_unlock(&g_x11.lock);
@@ -867,6 +900,8 @@ int xwayland_window_focus_lost_by_user(void)
 
 int xwayland_window_request_focus(void)
 {
+    if (beer_headless()) { return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window;
     /* The game calls SetFocus/SetForegroundWindow very often; an already focused window needs nothing, and an
@@ -934,6 +969,8 @@ static int apply_cursor_locked(void)
 
 int xwayland_window_set_cursor_visible(int visible)
 {
+    if (beer_headless()) { (void)visible; return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     g_x11.cursor_requested_visible = !!visible;
     const int ok = apply_cursor_locked();
@@ -943,6 +980,8 @@ int xwayland_window_set_cursor_visible(int visible)
 
 int xwayland_window_set_cursor_position(int root_x, int root_y)
 {
+    if (beer_headless()) { (void)root_x; (void)root_y; return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window;
     /* Mouse-look games re-centre the pointer every frame; when the window is not focused the pointer belongs to the
@@ -992,6 +1031,8 @@ static void apply_pointer_confine_locked(void)
 
 int xwayland_window_set_pointer_confine(int enable)
 {
+    if (beer_headless()) { (void)enable; return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     const int changed = g_x11.pointer_confine_wanted != (enable != 0);
     g_x11.pointer_confine_wanted = enable != 0;
@@ -1005,6 +1046,8 @@ int xwayland_window_set_pointer_confine(int enable)
 int xwayland_window_set_client_rect(int client_x, int client_y,
                                     int client_width, int client_height)
 {
+    if (beer_headless()) { (void)client_x; (void)client_y; if (client_width > 0) g_virtual.client_width = client_width; if (client_height > 0) g_virtual.client_height = client_height; return 1; }
+
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window;
     if (ok && client_x == 0 && client_y == 0 &&
@@ -1021,6 +1064,8 @@ int xwayland_window_set_client_rect(int client_x, int client_y,
 
 int xwayland_window_get_state(XwaylandWindowState *state)
 {
+    if (beer_headless()) { if (!state) return 0; state->x = g_virtual.x; state->y = g_virtual.y; state->width = g_virtual.width; state->height = g_virtual.height; state->client_width = g_virtual.client_width; state->client_height = g_virtual.client_height; state->visible = g_virtual.visible; return g_virtual.exists; }
+
     if (!state) return 0;
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window;
@@ -1051,6 +1096,8 @@ static void screen_size_locked(int *out_w, int *out_h)
 
 void xwayland_get_screen_size(int *out_width, int *out_height)
 {
+    if (beer_headless()) { if (out_width) *out_width = 2560; if (out_height) *out_height = 1440; return; }
+
     int w = 1920, h = 1080;
     pthread_mutex_lock(&g_x11.lock);
     /* DXGI and USER32 query the desktop before any window exists; connect now
@@ -1082,6 +1129,8 @@ void xwayland_get_screen_size(int *out_width, int *out_height)
 /* Current refresh rate of the default screen in Hz (XRandR), 60 if unknown. */
 int xwayland_get_screen_refresh(void)
 {
+    if (beer_headless()) { return 60; }
+
     int hz = 60;
     pthread_mutex_lock(&g_x11.lock);
     if (!g_x11.initialized) initialize_locked();
@@ -1112,6 +1161,8 @@ int xwayland_get_screen_refresh(void)
 
 int xwayland_window_poll_event(XwaylandEvent *out)
 {
+    if (beer_headless()) { (void)out; return 0; }
+
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     pthread_mutex_lock(&g_x11.lock);
@@ -1260,6 +1311,8 @@ int xwayland_window_poll_event(XwaylandEvent *out)
 
 int xwayland_window_pump_events(void)
 {
+    if (beer_headless()) { return 0; }
+
     int close_requested = 0;
     XwaylandEvent event;
     while (xwayland_window_poll_event(&event))
@@ -1430,6 +1483,8 @@ static int present_rgba8_internal(const void *resource, uint64_t serial,
 int xwayland_window_present_rgba8(const uint8_t *pixels, int width, int height,
                                   int row_pitch)
 {
+    if (beer_headless()) { (void)pixels; (void)width; (void)height; (void)row_pitch; return 1; }
+
     return present_rgba8_internal(NULL, 0, pixels, width, height, row_pitch);
 }
 
@@ -1437,6 +1492,8 @@ int xwayland_window_present_resource_rgba8(const void *resource, uint64_t serial
                                            const uint8_t *pixels, int width,
                                            int height, int row_pitch)
 {
+    if (beer_headless()) { (void)resource; (void)serial; (void)pixels; (void)width; (void)height; (void)row_pitch; return 1; }
+
     return present_rgba8_internal(resource, serial, pixels,
                                   width, height, row_pitch);
 }
@@ -1444,6 +1501,8 @@ int xwayland_window_present_resource_rgba8(const void *resource, uint64_t serial
 int xwayland_window_present_image(uint64_t image, uint32_t layout, int width,
                                   int height, int direct_blit)
 {
+    if (beer_headless()) { (void)image; (void)layout; (void)width; (void)height; (void)direct_blit; return 1; }
+
     if (width <= 0 || height <= 0) return 0;
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window && g_x11.presenter != XWAYLAND_PRESENTER_X11;
@@ -1458,6 +1517,8 @@ int xwayland_window_present_image(uint64_t image, uint32_t layout, int width,
 
 int xwayland_window_native(void **display, unsigned long *window)
 {
+    if (beer_headless()) { (void)display; (void)window; return 0; }
+
     pthread_mutex_lock(&g_x11.lock);
     int ok = g_x11.display && g_x11.window;
     if (ok) { *display = g_x11.display; *window = (unsigned long)g_x11.window; }
@@ -1467,6 +1528,8 @@ int xwayland_window_native(void **display, unsigned long *window)
 
 void xwayland_window_destroy(void)
 {
+    if (beer_headless()) { g_virtual.exists = 0; return; }
+
     pthread_mutex_lock(&g_x11.lock);
     vulkan_presenter_destroy();
     if (g_x11.display && g_x11.window) {
@@ -1493,6 +1556,8 @@ void xwayland_window_destroy(void)
 
 int xwayland_window_exists(void)
 {
+    if (beer_headless()) { return g_virtual.exists; }
+
     pthread_mutex_lock(&g_x11.lock);
     int exists = g_x11.display && g_x11.window;
     pthread_mutex_unlock(&g_x11.lock);

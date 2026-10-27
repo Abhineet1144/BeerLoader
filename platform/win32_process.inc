@@ -286,7 +286,14 @@ static u64 __attribute__((ms_abi))
 beer_CreateProcessA(const char *application, const char *command_line, void *process_sa, void *thread_sa,
                     u32 inherit, u32 flags, void *environment, const char *directory, void *startup, u8 *info)
 {
-    (void)process_sa; (void)thread_sa; (void)inherit; (void)environment; (void)directory; (void)startup;
+    (void)process_sa; (void)thread_sa; (void)startup;
+    if (getenv("BEER_PROCESS_DIAGNOSTICS")) {
+        fprintf(stderr, "[PROCESS] CreateProcessA inherit=%u flags=0x%x directory=%s environment=%p\n", inherit, flags, directory ? directory : "(null)", environment);
+        if (environment) {
+            const char *e = (const char *)environment;
+            for (int k = 0; k < 64 && *e; ++k) { fprintf(stderr, "[PROCESS]   env %s\n", e); e += strlen(e) + 1; }
+        }
+    }
     return beer_create_process(application, command_line, flags, info);
 }
 

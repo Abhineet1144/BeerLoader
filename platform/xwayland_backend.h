@@ -116,5 +116,7 @@ int xwayland_window_present_image(uint64_t image, uint32_t layout, int width,
 int xwayland_window_native(void **display, unsigned long *window);
 void xwayland_window_destroy(void);
 int xwayland_window_exists(void);
+/* Nonzero when BEER_HEADLESS=1: a virtual window stands in for the X11 one. */
+int xwayland_headless(void);
 
 #endif

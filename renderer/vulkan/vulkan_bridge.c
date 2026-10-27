@@ -340,7 +340,9 @@ static uint32_t filter_extensions(const char *const *in, uint32_t count, const c
             continue;
         out[n++] = e;
     }
-    if (want_xlib && !have_xlib && n < capacity) out[n++] = "VK_KHR_xlib_surface";
+    if (want_xlib && xwayland_headless()) {            /* no display: surfaces come from the loader's headless implementation */
+        if (n < capacity) out[n++] = "VK_EXT_headless_surface";
+    } else if (want_xlib && !have_xlib && n < capacity) out[n++] = "VK_KHR_xlib_surface";
     return n;
 }
 
@@ -408,7 +410,7 @@ static VkResult MS_ABI bridge_EnumerateInstanceExtensionProperties(const char *l
         if (!strcmp(all[i].extensionName, "VK_KHR_xlib_surface")) have_xlib = 1;
         if (!name_is_hidden_extension(all[i].extensionName)) keep[n++] = all[i];
     }
-    if (have_xlib) {
+    if (have_xlib || xwayland_headless()) {
         VkExtensionProperties win32 = { .specVersion = 6 };
         snprintf(win32.extensionName, sizeof(win32.extensionName), "VK_KHR_win32_surface");
         keep[n++] = win32;
@@ -462,6 +464,14 @@ static VkResult MS_ABI bridge_CreateWin32SurfaceKHR(VkInstance instance, const v
     (void)info; (void)allocator;
     void *display = NULL;
     unsigned long window = 0;
+    if (surface && host_init() && xwayland_headless()) {
+        PFN_vkCreateHeadlessSurfaceEXT headless = (PFN_vkCreateHeadlessSurfaceEXT)g_gipa(instance, "vkCreateHeadlessSurfaceEXT");
+        if (!headless) return VK_ERROR_EXTENSION_NOT_PRESENT;
+        VkHeadlessSurfaceCreateInfoEXT hinfo = { .sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
+        VkResult hr = headless(instance, &hinfo, NULL, surface);
+        fprintf(stderr, "[VKBRIDGE] vkCreateWin32SurfaceKHR -> headless surface -> %d\n", (int)hr);
+        return hr;
+    }
     if (!surface || !host_init() || !xwayland_window_native(&display, &window) || !display || !window)
         return VK_ERROR_INITIALIZATION_FAILED;
     PFN_vkCreateXlibSurfaceKHR create = (PFN_vkCreateXlibSurfaceKHR)g_gipa(instance, "vkCreateXlibSurfaceKHR");
@@ -474,6 +484,75 @@ static VkResult MS_ABI bridge_CreateWin32SurfaceKHR(VkInstance instance, const v
     VkResult r = create(instance, &xlib, NULL, surface);
     fprintf(stderr, "[VKBRIDGE] vkCreateWin32SurfaceKHR -> xlib surface -> %d\n", (int)r);
     return r;
+}
+
+/* Headless surface queries: the host reports whatever the headless implementation can do, which is often nothing
+ * (no formats, undefined extent); give the guest the answers a 2560x1440 sRGB window would. */
+static void *headless_host(const char *name)
+{
+    void *fn = (void *)g_gipa(VK_NULL_HANDLE, name);
+    return fn ? fn : host_symbol(name);
+}
+static VkResult MS_ABI bridge_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physical, VkSurfaceKHR surface, uint32_t *count,
+                                                                 VkSurfaceFormatKHR *formats)
+{
+    OVERRIDE_TRACE("vkGetPhysicalDeviceSurfaceFormatsKHR");
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR host = (PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)headless_host("vkGetPhysicalDeviceSurfaceFormatsKHR");
+    if (!xwayland_headless()) return host ? host(physical, surface, count, formats) : VK_ERROR_EXTENSION_NOT_PRESENT;
+    static const VkSurfaceFormatKHR table[] = {
+        { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR }, { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+        { VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },  { VK_FORMAT_R8G8B8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+        { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR }, { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR } };
+    const uint32_t total = sizeof(table) / sizeof(*table);
+    if (!count) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!formats) { *count = total; return VK_SUCCESS; }
+    uint32_t room = *count < total ? *count : total;
+    memcpy(formats, table, room * sizeof(*table));
+    *count = room;
+    return room < total ? VK_INCOMPLETE : VK_SUCCESS;
+}
+static VkResult MS_ABI bridge_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physical, VkSurfaceKHR surface, uint32_t *count,
+                                                                      VkPresentModeKHR *modes)
+{
+    OVERRIDE_TRACE("vkGetPhysicalDeviceSurfacePresentModesKHR");
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR host = (PFN_vkGetPhysicalDeviceSurfacePresentModesKHR)headless_host("vkGetPhysicalDeviceSurfacePresentModesKHR");
+    if (!xwayland_headless()) return host ? host(physical, surface, count, modes) : VK_ERROR_EXTENSION_NOT_PRESENT;
+    static const VkPresentModeKHR table[] = { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR };
+    const uint32_t total = 3;
+    if (!count) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!modes) { *count = total; return VK_SUCCESS; }
+    uint32_t room = *count < total ? *count : total;
+    memcpy(modes, table, room * sizeof(*table));
+    *count = room;
+    return room < total ? VK_INCOMPLETE : VK_SUCCESS;
+}
+static VkResult MS_ABI bridge_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physical, VkSurfaceKHR surface,
+                                                                      VkSurfaceCapabilitiesKHR *caps)
+{
+    OVERRIDE_TRACE("vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR host = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)headless_host("vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    if (!xwayland_headless() || !caps) return host ? host(physical, surface, caps) : VK_ERROR_EXTENSION_NOT_PRESENT;
+    memset(caps, 0, sizeof(*caps));
+    caps->minImageCount = 2; caps->maxImageCount = 8;
+    caps->currentExtent = (VkExtent2D){ 2560, 1440 };
+    caps->minImageExtent = (VkExtent2D){ 1, 1 }; caps->maxImageExtent = (VkExtent2D){ 16384, 16384 };
+    caps->maxImageArrayLayers = 1;
+    caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR; caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    caps->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    caps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    return VK_SUCCESS;
+}
+
+/* Headless surfaces have no windowing system to ask: every queue family may present (the images go nowhere). */
+static VkResult MS_ABI bridge_GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physical, uint32_t family, VkSurfaceKHR surface,
+                                                                 VkBool32 *supported)
+{
+    OVERRIDE_TRACE("vkGetPhysicalDeviceSurfaceSupportKHR");
+    if (xwayland_headless()) { if (supported) *supported = VK_TRUE; return VK_SUCCESS; }
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR host = (PFN_vkGetPhysicalDeviceSurfaceSupportKHR)g_gipa(VK_NULL_HANDLE, "vkGetPhysicalDeviceSurfaceSupportKHR");
+    if (!host) host = (PFN_vkGetPhysicalDeviceSurfaceSupportKHR)host_symbol("vkGetPhysicalDeviceSurfaceSupportKHR");
+    return host ? host(physical, family, surface, supported) : VK_ERROR_EXTENSION_NOT_PRESENT;
 }
 
 static VkBool32 MS_ABI bridge_GetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice physical, uint32_t family)
@@ -509,6 +588,10 @@ static void *override_for(const char *name)
         { "vkEnumerateInstanceLayerProperties", bridge_EnumerateInstanceLayerProperties },
         { "vkCreateDevice", bridge_CreateDevice },
         { "vkCreateWin32SurfaceKHR", bridge_CreateWin32SurfaceKHR },
+        { "vkGetPhysicalDeviceSurfaceSupportKHR", bridge_GetPhysicalDeviceSurfaceSupportKHR },
+        { "vkGetPhysicalDeviceSurfaceFormatsKHR", bridge_GetPhysicalDeviceSurfaceFormatsKHR },
+        { "vkGetPhysicalDeviceSurfacePresentModesKHR", bridge_GetPhysicalDeviceSurfacePresentModesKHR },
+        { "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", bridge_GetPhysicalDeviceSurfaceCapabilitiesKHR },
         { "vkGetPhysicalDeviceWin32PresentationSupportKHR", bridge_GetPhysicalDeviceWin32PresentationSupportKHR },
         { "vkCreateDebugUtilsMessengerEXT", bridge_CreateDebugCallback },
         { "vkDestroyDebugUtilsMessengerEXT", bridge_DestroyDebugCallback },

@@ -25,6 +25,8 @@
 
 #define MS_ABI __attribute__((ms_abi))
 #define MAX_QUEUES 32
+#include "../../platform/xwayland_backend.h"
+
 #define RING 2
 
 typedef struct Swap Swap;
@@ -92,6 +94,9 @@ struct Swap {
     VkCommandPool pool;
     struct { VkCommandBuffer cmd; VkFence fence; int submitted; } slot[RING];
     unsigned frame;
+    int virt;                           /* headless: the images are ours, there is no host swapchain */
+    VkDeviceMemory *virt_memory;
+    uint32_t acquire;
     Swap *next;
 };
 
@@ -287,6 +292,10 @@ static SwapMode mode_for_format(VkFormat format)
     }
 }
 
+static int make_image(Dev *d, VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, VkImage *image,
+                      VkDeviceMemory *memory);
+static void swap_release(Swap *s);
+
 static Swap *swap_find(VkSwapchainKHR handle)
 {
     for (Swap *s = g_swaps; s; s = s->next)
@@ -303,6 +312,29 @@ static VkResult MS_ABI map_CreateSwapchainKHR(VkDevice device, const VkSwapchain
     if (!d) {
         PFN_vkCreateSwapchainKHR host = (PFN_vkCreateSwapchainKHR)beer_vkbridge_host_device_proc(device, "vkCreateSwapchainKHR");
         return host ? host(device, info, NULL, out) : VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (xwayland_headless()) {
+        /* No display, no host swapchain: the "swapchain" is a set of our own images the guest renders into. */
+        Swap *v = calloc(1, sizeof(*v));
+        if (!v) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        uint32_t images = info->minImageCount < 2 ? 2 : info->minImageCount;
+        v->dev = d; v->virt = 1; v->handle = (VkSwapchainKHR)(uintptr_t)v; v->format = info->imageFormat;
+        v->extent = info->imageExtent; v->count = images;
+        v->mode = getenv("BEER_NO_POST") ? MODE_OFF : mode_for_format(info->imageFormat);
+        v->images = calloc(images, sizeof(*v->images));
+        v->virt_memory = calloc(images, sizeof(*v->virt_memory));
+        VkImageUsageFlags usage = info->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        int ok = v->images && v->virt_memory;
+        for (uint32_t i = 0; ok && i < images; ++i)
+            ok = make_image(d, info->imageExtent, info->imageFormat, usage, &v->images[i], &v->virt_memory[i]);
+        if (!ok) { v->count = images; swap_release(v); return VK_ERROR_INITIALIZATION_FAILED; }
+        pthread_mutex_lock(&g_lock);
+        v->next = g_swaps; g_swaps = v;
+        pthread_mutex_unlock(&g_lock);
+        *out = v->handle;
+        fprintf(stderr, "[VKMAP] headless swapchain %ux%u format %d, %u images\n", info->imageExtent.width, info->imageExtent.height,
+                (int)info->imageFormat, images);
+        return VK_SUCCESS;
     }
     VkSwapchainCreateInfoKHR copy = *info;
     SwapMode mode = getenv("BEER_NO_POST") ? MODE_OFF : mode_for_format(info->imageFormat);
@@ -365,6 +397,14 @@ static void swap_release(Swap *s)
         if (s->stage) d->DestroyImage(d->device, s->stage, NULL);
         if (s->stage_memory) d->FreeMemory(d->device, s->stage_memory, NULL);
     }
+    if (s->virt) {
+        if (!s->ready) d->DeviceWaitIdle(d->device);
+        for (uint32_t i = 0; i < s->count; ++i) {
+            if (s->images && s->images[i]) d->DestroyImage(d->device, s->images[i], NULL);
+            if (s->virt_memory && s->virt_memory[i]) d->FreeMemory(d->device, s->virt_memory[i], NULL);
+        }
+        free(s->virt_memory);
+    }
     free(s->images);
     free(s->done);
     free(s);
@@ -381,7 +421,11 @@ static void MS_ABI map_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapc
     Swap *s = *link;
     if (s) *link = s->next;
     pthread_mutex_unlock(&g_lock);
-    if (s) swap_release(s);
+    if (s) {
+        const int virt = s->virt;
+        swap_release(s);
+        if (virt) return;
+    }
     PFN_vkDestroySwapchainKHR host = d ? d->DestroySwapchainKHR : (PFN_vkDestroySwapchainKHR)beer_vkbridge_host_device_proc(device, "vkDestroySwapchainKHR");
     host(device, swapchain, NULL);
 }
@@ -448,10 +492,16 @@ static int swap_setup(Swap *s, uint32_t family)
         g_post_bound = 1;
     }
     uint32_t count = 0;
+    if (s->virt) {
+        count = s->count;
+        s->done = calloc(count, sizeof(*s->done));
+        if (!s->done) return 0;
+    } else {
     if (d->GetSwapchainImagesKHR(dev, s->handle, &count, NULL) != VK_SUCCESS || count == 0) return 0;
     s->images = calloc(count, sizeof(*s->images));
     s->done = calloc(count, sizeof(*s->done));
     if (!s->images || !s->done || d->GetSwapchainImagesKHR(dev, s->handle, &count, s->images) < 0) return 0;
+    }
     s->count = count;
     s->family = family;
     s->ready = 1;                               /* from here swap_release cleans up whatever got created */
@@ -627,11 +677,74 @@ static VkResult MS_ABI map_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR
     Swap *s = swap_find(info->pSwapchains[0]);
     pthread_mutex_unlock(&g_lock);                   /* the queue is externally synchronized by the guest */
     if (s) done = post_frame(s, queue, family, info);
+    if (s && s->virt) {
+        /* Nothing to show it on: just consume the semaphores the guest handed us (post_frame already waited on them when it ran). */
+        VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stages[16];
+        uint32_t waits = done ? 0 : (info->waitSemaphoreCount < 16 ? info->waitSemaphoreCount : 16);
+        for (uint32_t i = 0; i < waits; ++i) stages[i] = stage;
+        VkSubmitInfo drain = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = waits,
+                               .pWaitSemaphores = info->pWaitSemaphores, .pWaitDstStageMask = stages };
+        if (done) { drain.waitSemaphoreCount = 1; drain.pWaitSemaphores = &done; stages[0] = stage; drain.pWaitDstStageMask = stages; }
+        d->QueueSubmit(queue, 1, &drain, VK_NULL_HANDLE);
+        if (info->pResults) for (uint32_t i = 0; i < info->swapchainCount; ++i) info->pResults[i] = VK_SUCCESS;
+        return VK_SUCCESS;
+    }
     if (!done) return host(queue, info);
     VkPresentInfoKHR patched = *info;
     patched.waitSemaphoreCount = 1;
     patched.pWaitSemaphores = &done;
     return host(queue, &patched);
+}
+
+/* ---- headless swapchain: image enumeration and acquisition ---- */
+static VkResult MS_ABI map_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain, uint32_t *count, VkImage *images)
+{
+    pthread_mutex_lock(&g_lock);
+    Swap *v = swap_find(swapchain);
+    pthread_mutex_unlock(&g_lock);
+    if (v && v->virt) {
+        if (!count) return VK_ERROR_INITIALIZATION_FAILED;
+        if (!images) { *count = v->count; return VK_SUCCESS; }
+        uint32_t room = *count < v->count ? *count : v->count;
+        memcpy(images, v->images, room * sizeof(*images));
+        *count = room;
+        return room < v->count ? VK_INCOMPLETE : VK_SUCCESS;
+    }
+    PFN_vkGetSwapchainImagesKHR host = (PFN_vkGetSwapchainImagesKHR)beer_vkbridge_host_device_proc(device, "vkGetSwapchainImagesKHR");
+    return host ? host(device, swapchain, count, images) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VkResult virtual_acquire(Swap *v, VkSemaphore semaphore, VkFence fence, uint32_t *index)
+{
+    Dev *d = v->dev;
+    VkQueue queue = VK_NULL_HANDLE;
+    if (d->queue_count) queue = d->queues[0].queue;
+    else if (d->GetDeviceQueue) d->GetDeviceQueue(d->device, 0, 0, &queue);
+    if (index) *index = v->acquire++ % v->count;
+    if (!queue || (!semaphore && !fence)) return VK_SUCCESS;
+    VkSubmitInfo signal = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .signalSemaphoreCount = semaphore ? 1u : 0u, .pSignalSemaphores = &semaphore };
+    return d->QueueSubmit(queue, 1, &signal, fence);
+}
+
+static VkResult MS_ABI map_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore,
+                                               VkFence fence, uint32_t *index)
+{
+    pthread_mutex_lock(&g_lock);
+    Swap *v = swap_find(swapchain);
+    pthread_mutex_unlock(&g_lock);
+    if (v && v->virt) return virtual_acquire(v, semaphore, fence, index);
+    PFN_vkAcquireNextImageKHR host = (PFN_vkAcquireNextImageKHR)beer_vkbridge_host_device_proc(device, "vkAcquireNextImageKHR");
+    return host ? host(device, swapchain, timeout, semaphore, fence, index) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VkResult MS_ABI map_AcquireNextImage2KHR(VkDevice device, const VkAcquireNextImageInfoKHR *info, uint32_t *index)
+{
+    pthread_mutex_lock(&g_lock);
+    Swap *v = info ? swap_find(info->swapchain) : NULL;
+    pthread_mutex_unlock(&g_lock);
+    if (v && v->virt) return virtual_acquire(v, info->semaphore, info->fence, index);
+    PFN_vkAcquireNextImage2KHR host = (PFN_vkAcquireNextImage2KHR)beer_vkbridge_host_device_proc(device, "vkAcquireNextImage2KHR");
+    return host ? host(device, info, index) : VK_ERROR_INITIALIZATION_FAILED;
 }
 
 void *beer_vkmap_override(const char *name)
@@ -649,6 +762,9 @@ void *beer_vkmap_override(const char *name)
         { "vkDestroySwapchainKHR", map_DestroySwapchainKHR },
         { "vkDestroyDevice", map_DestroyDevice },
         { "vkQueuePresentKHR", map_QueuePresentKHR },
+        { "vkGetSwapchainImagesKHR", map_GetSwapchainImagesKHR },
+        { "vkAcquireNextImageKHR", map_AcquireNextImageKHR },
+        { "vkAcquireNextImage2KHR", map_AcquireNextImage2KHR },
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(*table); ++i)
         if (!strcmp(table[i].name, name)) return table[i].fn;
