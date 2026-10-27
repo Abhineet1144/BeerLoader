@@ -69,8 +69,6 @@ static u64 __attribute__((ms_abi)) stub_GetThreadId(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Module32First(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Module32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DebugBreak(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Thread32First(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Thread32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayCreate(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayRedim(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayGetUBound(void){ return 0; }
@@ -175,10 +173,6 @@ static u64 __attribute__((ms_abi)) stub_SetSysColors(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DrawFocusRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FillRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FrameRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_InflateRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_IntersectRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_OffsetRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetParent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetParent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumWindows(void){ return 0; }

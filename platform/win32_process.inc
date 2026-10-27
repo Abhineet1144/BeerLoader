@@ -68,7 +68,8 @@ static BeerProc g_procs[BEER_MAX_PROCS];
 static pthread_mutex_t g_proc_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct { u32 pid, ppid; char name[260]; } BeerProcEntry;
-typedef struct { int used, count, next; BeerProcEntry entries[BEER_SNAP_MAX_ENTRIES]; } BeerSnapshot;
+#define BEER_SNAP_MAX_THREADS 512
+typedef struct { int used, count, next; BeerProcEntry entries[BEER_SNAP_MAX_ENTRIES]; u32 tids[BEER_SNAP_MAX_THREADS]; int tcount, tnext; } BeerSnapshot;
 static BeerSnapshot g_snaps[BEER_MAX_SNAPS];
 
 static BeerProc *beer_proc_from_handle(u64 h)
@@ -349,6 +350,13 @@ static u64 __attribute__((ms_abi)) beer_CreateToolhelp32Snapshot(u32 flags, u32 
             }
             if (dir) closedir(dir);
         }
+        if (flags & 0x4u) {                      /* TH32CS_SNAPTHREAD: the threads of this process */
+            DIR *dir = (!pid || pid == (u32)getpid()) ? opendir("/proc/self/task") : NULL;
+            struct dirent *entry;
+            while (dir && (entry = readdir(dir)) != NULL && s->tcount < BEER_SNAP_MAX_THREADS)
+                if (atoi(entry->d_name) > 0) s->tids[s->tcount++] = (u32)atoi(entry->d_name);
+            if (dir) closedir(dir);
+        }
         g_last_error = 0;
         return (u64)(BEER_SNAP_HANDLE_BASE + id);
     }
@@ -382,6 +390,24 @@ static u64 __attribute__((ms_abi)) beer_Process32First(u64 s, u8 *e)  { return b
 static u64 __attribute__((ms_abi)) beer_Process32Next(u64 s, u8 *e)   { return beer_process32_fill(s, e, 0, 0); }
 static u64 __attribute__((ms_abi)) beer_Process32FirstW(u64 s, u8 *e) { return beer_process32_fill(s, e, 1, 1); }
 static u64 __attribute__((ms_abi)) beer_Process32NextW(u64 s, u8 *e)  { return beer_process32_fill(s, e, 1, 0); }
+
+/* THREADENTRY32: dwSize, cntUsage, th32ThreadID, th32OwnerProcessID, tpBasePri, tpDeltaPri, dwFlags (28 bytes). */
+static u64 beer_thread32_fill(u64 snapshot, u8 *out, int first)
+{
+    BeerSnapshot *s = beer_snap_from_handle(snapshot);
+    if (!s || !out) { g_last_error = s ? 87 : 6; return 0; }
+    if (*(u32 *)out < 28) { g_last_error = 24; return 0; }
+    if (first) s->tnext = 0;
+    if (s->tnext >= s->tcount) { g_last_error = 18; return 0; }   /* ERROR_NO_MORE_FILES */
+    memset(out + 4, 0, 24);
+    *(u32 *)(out + 8) = s->tids[s->tnext++];
+    *(u32 *)(out + 12) = (u32)getpid();
+    *(s32 *)(out + 16) = 8;
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) beer_Thread32First(u64 s, u8 *e) { return beer_thread32_fill(s, e, 1); }
+static u64 __attribute__((ms_abi)) beer_Thread32Next(u64 s, u8 *e)  { return beer_thread32_fill(s, e, 0); }
 
 /* ---- Named pipes (unix stream sockets) ---- */
 typedef struct { int used, fd, refs; char name[128]; char path[320]; } BeerPipeListener;

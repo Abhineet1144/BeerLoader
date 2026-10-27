@@ -66,7 +66,7 @@ static u64 __attribute__((ms_abi)) impl_QueryDisplayConfig(u32 flags, u32 *path_
 
     memset(paths, 0, 72);                                                  /* DISPLAYCONFIG_PATH_INFO */
     memcpy(paths + 0, &luid, 8);                                           /* sourceInfo.adapterId */
-    *(u32 *)(paths + 12) = 0x0000FFFFu;                                    /* cloneGroupId invalid, sourceModeInfoIdx 0 */
+    *(u32 *)(paths + 12) = 0;                                              /* modeInfoIdx: plain index of the source mode (no virtual-mode packing) */
     *(u32 *)(paths + 16) = 1;                                              /* SOURCE_IN_USE */
     memcpy(paths + 20, &luid, 8);                                          /* targetInfo.adapterId */
     *(u32 *)(paths + 32) = 1;                                              /* modeInfoIdx */

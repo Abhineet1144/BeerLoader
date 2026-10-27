@@ -1394,7 +1394,7 @@ beer_trace_log(u64 idx, u64 a, u64 b, u64 c, u64 d)
     if (pass) {
         t_trace_logged = 1;
         const char *name = idx < MAX_STUBS && g_snames[idx] ? g_snames[idx] : "?";
-        fprintf(stderr, "[API %u] %s(%lx, %lx, %lx, %lx)", k, name, a, b, c, d);
+        fprintf(stderr, "[API %u t%ld] %s(%lx, %lx, %lx, %lx)", k, (long)syscall(SYS_gettid), name, a, b, c, d);
         int win_args = strstr(name, "CreateWindowEx") != NULL ||
                        strstr(name, "DrawText") || strstr(name, "TextOut") ||
                        strstr(name, "SetWindowText") || strstr(name, "MessageBox") ||
@@ -5590,6 +5590,65 @@ impl_CreateDXGIFactory2(u32 flags, u64 riid, u64 **ppFactory)
 static __thread s32 g_wsa_last_error;
 static __thread u32 g_wsa_startup_count;
 
+/* ---- getaddrinfo family.  Beer runs offline by default, so only addresses that need no resolver are answered:
+ * a NULL node (wildcard, or loopback with AI_PASSIVE clear), "localhost" and dotted IPv4; any other name fails with
+ * WSAHOST_NOT_FOUND (a zero-returning stub reported success without writing *result and the game then followed
+ * the garbage pointer).  ADDRINFOA/W (x64): flags, family, socktype, protocol (int), addrlen (size_t), canonname,
+ * addr, next -- note canonname comes before addr, unlike glibc. ---- */
+typedef struct { s32 flags, family, socktype, protocol; u64 addrlen; u64 canonname; u64 addr; u64 next; } WinAddrInfo;
+
+static int win_getaddrinfo_common(const char *node, const char *service, const WinAddrInfo *hints, u64 *result)
+{
+    if (!result) return 10014;                                 /* WSAEFAULT */
+    *result = 0;
+    u32 ip = 0;
+    const int passive = hints && (hints->flags & 1);
+    if (!node || !*node) ip = passive ? 0 : htonl(INADDR_LOOPBACK);
+    else if (!strcasecmp(node, "localhost")) ip = htonl(INADDR_LOOPBACK);
+    else {
+        struct in_addr parsed;
+        if (inet_pton(AF_INET, node, &parsed) != 1) return 11001;   /* WSAHOST_NOT_FOUND */
+        ip = parsed.s_addr;
+    }
+    u16 port = service ? htons((u16)atoi(service)) : 0;
+    const int socktype = hints && hints->socktype ? hints->socktype : 1;
+    WinAddrInfo *info = calloc(1, sizeof(*info));
+    struct sockaddr_in *sa = calloc(1, sizeof(*sa));
+    if (!info || !sa) { free(info); free(sa); return 8; }           /* WSA_NOT_ENOUGH_MEMORY */
+    sa->sin_family = AF_INET;
+    sa->sin_port = port;
+    sa->sin_addr.s_addr = ip;
+    info->family = AF_INET;
+    info->socktype = socktype;
+    info->protocol = socktype == 2 ? 17 : 6;
+    info->addrlen = sizeof(*sa);
+    info->addr = (u64)(uintptr_t)sa;
+    *result = (u64)(uintptr_t)info;
+    return 0;
+}
+static u64 __attribute__((ms_abi))
+impl_getaddrinfo(const char *node, const char *service, const WinAddrInfo *hints, u64 *result)
+    { return (u64)win_getaddrinfo_common(node, service, hints, result); }
+static u64 __attribute__((ms_abi))
+impl_GetAddrInfoW(const u16 *node, const u16 *service, const WinAddrInfo *hints, u64 *result)
+{
+    char n[256] = "", sv[32] = "";
+    for (size_t i = 0; node && node[i] && i + 1 < sizeof(n); ++i) n[i] = (char)node[i];
+    for (size_t i = 0; service && service[i] && i + 1 < sizeof(sv); ++i) sv[i] = (char)service[i];
+    return (u64)win_getaddrinfo_common(node ? n : NULL, service ? sv : NULL, hints, result);
+}
+static u64 __attribute__((ms_abi)) impl_freeaddrinfo(u64 list)
+{
+    while (list) {
+        WinAddrInfo *info = (WinAddrInfo *)(uintptr_t)list;
+        list = info->next;
+        free((void *)(uintptr_t)info->addr);
+        free((void *)(uintptr_t)info->canonname);
+        free(info);
+    }
+    return 0;
+}
+
 static u64 __attribute__((ms_abi))
 impl_WSAStartup(u32 version, u8 *wsadata)
 {
@@ -5849,7 +5908,12 @@ impl_NtUnmapViewOfSection(u64 process_handle, void *base_address)
 /* ---- NtQuerySystemInformation ---- */
 static u64 __attribute__((ms_abi))
 impl_NtQuerySystemInformation(u32 cls, void *buf, u32 sz, u32 *retsz) {
-    (void)cls; if(buf) memset(buf,0,sz); if(retsz) *retsz=sz; return 0;
+    if (buf) memset(buf, 0, sz);
+    /* SystemKernelDebuggerInformation: { KernelDebuggerEnabled, KernelDebuggerNotPresent }.  Zero would claim a
+     * kernel debugger is attached, which copy-protection code reacts to. */
+    if (cls == 0x23 && buf && sz >= 2) ((u8 *)buf)[1] = 1;
+    if (retsz) *retsz = sz;
+    return 0;
 }
 
 /* ---- Time ---- */
@@ -6059,6 +6123,12 @@ static const char *beer_csidl_path(s32 csidl)
         return g_program_data;
     case 0x24: /* CSIDL_WINDOWS */
         return g_windows_dir;
+    case 0x26: /* CSIDL_PROGRAM_FILES */
+    case 0x2b: /* CSIDL_PROGRAM_FILES_COMMON */
+        return "C:\\Program Files";
+    case 0x2a: /* CSIDL_PROGRAM_FILESX86 */
+    case 0x2c: /* CSIDL_PROGRAM_FILES_COMMONX86 */
+        return "C:\\Program Files (x86)";
     default:
         return beer_roaming_appdata_path();
     }
@@ -6094,6 +6164,23 @@ impl_SHGetFolderPathA(u64 hwnd, s32 csidl, u64 tok, u32 flags, char *buf)
     strcpy(buf, path);
     fprintf(stderr, "[SHELL] SHGetFolderPathA(csidl=0x%x) -> %s\n", csidl, path);
     return 0;
+}
+
+/* SHGetSpecialFolderPath: the older BOOL-returning spelling of SHGetFolderPath. */
+static u64 __attribute__((ms_abi))
+impl_SHGetSpecialFolderPathW(u64 hwnd, u16 *buf, s32 csidl, u32 create)
+{
+    (void)hwnd; (void)create;
+    return copy_ascii_to_wide_path(buf, 260, beer_csidl_path(csidl)) ? 1 : 0;
+}
+static u64 __attribute__((ms_abi))
+impl_SHGetSpecialFolderPathA(u64 hwnd, char *buf, s32 csidl, u32 create)
+{
+    (void)hwnd; (void)create;
+    const char *path = beer_csidl_path(csidl);
+    if (!buf || strlen(path) >= 260) return 0;
+    strcpy(buf, path);
+    return 1;
 }
 
 static u64 __attribute__((ms_abi))
@@ -10697,6 +10784,47 @@ impl_AdjustWindowRect(WIN_RECT *rect, u32 style, u32 menu) {
 static u64 __attribute__((ms_abi))
 impl_AdjustWindowRectEx(WIN_RECT *rect, u32 style, u32 menu, u32 exstyle)
     { (void)exstyle; return impl_AdjustWindowRect(rect,style,menu); }
+/* ---- RECT helpers (user32).  RECT = { left, top, right, bottom } of 32-bit ints; POINT is passed packed in a u64. ---- */
+static u64 __attribute__((ms_abi)) impl_SetRect(s32 *r, s32 l, s32 t, s32 rt, s32 b)
+{ if (!r) return 0; r[0] = l; r[1] = t; r[2] = rt; r[3] = b; return 1; }
+static u64 __attribute__((ms_abi)) impl_SetRectEmpty(s32 *r)
+{ if (!r) return 0; r[0] = r[1] = r[2] = r[3] = 0; return 1; }
+static u64 __attribute__((ms_abi)) impl_CopyRect(s32 *dst, const s32 *src)
+{ if (!dst || !src) return 0; memcpy(dst, src, 16); return 1; }
+static u64 __attribute__((ms_abi)) impl_OffsetRect(s32 *r, s32 dx, s32 dy)
+{ if (!r) return 0; r[0] += dx; r[2] += dx; r[1] += dy; r[3] += dy; return 1; }
+static u64 __attribute__((ms_abi)) impl_InflateRect(s32 *r, s32 dx, s32 dy)
+{ if (!r) return 0; r[0] -= dx; r[2] += dx; r[1] -= dy; r[3] += dy; return 1; }
+static u64 __attribute__((ms_abi)) impl_IsRectEmpty(const s32 *r)
+{ return !r || r[0] >= r[2] || r[1] >= r[3]; }
+static u64 __attribute__((ms_abi)) impl_EqualRect(const s32 *a, const s32 *b)
+{ return a && b && !memcmp(a, b, 16); }
+static u64 __attribute__((ms_abi)) impl_PtInRect(const s32 *r, u64 point)
+{
+    const s32 x = (s32)(u32)point, y = (s32)(u32)(point >> 32);
+    return r && x >= r[0] && x < r[2] && y >= r[1] && y < r[3];
+}
+static u64 __attribute__((ms_abi)) impl_IntersectRect(s32 *out, const s32 *a, const s32 *b)
+{
+    if (!out || !a || !b) return 0;
+    s32 l = a[0] > b[0] ? a[0] : b[0], t = a[1] > b[1] ? a[1] : b[1];
+    s32 r = a[2] < b[2] ? a[2] : b[2], bt = a[3] < b[3] ? a[3] : b[3];
+    if (l >= r || t >= bt) { out[0] = out[1] = out[2] = out[3] = 0; return 0; }
+    out[0] = l; out[1] = t; out[2] = r; out[3] = bt;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_UnionRect(s32 *out, const s32 *a, const s32 *b)
+{
+    if (!out || !a || !b) return 0;
+    const int ea = a[0] >= a[2] || a[1] >= a[3], eb = b[0] >= b[2] || b[1] >= b[3];
+    if (ea && eb) { out[0] = out[1] = out[2] = out[3] = 0; return 0; }
+    if (ea) { memcpy(out, b, 16); return 1; }
+    if (eb) { memcpy(out, a, 16); return 1; }
+    out[0] = a[0] < b[0] ? a[0] : b[0]; out[1] = a[1] < b[1] ? a[1] : b[1];
+    out[2] = a[2] > b[2] ? a[2] : b[2]; out[3] = a[3] > b[3] ? a[3] : b[3];
+    return 1;
+}
+
 /* Per-monitor DPI APIs (Windows 10): the desktop runs at 96 dpi, so scaling is the identity. */
 static u64 __attribute__((ms_abi))
 impl_AdjustWindowRectExForDpi(WIN_RECT *rect, u32 style, u32 menu, u32 exstyle, u32 dpi)
@@ -13215,12 +13343,13 @@ impl_EnumDisplayMonitors(u64 hdc, void *clip, MonitorEnumProc proc, u64 data)
 }
 
 /* EnumDisplaySettingsW — reports a single fullscreen mode matching the screen */
-static u64 __attribute__((ms_abi))
-impl_EnumDisplaySettingsW(const u16 *device, u32 mode_num, u8 *devmode)
+/* DEVMODEA and DEVMODEW differ in the width of dmDeviceName/dmFormName, which shifts every later field:
+ *   A: dmSize@36 dmFields@40 dmPosition@44 dmBitsPerPel@104 dmPelsWidth@108 dmPelsHeight@112 dmDisplayFrequency@120 (156 bytes)
+ *   W: dmSize@68 dmFields@72 dmPosition@76 dmBitsPerPel@168 dmPelsWidth@172 dmPelsHeight@176 dmDisplayFrequency@184 (220 bytes)
+ * Mode numbers walk the same list DXGI exposes; ENUM_CURRENT_SETTINGS (-1) and ENUM_REGISTRY_SETTINGS (-2) report the
+ * desktop mode. */
+static u64 enum_display_settings(u32 mode_num, u8 *devmode, int wide)
 {
-    (void)device;
-    /* Mode numbers walk the same list DXGI exposes; ENUM_CURRENT_SETTINGS
-     * (-1) and ENUM_REGISTRY_SETTINGS (-2) report the desktop mode. */
     DxgiHostMode modes[64];
     const u32 mode_total = dxgi_host_modes(modes, 64);
     int sw = 1920, sh = 1080;
@@ -13236,22 +13365,33 @@ impl_EnumDisplaySettingsW(const u16 *device, u32 mode_num, u8 *devmode)
         return 0;
     }
     if (!devmode) return 0;
-    /* DEVMODEW is 220 bytes on Win64.  Zero it, fill key fields. */
-    memset(devmode, 0, 220);
-    /* dmSize at offset 36 (after dmDeviceName[32] + dmSpecVersion[2] +
-     * dmDriverVersion[2]); dmDriverExtra at offset 38 */
-    *(u16*)(devmode + 36) = 220; /* dmSize */
-    *(u16*)(devmode + 38) = 0;   /* dmDriverExtra */
-    /* dmFields at offset 40 */
-    *(u32*)(devmode + 40) = (1<<18)|(1<<19)|(1<<20)|(1<<22); /* DM_BITSPERPEL|PELSWIDTH|PELSHEIGHT|DISPLAYFREQUENCY */
-    /* dmBitsPerPel at offset 104, dmPelsWidth at 108, dmPelsHeight at 112,
-     * dmDisplayFrequency at 120 */
-    *(u32*)(devmode + 104) = 32;
-    *(u32*)(devmode + 108) = (u32)sw;
-    *(u32*)(devmode + 112) = (u32)sh;
-    *(u32*)(devmode + 120) = hz;
+    const char *device_name = "\\\\.\\DISPLAY1";
+    const u32 fields = (1u << 5) | (1u << 18) | (1u << 19) | (1u << 20) | (1u << 22);   /* POSITION|BITSPERPEL|PELSWIDTH|PELSHEIGHT|DISPLAYFREQUENCY */
+    if (wide) {
+        memset(devmode, 0, 220);
+        u16 *name = (u16 *)devmode;
+        for (int i = 0; device_name[i] && i < 31; ++i) name[i] = (u8)device_name[i];
+        *(u16 *)(devmode + 68) = 220;                 /* dmSize */
+        *(u32 *)(devmode + 72) = fields;
+        *(u32 *)(devmode + 168) = 32;
+        *(u32 *)(devmode + 172) = (u32)sw;
+        *(u32 *)(devmode + 176) = (u32)sh;
+        *(u32 *)(devmode + 184) = hz;
+    } else {
+        memset(devmode, 0, 156);
+        for (int i = 0; device_name[i] && i < 31; ++i) devmode[i] = (u8)device_name[i];
+        *(u16 *)(devmode + 36) = 156;                 /* dmSize */
+        *(u32 *)(devmode + 40) = fields;
+        *(u32 *)(devmode + 104) = 32;
+        *(u32 *)(devmode + 108) = (u32)sw;
+        *(u32 *)(devmode + 112) = (u32)sh;
+        *(u32 *)(devmode + 120) = hz;
+    }
     return 1;
 }
+static u64 __attribute__((ms_abi))
+impl_EnumDisplaySettingsW(const u16 *device, u32 mode_num, u8 *devmode)
+    { (void)device; return enum_display_settings(mode_num, devmode, 1); }
 /* DISPLAY_DEVICEW: one adapter (\\.\DISPLAY1, the host GPU) with one monitor. */
 static void display_device_text(u16 *dest, size_t capacity, const char *text)
 {
@@ -13320,7 +13460,7 @@ impl_EnumDisplayDevicesA(const char *device, u32 index, u8 *info, u32 flags)
 
 static u64 __attribute__((ms_abi))
 impl_EnumDisplaySettingsA(u64 device, u32 mode_num, u8 *devmode)
-    { return impl_EnumDisplaySettingsW((const u16*)(uintptr_t)device, mode_num, devmode); }
+    { (void)device; return enum_display_settings(mode_num, devmode, 0); }
 
 static u64 __attribute__((ms_abi))
 impl_SetWindowsHookExW(s32 type, u64 fn, u64 mod, u32 tid)
@@ -16996,6 +17136,38 @@ impl_RegGetValueW(u64 key, const u16 *subkey, const u16 *value, u32 flags, u32 *
 }
 typedef struct { const char *name; ImplFn fn; } ImplEntry;
 
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004u
+#define STATUS_INVALID_INFO_CLASS 0xC0000003u
+#define STATUS_PORT_NOT_SET 0xC0000353u
+static u64 __attribute__((ms_abi)) impl_NtQueryInformationProcess(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned);
+static u64 __attribute__((ms_abi)) impl_NtQueryVirtualMemory(u64 process, void *base, u32 info_class, void *buffer, u64 length, u64 *returned);
+static u64 __attribute__((ms_abi)) impl_GetThreadGroupAffinity(u64 thread, u64 *affinity)
+{
+    (void)thread;
+    if (!affinity) return 0;
+    memset(affinity, 0, 16);                       /* GROUP_AFFINITY { KAFFINITY Mask; WORD Group; WORD Reserved[3]; } */
+    affinity[0] = win_processor_mask();
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_SetThreadGroupAffinity(u64 thread, const u64 *affinity, u64 *previous)
+{
+    (void)thread; (void)affinity;
+    if (previous) { memset(previous, 0, 16); previous[0] = win_processor_mask(); }
+    return 1;
+}
+/* NtOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID): the process itself yields the pseudo handle. */
+static u64 __attribute__((ms_abi)) impl_NtOpenProcess(u64 *handle, u32 access, void *attributes, const u64 *client_id)
+{
+    (void)access; (void)attributes;
+    if (!handle || !client_id) return 0xC000000Du;                   /* STATUS_INVALID_PARAMETER */
+    const u32 pid = (u32)client_id[0];
+    if (pid != (u32)getpid()) return 0xC0000022u;                    /* STATUS_ACCESS_DENIED */
+    *handle = (u64)-1;
+    return 0;
+}
+static u64 __attribute__((ms_abi)) impl_ReturnTrue(void) { return 1; }                        /* SetDefaultDllDirectories, SetThreadStackGuarantee */
+static u64 __attribute__((ms_abi)) impl_GetNativeSystemInfo(WIN_SYSTEM_INFO *info) { return impl_GetSystemInfo(info); }
+
 static ImplEntry g_impls[] = {
 #include "platform/win32_missing_exports_table.inc"
     /* UCRT/VCRUNTIME primitives */
@@ -17222,6 +17394,10 @@ static ImplEntry g_impls[] = {
     {"CreateDXGIFactory2",                    (ImplFn)impl_CreateDXGIFactory2},
     /* WS2_32 */
     {"WSAStartup",                            (ImplFn)impl_WSAStartup},
+    {"getaddrinfo",                           (ImplFn)impl_getaddrinfo},
+    {"GetAddrInfoW",                          (ImplFn)impl_GetAddrInfoW},
+    {"freeaddrinfo",                          (ImplFn)impl_freeaddrinfo},
+    {"FreeAddrInfoW",                         (ImplFn)impl_freeaddrinfo},
     {"WSACleanup",                            (ImplFn)impl_WSACleanup},
     {"WSAGetLastError",                       (ImplFn)impl_WSAGetLastError},
     {"WSASetLastError",                       (ImplFn)impl_WSASetLastError},
@@ -17279,6 +17455,8 @@ static ImplEntry g_impls[] = {
     {"CreateProcessW",                        (ImplFn)beer_CreateProcessW},
     {"GetProcessId",                          (ImplFn)beer_GetProcessId},
     {"CreateToolhelp32Snapshot",              (ImplFn)beer_CreateToolhelp32Snapshot},
+    {"Thread32First",                         (ImplFn)beer_Thread32First},
+    {"Thread32Next",                          (ImplFn)beer_Thread32Next},
     {"Process32First",                        (ImplFn)beer_Process32First},
     {"Process32Next",                         (ImplFn)beer_Process32Next},
     {"Process32FirstW",                       (ImplFn)beer_Process32FirstW},
@@ -17311,6 +17489,8 @@ static ImplEntry g_impls[] = {
     /* Shell */
     {"SHGetFolderPathW",                      (ImplFn)impl_SHGetFolderPathW},
     {"SHGetFolderPathA",                      (ImplFn)impl_SHGetFolderPathA},
+    {"SHGetSpecialFolderPathW",               (ImplFn)impl_SHGetSpecialFolderPathW},
+    {"SHGetSpecialFolderPathA",               (ImplFn)impl_SHGetSpecialFolderPathA},
     {"SHGetKnownFolderPath",                  (ImplFn)impl_SHGetKnownFolderPath},
     {"CoTaskMemFree",                         (ImplFn)impl_CoTaskMemFree},
     /* COM */
@@ -17410,6 +17590,17 @@ static ImplEntry g_impls[] = {
     {"TerminateProcess",                      (ImplFn)impl_TerminateProcess},
     {"FatalAppExitW",                          (ImplFn)impl_FatalAppExitW},
     {"GetSystemInfo",                         (ImplFn)impl_GetSystemInfo},
+    {"GetNativeSystemInfo",                   (ImplFn)impl_GetNativeSystemInfo},
+    {"GetThreadGroupAffinity",                (ImplFn)impl_GetThreadGroupAffinity},
+    {"SetThreadGroupAffinity",                (ImplFn)impl_SetThreadGroupAffinity},
+    {"NtOpenProcess",                         (ImplFn)impl_NtOpenProcess},
+    {"ZwOpenProcess",                         (ImplFn)impl_NtOpenProcess},
+    {"SetDefaultDllDirectories",              (ImplFn)impl_ReturnTrue},
+    {"SetThreadStackGuarantee",               (ImplFn)impl_ReturnTrue},
+    {"NtQueryInformationProcess",             (ImplFn)impl_NtQueryInformationProcess},
+    {"NtQueryVirtualMemory",                  (ImplFn)impl_NtQueryVirtualMemory},
+    {"ZwQueryVirtualMemory",                  (ImplFn)impl_NtQueryVirtualMemory},
+    {"ZwQueryInformationProcess",             (ImplFn)impl_NtQueryInformationProcess},
     {"GetVersion",                            (ImplFn)impl_GetVersion},
     {"GetCommandLineA",                       (ImplFn)impl_GetCommandLineA},
     {"GetCommandLineW",                       (ImplFn)impl_GetCommandLineW},
@@ -17603,6 +17794,16 @@ static ImplEntry g_impls[] = {
     {"AdjustWindowRect",                      (ImplFn)impl_AdjustWindowRect},
     {"AdjustWindowRectEx",                    (ImplFn)impl_AdjustWindowRectEx},
     {"AdjustWindowRectExForDpi",              (ImplFn)impl_AdjustWindowRectExForDpi},
+    {"SetRect",                               (ImplFn)impl_SetRect},
+    {"SetRectEmpty",                          (ImplFn)impl_SetRectEmpty},
+    {"CopyRect",                              (ImplFn)impl_CopyRect},
+    {"OffsetRect",                            (ImplFn)impl_OffsetRect},
+    {"InflateRect",                           (ImplFn)impl_InflateRect},
+    {"IsRectEmpty",                           (ImplFn)impl_IsRectEmpty},
+    {"EqualRect",                             (ImplFn)impl_EqualRect},
+    {"PtInRect",                              (ImplFn)impl_PtInRect},
+    {"IntersectRect",                         (ImplFn)impl_IntersectRect},
+    {"UnionRect",                             (ImplFn)impl_UnionRect},
     {"GetDpiForSystem",                       (ImplFn)impl_GetDpiForSystem},
     {"GetDpiForWindow",                       (ImplFn)impl_GetDpiForWindow},
     {"EnableNonClientDpiScaling",             (ImplFn)impl_DpiSuccess},
@@ -19014,6 +19215,57 @@ _Static_assert(offsetof(WinProcessParameters, CommandLine) == 0x70,
  * Worker TEBs previously left this field zero, causing guest runtime code on
  * those threads to observe an invalid process environment. */
 static WinPEB *g_process_peb;
+
+/* NtQueryVirtualMemory for the current process: MemoryBasicInformation (class 0) is VirtualQuery; the other classes
+ * (mapped file names, working set) report that no information exists. */
+static u64 __attribute__((ms_abi))
+impl_NtQueryVirtualMemory(u64 process, void *base, u32 info_class, void *buffer, u64 length, u64 *returned)
+{
+    (void)process;
+    if (info_class != 0) return STATUS_INVALID_INFO_CLASS;
+    if (length < sizeof(BeerMemoryBasicInformation)) return STATUS_INFO_LENGTH_MISMATCH;
+    const u64 got = impl_VirtualQuery(base, buffer, length);
+    if (!got) return 0xC000000Du;                  /* STATUS_INVALID_PARAMETER (address outside user space) */
+    if (returned) *returned = got;
+    return 0;
+}
+
+/* NtQueryInformationProcess for the current process.  Protection code probes the debug classes (a real process has
+ * no debug port or object, debug flags are "inherit"); an unimplemented export that fails or leaves the buffer
+ * uninitialised reads as "being debugged / hooked". */
+static u64 __attribute__((ms_abi))
+impl_NtQueryInformationProcess(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned)
+{
+    (void)process;
+    u32 needed = 0;
+    switch (info_class) {
+    case 0:  needed = 48; break;                 /* ProcessBasicInformation */
+    case 7:  needed = 8;  break;                 /* ProcessDebugPort */
+    case 26: needed = 8;  break;                 /* ProcessWow64Information */
+    case 30: needed = 8;  break;                 /* ProcessDebugObjectHandle */
+    case 31: needed = 4;  break;                 /* ProcessDebugFlags */
+    default: return STATUS_INVALID_INFO_CLASS;
+    }
+    if (returned) *returned = needed;
+    if (length < needed || !buffer) return STATUS_INFO_LENGTH_MISMATCH;
+    memset(buffer, 0, needed);
+    switch (info_class) {
+    case 0: {
+        u64 *pbi = buffer;
+        pbi[0] = 259;                             /* ExitStatus: STILL_ACTIVE */
+        pbi[1] = (u64)(uintptr_t)g_process_peb;
+        pbi[2] = win_processor_mask();            /* AffinityMask */
+        pbi[3] = 8;                               /* BasePriority */
+        pbi[4] = (u64)getpid();
+        pbi[5] = (u64)getppid();
+        break;
+    }
+    case 30: return STATUS_PORT_NOT_SET;
+    case 31: *(u32 *)buffer = 1; break;           /* NoDebugInherit clear => 1 */
+    default: break;
+    }
+    return 0;
+}
 
 /*
  * alloc_teb_for_thread — allocate a private WinTEB with its own TLS array
@@ -21038,8 +21290,8 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
      * code while the fallback RVAs keep changing, defeating cycle detection. */
     if (sig == SIGSEGV) {
         g_total_sigsegv_count++;
-        fprintf(stderr, "[CRASH] SIGSEGV #%u at RIP=0x%lx FA=0x%lx\n",
-                g_total_sigsegv_count, rip, faultaddr);
+        fprintf(stderr, "[CRASH] SIGSEGV #%u at RIP=0x%lx FA=0x%lx (thread %ld)\n",
+                g_total_sigsegv_count, rip, faultaddr, (long)syscall(SYS_gettid));
         if (g_total_sigsegv_count == 1 && getenv("BEER_CRASH_CODE") && g_img &&
             rip >= (u64)g_img && rip < (u64)g_img + 0x8000000) {
             /* Code around the first guest fault, as hex: feed to `xxd -r -p` + objdump -D -b binary -mi386:x86-64
