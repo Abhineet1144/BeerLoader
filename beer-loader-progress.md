@@ -1018,3 +1018,23 @@ Handy: `tests/vulkan_guest` still passes after all of this; `make` can fail with
   `WinVerifyTrust` (stub, returns 0) -> `WTHelperProvDataFromStateData(NULL)` (stub, NULL) -> `CryptQueryObject` (stub, fails).
   Next step: a real wintrust/crypt32 signer layer (state handle, `CRYPT_PROVIDER_DATA`/SGNR/CERT chain, cert store + `CertGetNameStringW`)
   built on libcrypto's PKCS7 parser over the PE security directory.
+
+### Session 5 addendum 3: the crack's inline hooks never fired (root cause of the Social Club dialog)
+
+- Reference run: `GE-Proton9-2` (`~/Desktop/GamesScripts/RDR2.sh`, which needs the full `Launcher.exe` path with `proton run`) reaches the RDR2
+  main menu in ~35 s **without any Social Club install and without any dialog**. So the dialog was never about a missing Social Club.
+- The Razor1911 module `1911.dll` (loaded by RDR2.exe) inline-hooks `LoadLibraryExA/W`, `GetFileAttributesW`, `CreateFileW/A` by patching
+  5 bytes at the address `GetProcAddress(kernel32, name)` returns (it also suspends the other threads via Thread32*/OpenThread first).
+  Beer gave every IAT slot its own thunk, so the address `GetProcAddress` returned (first thunk created for that name) was *not* the
+  one the game's import table uses (`0x40005f88` vs `0x40001680` for GetFileAttributesW): the hooks were installed but no game call went through them.
+  Fix: an import reuses the thunk an earlier import/GetProcAddress already created for the same function (`loader.c`, `guest_dll_resolve_imports`).
+- With hooks live the Social Club dialog is gone. Also done: `GetProcAddress` by ordinal (previously crashed in `guest_dll_export`),
+  `WinVerifyTrust` (missing file -> 2, existing -> 0, STATEACTION_CLOSE -> 0), `GetFileAttributes` error 3 for a missing parent directory.
+- Reading the game's own code (`mem_read` over the control socket + objdump): the Social Club init function builds
+  `<ProgramFiles>\Rockstar Games\Social Club\socialclub.dll`, `GetFileAttributesW`, then verifies the Authenticode signer
+  (`WinVerifyTrust` + `WTHelperProvDataFromStateData` + cert name compare); error code 1 = not found, 16 = signature mismatch.
+- Open: the game now stops at "ACTIVATION REQUIRED - Verifying game ownership failed and your offline activation data could not be loaded".
+  The game connects to `RDR2Launcher_Pipe` and sends `<u32 13>"SCSI:26285943"`; the Beer-side Launcher just logs it (no reply is written; Wine behaves the same
+  as far as the pipe goes). Next: compare what Wine does between the pipe write and the menu (hooked `CreateFileW` paths, `.1911\...\profile\Player`, `Software\Rockstar Games\InstallGUID`).
+- Tools added: `BEER_CALLER_DIAGNOSTICS=<substr>` dumps the guest call chain when `GetFileAttributes*` is called with a matching path;
+  `BEER_PIPE_DIAGNOSTICS=1`; failed `LoadLibrary*` calls are now logged.
