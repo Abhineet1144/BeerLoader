@@ -1038,3 +1038,29 @@ Handy: `tests/vulkan_guest` still passes after all of this; `make` can fail with
   as far as the pipe goes). Next: compare what Wine does between the pipe write and the menu (hooked `CreateFileW` paths, `.1911\...\profile\Player`, `Software\Rockstar Games\InstallGUID`).
 - Tools added: `BEER_CALLER_DIAGNOSTICS=<substr>` dumps the guest call chain when `GetFileAttributes*` is called with a matching path;
   `BEER_PIPE_DIAGNOSTICS=1`; failed `LoadLibrary*` calls are now logged.
+
+### Session 5 addendum 4: matching Proton, what is now known about "ACTIVATION REQUIRED"
+
+Reference behaviour (GE-Proton9-2, `~/Desktop/GamesScripts/RDR2.sh`, run with the full `Launcher.exe` path): menu in ~35 s, no dialog, no Social Club, no network traffic
+besides `getaddrinfo(<hostname>)` -> 127.0.1.1. Launcher.exe stays alive polling `\\.\pipe\RDR2Launcher_Pipe`; the game sends `<u32 13>"SCSI:26285943"` (identical under Beer and Proton;
+Launcher.exe only answers messages that start with `INIT:`, so no reply is expected).
+
+Verified identical between Proton and Beer: `cfg.dat` (byte-identical, regenerated on demand), the hook installation order (first hooked `GetFileAttributesW` for the Social Club path
+triggers 1911.dll's lazy patching of the game functions `0x142615114` signer check, `0x1426127cc`, `0x142616dc0`), the pipe handshake, the Social Club probes.
+
+Fixed this session (all generic): shared thunk per imported function (inline hooks now fire), `GetProcAddress` by ordinal, `WinVerifyTrust`, `GetFileAttributes` error 3,
+`GetFileVersionInfo*` error 2 for missing files, real name resolution in `getaddrinfo` (own hostname used to fail with WSAHOST_NOT_FOUND), `ShellExecute*`,
+WMI (`platform/win32_wmi.inc`: Win32_Processor/Win32_VideoController rows, every other class an empty set, `IClientSecurity` blanket) and the Windows Firewall COM chain
+(`HNetCfg.FwMgr` -> LocalPolicy -> CurrentProfile -> AuthorizedApplications -> Item) that used to fail with E_FAIL.
+
+Still different (leads, in order of suspicion):
+1. Proton's game process runs anti-debug/guard threads that call `NtQueryInformationProcess` classes 7, 0x1e, 0x1f, 0x1a, 0x0c, 0x00, 0x25, 0x2b, 0x03, 0x15 hundreds of times
+   and one worker that wakes the main thread through `RtlWaitOnAddress`/`NtAlertThreadByThreadId` right before it opens `\\.\PhysicalDrive0..9` and
+   `HKCU\Software\Rockstar Games\InstallGUID`. Under Beer only class 0x1e is ever queried (`BEER_NT_DIAGNOSTICS=1`), no PhysicalDrive access happens and `WaitOnAddress`/`WakeByAddress*` are
+   not implemented. That worker (hardware/ownership check) never runs or never reports back, which would explain "offline activation data could not be loaded".
+2. `GetFileInformationByHandleExW` / `SetFileInformationByHandleW` still resolve to NULL (Proton exports both).
+3. Beer `OpenThread` rejects the host thread ids that `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` hands out (1911.dll suspends threads while patching).
+4. Missing NtQueryInformationProcess classes 3/0x0c/0x15/0x25/0x2b return STATUS_INVALID_INFO_CLASS.
+
+New diagnostics: `BEER_CALLER_DIAGNOSTICS=<path substring>`, `BEER_PIPE_DIAGNOSTICS=1`, `BEER_NT_DIAGNOSTICS=1`, `BEER_SPIN_DIAGNOSTICS=1`, `BEER_HOOK_PROBE=1`, `BEER_PROCESS_DIAGNOSTICS=1`.
+Note: the Launcher process shows up as comm `exe` (not `loader`), `pkill -x loader` only kills the game.

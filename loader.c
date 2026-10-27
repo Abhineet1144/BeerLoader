@@ -7922,6 +7922,14 @@ static u64 __attribute__((ms_abi)) impl_OpenMutexA(u32 a, u32 b, const char *n)
 /* ---- Sleep / Timing ---- */
 static u64 __attribute__((ms_abi)) impl_Sleep_inner(u32 ms);
 static u64 __attribute__((ms_abi)) impl_Sleep(u32 ms) {
+    if (getenv("BEER_SPIN_DIAGNOSTICS")) {
+        /* A thread that keeps calling Sleep is usually spin-waiting on a flag another thread should set. */
+        static __thread u32 sleeps;
+        if (++sleeps == 300000) {
+            fprintf(stderr, "[SPIN] tid %ld has called Sleep(%u) %u times\n", (long)syscall(SYS_gettid), ms, sleeps);
+            dbg_dump_guest_callchain("SPIN");
+        }
+    }
     g_dbg_wait_kind = 1; g_dbg_wait_ms = ms;
     const u64 r = impl_Sleep_inner(ms);
     g_dbg_wait_kind = 0;
@@ -19500,8 +19508,19 @@ impl_NtQueryVirtualMemory(u64 process, void *base, u32 info_class, void *buffer,
 /* NtQueryInformationProcess for the current process.  Protection code probes the debug classes (a real process has
  * no debug port or object, debug flags are "inherit"); an unimplemented export that fails or leaves the buffer
  * uninitialised reads as "being debugged / hooked". */
+static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned);
 static u64 __attribute__((ms_abi))
 impl_NtQueryInformationProcess(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned)
+{
+    u64 status = beer_nt_query_information_process(process, info_class, buffer, length, returned);
+    if (getenv("BEER_NT_DIAGNOSTICS")) {
+        static _Atomic(u32) logged;
+        if (atomic_fetch_add(&logged, 1) < 400)
+            fprintf(stderr, "[NT] NtQueryInformationProcess(class=%u len=%u) t%ld -> 0x%x\n", info_class, length, (long)syscall(SYS_gettid), (u32)status);
+    }
+    return status;
+}
+static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned)
 {
     (void)process;
     u32 needed = 0;
