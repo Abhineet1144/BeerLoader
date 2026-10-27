@@ -21689,7 +21689,7 @@ int (*g_beer_lazy_fault_hook)(void *addr);   /* BD11's lazily populated deferred
 /* BEER_BP="0xaddr,0xaddr" (+ BEER_BP_DELAY seconds, default 30): one-shot guest breakpoints for reverse engineering. After the delay an int3 is
  * written at each address; the first hit restores the byte, logs the thread and the code-looking return addresses on
  * the stack, and resumes. Lets a running game be asked "does this function ever run, and who calls it?" without a debugger. */
-static struct { u64 address; u8 original; int armed; } g_breakpoints[16];
+static struct { u64 address; u8 original; int armed; int expect; } g_breakpoints[16];
 static int g_breakpoint_count;
 static int beer_breakpoint_hit(ucontext_t *uc)
 {
@@ -21720,14 +21720,27 @@ static void *beer_breakpoint_thread(void *unused)
     (void)unused;
     const char *delay = getenv("BEER_BP_DELAY");
     sleep(delay ? (unsigned)atoi(delay) : 30u);
-    for (int i = 0; i < g_breakpoint_count; ++i) {
-        u8 *at = (u8 *)(uintptr_t)g_breakpoints[i].address;
-        int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
-        if (fd < 0 || pread(fd, &g_breakpoints[i].original, 1, (off_t)g_breakpoints[i].address) != 1) { if (fd >= 0) close(fd); continue; }
-        u8 trap = 0xCC;
-        if (pwrite(fd, &trap, 1, (off_t)(uintptr_t)at) == 1) { g_breakpoints[i].armed = 1; fprintf(stderr, "[BP] armed 0x%llx\n", (unsigned long long)g_breakpoints[i].address); }
-        close(fd);
+    int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    /* "addr:XX" arms only once the first byte of the (possibly still encrypted) code is the expected one; retries for 3 minutes. */
+    for (int round = 0; round < 360; ++round) {
+        int pending = 0;
+        for (int i = 0; i < g_breakpoint_count; ++i) {
+            if (g_breakpoints[i].armed || g_breakpoints[i].original == 0xFF) continue;
+            u8 now;
+            if (pread(fd, &now, 1, (off_t)g_breakpoints[i].address) != 1) { ++pending; continue; }
+            if (g_breakpoints[i].expect >= 0 && now != (u8)g_breakpoints[i].expect) { ++pending; continue; }
+            g_breakpoints[i].original = now;
+            u8 trap = 0xCC;
+            if (pwrite(fd, &trap, 1, (off_t)g_breakpoints[i].address) == 1) {
+                g_breakpoints[i].armed = 1;
+                fprintf(stderr, "[BP] armed 0x%llx (was %02x)\n", (unsigned long long)g_breakpoints[i].address, now);
+            }
+        }
+        if (!pending) break;
+        usleep(500000);
     }
+    close(fd);
     return NULL;
 }
 static void beer_breakpoints_start(void)
@@ -21736,7 +21749,11 @@ static void beer_breakpoints_start(void)
     if (!list || !*list) return;
     char copy[512]; snprintf(copy, sizeof(copy), "%s", list);
     for (char *tok = strtok(copy, ","); tok && g_breakpoint_count < 16; tok = strtok(NULL, ","))
+    {
+        char *colon = strchr(tok, ':');
+        g_breakpoints[g_breakpoint_count].expect = colon ? (int)strtoul(colon + 1, NULL, 16) : -1;
         g_breakpoints[g_breakpoint_count++].address = strtoull(tok, NULL, 0);
+    }
     pthread_t thread;
     if (g_breakpoint_count && pthread_create(&thread, NULL, beer_breakpoint_thread, NULL) == 0) pthread_detach(thread);
 }

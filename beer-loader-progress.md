@@ -1087,3 +1087,12 @@ Static findings (1911.dll and the dumped game image):
 - `1911.dll` also needs `GetFileSecurityW`, `AccessCheck`, `DuplicateToken`, `MapGenericMask`, `CreatePipe`, `SetHandleInformation`, `CreateTimerQueueTimer`,
   `DeleteTimerQueueTimer` - none of them is implemented in Beer yet (they would be zero-returning stubs when reached).
 - The game's `Settings\*_<profileid>.bin` files are plain XML UI settings, not activation data; `cfg.dat` is identical in both prefixes.
+
+### Session 5 addendum 6: breakpoints with expected byte, SC manager flow
+
+- `BEER_BP` entries can carry the expected first byte (`0xaddr:48`); the breakpoint thread retries for 3 minutes and arms only when the (Arxan-decrypted) byte matches, so it survives lazy code decryption.
+- Game SC manager: `0x1427c8a5c` (init) -> `0x1427cd5c8` (find/load socialclub.dll) ; failures are recorded with `0x1427f7dc4(obj, code)` (codes 5, 0xb, 0x12, 0x13, 0x14, 0x10, 1).
+  In the current Beer flow `0x1427cd5da` is hit (caller `0x1427c8a7d`) but the error setter is never called, so the "ACTIVATION REQUIRED" screen does not come from the Social Club manager.
+- `activationDataThing` (RDR2.exe string at `0x143421700`) is just a field name in the save-game structure, not the ownership check.
+- Next step: find the code that shows the screen's text key (GXT key not present in process memory as text) by breakpointing UI/message-box creation entry points, or compare the thread
+  list of a Proton run (the guest worker that runs `whoami`/`hostname` and wakes the main thread through `NtAlertThreadByThreadId`) with `BEER_THREAD_DUMP_AT` output.
