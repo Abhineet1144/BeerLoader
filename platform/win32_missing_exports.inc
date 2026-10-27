@@ -16,7 +16,6 @@ static u64 __attribute__((ms_abi)) stub_LoadResource(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SizeofResource(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_LockResource(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FreeResource(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateFileMappingA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetEnvironmentVariableA(void){ return 1; }
 static u64 __attribute__((ms_abi)) stub_GlobalAddAtomA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_WritePrivateProfileStringA(void){ return 0; }
@@ -24,7 +23,6 @@ static u64 __attribute__((ms_abi)) stub_GetVolumeInformationA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetComputerNameA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetDateFormatA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumCalendarInfoA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateFileMappingW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetLogicalDriveStringsW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetTempFileNameW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_QueryDosDeviceW(void){ return 0; }
@@ -53,11 +51,8 @@ static u64 __attribute__((ms_abi)) stub_DeviceIoControl(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FindClose(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_MulDiv(s32 a, s32 b, s32 c){ if(!c) return (u64)(s64)-1; return (u64)(s64)(s32)(((int64_t)a*b + (c/2))/c); }
 static u64 __attribute__((ms_abi)) stub_FileTimeToDosDateTime(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_MapViewOfFile(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_UnmapViewOfFile(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VirtualLock(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VirtualUnlock(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_MapViewOfFileEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_IsBadReadPtr(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_IsBadWritePtr(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetThreadLocale(void){ return 0x409; }

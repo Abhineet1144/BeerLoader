@@ -1106,3 +1106,13 @@ Static findings (1911.dll and the dumped game image):
   So the divergence is earlier than anything these APIs affect.
 - `title.rgl` (RGLM header, 2000 bytes) and `index.bin` are not opened by the game under Proton either (traced 70 s); they are not part of this check.
 - Proton prefix registry has no Rockstar keys; nothing to copy from compatdata (cfg.dat, Player, ProfileSettings and the Settings XML files were all tried, see addenda 3 and 5).
+
+### Session 5 addendum 8: Win32 file mappings, Wine relay findings
+
+- `CreateFileMappingA/W`, `OpenFileMappingA/W`, `MapViewOfFile(Ex)`, `UnmapViewOfFile` are real now (they were silent zero stubs), built on the NT section module;
+  named page-file mappings live in `/dev/shm/beer-map-<name>` so separate Beer processes share them (`BEER_NT_SECTION_DIAGNOSTICS=1` logs them). RDR2/1911.dll do not use them in this phase.
+- Wine relay tracing (registry `HKCU\Software\Wine\Debug` "RelayInclude" works in GE-Proton9-2; "RelayFromInclude" does not) shows 1911.dll's
+  inline hooks in action under Proton: every game `CreateFileW` goes through the hook, which compares the name against "cfg.dat"; the game then creates
+  `DxDiagProvider` (dxdiagn.dll) and `WbemLocator` and reads `Software\Wine\VR`. With relay enabled the game terminates itself shortly after (`TerminateProcess(-1,0)`
+  from 0x140136b29), so relay cannot follow the activation phase.
+- Proton cannot run the game without a desktop session (no DISPLAY -> crash into winedbg within 20 s), so Proton comparisons need the user logged in.

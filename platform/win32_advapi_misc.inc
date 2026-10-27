@@ -113,3 +113,110 @@ static u64 __attribute__((ms_abi)) impl_DeleteTimerQueueTimer(u64 queue, u64 tim
     return 1;
 }
 static u64 __attribute__((ms_abi)) impl_DeleteTimerQueueEx(u64 queue, u64 completion) { (void)queue; (void)completion; return 1; }
+
+/* ---- Win32 file mappings on top of the NT section objects (platform/win32_nt_section.c) ----
+ * Named page-file mappings are what two processes use to share memory (a launcher and its game, a crack module and its
+ * host); they live in /dev/shm as "beer-map-<name>" so every Beer process that opens the same name sees the same bytes. */
+static int beer_mapping_shm(const char *name, s64 size, int create, int *existed)
+{
+    char path[300] = "/beer-map-";
+    size_t n = strlen(path);
+    for (size_t i = 0; name[i] && n + 1 < sizeof(path); ++i) path[n++] = (name[i] == '/' || name[i] == '\\') ? '_' : name[i];
+    path[n] = 0;
+    int fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (existed) *existed = 0;
+    if (fd < 0 && errno == EEXIST) { fd = shm_open(path, O_RDWR, 0600); if (existed) *existed = 1; }
+    else if (fd < 0 && !create) return -1;
+    if (fd < 0 && !create) return -1;
+    if (fd >= 0 && create && size > 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size < size && ftruncate(fd, size) != 0) { close(fd); return -1; }
+    }
+    return fd;
+}
+static u64 beer_create_file_mapping(u64 file, u32 protect, u32 size_high, u32 size_low, const char *name)
+{
+    s64 size = (s64)(((u64)size_high << 32) | size_low);
+    int fd = -1, owned = 0, existed = 0;
+    if (file && file != INVALID_HANDLE_VALUE64) {
+        fd = fh_get(file);
+        if (fd < 0) { g_last_error = 6; return 0; }
+    } else if (name && *name) {
+        if (size <= 0) { g_last_error = 87; return 0; }
+        fd = beer_mapping_shm(name, size, 1, &existed);
+        if (fd < 0) { g_last_error = 5; return 0; }
+        owned = 1;
+        if (existed) { struct stat st; if (fstat(fd, &st) == 0 && st.st_size > size) size = st.st_size; }
+    } else if (size <= 0) { g_last_error = 87; return 0; }
+    u64 handle = 0;
+    u32 status = beer_nt_section_create(&handle, fd, size, protect & 0xFF, 0x8000000u /* SEC_COMMIT */);
+    if (owned) close(fd);
+    if (getenv("BEER_NT_SECTION_DIAGNOSTICS"))
+        fprintf(stderr, "[MAPPING] CreateFileMapping name=%s file=0x%llx size=%lld protect=0x%x -> status=0x%x handle=0x%llx%s\n",
+                name ? name : "(none)", (unsigned long long)file, (long long)size, protect, status, (unsigned long long)handle,
+                existed ? " (existing)" : "");
+    if (status) { g_last_error = status == BEER_STATUS_MAPPED_FILE_SIZE_ZERO ? 1006u : 8u; return 0; }
+    g_last_error = existed ? 183u : 0u;                                    /* ERROR_ALREADY_EXISTS */
+    return handle;
+}
+static void beer_mapping_name(const u16 *wide, char *out, size_t size)
+{
+    size_t i = 0;
+    for (; wide && wide[i] && i + 1 < size; ++i) out[i] = (char)(wide[i] < 0x80 ? wide[i] : '_');
+    out[i] = 0;
+}
+static u64 __attribute__((ms_abi)) impl_CreateFileMappingA(u64 file, void *attributes, u32 protect, u32 size_high, u32 size_low, const char *name)
+    { (void)attributes; return beer_create_file_mapping(file, protect, size_high, size_low, name); }
+static u64 __attribute__((ms_abi)) impl_CreateFileMappingW(u64 file, void *attributes, u32 protect, u32 size_high, u32 size_low, const u16 *name)
+{
+    (void)attributes;
+    char narrow[260];
+    beer_mapping_name(name, narrow, sizeof(narrow));
+    return beer_create_file_mapping(file, protect, size_high, size_low, name ? narrow : NULL);
+}
+static u64 beer_open_file_mapping(const char *name)
+{
+    int fd = name ? beer_mapping_shm(name, 0, 0, NULL) : -1;
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 0) {
+        if (fd >= 0) close(fd);
+        if (getenv("BEER_NT_SECTION_DIAGNOSTICS")) fprintf(stderr, "[MAPPING] OpenFileMapping name=%s -> not found\n", name ? name : "(none)");
+        g_last_error = 2;
+        return 0;
+    }
+    u64 handle = 0;
+    u32 status = beer_nt_section_create(&handle, fd, st.st_size, 0x04, 0x8000000u);
+    close(fd);
+    if (getenv("BEER_NT_SECTION_DIAGNOSTICS")) fprintf(stderr, "[MAPPING] OpenFileMapping name=%s -> handle=0x%llx\n", name, (unsigned long long)handle);
+    if (status) { g_last_error = 8; return 0; }
+    g_last_error = 0;
+    return handle;
+}
+static u64 __attribute__((ms_abi)) impl_OpenFileMappingA(u32 access, u32 inherit, const char *name)
+    { (void)access; (void)inherit; return beer_open_file_mapping(name); }
+static u64 __attribute__((ms_abi)) impl_OpenFileMappingW(u32 access, u32 inherit, const u16 *name)
+{
+    (void)access; (void)inherit;
+    char narrow[260];
+    beer_mapping_name(name, narrow, sizeof(narrow));
+    return beer_open_file_mapping(name ? narrow : NULL);
+}
+static u64 __attribute__((ms_abi)) impl_MapViewOfFileEx(u64 mapping, u32 access, u32 offset_high, u32 offset_low, u64 bytes, void *base)
+{
+    u32 protection = (access & 0x20u) ? 0x40u : ((access & 0x2u) || (access & 0xF001Fu) == 0xF001Fu) ? 0x04u
+                   : (access & 0x1u) ? 0x08u /* FILE_MAP_COPY */ : 0x02u;
+    s64 offset = (s64)(((u64)offset_high << 32) | offset_low);
+    size_t size = (size_t)bytes;
+    void *address = base;
+    u32 status = beer_nt_section_map(mapping, &address, 0, &offset, &size, 1, 0, protection);
+    if (getenv("BEER_NT_SECTION_DIAGNOSTICS"))
+        fprintf(stderr, "[MAPPING] MapViewOfFile handle=0x%llx access=0x%x offset=%lld size=%llu -> status=0x%x base=%p\n",
+                (unsigned long long)mapping, access, (long long)offset, (unsigned long long)bytes, status, address);
+    if (status) { g_last_error = status == BEER_STATUS_INVALID_HANDLE ? 6u : 8u; return 0; }
+    g_last_error = 0;
+    return (u64)(uintptr_t)address;
+}
+static u64 __attribute__((ms_abi)) impl_MapViewOfFile(u64 mapping, u32 access, u32 offset_high, u32 offset_low, u64 bytes)
+    { return impl_MapViewOfFileEx(mapping, access, offset_high, offset_low, bytes, NULL); }
+static u64 __attribute__((ms_abi)) impl_UnmapViewOfFile(void *base)
+    { return beer_nt_section_unmap(base) == 0 ? 1 : (g_last_error = 487, 0); }
