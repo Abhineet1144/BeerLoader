@@ -40,6 +40,9 @@ static const uint8_t iid_audio_client[16] = {
 static const uint8_t iid_render_client[16] = {
     0xfc,0xac,0x94,0xf2,0x46,0x31,0x83,0x44,0xa7,0xbf,0xad,0xdc,0xa7,0xc2,0x60,0xe2
 };
+static const uint8_t iid_session_control[16] = {   /* IAudioSessionControl */
+    0x99,0xa5,0xb1,0xf4,0x66,0x72,0x19,0x43,0xa8,0xca,0xe7,0x0a,0xcb,0x11,0xe8,0xcd
+};
 static const uint8_t iid_audio_clock[16] = {
     0x4f,0x31,0x63,0xcd,0xba,0x3f,0x1b,0x4a,0x81,0x2c,0xef,0x96,0x35,0x87,0x28,0xe7
 };
@@ -68,6 +71,8 @@ struct BeerWasapi {
     BeerWasapiInterface audio_client;
     BeerWasapiInterface render_client;
     BeerWasapiInterface audio_clock;
+    BeerWasapiInterface session;          /* IAudioSessionControl */
+    BeerWasapiInterface property_store;   /* IPropertyStore of the endpoint */
     WaveFormat format;
     uint32_t buffer_frames;
     uint32_t acquired_frames;
@@ -120,7 +125,19 @@ static void *select_interface(BeerWasapi *owner, const void *iid)
     if (guid_equal(iid, iid_audio_client)) return &owner->audio_client;
     if (guid_equal(iid, iid_render_client)) return &owner->render_client;
     if (guid_equal(iid, iid_audio_clock)) return &owner->audio_clock;
+    if (guid_equal(iid, iid_session_control)) return &owner->session;
     return NULL;
+}
+
+/* Interfaces the compat layer does not provide: logged (a few times) so a game's failed probe is visible. */
+static void wasapi_log_unsupported(const char *what, const void *iid)
+{
+    static _Atomic(unsigned) count;
+    if (atomic_fetch_add(&count, 1) >= 24) return;
+    const uint8_t *g = iid;
+    if (!g) { fprintf(stderr, "[WASAPI] %s\n", what); return; }
+    fprintf(stderr, "[WASAPI] %s {%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x} -> E_NOINTERFACE\n", what,
+            g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
 }
 
 static uint64_t __attribute__((ms_abi)) wasapi_query(void *self, const void *iid,
@@ -130,7 +147,7 @@ static uint64_t __attribute__((ms_abi)) wasapi_query(void *self, const void *iid
     *output = NULL;
     BeerWasapi *owner = wasapi_interface(self)->owner;
     void *selected = select_interface(owner, iid);
-    if (!selected) return E_NOINTERFACE;
+    if (!selected) { wasapi_log_unsupported("QueryInterface", iid); return E_NOINTERFACE; }
     wasapi_add_ref(selected);
     *output = selected;
     return S_OK;
@@ -183,7 +200,7 @@ static uint64_t __attribute__((ms_abi)) enumerator_enum_endpoints(
 }
 
 static uint64_t __attribute__((ms_abi)) enumerator_notimpl(void *self, ...)
-{ (void)self; return E_FAIL; }
+{ (void)self; wasapi_log_unsupported("IMMDeviceEnumerator method not implemented", NULL); return E_FAIL; }
 static uint64_t __attribute__((ms_abi)) enumerator_notify(void *self, void *callback)
 { (void)self; (void)callback; return S_OK; }
 
@@ -219,8 +236,59 @@ static uint64_t __attribute__((ms_abi)) device_activate(void *self, const void *
 
 static uint64_t __attribute__((ms_abi)) device_get_state(void *self, uint32_t *state)
 { (void)self; if (!state) return E_POINTER; *state = 1; return S_OK; }
-static uint64_t __attribute__((ms_abi)) device_notimpl(void *self, ...)
-{ (void)self; return E_FAIL; }
+/* Strings handed to the guest are released with CoTaskMemFree (free). */
+static uint16_t *wasapi_wide_dup(const char *text)
+{
+    size_t n = strlen(text);
+    uint16_t *wide = calloc(n + 1, sizeof(*wide));
+    for (size_t i = 0; wide && i < n; ++i) wide[i] = (uint8_t)text[i];
+    return wide;
+}
+
+static uint64_t __attribute__((ms_abi)) device_open_property_store(void *self, uint32_t access, void **store)
+{
+    (void)access;
+    if (!store) return E_POINTER;
+    BeerWasapi *owner = wasapi_interface(self)->owner;
+    wasapi_add_ref(&owner->property_store);
+    *store = &owner->property_store;
+    return S_OK;
+}
+
+static uint64_t __attribute__((ms_abi)) device_get_id(void *self, uint16_t **id)
+{
+    (void)self;
+    if (!id) return E_POINTER;
+    *id = wasapi_wide_dup("{0.0.0.00000000}.{beer00000-0000-0000-0000-000000000001}");
+    return *id ? S_OK : E_FAIL;
+}
+
+/* IPropertyStore: every value is the endpoint's friendly name (PKEY_Device_FriendlyName and its siblings). */
+static uint64_t __attribute__((ms_abi)) store_get_count(void *self, uint32_t *count)
+{ (void)self; if (!count) return E_POINTER; *count = 0; return S_OK; }
+static uint64_t __attribute__((ms_abi)) store_get_at(void *self, uint32_t index, void *key)
+{ (void)self; (void)index; (void)key; return E_FAIL; }
+static uint64_t __attribute__((ms_abi)) store_get_value(void *self, const void *key, uint8_t *value)
+{
+    (void)self; (void)key;
+    if (!value) return E_POINTER;
+    memset(value, 0, 24);                                  /* PROPVARIANT */
+    *(uint16_t *)value = 31;                               /* VT_LPWSTR */
+    *(uint16_t **)(value + 8) = wasapi_wide_dup("Beer Audio Output");
+    return S_OK;
+}
+static uint64_t __attribute__((ms_abi)) store_ok(void *self, ...)
+{ (void)self; return S_OK; }
+
+/* IAudioSessionControl: one always-active session; names and notifications are accepted and ignored. */
+static uint64_t __attribute__((ms_abi)) session_get_state(void *self, int *state)
+{ (void)self; if (!state) return E_POINTER; *state = 1; return S_OK; }   /* AudioSessionStateActive */
+static uint64_t __attribute__((ms_abi)) session_get_string(void *self, uint16_t **text)
+{ (void)self; if (!text) return E_POINTER; *text = wasapi_wide_dup(""); return *text ? S_OK : E_FAIL; }
+static uint64_t __attribute__((ms_abi)) session_get_grouping(void *self, uint8_t *guid)
+{ (void)self; if (!guid) return E_POINTER; memset(guid, 0, 16); return S_OK; }
+static uint64_t __attribute__((ms_abi)) session_ok(void *self, ...)
+{ (void)self; return S_OK; }
 
 static int supported_format(const WaveFormat *format)
 {
@@ -406,11 +474,13 @@ static uint64_t __attribute__((ms_abi)) audio_client_get_service(void *self,
     *service = NULL;
     BeerWasapi *owner = wasapi_interface(self)->owner;
     void *selected = select_interface(owner, iid);
-    if (selected != &owner->render_client && selected != &owner->audio_clock)
+    if (selected != &owner->render_client && selected != &owner->audio_clock && selected != &owner->session) {
+        wasapi_log_unsupported("IAudioClient::GetService", iid);
         return E_NOINTERFACE;
+    }
     if (getenv("BEER_WASAPI_DIAGNOSTICS"))
         fprintf(stderr, "[WASAPI] IAudioClient::GetService -> %s\n",
-                selected == &owner->render_client ? "render" : "clock");
+                selected == &owner->render_client ? "render" : selected == &owner->session ? "session" : "clock");
     wasapi_add_ref(selected);
     *service = selected;
     return S_OK;
@@ -662,7 +732,14 @@ static void *collection_vtable[5] = {
 };
 static void *device_vtable[7] = {
     wasapi_query, wasapi_add_ref, wasapi_release, device_activate,
-    device_notimpl, device_notimpl, device_get_state
+    device_open_property_store, device_get_id, device_get_state
+};
+static void *property_store_vtable[8] = {
+    wasapi_query, wasapi_add_ref, wasapi_release, store_get_count, store_get_at, store_get_value, store_ok, store_ok
+};
+static void *session_vtable[12] = {
+    wasapi_query, wasapi_add_ref, wasapi_release, session_get_state, session_get_string, session_ok,
+    session_get_string, session_ok, session_get_grouping, session_ok, session_ok, session_ok
 };
 static void *audio_client_vtable[15] = {
     wasapi_query, wasapi_add_ref, wasapi_release, audio_client_initialize,
@@ -697,6 +774,8 @@ uint64_t beer_wasapi_create_instance(const void *class_id, const void *interface
     owner->audio_client = (BeerWasapiInterface){audio_client_vtable, owner};
     owner->render_client = (BeerWasapiInterface){render_client_vtable, owner};
     owner->audio_clock = (BeerWasapiInterface){audio_clock_vtable, owner};
+    owner->session = (BeerWasapiInterface){session_vtable, owner};
+    owner->property_store = (BeerWasapiInterface){property_store_vtable, owner};
     atomic_init(&owner->event_handle, 0);
     atomic_init(&owner->clock_frames, 0);
     atomic_init(&owner->started, 0);

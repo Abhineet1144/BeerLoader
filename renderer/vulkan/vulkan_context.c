@@ -883,7 +883,7 @@ static int host_gpu_info_real(BeerHostGpuInfo *out)
     snprintf(out->name, sizeof(out->name), "%s", props.deviceName);
     out->vendor_id = props.vendorID;
     out->device_id = props.deviceID;
-    out->luid = ((uint64_t)props.vendorID << 32) | props.deviceID;
+    out->luid = (((uint64_t)props.vendorID << 16) | props.deviceID) & 0x7fffffffu;   /* HighPart 0, like Windows LUIDs */
 
     PFN_vkGetPhysicalDeviceMemoryProperties get_memory =
         (PFN_vkGetPhysicalDeviceMemoryProperties)g_context.GetInstanceProcAddr(
@@ -957,6 +957,15 @@ static int host_gpu_info_real(BeerHostGpuInfo *out)
 
 /* What the guest is told about the GPU. BEER_SPOOF_GPU_NAME / _VENDOR / _DEVICE (hex) / _VRAM_MB override
  * the identity DXGI and the display-device APIs report; the real Vulkan device still does the rendering. */
+int beer_vulkan_real_gpu_ids(uint32_t *vendor, uint32_t *device)
+{
+    BeerHostGpuInfo info;
+    if (!host_gpu_info_real(&info)) return 0;
+    *vendor = info.vendor_id;
+    *device = info.device_id;
+    return 1;
+}
+
 int beer_vulkan_gpu_spoof(char *name, size_t name_size, uint32_t *vendor, uint32_t *device, uint64_t *vram_bytes)
 {
     const char *n = getenv("BEER_SPOOF_GPU_NAME");
@@ -978,6 +987,6 @@ int beer_vulkan_host_gpu_info(BeerHostGpuInfo *out)
     const int mask = beer_vulkan_gpu_spoof(out->name, sizeof(out->name), &out->vendor_id, &out->device_id,
                                            &out->dedicated_video_memory);
     if (mask & (2 | 4))
-        out->luid = ((uint64_t)out->vendor_id << 32) | out->device_id;
+        out->luid = (((uint64_t)out->vendor_id << 16) | out->device_id) & 0x7fffffffu;
     return 1;
 }

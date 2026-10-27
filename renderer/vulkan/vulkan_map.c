@@ -29,13 +29,9 @@
 
 typedef struct Swap Swap;
 
-/* BEER_VKBRIDGE_TRACE=2 also logs the calls the mapper handles itself. */
-static void trace(const char *name)
-{
-    static int level = -1;
-    if (level < 0) { const char *v = getenv("BEER_VKBRIDGE_TRACE"); level = v ? atoi(v) : 0; }
-    if (level >= 2) fprintf(stderr, "[VKCALL] %s\n", name);
-}
+/* BEER_VKBRIDGE_TRACE=2 also logs the calls the mapper handles itself (3: with the guest code around each call site). */
+void beer_vkbridge_trace_call(const char *name, uintptr_t guest_return);
+#define trace(name) do { } while (0)   /* every call is logged by the bridge */
 
 typedef struct {
     VkDevice device;
@@ -178,6 +174,31 @@ static void spoof_properties(VkPhysicalDeviceProperties *p)
     p->deviceID = device;
 }
 
+/* Windows engines pair a Vulkan device with its DXGI adapter by LUID (they enumerate DXGI adapters and look for the
+ * one whose LUID equals VkPhysicalDeviceIDProperties::deviceLUID).  Linux drivers report no LUID, so report the
+ * one DXGI gives the same GPU. */
+static void spoof_luid(VkPhysicalDeviceProperties2 *props)
+{
+    BeerHostGpuInfo gpu;
+    if (!beer_vulkan_host_gpu_info(&gpu)) return;
+    for (VkBaseOutStructure *n = (VkBaseOutStructure *)props->pNext; n; n = n->pNext) {
+        uint8_t *luid = NULL;
+        VkBool32 *valid = NULL;
+        uint32_t *node_mask = NULL;
+        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES) {
+            VkPhysicalDeviceIDProperties *id = (VkPhysicalDeviceIDProperties *)n;
+            luid = id->deviceLUID; valid = &id->deviceLUIDValid; node_mask = &id->deviceNodeMask;
+        } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES) {
+            VkPhysicalDeviceVulkan11Properties *v = (VkPhysicalDeviceVulkan11Properties *)n;
+            luid = v->deviceLUID; valid = &v->deviceLUIDValid; node_mask = &v->deviceNodeMask;
+        }
+        if (!luid) continue;
+        memcpy(luid, &gpu.luid, 8);
+        *valid = VK_TRUE;
+        *node_mask = 1;
+    }
+}
+
 static void MS_ABI map_GetPhysicalDeviceProperties(VkPhysicalDevice physical, VkPhysicalDeviceProperties *out)
 {
     trace("vkGetPhysicalDeviceProperties");
@@ -194,7 +215,16 @@ static void MS_ABI map_GetPhysicalDeviceProperties2(VkPhysicalDevice physical, V
         (PFN_vkGetPhysicalDeviceProperties2)beer_vkbridge_host_symbol("vkGetPhysicalDeviceProperties2");
     if (!host) host = (PFN_vkGetPhysicalDeviceProperties2)beer_vkbridge_host_instance_proc(g_instance, "vkGetPhysicalDeviceProperties2KHR");
     host(physical, out);
+    /* Only the GPU DXGI describes gets its LUID: a machine can also expose software rasterisers. */
+    uint32_t real_vendor = 0, real_device = 0;
+    const int is_host_gpu = beer_vulkan_real_gpu_ids(&real_vendor, &real_device) &&
+                            out->properties.vendorID == real_vendor && out->properties.deviceID == real_device;
     spoof_properties(&out->properties);
+    if (is_host_gpu) spoof_luid(out);
+    if (getenv("BEER_VKBRIDGE_TRACE"))
+        fprintf(stderr, "[VKMAP] physical device %p \"%s\" %04x:%04x type %d host-gpu=%d\n", (void *)physical,
+                out->properties.deviceName, out->properties.vendorID, out->properties.deviceID,
+                (int)out->properties.deviceType, is_host_gpu);
 }
 
 static void spoof_memory(VkPhysicalDeviceMemoryProperties *m)
@@ -294,7 +324,14 @@ static VkResult MS_ABI map_CreateSwapchainKHR(VkDevice device, const VkSwapchain
         mode = MODE_OFF;
         r = d->CreateSwapchainKHR(device, info, NULL, out);
     }
-    if (r != VK_SUCCESS) return r;
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "[VKMAP] vkCreateSwapchainKHR failed: %d (%ux%u format %d colorspace %d usage 0x%x images %u present mode %d "
+                "surface %p flags 0x%x sharing %d transform 0x%x alpha 0x%x)\n", (int)r, info->imageExtent.width,
+                info->imageExtent.height, (int)info->imageFormat, (int)info->imageColorSpace, info->imageUsage,
+                info->minImageCount, (int)info->presentMode, (void *)(uintptr_t)info->surface, info->flags,
+                (int)info->imageSharingMode, (unsigned)info->preTransform, (unsigned)info->compositeAlpha);
+        return r;
+    }
     Swap *s = calloc(1, sizeof(*s));
     if (s) {
         s->handle = *out;

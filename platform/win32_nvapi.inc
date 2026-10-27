@@ -167,6 +167,6 @@ static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
         if (table[i].id == id) return table[i].fn;
     static _Atomic(u32) logged;
     if (atomic_fetch_add(&logged, 1) < 64)
-        fprintf(stderr, "[NVAPI] interface 0x%08X is not implemented\n", id);
+        fprintf(stderr, "[NVAPI] interface 0x%08X is not implemented (called from %p)\n", id, __builtin_return_address(0));
     return NULL;
 }

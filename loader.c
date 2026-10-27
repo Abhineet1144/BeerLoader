@@ -31,6 +31,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/personality.h>
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <spawn.h>
@@ -1280,8 +1281,8 @@ static u64 __attribute__((ms_abi))
 stub_dispatch(u64 idx, u64 a1, u64 a2, u64 a3)
 {
     const char *name = (idx < (u64)g_nstubs) ? g_snames[idx] : "??";
-    fprintf(stderr, "[STUB] %-60s  (0x%lx, 0x%lx, 0x%lx) -> 0\n",
-            name, a1, a2, a3);
+    fprintf(stderr, "[STUB] %-60s  (0x%lx, 0x%lx, 0x%lx) -> 0  from %p\n",
+            name, a1, a2, a3, __builtin_return_address(0));
     return 0;
 }
 
@@ -8905,18 +8906,42 @@ static u64 __attribute__((ms_abi))
 impl_InitializeCriticalSectionEx(WIN_CS *cs, u32 spin, u32 flags)
     { (void)flags; return impl_InitializeCriticalSectionAndSpinCount(cs, spin); }
 
+/* INIT_ONCE: 0 = not started, 1 = a thread is running the callback, otherwise (context | 2) once completed.  Other
+ * threads block until the callback finished (engines use this to build singletons such as the graphics adapter list;
+ * letting them through early hands them half-initialised objects). */
+static pthread_mutex_t g_init_once_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_init_once_done = PTHREAD_COND_INITIALIZER;
+
 static u64 __attribute__((ms_abi))
 impl_InitOnceExecuteOnce(u64 *once, u64 fn, u64 param, u64 *ctx)
 {
     if (!once) return 0;
-    if (*once == 0) {
-        *once = 1;
-        if (fn) {
-            typedef u64 __attribute__((ms_abi)) (*InitFn)(u64*, u64, u64*);
-            ((InitFn)fn)(once, param, ctx);
+    volatile u64 *state = (volatile u64 *)once;
+    pthread_mutex_lock(&g_init_once_lock);
+    for (;;) {
+        const u64 value = *state;
+        if (value != 0 && value != 1) {                      /* completed */
+            pthread_mutex_unlock(&g_init_once_lock);
+            if (ctx) *ctx = value & ~(u64)3;
+            return 1;
         }
+        if (value == 0) break;
+        pthread_cond_wait(&g_init_once_done, &g_init_once_lock);
     }
-    return 1;
+    *state = 1;
+    pthread_mutex_unlock(&g_init_once_lock);
+
+    u64 context = 0, ok = 1;
+    if (fn) {
+        typedef u64 __attribute__((ms_abi)) (*InitFn)(u64 *, u64, u64 *);
+        ok = ((InitFn)fn)(once, param, &context) & 0xffffffffu;
+    }
+    pthread_mutex_lock(&g_init_once_lock);
+    *state = ok ? ((context & ~(u64)3) | 2) : 0;            /* a failed callback leaves the once retryable */
+    pthread_cond_broadcast(&g_init_once_done);
+    pthread_mutex_unlock(&g_init_once_lock);
+    if (ok && ctx) *ctx = context & ~(u64)3;
+    return ok ? 1 : 0;
 }
 
 /* ---- Threads (real pthread implementation) ---- */
@@ -10672,6 +10697,17 @@ impl_AdjustWindowRect(WIN_RECT *rect, u32 style, u32 menu) {
 static u64 __attribute__((ms_abi))
 impl_AdjustWindowRectEx(WIN_RECT *rect, u32 style, u32 menu, u32 exstyle)
     { (void)exstyle; return impl_AdjustWindowRect(rect,style,menu); }
+/* Per-monitor DPI APIs (Windows 10): the desktop runs at 96 dpi, so scaling is the identity. */
+static u64 __attribute__((ms_abi))
+impl_AdjustWindowRectExForDpi(WIN_RECT *rect, u32 style, u32 menu, u32 exstyle, u32 dpi)
+    { (void)dpi; return impl_AdjustWindowRectEx(rect, style, menu, exstyle); }
+static u64 __attribute__((ms_abi)) impl_GetDpiForSystem(void) { return 96; }
+static u64 __attribute__((ms_abi)) impl_GetDpiForWindow(u64 hwnd) { (void)hwnd; return 96; }
+static u64 __attribute__((ms_abi)) impl_DpiSuccess(void) { return 1; }                       /* EnableNonClientDpiScaling, SetDialog*DpiChangeBehavior */
+static u64 __attribute__((ms_abi)) impl_DpiHresultOk(void) { return 0; }                      /* S_OK */
+static u64 __attribute__((ms_abi)) impl_GetThreadDpiAwarenessContext(void) { return (u64)-4; }  /* PER_MONITOR_AWARE_V2 */
+static u64 __attribute__((ms_abi)) impl_AreDpiAwarenessContextsEqual(u64 a, u64 b) { return a == b; }
+
 static void window_title_from_wide(const u16 *wide, char *out, size_t capacity)
 {
     if (!out || !capacity) return;
@@ -10778,6 +10814,21 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
                 "[THREAD] window owner thread=%u creator=0x%llx\n",
                 g_window_thread_id,
                 (unsigned long long)g_dispatch_incoming_return);
+    /* CW_USEDEFAULT size, or a zero-sized window (engines create hidden 0x0 windows for adapter probing): the
+     * native window needs a positive client area, so give it the default size or one pixel. */
+    if ((u32)w == 0x80000000u) w = 1280;
+    if ((u32)h == 0x80000000u) h = 720;
+    {
+        int fl = 0, ft = 0, fw = 0, fh = 0;
+        if (beer_window_style_is_decorated(style) &&
+            beer_window_client_from_outer(1000, 1000, 1, &fl, &ft, &fw, &fh)) {
+            fw = 1000 - fw; fh = 1000 - fh;       /* total frame thickness */
+        } else {
+            fw = fh = 0;
+        }
+        if (w < fw + 1) w = fw + 1;
+        if (h < fh + 1) h = fh + 1;
+    }
     g_window_outer_x = (u32)x == 0x80000000u ? 0 : x;
     g_window_outer_y = (u32)y == 0x80000000u ? 0 : y;
     g_window_outer_width = w;
@@ -10939,6 +10990,10 @@ impl_CreateWindowExW(u32 exstyle, u64 classname, u64 title, u32 style,
     window_title_from_wide((const u16 *)(uintptr_t)title, utf8_title, sizeof(utf8_title));
     fprintf(stderr, "[WIN] CreateWindowExW(%dx%d, title=%s)\n", w, h,
             utf8_title[0] ? utf8_title : "(untitled)");
+    if (getenv("BEER_WINDOW_DIAGNOSTICS"))
+        fprintf(stderr, "[WIN]   exstyle=0x%x style=0x%x pos=%d,%d parent=0x%lx menu=0x%lx inst=0x%lx param=0x%lx caller=%p\n",
+                exstyle, style, x, y, (unsigned long)parent, (unsigned long)menu, (unsigned long)inst,
+                (unsigned long)param, (void *)g_dispatch_incoming_return);
     return create_guest_window(exstyle, classname, title, style, x, y, w, h,
                                parent, menu, inst, param, utf8_title);
 }
@@ -11763,8 +11818,10 @@ impl_SendInput(u32 count, const WIN_INPUT *inputs, s32 size)
 static u64 __attribute__((ms_abi))
 impl_XInputGetStateDisconnected(u32 user_index, void *state)
 {
+    /* Real XInput leaves the caller's XINPUT_STATE untouched on failure.  This function is also the entry for
+     * XInputSetState, whose XINPUT_VIBRATION is only 4 bytes: clearing 16 bytes overran the game's stack frame. */
     (void)user_index;
-    if (state) memset(state, 0, 16); /* XINPUT_STATE */
+    (void)state;
     return 1167; /* ERROR_DEVICE_NOT_CONNECTED */
 }
 
@@ -17545,6 +17602,17 @@ static ImplEntry g_impls[] = {
     {"LoadCursorA",                           (ImplFn)impl_LoadCursorA},
     {"AdjustWindowRect",                      (ImplFn)impl_AdjustWindowRect},
     {"AdjustWindowRectEx",                    (ImplFn)impl_AdjustWindowRectEx},
+    {"AdjustWindowRectExForDpi",              (ImplFn)impl_AdjustWindowRectExForDpi},
+    {"GetDpiForSystem",                       (ImplFn)impl_GetDpiForSystem},
+    {"GetDpiForWindow",                       (ImplFn)impl_GetDpiForWindow},
+    {"EnableNonClientDpiScaling",             (ImplFn)impl_DpiSuccess},
+    {"SetProcessDPIAware",                    (ImplFn)impl_DpiSuccess},
+    {"SetProcessDpiAwarenessContext",         (ImplFn)impl_DpiSuccess},
+    {"SetProcessDpiAwareness",                (ImplFn)impl_DpiHresultOk},
+    {"SetDialogControlDpiChangeBehavior",     (ImplFn)impl_DpiSuccess},
+    {"SetDialogDpiChangeBehavior",            (ImplFn)impl_DpiSuccess},
+    {"GetThreadDpiAwarenessContext",          (ImplFn)impl_GetThreadDpiAwarenessContext},
+    {"AreDpiAwarenessContextsEqual",          (ImplFn)impl_AreDpiAwarenessContextsEqual},
     {"CreateWindowExW",                       (ImplFn)impl_CreateWindowExW},
     {"CreateWindowExA",                       (ImplFn)impl_CreateWindowExA},
     {"DestroyWindow",                         (ImplFn)impl_DestroyWindow},
@@ -20972,6 +21040,27 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
         g_total_sigsegv_count++;
         fprintf(stderr, "[CRASH] SIGSEGV #%u at RIP=0x%lx FA=0x%lx\n",
                 g_total_sigsegv_count, rip, faultaddr);
+        if (g_total_sigsegv_count == 1 && getenv("BEER_CRASH_CODE") && g_img &&
+            rip >= (u64)g_img && rip < (u64)g_img + 0x8000000) {
+            /* Code around the first guest fault, as hex: feed to `xxd -r -p` + objdump -D -b binary -mi386:x86-64
+             * --adjust-vma=<start> to read packed images that only exist decrypted in memory. */
+            const u8 *start = (const u8 *)(rip - 0x200);
+            fprintf(stderr, "[CRASHCODE] start=0x%lx\n[CRASHCODE] ", (unsigned long)(rip - 0x200));
+            for (int i = 0; i < 0x400; ++i) fprintf(stderr, "%02x", start[i]);
+            fputs("\n", stderr);
+        }
+        if (g_total_sigsegv_count == 1 && getenv("BEER_CRASH_RANGES")) {
+            /* "START:LEN,START:LEN" (hex): dump guest memory at the first fault, e.g. the callers of the faulting code. */
+            char list[512];
+            snprintf(list, sizeof(list), "%s", getenv("BEER_CRASH_RANGES"));
+            for (char *item = strtok(list, ","); item; item = strtok(NULL, ",")) {
+                unsigned long start = 0, length = 0;
+                if (sscanf(item, "%lx:%lx", &start, &length) != 2 || length > 0x20000) continue;
+                fprintf(stderr, "[CRASHRANGE] start=0x%lx\n[CRASHRANGE] ", start);
+                for (unsigned long i = 0; i < length; ++i) fprintf(stderr, "%02x", ((const u8 *)start)[i]);
+                fputs("\n", stderr);
+            }
+        }
         if (g_total_sigsegv_count <= 4) {
             /* Diagnostic only (a fault is already being reported): name the
              * host module/symbol and the call chain when RIP is host code. */
@@ -23482,6 +23571,14 @@ static void prof_start(void)
 
 int main(int argc, char **argv)
 {
+    /* Guest code is sensitive to the process layout: RDR2 takes different graphics start-up paths depending on where
+     * the host places its heaps and stacks, and fails most runs with address randomisation on.  Re-exec once with
+     * randomisation off (BEER_ASLR=1 keeps it) so every run lays memory out the same way, like gdb does. */
+    if (!getenv("BEER_ASLR") && !(personality(0xffffffffu) & ADDR_NO_RANDOMIZE)) {
+        if (personality(ADDR_NO_RANDOMIZE) != -1) {
+            execv("/proc/self/exe", argv);
+        }
+    }
     const char *recovery_limit = getenv("BEER_CRASH_RECOVERY_LIMIT");
     if (recovery_limit && *recovery_limit) {
         char *end = NULL;

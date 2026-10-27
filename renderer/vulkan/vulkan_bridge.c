@@ -49,7 +49,7 @@ __asm__(
     ".globl beer_vk_bridge_f3\n"
     ".globl beer_vk_bridge_g1\n"
     ".globl beer_vk_bridge\n"
-    ".globl beer_vk_bridge_trace\n"
+    ".globl beer_vk_common\n"
     ".type beer_vk_bridge,@function\n"
     /* Float arguments: Microsoft passes the Nth argument's float in xmmN-1, System V in the next free xmm. */
     "beer_vk_bridge_f3:\n"
@@ -67,13 +67,41 @@ __asm__(
     "beer_vk_bridge_g1:\n"
     "    movaps %xmm2, %xmm0\n"
     "    jmp beer_vk_bridge\n"
-    /* BEER_VKBRIDGE_TRACE=2: r10 holds the command name; log it, then continue into the bridge unchanged. */
-    "beer_vk_bridge_trace:\n"
-    "    pushq %rcx\n    pushq %rdx\n    pushq %r8\n    pushq %r9\n    pushq %r11\n    pushq %rsi\n    pushq %rdi\n"
-    "    movq %r10, %rdi\n"
+    /* Common entry of every thunk.  r10 -> VkThunk { host, entry, name }.  Runs the call on the thread's host call stack
+     * (the guest's own stack can be a few tens of KiB on worker threads, far too little for a Vulkan driver), copies
+     * the stack arguments across and returns to the guest on its own stack.  Not switched when already on the host
+     * stack or when the thread has none. */
+    "beer_vk_common:\n"
+    "    cmpl $0, beer_vk_trace_level(%rip)\n"
+    "    je 1f\n"
+    "    pushq %rcx\n    pushq %rdx\n    pushq %r8\n    pushq %r9\n    pushq %r10\n    pushq %rsi\n    pushq %rdi\n"
+    "    movq 16(%r10), %rdi\n"
+    "    movq 56(%rsp), %rsi\n"                 /* the guest's return address */
     "    callq beer_vkbridge_trace_call\n"
-    "    popq %rdi\n    popq %rsi\n    popq %r11\n    popq %r9\n    popq %r8\n    popq %rdx\n    popq %rcx\n"
-    "    jmp beer_vk_bridge\n"
+    "    popq %rdi\n    popq %rsi\n    popq %r10\n    popq %r9\n    popq %r8\n    popq %rdx\n    popq %rcx\n"
+    "1:\n"
+    "    movq 0(%r10), %r11\n"
+    "    movq 8(%r10), %r10\n"
+    "    cmpq $0, %fs:g_host_call_stack_top@tpoff\n"
+    "    je 3f\n"
+    "    movq %rsp, %rax\n"
+    "    subq %fs:g_host_call_stack_base@tpoff, %rax\n"
+    "    cmpq $1048576, %rax\n"
+    "    jb 3f\n"
+    "    movq %rsp, %rax\n"
+    "    movq %rsp, %fs:beer_vk_saved_rsp@tpoff\n"
+    "    movq %fs:g_host_call_stack_top@tpoff, %rsp\n"
+    "    andq $-16, %rsp\n"
+    "    subq $0x80, %rsp\n"
+    ".irp off,0,8,16,24,32,40,48,56,64,72,80,88\n"
+    "    movq 0x28+\\off(%rax), %xmm4\n"
+    "    movq %xmm4, 0x20+\\off(%rsp)\n"
+    ".endr\n"
+    "    callq *%r10\n"
+    "    movq %fs:beer_vk_saved_rsp@tpoff, %rsp\n"
+    "    ret\n"
+    "3:\n"
+    "    jmpq *%r10\n"
     "beer_vk_bridge:\n"
     "    pushq %rbp\n"
     "    movq %rsp, %rbp\n"
@@ -127,8 +155,13 @@ __asm__(
     "    ret\n"
     ".size beer_vk_bridge, .-beer_vk_bridge\n"
 );
-extern char beer_vk_bridge_trace[];
-void beer_vkbridge_trace_call(const char *name);
+extern char beer_vk_common[];
+extern __thread uint64_t g_host_call_stack_top;
+__thread uint64_t beer_vk_saved_rsp;
+int beer_vk_trace_level;
+void beer_vkbridge_trace_call(const char *name, uintptr_t guest_return);
+static int trace_calls(void);
+#define OVERRIDE_TRACE(name) do { } while (0)   /* every call is logged by beer_vk_common */
 extern char beer_vk_bridge[], beer_vk_bridge_f1[], beer_vk_bridge_f2[], beer_vk_bridge_f3[], beer_vk_bridge_g1[];
 
 /* ---- Host library ---- */
@@ -137,8 +170,10 @@ static void *g_lib;
 static PFN_vkGetInstanceProcAddr g_gipa;
 static int g_init_tried;
 
+static int trace_calls(void);
 static int host_init(void)
 {
+    trace_calls();
     pthread_mutex_lock(&g_lock);
     if (!g_init_tried) {
         g_init_tried = 1;
@@ -186,13 +221,35 @@ static struct { void *host; void *thunk; } g_thunk_cache[THUNK_CACHE];
 static int trace_calls(void)
 {
     static int level = -1;
-    if (level < 0) { const char *v = getenv("BEER_VKBRIDGE_TRACE"); level = v ? atoi(v) : 0; }
-    return level >= 2;
+    if (level < 0) { const char *v = getenv("BEER_VKBRIDGE_TRACE"); level = v ? atoi(v) : 0; beer_vk_trace_level = level >= 2; }
+    return level >= 2;   /* 2 and 3 */
 }
 
-void beer_vkbridge_trace_call(const char *name)
+/* Level 3 also dumps the guest code around each distinct call site (hex, see BEER_CRASH_CODE in loader.c). */
+void beer_vkbridge_trace_call(const char *name, uintptr_t guest_return)
 {
-    fprintf(stderr, "[VKCALL] %s\n", name);
+    fprintf(stderr, "[VKCALL] %s ret=0x%lx\n", name, (unsigned long)guest_return);
+    const char *v = getenv("BEER_VKBRIDGE_TRACE");
+    static uintptr_t seen[64];
+    static int seen_count;
+    static int range_done;
+    const char *range = getenv("BEER_DUMP_RANGE");     /* "0xSTART:0xLENGTH": hex of guest memory at the first traced call */
+    if (range && !range_done && guest_return) {
+        range_done = 1;
+        unsigned long start = 0, length = 0;
+        if (sscanf(range, "%lx:%lx", &start, &length) == 2 && length <= 0x40000) {
+            fprintf(stderr, "[RANGE] start=0x%lx\n[RANGE] ", start);
+            for (unsigned long i = 0; i < length; ++i) fprintf(stderr, "%02x", ((const uint8_t *)start)[i]);
+            fputs("\n", stderr);
+        }
+    }
+    if (!guest_return || !v || atoi(v) < 3) return;
+    for (int i = 0; i < seen_count; ++i)
+        if (seen[i] == guest_return) return;
+    if (seen_count < 64) seen[seen_count++] = guest_return;
+    fprintf(stderr, "[CALLSITE] start=0x%lx\n[CALLSITE] ", (unsigned long)(guest_return - 0x300));
+    for (int i = 0; i < 0x400; ++i) fprintf(stderr, "%02x", ((const uint8_t *)(guest_return - 0x300))[i]);
+    fputs("\n", stderr);
 }
 
 static void *bridge_entry_for(const char *name)
@@ -201,17 +258,22 @@ static void *bridge_entry_for(const char *name)
     if (!strcmp(name, "vkCmdSetDepthBounds")) return beer_vk_bridge_f2;
     if (!strcmp(name, "vkCmdSetLineWidth")) return beer_vk_bridge_f1;
     if (!strcmp(name, "vkSetDeviceMemoryPriorityEXT")) return beer_vk_bridge_g1;
-    return trace_calls() ? (void *)beer_vk_bridge_trace : (void *)beer_vk_bridge;
+    return beer_vk_bridge;
 }
 
-static void *thunk_for(const char *name, void *host)
+/* Per-command record the thunk points r10 at: the host function (loaded into r11 for the ABI bridge), the entry to run
+ * (a bridge label for forwarded commands, the C function for Beer's own overrides) and the name for tracing. */
+typedef struct { void *host; void *entry; const char *name; } VkThunk;
+
+static void *make_thunk(const char *name, void *host, void *entry)
 {
-    if (!host) return NULL;
+    void *key = host ? host : entry;
+    if (!key) return NULL;
     pthread_mutex_lock(&g_lock);
-    size_t slot = ((uintptr_t)host >> 4) % THUNK_CACHE;
+    size_t slot = ((uintptr_t)key >> 4) % THUNK_CACHE;
     for (size_t probe = 0; probe < THUNK_CACHE; ++probe) {
         size_t i = (slot + probe) % THUNK_CACHE;
-        if (g_thunk_cache[i].host == host) {
+        if (g_thunk_cache[i].host == key) {
             void *thunk = g_thunk_cache[i].thunk;
             pthread_mutex_unlock(&g_lock);
             return thunk;
@@ -224,23 +286,34 @@ static void *thunk_for(const char *name, void *host)
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (g_thunks == MAP_FAILED) { g_thunks = NULL; pthread_mutex_unlock(&g_lock); return NULL; }
     }
-    if (g_thunk_used + THUNK_SIZE > g_thunk_capacity) { pthread_mutex_unlock(&g_lock); return NULL; }
+    VkThunk *info = malloc(sizeof(*info));
+    if (!info || g_thunk_used + THUNK_SIZE > g_thunk_capacity) { free(info); pthread_mutex_unlock(&g_lock); return NULL; }
+    info->host = host;
+    info->entry = entry;
+    info->name = strdup(name);
     uint8_t *code = g_thunks + g_thunk_used;
     g_thunk_used += THUNK_SIZE;
-    uint64_t target = (uint64_t)(uintptr_t)host, bridge = (uint64_t)(uintptr_t)bridge_entry_for(name);
+    uint64_t record = (uint64_t)(uintptr_t)info, common = (uint64_t)(uintptr_t)beer_vk_common;
     size_t o = 0;
-    if (trace_calls()) {
-        const char *copy = strdup(name);                                          /* mov r10, name (for the trace entry) */
-        uint64_t text = (uint64_t)(uintptr_t)copy;
-        code[o++] = 0x49; code[o++] = 0xBA; memcpy(code + o, &text, 8); o += 8;
-    }
-    code[o++] = 0x49; code[o++] = 0xBB; memcpy(code + o, &target, 8); o += 8;     /* mov r11, host */
-    code[o++] = 0x48; code[o++] = 0xB8; memcpy(code + o, &bridge, 8); o += 8;     /* mov rax, bridge */
+    code[o++] = 0x49; code[o++] = 0xBA; memcpy(code + o, &record, 8); o += 8;     /* mov r10, record */
+    code[o++] = 0x48; code[o++] = 0xB8; memcpy(code + o, &common, 8); o += 8;     /* mov rax, beer_vk_common */
     code[o++] = 0xFF; code[o++] = 0xE0;                                           /* jmp rax */
-    g_thunk_cache[slot].host = host;
+    g_thunk_cache[slot].host = key;
     g_thunk_cache[slot].thunk = code;
     pthread_mutex_unlock(&g_lock);
     return code;
+}
+
+/* Forwarded command: guest -> ABI bridge -> host function. */
+static void *thunk_for(const char *name, void *host)
+{
+    return host ? make_thunk(name, host, bridge_entry_for(name)) : NULL;
+}
+
+/* Beer's own implementation (an ms_abi C function), still entered on the host stack. */
+static void *thunk_for_override(const char *name, void *fn)
+{
+    return make_thunk(name, NULL, fn);
 }
 
 /* ---- Windows-specific translations ---- */
@@ -292,6 +365,7 @@ static int strip_callback_structs(const void **head_link, BaseIn **splice_owner,
 
 static VkResult MS_ABI bridge_CreateInstance(const VkInstanceCreateInfo *info, const void *allocator, VkInstance *instance)
 {
+    OVERRIDE_TRACE("vkCreateInstance");
     (void)allocator;
     if (!info || !instance || !host_init()) return VK_ERROR_INCOMPATIBLE_DRIVER;
     PFN_vkCreateInstance create = (PFN_vkCreateInstance)g_gipa(VK_NULL_HANDLE, "vkCreateInstance");
@@ -318,6 +392,7 @@ static VkResult MS_ABI bridge_CreateInstance(const VkInstanceCreateInfo *info, c
 static VkResult MS_ABI bridge_EnumerateInstanceExtensionProperties(const char *layer, uint32_t *count,
                                                                     VkExtensionProperties *props)
 {
+    OVERRIDE_TRACE("vkEnumerateInstanceExtensionProperties");
     if (!count || !host_init()) return VK_ERROR_INITIALIZATION_FAILED;
     if (layer) { *count = 0; return VK_ERROR_LAYER_NOT_PRESENT; }
     PFN_vkEnumerateInstanceExtensionProperties host =
@@ -352,6 +427,7 @@ static VkResult MS_ABI bridge_EnumerateInstanceExtensionProperties(const char *l
 
 static VkResult MS_ABI bridge_EnumerateInstanceLayerProperties(uint32_t *count, VkLayerProperties *props)
 {
+    OVERRIDE_TRACE("vkEnumerateInstanceLayerProperties");
     (void)props;
     if (count) *count = 0;                   /* no layers: validation would call back into guest code */
     return VK_SUCCESS;
@@ -360,9 +436,9 @@ static VkResult MS_ABI bridge_EnumerateInstanceLayerProperties(uint32_t *count, 
 static VkResult MS_ABI bridge_CreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo *info,
                                            const void *allocator, VkDevice *device)
 {
+    OVERRIDE_TRACE("vkCreateDevice");
     (void)allocator;
-    beer_vkbridge_trace_call("vkCreateDevice");
-    if (!info || !device || !host_init()) return VK_ERROR_INITIALIZATION_FAILED;
+        if (!info || !device || !host_init()) return VK_ERROR_INITIALIZATION_FAILED;
     PFN_vkCreateDevice create = (PFN_vkCreateDevice)dlsym(g_lib, "vkCreateDevice");
     if (!create) return VK_ERROR_INITIALIZATION_FAILED;
     const char *names[256];
@@ -382,6 +458,7 @@ static VkResult MS_ABI bridge_CreateDevice(VkPhysicalDevice physical, const VkDe
 static VkResult MS_ABI bridge_CreateWin32SurfaceKHR(VkInstance instance, const void *info, const void *allocator,
                                                     VkSurfaceKHR *surface)
 {
+    OVERRIDE_TRACE("vkCreateWin32SurfaceKHR");
     (void)info; (void)allocator;
     void *display = NULL;
     unsigned long window = 0;
@@ -401,6 +478,7 @@ static VkResult MS_ABI bridge_CreateWin32SurfaceKHR(VkInstance instance, const v
 
 static VkBool32 MS_ABI bridge_GetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice physical, uint32_t family)
 {
+    OVERRIDE_TRACE("vkGetPhysicalDeviceWin32PresentationSupportKHR");
     (void)physical; (void)family;
     return VK_TRUE;
 }
@@ -456,7 +534,7 @@ static PFN_vkVoidFunction MS_ABI bridge_GetInstanceProcAddr(VkInstance instance,
 {
     if (!name || !host_init()) return NULL;
     void *fn = override_for(name);
-    if (fn) return (PFN_vkVoidFunction)fn;
+    if (fn) return (PFN_vkVoidFunction)thunk_for_override(name, fn);
     void *host = (void *)g_gipa(instance, name);
     if (!host && !instance) host = host_symbol(name);
     trace_resolve("vkGetInstanceProcAddr", name, host != NULL);
@@ -467,7 +545,7 @@ static PFN_vkVoidFunction MS_ABI bridge_GetDeviceProcAddr(VkDevice device, const
 {
     if (!name || !host_init() || !device) return NULL;
     void *fn = override_for(name);
-    if (fn) return (PFN_vkVoidFunction)fn;
+    if (fn) return (PFN_vkVoidFunction)thunk_for_override(name, fn);
     PFN_vkGetDeviceProcAddr host_gdpa = (PFN_vkGetDeviceProcAddr)dlsym(g_lib, "vkGetDeviceProcAddr");
     void *host = host_gdpa ? (void *)host_gdpa(device, name) : NULL;
     trace_resolve("vkGetDeviceProcAddr", name, host != NULL);
@@ -478,7 +556,7 @@ uintptr_t beer_vkbridge_get_proc(const char *name)
 {
     if (!name || strncmp(name, "vk", 2) != 0 || !host_init()) return 0;
     void *fn = override_for(name);
-    if (fn) return (uintptr_t)fn;
+    if (fn) return (uintptr_t)thunk_for_override(name, fn);
     void *host = host_symbol(name);
     trace_resolve("GetProcAddress", name, host != NULL);
     return (uintptr_t)thunk_for(name, host);
