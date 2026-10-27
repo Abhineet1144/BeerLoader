@@ -6183,6 +6183,67 @@ impl_SHGetSpecialFolderPathA(u64 hwnd, char *buf, s32 csidl, u32 create)
     return 1;
 }
 
+/* ShellExecute*: URLs and documents are handed to the desktop (xdg-open), like Windows hands them to the default
+ * handler. Returns an HINSTANCE > 32 on success; executables are not launched here (SE_ERR_NOASSOC). */
+static int wide_to_host_path(const u16 *path, char *out, size_t size);
+extern char **environ;
+static u64 beer_shell_open(const char *verb, const char *file)
+{
+    if (!file || !*file) return 2;                                   /* SE_ERR_FNF */
+    if (verb && *verb && strcasecmp(verb, "open") && strcasecmp(verb, "edit") && strcasecmp(verb, "print")) return 31;
+    size_t len = strlen(file);
+    if (len > 4 && !strcasecmp(file + len - 4, ".exe")) return 31;
+    char host[1100];
+    if (!strncasecmp(file, "http://", 7) || !strncasecmp(file, "https://", 8) || !strncasecmp(file, "mailto:", 7)) snprintf(host, sizeof(host), "%s", file);
+    else {
+        u16 wide[520]; size_t i = 0;
+        for (; file[i] && i < 519; ++i) wide[i] = (u8)file[i];
+        wide[i] = 0;
+        if (!wide_to_host_path(wide, host, sizeof(host))) return 2;
+    }
+    fprintf(stderr, "[SHELL] ShellExecute open %s\n", host);
+    pid_t child;
+    char *argv[] = { (char *)"xdg-open", host, NULL };
+    if (posix_spawnp(&child, "xdg-open", NULL, NULL, argv, environ) != 0) return 31;
+    return 33;
+}
+static u64 __attribute__((ms_abi))
+impl_ShellExecuteA(u64 hwnd, const char *verb, const char *file, const char *params, const char *dir, s32 show)
+{
+    (void)hwnd; (void)params; (void)dir; (void)show;
+    return beer_shell_open(verb, file);
+}
+static u64 __attribute__((ms_abi))
+impl_ShellExecuteW(u64 hwnd, const u16 *verb, const u16 *file, const u16 *params, const u16 *dir, s32 show)
+{
+    (void)hwnd; (void)params; (void)dir; (void)show;
+    char v[32] = "", f[1100] = "";
+    for (size_t i = 0; verb && verb[i] && i < 31; ++i) v[i] = (char)verb[i];
+    for (size_t i = 0; file && file[i] && i < 1099; ++i) f[i] = (char)file[i];
+    return beer_shell_open(v, f);
+}
+/* SHELLEXECUTEINFO (x64): lpVerb at 16, lpFile at 24, hInstApp at 48. */
+static u64 __attribute__((ms_abi)) impl_ShellExecuteExA(u8 *info)
+{
+    if (!info) return 0;
+    u64 r = beer_shell_open(*(const char **)(info + 16), *(const char **)(info + 24));
+    *(u64 *)(info + 48) = r;
+    if (r <= 32) g_last_error = r == 2 ? 2 : 1155;                   /* ERROR_NO_ASSOCIATION */
+    return r > 32;
+}
+static u64 __attribute__((ms_abi)) impl_ShellExecuteExW(u8 *info)
+{
+    if (!info) return 0;
+    const u16 *vw = *(const u16 **)(info + 16), *fw = *(const u16 **)(info + 24);
+    char v[32] = "", f[1100] = "";
+    for (size_t i = 0; vw && vw[i] && i < 31; ++i) v[i] = (char)vw[i];
+    for (size_t i = 0; fw && fw[i] && i < 1099; ++i) f[i] = (char)fw[i];
+    u64 r = beer_shell_open(v, f);
+    *(u64 *)(info + 48) = r;
+    if (r <= 32) g_last_error = r == 2 ? 2 : 1155;
+    return r > 32;
+}
+
 static u64 __attribute__((ms_abi))
 impl_SHGetKnownFolderPath(const void *rfid, u32 flags, u64 tok, u64 *out)
 {
@@ -17543,6 +17604,10 @@ static ImplEntry g_impls[] = {
     {"SHGetSpecialFolderPathW",               (ImplFn)impl_SHGetSpecialFolderPathW},
     {"SHGetSpecialFolderPathA",               (ImplFn)impl_SHGetSpecialFolderPathA},
     {"SHGetKnownFolderPath",                  (ImplFn)impl_SHGetKnownFolderPath},
+    {"ShellExecuteA",                             (ImplFn)impl_ShellExecuteA},
+    {"ShellExecuteW",                             (ImplFn)impl_ShellExecuteW},
+    {"ShellExecuteExA",                           (ImplFn)impl_ShellExecuteExA},
+    {"ShellExecuteExW",                           (ImplFn)impl_ShellExecuteExW},
     {"CoTaskMemFree",                         (ImplFn)impl_CoTaskMemFree},
     /* COM */
     {"CoInitialize",                          (ImplFn)impl_CoInitialize},

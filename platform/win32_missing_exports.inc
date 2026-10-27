@@ -312,7 +312,6 @@ static u64 __attribute__((ms_abi)) stub_GetDCOrgEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DragQueryFileA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DragQueryFileW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExtractAssociatedIconW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_ShellExecuteW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DragFinish(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_OleUninitialize(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CLSIDFromProgID(void){ return 0; }

@@ -1007,3 +1007,14 @@ Handy: `tests/vulkan_guest` still passes after all of this; `make` can fail with
 - New diagnostics: `BEER_PIPE_DIAGNOSTICS=1` hex-dumps named-pipe traffic (the game never connects to `RDR2Launcher_Pipe`);
   control-socket `mem_regions`/`mem_read` can be used to search the live process for strings (ptrace/`/proc/pid/mem` are blocked by Yama).
 - Note: heavy `BEER_API_TRACE` runs change timing; one traced run crashed after audio init, untraced runs did not.
+
+### Session 5 addendum 2: Social Club present -> "Error code: 16"
+
+- `ShellExecuteA/W/ExA/ExW` are real now (URLs/documents go to `xdg-open`; `.exe` returns SE_ERR_NOASSOC). Accept on the
+  Social Club dialog opens the Rockstar support URL and then the game exits by design.
+- Copying a real `Program Files/Rockstar Games/Social Club` (from another Proton prefix, `compatdata/3240220`) into the Beer prefix
+  moves the dialog from "incomplete installation" to "Social Club failed to initialize. Error code: 16".
+  `socialclub.dll` is still never mapped: right after the file check the game runs an Authenticode check:
+  `WinVerifyTrust` (stub, returns 0) -> `WTHelperProvDataFromStateData(NULL)` (stub, NULL) -> `CryptQueryObject` (stub, fails).
+  Next step: a real wintrust/crypt32 signer layer (state handle, `CRYPT_PROVIDER_DATA`/SGNR/CERT chain, cert store + `CertGetNameStringW`)
+  built on libcrypto's PKCS7 parser over the PE security directory.

@@ -317,7 +317,6 @@
     {"DragQueryFileA", (ImplFn)stub_DragQueryFileA},
     {"DragQueryFileW", (ImplFn)stub_DragQueryFileW},
     {"ExtractAssociatedIconW", (ImplFn)stub_ExtractAssociatedIconW},
-    {"ShellExecuteW", (ImplFn)stub_ShellExecuteW},
     {"DragFinish", (ImplFn)stub_DragFinish},
     {"OleUninitialize", (ImplFn)stub_OleUninitialize},
     {"CLSIDFromProgID", (ImplFn)stub_CLSIDFromProgID},
