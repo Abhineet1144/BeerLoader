@@ -10825,6 +10825,44 @@ static u64 __attribute__((ms_abi)) impl_UnionRect(s32 *out, const s32 *a, const 
     return 1;
 }
 
+/* ---- Small system services that protection and telemetry code calls and then trusts the outputs of.  A zero-returning
+ * stub left their output buffers uninitialised (UUID, locale name, token privileges, cursor info). ---- */
+static u64 __attribute__((ms_abi)) impl_UuidCreate(u8 *uuid)
+{
+    if (!uuid) return 87;
+    static _Atomic(u64) counter;
+    u64 a = (u64)time(NULL) * 1000003ull + atomic_fetch_add(&counter, 1) * 7919ull + (u64)getpid();
+    u64 b = a * 6364136223846793005ull + 1442695040888963407ull;
+    memcpy(uuid, &a, 8); memcpy(uuid + 8, &b, 8);
+    uuid[7] = (uuid[7] & 0x0f) | 0x40;          /* version 4 */
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;          /* RFC 4122 variant */
+    return 0;                                   /* RPC_S_OK */
+}
+static u64 __attribute__((ms_abi)) impl_GetSystemDefaultLocaleName(u16 *buf, int size)
+{
+    static const u16 name[] = {'e','n','-','U','S',0};
+    if (!buf || size < 6) { g_last_error = 122; return 0; }
+    memcpy(buf, name, sizeof(name));
+    return 6;
+}
+static u64 __attribute__((ms_abi)) impl_GetSystemDefaultUILanguage(void) { return 0x0409; }
+static u64 __attribute__((ms_abi)) impl_OpenProcessToken(u64 process, u32 access, u64 *token)
+{ (void)process; (void)access; if (!token) { g_last_error = 87; return 0; } *token = 0x7E0C0001ull; return 1; }
+static u64 __attribute__((ms_abi)) impl_LookupPrivilegeValue(const void *system, const void *name, u32 *luid)
+{ (void)system; (void)name; if (!luid) { g_last_error = 87; return 0; } luid[0] = 20; luid[1] = 0; return 1; }
+static u64 __attribute__((ms_abi)) impl_AdjustTokenPrivileges(u64 token, u32 disable_all, void *new_state, u32 len, void *old, u32 *ret)
+{ (void)token; (void)disable_all; (void)new_state; (void)len; (void)old; if (ret) *ret = 0; g_last_error = 0; return 1; }
+static u64 __attribute__((ms_abi)) impl_GetCursorInfo(u32 *info)
+{
+    if (!info || info[0] < 24) { g_last_error = 87; return 0; }
+    info[1] = 1;                                 /* CURSOR_SHOWING */
+    *(u64 *)(info + 2) = 0x20000001ull;          /* hCursor, as LoadCursor returns */
+    info[4] = info[5] = 0;                       /* ptScreenPos */
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_EventRegister(const void *provider, void *callback, void *context, u64 *handle)
+{ (void)provider; (void)callback; (void)context; if (handle) *handle = 0x7E0E0001ull; return 0; }
+
 /* Per-monitor DPI APIs (Windows 10): the desktop runs at 96 dpi, so scaling is the identity. */
 static u64 __attribute__((ms_abi))
 impl_AdjustWindowRectExForDpi(WIN_RECT *rect, u32 style, u32 menu, u32 exstyle, u32 dpi)
@@ -17794,6 +17832,18 @@ static ImplEntry g_impls[] = {
     {"AdjustWindowRect",                      (ImplFn)impl_AdjustWindowRect},
     {"AdjustWindowRectEx",                    (ImplFn)impl_AdjustWindowRectEx},
     {"AdjustWindowRectExForDpi",              (ImplFn)impl_AdjustWindowRectExForDpi},
+    {"UuidCreate",                            (ImplFn)impl_UuidCreate},
+    {"UuidCreateSequential",                  (ImplFn)impl_UuidCreate},
+    {"GetSystemDefaultLocaleName",            (ImplFn)impl_GetSystemDefaultLocaleName},
+    {"GetSystemDefaultUILanguage",            (ImplFn)impl_GetSystemDefaultUILanguage},
+    {"OpenProcessToken",                      (ImplFn)impl_OpenProcessToken},
+    {"LookupPrivilegeValueA",                 (ImplFn)impl_LookupPrivilegeValue},
+    {"LookupPrivilegeValueW",                 (ImplFn)impl_LookupPrivilegeValue},
+    {"AdjustTokenPrivileges",                 (ImplFn)impl_AdjustTokenPrivileges},
+    {"GetCursorInfo",                         (ImplFn)impl_GetCursorInfo},
+    {"EventRegister",                         (ImplFn)impl_EventRegister},
+    {"HeapSetInformation",                    (ImplFn)impl_ReturnTrue},
+    {"SetHandleCount",                        (ImplFn)impl_ReturnTrue},
     {"SetRect",                               (ImplFn)impl_SetRect},
     {"SetRectEmpty",                          (ImplFn)impl_SetRectEmpty},
     {"CopyRect",                              (ImplFn)impl_CopyRect},
@@ -18065,8 +18115,13 @@ static void fake_pe_exports_build(void)
             *(u16 *)(p + ordinals + i * 2) = (u16)i;
             u8 *stub = p + stubs + i * FAKE_PE_STUB_SLOT;
             memset(stub, 0xCC, FAKE_PE_STUB_SLOT);
-            stub[0] = 0x48; stub[1] = 0xB8; *(u64 *)(stub + 2) = targets[i];   /* mov rax, imm64 */
-            stub[10] = 0xFF; stub[11] = 0xE0;                                  /* jmp rax */
+            /* A bare "mov rax, imm64; jmp rax" at an export is what a detour hook looks like: protection code that
+             * walks ntdll/kernel32 exports follows it, sees a target outside the module and reports tampering. The
+             * leading two-byte nop keeps the stub from matching that pattern (real exports begin with ordinary
+             * prologues) and costs nothing. */
+            stub[0] = 0x66; stub[1] = 0x90;                                    /* xchg ax, ax */
+            stub[2] = 0x48; stub[3] = 0xB8; *(u64 *)(stub + 4) = targets[i];   /* mov rax, imm64 */
+            stub[12] = 0xFF; stub[13] = 0xE0;                                  /* jmp rax */
             *(u32 *)(p + funcs + i * 4) = stubs + (u32)(i * FAKE_PE_STUB_SLOT);
             strings += (u32)len;
         }
@@ -18277,7 +18332,10 @@ static void pe_load(const char *path)
            preferred, imgsz, nt->opt.entry_rva, nt->file.nsections);
 
     /* ── map image memory ── */
-    g_img = mmap((void *)preferred, imgsz,
+    /* BEER_EXE_BASE=<hex> loads the executable at another address (relocated), like ASLR does on Windows. */
+    u64 wanted_base = preferred;
+    if (getenv("BEER_EXE_BASE")) wanted_base = strtoull(getenv("BEER_EXE_BASE"), NULL, 16) & ~0xffffull;
+    g_img = mmap((void *)wanted_base, imgsz,
                  PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                  -1, 0);
@@ -18288,7 +18346,7 @@ static void pe_load(const char *path)
         if (g_img == MAP_FAILED) die("mmap(image): %s", strerror(errno));
         printf("[PE]  Preferred base busy; loaded at 0x%lx (need relocs)\n", (u64)g_img);
     } else {
-        printf("[PE]  Mapped at preferred base 0x%lx\n", (u64)g_img);
+        printf("[PE]  Mapped at %s base 0x%lx\n", wanted_base == preferred ? "preferred" : "requested", (u64)g_img);
     }
     g_delta = (u64)g_img - preferred;
 
@@ -18342,6 +18400,7 @@ static void pe_load(const char *path)
                 p += blk->block_sz;
             }
             printf("[PE]  %u reloc entries patched (delta=+0x%lx)\n", npatched, g_delta);
+            nt2->opt.imagebase = (u64)g_img;       /* the Windows loader records the real base in the header */
         } else {
             fprintf(stderr, "[WARN] No reloc table — image may malfunction at non-preferred base\n");
         }
@@ -18679,7 +18738,10 @@ static u64 call_guest_nested(GuestNtCall fn, u64 a0, u64 a1, u64 a2, u64 a3, u64
 static GuestNtCall hooked_ntdll(const char *name)
 {
     u64 address = fake_pe_export_address(HMOD_NTDLL, name);
-    if (!address || *(const u8 *)address == 0x48) return NULL;   /* unmodified stub starts with mov rax,imm64 */
+    const u8 *stub = (const u8 *)address;
+    /* An unmodified stub is the one fake_pe_exports_build wrote: "xchg ax,ax; mov rax,imm64; jmp rax". */
+    if (!address || (stub[0] == 0x66 && stub[1] == 0x90 && stub[2] == 0x48 && stub[3] == 0xB8 && stub[12] == 0xFF && stub[13] == 0xE0))
+        return NULL;
     return (GuestNtCall)(uintptr_t)address;
 }
 
@@ -21127,6 +21189,20 @@ static void beer_context_to_ucontext(ucontext_t *uc, const u8 *context)
     uc->uc_mcontext.gregs[REG_RIP] = (greg_t)*(const u64 *)(context + 0xf8);
 }
 
+/* "int 2dh" (debugger service, used by protection code to see whether an exception handler turns it into a breakpoint)
+ * and "int 2ch" (assertion failure) fault as general-protection SIGSEGVs on Linux.  Windows reports them as
+ * EXCEPTION_BREAKPOINT / STATUS_ASSERTION_FAILURE with the context already past the two-byte instruction.  Returns 1
+ * and sets *code when the faulting instruction is one of them. */
+static int beer_decode_int_trap(const ucontext_t *uc, const siginfo_t *si, u32 *code)
+{
+    if (!si || si->si_code <= 0) return 0;                 /* a real memory fault, not a trap instruction */
+    const u8 *ip = (const u8 *)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    if (!is_valid_resume_target((u64)(uintptr_t)ip) || ip[0] != 0xCD) return 0;
+    if (ip[1] == 0x2d) { *code = 0x80000003u; return 1; }
+    if (ip[1] == 0x2c) { *code = 0xC0000420u; return 1; }
+    return 0;
+}
+
 static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, ucontext_t *uc)
 {
     if (g_delivering_vectored_exception) return 0;
@@ -21134,8 +21210,15 @@ static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, ucontext_t *uc)
     BeerExceptionRecord64 record;
     memset(&record, 0, sizeof(record));
     record.code = beer_signal_exception_code(sig);
+    const greg_t original_rip = uc->uc_mcontext.gregs[REG_RIP];
+    u32 trap_code = 0;
+    const int is_int_trap = sig == SIGSEGV && beer_decode_int_trap(uc, si, &trap_code);
+    if (is_int_trap) {
+        record.code = trap_code;
+        uc->uc_mcontext.gregs[REG_RIP] += 2;               /* the context points past "int 2dh" */
+    }
     record.address = (u64)uc->uc_mcontext.gregs[REG_RIP];
-    if (sig == SIGSEGV || sig == SIGBUS) {
+    if (!is_int_trap && (sig == SIGSEGV || sig == SIGBUS)) {
         u64 fault = (u64)si->si_addr;
         u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
         record.parameter_count = 2;
@@ -21149,7 +21232,7 @@ static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, ucontext_t *uc)
     g_delivering_vectored_exception = 1;
     int handled = beer_veh_dispatch(&pointers);
     g_delivering_vectored_exception = 0;
-    if (!handled) return 0;
+    if (!handled) { uc->uc_mcontext.gregs[REG_RIP] = original_rip; return 0; }
 
     beer_context_to_ucontext(uc, context);
     g_cycle_hist_n = 0;
@@ -21177,8 +21260,15 @@ static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
     BeerExceptionRecord64 record;
     memset(&record, 0, sizeof(record));
     record.code = beer_signal_exception_code(sig);
+    const greg_t original_rip = uc->uc_mcontext.gregs[REG_RIP];
+    u32 trap_code = 0;
+    const int is_int_trap = sig == SIGSEGV && beer_decode_int_trap(uc, si, &trap_code);
+    if (is_int_trap) {
+        record.code = trap_code;
+        uc->uc_mcontext.gregs[REG_RIP] += 2;               /* the context points past "int 2dh" */
+    }
     record.address = (u64)uc->uc_mcontext.gregs[REG_RIP];
-    if (sig == SIGSEGV || sig == SIGBUS) {
+    if (!is_int_trap && (sig == SIGSEGV || sig == SIGBUS)) {
         u64 fault = (u64)si->si_addr;
         u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
         record.parameter_count = 2;
@@ -21207,7 +21297,7 @@ static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
         }
         fputc('\n', stderr);
     }
-    if (!handled) return 0;
+    if (!handled) { uc->uc_mcontext.gregs[REG_RIP] = original_rip; return 0; }
 
     beer_context_to_ucontext(uc, context);
     g_cycle_hist_n = 0;
