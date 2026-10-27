@@ -10138,6 +10138,17 @@ typedef struct {
     u64 hEvent;
 } WIN_OVERLAPPED;
 
+/* BEER_PIPE_DIAGNOSTICS=1: hex-dumps the first bytes of every named-pipe transfer. */
+static void beer_pipe_dump(const char *dir, u64 h, const void *buf, ssize_t n)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("BEER_PIPE_DIAGNOSTICS") != NULL;
+    if (!enabled) return;
+    fprintf(stderr, "[PIPE] %s h=0x%llx %zd bytes:", dir, (unsigned long long)h, n);
+    for (ssize_t i = 0; i < n && i < 96; ++i) fprintf(stderr, " %02x", ((const u8 *)buf)[i]);
+    fputc('\n', stderr);
+}
+
 static u64 __attribute__((ms_abi))
 impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
 {
@@ -10155,6 +10166,7 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
         fd = fh_get(h);     /* adopting a client replaces the descriptor */
         /* Pipes have no file position: overlapped reads complete synchronously. */
         do { received = read(fd, buf, n); } while (received < 0 && errno == EINTR);
+        beer_pipe_dump("read", h, buf, received);
         if (overlapped) {
             overlapped->Internal = received < 0 ? (u64)(u32)errno : 0;
             overlapped->InternalHigh = received < 0 ? 0 : (u64)received;
@@ -14027,6 +14039,7 @@ impl_WriteFile(u64 h, const void *buf, u32 n, u32 *written, u64 ov)
         fd = fh_get(h);
     }
     ssize_t r = write(fd, buf, n);
+    if (beer_pipe_is_pipe(h)) beer_pipe_dump("write", h, buf, r);
     if (r < 0 && beer_pipe_is_pipe(h)) g_last_error = 232;      /* ERROR_NO_DATA: the other end is closing */
     if (written) *written = (u32)(r < 0 ? 0 : r);
     return r >= 0 ? 1 : 0;

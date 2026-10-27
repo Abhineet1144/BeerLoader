@@ -993,3 +993,17 @@ Fixed (all generic):
 **Open: copy-protection (Arxan) crash after ~24 s / ~190 frames.** An obfuscated guard stub in the second `.text` (RVA 0x6033000+, e.g. 0x1470a411b `mov %rax,(%rcx)`) overwrites its caller's return address (slot at `rbp+8` of the calling frame) with `0x186d30a12`; the `ret` then jumps there (RIP=FA=0x186d30a12, thread != main). The value is identical in every run and with ASLR on or off, so it is a pure function of the image/environment, and it is exactly `0x146d30a12 + 0x40000000` (0x146d30a12 is a valid in-image address, so something contributes +0x40000000 too much; candidates: a Win32 constant or an API result that is 0x4000xxxx here, e.g. our fake export/trampoline addresses live at 0x40dc....). The routine is control-flow-flattened (`push rbp; lea rbp,[..]; xchg rbp,(rsp); ret` gadgets), so find the inputs dynamically: record with gdb (`record full` from a breakpoint just before the guard runs), or compare a run of the same exe under Wine. The stubs `UuidCreateSequential`, `GetSystemDefaultLocaleName`, `OpenProcessToken/AdjustTokenPrivileges`, `WinVerifyTrust`, `EventRegister`, `HeapSetInformation`, `SetHandleCount` are still zero-return stubs and are the first candidates (output buffers left uninitialised).
 
 Handy: `tests/vulkan_guest` still passes after all of this; `make` can fail with "glslc: No such file" because something deletes the tracked `.spv` files (restore: `git restore -- renderer/vulkan/shaders/*.spv`).
+
+## Session 5 addendum: why RDR2 shows "Social Club failed to load"
+
+- The game never touches the registry or the Launcher pipe for this. Right before the dialog the game main thread calls
+  `SHGetSpecialFolderPathA(CSIDL 0x26)` and then `GetFileAttributesW("C:\Program Files\Rockstar Games\Social Club\socialclub.dll")`
+  (string table in RDR2.exe also holds `\Rockstar Games\`, `Social Club`, `Social Club Debug`, `\socialclub.dll`).
+  The prefix's `Program Files` is empty, so the check fails (0xffffffff) and the game shows the error.
+- The dialog itself says Accept opens Rockstar support and then quits, Cancel quits: with a missing Social Club both buttons end the game by design.
+  So Enter -> quit is the game's intended behaviour, not an input bug.
+- Fix needed: a real Social Club install in the prefix (`socialclub.dll` etc. under `drive_c/Program Files/Rockstar Games/Social Club`).
+  The repack does not ship it (`_Redist` has only DirectX/VC++ redistributables).
+- New diagnostics: `BEER_PIPE_DIAGNOSTICS=1` hex-dumps named-pipe traffic (the game never connects to `RDR2Launcher_Pipe`);
+  control-socket `mem_regions`/`mem_read` can be used to search the live process for strings (ptrace/`/proc/pid/mem` are blocked by Yama).
+- Note: heavy `BEER_API_TRACE` runs change timing; one traced run crashed after audio init, untraced runs did not.
