@@ -1122,3 +1122,22 @@ Static findings (1911.dll and the dumped game image):
 - `BEER_THUNK_NAMES=1` prints thunk index/address/name.
 - New: the executable's own TLS callbacks now get DLL_THREAD_ATTACH/DETACH on new threads (Windows does; Arxan's per-thread anti-debug runs there). Only NtQueryInformationProcess class 0x1e is seen per thread (Proton also does 7 and 0x1f); `BEER_NO_EXE_THREAD_TLS=1` disables.
 - Still open: 1911's `_beginthreadex` site (1911.dll+0x5ea1d) never runs in Beer; ACTIVATION REQUIRED persists. Proton's startup threads (net poll / DXVK display query / cfg.dat+whoami) are not reproduced.
+
+### Session 5 addendum 10 – ACTIVATION REQUIRED fixed (game reaches Brightness Calibration)
+Root cause: RAGE reads the crack's offline activation (`%APPDATA%\.1911\Red Dead Redemption 2\profile\cfg.dat`) through
+its own hook-proof file path: function 0x1425b7da4 validates the PEB (BeingDebugged == 0, **PEB->Ldr->Length == 0x58**),
+walks `InLoadOrderModuleList` hashing lowercased BaseDllName (FNV-1a 64) to find ntdll/kernel32/**kernelbase**, parses
+their export tables by name hash, then calls LdrLockLoaderLock / RtlGetNtVersionNumbers / RtlInitUnicodeString /
+NtCreateFile / NtReadFile directly (Proton relay: `NtCreateFile(... cfg.dat) ret=1424eb30d`). In Beer the check returned
+2 (Ldr Length was 0x40), then 8 (RtlGetNtVersionNumbers not exported) → cfg.dat never read → activation dialog.
+Found with: `BEER_CALLER_MATCH` call chains, `BEER_BP` with fast polling (`BEER_BP_POLL_US`, code is decrypted only while
+it runs), Wine `RelayInclude` on ntdll functions, and a hash scan of the decrypted RDR2 image against every Proton
+system-DLL export (lists all by-hash imports: GetSystemFirmwareTable, LdrGetDllHandle, LdrGetProcedureAddress,
+LdrLock/UnlockLoaderLock, NtClose, NtCreateFile, NtQueryInformationProcess, NtQuerySystemInformation,
+NtQueryVirtualMemory, NtReadFile, RtlAnsiStringToUnicodeString, RtlGetNtVersionNumbers, RtlInitUnicodeString).
+Generic fixes:
+- PEB_LDR_DATA is the real 0x58 bytes (Length 0x58); LDR entries padded to the Win10 size with Flags/LoadCount/HashLinks/TimeDateStamp; KERNELBASE.dll entry added (same fake image as kernel32).
+- New exports: RtlGetNtVersionNumbers, LdrLockLoaderLock/LdrUnlockLoaderLock, RtlAnsiStringToUnicodeString, GetSystemFirmwareTable/EnumSystemFirmwareTables (SMBIOS from /sys/class/dmi/id).
+- RtlLookupFunctionEntry searches every guest DLL's .pdata, not only the EXE's.
+- ntdll Nt*/Zw* fake exports now begin like Windows syscall stubs (`mov r10,rcx; mov eax,ssn`); guest `syscall` with those numbers is emulated through a seccomp SIGSYS trap (Proton has the same for RDR2). Every guest thread gets a signal stack.
+- Diagnostics: BEER_HWBP (needs perf_event_paranoid<=2), BEER_CALLER_MATCH, BEER_CHAIN_DEPTH, BEER_SYSCALL_DIAGNOSTICS.

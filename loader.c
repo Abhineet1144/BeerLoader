@@ -43,6 +43,12 @@
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
+#include <sys/prctl.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
 #include <time.h>
 #include <ucontext.h>
 #include <wctype.h>
@@ -1917,15 +1923,17 @@ static u64 __attribute__((ms_abi))
 impl_RtlLookupFunctionEntry(u64 ControlPc, u64 *ImageBase, void *History)
 {
     (void)History;
-    NtHdrs64 *nt  = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
-    u64 base = (u64)g_img;
-    u64 top  = base + nt->opt.sz_image;
-
-    if (ControlPc >= base && ControlPc < top) {
+    /* The executable and every loaded guest DLL: stack walks and C++ unwinding pass through runtime and plugin DLLs. */
+    for (int module = -1; module < g_guest_dll_count; ++module) {
+        u8 *image = module < 0 ? g_img : g_guest_dlls[module].image;
+        if (!image) continue;
+        NtHdrs64 *nt  = (NtHdrs64 *)(image + ((DosHdr *)image)->lfanew);
+        u64 base = (u64)image;
+        if (ControlPc < base || ControlPc >= base + nt->opt.sz_image) continue;
         u32 rva = (u32)(ControlPc - base);
         DataDir *pd = &nt->opt.dirs[3]; /* IMAGE_DIRECTORY_ENTRY_EXCEPTION */
         if (pd->size) {
-            RUNTIME_FUNC *funcs = (RUNTIME_FUNC *)(g_img + pd->rva);
+            RUNTIME_FUNC *funcs = (RUNTIME_FUNC *)(image + pd->rva);
             int lo = 0, hi = (int)(pd->size / sizeof(RUNTIME_FUNC)) - 1;
             while (lo <= hi) {
                 int mid = (lo + hi) / 2;
@@ -1937,6 +1945,7 @@ impl_RtlLookupFunctionEntry(u64 ControlPc, u64 *ImageBase, void *History)
                 }
             }
         }
+        break;
     }
 
     return (u64)(uintptr_t)beer_lookup_dynamic_function_entry(ControlPc, ImageBase);
@@ -2536,6 +2545,61 @@ static void fake_pe_header_init(u64 base, const char *name)
 static void fake_pe_exports_build(void);
 static const char **g_fake_pe_names;        /* sorted export names, identical for every fake system module */
 static size_t g_fake_pe_count;
+
+/* Direct system calls from guest code. Packers and cracks (Arxan, RDR2's 1911.dll) locate ntdll's Nt* stubs, read the
+ * service number and execute `syscall` themselves so that user-mode hooks are bypassed. Beer's ntdll stubs carry
+ * service numbers BEER_SSN_BASE+i, a range Linux never assigns; a seccomp filter turns exactly those numbers into
+ * SIGSYS and the handler runs the export's implementation with the Windows convention (r10, rdx, r8, r9, then the
+ * caller's stack from rsp+0x28), returning the NTSTATUS in rax. Host system calls are untouched. */
+#define BEER_SSN_BASE  0x1000u
+#define BEER_SSN_COUNT 0x3000u
+static u64 g_ssn_impl[BEER_SSN_COUNT];
+static void beer_syscall_trap(int sig, siginfo_t *si, void *uctx)
+{
+    (void)sig;
+    ucontext_t *uc = uctx;
+    greg_t *r = uc->uc_mcontext.gregs;
+    u32 nr = (u32)si->si_syscall;
+    u64 fn = (nr >= BEER_SSN_BASE && nr < BEER_SSN_BASE + BEER_SSN_COUNT) ? g_ssn_impl[nr - BEER_SSN_BASE] : 0;
+    if (getenv("BEER_SYSCALL_DIAGNOSTICS")) {
+        static _Atomic(u32) logged;
+        if (atomic_fetch_add(&logged, 1) < 400) {
+            char line[160];
+            int n = snprintf(line, sizeof(line), "[SYSCALL] guest ssn 0x%x -> %s from 0x%llx\n", nr,
+                             nr - BEER_SSN_BASE < g_fake_pe_count && g_fake_pe_names ? g_fake_pe_names[nr - BEER_SSN_BASE] : "?",
+                             (unsigned long long)r[REG_RIP]);
+            if (n > 0) { ssize_t ignored = write(2, line, (size_t)n); (void)ignored; }
+        }
+    }
+    if (!fn) { r[REG_RAX] = (greg_t)0xC000001Cu; return; }      /* STATUS_INVALID_SYSTEM_SERVICE */
+    const u64 *stack = (const u64 *)(uintptr_t)r[REG_RSP];
+    typedef u64 __attribute__((ms_abi)) (*NtFn)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+    r[REG_RAX] = (greg_t)((NtFn)(uintptr_t)fn)((u64)r[REG_R10], (u64)r[REG_RDX], (u64)r[REG_R8], (u64)r[REG_R9],
+                                              stack[5], stack[6], stack[7], stack[8], stack[9], stack[10], stack[11],
+                                              stack[12], stack[13], stack[14]);
+}
+static void beer_syscall_emulation_start(void)
+{
+    if (getenv("BEER_NO_SYSCALL_EMULATION")) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = beer_syscall_trap;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigaction(SIGSYS, &sa, NULL);
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 4),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, BEER_SSN_BASE, 0, 2),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, BEER_SSN_BASE + BEER_SSN_COUNT, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog program = { (unsigned short)(sizeof(filter) / sizeof(*filter)), filter };
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+        syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &program) != 0)
+        fprintf(stderr, "[SYSCALL] guest syscall emulation unavailable: %s\n", strerror(errno));
+}
 static u32 g_fake_pe_stub_offset;
 static volatile int g_fake_pe_ready;
 /* Address of the export-table entry for `name` in a fake system module, or 0. Protectors hook the
@@ -3239,11 +3303,21 @@ static void dbg_dump_guest_callchain(const char *tag) {
     fprintf(stderr, "[CHAIN:%s] rsp=0x%lx\n", tag, rsp);
     u64 *sp = (u64 *)rsp;
     int printed = 0;
-    for (int i = 0; i < 200 && printed < 24; i++) {
+    int depth = getenv("BEER_CHAIN_DEPTH") ? atoi(getenv("BEER_CHAIN_DEPTH")) : 24;
+    for (int i = 0; i < depth * 10 && printed < depth; i++) {
         u64 v = sp[i];
         if (v >= (u64)g_img && v < (u64)g_img + g_img_size) {
             fprintf(stderr, "[CHAIN:%s]   [%3d] img+0x%lx\n", tag, i, v - (u64)g_img);
             printed++;
+            continue;
+        }
+        for (int d = 0; d < g_guest_dll_count; ++d) {
+            const GuestDll *dll = &g_guest_dlls[d];
+            if (dll->image && v >= (u64)dll->image && v < (u64)dll->image + dll->image_size) {
+                fprintf(stderr, "[CHAIN:%s]   [%3d] %s+0x%lx\n", tag, i, dll->name, v - (u64)dll->image);
+                printed++;
+                break;
+            }
         }
     }
 }
@@ -3608,6 +3682,15 @@ static u64 fill_windows_version(WIN_OSVERSIONINFOEXW *info)
 }
 static u64 __attribute__((ms_abi)) impl_RtlGetVersion(WIN_OSVERSIONINFOEXW *info)
     { return fill_windows_version(info); }
+/* Undocumented but widely used (RAGE resolves it by hash): same version as RtlGetVersion; the build carries the
+ * 0xF0000000 "free build" marker, as on Windows. */
+static u64 __attribute__((ms_abi)) impl_RtlGetNtVersionNumbers(u32 *major, u32 *minor, u32 *build)
+{
+    if (major) *major = 10;
+    if (minor) *minor = 0;
+    if (build) *build = 0xF0000000u | 19045u;
+    return 0;
+}
 static u64 __attribute__((ms_abi)) impl_GetVersionExW(WIN_OSVERSIONINFOEXW *info)
 {
     if (!info || (info->size != 276 && info->size != 284)) { g_last_error = 87; return 0; }
@@ -17573,6 +17656,7 @@ static ImplEntry g_impls[] = {
     {"VerSetConditionMask",                     (ImplFn)impl_VerSetConditionMask},
     {"VerifyVersionInfoW",                      (ImplFn)impl_VerifyVersionInfoW},
     {"RtlGetVersion",                           (ImplFn)impl_RtlGetVersion},
+    {"RtlGetNtVersionNumbers",                  (ImplFn)impl_RtlGetNtVersionNumbers},
     {"GetVersionExW",                           (ImplFn)impl_GetVersionExW},
     {"GetVersionExA",                           (ImplFn)impl_GetVersionExA},
     {"WinHttpCheckPlatform",                    (ImplFn)impl_WinHttpCheckPlatform},
@@ -18470,9 +18554,22 @@ static void fake_pe_exports_build(void)
              * walks ntdll/kernel32 exports follows it, sees a target outside the module and reports tampering. The
              * leading two-byte nop keeps the stub from matching that pattern (real exports begin with ordinary
              * prologues) and costs nothing. */
+            if (modules[m].base == HMOD_NTDLL && i < BEER_SSN_COUNT &&
+                (!strncmp(names[i], "Nt", 2) || !strncmp(names[i], "Zw", 2))) {
+                /* Windows syscall stub prefix: code that bypasses hooks reads the service number at +4 and issues
+                 * `syscall` itself; beer_syscall_trap maps the number back to this export. */
+                u64 thunk = targets[i];
+                if (thunk >= (u64)(uintptr_t)g_tramp && thunk < (u64)(uintptr_t)g_tramp + (u64)MAX_STUBS * THUNK_SZ)
+                    g_ssn_impl[i] = g_impl_real[(thunk - (u64)(uintptr_t)g_tramp) / THUNK_SZ];
+                stub[0] = 0x4C; stub[1] = 0x8B; stub[2] = 0xD1;                   /* mov r10, rcx */
+                stub[3] = 0xB8; *(u32 *)(stub + 4) = BEER_SSN_BASE + (u32)i;       /* mov eax, ssn */
+                stub[8] = 0x48; stub[9] = 0xB8; *(u64 *)(stub + 10) = targets[i];  /* mov rax, imm64 */
+                stub[18] = 0xFF; stub[19] = 0xE0;                                  /* jmp rax */
+            } else {
             stub[0] = 0x66; stub[1] = 0x90;                                    /* xchg ax, ax */
             stub[2] = 0x48; stub[3] = 0xB8; *(u64 *)(stub + 4) = targets[i];   /* mov rax, imm64 */
             stub[12] = 0xFF; stub[13] = 0xE0;                                  /* jmp rax */
+            }
             *(u32 *)(p + funcs + i * 4) = stubs + (u32)(i * FAKE_PE_STUB_SLOT);
             strings += (u32)len;
         }
@@ -19104,8 +19201,11 @@ static GuestNtCall hooked_ntdll(const char *name)
 {
     u64 address = fake_pe_export_address(HMOD_NTDLL, name);
     const u8 *stub = (const u8 *)address;
-    /* An unmodified stub is the one fake_pe_exports_build wrote: "xchg ax,ax; mov rax,imm64; jmp rax". */
-    if (!address || (stub[0] == 0x66 && stub[1] == 0x90 && stub[2] == 0x48 && stub[3] == 0xB8 && stub[12] == 0xFF && stub[13] == 0xE0))
+    /* An unmodified stub is one fake_pe_exports_build wrote: "xchg ax,ax; mov rax,imm64; jmp rax", or for Nt/Zw
+     * exports "mov r10,rcx; mov eax,ssn; mov rax,imm64; jmp rax". */
+    if (!address || (stub[0] == 0x66 && stub[1] == 0x90 && stub[2] == 0x48 && stub[3] == 0xB8 && stub[12] == 0xFF && stub[13] == 0xE0) ||
+        (stub[0] == 0x4C && stub[1] == 0x8B && stub[2] == 0xD1 && stub[3] == 0xB8 && stub[8] == 0x48 && stub[9] == 0xB8 &&
+         stub[18] == 0xFF && stub[19] == 0xE0))
         return NULL;
     return (GuestNtCall)(uintptr_t)address;
 }
@@ -19613,7 +19713,11 @@ typedef struct {
     WinListEntry InLoadOrderModuleList;          /* +0x010 */
     WinListEntry InMemoryOrderModuleList;        /* +0x020 */
     WinListEntry InInitializationOrderModuleList;/* +0x030 */
-} WinPebLdrData;
+    u64 EntryInProgress;                         /* +0x040 */
+    u8  ShutdownInProgress;                      /* +0x048 */
+    u8  _pad1[7];
+    u64 ShutdownThreadId;                        /* +0x050 */
+} WinPebLdrData;                                 /* 0x58: protection code checks Length == 0x58 */
 
 /* Windows code routinely walks PEB->Ldr directly before calling a loader API.
  * Empty list heads are not a harmless approximation: module discovery then
@@ -19629,6 +19733,12 @@ typedef struct {
     u32 _pad0;
     WinUnicodeString FullDllName;            /* +0x048 */
     WinUnicodeString BaseDllName;            /* +0x058 */
+    u32 Flags;                               /* +0x068 */
+    u16 ObsoleteLoadCount;                   /* +0x06c */
+    u16 TlsIndex;                            /* +0x06e */
+    WinListEntry HashLinks;                  /* +0x070 */
+    u32 TimeDateStamp;                       /* +0x080 */
+    u8  _rest[0x120 - 0x84];                 /* remaining Win10 fields, zero */
 } WinLdrDataTableEntry;
 
 _Static_assert(offsetof(WinPebLdrData, InLoadOrderModuleList) == 0x10,
@@ -19637,6 +19747,8 @@ _Static_assert(offsetof(WinLdrDataTableEntry, DllBase) == 0x30,
                "LDR module base offset");
 _Static_assert(offsetof(WinLdrDataTableEntry, FullDllName) == 0x48,
                "LDR full name offset");
+_Static_assert(sizeof(WinPebLdrData) == 0x58, "PEB_LDR_DATA size");
+_Static_assert(offsetof(WinLdrDataTableEntry, HashLinks) == 0x70, "LDR hash links offset");
 
 typedef struct {
     u32 Length;                     /* +0x000 */
@@ -19771,6 +19883,18 @@ static void *alloc_teb_for_thread(void)
     if (host_stack == MAP_FAILED) { perror("mmap(host_call_stack)"); _exit(2); }
     u64 host_stack_base = (u64)host_stack;
     u64 host_stack_top = ((u64)host_stack + HOST_CALL_STACK_SIZE - 256) & ~0xFULL;
+
+    /* Signal handlers (guest faults, emulated syscalls) must not run on a guest thread's stack, which can be 16 KiB. */
+    {
+        stack_t current;
+        if (sigaltstack(NULL, &current) == 0 && (current.ss_flags & SS_DISABLE)) {
+            void *alt = mmap(NULL, 256 << 10, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (alt != MAP_FAILED) {
+                stack_t ss = { .ss_sp = alt, .ss_size = 256 << 10, .ss_flags = 0 };
+                sigaltstack(&ss, NULL);
+            }
+        }
+    }
 
     WinTEB *teb = mmap(NULL, sizeof(WinTEB), PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -19914,6 +20038,7 @@ static void init_peb_loader_data(WinPebLdrData *ldr)
     } emulated_modules[] = {
         { "C:\\Windows\\System32\\ntdll.dll",    HMOD_NTDLL },
         { "C:\\Windows\\System32\\kernel32.dll", HMOD_K32 },
+        { "C:\\Windows\\System32\\KERNELBASE.dll", HMOD_K32 },   /* same fake image; looked up by name hash */
         { "C:\\Windows\\System32\\user32.dll",   HMOD_USER32 },
         { "C:\\Windows\\System32\\advapi32.dll", HMOD_ADVAPI },
     };
@@ -19961,6 +20086,13 @@ static void init_peb_loader_data(WinPebLdrData *ldr)
 
         entry->DllBase = image_base;
         entry->EntryPoint = entry_point;
+        entry->Flags = index ? 0x000CC004u : 0x00004000u;   /* DLLs: IMAGE_DLL|ENTRY_PROCESSED|PROCESS_ATTACH_CALLED|...; exe: ENTRY_PROCESSED */
+        entry->ObsoleteLoadCount = 0xFFFF;
+        entry->HashLinks.Flink = entry->HashLinks.Blink = (u64)(uintptr_t)&entry->HashLinks;
+        if (image_base) {
+            const DosHdr *dh = (const DosHdr *)(uintptr_t)image_base;
+            if (dh->magic == MZ_MAGIC) entry->TimeDateStamp = ((const NtHdrs64 *)(uintptr_t)(image_base + dh->lfanew))->file.timestamp;
+        }
         entry->SizeOfImage = image_size > UINT32_MAX ? UINT32_MAX : (u32)image_size;
         entry->FullDllName.Buffer = (u64)(uintptr_t)
             win16_dup_ascii(full_name, &entry->FullDllName.Length);
@@ -21749,7 +21881,8 @@ static int beer_breakpoint_hit(ucontext_t *uc)
         g_breakpoints[i].armed = 0;
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)at;
         const u64 *stack = (const u64 *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
-        fprintf(stderr, "[BP] hit 0x%llx tid %ld rcx=%llx rdx=%llx r8=%llx r9=%llx\n", (unsigned long long)at, (long)syscall(SYS_gettid),
+        fprintf(stderr, "[BP] hit 0x%llx tid %ld rax=%llx rcx=%llx rdx=%llx r8=%llx r9=%llx\n", (unsigned long long)at, (long)syscall(SYS_gettid),
+                (unsigned long long)uc->uc_mcontext.gregs[REG_RAX],
                 (unsigned long long)uc->uc_mcontext.gregs[REG_RCX], (unsigned long long)uc->uc_mcontext.gregs[REG_RDX],
                 (unsigned long long)uc->uc_mcontext.gregs[REG_R8], (unsigned long long)uc->uc_mcontext.gregs[REG_R9]);
         int shown = 0;
@@ -21773,7 +21906,11 @@ static void *beer_breakpoint_thread(void *unused)
     if (fd < 0) return NULL;
     g_breakpoint_memfd = fd;
     /* "addr:XX" arms only once the first byte of the (possibly still encrypted) code is the expected one; retries for 3 minutes. */
-    for (int round = 0; round < 360; ++round) {
+    const char *poll = getenv("BEER_BP_POLL_US");     /* faster polling catches code decrypted only while it runs */
+    useconds_t interval = poll ? (useconds_t)atoi(poll) : 500000;
+    if (!interval) interval = 1;
+    u64 rounds = 180000000ull / interval;
+    for (u64 round = 0; round < rounds; ++round) {
         int pending = 0;
         for (int i = 0; i < g_breakpoint_count; ++i) {
             if (g_breakpoints[i].armed || g_breakpoints[i].original == 0xFF) continue;
@@ -21793,7 +21930,7 @@ static void *beer_breakpoint_thread(void *unused)
             }
         }
         if (!pending) break;
-        usleep(500000);
+        usleep(interval);
     }
     return NULL;
 }
@@ -21816,6 +21953,67 @@ static void beer_breakpoints_start(void)
     }
     pthread_t thread;
     if (g_breakpoint_count && pthread_create(&thread, NULL, beer_breakpoint_thread, NULL) == 0) pthread_detach(thread);
+}
+
+/* BEER_HWBP="0xaddr,0xaddr" (up to 4): hardware execute breakpoints through perf_event_open. Unlike BEER_BP they do
+ * not touch code bytes, so they work on code that a packer decrypts, runs and re-encrypts. Installed on the main
+ * thread before any guest thread exists and inherited by every thread created later; each hit logs the registers and
+ * the code-looking stack values (first 8 hits per address). */
+static u64 g_hw_breakpoints[4];
+static _Atomic(u32) g_hw_breakpoint_hits[4];
+static int g_hw_breakpoint_count;
+static int beer_hw_breakpoint_hit(siginfo_t *si, ucontext_t *uc)
+{
+    if (si->si_code != TRAP_PERF) return 0;
+    u64 at = (u64)uc->uc_mcontext.gregs[REG_RIP];
+    for (int i = 0; i < g_hw_breakpoint_count; ++i) {
+        if (g_hw_breakpoints[i] != at) continue;
+        if (atomic_fetch_add(&g_hw_breakpoint_hits[i], 1) >= 8) return 1;
+        greg_t *r = uc->uc_mcontext.gregs;
+        fprintf(stderr, "[HWBP] hit 0x%llx tid %ld rax=%llx rcx=%llx rdx=%llx r8=%llx r9=%llx rbx=%llx rsi=%llx rdi=%llx\n",
+                (unsigned long long)at, (long)syscall(SYS_gettid), (unsigned long long)r[REG_RAX],
+                (unsigned long long)r[REG_RCX], (unsigned long long)r[REG_RDX], (unsigned long long)r[REG_R8],
+                (unsigned long long)r[REG_R9], (unsigned long long)r[REG_RBX], (unsigned long long)r[REG_RSI],
+                (unsigned long long)r[REG_RDI]);
+        const u64 *stack = (const u64 *)(uintptr_t)r[REG_RSP];
+        int shown = 0;
+        for (int k = 0; k < 300 && shown < 12; ++k) {
+            u64 v = stack[k];
+            if ((v >= 0x140000000ull && v < 0x148000000ull) || (v >= 0x7ffff5000000ull && v < 0x7ffff9000000ull)) {
+                fprintf(stderr, "[HWBP]   [%3d] 0x%llx\n", k, (unsigned long long)v);
+                ++shown;
+            }
+        }
+        return 1;
+    }
+    return 1;      /* a perf trap for an address no longer listed: nothing to do */
+}
+static void beer_hw_breakpoints_start(void)
+{
+    const char *list = getenv("BEER_HWBP");
+    if (!list || !*list) return;
+    char copy[256]; snprintf(copy, sizeof(copy), "%s", list);
+    for (char *tok = strtok(copy, ","); tok && g_hw_breakpoint_count < 4; tok = strtok(NULL, ",")) {
+        u64 address = strtoull(tok, NULL, 0);
+        struct perf_event_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.type = PERF_TYPE_BREAKPOINT;
+        attr.size = sizeof(attr);
+        attr.bp_type = HW_BREAKPOINT_X;
+        attr.bp_addr = address;
+        attr.bp_len = sizeof(long);
+        attr.sample_period = 1;
+        attr.inherit = 1;
+        attr.remove_on_exec = 1;
+        attr.sigtrap = 1;
+        attr.sig_data = (u64)g_hw_breakpoint_count;
+        attr.exclude_kernel = 1;
+        attr.exclude_hv = 1;
+        int fd = (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, PERF_FLAG_FD_CLOEXEC);
+        if (fd < 0) { fprintf(stderr, "[HWBP] 0x%llx: perf_event_open failed: %s\n", (unsigned long long)address, strerror(errno)); continue; }
+        g_hw_breakpoints[g_hw_breakpoint_count++] = address;
+        fprintf(stderr, "[HWBP] armed 0x%llx\n", (unsigned long long)address);
+    }
 }
 
 /* BEER_THREAD_DUMP_AT=<seconds>: once, signal every thread of the process and have each print where it is (code-looking
@@ -21887,6 +22085,7 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     /* Windows calls vectored handlers before frame-based/unhandled exception
      * processing. Give registered guest handlers the original machine context;
      * only use Beer's compatibility recovery when every handler searches on. */
+    if (sig == SIGTRAP && beer_hw_breakpoint_hit(si, uc)) return;
     if (sig == SIGTRAP && beer_breakpoint_hit(uc)) return;
     if (beer_dispatch_signal_to_veh(sig, si, uc)) return;
     if (beer_dispatch_signal_to_seh(sig, si, uc)) return;
@@ -24667,6 +24866,8 @@ int main(int argc, char **argv)
     sigaction(SIGILL,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);  /* int3 / abort() in Windows CRT */
+    beer_syscall_emulation_start();
+    beer_hw_breakpoints_start();
     
     pe_imports();
     setup_teb_peb();

@@ -336,6 +336,92 @@ static u64 __attribute__((ms_abi)) stub_RtlFreeUnicodeString(u16 *us)
     *(u16 **)(void *)((u8 *)us + 8) = NULL;
     return 0;
 }
+/* ANSI_STRING -> UNICODE_STRING (ANSI code page treated as Latin-1/ASCII, like the rest of Beer's narrow paths). */
+static u64 __attribute__((ms_abi)) beer_RtlAnsiStringToUnicodeString(u16 *dst, const u16 *src, u8 allocate)
+{
+    if (!dst || !src) return 0xC000000Du;                          /* STATUS_INVALID_PARAMETER */
+    u32 length = src[0];
+    const u8 *text = *(const u8 * const *)(const void *)((const u8 *)src + 8);
+    u32 bytes = length * 2;
+    if (bytes + 2 > 0xFFFF) return 0x80000005u;                    /* STATUS_BUFFER_OVERFLOW */
+    u16 *buffer;
+    if (allocate) {
+        buffer = (u16 *)(uintptr_t)impl_HeapAlloc(1, 0, bytes + 2);
+        if (!buffer) return 0xC0000017u;                           /* STATUS_NO_MEMORY */
+        dst[1] = (u16)(bytes + 2);
+        *(u16 **)(void *)((u8 *)dst + 8) = buffer;
+    } else {
+        buffer = *(u16 **)(void *)((u8 *)dst + 8);
+        if (!buffer || dst[1] < bytes) return 0x80000005u;
+    }
+    for (u32 i = 0; i < length; ++i) buffer[i] = text ? text[i] : 0;
+    if (dst[1] >= bytes + 2) buffer[length] = 0;
+    dst[0] = (u16)bytes;
+    return 0;
+}
+
+/* SMBIOS ("RSMB") for GetSystemFirmwareTable: BIOS, system and baseboard structures built from /sys/class/dmi/id,
+ * which unprivileged users can read (the raw DMI table needs root). Same approach as Wine. */
+static size_t beer_smbios_string(char *out, size_t room, const char *field, const char *fallback)
+{
+    char path[96], value[128] = "";
+    snprintf(path, sizeof(path), "/sys/class/dmi/id/%s", field);
+    FILE *f = fopen(path, "r");
+    if (f) { if (!fgets(value, sizeof(value), f)) value[0] = 0; fclose(f); }
+    value[strcspn(value, "\n")] = 0;
+    if (!value[0]) snprintf(value, sizeof(value), "%s", fallback);
+    size_t n = strlen(value) + 1;
+    if (n > room) return 0;
+    memcpy(out, value, n);
+    return n;
+}
+static size_t beer_build_smbios(u8 *t, size_t room)
+{
+    size_t n = 0;
+    #define SMB_STR(field, fb) do { size_t k = beer_smbios_string((char *)t + n, room - n, field, fb); if (!k) return 0; n += k; } while (0)
+    if (room < 512) return 0;
+    /* Type 0: BIOS information */
+    u8 *h = t + n; memset(h, 0, 0x18); h[0] = 0; h[1] = 0x18; h[4] = 1; h[5] = 2; h[8] = 3; h[9] = 0xFF;
+    h[10] = 0x08; h[0x14] = 0x03; h[0x15] = 0x0D; n += 0x18;
+    SMB_STR("bios_vendor", "American Megatrends Inc."); SMB_STR("bios_version", "1.0"); SMB_STR("bios_date", "01/01/2020"); t[n++] = 0;
+    /* Type 1: system information (UUID zero: product_uuid is root-only) */
+    h = t + n; memset(h, 0, 0x1B); h[0] = 1; h[1] = 0x1B; h[2] = 1; h[4] = 1; h[5] = 2; h[6] = 3; h[7] = 4;
+    h[0x18] = 6; h[0x19] = 5; h[0x1A] = 6; n += 0x1B;
+    SMB_STR("sys_vendor", "System manufacturer"); SMB_STR("product_name", "System Product Name");
+    SMB_STR("product_version", "1.0"); SMB_STR("product_serial", "Default string");
+    SMB_STR("product_sku", "Default string"); SMB_STR("product_family", "Default string"); t[n++] = 0;
+    /* Type 2: baseboard */
+    h = t + n; memset(h, 0, 0x0F); h[0] = 2; h[1] = 0x0F; h[2] = 2; h[4] = 1; h[5] = 2; h[6] = 3; h[7] = 4; h[8] = 5;
+    h[9] = 0x09; h[0x0D] = 0x0A; n += 0x0F;
+    SMB_STR("board_vendor", "Default string"); SMB_STR("board_name", "Default string"); SMB_STR("board_version", "1.0");
+    SMB_STR("board_serial", "Default string"); SMB_STR("board_asset_tag", "Default string"); t[n++] = 0;
+    /* Type 127: end of table */
+    if (room - n < 6) return 0;
+    h = t + n; h[0] = 127; h[1] = 4; h[2] = 3; h[3] = 0; h[4] = 0; h[5] = 0; n += 6;
+    #undef SMB_STR
+    return n;
+}
+static u64 __attribute__((ms_abi)) beer_GetSystemFirmwareTable(u32 provider, u32 id, u8 *buffer, u32 size)
+{
+    (void)id;
+    if (provider != 0x52534D42u) { g_last_error = 1; return 0; }   /* only 'RSMB'; ERROR_INVALID_FUNCTION */
+    u8 table[2048];
+    size_t length = beer_build_smbios(table, sizeof(table));
+    u32 needed = (u32)(8 + length);                                 /* RawSMBIOSData header */
+    if (!buffer || size < needed) { g_last_error = 122; return needed; }   /* ERROR_INSUFFICIENT_BUFFER */
+    buffer[0] = 0; buffer[1] = 2; buffer[2] = 8; buffer[3] = 0;     /* SMBIOS 2.8 */
+    u32 len32 = (u32)length;
+    memcpy(buffer + 4, &len32, 4);
+    memcpy(buffer + 8, table, length);
+    g_last_error = 0;
+    return needed;
+}
+static u64 __attribute__((ms_abi)) beer_EnumSystemFirmwareTables(u32 provider, u8 *buffer, u32 size)
+{
+    if (provider != 0x52534D42u) { g_last_error = 1; return 0; }
+    if (buffer && size >= 4) memset(buffer, 0, 4);                  /* one table, id 0 */
+    return 4;
+}
 static u64 __attribute__((ms_abi)) stub_RtlInitUnicodeString(u16 *d, const u16 *s){ if(!d) return 0; size_t n=0; if(s) while(s[n]) ++n; d[0]=(u16)(n*2); d[1]=(u16)(s?n*2+2:0); *(const u16 **)(void*)((u8*)d+8)=s; return 0; }
 static u64 __attribute__((ms_abi)) stub_NtOpenSection(void){ return 0xC0000022u; }
 static u64 __attribute__((ms_abi)) stub_RtlInitString(u16 *d, const char *s){ if(!d) return 0; size_t n=0; if(s) while(s[n]) ++n; d[0]=(u16)n; d[1]=(u16)(s?n+1:0); *(const char **)(void*)((u8*)d+8)=s; return 0; }
