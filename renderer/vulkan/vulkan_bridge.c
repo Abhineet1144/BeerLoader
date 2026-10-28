@@ -80,6 +80,7 @@ __asm__(
     "    callq beer_vkbridge_trace_call\n"
     "    popq %rdi\n    popq %rsi\n    popq %r10\n    popq %r9\n    popq %r8\n    popq %rdx\n    popq %rcx\n"
     "1:\n"
+    "    movq %r10, %fs:beer_vk_current@tpoff\n"
     "    movq 0(%r10), %r11\n"
     "    movq 8(%r10), %r10\n"
     "    cmpq $0, %fs:g_host_call_stack_top@tpoff\n"
@@ -137,6 +138,18 @@ __asm__(
     "    movq 0x38(%rbp), %r9\n"
     "    xorl %eax, %eax\n"
     "    callq *%r11\n"
+    /* A failing VkResult command is reported (the guest often treats the failure as fatal without saying so). */
+    "    testl %eax, %eax\n"
+    "    jns 4f\n"
+    "    movq %fs:beer_vk_current@tpoff, %r11\n"
+    "    cmpl $0, 24(%r11)\n"
+    "    je 4f\n"
+    "    movl %eax, %ebx\n"
+    "    movq 16(%r11), %rdi\n"
+    "    movl %eax, %esi\n"
+    "    callq beer_vkbridge_report_error\n"
+    "    movl %ebx, %eax\n"
+    "4:\n"
     "    movups 64(%rsp), %xmm6\n"
     "    movups 80(%rsp), %xmm7\n"
     "    movups 96(%rsp), %xmm8\n"
@@ -158,6 +171,7 @@ __asm__(
 extern char beer_vk_common[];
 extern __thread uint64_t g_host_call_stack_top;
 __thread uint64_t beer_vk_saved_rsp;
+__thread void *beer_vk_current;   /* VkThunk of the command in flight on this thread */
 int beer_vk_trace_level;
 void beer_vkbridge_trace_call(const char *name, uintptr_t guest_return);
 static int trace_calls(void);
@@ -263,7 +277,26 @@ static void *bridge_entry_for(const char *name)
 
 /* Per-command record the thunk points r10 at: the host function (loaded into r11 for the ABI bridge), the entry to run
  * (a bridge label for forwarded commands, the C function for Beer's own overrides) and the name for tracing. */
-typedef struct { void *host; void *entry; const char *name; } VkThunk;
+typedef struct { void *host; void *entry; const char *name; int reports_errors; } VkThunk;
+
+/* Commands whose negative VkResult means a resource or submission failed (queries such as image format support
+ * legitimately return errors and are left out). */
+static int reports_errors(const char *name)
+{
+    static const char *const prefixes[] = {
+        "vkCreate", "vkAllocate", "vkBind", "vkMapMemory", "vkQueueSubmit", "vkQueuePresent", "vkAcquireNextImage",
+        "vkBeginCommandBuffer", "vkEndCommandBuffer", "vkDeviceWaitIdle", "vkQueueWaitIdle", "vkWaitForFences",
+        "vkResetFences", "vkResetCommandPool", "vkResetDescriptorPool", "vkWaitSemaphores",
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i)
+        if (!strncmp(name, prefixes[i], strlen(prefixes[i]))) return 1;
+    return 0;
+}
+
+void beer_vkbridge_report_error(const char *name, int result)
+{
+    fprintf(stderr, "[VKERR] %s -> %d\n", name, result);
+}
 
 static void *make_thunk(const char *name, void *host, void *entry)
 {
@@ -291,6 +324,7 @@ static void *make_thunk(const char *name, void *host, void *entry)
     info->host = host;
     info->entry = entry;
     info->name = strdup(name);
+    info->reports_errors = host && reports_errors(name);
     uint8_t *code = g_thunks + g_thunk_used;
     g_thunk_used += THUNK_SIZE;
     uint64_t record = (uint64_t)(uintptr_t)info, common = (uint64_t)(uintptr_t)beer_vk_common;

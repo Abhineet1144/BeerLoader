@@ -1158,3 +1158,17 @@ On the desktop (DISPLAY=:0) with key injection, RDR2 now goes: legal screens →
 setup → tintype loading screens → opening story cutscene (Colter, Dutch/Hosea/Arthur, opening credits); ~6 minutes with
 no errors. Open issue: in headless mode (BEER_HEADLESS=1, virtual swapchain) the game stops with ERR_GFX_STATE right
 after the intro Bink videos close, i.e. when the 3D renderer starts using the swapchain; desktop runs are unaffected.
+
+### Addendum 13 — RDR2 intermittent start-up crash (2026-10-28)
+
+- A user launch crashed at RIP `0x1426c0d92` reading `[NULL+0x20]` right after `[VKMAP] swapchain ...`: RAGE's
+  buffer factory (`0x14269e2f8` → device vtable `+0x110` = `0x1426980f0` → `0x142670570`) returned false and the
+  caller dereferences the result unchecked. That routine fails on any non-zero result of vkCreateBuffer,
+  vkBindBufferMemory, vkMapMemory and friends, or of its own suballocator.
+- Not reproduced in 23 desktop launches (file output, and pty output drained at terminal speed). GPU memory was ample.
+- The Vulkan bridge now logs `[VKERR] <command> -> <VkResult>` for every failing create/allocate/bind/map/submit/wait
+  command (thread-local current thunk, checked after the host call; costs nothing on success). Normal RDR2 runs show
+  one late `vkAllocateMemory -> -2` and `vkAllocateDescriptorSets -> VK_ERROR_OUT_OF_POOL_MEMORY`, both handled by
+  the game.
+- Separately, 1 of 23 launches hung inside RDR2.exe's Arxan start-up (log stops after `[ENTRY] Before TLS/entry
+  handoff`). Not yet investigated.
