@@ -1116,3 +1116,9 @@ Static findings (1911.dll and the dumped game image):
   `DxDiagProvider` (dxdiagn.dll) and `WbemLocator` and reads `Software\Wine\VR`. With relay enabled the game terminates itself shortly after (`TerminateProcess(-1,0)`
   from 0x140136b29), so relay cannot follow the activation phase.
 - Proton cannot run the game without a desktop session (no DISPLAY -> crash into winedbg within 20 s), so Proton comparisons need the user logged in.
+
+### Session 5 addendum 9 – hooks verified live, exe thread-attach TLS
+- `BEER_BP` now accepts `module.dll+0xoff[:byte]` (resolved once the DLL is mapped) and restores bytes through /proc/self/mem (the old direct write faulted on read-only DLL text, which made earlier "hook never entered" conclusions WRONG). With the fix: 1911's inline hooks (LoadLibraryExW/A, CreateFileW/A, GetFileAttributesW) ARE entered in Beer, via thunk -> detour page 0x3fff0f.. -> 1911 hook fn.
+- `BEER_THUNK_NAMES=1` prints thunk index/address/name.
+- New: the executable's own TLS callbacks now get DLL_THREAD_ATTACH/DETACH on new threads (Windows does; Arxan's per-thread anti-debug runs there). Only NtQueryInformationProcess class 0x1e is seen per thread (Proton also does 7 and 0x1f); `BEER_NO_EXE_THREAD_TLS=1` disables.
+- Still open: 1911's `_beginthreadex` site (1911.dll+0x5ea1d) never runs in Beer; ACTIVATION REQUIRED persists. Proton's startup threads (net poll / DXVK display query / cfg.dat+whoami) are not reproduced.

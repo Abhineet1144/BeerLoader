@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/random.h>
@@ -1330,6 +1331,7 @@ static void emit_thunk(int idx)
 static void emit_impl_thunk(int idx, u64 fn_ptr)
 {
     u8 *p = g_tramp + idx * THUNK_SZ;
+    if (getenv("BEER_THUNK_NAMES")) fprintf(stderr, "[THUNK] %d 0x%llx %s\n", idx, (unsigned long long)(0x40000000ull + (u64)idx * THUNK_SZ), g_snames[idx] ? g_snames[idx] : "?");
     if (g_api_trace < 0) g_api_trace = getenv("BEER_API_TRACE") != NULL;
     g_impl_real[idx] = fn_ptr;
     g_impl_targets[idx] = g_api_trace ? (u64)beer_trace_wrap : fn_ptr;
@@ -19177,8 +19179,27 @@ static u64 virtual_fs_load_library(const char *name)
     return loaded ? (u64)(uintptr_t)loaded->image : 0;
 }
 
+static volatile int g_exe_tls_attached;   /* set once the process-attach pass over the executable's callbacks has finished */
+
+/* The Windows loader hands DLL_THREAD_ATTACH/DETACH to the executable's own TLS callbacks as well; packers (Arxan)
+ * run their per-thread anti-debug checks there, and the thread's real work follows the checks. */
+static void exe_tls_notify_thread(u32 reason)
+{
+    if (!g_exe_tls_attached || !g_img || getenv("BEER_NO_EXE_THREAD_TLS")) return;
+    NtHdrs64 *nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
+    DataDir *directory = &nt->opt.dirs[9];
+    if (directory->size < sizeof(TLS_DIR64)) return;
+    TLS_DIR64 *tls = (TLS_DIR64 *)(g_img + directory->rva);
+    if (!tls->AddrOfCallbacks) return;
+    typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
+    TlsCallback *callbacks = (TlsCallback *)(uintptr_t)tls->AddrOfCallbacks;
+    for (size_t n = 0; n < 64 && callbacks[n]; ++n)
+        callbacks[n](g_img, reason, NULL);
+}
+
 static void guest_dll_notify_thread(u32 reason)
 {
+    if (reason == 2) exe_tls_notify_thread(reason);
     for (int i = 0; i < g_guest_dll_count; ++i) {
         GuestDll *dll = &g_guest_dlls[i];
         if (!dll->entry_called || !dll->image) continue;
@@ -19194,6 +19215,7 @@ static void guest_dll_notify_thread(u32 reason)
             ((DllEntry)(dll->image + nt->opt.entry_rva))(dll->image, reason, NULL);
         }
     }
+    if (reason == 3) exe_tls_notify_thread(reason);
 }
 
 static void guest_dll_initialize_one(GuestDll *dll);
@@ -20188,6 +20210,7 @@ static void __attribute__((ms_abi)) executable_tls_process_attach(void)
     }
     executable_tls_arm_timeout(0);
     sigaction(SIGALRM, &previous_timeout_action, NULL);
+    g_exe_tls_attached = 1;
 }
 
 /* ── Section permissions ────────────────────────────────────────── */
@@ -21713,14 +21736,16 @@ int (*g_beer_lazy_fault_hook)(void *addr);   /* BD11's lazily populated deferred
 /* BEER_BP="0xaddr,0xaddr" (+ BEER_BP_DELAY seconds, default 30): one-shot guest breakpoints for reverse engineering. After the delay an int3 is
  * written at each address; the first hit restores the byte, logs the thread and the code-looking return addresses on
  * the stack, and resumes. Lets a running game be asked "does this function ever run, and who calls it?" without a debugger. */
-static struct { u64 address; u8 original; int armed; int expect; } g_breakpoints[16];
+static struct { u64 address; u8 original; int armed; int expect; char module[48]; u64 offset; } g_breakpoints[16];
 static int g_breakpoint_count;
+static int g_breakpoint_memfd = -1;     /* /proc/self/mem: restores bytes in read-only (DLL text) pages */
 static int beer_breakpoint_hit(ucontext_t *uc)
 {
     u64 at = (u64)uc->uc_mcontext.gregs[REG_RIP] - 1;
     for (int i = 0; i < g_breakpoint_count; ++i) {
         if (!g_breakpoints[i].armed || g_breakpoints[i].address != at) continue;
-        *(volatile u8 *)(uintptr_t)at = g_breakpoints[i].original;
+        if (g_breakpoint_memfd < 0 || pwrite(g_breakpoint_memfd, &g_breakpoints[i].original, 1, (off_t)at) != 1)
+            *(volatile u8 *)(uintptr_t)at = g_breakpoints[i].original;
         g_breakpoints[i].armed = 0;
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)at;
         const u64 *stack = (const u64 *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
@@ -21746,11 +21771,17 @@ static void *beer_breakpoint_thread(void *unused)
     sleep(delay ? (unsigned)atoi(delay) : 30u);
     int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
     if (fd < 0) return NULL;
+    g_breakpoint_memfd = fd;
     /* "addr:XX" arms only once the first byte of the (possibly still encrypted) code is the expected one; retries for 3 minutes. */
     for (int round = 0; round < 360; ++round) {
         int pending = 0;
         for (int i = 0; i < g_breakpoint_count; ++i) {
             if (g_breakpoints[i].armed || g_breakpoints[i].original == 0xFF) continue;
+            if (g_breakpoints[i].module[0]) {                 /* "module.dll+0xoffset": resolve once the DLL is mapped */
+                GuestDll *dll = guest_dll_find(g_breakpoints[i].module);
+                if (!dll || !dll->image) { ++pending; continue; }
+                g_breakpoints[i].address = (u64)(uintptr_t)dll->image + g_breakpoints[i].offset;
+            }
             u8 now;
             if (pread(fd, &now, 1, (off_t)g_breakpoints[i].address) != 1) { ++pending; continue; }
             if (g_breakpoints[i].expect >= 0 && now != (u8)g_breakpoints[i].expect) { ++pending; continue; }
@@ -21764,7 +21795,6 @@ static void *beer_breakpoint_thread(void *unused)
         if (!pending) break;
         usleep(500000);
     }
-    close(fd);
     return NULL;
 }
 static void beer_breakpoints_start(void)
@@ -21776,7 +21806,13 @@ static void beer_breakpoints_start(void)
     {
         char *colon = strchr(tok, ':');
         g_breakpoints[g_breakpoint_count].expect = colon ? (int)strtoul(colon + 1, NULL, 16) : -1;
-        g_breakpoints[g_breakpoint_count++].address = strtoull(tok, NULL, 0);
+        char *plus = strchr(tok, '+');
+        if (plus && strncmp(tok, "0x", 2)) {
+            *plus = 0;
+            snprintf(g_breakpoints[g_breakpoint_count].module, sizeof(g_breakpoints[g_breakpoint_count].module), "%s", tok);
+            g_breakpoints[g_breakpoint_count].offset = strtoull(plus + 1, NULL, 0);
+        } else g_breakpoints[g_breakpoint_count].address = strtoull(tok, NULL, 0);
+        g_breakpoint_count++;
     }
     pthread_t thread;
     if (g_breakpoint_count && pthread_create(&thread, NULL, beer_breakpoint_thread, NULL) == 0) pthread_detach(thread);
