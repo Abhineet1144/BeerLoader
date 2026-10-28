@@ -1172,3 +1172,9 @@ after the intro Bink videos close, i.e. when the 3D renderer starts using the sw
   the game.
 - Separately, 1 of 23 launches hung inside RDR2.exe's Arxan start-up (log stops after `[ENTRY] Before TLS/entry
   handoff`). Not yet investigated.
+- **Root cause found** (same day): the crash is deterministic when the loader is started from a desktop terminal
+  (Alacritty under GNOME) whose soft `RLIMIT_NOFILE` is 1024. NVIDIA backs each `vkAllocateMemory` with file
+  descriptors, RDR2 exceeds 1024 during start-up, the driver returns `VK_ERROR_OUT_OF_DEVICE_MEMORY` (20 `[VKERR]`
+  lines in the failing log), the buffer factory fails and the game dereferences NULL. My test shells inherited
+  524288 from VS Code, which is why it never reproduced. `main` now raises the soft file limit to the hard limit
+  (as Wine does); verified with `ulimit -Sn 1024`.

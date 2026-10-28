@@ -44,6 +44,7 @@
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
@@ -24717,6 +24718,15 @@ static void prof_start(void)
 
 int main(int argc, char **argv)
 {
+    /* Graphics drivers back device memory allocations with file descriptors (NVIDIA: one or more per
+     * vkAllocateMemory), and Windows has no comparable per-process handle limit.  Desktop sessions usually start
+     * programs with a soft limit of 1024, which RDR2 exhausts during start-up: vkAllocateMemory then reports
+     * VK_ERROR_OUT_OF_DEVICE_MEMORY and the game crashes.  Raise the soft limit to the hard limit, as Wine does. */
+    struct rlimit files;
+    if (getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur < files.rlim_max) {
+        files.rlim_cur = files.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &files);
+    }
     /* Guest code is sensitive to the process layout: RDR2 takes different graphics start-up paths depending on where
      * the host places its heaps and stacks, and fails most runs with address randomisation on.  Re-exec once with
      * randomisation off (BEER_ASLR=1 keeps it) so every run lays memory out the same way, like gdb does. */
