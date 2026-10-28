@@ -6,7 +6,6 @@
 #include <string.h>
 
 #undef getenv
-extern char *getenv(const char *name);   /* <stdlib.h> above declared beer_getenv through the macro */
 
 /* Open-addressing table of BEER_* lookups, keyed by name text (names are sometimes built in reused buffers).
  * Readers never lock: an entry's name is published last, after its value. */
@@ -55,4 +54,15 @@ char *beer_getenv(const char *name)
     }
     pthread_mutex_unlock(&g_env_lock);
     return value;
+}
+
+char *beer_getenv_site(const char *name, char **value, int *state)
+{
+    if (strncmp(name, "BEER_", 5) != 0) {
+        __atomic_store_n(state, 2, __ATOMIC_RELAXED);
+        return getenv(name);
+    }
+    *value = beer_getenv(name);
+    __atomic_store_n(state, 1, __ATOMIC_RELEASE);
+    return *value;
 }

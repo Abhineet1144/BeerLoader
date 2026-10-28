@@ -8047,6 +8047,7 @@ static u64 __attribute__((ms_abi)) impl_Sleep_inner(u32 ms) {
                     (unsigned)impl_GetCurrentThreadId());
     }
     if (ms) { struct timespec ts = {ms/1000, (ms%1000)*1000000L}; nanosleep(&ts,NULL); }
+    else sched_yield();   /* Sleep(0) gives up the rest of the time slice */
     return 0;
 }
 static u64 __attribute__((ms_abi)) impl_SleepEx(u32 ms, u32 alertable) {
@@ -24660,7 +24661,7 @@ static uint64_t beer_monotonic_nanoseconds(void)
 
 /* Opt-in sampling profiler (BEER_PROF_SAMPLE=1). ITIMER_PROF fires every ~1 ms
  * of process CPU time and records the interrupted RIP and thread id; SIGUSR2
- * dumps /tmp/beer-prof.txt (maps, image base, raw samples). perf/gdb are
+ * dumps /tmp/beer-prof.txt (maps, image base, raw samples) and starts a new interval. perf/gdb are
  * unavailable here, so this is the only CPU profiler. */
 #define BEER_PROF_MAX 400000
 static volatile unsigned long long g_prof_rip[BEER_PROF_MAX];
@@ -24702,6 +24703,7 @@ static void prof_dump(int sig)
         fprintf(out, "S %u %llx %llx\n", g_prof_tid[i], g_prof_rip[i], g_prof_ret[i]);
     fclose(out);
     fprintf(stderr, "[PROF] wrote %u samples\n", g_prof_count);
+    g_prof_count = 0;   /* each dump covers the interval since the previous one */
 }
 
 static void prof_start(void)

@@ -1178,3 +1178,23 @@ after the intro Bink videos close, i.e. when the 3D renderer starts using the sw
   lines in the failing log), the buffer factory fails and the game dereferences NULL. My test shells inherited
   524288 from VS Code, which is why it never reproduced. `main` now raises the soft file limit to the hard limit
   (as Wine does); verified with `ulimit -Sn 1024`.
+
+### Addendum 14 — RDR2 performance and memory (2026-10-28)
+
+Measured with the built-in sampler (`BEER_PROF_SAMPLE=1`; each SIGUSR2 now dumps `/tmp/beer-prof.txt` and starts
+a new interval) and the control socket's `status` (keep one connection open: fps/cpu are deltas per connection).
+
+- **getenv was ~23% of all CPU.** Diagnostic `getenv("BEER_...")` checks sit on hot paths (Sleep, HeapAlloc,
+  QueryPerformanceCounter...), and glibc's getenv scans the environment with strncmp each time. `platform/beer_env.h`
+  is force-included into every loader object: literal names are cached per call site (one load), other BEER_* names
+  in a lock-free table, non-BEER names still go to libc (the loader setenv()s APPDATA etc.). Main-menu CPU halved.
+- **glibc arenas kept ~400 MB of freed memory** (92 threads, dozens of 64 MB arenas). A background `malloc_trim`
+  every 20 s (`BEER_NO_MALLOC_TRIM`, `BEER_MALLOC_TRIM_S`) keeps RDR2 at ~5.6 GB instead of growing past 6 GB;
+  the control socket has a `trim` command. VirtualAlloc was checked: commits are lazy, decommit uses MADV_DONTNEED.
+- `Sleep(0)` now yields like Windows.
+- Gameplay (prologue ride, Ultra preset at 2560x1440 on an RTX 2070 SUPER): 33–36 fps with the GPU at 98%, i.e.
+  GPU-bound at those settings. RDR2 compiles pipelines on its own background thread (libnvidia-gpucomp); that is
+  not on the frame path. The user's 5 fps coincided with RAM exhausted (15 GB total, swap full, game ~6 GB) and Ultra
+  textures near the 8 GB VRAM limit.
+- Still open: a ~60 s stretch after "Story" with no presents (fps 0, CPU flat at 1.5 cores) while the world loads;
+  the loader is still built at -O0 with SIMD disabled.
