@@ -1152,3 +1152,9 @@ Generic fixes:
 - Control socket `key` command (`{"cmd":"key","vk":13,"dik":28,"down":1}`) injects a key exactly like a real X event
   (GNOME/mutter does not deliver xdotool XTest keys to Xwayland clients). Diagnostics: BEER_WNDPROC_DIAGNOSTICS,
   DirectInput Acquire caller/refusal logging.
+
+### Session 5 addendum 12 – RDR2 reaches story mode
+On the desktop (DISPLAY=:0) with key injection, RDR2 now goes: legal screens → Brightness/Subtitles/Audio first-run
+setup → tintype loading screens → opening story cutscene (Colter, Dutch/Hosea/Arthur, opening credits); ~6 minutes with
+no errors. Open issue: in headless mode (BEER_HEADLESS=1, virtual swapchain) the game stops with ERR_GFX_STATE right
+after the intro Bink videos close, i.e. when the 3D renderer starts using the swapchain; desktop runs are unaffected.
