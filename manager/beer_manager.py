@@ -294,6 +294,14 @@ def pid_alive(pid):
         return True
 
 
+def parent_pid(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
 # ---------------------------------------------------------------- running game card
 
 SCALE_MIN, SCALE_MAX = 0.05, 10.0
@@ -1055,7 +1063,7 @@ class Manager(Adw.Application):
         for pid, (proc, _log, _name) in list(self.children.items()):
             if proc.poll() is not None:
                 del self.children[pid]
-        seen = set()
+        sockets = {}
         for path in glob.glob(os.path.join(SOCKET_DIR, "*.sock")):
             try:
                 pid = int(os.path.basename(path)[:-5])
@@ -1067,6 +1075,15 @@ class Manager(Adw.Application):
                 except OSError:
                     pass
                 continue
+            sockets[pid] = path
+        # A launcher exe (RDR2's Launcher.exe) runs the real game as a child loader and then only waits for it:
+        # show the game, under the launcher's library name and log, instead of two cards.
+        launcher_of = {pid: parent_pid(pid) for pid in sockets}
+        launcher_of = {pid: parent for pid, parent in launcher_of.items() if parent in sockets}
+        seen = set()
+        for pid, path in sockets.items():
+            if pid in launcher_of.values():
+                continue
             seen.add(pid)
             if pid not in self.cards:
                 control = Control(path)
@@ -1075,9 +1092,11 @@ class Manager(Adw.Application):
                 if not hello or not hello.get("ok"):
                     continue
                 exe = hello.get("exe", "")
-                name = next((g["name"] for g in self.lib.games if g["exe"] == exe),
-                            os.path.splitext(os.path.basename(exe))[0] or "game")
-                log = self.children.get(pid, (None, "", ""))[1]
+                launcher = launcher_of.get(pid)
+                started = self.children.get(pid) or self.children.get(launcher) or (None, "", "")
+                name = next((g["name"] for g in self.lib.games if g["exe"] == exe), started[2]
+                            or os.path.splitext(os.path.basename(exe))[0] or "game")
+                log = started[1]
                 card = RunningCard(self, pid, path, name, log, exe)
                 apply_saved_tweaks(card.control, exe)
                 self.cards[pid] = card
