@@ -1,5 +1,5 @@
 CC     = gcc
-CFLAGS = -O0 -Wall -Wextra -m64 -g -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan -Ithird_party/dxil-spirv
+CFLAGS = -O0 -Wall -Wextra -m64 -g -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan -Ithird_party/dxil-spirv -include platform/beer_env.h
 RENDER_CFLAGS = $(filter-out -O0,$(CFLAGS)) -O3 -march=native
 LDFLAGS = -lpthread -ldl -lcrypto -lz -lm
 TARGET = loader
@@ -7,7 +7,7 @@ TARGET = loader
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
 MEDIA_SRCS = media/media_foundation.c
-PLATFORM_SRCS = platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_bcrypt.c platform/win32_version.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
+PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_bcrypt.c platform/win32_version.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
                 platform/win32_nt_section.c platform/win32_virtual_memory.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
                 platform/win32_seh.c
@@ -41,6 +41,10 @@ DEPS = $(OBJS:.o=.d)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
+
+# Hot: every BEER_* switch lookup goes through it.
+platform/beer_env.o: platform/beer_env.c platform/beer_env.h
+	$(CC) $(RENDER_CFLAGS) -c $< -o $@
 
 graphics/d3d11/d3d11_impl.o: graphics/d3d11/d3d11_impl.c
 	$(CC) $(RENDER_CFLAGS) -c $< -o $@

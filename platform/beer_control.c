@@ -6,6 +6,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -240,6 +241,16 @@ static void handle(Session *session, const char *request, char *out, size_t size
         char exe[600];
         json_escape(exe, sizeof(exe), g_exe);
         snprintf(out, size, "{\"ok\":true,\"protocol\":1,\"pid\":%d,\"exe\":\"%s\"}\n", (int)getpid(), exe);
+    } else if (!strcmp(cmd, "trim")) {
+        /* Hands free memory inside the host allocator's arenas back to the system. */
+        uint64_t ticks, before, after, threads;
+        read_proc(&ticks, &before, &threads);
+        const uint64_t start = wall_ns();
+        malloc_trim(0);
+        const uint64_t took = wall_ns() - start;
+        read_proc(&ticks, &after, &threads);
+        snprintf(out, size, "{\"ok\":true,\"rss_before_mb\":%llu,\"rss_after_mb\":%llu,\"ms\":%llu}\n",
+                 (unsigned long long)(before / 1024), (unsigned long long)(after / 1024), (unsigned long long)(took / 1000000));
     } else if (!strcmp(cmd, "status")) {
         uint64_t ticks, rss, threads;
         read_proc(&ticks, &rss, &threads);
@@ -379,11 +390,35 @@ static void *accept_thread(void *opaque)
     return NULL;
 }
 
+/* Games allocate and free heavily from many threads, and glibc keeps freed memory inside its per-thread arenas: RDR2
+ * held ~400 MB of free arena memory after start-up.  Handing it back periodically costs ~60 ms of background work and
+ * no frame time.  BEER_NO_MALLOC_TRIM=1 disables it; BEER_MALLOC_TRIM_S sets the interval (default 20 s). */
+static void *trim_thread(void *arg)
+{
+    const unsigned interval = (unsigned)(uintptr_t)arg;
+    for (;;) {
+        sleep(interval);
+        malloc_trim(0);
+    }
+    return NULL;
+}
+
+static void start_trim_thread(void)
+{
+    if (getenv("BEER_NO_MALLOC_TRIM")) return;
+    const char *value = getenv("BEER_MALLOC_TRIM_S");
+    int interval = value ? atoi(value) : 20;
+    if (interval <= 0) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, trim_thread, (void *)(uintptr_t)interval) == 0) pthread_detach(thread);
+}
+
 void beer_control_start(const char *exe_path)
 {
     if (g_listen_fd >= 0) return;
     snprintf(g_exe, sizeof(g_exe), "%s", exe_path ? exe_path : "");
     g_start_ns = wall_ns();
+    start_trim_thread();
     const char *initial = getenv("BEER_TIME_SCALE");
     if (initial) {
         char json[64];
