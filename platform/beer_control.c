@@ -189,6 +189,8 @@ static void format_milli(char *out, size_t size, int32_t milli)
     snprintf(out, size, "%s%d.%03d", milli < 0 ? "-" : "", (int)(abs(milli) / 1000), (int)(abs(milli) % 1000));
 }
 
+void beer_control_inject_key(unsigned vk, unsigned dik, int extended, int down);   /* loader.c */
+
 static void json_escape(char *out, size_t size, const char *text)
 {
     size_t i = 0;
@@ -294,6 +296,16 @@ static void handle(Session *session, const char *request, char *out, size_t size
             return;
         }
         reply_error(out, size, "unknown setting");
+    } else if (!strcmp(cmd, "key")) {
+        /* {"cmd":"key","vk":13,"dik":28,"down":1}: one key transition, delivered like a real keyboard event
+         * (lets scripts drive menus in headless runs and on compositors that ignore synthetic X input). */
+        int32_t vk = 0, dik = 0, down = 1000, extended = 0;
+        if (!beer_json_milli(request, "vk", &vk)) { reply_error(out, size, "key needs vk"); return; }
+        beer_json_milli(request, "dik", &dik);
+        beer_json_milli(request, "down", &down);
+        beer_json_milli(request, "extended", &extended);
+        beer_control_inject_key((unsigned)(vk / 1000), (unsigned)(dik / 1000), extended != 0, down != 0);
+        snprintf(out, size, "{\"ok\":true}\n");
     } else if (!strncmp(cmd, "gfx_", 4)) {
         bd12_cbt_handle(cmd, request, out, size);
     } else if (!strncmp(cmd, "post_", 5) || !strcmp(cmd, "screenshot")) {

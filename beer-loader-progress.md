@@ -1141,3 +1141,14 @@ Generic fixes:
 - RtlLookupFunctionEntry searches every guest DLL's .pdata, not only the EXE's.
 - ntdll Nt*/Zw* fake exports now begin like Windows syscall stubs (`mov r10,rcx; mov eax,ssn`); guest `syscall` with those numbers is emulated through a seccomp SIGSYS trap (Proton has the same for RDR2). Every guest thread gets a signal stack.
 - Diagnostics: BEER_HWBP (needs perf_event_paranoid<=2), BEER_CALLER_MATCH, BEER_CHAIN_DEPTH, BEER_SYSCALL_DIAGNOSTICS.
+
+### Session 5 addendum 11 – keyboard input in RDR2 (first-run setup screens now navigable)
+- RAGE polls its DirectInput keyboard (`GetDeviceState`, like Proton: ~5700 calls) only while its own "window active"
+  flag is set, and that flag is driven by WM_ACTIVATEAPP/WM_ACTIVATE. Beer never sent the activation burst: RAGE calls
+  SetFocus on the hidden window (sets `g_window_focused`, WM_SETFOCUS only), the native fullscreen window is already
+  mapped, and both ShowWindow and X FOCUS_IN gated the burst on "not focused"/"was hidden". New `g_window_activated`
+  tracks activation separately; ShowWindow/FOCUS_IN deliver WM_ACTIVATEAPP/WM_NCACTIVATE/WM_ACTIVATE once per activation.
+- Raw input: unknown HID usages in RegisterRawInputDevices are accepted (no longer fail the whole array).
+- Control socket `key` command (`{"cmd":"key","vk":13,"dik":28,"down":1}`) injects a key exactly like a real X event
+  (GNOME/mutter does not deliver xdotool XTest keys to Xwayland clients). Diagnostics: BEER_WNDPROC_DIAGNOSTICS,
+  DirectInput Acquire caller/refusal logging.

@@ -8358,6 +8358,9 @@ static s32 g_window_outer_y;
 static s32 g_window_outer_width;
 static s32 g_window_outer_height;
 static int g_window_focused;
+/* The activation burst (WM_ACTIVATEAPP/WM_NCACTIVATE/WM_ACTIVATE) is tracked apart from keyboard focus: a game that
+ * calls SetFocus on its still-hidden window gets WM_SETFOCUS only, and must still be activated when it is shown. */
+static int g_window_activated;
 
 #define WINDOW_PROPERTY_CAPACITY 256
 #define WINDOW_PROPERTY_NAME_CAPACITY 128
@@ -8458,7 +8461,10 @@ impl_ShowWindow(u64 hw, u32 cmd) {
         /* Deliver the activation burst when transitioning from hidden → visible
          * and the window has not been activated yet (g_window_focused == 0).
          * This covers the pattern: CreateWindowEx(no WS_VISIBLE) + ShowWindow. */
-        if (visible && !was_visible && !g_window_focused) {
+        /* Keyed on activation, not on native visibility: fullscreen windows are mapped at creation, so the
+         * first ShowWindow can find the native window already visible. */
+        if (visible && !g_window_activated) {
+            g_window_activated = 1;
             /* WM_WINDOWPOSCHANGING */
             {
                 u64 wpos[7];
@@ -11363,7 +11369,14 @@ static u64 call_guest_wndproc(u32 message, u64 wparam, u64 lparam)
         fprintf(stderr, "[INPUT] wndproc mouse message 0x%04x wparam=0x%llx\n",
                 message, (unsigned long long)wparam);
     if (!g_window_proc) return message == 0x0081 ? 1 : 0;
-    return ((GuestWndProc)(uintptr_t)g_window_proc)(FAKE_HWND, message, wparam, lparam);
+    u64 result = ((GuestWndProc)(uintptr_t)g_window_proc)(FAKE_HWND, message, wparam, lparam);
+    if (getenv("BEER_WNDPROC_DIAGNOSTICS")) {     /* every message Beer itself sends to the guest window procedure */
+        static _Atomic(u32) logs;
+        if (atomic_fetch_add(&logs, 1) < 400)
+            fprintf(stderr, "[WNDPROC] msg=0x%04x wparam=0x%llx lparam=0x%llx -> 0x%llx\n", message,
+                    (unsigned long long)wparam, (unsigned long long)lparam, (unsigned long long)result);
+    }
+    return result;
 }
 
 static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
@@ -11502,6 +11515,7 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
         }
 
         /* WM_ACTIVATEAPP (0x001c): wParam=1 (activated), lParam=0 (no other TID) */
+        g_window_activated = 1;
         call_guest_wndproc(0x001c, 1, 0);
 
         /* WM_NCACTIVATE (0x0086): wParam=1 (title bar active), lParam=0 */
@@ -11579,6 +11593,7 @@ impl_DestroyWindow(u64 hw) {
     call_guest_wndproc(0x0082, 0, 0);
     xwayland_window_destroy();
     g_window_focused = 0;
+    g_window_activated = 0;
     return 1;
 }
 static u64 __attribute__((ms_abi))
@@ -12126,12 +12141,13 @@ impl_RegisterRawInputDevices(const BEER_RAW_INPUT_DEVICE *devices,
     pthread_mutex_lock(&g_raw_input_mutex);
     for (u32 i = 0; i < count; ++i) {
         const BEER_RAW_INPUT_DEVICE *device = &devices[i];
-        if (device->usage_page != 1 ||
-            (device->usage != 2 && device->usage != 6)) {
-            pthread_mutex_unlock(&g_raw_input_mutex);
-            g_last_error = 87;
-            return 0;
-        }
+        if (getenv("BEER_INPUT_DIAGNOSTICS"))
+            fprintf(stderr, "[INPUT] RegisterRawInputDevices[%u/%u] usage=%u:%u flags=0x%x target=0x%llx\n", i, count,
+                    device->usage_page, device->usage, device->flags, (unsigned long long)device->target);
+        /* Windows accepts any HID top-level collection (gamepads, consumer control, ...). Beer only produces mouse
+         * and keyboard reports, so other usages are accepted and simply never deliver data; rejecting the whole
+         * array used to drop the keyboard registration that came with them. */
+        if (device->usage_page != 1 || (device->usage != 2 && device->usage != 6)) continue;
         BEER_RAW_INPUT_DEVICE *registration = device->usage == 2
             ? &g_raw_mouse_registration : &g_raw_keyboard_registration;
         int *registered = device->usage == 2
@@ -12733,6 +12749,58 @@ static void post_wm_setcursor(u32 mouse_message)
     queue_window_message(0x0020, FAKE_HWND, 1u | ((u64)mouse_message << 16)); /* HTCLIENT */
 }
 
+/* One key transition into every guest-visible keyboard source: GetKeyState/GetAsyncKeyState, DirectInput,
+ * WM_KEYDOWN/WM_KEYUP and raw input. Used by the X event loop and by the control socket's "key" command. */
+static void beer_deliver_key(u32 vk, u8 dik, int extended, int down, int top_level)
+{
+    /* Win32 keyboard messages carry the generic modifier VKs;
+     * the left/right VKs only exist in GetKeyState/raw input. */
+    u32 message_vk = vk;
+    u32 generic_vk = 0;
+    if (vk == 0xa0 || vk == 0xa1) generic_vk = 0x10;
+    else if (vk == 0xa2 || vk == 0xa3) generic_vk = 0x11;
+    else if (vk == 0xa4 || vk == 0xa5) generic_vk = 0x12;
+    if (generic_vk) message_vk = generic_vk;
+    pthread_mutex_lock(&g_input_mutex);
+    if (vk && vk < 256) {
+        if (down && !(g_input.keys[vk] & 0x80)) g_input.pressed[vk] = 1;
+        g_input.keys[vk] = down ? 0x80 : 0;
+        if (generic_vk) {
+            const u32 pair = vk & ~1u;      /* left/right VK pair */
+            const int either = (g_input.keys[pair] | g_input.keys[pair + 1]) & 0x80;
+            g_input.keys[generic_vk] = either ? 0x80 : 0;
+        }
+    }
+    if (dik) {
+        g_input.dik[dik] = down ? 0x80 : 0;
+        if (down) g_input.dik_latch[dik] = 1;
+        if (top_level)
+            queue_dinput_event_locked(2, dik, down ? 0x80u : 0u);
+    }
+    pthread_mutex_unlock(&g_input_mutex);
+    if (top_level && vk) {
+        u64 lparam = 1 | ((u64)(dik & 0x7f) << 16);
+        if (extended) lparam |= 1ULL << 24;
+        if (!down) lparam |= 0xc0000000ULL;
+        queue_window_message(down ? 0x0100 : 0x0101, message_vk, lparam);
+        BeerRawInput raw = beer_raw_keyboard_input(vk, dik & 0x7f, down);
+        if (extended) raw.data.keyboard.flags |= 2; /* RI_KEY_E0 */
+        queue_raw_input(&raw, 1);
+        if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+            u32 log = atomic_fetch_add(&g_input_event_logs, 1);
+            if (log < 32)
+                fprintf(stderr,
+                        "[INPUT] key %s vk=0x%02x dik=0x%02x%s\n",
+                        down ? "down" : "up", vk, dik,
+                        extended ? " ext" : "");
+        }
+    }
+}
+void beer_control_inject_key(unsigned vk, unsigned dik, int extended, int down)
+{
+    beer_deliver_key(vk, (u8)dik, extended, down, 1);
+}
+
 static void collect_native_window_events(void)
 {
     pthread_mutex_lock(&g_event_collect_mutex);
@@ -12753,48 +12821,7 @@ static void collect_native_window_events(void)
                 if (!vk) vk = x11_keysym_to_vk(event.keysym);
                 u8 dik = x11_keycode_to_dik(event.keycode);
                 const int extended = x11_keycode_is_extended(event.keycode);
-                /* Win32 keyboard messages carry the generic modifier VKs;
-                 * the left/right VKs only exist in GetKeyState/raw input. */
-                u32 message_vk = vk;
-                u32 generic_vk = 0;
-                if (vk == 0xa0 || vk == 0xa1) generic_vk = 0x10;
-                else if (vk == 0xa2 || vk == 0xa3) generic_vk = 0x11;
-                else if (vk == 0xa4 || vk == 0xa5) generic_vk = 0x12;
-                if (generic_vk) message_vk = generic_vk;
-                pthread_mutex_lock(&g_input_mutex);
-                if (vk && vk < 256) {
-                    if (down && !(g_input.keys[vk] & 0x80)) g_input.pressed[vk] = 1;
-                    g_input.keys[vk] = down ? 0x80 : 0;
-                    if (generic_vk) {
-                        const u32 pair = vk & ~1u;      /* left/right VK pair */
-                        const int either = (g_input.keys[pair] | g_input.keys[pair + 1]) & 0x80;
-                        g_input.keys[generic_vk] = either ? 0x80 : 0;
-                    }
-                }
-                if (dik) {
-                    g_input.dik[dik] = down ? 0x80 : 0;
-                    if (down) g_input.dik_latch[dik] = 1;
-                    if (top_level)
-                        queue_dinput_event_locked(2, dik, down ? 0x80u : 0u);
-                }
-                pthread_mutex_unlock(&g_input_mutex);
-                if (top_level && vk) {
-                    u64 lparam = 1 | ((u64)(dik & 0x7f) << 16);
-                    if (extended) lparam |= 1ULL << 24;
-                    if (!down) lparam |= 0xc0000000ULL;
-                    queue_window_message(down ? 0x0100 : 0x0101, message_vk, lparam);
-                    BeerRawInput raw = beer_raw_keyboard_input(vk, dik & 0x7f, down);
-                    if (extended) raw.data.keyboard.flags |= 2; /* RI_KEY_E0 */
-                    queue_raw_input(&raw, 1);
-                    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
-                        u32 log = atomic_fetch_add(&g_input_event_logs, 1);
-                        if (log < 32)
-                            fprintf(stderr,
-                                    "[INPUT] key %s vk=0x%02x dik=0x%02x%s\n",
-                                    down ? "down" : "up", vk, dik,
-                                    extended ? " ext" : "");
-                    }
-                }
+                beer_deliver_key(vk, dik, extended, down, top_level);
                 break;
             }
             case XWAYLAND_EVENT_BUTTON_DOWN:
@@ -13034,8 +13061,9 @@ static void collect_native_window_events(void)
                 /* If focus was already granted synchronously during
                  * create_guest_window (WS_VISIBLE path), do not re-deliver
                  * WM_ACTIVATEAPP/WM_ACTIVATE/WM_SETFOCUS; just record state. */
-                if (!g_window_focused) {
+                if (!g_window_activated) {
                     g_window_focused = 1;
+                    g_window_activated = 1;
                     if (top_level) {
                         queue_window_message(0x001c, 1, 0);
                         queue_window_message(0x0086, 1, 0);
@@ -13049,6 +13077,7 @@ static void collect_native_window_events(void)
                 break;
             case XWAYLAND_EVENT_FOCUS_OUT:
                 g_window_focused = 0;
+                g_window_activated = 0;
                 pthread_mutex_lock(&g_input_mutex);
                 memset(g_input.keys, 0, sizeof(g_input.keys));
                 memset(g_input.dik, 0, sizeof(g_input.dik));
@@ -16422,11 +16451,16 @@ static u64 __attribute__((ms_abi))
 beer_dinput_device_Acquire(BeerDirectInputDevice *self)
 {
     if (!self) return DIERR_INVALIDPARAM;
-    if (!beer_dinput_can_acquire(g_window_focused, self->cooperative_flags))
+    if (!beer_dinput_can_acquire(g_window_focused, self->cooperative_flags)) {
+        if (getenv("BEER_INPUT_DIAGNOSTICS"))
+            fprintf(stderr, "[DINPUT] Acquire kind=%d refused (window not focused, flags=0x%x)\n", self->kind, self->cooperative_flags);
         return DIERR_NOTACQUIRED;
+    }
     self->acquired = 1;
-    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
         fprintf(stderr, "[DINPUT] Acquire kind=%d\n", self->kind);
+        fprintf(stderr, "[DINPUT]   Acquire caller=%p\n", __builtin_return_address(0));
+    }
     return DI_OK;
 }
 
