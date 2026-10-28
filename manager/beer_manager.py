@@ -1034,7 +1034,13 @@ class Manager(Adw.Application):
                 pass
 
     def stop_game(self, pid):
+        # Launchers start the real game as a child loader (RDR2: Launcher.exe -> RDR2.exe), which outlives its parent.
+        # Games started here run in their own session, so stop the whole process group.
         try:
+            group = os.getpgid(pid)
+            if group != os.getpgid(0):
+                os.killpg(group, signal.SIGTERM)
+                return
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
