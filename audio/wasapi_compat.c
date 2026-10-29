@@ -80,6 +80,7 @@ struct BeerWasapi {
     int float_staging;            /* the engine mixes floats in place: sticky once seen (a packet's tail can be silent) */
     uint8_t *acquired_buffer;
     atomic_uint_fast64_t submitted_frames;
+    BeerAudioStream *stream;      /* this client's own sound-server stream */
     atomic_uint_fast64_t event_handle;
     atomic_uint_fast64_t clock_frames;
     atomic_int started;
@@ -111,6 +112,7 @@ static uint64_t __attribute__((ms_abi)) wasapi_release(void *self)
         if (atomic_exchange_explicit(&owner->worker_running, 0,
                                      memory_order_acq_rel))
             pthread_join(owner->worker, NULL);
+        beer_audio_stream_close(owner->stream);
         free(owner->acquired_buffer);
         free(owner);
     }
@@ -315,9 +317,13 @@ static uint64_t __attribute__((ms_abi)) audio_client_initialize(
     if (!supported_format(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
     owner->format = *format;
     uint64_t duration = buffer_duration > 0 ? (uint64_t)buffer_duration : UINT64_C(1000000);
+    /* Shared mode never hands out less than a few device periods (Wine's drivers use three): RDR2 asks for one 10 ms
+     * period, and with exactly 10 ms any scheduling hiccup leaves its mixer no room to write ahead. */
+    if (share_mode == 0 && duration < UINT64_C(300000)) duration = UINT64_C(300000);
     owner->buffer_frames = (uint32_t)((duration * format->rate + 9999999u) / 10000000u);
     if (owner->buffer_frames < format->rate / 100u) owner->buffer_frames = format->rate / 100u;
-    if (!beer_audio_init(format->rate, format->channels)) return E_FAIL;
+    owner->stream = beer_audio_stream_open(format->rate, format->channels, "WASAPI");
+    if (!owner->stream) return E_FAIL;
     owner->initialized = 1;
     return S_OK;
 }
@@ -377,6 +383,19 @@ static uint64_t __attribute__((ms_abi)) audio_client_get_period(void *self,
     int64_t *default_period, int64_t *minimum_period)
 { (void)self; if(default_period)*default_period=100000; if(minimum_period)*minimum_period=100000; return S_OK; }
 
+/* Audio kept queued at the sound server beyond the client's own buffer (BEER_AUDIO_LATENCY_MS, default 40). */
+static unsigned latency_margin_ms(void)
+{
+    static int margin = -1;
+    if (margin < 0) {
+        const char *value = getenv("BEER_AUDIO_LATENCY_MS");
+        margin = value ? atoi(value) : 40;
+        if (margin < 0) margin = 0;
+        if (margin > 500) margin = 500;
+    }
+    return (unsigned)margin;
+}
+
 static void *wasapi_event_worker(void *opaque)
 {
     BeerWasapi *owner = opaque;
@@ -404,7 +423,20 @@ static void *wasapi_event_worker(void *opaque)
                                                 memory_order_relaxed);
         uint64_t submitted = atomic_load_explicit(&owner->submitted_frames,
                                                   memory_order_acquire);
-        uint64_t advanced = current + (uint64_t)elapsed_ns * rate / 1000000000ull;
+        /* The device position follows what the sound server has really played, plus a fixed margin.  The game
+         * keeps padding = submitted - position below its buffer size, so the server always holds margin + buffer
+         * of audio.  A wall-clock position let the game run only ~a buffer ahead of real time: PipeWire, which
+         * pulls ~21 ms quanta, found the stream empty on nearly every cycle (crackling, dropouts).  Following the
+         * server also keeps it locked to the sound card's clock over long sessions. */
+        int exact = 0;
+        uint64_t heard = beer_audio_stream_bytes_heard(owner->stream, &exact);
+        uint64_t advanced;
+        if (exact && owner->format.block_align) {
+            advanced = heard / owner->format.block_align + (uint64_t)latency_margin_ms() * rate / 1000u;
+            if (advanced < current) advanced = current;
+        } else {
+            advanced = current + (uint64_t)elapsed_ns * rate / 1000000000ull;
+        }
         if (advanced > submitted) advanced = submitted;
         atomic_store_explicit(&owner->clock_frames, advanced,
                               memory_order_release);
@@ -449,7 +481,7 @@ static uint64_t __attribute__((ms_abi)) audio_client_reset(void *self)
 {
     BeerWasapi *owner=wasapi_interface(self)->owner;
     if(!owner->initialized)return AUDCLNT_E_NOT_INITIALIZED;
-    beer_audio_reset();
+    beer_audio_stream_reset(owner->stream);
     atomic_store_explicit(&owner->submitted_frames, 0, memory_order_release);
     atomic_store_explicit(&owner->clock_frames, 0, memory_order_release);
     return S_OK;
@@ -666,7 +698,7 @@ static uint64_t __attribute__((ms_abi)) render_release_buffer(void *self,
          * restart after the gap clicks. */
         if (flags & 2u) memset(owner->acquired_buffer, 0, bytes);
         else convert_float_staging_packet(owner, frames);
-        if (!beer_audio_submit(owner->acquired_buffer, bytes, NULL, NULL))
+        if (!beer_audio_stream_submit(owner->stream, owner->acquired_buffer, bytes, 1, NULL, NULL))
             return E_FAIL;
     }
     owner->submitted_frames += frames;
@@ -696,11 +728,7 @@ static uint64_t __attribute__((ms_abi)) clock_get_position(void *self,
 {
     BeerWasapi *owner = wasapi_interface(self)->owner;
     if (!position) return E_POINTER;
-    uint64_t device_position = atomic_load_explicit(&owner->clock_frames,
-                                                    memory_order_acquire);
-    uint32_t align = owner->format.block_align ? owner->format.block_align : 4;
-    uint64_t played_position = beer_audio_bytes_played() / align;
-    *position = device_position > played_position ? device_position : played_position;
+    *position = atomic_load_explicit(&owner->clock_frames, memory_order_acquire);
     if (qpc) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);

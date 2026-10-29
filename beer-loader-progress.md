@@ -1198,3 +1198,21 @@ a new interval) and the control socket's `status` (keep one connection open: fps
   textures near the 8 GB VRAM limit.
 - Still open: a ~60 s stretch after "Story" with no presents (fps 0, CPU flat at 1.5 cores) while the world loads;
   the loader is still built at -O0 with SIMD disabled.
+
+### Addendum 15 — RDR2 audio: separate streams, WASAPI clock follows the sound server (2026-10-29)
+
+RDR2 plays its game audio through WASAPI (shared mode, 48 kHz stereo S16, asks for a 10 ms buffer) and Bink videos
+through DirectSound. Problems found:
+
+- **One Pulse stream for everything.** WASAPI and every DirectSound buffer appended into the same pa_simple stream,
+  so during videos game and video PCM were concatenated (twice real-time: the queue grew, the game's audio thread
+  blocked), and a DirectSound Stop (BinkClose) flushed the game's audio too. `audio_backend` now has
+  `BeerAudioStream` objects: one per WASAPI client, one per DirectSound buffer (opened on Play, closed on the last
+  Release), plus the default stream for waveOut. PipeWire mixes them.
+- **WASAPI position was wall-clock time.** padding = submitted - position kept the game only one buffer ahead of real
+  time, so the server held almost nothing and PipeWire (~21 ms quanta) found it empty on nearly every cycle:
+  36,541 underruns in ~3.5 min with `BEER_AUDIO_DIAGNOSTICS=1`. The position now follows the server
+  (`beer_audio_stream_bytes_heard` = handed over - pa_simple_get_latency) plus a 40 ms margin
+  (`BEER_AUDIO_LATENCY_MS`): the server holds ~55–60 ms, drift-free against the sound card. Shared-mode buffers are
+  at least 30 ms (three periods, as Wine's drivers do). Same run afterwards: 54 underruns, all in one burst while
+  the game initialised, none through videos, menu, loading and the opening cutscene.

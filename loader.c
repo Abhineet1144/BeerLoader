@@ -4117,6 +4117,7 @@ struct BeerDirectSoundBuffer {
     u32 playing;
     u32 volume;
     u32 pan;
+    BeerAudioStream *stream;   /* this buffer's own sound-server stream, opened on Play */
 };
 
 enum {
@@ -4164,11 +4165,23 @@ static u64 __attribute__((ms_abi)) beer_ds_release(void *self)
     return refs;
 }
 
+static u64 __attribute__((ms_abi)) beer_dsb_release(BeerDirectSoundBuffer *buffer)
+{
+    if (!buffer) return 0;
+    u32 refs = atomic_fetch_sub_explicit(&buffer->refs, 1, memory_order_acq_rel) - 1;
+    if (!refs) {
+        beer_audio_stream_close(buffer->stream);
+        free(buffer->data);
+        free(buffer);
+    }
+    return refs;
+}
+
 static u64 __attribute__((ms_abi))
 beer_dsb_get_current_position(BeerDirectSoundBuffer *buffer, u32 *play, u32 *write)
 {
     if (!buffer || !buffer->size) return BEER_DSERR_INVALIDPARAM;
-    u32 position = (u32)(beer_audio_bytes_played() % buffer->size);
+    u32 position = (u32)(beer_audio_stream_bytes_played(buffer->stream) % buffer->size);
     if (play) *play = position;
     if (write) *write = (position + buffer->size / 4u) % buffer->size;
     return BEER_DS_OK;
@@ -4230,7 +4243,7 @@ beer_dsb_lock(BeerDirectSoundBuffer *buffer, u32 offset, u32 bytes,
     if (!buffer || !buffer->data || !part1 || !bytes1 || !part2 || !bytes2)
         return BEER_DSERR_INVALIDPARAM;
     if (flags & BEER_DSBLOCK_FROMWRITECURSOR)
-        offset = (u32)((beer_audio_bytes_played() + buffer->size / 4u) % buffer->size);
+        offset = (u32)((beer_audio_stream_bytes_played(buffer->stream) + buffer->size / 4u) % buffer->size);
     if ((flags & BEER_DSBLOCK_ENTIREBUFFER) || !bytes) bytes = buffer->size;
     offset %= buffer->size;
     if (bytes > buffer->size) bytes = buffer->size;
@@ -4248,7 +4261,8 @@ beer_dsb_play(BeerDirectSoundBuffer *buffer, u32 reserved1, u32 priority, u32 fl
 {
     (void)reserved1; (void)priority;
     if (!buffer || !buffer->data) return BEER_DSERR_INVALIDPARAM;
-    if (!beer_audio_init(buffer->rate, buffer->channels)) return BEER_DSERR_INVALIDPARAM;
+    if (!buffer->stream) buffer->stream = beer_audio_stream_open(buffer->rate, buffer->channels, "DirectSound");
+    if (!buffer->stream) return BEER_DSERR_INVALIDPARAM;
     buffer->playing = 1;
     buffer->flags = (buffer->flags & ~BEER_DSBSTATUS_LOOPING) |
                     ((flags & BEER_DSBPLAY_LOOPING) ? BEER_DSBSTATUS_LOOPING : 0);
@@ -4257,7 +4271,7 @@ beer_dsb_play(BeerDirectSoundBuffer *buffer, u32 reserved1, u32 priority, u32 fl
      * never observed room for the next mix block. Seed one quarter-ring now;
      * subsequent Lock/Unlock writes keep the host queue and cursor moving. */
     u32 seed_bytes = buffer->size / 4u;
-    if (!seed_bytes || !beer_audio_submit(buffer->data, seed_bytes, NULL, NULL)) {
+    if (!seed_bytes || !beer_audio_stream_submit(buffer->stream, buffer->data, seed_bytes, 0, NULL, NULL)) {
         buffer->playing = 0;
         return BEER_DSERR_INVALIDPARAM;
     }
@@ -4272,6 +4286,11 @@ beer_dsb_set_format(BeerDirectSoundBuffer *buffer, const BeerWaveFormat *format)
 {
     if (!buffer || !format || format->format_tag != WAVE_FORMAT_PCM || format->bits_per_sample != 16)
         return WAVERR_BADFORMAT;
+    if (buffer->stream && (buffer->rate != format->samples_per_sec || buffer->channels != format->channels)) {
+        beer_audio_stream_close(buffer->stream);   /* reopened in the new format on the next Play */
+        buffer->stream = NULL;
+        buffer->playing = 0;
+    }
     buffer->rate = format->samples_per_sec;
     buffer->channels = format->channels;
     buffer->bits = format->bits_per_sample;
@@ -4284,7 +4303,7 @@ static u64 __attribute__((ms_abi)) beer_dsb_set_pan(BeerDirectSoundBuffer *b, s3
 static u64 __attribute__((ms_abi)) beer_dsb_set_frequency(BeerDirectSoundBuffer *b, u32 v)
     { if (!b || !v) return BEER_DSERR_INVALIDPARAM; b->rate = v; return 0; }
 static u64 __attribute__((ms_abi)) beer_dsb_stop(BeerDirectSoundBuffer *b)
-    { if (!b) return BEER_DSERR_INVALIDPARAM; b->playing = 0; beer_audio_reset(); return 0; }
+    { if (!b) return BEER_DSERR_INVALIDPARAM; b->playing = 0; beer_audio_stream_reset(b->stream); return 0; }
 static void beer_pcm_measure(const void *data, u32 bytes, u64 *nonzero, u32 *peak)
 {
     if (!data || !bytes) return;
@@ -4312,9 +4331,9 @@ beer_dsb_unlock(BeerDirectSoundBuffer *buffer, void *part1, u32 bytes1,
         u32 ring_peak = 0;
         beer_pcm_measure(buffer->data, buffer->size, &ring_nonzero, &ring_peak);
         int submitted = 1;
-        if (part1 && bytes1) submitted = beer_audio_submit_nowait(part1, bytes1);
+        if (part1 && bytes1) submitted = beer_audio_stream_submit(buffer->stream, part1, bytes1, 0, NULL, NULL);
         if (submitted && part2 && bytes2)
-            submitted = beer_audio_submit_nowait(part2, bytes2);
+            submitted = beer_audio_stream_submit(buffer->stream, part2, bytes2, 0, NULL, NULL);
         if (!submitted) return BEER_DSERR_INVALIDPARAM;
         static _Atomic(u32) unlocks;
         static _Atomic(u64) nonzero_samples;
@@ -4344,7 +4363,7 @@ static u64 __attribute__((ms_abi)) beer_dsb_noop(void *b, u64 a, u64 c, u64 d)
     { (void)a; (void)c; (void)d; return b ? BEER_DS_OK : BEER_DSERR_INVALIDPARAM; }
 
 static void *g_direct_sound_buffer_vtable[24] = {
-    (void *)beer_ds_query, (void *)beer_ds_addref, (void *)beer_ds_release,
+    (void *)beer_ds_query, (void *)beer_ds_addref, (void *)beer_dsb_release,
     (void *)beer_dsb_get_caps, (void *)beer_dsb_get_current_position,
     (void *)beer_dsb_get_format, (void *)beer_dsb_get_volume,
     (void *)beer_dsb_get_pan, (void *)beer_dsb_get_frequency,
