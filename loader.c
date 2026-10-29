@@ -1290,9 +1290,15 @@ extern void beer_dispatch_trampoline(void);
 static u64 __attribute__((ms_abi))
 stub_dispatch(u64 idx, u64 a1, u64 a2, u64 a3)
 {
+    /* Each stub logs its first 16 calls, then only at powers of two: some are called thousands of times a second
+     * (RDR2: ResetWriteWatch, ActivateKeyboardLayout, NvLL_VK_SetLatencyMarker), and an unbuffered stderr write per
+     * call cost CPU and grew logs by ~100 MB.  BEER_STUB_LOG_ALL=1 logs every call. */
+    static _Atomic(u32) calls[MAX_STUBS];
+    const u32 n = idx < MAX_STUBS ? atomic_fetch_add_explicit(&calls[idx], 1, memory_order_relaxed) + 1 : 1;
+    if (n > 16 && (n & (n - 1)) && !getenv("BEER_STUB_LOG_ALL")) return 0;
     const char *name = (idx < (u64)g_nstubs) ? g_snames[idx] : "??";
-    fprintf(stderr, "[STUB] %-60s  (0x%lx, 0x%lx, 0x%lx) -> 0  from %p\n",
-            name, a1, a2, a3, __builtin_return_address(0));
+    fprintf(stderr, "[STUB] %-60s  (0x%lx, 0x%lx, 0x%lx) -> 0  from %p  #%u\n",
+            name, a1, a2, a3, __builtin_return_address(0), n);
     return 0;
 }
 
@@ -19627,15 +19633,18 @@ static void pe_imports(void)
                     guest_export = (u64)impl_BinkWait_dispatch;
                 else if (!strcmp(fn_only, "BinkNextFrame"))
                     guest_export = (u64)impl_BinkNextFrame_dispatch;
-                else if (!strcmp(fn_only, "BinkDoFrameAsyncMulti"))
+                /* BEER_BINK_SYNC=1: decode on the caller instead of Bink's own worker threads.  Native workers are
+                 * the default: the synchronous fallback put whole-frame decodes on the game's movie/render thread
+                 * (RDR2's intro cards played at ~1 fps). */
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkDoFrameAsyncMulti"))
                     guest_export = (u64)impl_BinkDoFrameAsyncMulti_dispatch;
-                else if (!strcmp(fn_only, "BinkDoFrameAsyncWait"))
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkDoFrameAsyncWait"))
                     guest_export = (u64)impl_BinkDoFrameAsyncWait_dispatch;
-                else if (!strcmp(fn_only, "BinkStartAsyncThread"))
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkStartAsyncThread"))
                     guest_export = (u64)impl_BinkStartAsyncThread_dispatch;
-                else if (!strcmp(fn_only, "BinkRequestStopAsyncThread"))
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkRequestStopAsyncThread"))
                     guest_export = (u64)impl_BinkRequestStopAsyncThread_dispatch;
-                else if (!strcmp(fn_only, "BinkWaitStopAsyncThread"))
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkWaitStopAsyncThread"))
                     guest_export = (u64)impl_BinkWaitStopAsyncThread_dispatch;
             }
             g_snames[g_nstubs] = strdup(buf);

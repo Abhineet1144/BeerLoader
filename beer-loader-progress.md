@@ -1216,3 +1216,16 @@ through DirectSound. Problems found:
   (`BEER_AUDIO_LATENCY_MS`): the server holds ~55–60 ms, drift-free against the sound card. Shared-mode buffers are
   at least 30 ms (three periods, as Wine's drivers do). Same run afterwards: 54 underruns, all in one burst while
   the game initialised, none through videos, menu, loading and the opening cutscene.
+
+### Addendum 16 — loading stalls: Bink decoded on the caller (2026-10-29)
+
+- RDR2's intro cards ("Even the west had mostly been tamed") are Bink videos played while the world loads; they ran
+  at ~1 fps (CPU 1.5 cores, GPU 5%, almost no disk wait). Beer had replaced BinkDoFrameAsyncMulti/Wait and
+  BinkStartAsyncThread with a synchronous BinkDoFrame on the caller (added for Sekiro/RE8 when Bink's workers spun),
+  so whole-frame decodes ran on the game's movie/render path. With Bink's native workers the loading phase runs at
+  40–60 fps. The synchronous path remains behind `BEER_BINK_SYNC=1`.
+- Stub calls log their first 16 calls and then powers of two (`BEER_STUB_LOG_ALL=1` for all): RDR2 called
+  ResetWriteWatch ~1300 times a second, an unbuffered stderr write each (logs shrank from >100 MB to ~1 MB).
+- Control-socket `status` reports `max_frame_ms` and `hitches` (presents >50 ms apart) since the previous request.
+  Loading + opening cutscene: 0 hitches, worst frame 36 ms.
+- Seen once since (8 min in, opening cutscene): SIGSEGV reading NULL at img+0x2ea0e89, not yet analysed.

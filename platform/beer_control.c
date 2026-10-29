@@ -70,9 +70,22 @@ static uint64_t wall_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Frame pacing since the last status request: the longest present-to-present gap and the number over 50 ms
+ * (a visible hitch).  The average fps hides stutter. */
+static _Atomic uint64_t g_last_present_ns, g_max_frame_ns, g_hitches;
+
 void beer_control_note_frame(void)
 {
     atomic_fetch_add_explicit(&g_frames, 1, memory_order_relaxed);
+    const uint64_t now = wall_ns();
+    const uint64_t last = atomic_exchange_explicit(&g_last_present_ns, now, memory_order_relaxed);
+    if (last && now > last) {
+        const uint64_t gap = now - last;
+        uint64_t max = atomic_load_explicit(&g_max_frame_ns, memory_order_relaxed);
+        while (gap > max && !atomic_compare_exchange_weak_explicit(&g_max_frame_ns, &max, gap, memory_order_relaxed,
+                                                                   memory_order_relaxed)) {}
+        if (gap > 50000000ull) atomic_fetch_add_explicit(&g_hitches, 1, memory_order_relaxed);
+    }
     beer_overlay_note_frame();
 }
 
@@ -266,16 +279,19 @@ static void handle(Session *session, const char *request, char *out, size_t size
             cpu_total_x10 = cpu_x10 / (uint64_t)(logical > 0 ? logical : 1);   /* share of the whole machine */
         }
         session->last = (Sample){ ticks, now, frames };
+        const uint64_t max_frame_ns = atomic_exchange(&g_max_frame_ns, 0);
+        const uint64_t hitches = atomic_exchange(&g_hitches, 0);
         char scale[24];
         format_milli(scale, sizeof(scale), (int32_t)atomic_load(&settings[0].value));
         snprintf(out, size,
-                 "{\"ok\":true,\"pid\":%d,\"uptime_s\":%llu,\"frames\":%llu,\"fps\":%llu.%llu,\"cpu_percent\":%llu.%llu,\"cpu_cores\":%llu.%llu,\"rss_mb\":%llu,\"threads\":%llu,\"time_scale\":%s,\"fps_limit\":%d,\"paused\":%s}\n",
+                 "{\"ok\":true,\"pid\":%d,\"uptime_s\":%llu,\"frames\":%llu,\"fps\":%llu.%llu,\"cpu_percent\":%llu.%llu,\"cpu_cores\":%llu.%llu,\"rss_mb\":%llu,\"threads\":%llu,\"time_scale\":%s,\"fps_limit\":%d,\"paused\":%s,\"max_frame_ms\":%llu,\"hitches\":%llu}\n",
                  (int)getpid(), (unsigned long long)((now - g_start_ns) / 1000000000ull), (unsigned long long)frames,
                  (unsigned long long)(fps_x10 / 10), (unsigned long long)(fps_x10 % 10),
                  (unsigned long long)(cpu_total_x10 / 10), (unsigned long long)(cpu_total_x10 % 10),
                  (unsigned long long)(cpu_x10 / 1000), (unsigned long long)((cpu_x10 / 100) % 10),
                  (unsigned long long)(rss / 1024), (unsigned long long)threads, scale,
-                 (int)atomic_load(&settings[1].value), atomic_load(&settings[2].value) ? "true" : "false");
+                 (int)atomic_load(&settings[1].value), atomic_load(&settings[2].value) ? "true" : "false",
+                 (unsigned long long)(max_frame_ns / 1000000u), (unsigned long long)hitches);
     } else if (!strcmp(cmd, "settings")) {
         size_t used = (size_t)snprintf(out, size, "{\"ok\":true,\"settings\":[");
         for (size_t i = 0; i < SETTING_COUNT && used + 600 < size; ++i) {
