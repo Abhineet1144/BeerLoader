@@ -312,7 +312,6 @@
     {"NtProtectVirtualMemory", (ImplFn)beer_NtProtectVirtualMemory},
     {"RtlFormatCurrentUserKeyPath", (ImplFn)stub_RtlFormatCurrentUserKeyPath},
     {"RtlDosPathNameToNtPathName_U", (ImplFn)beer_RtlDosPathNameToNtPathName_U},
-    {"NtOpenSection", (ImplFn)stub_NtOpenSection},
     {"RtlInitString", (ImplFn)stub_RtlInitString},
     {"PathMatchSpecW", (ImplFn)stub_PathMatchSpecW},
     {"InitCommonControls", (ImplFn)stub_InitCommonControls},

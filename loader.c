@@ -28,12 +28,17 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <ifaddrs.h>
+#include <netpacket/packet.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <ucontext.h>
 #include <locale.h>
@@ -71,9 +76,11 @@
 #include "win32_onexit.h"
 #include "win32_crt_init.h"
 #include "win32_process_parameters.h"
+#include "win32_ip_adapter.h"
 #include "win32_vectored_exception.h"
 #include "win32_unwind.h"
 #include "win32_seh.h"
+#include "win32_syscall.h"
 #include "renderer/vulkan/vulkan_graphics.h"
 #include "renderer/vulkan/vulkan_renderer.h"
 #include "platform/xwayland_backend.h"
@@ -222,6 +229,9 @@ typedef struct {
     int entry_called;
     int initializing;
 } GuestDll;
+static void touch_trace_maybe_arm(void);
+static void cpuid_trace_arm(void);
+static void touch_trace_disarm(void);
 /* Guard for a guest DLL's initialisation (see on_crash_impl). */
 static __thread sigjmp_buf *t_guest_dll_init_jmp;
 static __thread GuestDll *t_guest_dll_init_dll;
@@ -1199,6 +1209,8 @@ __asm__(
     ".text\n"
     ".global beer_dispatch_trampoline\n"
     "beer_dispatch_trampoline:\n"
+    /* Guest code called Beer: host system calls are allowed until the return to the guest (win32_syscall.h). */
+    "    movb $0, %fs:beer_win32_syscall_selector@tpoff\n"
     "    mov %r10, %fs:g_dispatch_import_index@tpoff\n"
     "    mov %rsp, %fs:g_dispatch_incoming_rsp@tpoff\n"
     "    mov (%rsp), %rax\n"
@@ -1323,6 +1335,7 @@ __asm__(
     "    mov %fs:g_saved_guest_rsp@tpoff, %rsp\n"
     "    movq $0, %fs:g_saved_guest_rsp@tpoff\n"              /* No outer dispatch remains active after restore */
     "    pop %r11\n"
+    "    movb $1, %fs:beer_win32_syscall_selector@tpoff\n"   /* back to guest: block its system calls */
     "    jmp *%r11\n"
     "1:\n"                                /* nested: keep using the current (already-switched) rsp */
     "    lea g_impl_targets(%rip), %r11\n"
@@ -1355,6 +1368,7 @@ __asm__(
     "    movdqu (0x20+\\reg*0x10)(%rsp), %xmm\\reg\n"
     ".endr\n"
     "    mov 0x120(%rsp), %rsp\n"
+    "    movb $1, %fs:beer_win32_syscall_selector@tpoff\n"
     "    ret\n"
 );
 #endif
@@ -1389,7 +1403,10 @@ stub_dispatch(u64 idx, u64 a1, u64 a2, u64 a3)
 #if !BEER_GUEST_NATIVE
 /* Emulated guest: every import is  mov r10,rcx ; mov eax,<id> ; syscall ; ret  (R10 carries argument 1 because the
  * syscall instruction clobbers RCX). The backend hands the id and the argument registers to
- * beer_guest_import_dispatch(). Ids >= 0x40000000 are the logging stubs for unimplemented imports. */
+ * beer_guest_import_dispatch(). Ids with BEER_IMPORT_ID_IMPL are implemented imports, ids >= 0x40000000 the logging
+ * stubs for unimplemented ones; untagged ids below BEER_WIN32_SYSCALL_CAPACITY are Windows system-service numbers from
+ * the guest's own SYSCALL instructions (ntdll's Nt/Zw stubs, win32_syscall.h). */
+#define BEER_IMPORT_ID_IMPL 0x20000000u
 static void emit_syscall_thunk(int idx, u32 id)
 {
     u8 *p = g_tramp + idx * THUNK_SZ;
@@ -1441,7 +1458,7 @@ static void emit_impl_thunk(int idx, u64 fn_ptr)
 #if !BEER_GUEST_NATIVE
     (void)p;
     g_impl_targets[idx] = fn_ptr;   /* BEER_API_TRACE's wrapper is native asm; not available under emulation */
-    emit_syscall_thunk(idx, (u32)idx);
+    emit_syscall_thunk(idx, BEER_IMPORT_ID_IMPL | (u32)idx);
     return;
 #else
     g_impl_targets[idx] = g_api_trace ? (u64)beer_trace_wrap : fn_ptr;
@@ -1528,8 +1545,8 @@ static void thread_dump_handler(int sig)
     for (int i = 0; i < n && i < MAX_TRACKED_THREADS; ++i) {
         ThreadTrack *t = &g_tracks[i];
         const u64 id = atomic_load(&t->last_id);
-        const u64 idx = (id & 0x40000000u) ? (id & 0xffffu) : id;
-        const char *name = idx < MAX_STUBS && g_snames[idx] ? g_snames[idx] : "?";
+        const u64 idx = (id & 0x40000000u) ? (id & 0xffffu) : (id & BEER_IMPORT_ID_IMPL) ? (id & 0xffffu) : MAX_STUBS;
+        const char *name = idx < MAX_STUBS && g_snames[idx] ? g_snames[idx] : (id < BEER_IMPORT_ID_IMPL ? "<syscall>" : "?");
         fprintf(stderr, "[THREAD-DUMP] tid=%d calls=%llu %s %s ret=0x%llx\n", (int)t->tid,
                 (unsigned long long)atomic_load(&t->calls),
                 atomic_load(&t->in_import) ? "IN " : "after", name, (unsigned long long)atomic_load(&t->last_ret));
@@ -1572,7 +1589,10 @@ u64 beer_guest_import_dispatch(u64 id, const u64 *a, const u64 *xmm, u64 guest_r
     u64 result = 0;
     if (id & 0x40000000u) {
         result = stub_dispatch(id & 0xffffu, a[1], a[2], a[3]);
-    } else if (id < MAX_STUBS && g_impl_targets[id]) {
+    } else if (!(id & BEER_IMPORT_ID_IMPL) && id < BEER_WIN32_SYSCALL_CAPACITY) {
+        /* The guest's own SYSCALL: a Windows system-service number. Traced with the caller's return address. */
+        result = beer_win32_syscall_service((unsigned)id, a, g_dispatch_incoming_return);
+    } else if ((id &= ~(u64)BEER_IMPORT_ID_IMPL) < MAX_STUBS && g_impl_targets[id]) {
         g_dispatch_import_index = id;
         if (g_api_trace > 0) beer_trace_log(id, a[0], a[1], a[2], a[3]);   /* BEER_API_TRACE under emulation */
         result = beer_guest_host_call(g_impl_targets[id], a, xmm);
@@ -2686,9 +2706,42 @@ static GuestDll *guest_dll_find(const char *name)
     return NULL;
 }
 
+#define BEER_DLL_DIRECTORY_CAPACITY 32
+static char g_dll_directories[BEER_DLL_DIRECTORY_CAPACITY][PATH_MAX];
+static u8 g_dll_directory_used[BEER_DLL_DIRECTORY_CAPACITY];
+static pthread_mutex_t g_dll_directory_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int search_added_dll_directories(const char *name, char *out,
+                                        size_t out_size)
+{
+    if (!name || !*name || strchr(name, '/') || strchr(name, '\\')) return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_dll_directory_mutex);
+    for (size_t i = 0; i < BEER_DLL_DIRECTORY_CAPACITY && !found; ++i) {
+        if (!g_dll_directory_used[i]) continue;
+        char candidate[PATH_MAX];
+        if (snprintf(candidate, sizeof(candidate), "%s/%s",
+                     g_dll_directories[i], name) >= (int)sizeof(candidate))
+            continue;
+        if (realpath(candidate, out)) found = 1;
+        else if (resolve_windows_host_path(candidate, out, out_size) &&
+                 access(out, R_OK) == 0)
+            found = 1;
+    }
+    pthread_mutex_unlock(&g_dll_directory_mutex);
+    return found;
+}
+
 static int build_guest_dll_path(const char *name, char *out, size_t out_size)
 {
     if (!name || !*name || !out || out_size < 2) return 0;
+    /* A Windows path (drive letter, or rooted) goes through the prefix's drive mapping; Windows
+     * accepts '/' as a separator, so "Z:\\dir\\/x.dll" names the same file. */
+    if ((name[0] && name[1] == ':') || name[0] == '\\') {
+        char host[PATH_MAX];
+        if (resolve_windows_host_path(name, host, sizeof(host)) && realpath(host, out)) return 1;
+        return 0;
+    }
     if (strchr(name, '/') || strchr(name, '\\')) {
         char normalized[PATH_MAX];
         size_t n = strlen(name);
@@ -2722,6 +2775,11 @@ static int build_guest_dll_path(const char *name, char *out, size_t out_size)
     }
     if (resolve_windows_host_path(absolute_candidate, out, out_size) &&
         access(out, R_OK) == 0) return 1;
+
+    /* AddDllDirectory directories participate in normal LoadLibrary search.
+     * Keep them process-local and resolve names case-insensitively through the
+     * same Windows-path layer as the application directory. */
+    if (search_added_dll_directories(name, out, out_size)) return 1;
 
     /* Several games ship the VC/UCRT redistributable privately in a Win64
      * subdirectory. Windows searches application directories supplied by the
@@ -2997,6 +3055,8 @@ static u64 steam_client_module(void)
     return g_steam_client_module;
 }
 
+static void compat_module_exports_build(u64 base, const char *module);
+
 static u64 dll_name_to_handle(const char *lname, int create_fallback) {
     int system_module = !strcmp(lname,"kernel32.dll") || !strcmp(lname,"kernelbase.dll") ||
                         !strcmp(lname,"user32.dll") || !strcmp(lname,"ntdll.dll") ||
@@ -3041,12 +3101,19 @@ static u64 dll_name_to_handle(const char *lname, int create_fallback) {
      * an inert module handle. */
     if (!create_fallback) return 0;
     
-    /* Create a new fake handle: use 0x140000000 + (index * 0x100000) */
+    /* A compatibility module handle is a real, minimal PE image (headers and an export directory
+     * naming the DLL), because software walks loaded modules' headers. The handles live in their own
+     * low range: the old 0x140000000 + n MiB numbering fell inside any executable using the default
+     * image base, so header reads through the handle returned the executable's bytes. */
     if (g_fake_dll_count < 128) {
-        u64 fake_h = 0x140000000ULL + ((u64)g_fake_dll_count << 20);
+        u64 fake_h = 0;
+        for (u64 slot = (u64)g_fake_dll_count; slot < 512 && !fake_h; ++slot)
+            fake_h = fake_pe_header_init(0xF0000000ULL + slot * FAKE_PE_SIZE, lname);
+        if (!fake_h) return 0;
         strncpy(g_fake_dll_cache[g_fake_dll_count].name, lname, 63);
         g_fake_dll_cache[g_fake_dll_count].handle = fake_h;
         g_fake_dll_count++;
+        compat_module_exports_build(fake_h, lname);
         return fake_h;
     }
     return 0;
@@ -3056,9 +3123,12 @@ static u64 __attribute__((ms_abi))
 impl_GetModuleHandleA(const char *name)
 {
     if (!name) return HMOD_EXE;
-    char lname[64]; int i;
-    for (i=0; i<63 && name[i]; i++) { char c=name[i]; if(c>='A'&&c<='Z')c+=32; lname[i]=c; }
-    lname[i]=0;
+    char lname[64];
+    lowercase_dll_basename(name, lname, sizeof(lname));
+    /* Windows accepts a module basename with or without the conventional .dll
+     * suffix. Normalize only the query; loader-list identities remain complete. */
+    if (!strchr(lname, '.') && strlen(lname) + 4 < sizeof(lname))
+        strcat(lname, ".dll");
     u64 h = dll_name_to_handle(lname, 0);
     if (!h) fprintf(stderr, "[IMPL] GetModuleHandleA(\"%s\") -> NULL\n", name);
     return h;
@@ -3068,9 +3138,14 @@ static u64 __attribute__((ms_abi))
 impl_GetModuleHandleW(const u16 *name)
 {
     if (!name) return HMOD_EXE;
-    char lname[64]; int i;
-    for (i=0; i<63 && name[i]; i++) { char c=(char)(name[i]&0x7f); if(c>='A'&&c<='Z')c+=32; lname[i]=c; }
-    lname[i]=0;
+    char narrow[PATH_MAX]; size_t i;
+    for (i = 0; i + 1 < sizeof(narrow) && name[i]; ++i)
+        narrow[i] = (char)(name[i] > 0x7f ? '?' : name[i]);
+    narrow[i] = 0;
+    char lname[64];
+    lowercase_dll_basename(narrow, lname, sizeof(lname));
+    if (!strchr(lname, '.') && strlen(lname) + 4 < sizeof(lname))
+        strcat(lname, ".dll");
     u64 h = dll_name_to_handle(lname, 0);
     if (!h) fprintf(stderr, "[IMPL] GetModuleHandleW(\"%s\") -> NULL\n", lname);
     return h;
@@ -3799,7 +3874,13 @@ static void dbg_dump_guest_callchain(const char *tag) {
         }
     }
 }
-static u64 __attribute__((ms_abi)) impl_SetUnhandledExceptionFilter(u64 f) { (void)f; return 0; }
+/* The top-level exception filter. Windows calls it for an exception that no vectored or
+ * frame-based handler took (see beer_dispatch_signal_to_top_level_filter). */
+static _Atomic(u64) g_top_level_exception_filter;
+static u64 __attribute__((ms_abi)) impl_SetUnhandledExceptionFilter(u64 f)
+{
+    return atomic_exchange(&g_top_level_exception_filter, f);
+}
 static u64 __attribute__((ms_abi))
 impl_AddVectoredExceptionHandler(u32 first, BeerVectoredExceptionHandler handler)
 {
@@ -4131,6 +4212,72 @@ impl_LoadLibraryExA(const char *name, u64 h, u32 flags)
 static u64 __attribute__((ms_abi))
 impl_LoadLibraryExW(const u16 *name, u64 h, u32 flags)
     { (void)h; (void)flags; return impl_LoadLibraryW(name); }
+
+static u64 __attribute__((ms_abi))
+impl_AddDllDirectory(const u16 *path)
+{
+    if (!path || !*path) { g_last_error = 87; return 0; }
+    char windows_path[PATH_MAX], host_path[PATH_MAX];
+    size_t length = 0;
+    while (path[length] && length + 1 < sizeof(windows_path)) {
+        if (path[length] > 0x7f) { g_last_error = 1113; return 0; }
+        windows_path[length] = (char)path[length];
+        ++length;
+    }
+    if (path[length]) { g_last_error = 206; return 0; }
+    windows_path[length] = 0;
+    if (!resolve_windows_host_path(windows_path, host_path, sizeof(host_path))) {
+        g_last_error = 3;
+        return 0;
+    }
+    struct stat status;
+    if (stat(host_path, &status) != 0 || !S_ISDIR(status.st_mode)) {
+        g_last_error = 3;
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_dll_directory_mutex);
+    for (size_t i = 0; i < BEER_DLL_DIRECTORY_CAPACITY; ++i) {
+        if (g_dll_directory_used[i] &&
+            !strcasecmp(g_dll_directories[i], host_path)) {
+            pthread_mutex_unlock(&g_dll_directory_mutex);
+            g_last_error = 0;
+            return i + 1;
+        }
+    }
+    for (size_t i = 0; i < BEER_DLL_DIRECTORY_CAPACITY; ++i) {
+        if (g_dll_directory_used[i]) continue;
+        snprintf(g_dll_directories[i], sizeof(g_dll_directories[i]), "%s",
+                 host_path);
+        g_dll_directory_used[i] = 1;
+        pthread_mutex_unlock(&g_dll_directory_mutex);
+        g_last_error = 0;
+        return i + 1; /* opaque non-NULL DLL_DIRECTORY_COOKIE */
+    }
+    pthread_mutex_unlock(&g_dll_directory_mutex);
+    g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_RemoveDllDirectory(u64 cookie)
+{
+    if (!cookie || cookie > BEER_DLL_DIRECTORY_CAPACITY) {
+        g_last_error = 87;
+        return 0;
+    }
+    size_t index = (size_t)cookie - 1;
+    pthread_mutex_lock(&g_dll_directory_mutex);
+    int present = g_dll_directory_used[index];
+    if (present) {
+        g_dll_directory_used[index] = 0;
+        g_dll_directories[index][0] = 0;
+    }
+    pthread_mutex_unlock(&g_dll_directory_mutex);
+    g_last_error = present ? 0 : 87;
+    return present ? 1 : 0;
+}
+
 static u64 __attribute__((ms_abi)) impl_FreeLibrary(u64 h) { (void)h; return 1; }
 
 /* WinVerifyTrust is dynamically resolved from wintrust.dll. Beer does not
@@ -4139,6 +4286,7 @@ static u64 __attribute__((ms_abi)) impl_FreeLibrary(u64 h) { (void)h; return 1; 
  * absent/non-file subject remains a provider failure. This models the loader
  * contract needed by local compatibility wrappers without claiming that an
  * arbitrary file has a Microsoft/Valve signature. */
+static void crypt_wintrust_signature_settings(const u8 *trust_data);
 static s64 __attribute__((ms_abi))
 impl_WinVerifyTrust(u64 hwnd, const void *action, const void *trust_data)
 {
@@ -4147,6 +4295,7 @@ impl_WinVerifyTrust(u64 hwnd, const void *action, const void *trust_data)
     if (!trust_data) return (s64)0x800B0003u; /* TRUST_E_SUBJECT_FORM_UNKNOWN */
     if (getenv("BEER_TRUST_DIAGNOSTICS"))
         fprintf(stderr, "[WINTRUST] local-file trust request accepted\n");
+    crypt_wintrust_signature_settings(trust_data);
     return 0; /* ERROR_SUCCESS */
 }
 
@@ -4226,28 +4375,172 @@ static u64 __attribute__((ms_abi)) impl_VerSetConditionMask(u64 mask, u32 type, 
     if (!type || !condition) return mask;
     return mask | ((u64)(condition & 7u) << ((__builtin_ctz(type) * 3u) & 63u));
 }
+static int windows_version_matches(const WIN_OSVERSIONINFOEXW *requested,
+                                   u32 type_mask, u64 condition_mask)
+{
+    (void)type_mask;
+    (void)condition_mask;
+    if (!requested) return 0;
+    return requested->major < 10 ||
+           (requested->major == 10 && requested->minor == 0 &&
+            requested->build <= 19045);
+}
+
 static u64 __attribute__((ms_abi))
 impl_VerifyVersionInfoW(const WIN_OSVERSIONINFOEXW *requested, u32 type_mask, u64 condition_mask)
 {
-    (void)type_mask; (void)condition_mask;
     if (!requested) { g_last_error = 87; return 0; }
-    if (requested->major > 10 ||
-        (requested->major == 10 && requested->minor > 0) ||
-        (requested->major == 10 && requested->minor == 0 && requested->build > 19045)) {
-        g_last_error = 1150;
+    if (!windows_version_matches(requested, type_mask, condition_mask)) {
+        g_last_error = 1150; /* ERROR_OLD_WIN_VERSION */
         return 0;
     }
     g_last_error = 0;
     return 1;
 }
+
+static u64 __attribute__((ms_abi))
+impl_RtlVerifyVersionInfo(const WIN_OSVERSIONINFOEXW *requested,
+                          u32 type_mask, u64 condition_mask)
+{
+    if (!requested) return 0xc000000dull; /* STATUS_INVALID_PARAMETER */
+    return windows_version_matches(requested, type_mask, condition_mask)
+         ? 0 : 0xc0000059ull; /* STATUS_REVISION_MISMATCH */
+}
 static u64 __attribute__((ms_abi)) impl_AreFileApisANSI(void) { return 1; }
+static u64 __attribute__((ms_abi))
+impl_AppPolicyGetThreadInitializationType(u64 process_token, int32_t *initialization_type)
+{
+    (void)process_token;
+    return (u64)(uint32_t)beer_app_policy_get_thread_initialization_type(
+        initialization_type);
+}
 static u64 __attribute__((ms_abi)) impl_WinHttpCheckPlatform(void) { return 1; }
+
+/* GetAdaptersAddresses returns one self-contained Windows x64 record for the
+ * first active, non-loopback host interface. The old 96-byte prefix claimed
+ * Length=96 and omitted the unicast list, MTU, type and operational status;
+ * callers using the documented structure therefore interpreted a successful
+ * call as an unusable adapter. */
 static u64 __attribute__((ms_abi))
 impl_GetAdaptersAddresses(u32 family, u32 flags, void *reserved, void *addresses, u32 *size)
 {
-    (void)family; (void)flags; (void)reserved; (void)addresses;
-    if (size) *size = 0;
-    return 232; /* ERROR_NO_DATA */
+    (void)flags;
+    (void)reserved;
+    if (!size) return 87; /* ERROR_INVALID_PARAMETER */
+    if (family != 0 && family != 2 && family != 23) {
+        *size = 0;
+        return 87;
+    }
+
+    struct ifaddrs *interfaces = NULL;
+    if (getifaddrs(&interfaces) != 0) {
+        *size = 0;
+        return 232; /* ERROR_NO_DATA */
+    }
+    struct ifaddrs *selected_link = NULL;
+    struct ifaddrs *selected_ipv4 = NULL;
+    for (struct ifaddrs *entry = interfaces; entry; entry = entry->ifa_next) {
+        if (!entry->ifa_name || !entry->ifa_addr ||
+            (entry->ifa_flags & IFF_LOOPBACK) || !(entry->ifa_flags & IFF_UP))
+            continue;
+        if (!selected_link && entry->ifa_addr->sa_family == AF_PACKET)
+            selected_link = entry;
+    }
+    if (selected_link) {
+        for (struct ifaddrs *entry = interfaces; entry; entry = entry->ifa_next) {
+            if (entry->ifa_name && entry->ifa_addr &&
+                !strcmp(entry->ifa_name, selected_link->ifa_name) &&
+                entry->ifa_addr->sa_family == AF_INET) {
+                selected_ipv4 = entry;
+                break;
+            }
+        }
+    }
+    if (!selected_link || (family == 2 && !selected_ipv4)) {
+        freeifaddrs(interfaces);
+        *size = 0;
+        return 232;
+    }
+
+    const size_t adapter_name_length = strlen(selected_link->ifa_name) + 1;
+    const size_t required_size = sizeof(BeerIpAdapterAddresses) +
+        adapter_name_length + (selected_ipv4 ? sizeof(BeerIpAdapterUnicastAddress) +
+                                               sizeof(struct sockaddr_in) : 0);
+    if (required_size > UINT32_MAX) {
+        freeifaddrs(interfaces);
+        *size = 0;
+        return 8; /* ERROR_NOT_ENOUGH_MEMORY */
+    }
+    const u32 required = (u32)required_size;
+    if (!addresses || *size < required) {
+        *size = required;
+        freeifaddrs(interfaces);
+        return 111; /* ERROR_BUFFER_OVERFLOW */
+    }
+
+    memset(addresses, 0, required);
+    BeerIpAdapterAddresses *adapter = addresses;
+    adapter->length = sizeof(*adapter);
+    adapter->if_index = if_nametoindex(selected_link->ifa_name);
+    adapter->ipv6_if_index = adapter->if_index;
+    adapter->flags = 0x80u; /* IP_ADAPTER_IPV4_ENABLED */
+    adapter->if_type = !strncmp(selected_link->ifa_name, "wl", 2)
+                     ? BEER_IF_TYPE_IEEE80211 : BEER_IF_TYPE_ETHERNET_CSMACD;
+    adapter->oper_status = BEER_IF_OPER_STATUS_UP;
+    adapter->connection_type = 1; /* NET_IF_CONNECTION_DEDICATED */
+    adapter->transmit_link_speed = 1000000000ull;
+    adapter->receive_link_speed = 1000000000ull;
+
+    char *cursor = (char *)adapter + sizeof(*adapter);
+    adapter->adapter_name = (u64)(uintptr_t)cursor;
+    memcpy(cursor, selected_link->ifa_name, adapter_name_length);
+    cursor += adapter_name_length;
+
+    const struct sockaddr_ll *link =
+        (const struct sockaddr_ll *)selected_link->ifa_addr;
+    size_t hardware_length = link->sll_halen;
+    if (hardware_length > sizeof(adapter->physical_address))
+        hardware_length = sizeof(adapter->physical_address);
+    memcpy(adapter->physical_address, link->sll_addr, hardware_length);
+    adapter->physical_address_length = (u32)hardware_length;
+
+    int socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_fd >= 0) {
+        struct ifreq request;
+        memset(&request, 0, sizeof(request));
+        snprintf(request.ifr_name, sizeof(request.ifr_name), "%s",
+                 selected_link->ifa_name);
+        if (ioctl(socket_fd, SIOCGIFMTU, &request) == 0 && request.ifr_mtu > 0)
+            adapter->mtu = (u32)request.ifr_mtu;
+        close(socket_fd);
+    }
+    if (!adapter->mtu) adapter->mtu = 1500;
+
+    if (selected_ipv4) {
+        BeerIpAdapterUnicastAddress *unicast = (void *)cursor;
+        cursor += sizeof(*unicast);
+        struct sockaddr_in *socket_address = (void *)cursor;
+        memcpy(socket_address, selected_ipv4->ifa_addr, sizeof(*socket_address));
+        unicast->length = sizeof(*unicast);
+        unicast->address.sockaddr = (u64)(uintptr_t)socket_address;
+        unicast->address.length = sizeof(*socket_address);
+        unicast->prefix_origin = BEER_IP_PREFIX_ORIGIN_DHCP;
+        unicast->suffix_origin = BEER_IP_SUFFIX_ORIGIN_DHCP;
+        unicast->dad_state = BEER_IP_DAD_STATE_PREFERRED;
+        unicast->valid_lifetime = UINT32_MAX;
+        unicast->preferred_lifetime = UINT32_MAX;
+        unicast->lease_lifetime = UINT32_MAX;
+        if (selected_ipv4->ifa_netmask) {
+            u32 mask = ntohl(((const struct sockaddr_in *)
+                              selected_ipv4->ifa_netmask)->sin_addr.s_addr);
+            unicast->on_link_prefix_length = (u8)__builtin_popcount(mask);
+        }
+        adapter->first_unicast_address = (u64)(uintptr_t)unicast;
+    }
+
+    *size = required;
+    freeifaddrs(interfaces);
+    return 0;
 }
 
 /* ---- WINMM timing ---- */
@@ -6454,6 +6747,139 @@ impl_connect(u64 socket_handle, const void *address, s32 address_length)
 }
 
 static u64 __attribute__((ms_abi))
+impl_bind(u64 socket_handle, const void *address, s32 address_length)
+{
+    if (!winsock_ready()) return (u32)-1;
+    if (!address || address_length <= 0) {
+        g_wsa_last_error = 10014;
+        return (u32)-1;
+    }
+    if (bind((int)socket_handle, (const struct sockaddr *)address,
+             (socklen_t)address_length) != 0) {
+        g_wsa_last_error = winsock_error_from_errno(errno);
+        return (u32)-1;
+    }
+    g_wsa_last_error = 0;
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_ioctlsocket(u64 socket_handle, u32 command, u32 *argument)
+{
+    if (!winsock_ready()) return (u32)-1;
+    if (!argument) { g_wsa_last_error = 10014; return (u32)-1; }
+    /* Windows and Linux encode ioctl direction/size bits differently. Translate
+     * Winsock's two socket ioctls explicitly instead of passing the command
+     * number through to the host. */
+    unsigned long host_command;
+    if (command == UINT32_C(0x8004667e)) host_command = FIONBIO;
+    else if (command == UINT32_C(0x4004667f)) host_command = FIONREAD;
+    else { g_wsa_last_error = 10022; return (u32)-1; }
+    int value = (int)*argument;
+    if (ioctl((int)socket_handle, host_command, &value) != 0) {
+        g_wsa_last_error = winsock_error_from_errno(errno);
+        return (u32)-1;
+    }
+    *argument = (u32)value;
+    g_wsa_last_error = 0;
+    return 0;
+}
+
+/* recv/recvfrom: MSG_OOB (1) and MSG_PEEK (2) share their values with Linux. A non-blocking socket with
+ * no datagram fails with WSAEWOULDBLOCK, as on Windows; 0 means an orderly shutdown only. */
+static u64 __attribute__((ms_abi))
+impl_recvfrom(u64 socket_handle, void *buffer, s32 length, s32 flags, void *from, s32 *from_length)
+{
+    if (!winsock_ready()) return (u32)-1;
+    if ((!buffer && length) || length < 0 || (from && !from_length)) { g_wsa_last_error = 10014; return (u32)-1; }
+    socklen_t address_length = from_length ? (socklen_t)*from_length : 0;
+    ssize_t got = recvfrom((int)socket_handle, buffer, (size_t)length, flags & 3,
+                           (struct sockaddr *)from, from ? &address_length : NULL);
+    if (got < 0) {
+        g_wsa_last_error = winsock_error_from_errno(errno);
+        return (u32)-1;
+    }
+    if (from_length && from) *from_length = (s32)address_length;
+    g_wsa_last_error = 0;
+    return (u32)got;
+}
+
+static u64 __attribute__((ms_abi))
+impl_accept(u64 socket_handle, void *address, s32 *address_length)
+{
+    if (!winsock_ready()) return UINT64_MAX;
+    if (address && !address_length) { g_wsa_last_error = 10014; return UINT64_MAX; }
+    socklen_t length = address_length ? (socklen_t)*address_length : 0;
+    int descriptor = accept((int)socket_handle, (struct sockaddr *)address, address ? &length : NULL);
+    if (descriptor < 0) {
+        g_wsa_last_error = winsock_error_from_errno(errno);
+        return UINT64_MAX;                      /* INVALID_SOCKET */
+    }
+    if (address && address_length) *address_length = (s32)length;
+    g_wsa_last_error = 0;
+    return (u64)(u32)descriptor;
+}
+
+static u64 __attribute__((ms_abi))
+impl_recv(u64 socket_handle, void *buffer, s32 length, s32 flags)
+{
+    return impl_recvfrom(socket_handle, buffer, length, flags, NULL, NULL);
+}
+
+static u64 __attribute__((ms_abi))
+impl_setsockopt(u64 socket_handle, s32 level, s32 option,
+                const void *value, s32 value_length)
+{
+    if (!winsock_ready()) return (u32)-1;
+    if (!value || value_length < 0) {
+        g_wsa_last_error = 10014;
+        return (u32)-1;
+    }
+    if (setsockopt((int)socket_handle, level, option, value,
+                   (socklen_t)value_length) != 0) {
+        g_wsa_last_error = winsock_error_from_errno(errno);
+        return (u32)-1;
+    }
+    g_wsa_last_error = 0;
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_listen(u64 socket_handle, s32 backlog)
+{
+    if (!winsock_ready()) return (u32)-1;
+    if (listen((int)socket_handle, backlog) != 0) {
+        g_wsa_last_error = winsock_error_from_errno(errno);
+        return (u32)-1;
+    }
+    g_wsa_last_error = 0;
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_sendto(u64 socket_handle, const void *buffer, s32 length, s32 flags,
+            const void *destination, s32 destination_length)
+{
+    if (!winsock_ready()) return (u32)-1;
+    if ((!buffer && length) || length < 0 || !destination || destination_length <= 0) {
+        g_wsa_last_error = 10014;
+        return (u32)-1;
+    }
+    ssize_t sent = sendto((int)socket_handle, buffer, (size_t)length, flags,
+                          (const struct sockaddr *)destination,
+                          (socklen_t)destination_length);
+    if (sent < 0) {
+        g_wsa_last_error = winsock_error_from_errno(errno);
+        return (u32)-1;
+    }
+    g_wsa_last_error = 0;
+    return (u64)(u32)sent;
+}
+
+static u64 __attribute__((ms_abi)) impl_htons(u32 value)
+    { return (u64)htons((u16)value); }
+
+static u64 __attribute__((ms_abi))
 impl_closesocket(u64 socket_handle)
 {
     if (!winsock_ready()) return (u32)-1;
@@ -6525,6 +6951,51 @@ impl_gethostname(char *name, s32 length)
     memcpy(name, host, strlen(host) + 1);
     g_wsa_last_error = 0;
     return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_if_nametoindex(const char *name)
+{
+    if (!winsock_ready()) return 0;
+    if (!name || !*name) {
+        g_wsa_last_error = name ? 10022 : 10014; /* WSAEINVAL / WSAEFAULT */
+        return 0;
+    }
+    unsigned index = if_nametoindex(name);
+    if (!index) {
+        g_wsa_last_error = errno ? winsock_error_from_errno(errno) : 10022;
+        return 0;
+    }
+    g_wsa_last_error = 0;
+    return index;
+}
+
+/* Legacy Winsock ordinals are part of the ws2_32 ABI and are still used by
+ * application DLLs. Keep one resolver for both the executable and DLL import
+ * binders so a module loaded later receives the same implemented contracts. */
+static ImplFn winsock_ordinal_impl(u16 ordinal)
+{
+    switch (ordinal) {
+    case 1: return (ImplFn)impl_accept;
+    case 2: return (ImplFn)impl_bind;
+    case 3: return (ImplFn)impl_closesocket;
+    case 4: return (ImplFn)impl_connect;
+    case 6: return (ImplFn)impl_getsockname;
+    case 9: return (ImplFn)impl_htons;
+    case 10: return (ImplFn)impl_ioctlsocket;
+    case 13: return (ImplFn)impl_listen;
+    case 16: return (ImplFn)impl_recv;
+    case 17: return (ImplFn)impl_recvfrom;
+    case 20: return (ImplFn)impl_sendto;
+    case 21: return (ImplFn)impl_setsockopt;
+    case 23: return (ImplFn)impl_socket;
+    case 57: return (ImplFn)impl_gethostname;
+    case 111: return (ImplFn)impl_WSAGetLastError;
+    case 112: return (ImplFn)impl_WSASetLastError;
+    case 115: return (ImplFn)impl_WSAStartup;
+    case 116: return (ImplFn)impl_WSACleanup;
+    default: return NULL;
+    }
 }
 
 /* ---- Native NT memory/section APIs ---- */
@@ -7813,6 +8284,7 @@ static u64 __attribute__((ms_abi)) impl_GetSystemInfo(WIN_SYSTEM_INFO *info) {
     info->allocation_granularity = 0x10000;
     info->processor_level = 6;
     info->processor_revision = 0;
+    touch_trace_maybe_arm();
     return 0;
 }
 
@@ -10172,9 +10644,34 @@ impl_SetThreadDescription(u64 thread, const u16 *description)
     return 0; /* S_OK */
 }
 
+/* A real handle to the calling thread: the duplicate of GetCurrentThread(). Threads Beer did not
+ * create (the main thread) get a stand-in table entry, as OpenThread gives them. */
+static u64 current_thread_real_handle(void)
+{
+    u32 tid = (u32)current_windows_thread_id();
+    for (int i = 1; i < g_thread_cnt; i++) {
+        if (g_threads[i].used && g_threads[i].tid == tid) {
+            pthread_mutex_lock(&g_threads[i].mtx);
+            g_threads[i].handle_refs++;
+            pthread_mutex_unlock(&g_threads[i].mtx);
+            return (u64)(THREAD_HANDLE_BASE + (u32)i);
+        }
+    }
+    if (g_thread_cnt >= MAX_THREADS) return 0;
+    int id = g_thread_cnt++;
+    WinThread *t = &g_threads[id];
+    memset(t, 0, sizeof(*t));
+    t->used = 1; t->started = 1; t->handle_refs = 1; t->tid = tid; t->exit_code = 259u;
+    t->pt = pthread_self();
+    pthread_mutex_init(&t->mtx, NULL);
+    pthread_cond_init(&t->cv, NULL);
+    return (u64)(THREAD_HANDLE_BASE + (u32)id);
+}
+
 static u64 __attribute__((ms_abi))
 impl_GetExitCodeThread(u64 h, u32 *exit_code)
 {
+    if (h == (u64)-2 && exit_code) { *exit_code = 259u; return 1; }   /* the caller is running */
     int id = thread_id_from_handle(h);
     if (id < 0 || !exit_code) { g_last_error = 6; return 0; }
     WinThread *t = &g_threads[id];
@@ -10212,8 +10709,15 @@ impl_DuplicateHandle(u64 source_process, u64 source, u64 target_process,
         g_last_error = 0;
         return 1;
     }
-    /* Pseudo current-process/thread handles are valid duplication sources. */
-    if (source == (u64)-1 || source == (u64)-2) {
+    /* Duplicating GetCurrentThread() yields a real handle that names this thread from any thread. */
+    if (source == (u64)-2) {
+        u64 handle = current_thread_real_handle();
+        if (!handle) { g_last_error = 8; return 0; }
+        *target = handle;
+        g_last_error = 0;
+        return 1;
+    }
+    if (source == (u64)-1) {
         *target = source;
         return 1;
     }
@@ -10293,7 +10797,11 @@ impl_OpenThread(u32 access, u32 inherit, u32 tid)
             return (u64)(THREAD_HANDLE_BASE + (u32)i);
         }
     }
-    if (tid == (u32)current_windows_thread_id()) { g_last_error = 0; return (u64)-2; }
+    if (tid == (u32)current_windows_thread_id()) {
+        u64 handle = current_thread_real_handle();
+        g_last_error = handle ? 0 : 8;
+        return handle;
+    }
     /* A thread Beer did not create (the main thread, the window thread): hand out a handle to a table entry that
      * stands for it, enough for SetThreadPriority/SetThreadAffinityMask/CloseHandle. */
     if (g_thread_cnt < MAX_THREADS && tid) {
@@ -10955,21 +11463,29 @@ impl_GetDiskFreeSpaceExW(const u16 *directory, u64 *free_available,
 
 static int stat_ok_probe(const char *p) { struct stat st; return stat(p, &st); }
 
+/* Beer-owned system module whose generated PE bytes are the file named by this path, or 0. */
+static u64 synthetic_system_module_base(const char *name)
+{
+    char lower[64];
+    lowercase_dll_basename(name, lower, sizeof(lower));
+    if (!strcmp(lower, "kernelbase.dll")) return HMOD_KBASE;
+    if (!strcmp(lower, "kernel32.dll")) return HMOD_K32;
+    if (!strcmp(lower, "user32.dll")) return HMOD_USER32;
+    if (!strcmp(lower, "ntdll.dll")) return HMOD_NTDLL;
+    if (!strcmp(lower, "advapi32.dll")) return HMOD_ADVAPI;
+    if (!strcmp(lower, "win32u.dll")) return HMOD_WIN32U;
+    return 0;
+}
+
 static u64 synthetic_system_module_file(const char *name)
 {
     char lower[64];
     lowercase_dll_basename(name, lower, sizeof(lower));
-    u64 base = 0;
+    u64 base = synthetic_system_module_base(name);
     /* Compatibility facades are application modules, not system files. Their
      * executable export surface is Beer-owned, but CreateFile on the path from
      * GetModuleFileName must observe the application file, as it does on
      * Windows. Only generated Windows runtime modules use serialized bytes. */
-    if (!strcmp(lower, "kernelbase.dll")) base = HMOD_KBASE;
-    else if (!strcmp(lower, "kernel32.dll")) base = HMOD_K32;
-    else if (!strcmp(lower, "user32.dll")) base = HMOD_USER32;
-    else if (!strcmp(lower, "ntdll.dll")) base = HMOD_NTDLL;
-    else if (!strcmp(lower, "advapi32.dll")) base = HMOD_ADVAPI;
-    else if (!strcmp(lower, "win32u.dll")) base = HMOD_WIN32U;
     if (!base) return 0;
 
     fake_pe_exports_build();
@@ -15495,6 +16011,20 @@ static u64 __attribute__((ms_abi)) impl_lstrcmpW(const u16 *left, const u16 *rig
     { return (u64)(s64)compare_wide_strings(left, right, 0); }
 static u64 __attribute__((ms_abi)) impl_lstrcmpiW(const u16 *left, const u16 *right)
     { return (u64)(s64)compare_wide_strings(left, right, 1); }
+static u64 __attribute__((ms_abi)) impl_lstrlenA(const char *value)
+    { return value ? strlen(value) : 0; }
+static u64 __attribute__((ms_abi)) impl_lstrcpyA(char *destination, const char *source)
+{
+    if (!destination || !source) return 0;
+    strcpy(destination, source);
+    return (u64)(uintptr_t)destination;
+}
+static u64 __attribute__((ms_abi)) impl_lstrcatA(char *destination, const char *source)
+{
+    if (!destination || !source) return 0;
+    strcat(destination, source);
+    return (u64)(uintptr_t)destination;
+}
 
 extern char **environ;
 
@@ -19014,6 +19544,8 @@ impl___acrt_iob_func(u32 index)
 /* ---- Impl dispatch table ---- */
 #include "platform/win32_file_search.inc"
 #include "platform/win32_missing_exports.inc"
+#include "platform/win32_native_info.inc"
+#include "platform/win32_crypt32.inc"
 typedef struct { const char *name; ImplFn fn; } ImplEntry;
 
 static ImplEntry g_impls[] = {
@@ -19063,8 +19595,10 @@ static ImplEntry g_impls[] = {
     {"_get_stream_buffer_pointers",             (ImplFn)impl__get_stream_buffer_pointers},
     {"_set_new_mode",                           (ImplFn)impl__set_new_mode},
     {"AreFileApisANSI",                         (ImplFn)impl_AreFileApisANSI},
+    {"AppPolicyGetThreadInitializationType",    (ImplFn)impl_AppPolicyGetThreadInitializationType},
     {"VerSetConditionMask",                     (ImplFn)impl_VerSetConditionMask},
     {"VerifyVersionInfoW",                      (ImplFn)impl_VerifyVersionInfoW},
+    {"RtlVerifyVersionInfo",                    (ImplFn)impl_RtlVerifyVersionInfo},
     {"RtlGetVersion",                           (ImplFn)impl_RtlGetVersion},
     {"GetVersionExW",                           (ImplFn)impl_GetVersionExW},
     {"GetVersionExA",                           (ImplFn)impl_GetVersionExA},
@@ -19139,8 +19673,8 @@ static ImplEntry g_impls[] = {
     {"GetErrorMode",                          (ImplFn)impl_GetErrorMode},
     {"Wow64GetThreadContext",                 (ImplFn)impl_Wow64GetSetThreadContext},
     {"Wow64SetThreadContext",                 (ImplFn)impl_Wow64GetSetThreadContext},
-    {"NtSetInformationThread",                (ImplFn)impl_NtSetInformationThread},
-    {"ZwSetInformationThread",                (ImplFn)impl_NtSetInformationThread},
+    {"NtSetInformationThread",                (ImplFn)impl_NtSetInformationThreadNative},
+    {"ZwSetInformationThread",                (ImplFn)impl_NtSetInformationThreadNative},
     {"FatalAppExitA",                         (ImplFn)impl_FatalAppExitA},
     {"IsDebuggerPresent",                     (ImplFn)impl_IsDebuggerPresent},
     {"IsProcessorFeaturePresent",             (ImplFn)impl_IsProcessorFeaturePresent},
@@ -19163,6 +19697,8 @@ static ImplEntry g_impls[] = {
     {"LoadLibraryW",                          (ImplFn)impl_LoadLibraryW},
     {"LoadLibraryExA",                        (ImplFn)impl_LoadLibraryExA},
     {"LoadLibraryExW",                        (ImplFn)impl_LoadLibraryExW},
+    {"AddDllDirectory",                       (ImplFn)impl_AddDllDirectory},
+    {"RemoveDllDirectory",                    (ImplFn)impl_RemoveDllDirectory},
     {"FreeLibrary",                           (ImplFn)impl_FreeLibrary},
     {"DisableThreadLibraryCalls",             (ImplFn)impl_DisableThreadLibraryCalls},
     /* Process affinity */
@@ -19263,12 +19799,22 @@ static ImplEntry g_impls[] = {
     {"WSAResetEvent",                         (ImplFn)impl_WSAResetEvent},
     {"WSAWaitForMultipleEvents",              (ImplFn)impl_WSAWaitForMultipleEvents},
     {"socket",                                  (ImplFn)impl_socket},
+    {"recv",                                    (ImplFn)impl_recv},
+    {"accept",                                  (ImplFn)impl_accept},
+    {"recvfrom",                                (ImplFn)impl_recvfrom},
+    {"bind",                                    (ImplFn)impl_bind},
     {"connect",                                 (ImplFn)impl_connect},
+    {"ioctlsocket",                             (ImplFn)impl_ioctlsocket},
+    {"listen",                                  (ImplFn)impl_listen},
+    {"sendto",                                  (ImplFn)impl_sendto},
+    {"htons",                                   (ImplFn)impl_htons},
+    {"setsockopt",                              (ImplFn)impl_setsockopt},
     {"closesocket",                             (ImplFn)impl_closesocket},
     {"getsockname",                             (ImplFn)impl_getsockname},
     {"inet_pton",                               (ImplFn)impl_inet_pton},
     {"inet_ntop",                               (ImplFn)impl_inet_ntop},
     {"gethostname",                             (ImplFn)impl_gethostname},
+    {"if_nametoindex",                          (ImplFn)impl_if_nametoindex},
     /* NTDLL */
     {"NtCreateSection",                      (ImplFn)impl_NtCreateSection},
     {"ZwCreateSection",                      (ImplFn)impl_NtCreateSection},
@@ -19277,6 +19823,41 @@ static ImplEntry g_impls[] = {
     {"NtMapViewOfSection",                   (ImplFn)impl_NtMapViewOfSection},
     {"NtUnmapViewOfSection",                 (ImplFn)impl_NtUnmapViewOfSection},
     {"NtQuerySystemInformation",              (ImplFn)impl_NtQuerySystemInformation},
+    {"ZwQuerySystemInformation",              (ImplFn)impl_NtQuerySystemInformation},
+    {"NtQueryInformationProcess",             (ImplFn)impl_NtQueryInformationProcess},
+    {"ZwQueryInformationProcess",             (ImplFn)impl_NtQueryInformationProcess},
+    {"NtSetInformationProcess",               (ImplFn)impl_NtSetInformationProcess},
+    {"ZwSetInformationProcess",               (ImplFn)impl_NtSetInformationProcess},
+    {"NtQueryInformationThread",              (ImplFn)impl_NtQueryInformationThread},
+    {"ZwQueryInformationThread",              (ImplFn)impl_NtQueryInformationThread},
+    {"NtQueryVirtualMemory",                  (ImplFn)impl_NtQueryVirtualMemory},
+    {"ZwQueryVirtualMemory",                  (ImplFn)impl_NtQueryVirtualMemory},
+    {"NtDelayExecution",                      (ImplFn)impl_NtDelayExecution},
+    {"ZwDelayExecution",                      (ImplFn)impl_NtDelayExecution},
+    {"NtRaiseHardError",                      (ImplFn)impl_NtRaiseHardError},
+    {"ZwRaiseHardError",                      (ImplFn)impl_NtRaiseHardError},
+    {"NtOpenSection",                         (ImplFn)impl_NtOpenSection},
+    {"PathRemoveFileSpecW",                   (ImplFn)impl_PathRemoveFileSpecW},
+    {"TaskDialogIndirect",                    (ImplFn)impl_TaskDialogIndirect},
+    {"LoadStringW",                           (ImplFn)impl_LoadStringW},
+    {"InitCommonControlsEx",                  (ImplFn)impl_InitCommonControlsEx},
+    {"CryptQueryObject",                      (ImplFn)impl_CryptQueryObject},
+    {"CryptMsgGetParam",                      (ImplFn)impl_CryptMsgGetParam},
+    {"CryptMsgOpenToDecode",                  (ImplFn)impl_CryptMsgOpenToDecode},
+    {"CryptMsgUpdate",                        (ImplFn)impl_CryptMsgUpdate},
+    {"CryptMsgClose",                         (ImplFn)impl_CryptMsgClose},
+    {"CertOpenStore",                         (ImplFn)impl_CertOpenStore},
+    {"CertCloseStore",                        (ImplFn)impl_CertCloseStore},
+    {"CertFindCertificateInStore",            (ImplFn)impl_CertFindCertificateInStore},
+    {"CertFreeCertificateContext",            (ImplFn)impl_CertFreeCertificateContext},
+    {"CryptDecodeObjectEx",                   (ImplFn)impl_CryptDecodeObjectEx},
+    {"PathRemoveFileSpecA",                   (ImplFn)impl_PathRemoveFileSpecA},
+    {"ShellExecuteExW",                       (ImplFn)impl_ShellExecuteExW},
+    {"NtReadVirtualMemory",                   (ImplFn)impl_NtReadVirtualMemory},
+    {"ZwReadVirtualMemory",                   (ImplFn)impl_NtReadVirtualMemory},
+    {"NtWriteVirtualMemory",                  (ImplFn)impl_NtWriteVirtualMemory},
+    {"ZwWriteVirtualMemory",                  (ImplFn)impl_NtWriteVirtualMemory},
+    {"ZwOpenSection",                         (ImplFn)impl_NtOpenSection},
     {"GetLogicalProcessorInformation",        (ImplFn)impl_GetLogicalProcessorInformation},
     {"GetLogicalProcessorInformationEx",      (ImplFn)impl_GetLogicalProcessorInformationEx},
     {"SetupDiGetClassDevsA",                  (ImplFn)impl_SetupDiGetClassDevsA},
@@ -19856,10 +20437,13 @@ static ImplEntry g_impls[] = {
     {"CompareStringW",                        (ImplFn)impl_CompareStringW},
     {"CompareStringA",                        (ImplFn)impl_CompareStringA},
     {"CompareStringOrdinal",                  (ImplFn)impl_CompareStringOrdinal},
+    {"lstrcatA",                              (ImplFn)impl_lstrcatA},
     {"lstrcmpA",                              (ImplFn)impl_lstrcmpA},
     {"lstrcmpW",                              (ImplFn)impl_lstrcmpW},
     {"lstrcmpiA",                             (ImplFn)impl_lstrcmpiA},
     {"lstrcmpiW",                             (ImplFn)impl_lstrcmpiW},
+    {"lstrcpyA",                              (ImplFn)impl_lstrcpyA},
+    {"lstrlenA",                              (ImplFn)impl_lstrlenA},
     /* Thread Pool API (Vista+) — required by Dantelion2 job system */
     {"CreateThreadpoolWork",                  (ImplFn)impl_CreateThreadpoolWork},
     {"SubmitThreadpoolWork",                  (ImplFn)impl_SubmitThreadpoolWork},
@@ -19972,10 +20556,92 @@ static int fake_pe_add_export(FakePeModule *module, const char *name, size_t cap
     return 1;
 }
 
+/* BEER_WIN32_SYSCALLS=0 keeps the older jump-stub ntdll exports and enables no system-call dispatch. */
+static int g_win32_syscalls = 1;
+
 static int fake_pe_native_export_name(const char *name)
 {
     return name && (!strncmp(name, "Nt", 2) || !strncmp(name, "Zw", 2) ||
                     !strncmp(name, "Rtl", 3) || !strncmp(name, "Ldr", 3));
+}
+
+/* Documented entry points of graphics runtimes that Beer implements without a PE image. Software that
+ * loads these DLLs (NVIDIA Streamline's interposer) resolves the real functions by walking the export
+ * table, so the compatibility image must export them. Only names with a Beer implementation are used. */
+static const char *const g_compat_module_exports[][2] = {
+    { "d3d12.dll", "D3D12CreateDevice" },
+    { "d3d12.dll", "D3D12CreateRootSignatureDeserializer" },
+    { "d3d12.dll", "D3D12CreateVersionedRootSignatureDeserializer" },
+    { "d3d12.dll", "D3D12EnableExperimentalFeatures" },
+    { "d3d12.dll", "D3D12GetDebugInterface" },
+    { "d3d12.dll", "D3D12GetInterface" },
+    { "d3d12.dll", "D3D12SerializeRootSignature" },
+    { "d3d12.dll", "D3D12SerializeVersionedRootSignature" },
+    { "dxgi.dll", "CreateDXGIFactory" },
+    { "dxgi.dll", "CreateDXGIFactory1" },
+    { "dxgi.dll", "CreateDXGIFactory2" },
+    { "dxgi.dll", "DXGIDeclareAdapterRemovalSupport" },
+    { "dxgi.dll", "DXGIGetDebugInterface1" },
+};
+
+
+/* Fill a compatibility module image's export table: the module's names known from guest import
+ * descriptors ("module!name") and the documented list above, limited to Beer implementations. Each
+ * export is an in-image stub that jumps to the normal dispatcher thunk. */
+static void compat_module_exports_build(u64 base, const char *module)
+{
+    enum { MAX_COMPAT_EXPORTS = 512 };
+    const char *names[MAX_COMPAT_EXPORTS];
+    size_t count = 0;
+    size_t module_length = strlen(module);
+    for (int i = 0; i < g_nstubs && count < MAX_COMPAT_EXPORTS; ++i) {
+        const char *bang = g_snames[i] ? strchr(g_snames[i], '!') : NULL;
+        if (!bang || (size_t)(bang - g_snames[i]) != module_length ||
+            strncasecmp(g_snames[i], module, module_length) || bang[1] == '#' || !find_impl(bang + 1))
+            continue;
+        names[count++] = bang + 1;
+    }
+    for (size_t i = 0; i < sizeof(g_compat_module_exports) / sizeof(*g_compat_module_exports); ++i)
+        if (!strcmp(g_compat_module_exports[i][0], module) && find_impl(g_compat_module_exports[i][1]) &&
+            count < MAX_COMPAT_EXPORTS)
+            names[count++] = g_compat_module_exports[i][1];
+    qsort(names, count, sizeof(*names), fake_pe_name_cmp);
+    size_t unique = 0;
+    for (size_t i = 0; i < count; ++i)
+        if (!unique || strcmp(names[unique - 1], names[i])) names[unique++] = names[i];
+    count = unique;
+
+    u8 *p = (u8 *)(uintptr_t)base;
+    u32 funcs = FAKE_PE_EDATA_RVA + 0x200;
+    u32 name_rvas = funcs + (u32)(count * 4);
+    u32 ordinals = name_rvas + (u32)(count * 4);
+    u32 strings = (ordinals + (u32)(count * 2) + 15) & ~15u;
+    for (size_t i = 0; i < count; ++i) {
+        size_t length = strlen(names[i]) + 1;
+        if (strings + length > FAKE_PE_TEXT_RVA ||
+            FAKE_PE_TEXT_RVA + (i + 1) * FAKE_PE_STUB_SLOT > FAKE_PE_SIZE) { count = i; break; }
+        memcpy(p + strings, names[i], length);
+        *(u32 *)(p + name_rvas + i * 4) = strings;
+        *(u16 *)(p + ordinals + i * 2) = (u16)i;
+        strings += (u32)length;
+        u8 *stub = p + FAKE_PE_TEXT_RVA + i * FAKE_PE_STUB_SLOT;
+        memset(stub, 0xCC, FAKE_PE_STUB_SLOT);
+        u64 target = impl_GetProcAddress(base, names[i]);
+        stub[0] = 0x48; stub[1] = 0xB8; memcpy(stub + 2, &target, 8);
+        stub[10] = 0xFF; stub[11] = 0xE0;
+        *(u32 *)(p + funcs + i * 4) = FAKE_PE_TEXT_RVA + (u32)(i * FAKE_PE_STUB_SLOT);
+    }
+    u8 *directory = p + FAKE_PE_EDATA_RVA;
+    *(u32 *)(directory + 20) = (u32)count;
+    *(u32 *)(directory + 24) = (u32)count;
+    *(u32 *)(directory + 28) = funcs;
+    *(u32 *)(directory + 32) = name_rvas;
+    *(u32 *)(directory + 36) = ordinals;
+    u8 *opt = p + *(u32 *)(p + 0x3c) + 24;
+    *(u32 *)(opt + 116) = strings - FAKE_PE_EDATA_RVA;
+    mprotect(p, FAKE_PE_TEXT_RVA, PROT_READ);
+    mprotect(p + FAKE_PE_TEXT_RVA, FAKE_PE_SIZE - FAKE_PE_TEXT_RVA, PROT_READ | PROT_EXEC);
+    if (count) fprintf(stderr, "[PE] compatibility module %s: %zu exports\n", module, count);
 }
 
 static void fake_pe_exports_build(void)
@@ -20097,6 +20763,17 @@ static void fake_pe_exports_build(void)
         const char *name = beer_kernel32_file_search_exports[i];
         if (find_impl(name)) fake_pe_add_export(kernel32, name, capacity);
     }
+    for (size_t i = 0; i < BEER_KERNEL32_CRT_RUNTIME_EXPORT_COUNT; ++i) {
+        const char *name = beer_kernel32_crt_runtime_exports[i];
+        if (!find_impl(name)) continue;
+        fake_pe_add_export(kernel32, name, capacity);
+        fake_pe_add_export(kernelbase, name, capacity);
+    }
+    /* Emitted as ntdll.<name> forwarders below, so only names ntdll implements. */
+    for (size_t i = 0; i < BEER_KERNEL32_RUNTIME_FUNCTION_EXPORT_COUNT; ++i) {
+        const char *name = beer_kernel32_runtime_function_exports[i];
+        if (find_impl(name)) fake_pe_add_export(kernel32, name, capacity);
+    }
 
     for (size_t m = 0; m < sizeof(g_fake_pe_modules) / sizeof(*g_fake_pe_modules); ++m) {
         FakePeModule *module = &g_fake_pe_modules[m];
@@ -20149,6 +20826,19 @@ static void fake_pe_exports_build(void)
 
             u8 *stub = p + stubs + emitted * FAKE_PE_STUB_SLOT;
             memset(stub, 0xCC, FAKE_PE_STUB_SLOT);
+            /* ntdll's Nt and Zw exports are native system-call stubs, as on Windows. Protected
+             * executables read the service number from these bytes, in this image or a file view
+             * of it, and execute SYSCALL themselves. platform/win32_syscall.c routes both paths to
+             * the same Beer implementation. */
+            if (module->base == HMOD_NTDLL && g_win32_syscalls &&
+                beer_win32_syscall_is_service_name(name)) {
+                int number = beer_win32_syscall_register(name, (BeerWin32SyscallFn)find_impl(name));
+                if (number >= 0 &&
+                    beer_win32_syscall_write_stub(stub, FAKE_PE_STUB_SLOT, (u32)number)) {
+                    *(u32 *)(p + funcs + emitted * 4) = stubs + (u32)(emitted * FAKE_PE_STUB_SLOT);
+                    continue;
+                }
+            }
             /* Calls from guest code must cross the normal dispatcher thunk; jumping directly to
              * a host C implementation would run it on the guest stack and bypass trace/context
              * setup. fake_pe_ready remains false during construction, so this lookup cannot
@@ -20540,6 +21230,9 @@ static void guest_dll_resolve_imports(GuestDll *dll)
             char dependency_lower[64];
             lowercase_dll_basename(dependency, dependency_lower,
                                    sizeof(dependency_lower));
+            if (!implementation && !function &&
+                !strcmp(dependency_lower, "ws2_32.dll"))
+                implementation = winsock_ordinal_impl((u16)(ilt[i] & 0xffff));
             int api_set_contract = !strncmp(dependency_lower, "api-ms-", 7) ||
                                    !strncmp(dependency_lower, "ext-ms-", 7);
             /* API-set DLLs are contracts forwarded into the Windows runtime,
@@ -20570,7 +21263,9 @@ static void guest_dll_resolve_imports(GuestDll *dll)
             int prefer_crt_export = api_set_contract && dependency_export &&
                                     !strncmp(dependency_lower,
                                              "api-ms-win-crt-", 15);
-            if (prefer_crt_export) {
+            int prefer_guest_dstorage = dependency_export &&
+                                          !strcasecmp(dependency, "dstorage.v38");
+            if (prefer_crt_export || prefer_guest_dstorage) {
                 iat[i] = dependency_export;
             } else if (dependency_export && g_use_guest_fmod &&
                 (!strcasecmp(dependency, "fmodex64.dll") ||
@@ -20785,7 +21480,17 @@ static u64 call_guest_nested(GuestNtCall fn, u64 a0, u64 a1, u64 a2, u64 a3, u64
 static GuestNtCall hooked_ntdll(const char *name)
 {
     u64 address = fake_pe_export_address(HMOD_NTDLL, name);
-    if (!address || *(const u8 *)address == 0x48) return NULL;   /* unmodified stub starts with mov rax,imm64 */
+    if (!address) return NULL;
+    if (g_win32_syscalls && beer_win32_syscall_is_service_name(name)) {
+        /* An unmodified export is exactly the system-call stub Beer generated. */
+        u8 original[BEER_WIN32_SYSCALL_STUB_SIZE];
+        int number = beer_win32_syscall_register(name, NULL);
+        if (number >= 0 && beer_win32_syscall_write_stub(original, sizeof(original), (u32)number) &&
+            !memcmp((const void *)(uintptr_t)address, original, sizeof(original)))
+            return NULL;
+    } else if (*(const u8 *)address == 0x48) {
+        return NULL;   /* unmodified jump stub starts with mov rax,imm64 */
+    }
     return (GuestNtCall)(uintptr_t)address;
 }
 
@@ -20961,6 +21666,41 @@ static void guest_dll_initialize_all(void)
 }
 
 /* ── Import resolution ──────────────────────────────────────────── */
+static int app_local_imports_enabled(void)
+{
+    const char *value = getenv("BEER_APP_LOCAL_IMPORTS");
+    return !value || strcmp(value, "0");
+}
+
+/* Case-insensitive lookup of a DLL file in the executable's directory. */
+static int app_local_dll_exists(const char *dll_name)
+{
+    if (!g_exe_host_path || !dll_name || strchr(dll_name, '/') || strchr(dll_name, '\\')) return 0;
+    char directory[4096];
+    snprintf(directory, sizeof(directory), "%s", g_exe_host_path);
+    char *slash = strrchr(directory, '/');
+    if (!slash) return 0;
+    *slash = 0;
+    DIR *dir = opendir(directory);
+    struct dirent *entry;
+    int found = 0;
+    while (dir && !found && (entry = readdir(dir)))
+        found = !strcasecmp(entry->d_name, dll_name);
+    if (dir) closedir(dir);
+    return found;
+}
+
+/* True when Beer implements any name the executable imports through this descriptor. */
+static int import_descriptor_has_beer_impl(const ImportDesc *d)
+{
+    const u64 *ilt = rva_ptr(d->orig_ilt ? d->orig_ilt : d->iat_rva);
+    for (int i = 0; ilt[i]; i++) {
+        if (ilt[i] & (1ull << 63)) continue;
+        if (find_impl((const char *)rva_ptr((u32)ilt[i] + 2))) return 1;
+    }
+    return 0;
+}
+
 static void pe_imports(void)
 {
     NtHdrs64  *nt  = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
@@ -20999,6 +21739,11 @@ static void pe_imports(void)
                               !strcmp(lower, "steam_api64.dll");
         int required = !strcmp(lower, "oo2core_6_win64.dll");
         int real_bink = !strcmp(lower, "bink2w64.dll");
+        /* DirectStorage redistributables use an application-local bootstrap
+         * DLL whose DllMain selects and loads the adjacent versioned runtime.
+         * Load that declared import as a normal guest module; binding it to
+         * generic stubs prevents the package's native bootstrap from running. */
+        int real_dstorage = !strcmp(lower, "dstorage.dll");
         int real_fmod = g_use_guest_fmod &&
                         (!strcmp(lower, "fmodex64.dll") ||
                          !strcmp(lower, "fmod_event64.dll"));
@@ -21015,14 +21760,32 @@ static void pe_imports(void)
             if (!ucrt)
                 fprintf(stderr, "[PE DLL] bundled runtime ucrtbase.dll was not found/loadable\n");
         }
+        /* The Windows loader maps every static import found next to the executable. Do the same
+         * for application-local DLLs that Beer does not stand in for: an import descriptor with no
+         * Beer implementation behind any of its names would otherwise be bound to inert stubs
+         * (PRAGMATA's CrashHandler.dll, XeSS, FidelityFX loader). A facade Beer does implement,
+         * such as amd_ags_x64.dll, keeps its Beer implementation. BEER_APP_LOCAL_IMPORTS=0 disables. */
+        int app_local = 0;
+        if (!required && !real_bink && !real_dstorage && !real_fmod && !bundled_runtime &&
+            !guest_steam_api && strcmp(lower, "steam_api64.dll") && !guest_dll_find(dll_name) &&
+            app_local_imports_enabled() && app_local_dll_exists(dll_name) &&
+            !import_descriptor_has_beer_impl(d))
+            app_local = 1;
         GuestDll *loaded = NULL;
-        if (required || real_bink || real_fmod || bundled_runtime || guest_steam_api) {
+        if (app_local) {
+            loaded = guest_dll_load(dll_name);
+            fprintf(stderr, "[PE DLL] application-local import %s %s\n", dll_name,
+                    loaded ? "loaded as a guest module" : "could not be loaded; using stubs");
+        }
+        if (required || real_bink || real_dstorage || real_fmod || bundled_runtime ||
+            guest_steam_api) {
             loaded = guest_dll_load(dll_name);
             if (bundled_runtime && !loaded)
                 fprintf(stderr, "[PE DLL] bundled runtime %s was not found/loadable\n", dll_name);
         }
-        if ((required || real_bink || real_fmod || guest_steam_api) && !loaded) {
-            if (required || real_bink || guest_steam_api)
+        if ((required || real_bink || real_dstorage || real_fmod || guest_steam_api) &&
+            !loaded) {
+            if (required || real_bink || real_dstorage || guest_steam_api)
                 die("unable to load required guest DLL %s", dll_name);
             fprintf(stderr, "[AUDIO] unable to load %s; FMOD audio unavailable\n", dll_name);
         }
@@ -21115,20 +21878,10 @@ static void pe_imports(void)
                 else if (ordinal == 5)
                     real = (ImplFn)impl_XInputEnable;
             }
-            if (!real && import_by_ordinal && !strcasecmp(dll, "ws2_32.dll")) {
-                u16 ordinal = (u16)(ilt[i] & 0xffff);
-                /* Winsock's legacy ordinal exports are still used by Sekiro's
-                 * networking bootstrap. Resolve the observed lifecycle calls
-                 * to the same implementations as their named exports. */
-                if (ordinal == 3) real = (ImplFn)impl_closesocket;
-                else if (ordinal == 4) real = (ImplFn)impl_connect;
-                else if (ordinal == 6) real = (ImplFn)impl_getsockname;
-                else if (ordinal == 23) real = (ImplFn)impl_socket;
-                else if (ordinal == 57) real = (ImplFn)impl_gethostname;
-                else if (ordinal == 111) real = (ImplFn)impl_WSAGetLastError;
-                else if (ordinal == 115) real = (ImplFn)impl_WSAStartup;
-                else if (ordinal == 116) real = (ImplFn)impl_WSACleanup;
-            }
+            if (!real && import_by_ordinal && !strcasecmp(dll, "comctl32.dll") && (u16)(ilt[i] & 0xffff) == 345)
+                real = (ImplFn)impl_TaskDialogIndirect;
+            if (!real && import_by_ordinal && !strcasecmp(dll, "ws2_32.dll"))
+                real = winsock_ordinal_impl((u16)(ilt[i] & 0xffff));
             GuestDll *guest = guest_dll_find(dll);
             char import_lower[64];
             lowercase_dll_basename(dll, import_lower, sizeof(import_lower));
@@ -21172,6 +21925,8 @@ static void pe_imports(void)
             g_snames[g_nstubs] = strdup(buf);
             int prefer_guest_steam = g_steam_api_guest_mode && guest_export && guest &&
                                      !strcmp(guest->name, "steam_api64.dll");
+            int prefer_guest_dstorage = guest_export && guest &&
+                                        !strcmp(guest->name, "dstorage.dll");
             int prefer_guest_fmod = g_use_guest_fmod && guest_export && guest &&
                                     (!strcmp(guest->name, "fmodex64.dll") ||
                                      !strcmp(guest->name, "fmod_event64.dll"));
@@ -21237,7 +21992,8 @@ static void pe_imports(void)
                 emit_impl_thunk(g_nstubs, (u64)traced);
                 iat[i] = (u64)(g_tramp + g_nstubs * THUNK_SZ);
                 printf("  [REAL] %s (real-FMOD dispatch)\n", buf);
-            } else if (prefer_guest_steam || prefer_guest_fmod) {
+            } else if (prefer_guest_steam || prefer_guest_dstorage ||
+                       prefer_guest_fmod) {
                 iat[i] = guest_export;
                 printf("  [DLL ] %s -> 0x%lx\n", buf, guest_export);
             } else if (real) {
@@ -21256,6 +22012,38 @@ static void pe_imports(void)
             g_nstubs++;
         }
     }
+    /* Windows binds an import to an address inside the exporting module's image, and protected
+     * code relies on that: it walks down from an imported function in allocation-granularity steps
+     * to the owning module's MZ header. Beer's dispatcher thunks live in a separate low mapping, so
+     * rebind imports from Beer-owned system modules to their export entries in the synthetic module
+     * image. Those entries jump to the same thunk, so behaviour is unchanged. */
+    fake_pe_exports_build();
+    int rebound = 0;
+    for (ImportDesc *d = rva_ptr(dir->rva); d->name_rva; d++) {
+        const char *dll = rva_ptr(d->name_rva);
+        if (!dll || !dll[0]) break;
+        FakePeModule *owner = fake_pe_module_for_import(dll);
+        if (!owner) continue;
+        u64 *ilt = rva_ptr(d->orig_ilt ? d->orig_ilt : d->iat_rva);
+        u64 *iat = rva_ptr(d->iat_rva);
+        for (int i = 0; ilt[i]; i++) {
+            if (ilt[i] & (1ull << 63)) continue;              /* by ordinal */
+            if (iat[i] < (u64)(uintptr_t)g_tramp || iat[i] >= (u64)(uintptr_t)g_tramp + g_trampsz)
+                continue;
+            const char *fn = (const char *)rva_ptr((u32)ilt[i] + 2);
+            u64 address = fake_pe_export_address(owner->base, fn);
+            for (size_t m = 0; address && m < sizeof(g_fake_pe_modules) / sizeof(*g_fake_pe_modules); ++m) {
+                u64 base = g_fake_pe_modules[m].base;
+                if (address >= base + FAKE_PE_TEXT_RVA && address < base + FAKE_PE_SIZE) {
+                    iat[i] = address;
+                    ++rebound;
+                    break;
+                }
+            }
+        }
+    }
+    printf("[IMP] %d system-module imports bound to their module images\n", rebound);
+
     int nreal = 0;
     for (int i = 0; i < g_nstubs; i++) {
         const char *bang = strchr(g_snames[i], '!');
@@ -21353,6 +22141,7 @@ static WinPEB *g_process_peb;
  */
 static void *alloc_teb_for_thread(void)
 {
+    beer_win32_syscall_thread_init();   /* this thread will run guest code */
     /* Allocate per-thread host call stack first, capturing bounds locally */
     void *host_stack = mmap(NULL, HOST_CALL_STACK_SIZE, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -21542,6 +22331,7 @@ static void init_peb_loader_data(WinPebLdrData *ldr)
     for (size_t index = 0; index < module_count; ++index) {
         WinLdrDataTableEntry *entry = &entries[index];
         const char *full_name;
+        char windows_full_name[PATH_MAX + 3];
         u64 image_base;
         u64 image_size;
         u64 entry_point = 0;
@@ -21562,6 +22352,13 @@ static void init_peb_loader_data(WinPebLdrData *ldr)
         } else {
             GuestDll *dll = &g_guest_dlls[index - 1 - system_count - compatibility_count];
             full_name = dll->path[0] ? dll->path : dll->name;
+            /* LDR_DATA_TABLE_ENTRY exposes Windows paths. Publishing a host
+             * path with '/' makes native module walkers fail to find the base
+             * name (and can turn NULL+sizeof(WCHAR) into pointer 0x2). */
+            if (dll->path[0] &&
+                beer_windows_path_from_host(dll->path, windows_full_name,
+                                            sizeof(windows_full_name)))
+                full_name = windows_full_name;
             image_base = (u64)(uintptr_t)dll->image;
             image_size = dll->image_size;
             if (dll->image) {
@@ -23787,7 +24584,288 @@ static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, beer_guest_uconte
     return 1;
 }
 
+/* After vectored and frame-based handlers decline, Windows' unhandled-exception path calls the
+ * filter installed with SetUnhandledExceptionFilter. EXCEPTION_CONTINUE_EXECUTION resumes with the
+ * (possibly modified) context; any other answer leaves the exception unhandled. */
+static int beer_dispatch_signal_to_top_level_filter(int sig, siginfo_t *si, beer_guest_ucontext_t *uc)
+{
+    u64 filter = atomic_load(&g_top_level_exception_filter);
+    if (!filter || g_delivering_vectored_exception) return 0;
+
+    BeerExceptionRecord64 record;
+    memset(&record, 0, sizeof(record));
+    record.code = beer_signal_exception_code(sig);
+    record.address = (u64)uc->uc_mcontext.gregs[REG_RIP];
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        u64 fault = (u64)si->si_addr;
+        u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
+        record.parameter_count = 2;
+        record.information[0] = fault == record.address ? 8u : ((error & 2u) ? 1u : 0u);
+        record.information[1] = fault;
+    }
+    u8 context[0x4d0] __attribute__((aligned(16)));
+    beer_context_from_ucontext(context, uc);
+    BeerExceptionPointers64 pointers = { &record, context };
+    g_delivering_vectored_exception = 1;
+    s32 result = BEER_GUEST_CALL(((BeerVectoredExceptionHandler)(uintptr_t)filter), &pointers);
+    g_delivering_vectored_exception = 0;
+    if (getenv("BEER_UEF_PEEK")) {   /* BEER_UEF_PEEK=hexaddr: print 64 qwords from there at the filter call */
+        const u64 *peek = (const u64 *)(uintptr_t)strtoull(getenv("BEER_UEF_PEEK"), NULL, 16);
+        for (int i = 0; i < 64; ++i) {
+            u64 value = 0;
+            struct iovec local = { &value, 8 }, remote = { (void *)(peek + i), 8 };
+            if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 8) break;
+            fprintf(stderr, "[UEF] peek %p = 0x%llx\n", (void *)(peek + i), (unsigned long long)value);
+        }
+    }
+    if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
+        fprintf(stderr, "[UEF] top-level filter 0x%llx code=0x%08x RIP=0x%llx -> %d\n",
+                (unsigned long long)filter, record.code, (unsigned long long)record.address, result);
+    if (result != BEER_EXCEPTION_CONTINUE_EXECUTION) return 0;
+    beer_context_to_ucontext(uc, context);
+    g_cycle_hist_n = 0;
+    return 1;
+}
+
 int (*g_beer_lazy_fault_hook)(void *addr);   /* BD11's lazily populated deferred-map scratch pages */
+
+/* BEER_TOUCH_TRACE=<n> (diagnostic, off by default): from the n-th GetSystemInfo/GetNativeSystemInfo call
+ * until the next MessageBox, every access to the process-environment pages (TEB, PEB, loader data, process
+ * parameters, KUSER_SHARED_DATA, Beer's synthetic system modules, the executable's headers) is logged once
+ * per (rip, address) as "[TOUCH] rip=... addr=... r|w|x". Pages are made inaccessible; a fault restores the
+ * original protection, single-steps the access and re-protects it. Guest code and memory are not altered.
+ * Both tracers rely on x86 hardware features of the host (TF single-step, CPUID faulting, PR_TSC_SIGSEGV), so
+ * they exist in the native build only. */
+#if BEER_GUEST_NATIVE
+typedef struct { u64 page; int prot; } TouchPage;
+static TouchPage g_touch_pages[2048];
+static int g_touch_page_count;
+static volatile int g_touch_armed;
+static __thread int t_touch_pending[4];
+static __thread int t_touch_pending_count;
+static u64 g_touch_seen[1 << 16];
+
+static int touch_page_index(u64 page)
+{
+    for (int i = 0; i < g_touch_page_count; ++i)
+        if (g_touch_pages[i].page == page) return i;
+    return -1;
+}
+
+static int touch_maps_prot(u64 page)
+{
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512];
+    int prot = -1;
+    while (maps && fgets(line, sizeof(line), maps)) {
+        unsigned long long start, end;
+        char perms[8];
+        if (sscanf(line, "%llx-%llx %7s", &start, &end, perms) != 3) continue;
+        if (page < start || page >= end) continue;
+        prot = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) |
+               (perms[2] == 'x' ? PROT_EXEC : 0);
+        break;
+    }
+    if (maps) fclose(maps);
+    return prot;
+}
+
+static void touch_add_range(u64 start, u64 size)
+{
+    if (!start || !size) return;
+    for (u64 page = start & ~0xfffull; page < start + size; page += 0x1000) {
+        if (touch_page_index(page) >= 0) continue;
+        if (g_touch_page_count >= (int)(sizeof(g_touch_pages) / sizeof(*g_touch_pages))) return;
+        int prot = touch_maps_prot(page);
+        if (prot < 0) continue;
+        g_touch_pages[g_touch_page_count].page = page;
+        g_touch_pages[g_touch_page_count].prot = prot;
+        ++g_touch_page_count;
+    }
+}
+
+static void touch_trace_arm(void)
+{
+    u64 teb = 0;
+    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &teb) != 0 || !teb) return;
+    g_touch_page_count = 0;
+    touch_add_range(teb, 0x2000);
+    u64 peb = *(u64 *)(uintptr_t)(teb + 0x60);
+    touch_add_range(peb, 0x1000);
+    u64 ldr = peb ? *(u64 *)(uintptr_t)(peb + 0x18) : 0;
+    u64 params = peb ? *(u64 *)(uintptr_t)(peb + 0x20) : 0;
+    touch_add_range(ldr, 0x58);
+    touch_add_range(params, 0x400);
+    if (ldr) {
+        u64 head = ldr + 0x10;
+        u64 link = *(u64 *)(uintptr_t)head;
+        for (int guard = 0; link && link != head && guard < 256; ++guard) {
+            touch_add_range(link, 0x120);
+            for (u32 name = 0x48; name <= 0x58; name += 0x10) {
+                u16 bytes = *(u16 *)(uintptr_t)(link + name);
+                touch_add_range(*(u64 *)(uintptr_t)(link + name + 8), bytes);
+            }
+            link = *(u64 *)(uintptr_t)link;
+        }
+    }
+    touch_add_range(0x7ffe0000ull, 0x1000);
+    static const u64 modules[] = { HMOD_WINTRUST, HMOD_STEAM, HMOD_KBASE, HMOD_K32,
+                                   HMOD_USER32, HMOD_NTDLL, HMOD_ADVAPI, HMOD_WIN32U };
+    for (size_t i = 0; i < sizeof(modules) / sizeof(*modules); ++i)
+        touch_add_range(modules[i], FAKE_PE_SIZE);
+    touch_add_range((u64)(uintptr_t)g_img, 0x1000);
+    fprintf(stderr, "[TOUCH] armed: %d pages (teb=0x%llx peb=0x%llx ldr=0x%llx params=0x%llx)\n",
+            g_touch_page_count, (unsigned long long)teb, (unsigned long long)peb,
+            (unsigned long long)ldr, (unsigned long long)params);
+    g_touch_armed = 1;
+    for (int i = 0; i < g_touch_page_count; ++i)
+        mprotect((void *)(uintptr_t)g_touch_pages[i].page, 0x1000, PROT_NONE);
+}
+
+static void touch_trace_disarm(void)
+{
+    if (!g_touch_armed) return;
+    g_touch_armed = 0;
+    for (int i = 0; i < g_touch_page_count; ++i)
+        mprotect((void *)(uintptr_t)g_touch_pages[i].page, 0x1000, g_touch_pages[i].prot);
+    fprintf(stderr, "[TOUCH] disarmed\n");
+    const char *dir = getenv("BEER_TOUCH_DUMP");   /* <dir>: also save the synthetic module images */
+    static const u64 modules[] = { HMOD_KBASE, HMOD_K32, HMOD_USER32, HMOD_NTDLL, HMOD_WIN32U };
+    for (size_t i = 0; dir && i < sizeof(modules) / sizeof(*modules); ++i) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%llx.bin", dir, (unsigned long long)modules[i]);
+        FILE *out = fopen(path, "wb");
+        if (!out) continue;
+        fwrite((const void *)(uintptr_t)modules[i], 1, FAKE_PE_SIZE, out);
+        fclose(out);
+    }
+}
+
+static void touch_trace_maybe_arm(void)
+{
+    static long target = -2;
+    static long calls;
+    if (target == -2) target = getenv("BEER_TOUCH_TRACE") ? strtol(getenv("BEER_TOUCH_TRACE"), NULL, 0) : -1;
+    static long cpuid_target = -2;
+    if (cpuid_target == -2) cpuid_target = getenv("BEER_CPUID_TRACE") ? strtol(getenv("BEER_CPUID_TRACE"), NULL, 0) : -1;
+    ++calls;
+    if (cpuid_target >= 0 && calls == cpuid_target) cpuid_trace_arm();
+    if (target < 0 || g_touch_armed) return;
+    if (calls == target) touch_trace_arm();
+}
+
+/* BEER_CPUID_TRACE=<n> (diagnostic, off by default): from the n-th GetSystemInfo/GetNativeSystemInfo call,
+ * CPUID and RDTSC/RDTSCP fault on the calling thread (Linux CPUID faulting and PR_TSC_SIGSEGV). Each is
+ * executed for real on the host and its results returned unchanged; unique CPUID leaves and the RDTSC
+ * count are logged as "[CPUID] ..." and "[RDTSC] ...". */
+static __thread int t_cpuid_trace;
+static void cpuid_trace_arm(void)
+{
+    t_cpuid_trace = 1;
+    if (syscall(SYS_arch_prctl, 0x1012 /* ARCH_SET_CPUID */, 0) != 0)
+        fprintf(stderr, "[CPUID] CPUID faulting unavailable: %s\n", strerror(errno));
+    prctl(PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0, 0);
+    fprintf(stderr, "[CPUID] trace armed on tid %ld\n", (long)syscall(SYS_gettid));
+}
+
+static int cpuid_trace_signal(int sig, ucontext_t *uc)
+{
+    if (sig != SIGSEGV || !t_cpuid_trace) return 0;
+    u64 rip = (u64)uc->uc_mcontext.gregs[REG_RIP];
+    u8 code[3] = {0};
+    struct iovec local = { code, sizeof(code) }, remote = { (void *)(uintptr_t)rip, sizeof(code) };
+    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(code)) return 0;
+    greg_t *r = uc->uc_mcontext.gregs;
+    if (code[0] == 0x0F && code[1] == 0xA2) {
+        u32 leaf = (u32)r[REG_RAX], sub = (u32)r[REG_RCX], a, b, c, d;
+        syscall(SYS_arch_prctl, 0x1012, 1);
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(sub));
+        syscall(SYS_arch_prctl, 0x1012, 0);
+        static u64 seen[256];
+        u64 key = ((u64)leaf << 32) | sub;
+        int fresh = 1;
+        for (int i = 0; i < 256; ++i) {
+            if (seen[i] == key + 1) { fresh = 0; break; }
+            if (!seen[i]) { seen[i] = key + 1; break; }
+        }
+        if (fresh)
+            fprintf(stderr, "[CPUID] rip=0x%llx leaf=0x%x sub=0x%x -> %08x %08x %08x %08x\n",
+                    (unsigned long long)rip, leaf, sub, a, b, c, d);
+        r[REG_RAX] = a; r[REG_RBX] = b; r[REG_RCX] = c; r[REG_RDX] = d;
+        r[REG_RIP] = (greg_t)(rip + 2);
+        return 1;
+    }
+    int rdtscp = code[0] == 0x0F && code[1] == 0x01 && code[2] == 0xF9;
+    if ((code[0] == 0x0F && code[1] == 0x31) || rdtscp) {
+        u32 lo, hi, aux = 0;
+        prctl(PR_SET_TSC, PR_TSC_ENABLE, 0, 0, 0);
+        if (rdtscp) __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
+        else __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        prctl(PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0, 0);
+        static u32 count;
+        static u64 previous;
+        u64 now = ((u64)hi << 32) | lo;
+        if (++count <= 96 || (count & (count - 1)) == 0)
+            fprintf(stderr, "[RDTSC] #%u rip=0x%llx delta=%llu%s\n", count, (unsigned long long)rip,
+                    (unsigned long long)(previous ? now - previous : 0), rdtscp ? " (rdtscp)" : "");
+        previous = now;
+        r[REG_RAX] = lo; r[REG_RDX] = hi;
+        if (rdtscp) r[REG_RCX] = aux;
+        r[REG_RIP] = (greg_t)(rip + (rdtscp ? 3 : 2));
+        return 1;
+    }
+    return 0;
+}
+
+static int touch_trace_signal(int sig, siginfo_t *si, ucontext_t *uc)
+{
+    if (cpuid_trace_signal(sig, uc)) return 1;
+    if (sig == SIGTRAP && t_touch_pending_count) {
+        for (int i = 0; i < t_touch_pending_count; ++i)
+            if (g_touch_armed)
+                mprotect((void *)(uintptr_t)g_touch_pages[t_touch_pending[i]].page, 0x1000, PROT_NONE);
+        t_touch_pending_count = 0;
+        uc->uc_mcontext.gregs[REG_EFL] &= ~0x100LL;
+        return 1;
+    }
+    if (sig != SIGSEGV || !g_touch_armed || t_touch_pending_count >= 4) return 0;
+    u64 addr = (u64)(uintptr_t)si->si_addr;
+    int index = touch_page_index(addr & ~0xfffull);
+    if (index < 0) return 0;
+    u64 rip = (u64)uc->uc_mcontext.gregs[REG_RIP];
+    u64 err = (u64)uc->uc_mcontext.gregs[REG_ERR];
+    u64 key = rip * 0x9e3779b97f4a7c15ull ^ addr;
+    u32 slot = (u32)(key >> 48);
+    static int every = -1;   /* BEER_TOUCH_ALL=1: log every access, in order (no per-site dedup) */
+    if (every < 0) every = getenv("BEER_TOUCH_ALL") != NULL;
+    for (u32 probe = 0; probe < 64; ++probe, slot = (slot + 1) & 0xffff) {
+        if (g_touch_seen[slot] == key && !every) break;
+        if (every) g_touch_seen[slot] = 0;
+        if (!g_touch_seen[slot]) {
+            g_touch_seen[slot] = key;
+            char line[160];
+            int n = snprintf(line, sizeof(line), "[TOUCH] tid=%ld rip=0x%llx addr=0x%llx %c\n",
+                             (long)syscall(SYS_gettid), (unsigned long long)rip,
+                             (unsigned long long)addr, (err & 0x10) ? 'x' : (err & 2) ? 'w' : 'r');
+            if (n > 0) (void)!write(2, line, (size_t)n);
+            break;
+        }
+    }
+    mprotect((void *)(uintptr_t)g_touch_pages[index].page, 0x1000, g_touch_pages[index].prot);
+    t_touch_pending[t_touch_pending_count++] = index;
+    uc->uc_mcontext.gregs[REG_EFL] |= 0x100LL;
+    return 1;
+}
+#else
+static void touch_trace_disarm(void) { }
+static void touch_trace_maybe_arm(void) { }
+static void cpuid_trace_arm(void) { }
+static int touch_trace_signal(int sig, siginfo_t *si, beer_guest_ucontext_t *uc)
+{
+    (void)sig; (void)si; (void)uc;
+    return 0;
+}
+#endif
 
 /* A guest DLL's initialisation (TLS callbacks + DllMain) runs under this guard: an execute-fault inside it
  * (a jump to a non-executable address) abandons the initialisation and makes LoadLibrary fail, the way the
@@ -23801,11 +24879,14 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     u64 rsp0 = (u64)uc->uc_mcontext.gregs[REG_RSP];
     u64 rcx0 = (u64)uc->uc_mcontext.gregs[REG_RCX];
 
+    if (touch_trace_signal(sig, si, uc)) return;
+
     /* Windows calls vectored handlers before frame-based/unhandled exception
      * processing. Give registered guest handlers the original machine context;
      * only use Beer's compatibility recovery when every handler searches on. */
     if (beer_dispatch_signal_to_veh(sig, si, uc)) return;
     if (beer_dispatch_signal_to_seh(sig, si, uc)) return;
+    if (beer_dispatch_signal_to_top_level_filter(sig, si, uc)) return;
 
     if (t_guest_dll_init_jmp && sig == SIGSEGV && faultaddr == rip) {
         fprintf(stderr, "[PE DLL] %s: execute-fault at 0x%lx during DLL_PROCESS_ATTACH; the DLL fails to initialise\n",
@@ -26612,6 +27693,13 @@ int main(int argc, char **argv)
     printf("=== Beer Loader ===\n");
     if (!beer_win32_shared_data_map())
         return 2;
+    if (getenv("BEER_WIN32_SYSCALLS") && !strcmp(getenv("BEER_WIN32_SYSCALLS"), "0"))
+        g_win32_syscalls = 0;
+    if (g_win32_syscalls && !beer_win32_syscall_install()) {
+        fprintf(stderr, "[SYSCALL] Syscall User Dispatch unavailable (%s); "
+                        "using jump-stub ntdll exports\n", strerror(errno));
+        g_win32_syscalls = 0;
+    }
     pe_load(exe);
     beer_overlay_init();
     beer_post_init(exe_arg);
@@ -26639,14 +27727,18 @@ int main(int argc, char **argv)
     
     pe_imports();
     setup_teb_peb();
-    guest_dll_initialize_all();
     pe_initialize_security_cookie();
 
     {
         int n = patch_transaction_assertions();
         if (n) printf("[PATCH] Disabled %d Transaction-failed assertion branches\n", n);
     }
+    /* Windows finalizes the executable image before dependency process-attach
+     * callbacks run. A DLL may then deliberately change an image page with
+     * VirtualProtect and expect that protection to survive its DllMain return.
+     * Applying PE section permissions after DllMain silently undid such changes. */
     apply_section_perms();
+    guest_dll_initialize_all();
     patch_known_bad_targets();
     /* Executable TLS callbacks need the final image protections and a valid
      * Windows loader stack. They are invoked immediately before entry below. */

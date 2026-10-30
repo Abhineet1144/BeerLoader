@@ -1297,6 +1297,17 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
             return HR_OK;                           /* SHADER_MODEL, e.g. 66 */
         }
     }
+    if (feature == 8 && size >= 24) {
+        /* OPTIONS1. Wave intrinsics are not translated, so WaveOps stays FALSE, but every device has a
+         * native wave width and callers divide by it. Vulkan does not expose the processor-wide lane
+         * total, so TotalLaneCount reports the one certain value, a single wave's maximum width. */
+        uint32_t *f = data;
+        memset(data, 0, size);
+        f[1] = self->bd->wave_lane_min;
+        f[2] = self->bd->wave_lane_max;
+        f[3] = self->bd->wave_lane_max;
+        return HR_OK;
+    }
     switch (feature) {
     case 7: case 8: case 12: case 18: case 19:
     case 21: case 23: case 27: case 30: case 32:

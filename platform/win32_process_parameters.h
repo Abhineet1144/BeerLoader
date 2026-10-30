@@ -43,6 +43,26 @@ _Static_assert(offsetof(BeerProcessParameters, ImagePathName) == 0x60, "image pa
 _Static_assert(offsetof(BeerProcessParameters, CommandLine) == 0x70, "command line offset");
 _Static_assert(offsetof(BeerProcessParameters, Environment) == 0x80, "environment offset");
 
+static inline int beer_windows_path_from_host(const char *source,
+    char *destination, size_t destination_size)
+{
+    if (!source || !destination || !destination_size) return 0;
+    size_t source_length = strlen(source);
+    int has_drive = source_length >= 2 &&
+                    ((source[0] >= 'A' && source[0] <= 'Z') ||
+                     (source[0] >= 'a' && source[0] <= 'z')) &&
+                    source[1] == ':';
+    size_t prefix = source[0] == '/' && !has_drive ? 2u : 0u;
+    if (prefix + source_length + 1 > destination_size) return 0;
+    if (prefix) {
+        destination[0] = 'Z';
+        destination[1] = ':';
+    }
+    for (size_t index = 0; index <= source_length; ++index)
+        destination[prefix + index] = source[index] == '/' ? '\\' : source[index];
+    return 1;
+}
+
 static inline void beer_process_parameters_initialize(BeerProcessParameters *params,
     uint64_t standard_input, uint64_t standard_output, uint64_t standard_error)
 {

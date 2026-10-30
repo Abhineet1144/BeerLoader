@@ -1,5 +1,214 @@
 # Beer Loader — Active Development Context
 
+## PRAGMATA — past all protection stages; stops at RE Engine "Unsupported graphics card" (2026-10-31, current)
+
+Current end state, on the Intel UHD 770 (the NVIDIA driver is not loaded): both
+Mentha modules pass. The game creates its 1920x1080 window, passes NVIDIA's
+signature check and loads Streamline with all 7 plugins. Beer's BD12 D3D12
+device is created, and the engine works through its CheckFeatureSupport
+queries. It then shows its own TaskDialog **"RE ENGINE - Aborted: Unsupported
+graphics card. Please read the system requirements for details."** and exits
+with -1. Likely cause: BD12 reports SHADER_MODEL (feature 7) and most OPTIONS*
+as zero/unsupported, and the GPU is an iGPU. Next: make BD12 report the shader
+model and features it really translates, and test on the NVIDIA GPU.
+The manager's GPU spoof (RTX 3080 preset, `10de`/`2206`, 10240 MB) was
+applied and seen by the game (DXGI GetDesc1), but did not pass the check, so
+it is feature-based. **Parked until the NVIDIA GPU is back from service.** A
+test-only D3D12 feature override was considered and not added.
+
+Found with Wine as a behavioural oracle (the default prefix's Wine
+ntdll/win32u symlinks are intentional, for comparison only). Fixes, in order:
+- **Error 1 = the Windows-native path's raw syscalls.** On Wine the module finds
+  `ntdll!wine_get_version` and takes a Wine path. Beer must not export that
+  (impersonation). The native path runs `SYSCALL` with hard-coded Windows 10
+  19045 numbers (0x3F NtReadVirtualMemory, 0x50 NtProtectVirtualMemory), which
+  Linux ran as uname/chdir. `platform/win32_syscall.c` now uses **Syscall User
+  Dispatch**: a per-thread selector (host ELF TLS) is BLOCK in guest code and
+  ALLOW in host code. The import trampoline flips it on entry/exit, and every
+  guest thread enables dispatch in `alloc_teb_for_thread`. A trapped host
+  syscall (host code entered without the trampoline: COM methods, signal
+  handlers) re-allows and re-executes. ntdll stubs use the build-19045 numbers
+  for known services (table in the file; the Windows ABI of the advertised
+  build, not Wine's numbering) and Beer numbers from 0x800 otherwise. The
+  seccomp filter is gone. Added NtReadVirtualMemory/NtWriteVirtualMemory
+  (process_vm_readv/writev, STATUS_PARTIAL_COPY) and
+  ProcessDefaultHardErrorMode query/set.
+- **"Entry point RtlDeleteFunctionTable / FlsAlloc could not be located in
+  KERNEL32.dll":** Beer's kernel32 exported only the exe's own imports, and
+  GetProcAddress returned out-of-module thunks. Two first-party manifests in
+  `win32_kernel32_contract.h` fix this: `runtime_function_exports` (x64
+  `ntdll.Rtl*` forwarders) and `crt_runtime_exports` (49 APIs the MSVC runtime
+  resolves dynamically, published from kernel32 and kernelbase). Both are
+  limited to implemented names.
+- **Fault at exe RVA 0x101062f1:** protected code walks down from an imported
+  function in 64 KiB steps to its module's MZ header. Exe imports from Beer
+  system modules are now bound to the in-image export stubs (300 rebound), not
+  to the separate MAP_32BIT thunk block.
+- **SetUnhandledExceptionFilter** now records the filter, and the signal path
+  calls it after VEH and SEH (EXCEPTION_CONTINUE_EXECUTION resumes).
+- `DuplicateHandle(GetCurrentThread())` and `OpenThread(own tid)` return a real
+  table handle; `GetExitCodeThread(-2)` reports STILL_ACTIVE.
+  PathRemoveFileSpecA/W, ShellExecuteExW (logs and fails with
+  SE_ERR_NOASSOC), LoadStringW, TaskDialogIndirect (comctl32 #345; the config
+  is 1-byte packed; logged like MessageBox) and InitCommonControlsEx are
+  implemented. Winsock gains accept, recv and recvfrom: the GSE Steam emulator
+  spun on the stubbed recvfrom/accept and produced 5 GB logs.
+- **Application-local static imports** (CrashHandler.dll, XeSS, FidelityFX
+  loader) now load as guest modules when Beer implements none of their
+  imported names, like the Windows loader. `BEER_APP_LOCAL_IMPORTS=0`
+  disables this.
+- **Streamline (`slInit` NULL call):** the exe verifies `sl.interposer.dll`'s
+  Authenticode signature and needs `WINTRUST_SIGNATURE_SETTINGS.cSecondarySigs
+  == 1`, followed by a crypt32 certificate check. New first-party
+  `platform/win32_crypt32.inc` (host OpenSSL) adds CryptQueryObject,
+  CryptMsgGetParam (signer info, self-relative), CryptMsgOpenToDecode/Update,
+  CertOpenStore (PKCS7/MSG), CertFindCertificateInStore (subject cert),
+  CryptDecodeObjectEx (CNG_RSA_PUBLIC_KEY_BLOB) and the close/free calls.
+  WinVerifyTrust reports the file's real nested-signature count.
+- Absolute Windows paths in guest LoadLibrary ("Z:\...\/sl.common.dll") are now
+  translated through the drive mapping. Before, the Streamline plugins got
+  inert handles.
+- **Compatibility module handles** (crypt32, dxgi, d3d12, ...) were bare
+  numbers `0x140000000 + n MiB`, which fell inside PRAGMATA's own image.
+  Streamline parsed exe bytes as their headers. They are now minimal valid PE
+  images at 0xF0000000+ with export tables: guest import labels plus a
+  documented d3d12/dxgi list, limited to Beer implementations. This lets
+  Streamline find the real CreateDXGIFactory2/D3D12CreateDevice.
+- **BD12 OPTIONS1** now reports the Vulkan subgroup size range as
+  WaveLaneCountMin/Max (TotalLaneCount = one wave's maximum width; WaveOps
+  stays FALSE). The engine divided by the zero lane count (0xC0000094).
+
+Diagnostics added: `BEER_UEF_PEEK=hexaddr`, `BEER_TASKDIALOG_RAW=1`.
+`ShellExecuteExW` logs its guest stack. RE8 passed the 75 s gate after these
+changes (`/tmp/beer-re8-after-native-services.log`). Focused tests pass up to
+the pre-existing unwind assertion (syscall and Kernel32 contract tests
+updated).
+
+## PRAGMATA — native system services; Initialization error 3 fixed, error 1 open (2026-10-31, current)
+
+Both `Fatal Error: Initialization error 3` dialogs come from two run-time mapped,
+VM-protected modules (sections `.Mentha0/1/2`; the second one names itself
+`Citrus.dll`). The exe copies them out of its own `.00cfg` region (VA
+`0x14beb6000`). Before failing they make no API calls. A page-protection
+access tracer (below) showed that each one walks `PEB->Ldr`, finds ntdll, and
+binary-searches its export names for 15 natives: `ZwQueryVirtualMemory,
+ZwOpenFile, ZwCreateSection, ZwOpenSection, ZwMapViewOfSection,
+ZwUnmapViewOfSection, ZwClose, ZwProtectVirtualMemory, ZwQueryInformationProcess,
+ZwQueryInformationThread, ZwSetInformationThread, ZwSetInformationProcess,
+ZwQuerySystemInformation, ZwDelayExecution, ZwRaiseHardError`. Beer's synthetic
+ntdll did not export 8 of them, so the lookup failed: **error 3 = required ntdll
+natives missing**.
+
+A related defect: Beer's ntdll exports were `mov rax,imm64; jmp rax`. The exe's
+TLS stage reads service numbers out of ntdll stubs and executes `SYSCALL`
+itself. It got none, so it ran raw syscalls with RAX=-1 (seen with
+`strace -f -i`). Changes:
+
+- New `platform/win32_syscall.{h,c}`: ntdll Nt/Zw exports are now the native x64
+  stub shape (`mov r10,rcx; mov eax,N; test [7FFE0308h],1; jne; syscall; ret;
+  int 2Eh; ret`). The service numbers are Beer-owned, in 0x800-0xFFF, and Nt/Zw
+  share a number. A seccomp filter (NO_NEW_PRIVS + TSYNC) traps only that range
+  to SIGSYS. The handler calls Beer's implementation with R10, RDX, R8, R9 and
+  `[RSP+0x28..]`. Unknown numbers in the range get STATUS_INVALID_SYSTEM_SERVICE;
+  registered names without an implementation get STATUS_NOT_IMPLEMENTED (logged
+  once). `BEER_WIN32_SYSCALLS=0` restores the old jump stubs and installs no
+  filter. With `BEER_API_TRACE` every service call is logged as `[SYSCALL]`,
+  including file and section object names. Test:
+  `platform/win32_syscall_test.c` (in `make test-input`) runs real stubs through
+  the trap, including 5th and 6th stack arguments.
+- `hooked_ntdll()` (VFS LoadLibrary path) used to treat any ntdll stub not
+  starting with `0x48` as hooked. With native stubs this sent `voices38.v38`
+  through the section path to a non-preferred base and caused an execute fault
+  at `0x3b4016d0`. It now compares against the exact generated stub bytes.
+- New `platform/win32_native_info.inc`: NtQueryInformationProcess (Basic,
+  DebugPort, Wow64, BreakOnTermination, DebugObjectHandle -> PORT_NOT_SET,
+  DebugFlags, Cookie), NtSetInformationProcess (DefaultHardErrorMode;
+  BreakOnTermination -> PRIVILEGE_NOT_HELD), NtQueryInformationThread (Basic,
+  Win32StartAddress, HideFromDebugger readback, BreakOnTermination,
+  IsTerminated). NtSetInformationThread(ThreadHideFromDebugger) now checks
+  length and handle and records the flag. Also NtQueryVirtualMemory
+  (MemoryBasicInformation), NtDelayExecution, NtRaiseHardError (logged as
+  `[HARDERROR]`, answered like a dismissed box), NtOpenSection (`\KnownDlls\`
+  for Beer's own system modules, otherwise OBJECT_NAME_NOT_FOUND; this replaces
+  the ACCESS_DENIED stub), and the Zw alias of NtQuerySystemInformation.
+  Unsupported classes are logged once as `[NTINFO]` and answered with
+  STATUS_INVALID_INFO_CLASS.
+- `GetFileAttributesExW`/`NtQuery(Full)AttributesFile` on a Beer system-module
+  name now describe the synthetic image that `CreateFile` opens (size
+  0x40000). Before, they described a same-named host file.
+  Note: `~/.beer/prefixes/default/drive_c/Windows/System32/ntdll.dll` and
+  `win32u.dll` are deliberate symlinks to Wine's DLLs, kept for debugging and
+  comparison with Wine (oracle use only, never a runtime dependency). Leave them
+  in place. Since this change, Beer's attribute queries for those names no
+  longer read the symlinks.
+
+Result: error 3 no longer occurs. TLS-stage raw syscalls now resolve
+(`NtQueryFullAttributesFile("\??\C:\Windows\System32\ntdll.dll")`,
+`NtQuerySystemInformation(0)`). The first Mentha module resolves all 15
+natives and then reports **`Initialization error 1`** via
+`NtRaiseHardError(STATUS_SERVICE_NOTIFICATION, ...)`. Error 1 is decided
+without any OS call (no API or syscall between export resolution and the hard
+error). The module allocates and frees 0x234, 0x238, 0x651fc and 0xd36fd bytes,
+then fails. It reads ~49 RDTSC samples at one site (about 450k cycles apart)
+and executes no CPUID beforehand. Environment reads: PEB+0x18/+0x30/+0x120
+(OSBuildNumber), the Ldr list, ntdll/user32 headers and export tables,
+KUSER+0x308. No PEB debugger fields. Ruled out: CFG load-config pointers
+(GuardFlags=0), VirtualAlloc granularity (64 KiB aligned), host file attributes
+of ntdll. Next: identify the error-1 input. Candidates are the RDTSC timing
+loop, the exe-side state handed to the module, and the payload check implied by
+the two large buffers.
+
+New opt-in diagnostics:
+- `BEER_TOUCH_TRACE=<n>`: from the n-th GetSystemInfo call, logs accesses to
+  TEB/PEB/Ldr/params/KUSER/system-module images/exe header. Add
+  `BEER_TOUCH_ALL=1` for no dedup and `BEER_TOUCH_DUMP=<dir>` to save the module
+  images at disarm.
+- `BEER_CPUID_TRACE=<n>`: CPUID/RDTSC faulting with exact host results, plus
+  leaf and delta logging.
+- `BEER_MSGBOX_DUMP=<dir>`: dumps the anonymous mappings around a MessageBox
+  caller.
+
+RE8 passed the 75-second gate on the UHD 770 (BD12 device ready, 2560x1440
+swapchains, no fatal). Every focused test passes up to the pre-existing unwind
+assertion. Logs: `/tmp/beer-prag-citrus-trace-3.log` (baseline),
+`/tmp/beer-prag-touchall-3.log` (export search), `/tmp/beer-prag-natives2-1.log`,
+`/tmp/beer-prag-tsc-1.log`, `/tmp/beer-re8-after-win32-syscalls.log`.
+
+## PRAGMATA — memory-capped application bootstrap
+
+All new build and runtime checks are now run in a cgroup-v2 scope with
+`MemoryMax=6G`, `MemoryHigh=5500M`, and `MemorySwapMax=1G`. This contains a guest
+or loader OOM without exhausting the 14 GiB host. The current 120-second runs did
+not hit the cap.
+
+A new comparison with the existing Wine behavioral trace corrected the Steam-loop
+diagnosis. The component loaded at Wine base `0x6ffff9d60000` is the shipped
+`dstorage.dll` bootstrap: its DllMain reads the application-local Steam registry
+root, loads `dstorage.v38`, then explicitly loads `steam_api64.v38` and
+`voices38.v38`. Beer had bound the executable's `DSTORAGE.dll` imports to generic
+host stubs, so that DllMain never ran; the separate stock `steam_api64.dll` wrapper
+then selected a host-installed `steamclient64.dll` and waited forever in
+`Steam_BGetCallback`/`Sleep(100)`.
+
+Beer now loads the application-imported `dstorage.dll` as a normal guest PE and
+prefers its real exports, while the versioned `dstorage.v38` dependency remains
+application-local. This is package/native loader behavior rather than a title
+check. The correction immediately reproduces the native module chain:
+`dstorage.dll -> steam_api64.v38 -> voices38.v38`, and no host
+`steamclient64.dll` is loaded on that path.
+
+The bootstrap also exposed three truthful Kernel32 omissions used before loading
+its adjacent versioned DLLs: `lstrcatA`, `lstrcpyA`, and `lstrlenA`. They now have
+first-party implementations, stable Kernel32 ownership, and contract coverage.
+The next stop is later inside the packed `voices38.v38` path at
+`RIP=0x3b65a12a`, writing to main-image RVA `0x978c408` (inside `.debug`). This
+means the previous Steam callback wait is gone. The next investigation is the
+state producer for that write and the remaining versioned-runtime imports; no GPU
+spoof or guest patch has been added. Logs:
+`/tmp/beer-pragmata-memory-cap.log`,
+`/tmp/beer-pragmata-dstorage-bootstrap.log`, and
+`/tmp/beer-pragmata-dstorage-strings.log`.
+
 ## PRAGMATA — guest Steam interface ABI progress (current)
 
 After the app-ID and WinTrust/module-identity fixes, the repeatable crash at
@@ -1417,3 +1626,9 @@ Also fixed while gating on RE8: a DllMain run at LoadLibrary time executes on th
 2026-10-30 CPU-only Wine-oracle follow-up: a fresh 35-second relay captured observed calls only and was compared with Beer's implementation table. `QueueUserWorkItem` was the most frequent missing documented Kernel32 contract (114 calls). Beer now implements it generically with a detached worker, per-thread TEB/GS setup, DLL thread attach/detach notifications, the existing protected guest/host ABI call boundary, Win32 BOOL/error behavior, and a stable first-party Kernel32 export. No Wine implementation, DLL, export inventory, constant, or title-specific data was copied. The loader and focused environment/Kernel32 contract tests pass. Four 75-second PRAGMATA samples did not conclusively reach the post-TLS resolver: one selected the known callback-2 `FNEM` transfer and three remained active in callback 2. Therefore this increment's effect on the second lookup remains runtime-pending. Logs: `/tmp/prag-wine-cpu-relay.log` and `/tmp/beer-prag-queue-work-{1..4}.log`. The GPU-dependent RE8 gate remains deferred until suitable graphics hardware is available.
 
 2026-10-30 validation after newly added changes: rebuilt the loader serially and reviewed the new initial TLS/entry assembly boundary, `VirtualAlloc2`/aligned allocation support, `IsBadStringPtrA/W`, and the expanded first-party Kernel32 contract. Focused CPU tests pass for initial TLS/entry ABI, environment handling, API-set schema, Kernel32 contracts, and virtual memory/string probes; source diagnostics and `git diff --check` pass. The complete `make test-input` run passes every preceding test and still stops at the pre-existing `platform/win32_unwind_test.c:61` handler assertion. PRAGMATA now exposes 315 Beer-owned Kernel32 exports. Three serial CPU-only samples retained the known callback-2 split: one 75-second watchdog, one `FNEM` invalid continuation, and one run that completed all four TLS callbacks and remained active for the full 85-second external bound without reaching the old immediate second-lookup fault at RVA `0xf022e48`. This is encouraging but not yet conclusive because no API, Vulkan, or BD12 activity occurred during that successful-TLS window. Logs: `/tmp/beer-prag-after-new-changes.log`, `/tmp/beer-prag-updated-{1..3}.log`, and `/tmp/beer-test-input-after-new-changes.log`. GPU-dependent RE8 validation remains deferred.
+
+### PRAGMATA Citrus adapter-contract checkpoint (memory-capped, current pause)
+
+The pending `GetAdaptersAddresses` correction was completed and validated under a cgroup limit of 6 GiB RAM plus 1 GiB swap. Beer now returns one self-contained Windows x64 `IP_ADAPTER_ADDRESSES` record backed by the first active non-loopback host interface, including a real interface index, MAC address, MTU, interface type, operational status, link speed, and an IPv4 `IP_ADAPTER_UNICAST_ADDRESS`/`SOCKET_ADDRESS` when available. The previous implementation returned `ERROR_NO_DATA`/an unusable truncated prefix. New first-party layout coverage is in `platform/win32_ip_adapter.{h,test.c}` and is wired into `make test-input`.
+
+Validation: serial loader build passes under the cap; the focused adapter layout test passes; source diagnostics and `git diff --check` pass. A 150-second capped PRAGMATA guest-Steam run still raises the deliberate `Fatal Error: Initialization error 3`. Its stack remains entirely inside the manually mapped `Citrus.dll` (not D3DKMT/GPU telemetry), including stable RVAs `0x525b17`, `0x53cc7d`, `0x53e4b0`, and `0x481d34`. Therefore the malformed adapter record was a genuine generic Windows-contract defect but is not the decisive Citrus initialization condition. No GPU spoof or Citrus-specific bypass was added. Log: `/tmp/beer-prag-ip-adapter-final.log`.

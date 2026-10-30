@@ -99,6 +99,20 @@ BD12Device *bd12_device_create(void)
     get_properties(device->physical_device, &properties);
     snprintf(device->device_name, sizeof(device->device_name), "%s",
              properties.deviceName);
+    {   /* Native wave width: the subgroup size range (Vulkan 1.3 subgroup size control). */
+        PFN_vkGetPhysicalDeviceProperties2 get_properties2 =
+            (PFN_vkGetPhysicalDeviceProperties2)get_instance(
+                device->instance, "vkGetPhysicalDeviceProperties2");
+        VkPhysicalDeviceSubgroupSizeControlProperties size_control = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES };
+        VkPhysicalDeviceSubgroupProperties subgroup = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, .pNext = &size_control };
+        VkPhysicalDeviceProperties2 properties2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &subgroup };
+        if (get_properties2) get_properties2(device->physical_device, &properties2);
+        device->wave_lane_min = size_control.minSubgroupSize ? size_control.minSubgroupSize : subgroup.subgroupSize;
+        device->wave_lane_max = size_control.maxSubgroupSize ? size_control.maxSubgroupSize : subgroup.subgroupSize;
+    }
     device->min_uniform_alignment =
         properties.limits.minUniformBufferOffsetAlignment;
     device->max_uniform_range = properties.limits.maxUniformBufferRange;

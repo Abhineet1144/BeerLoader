@@ -222,9 +222,18 @@ static u64 __attribute__((ms_abi)) beer_GetFileAttributesExW(const u16 *name, u3
     if (!name || !data || level != 0) { g_last_error = 87; return 0; }
     char narrow[PATH_MAX], host[PATH_MAX];
     beer_utf16_to_utf8(name, narrow, sizeof(narrow));
-    if (!resolve_windows_host_path(narrow, host, sizeof(host))) { g_last_error = 3; return 0; }
     struct stat sb;
-    if (stat(host, &sb) != 0) { g_last_error = errno == ENOENT ? 2 : 3; return 0; }
+    if (synthetic_system_module_base(narrow)) {
+        /* CreateFile on this name opens Beer's generated module image (see synthetic_system_module_file),
+         * so its attributes describe that file too, never a same-named host file. The timestamps are
+         * the loader binary's, which produced the image. */
+        if (stat("/proc/self/exe", &sb) != 0) memset(&sb, 0, sizeof(sb));
+        sb.st_mode = S_IFREG | 0444;
+        sb.st_size = FAKE_PE_SIZE;
+    } else {
+        if (!resolve_windows_host_path(narrow, host, sizeof(host))) { g_last_error = 3; return 0; }
+        if (stat(host, &sb) != 0) { g_last_error = errno == ENOENT ? 2 : 3; return 0; }
+    }
     u8 *o = data;
     u32 attr = S_ISDIR(sb.st_mode) ? 0x10u : 0x80u;
     if (!(sb.st_mode & 0222)) attr |= 1u;
@@ -654,12 +663,157 @@ static void beer_log_guest_stack(const char *tag)
     __asm__ volatile("mov %%fs:g_saved_guest_rsp@tpoff, %0" : "=r"(rsp));
 #endif
     if (!rsp) return;
-    fprintf(stderr, "[%s] guest stack:", tag);
+    fprintf(stderr, "[%s] guest stack:\n", tag);
     for (int i = 0; i < 96; ++i) {
-        u64 v = ((const u64 *)rsp)[i];
-        if (v > 0x10000000ULL && v < 0x7fffffffffffULL) fprintf(stderr, " %llx", (unsigned long long)v);
+        u64 value = ((const u64 *)rsp)[i];
+        if (value <= 0x10000000ULL || value >= 0x7fffffffffffULL) continue;
+        if (value >= (u64)(uintptr_t)g_img &&
+            value < (u64)(uintptr_t)g_img + g_img_size) {
+            fprintf(stderr, "  stack[%d] = %llx (main+0x%llx)\n", i,
+                    (unsigned long long)value,
+                    (unsigned long long)(value - (u64)(uintptr_t)g_img));
+            continue;
+        }
+        int identified = 0;
+        for (int dll_index = 0; dll_index < g_guest_dll_count; ++dll_index) {
+            const GuestDll *dll = &g_guest_dlls[dll_index];
+            u64 base = (u64)(uintptr_t)dll->image;
+            if (!base || value < base || value >= base + dll->image_size) continue;
+            fprintf(stderr, "  stack[%d] = %llx (%s+0x%llx)\n", i,
+                    (unsigned long long)value, dll->name,
+                    (unsigned long long)(value - base));
+            identified = 1;
+            break;
+        }
+        if (!identified) {
+            typedef struct BeerMapInfo {
+                u64 start, end;
+                char permissions[8];
+                char path[256];
+            } BeerMapInfo;
+            BeerMapInfo regions[512];
+            size_t region_count = 0;
+            FILE *maps = fopen("/proc/self/maps", "r");
+            char line[512];
+            while (maps && region_count < sizeof(regions) / sizeof(regions[0]) &&
+                   fgets(line, sizeof(line), maps)) {
+                unsigned long long start = 0, end = 0, offset = 0, inode = 0;
+                char device[32] = "", path[256] = "", permissions[8] = "";
+                int fields = sscanf(line, "%llx-%llx %7s %llx %31s %llu %255[^\n]",
+                                    &start, &end, permissions, &offset, device,
+                                    &inode, path);
+                if (fields < 6) continue;
+                BeerMapInfo *region = &regions[region_count++];
+                region->start = start;
+                region->end = end;
+                snprintf(region->permissions, sizeof(region->permissions), "%s",
+                         permissions);
+                region->path[0] = 0;
+                if (fields == 7) snprintf(region->path, sizeof(region->path), "%s", path);
+            }
+            if (maps) fclose(maps);
+
+            /* BEER_MSGBOX_DUMP=<dir>: save every non-file mapping within 32 MiB of the caller for offline disassembly
+             * (run-time mapped modules often erase their PE headers). Files are named <start>-<end>-<perm>.bin. */
+            const char *dump_dir = getenv("BEER_MSGBOX_DUMP");
+            for (size_t map_index = 0; dump_dir && map_index < region_count; ++map_index) {
+                BeerMapInfo *region = &regions[map_index];
+                if (region->path[0] || region->permissions[0] != 'r' ||
+                    region->end + (32ull << 20) < value || region->start > value + (32ull << 20) ||
+                    region->end - region->start > (64ull << 20))
+                    continue;
+                char file_name[512];
+                snprintf(file_name, sizeof(file_name), "%s/%llx-%llx-%.4s.bin", dump_dir,
+                         (unsigned long long)region->start, (unsigned long long)region->end,
+                         region->permissions);
+                if (access(file_name, F_OK) == 0) continue;
+                FILE *out = fopen(file_name, "wb");
+                if (!out) continue;
+                static u8 chunk[1 << 16];
+                for (u64 at = region->start; at < region->end; at += sizeof(chunk)) {
+                    u64 want = region->end - at < sizeof(chunk) ? region->end - at : sizeof(chunk);
+                    struct iovec local = { chunk, want };
+                    struct iovec remote = { (void *)(uintptr_t)at, want };
+                    ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+                    if (got <= 0) { memset(chunk, 0, want); got = (ssize_t)want; }
+                    fwrite(chunk, 1, (size_t)got, out);
+                }
+                fclose(out);
+            }
+
+            BeerMapInfo *containing = NULL;
+            u64 pe_base = 0;
+            for (size_t map_index = 0; map_index < region_count; ++map_index) {
+                BeerMapInfo *region = &regions[map_index];
+                if (value >= region->start && value < region->end)
+                    containing = region;
+                if (region->start > value || value - region->start > (1ull << 30))
+                    continue;
+                u8 header[0x1000];
+                struct iovec local = { header, sizeof(header) };
+                struct iovec remote = { (void *)(uintptr_t)region->start, sizeof(header) };
+                if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) !=
+                    (ssize_t)sizeof(header))
+                    continue;
+                DosHdr *dos = (DosHdr *)header;
+                if (dos->magic != MZ_MAGIC || dos->lfanew < sizeof(*dos) ||
+                    dos->lfanew + sizeof(NtHdrs64) > sizeof(header))
+                    continue;
+                NtHdrs64 *nt = (NtHdrs64 *)(header + dos->lfanew);
+                if (nt->sig != PE_SIG || nt->opt.magic != PE32PLUS ||
+                    !nt->opt.sz_image || value >= region->start + nt->opt.sz_image)
+                    continue;
+                pe_base = region->start;
+            }
+            if (pe_base) {
+                char image_name[128] = "";
+                u8 header[0x1000];
+                struct iovec local = { header, sizeof(header) };
+                struct iovec remote = { (void *)(uintptr_t)pe_base, sizeof(header) };
+                if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) ==
+                    (ssize_t)sizeof(header)) {
+                    DosHdr *dos = (DosHdr *)header;
+                    NtHdrs64 *nt = (NtHdrs64 *)(header + dos->lfanew);
+                    DataDir *exports = &nt->opt.dirs[0];
+                    if (exports->rva && exports->size >= sizeof(ExportDir)) {
+                        ExportDir directory;
+                        struct iovec export_local = { &directory, sizeof(directory) };
+                        struct iovec export_remote = {
+                            (void *)(uintptr_t)(pe_base + exports->rva), sizeof(directory)
+                        };
+                        if (process_vm_readv(getpid(), &export_local, 1,
+                                             &export_remote, 1, 0) ==
+                            (ssize_t)sizeof(directory) && directory.name_rva) {
+                            struct iovec name_local = { image_name, sizeof(image_name) - 1 };
+                            struct iovec name_remote = {
+                                (void *)(uintptr_t)(pe_base + directory.name_rva),
+                                sizeof(image_name) - 1
+                            };
+                            if (process_vm_readv(getpid(), &name_local, 1,
+                                                 &name_remote, 1, 0) > 0)
+                                image_name[sizeof(image_name) - 1] = 0;
+                        }
+                    }
+                }
+                fprintf(stderr,
+                        "  stack[%d] = %llx (manual PE %llx+0x%llx%s%s)\n",
+                        i, (unsigned long long)value, (unsigned long long)pe_base,
+                        (unsigned long long)(value - pe_base),
+                        image_name[0] ? " " : "", image_name);
+            }
+            else if (containing)
+                fprintf(stderr,
+                        "  stack[%d] = %llx (map %llx-%llx %s +0x%llx%s%s)\n",
+                        i, (unsigned long long)value,
+                        (unsigned long long)containing->start,
+                        (unsigned long long)containing->end, containing->permissions,
+                        (unsigned long long)(value - containing->start),
+                        containing->path[0] ? " " : "", containing->path);
+            else
+                fprintf(stderr, "  stack[%d] = %llx (unmapped/unowned)\n", i,
+                        (unsigned long long)value);
+        }
     }
-    fprintf(stderr, "\n");
 }
 static u64 beer_message_box_result(u32 type)
 {
@@ -673,6 +827,7 @@ static u64 beer_message_box_result(u32 type)
 static u64 __attribute__((ms_abi)) beer_MessageBoxA(u64 owner, const char *text, const char *title, u32 type)
 {
     (void)owner;
+    touch_trace_disarm();
     fprintf(stderr, "[MSGBOX] \"%s\": %s\n", title ? title : "", text ? text : "");
     beer_log_guest_stack("MSGBOX");
     return beer_message_box_result(type);
@@ -681,6 +836,7 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxW(u64 owner, const u16 *text, 
 {
     (void)owner;
     char t[512], c[1024];
+    touch_trace_disarm();
     reg_narrow(title, t, sizeof(t)); reg_narrow(text, c, sizeof(c));
     fprintf(stderr, "[MSGBOX] \"%s\": %s\n", t, c);
     beer_log_guest_stack("MSGBOX");

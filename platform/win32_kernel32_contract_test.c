@@ -25,12 +25,16 @@ int main(void)
     assert(!strcmp(beer_kernel32_environment_exports[0], "ExpandEnvironmentStringsA"));
     assert(!strcmp(beer_kernel32_environment_exports[2], "GetEnvironmentVariableA"));
     assert(!strcmp(beer_kernel32_environment_exports[5], "SetEnvironmentVariableW"));
-    assert(BEER_KERNEL32_THREAD_EXPORT_COUNT == 2);
-    assert(!strcmp(beer_kernel32_thread_exports[0], "QueueUserWorkItem"));
-    assert(!strcmp(beer_kernel32_thread_exports[1], "SetThreadDescription"));
-    assert(BEER_KERNEL32_STRING_EXPORT_COUNT == 4);
-    assert(!strcmp(beer_kernel32_string_exports[0], "lstrcmpA"));
-    assert(!strcmp(beer_kernel32_string_exports[3], "lstrcmpiW"));
+    assert(BEER_KERNEL32_THREAD_EXPORT_COUNT == 3);
+    assert(!strcmp(beer_kernel32_thread_exports[0], "AppPolicyGetThreadInitializationType"));
+    assert(!strcmp(beer_kernel32_thread_exports[1], "QueueUserWorkItem"));
+    assert(!strcmp(beer_kernel32_thread_exports[2], "SetThreadDescription"));
+    assert(BEER_KERNEL32_STRING_EXPORT_COUNT == 7);
+    assert(!strcmp(beer_kernel32_string_exports[0], "lstrcatA"));
+    assert(!strcmp(beer_kernel32_string_exports[1], "lstrcmpA"));
+    assert(!strcmp(beer_kernel32_string_exports[4], "lstrcmpiW"));
+    assert(!strcmp(beer_kernel32_string_exports[5], "lstrcpyA"));
+    assert(!strcmp(beer_kernel32_string_exports[6], "lstrlenA"));
     assert(BEER_KERNEL32_STRING_PROBE_EXPORT_COUNT == 2);
     assert(!strcmp(beer_kernel32_string_probe_exports[0], "IsBadStringPtrA"));
     assert(!strcmp(beer_kernel32_string_probe_exports[1], "IsBadStringPtrW"));
@@ -46,6 +50,21 @@ int main(void)
     assert(!strcmp(beer_kernel32_file_search_exports[0], "FindClose"));
     assert(!strcmp(beer_kernel32_file_search_exports[4], "FindFirstFileW"));
     assert(!strcmp(beer_kernel32_file_search_exports[6], "FindNextFileW"));
+    assert(BEER_KERNEL32_RUNTIME_FUNCTION_EXPORT_COUNT == 11);
+    assert(!strcmp(beer_kernel32_runtime_function_exports[0], "RtlAddFunctionTable"));
+    assert(!strcmp(beer_kernel32_runtime_function_exports[3], "RtlDeleteFunctionTable"));
+    assert(!strcmp(beer_kernel32_runtime_function_exports[10], "RtlVirtualUnwind"));
+    assert(BEER_KERNEL32_CRT_RUNTIME_EXPORT_COUNT == 49);
+    for (size_t i = 1; i < BEER_KERNEL32_CRT_RUNTIME_EXPORT_COUNT; ++i)
+        assert(strcmp(beer_kernel32_crt_runtime_exports[i - 1],
+                      beer_kernel32_crt_runtime_exports[i]) < 0);
+    for (size_t i = 1; i < BEER_KERNEL32_RUNTIME_FUNCTION_EXPORT_COUNT; ++i)
+        assert(strcmp(beer_kernel32_runtime_function_exports[i - 1],
+                      beer_kernel32_runtime_function_exports[i]) < 0);
+    int32_t initialization_type = -1;
+    assert(beer_app_policy_get_thread_initialization_type(&initialization_type) == 0);
+    assert(initialization_type == BEER_APP_POLICY_THREAD_INITIALIZATION_NONE);
+    assert(beer_app_policy_get_thread_initialization_type(NULL) == 87);
     assert(beer_compare_filetime(99, 100) == -1);
     assert(beer_compare_filetime(100, 100) == 0);
     assert(beer_compare_filetime(101, 100) == 1);

@@ -359,7 +359,8 @@ First working APK: RE8 reaches its title-screen background, full screen, no X11.
 
 ## Merge of main (2026-10-31)
 
-`origin/main` (3240eb5 "Launch Ghost of Tsushima, Improve Sekiro", d006c2e "Improve PRAGMATA") merged into `apk`.
+`main` (3240eb5 "Launch Ghost of Tsushima, Improve Sekiro", then d006c2e "Improve PRAGMATA", which was only on the
+local `main` of the dev PC, not on GitHub) merged into `apk`.
 - Main's new `platform/win32_entry.c` `beer_guest_enter(stack, tls, entry)` is now the seam's signature too
   (`guest_cpu.h` includes `win32_entry.h`); the FEX backend implements it and now runs the executable's TLS callbacks
   (main made them mandatory) instead of skipping them. `win32_entry.c` is x86-only and not in the ARM source list.
@@ -371,11 +372,23 @@ First working APK: RE8 reaches its title-screen background, full screen, no X11.
   `g_saved_guest_rsp` are compiled out when emulated.
 - Main's new platform sources (`win32_apiset`, `win32_gdi`, `win32_resource`, `win32_onexit`, `win32_crt_init`) added to
   `android/check_aarch64.sh`.
+- Native Windows system calls (d006c2e, `platform/win32_syscall.c`): ntdll's Nt/Zw exports are real `syscall` stubs with
+  Windows 10 19045 service numbers. Natively they are trapped with Syscall User Dispatch + SIGSYS; emulated, every guest
+  `syscall` already reaches the backend, so `beer_guest_import_dispatch` sends untagged ids below
+  `BEER_WIN32_SYSCALL_CAPACITY` to the shared `beer_win32_syscall_service()` and Beer's own import thunks now carry
+  `BEER_IMPORT_ID_IMPL` (0x20000000). SUD/SIGSYS/resume asm are native-only.
+- crypt32 (d006c2e, `platform/win32_crypt32.inc`) parses Authenticode signatures with OpenSSL, which Android lacks.
+  **On Android every file currently reads as unsigned** (`BEER_HAVE_OPENSSL=0`: CryptQueryObject -> CRYPT_E_NO_MATCH,
+  a one-time `[CRYPT32] built without OpenSSL` log line). A game that checks its own signature (PRAGMATA) may refuse to
+  run on the phone until OpenSSL is shipped in the APK or a built-in PKCS#7 reader replaces it.
+- The x86-only BEER_TOUCH_TRACE / BEER_CPUID_TRACE diagnostics are compiled out when emulated; the unhandled-exception
+  filter call goes through `BEER_GUEST_CALL`.
 - Checked: desktop build matches main (same warnings; per-function disassembly differs only where the apk branch
   already used the seam), `make test-input` as on main (`win32_unwind_test` fails on both), the five test exes identical.
   On the phone: all sources compile for aarch64 (0 errors), `beer_arm` links, the five test exes give the desktop's
-  results, `find_indirect_calls.py` finds no new host->guest calls. Not yet exercised: TLS callbacks and C++ unwind
-  consolidation under emulation (no test exe has them), the APK build, any game.
+  results, `find_indirect_calls.py` over every ARM source finds no host->guest call outside the seam. Not yet exercised:
+  TLS callbacks, C++ unwind consolidation and native syscalls under emulation (no test exe has them), the APK build
+  (`android/apk/build_native.sh` needs the NDK, not installed on this PC), any game.
 
 ## Resuming on another machine (state at the pause, 2026-10-30)
 
