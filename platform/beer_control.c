@@ -1,3 +1,4 @@
+#include "beer_paths.h"
 #include "beer_control.h"
 #include "beer_time.h"
 #include "beer_memory.h"
@@ -387,7 +388,7 @@ void beer_control_start(const char *exe_path)
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     char directory[256];
     if (runtime && *runtime) snprintf(directory, sizeof(directory), "%s/beer", runtime);
-    else snprintf(directory, sizeof(directory), "/tmp/beer-%d", (int)getuid());
+    else snprintf(directory, sizeof(directory), "%s/beer-%d", beer_tmp_dir(), (int)getuid());
     mkdir(directory, 0700);
     chmod(directory, 0700);
     struct sockaddr_un address = { .sun_family = AF_UNIX };

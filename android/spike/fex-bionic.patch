@@ -1,0 +1,36 @@
+ FEXCore/Source/Utils/AllocatorHooks.cpp | 5 +++++
+ FEXCore/Source/Utils/FileUtils.cpp      | 8 ++++++++
+ 2 files changed, 13 insertions(+)
+diff --git a/FEXCore/Source/Utils/AllocatorHooks.cpp b/FEXCore/Source/Utils/AllocatorHooks.cpp
+index 63f84a8..7c1c49b 100644
+--- a/FEXCore/Source/Utils/AllocatorHooks.cpp
++++ b/FEXCore/Source/Utils/AllocatorHooks.cpp
+@@ -230,7 +230,12 @@ void* memalign(size_t align, size_t s) {
+   return ::memalign(align, s);
+ }
+ void* valloc(size_t size) {
++#if defined(__ANDROID__)
++  // Beer/bionic: no valloc in bionic.
++  return ::memalign(sysconf(_SC_PAGESIZE), size);
++#else
+   return ::valloc(size);
++#endif
+ }
+ int posix_memalign(void** r, size_t a, size_t s) {
+   return ::posix_memalign(r, a, s);
+diff --git a/FEXCore/Source/Utils/FileUtils.cpp b/FEXCore/Source/Utils/FileUtils.cpp
+index d3e62ca..d6c2592 100644
+--- a/FEXCore/Source/Utils/FileUtils.cpp
++++ b/FEXCore/Source/Utils/FileUtils.cpp
+@@ -1,3 +1,11 @@
++// Beer/bionic: getdents64 has no libc wrapper on Android.
++#if defined(__ANDROID__)
++#include <sys/syscall.h>
++#include <unistd.h>
++static inline ssize_t getdents64(int fd, void* buf, size_t n) {
++  return syscall(SYS_getdents64, fd, buf, n);
++}
++#endif
+ // SPDX-License-Identifier: MIT
+ #include <FEXCore/fextl/fmt.h>
+ #include <FEXCore/fextl/functional.h>

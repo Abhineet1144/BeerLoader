@@ -3,6 +3,7 @@
  * every method builds a B11Op; ctx_emit() either executes it (immediate) or records it
  * (deferred). ExecuteCommandList replays the recorded ops through the immediate path. */
 
+#include "guest_cpu.h"
 #include "bd11.h"
 #include <sys/mman.h>
 #include <stdatomic.h>
@@ -1471,6 +1472,7 @@ static void B11_MS ctx_clear_dsv(B11Context *c, B11Obj *dsv, uint32_t flags, flo
     B11Op op = op_new(B11_OP_CLEAR_DSV); op.obj[0] = dsv; op.a = flags; memcpy(&op.b, &depth, 4); op.c = stencil;
     ctx_emit(c, &op);
 }
+BEER_HOST_FLOAT_FN(ctx_clear_dsv, 1u << 3)   /* float depth is the 4th argument */
 static void B11_MS ctx_clear_uav_uint(B11Context *c, B11Obj *uav, const uint32_t *values)
 {
     if (!uav || !values) return;
@@ -1542,6 +1544,7 @@ static void B11_MS ctx_generate_mips(B11Context *c, B11Obj *srv)
     if (!warned++) fprintf(stderr, "[BD11] GenerateMips not implemented yet\n");
 }
 static void B11_MS ctx_set_min_lod(B11Context *c, B11Obj *res, float lod) { (void)c; (void)res; (void)lod; }
+BEER_HOST_FLOAT_FN(ctx_set_min_lod, 1u << 2)   /* float lod is the 3rd argument */
 static float B11_MS ctx_get_min_lod(B11Context *c, B11Obj *res) { (void)c; (void)res; return 0.0f; }
 static void B11_MS ctx_resolve(B11Context *c, B11Obj *dst, uint32_t dsub, B11Obj *src, uint32_t ssub, uint32_t fmt)
 {

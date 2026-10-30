@@ -1,3 +1,5 @@
+#include "beer_paths.h"
+#include "guest_cpu.h"
 #include "media_foundation.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -342,7 +344,7 @@ static uint64_t mf_unknown_add_ref(void *object)
     if (!object) return 0;
     void ***vtable = (void ***)object;
     typedef uint64_t __attribute__((ms_abi)) (*AddRefFn)(void *);
-    return ((AddRefFn)(*vtable)[1])(object);
+    return BEER_GUEST_CALL(((AddRefFn)(*vtable)[1]), object);
 }
 
 static uint64_t mf_unknown_release(void *object)
@@ -350,7 +352,7 @@ static uint64_t mf_unknown_release(void *object)
     if (!object) return 0;
     void ***vtable = (void ***)object;
     typedef uint64_t __attribute__((ms_abi)) (*ReleaseFn)(void *);
-    return ((ReleaseFn)(*vtable)[2])(object);
+    return BEER_GUEST_CALL(((ReleaseFn)(*vtable)[2]), object);
 }
 
 static uint64_t __attribute__((ms_abi))
@@ -765,16 +767,15 @@ static void mf_probe_stream_header(BeerMfShell *byte_stream)
     void **vtable = *(void ***)stream;
     if (!vtable || !vtable[3] || !vtable[5]) return;
     uint64_t original = 0;
-    if (((BeerStreamSeekFn)vtable[5])(stream, 0, 1, &original) != BEER_S_OK)
+    if (BEER_GUEST_CALL(((BeerStreamSeekFn)vtable[5]), stream, 0, 1, &original) != BEER_S_OK)
         return;
     uint64_t ignored = 0;
-    if (((BeerStreamSeekFn)vtable[5])(stream, 0, 0, &ignored) != BEER_S_OK)
+    if (BEER_GUEST_CALL(((BeerStreamSeekFn)vtable[5]), stream, 0, 0, &ignored) != BEER_S_OK)
         return;
     uint8_t header[64] = {0};
     uint32_t read = 0;
-    uint64_t result = ((BeerStreamReadFn)vtable[3])(
-        stream, header, (uint32_t)sizeof(header), &read);
-    ((BeerStreamSeekFn)vtable[5])(stream, (int64_t)original, 0, &ignored);
+    uint64_t result = BEER_GUEST_CALL(((BeerStreamReadFn)vtable[3]), stream, header, (uint32_t)sizeof(header), &read);
+    BEER_GUEST_CALL(((BeerStreamSeekFn)vtable[5]), stream, (int64_t)original, 0, &ignored);
     fprintf(stderr, "[MF STREAM] hr=%#llx position=%llu bytes=%u header=",
             (unsigned long long)result, (unsigned long long)original, read);
     uint32_t shown = read < 32 ? read : 32;
@@ -790,18 +791,18 @@ static void mf_probe_stream_with_ffmpeg(BeerMfShell *byte_stream)
     void **vtable = *(void ***)stream;
     if (!vtable || !vtable[3] || !vtable[5]) return;
     uint64_t original = 0, ignored = 0;
-    if (((BeerStreamSeekFn)vtable[5])(stream, 0, 1, &original) != BEER_S_OK ||
-        ((BeerStreamSeekFn)vtable[5])(stream, 0, 0, &ignored) != BEER_S_OK)
+    if (BEER_GUEST_CALL(((BeerStreamSeekFn)vtable[5]), stream, 0, 1, &original) != BEER_S_OK ||
+        BEER_GUEST_CALL(((BeerStreamSeekFn)vtable[5]), stream, 0, 0, &ignored) != BEER_S_OK)
         return;
-    char path[] = "/tmp/beer-mf-stream-XXXXXX";
+    char path[512];
+    snprintf(path, sizeof(path), "%s/beer-mf-stream-XXXXXX", beer_tmp_dir());
     int fd = mkstemp(path);
     if (fd < 0) return;
     uint64_t total = 0;
     uint8_t block[64 * 1024];
     for (;;) {
         uint32_t read = 0;
-        uint64_t result = ((BeerStreamReadFn)vtable[3])(
-            stream, block, (uint32_t)sizeof(block), &read);
+        uint64_t result = BEER_GUEST_CALL(((BeerStreamReadFn)vtable[3]), stream, block, (uint32_t)sizeof(block), &read);
         if (result != BEER_S_OK || !read) break;
         uint32_t offset = 0;
         while (offset < read) {
@@ -813,7 +814,7 @@ static void mf_probe_stream_with_ffmpeg(BeerMfShell *byte_stream)
         if (offset != read || total > UINT64_C(512) * 1024 * 1024) break;
     }
     close(fd);
-    ((BeerStreamSeekFn)vtable[5])(stream, (int64_t)original, 0, &ignored);
+    BEER_GUEST_CALL(((BeerStreamSeekFn)vtable[5]), stream, (int64_t)original, 0, &ignored);
     fprintf(stderr, "[MF STREAM] dumped %llu bytes to %s\n",
             (unsigned long long)total, path);
     char command[1024];
@@ -1111,12 +1112,11 @@ mf_media_buffer_copy_2d_to(BeerMfMediaBuffer *self, void *destination)
     typedef uint64_t __attribute__((ms_abi)) (*Lock2DSizeFn)(
         void *, uint32_t, uint8_t **, int32_t *, uint8_t **, uint32_t *);
     typedef uint64_t __attribute__((ms_abi)) (*Unlock2DFn)(void *);
-    uint64_t result = ((Lock2DSizeFn)vtable[15])(
-        destination, 2, &scanline, &pitch, &start, &length);
+    uint64_t result = BEER_GUEST_CALL(((Lock2DSizeFn)vtable[15]), destination, 2, &scanline, &pitch, &start, &length);
     if (result != BEER_S_OK) return result;
     if (length < self->contiguous_length || !start) result = BEER_E_INVALIDARG;
     else memcpy(start, self->data, self->contiguous_length);
-    ((Unlock2DFn)vtable[9])(destination);
+    BEER_GUEST_CALL(((Unlock2DFn)vtable[9]), destination);
     return result;
 }
 
@@ -1319,10 +1319,11 @@ static int mf_dump_stream(BeerMfShell *byte_stream, char **path_out)
     void **vtable = *(void ***)stream;
     if (!vtable || !vtable[3] || !vtable[5]) return 0;
     uint64_t original = 0, ignored = 0;
-    if (((BeerStreamSeekFn)vtable[5])(stream, 0, 1, &original) != BEER_S_OK ||
-        ((BeerStreamSeekFn)vtable[5])(stream, 0, 0, &ignored) != BEER_S_OK)
+    if (BEER_GUEST_CALL(((BeerStreamSeekFn)vtable[5]), stream, 0, 1, &original) != BEER_S_OK ||
+        BEER_GUEST_CALL(((BeerStreamSeekFn)vtable[5]), stream, 0, 0, &ignored) != BEER_S_OK)
         return 0;
-    char path[] = "/tmp/beer-mf-decode-XXXXXX";
+    char path[512];
+    snprintf(path, sizeof(path), "%s/beer-mf-decode-XXXXXX", beer_tmp_dir());
     int fd = mkstemp(path);
     if (fd < 0) return 0;
     uint8_t block[64 * 1024];
@@ -1330,8 +1331,7 @@ static int mf_dump_stream(BeerMfShell *byte_stream, char **path_out)
     int ok = 1;
     for (;;) {
         uint32_t read = 0;
-        uint64_t result = ((BeerStreamReadFn)vtable[3])(
-            stream, block, sizeof(block), &read);
+        uint64_t result = BEER_GUEST_CALL(((BeerStreamReadFn)vtable[3]), stream, block, sizeof(block), &read);
         /* COM IStream::Read commonly returns S_FALSE at a clean short/zero-byte
          * EOF. Bytes already returned are valid; only a failing call that also
          * produced no data terminates extraction. */
@@ -1348,7 +1348,7 @@ static int mf_dump_stream(BeerMfShell *byte_stream, char **path_out)
         if (!ok || (total += read) > UINT64_C(512) * 1024 * 1024) { ok = 0; break; }
     }
     close(fd);
-    ((BeerStreamSeekFn)vtable[5])(stream, (int64_t)original, 0, &ignored);
+    BEER_GUEST_CALL(((BeerStreamSeekFn)vtable[5]), stream, (int64_t)original, 0, &ignored);
     if (!ok || !total) {
         if (getenv("BEER_MF_DIAGNOSTICS"))
             fprintf(stderr, "[MF DECODE] stream extraction failed ok=%d bytes=%llu\n",
@@ -1438,6 +1438,16 @@ static void mf_probe_decoder_metadata(BeerMfSourceReader *self)
     pclose(probe);
 }
 
+/* On a phone the two software decoders must not take the whole CPU from the game: two threads each, low priority. */
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#define MF_DECODER_THREAD_ARGS "-threads", "2",
+#define MF_DECODER_NICE() setpriority(PRIO_PROCESS, 0, 10)
+#else
+#define MF_DECODER_THREAD_ARGS
+#define MF_DECODER_NICE() ((void)0)
+#endif
+
 static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
 {
     if (!self->decoder_input_path) return 0;
@@ -1460,7 +1470,8 @@ static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
         if (null_fd >= 0) dup2(null_fd, STDERR_FILENO);
         close(video_pipe[0]); close(video_pipe[1]);
         close(audio_pipe[0]); close(audio_pipe[1]);
-        execlp("ffmpeg", "ffmpeg", "-nostdin", "-v", "error", "-i",
+        MF_DECODER_NICE();
+        execlp("ffmpeg", "ffmpeg", "-nostdin", "-v", "error", MF_DECODER_THREAD_ARGS "-i",
                self->decoder_input_path, "-map", "0:v:0", "-an", "-sn",
                "-vsync", "0", "-pix_fmt", "nv12", "-f", "rawvideo",
                "pipe:1", (char *)NULL);
@@ -1479,7 +1490,8 @@ static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
         if (null_fd >= 0) dup2(null_fd, STDERR_FILENO);
         close(video_pipe[0]); close(video_pipe[1]);
         close(audio_pipe[0]); close(audio_pipe[1]);
-        execlp("ffmpeg", "ffmpeg", "-nostdin", "-v", "error", "-i",
+        MF_DECODER_NICE();
+        execlp("ffmpeg", "ffmpeg", "-nostdin", "-v", "error", MF_DECODER_THREAD_ARGS "-i",
                self->decoder_input_path, "-map", "0:a:0", "-vn", "-sn",
                "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1",
                (char *)NULL);
@@ -2116,8 +2128,7 @@ beer_mf_create_source_reader_from_byte_stream(void *byte_stream,
             void *, const void *, const void *, void **);
         void **attr_vtable = *(void ***)attributes;
         if (attr_vtable && attr_vtable[17]) {
-            uint64_t hr = ((GetUnknownFn)attr_vtable[17])(
-                attributes, &g_mf_source_reader_async_callback, NULL, &cb);
+            uint64_t hr = BEER_GUEST_CALL(((GetUnknownFn)attr_vtable[17]), attributes, &g_mf_source_reader_async_callback, NULL, &cb);
             if (hr == BEER_S_OK && cb) {
                 shell->async_callback = cb; /* already AddRef'd by GetUnknown */
                 fprintf(stderr,

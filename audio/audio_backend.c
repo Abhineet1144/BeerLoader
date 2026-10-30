@@ -67,9 +67,12 @@ static struct {
     atomic_uint_fast64_t bytes_played;
     atomic_uint_fast64_t write_started_ms;   /* 0 while no pa_simple_write is in flight */
     pthread_t watchdog;
+    int have_watchdog;
     int initialized;
     int running;
     int failed;
+    int null_sink;                 /* no sound server: accept PCM and discard it at real-time pace */
+    uint64_t bytes_per_second;
 } g_audio;
 
 static void audio_finish_packet(AudioPacket *packet)
@@ -156,7 +159,13 @@ static void *audio_thread_main(void *unused)
         for (size_t done = 0; write_ok && done < packet->size; ) {
             size_t n = packet->size - done < piece ? packet->size - done : piece;
             const uint64_t t_before = audio_now_ms();
-            if (g_audio.simple_write(g_audio.stream, (const uint8_t *)packet->data + done, n, &error) != 0) write_ok = 0;
+            if (g_audio.null_sink) {
+                /* A real device consumes PCM at its sample rate; pace the producer the same way so the game's audio
+                 * threads see normal timing (and callbacks complete) instead of an instant, endless drain. */
+                usleep((useconds_t)((uint64_t)n * 1000000u / (g_audio.bytes_per_second ? g_audio.bytes_per_second : 1)));
+            } else if (g_audio.simple_write(g_audio.stream, (const uint8_t *)packet->data + done, n, &error) != 0) {
+                write_ok = 0;
+            }
             if (getenv("BEER_AUDIO_DIAGNOSTICS") && audio_now_ms() - t_before > 100)
                 fprintf(stderr, "[AUDIO] slow write: %zu bytes took %llu ms (queued %zu)\n", n, (unsigned long long)(audio_now_ms() - t_before), g_audio.queued_bytes);
             done += n;
@@ -180,12 +189,28 @@ int beer_audio_init(unsigned rate, unsigned channels)
     if (g_audio.initialized)
         return !g_audio.failed;
     memset(&g_audio, 0, sizeof(g_audio));
-    g_audio.library = dlopen("libpulse-simple.so.0", RTLD_NOW | RTLD_LOCAL);
+    const char *force_null = getenv("BEER_AUDIO_NULL");
+    if (!(force_null && *force_null && strcmp(force_null, "0")))
+        g_audio.library = dlopen("libpulse-simple.so.0", RTLD_NOW | RTLD_LOCAL);
     if (!g_audio.library) {
-        fprintf(stderr, "[AUDIO] libpulse-simple.so.0 unavailable: %s\n", dlerror());
-        g_audio.failed = 1;
+        /* No sound server (Android has no PulseAudio): keep the game's audio path working with a silent sink. */
+        fprintf(stderr, "[AUDIO] no Pulse/PipeWire library (%s): using a silent timed sink\n",
+                force_null && *force_null ? "BEER_AUDIO_NULL" : dlerror());
+        g_audio.null_sink = 1;
+        g_audio.bytes_per_second = (uint64_t)rate * channels * sizeof(int16_t);
+        pthread_mutex_init(&g_audio.mutex, NULL);
+        pthread_cond_init(&g_audio.condition, NULL);
+        g_audio.running = 1;
+        g_audio.max_queued_bytes = (size_t)(g_audio.bytes_per_second * 2u / 5u);
+        g_audio.piece_bytes = (size_t)(g_audio.bytes_per_second / 50u);
+        g_audio.piece_bytes -= g_audio.piece_bytes % (channels * sizeof(int16_t));
         g_audio.initialized = 1;
-        return 0;
+        if (pthread_create(&g_audio.thread, NULL, audio_thread_main, NULL) != 0) {
+            g_audio.running = 0;
+            g_audio.failed = 1;
+            return 0;
+        }
+        return 1;
     }
 #define LOAD(field, symbol) do { *(void **)(&g_audio.field) = dlsym(g_audio.library, symbol); \
     if (!g_audio.field) goto load_failed; } while (0)
@@ -225,7 +250,8 @@ int beer_audio_init(unsigned rate, unsigned channels)
         g_audio.running = 0;
         goto load_failed;
     }
-    pthread_create(&g_audio.watchdog, NULL, audio_watchdog_main, NULL);
+    g_audio.have_watchdog = pthread_create(&g_audio.watchdog, NULL, audio_watchdog_main, NULL) == 0;
+    g_audio.bytes_per_second = bytes_per_second;
     fprintf(stderr, "[AUDIO] PipeWire/Pulse output initialized: %u Hz, %u channels, S16LE\n",
             rate, channels);
     return 1;
@@ -289,7 +315,7 @@ int beer_audio_submit_nowait(const void *pcm, size_t bytes)
 
 void beer_audio_reset(void)
 {
-    if (!g_audio.initialized || !g_audio.stream) return;
+    if (!g_audio.initialized || (!g_audio.stream && !g_audio.null_sink)) return;
     pthread_mutex_lock(&g_audio.mutex);
     AudioPacket *packet = g_audio.head;
     g_audio.head = g_audio.tail = NULL;
@@ -302,7 +328,7 @@ void beer_audio_reset(void)
         packet = next;
     }
     int error = 0;
-    g_audio.simple_flush(g_audio.stream, &error);
+    if (g_audio.simple_flush) g_audio.simple_flush(g_audio.stream, &error);
 }
 
 void beer_audio_shutdown(void)
@@ -314,7 +340,7 @@ void beer_audio_shutdown(void)
         pthread_cond_broadcast(&g_audio.condition);
         pthread_mutex_unlock(&g_audio.mutex);
         pthread_join(g_audio.thread, NULL);
-        pthread_join(g_audio.watchdog, NULL);
+        if (g_audio.have_watchdog) pthread_join(g_audio.watchdog, NULL);
     }
     if (g_audio.stream) {
         int error = 0;

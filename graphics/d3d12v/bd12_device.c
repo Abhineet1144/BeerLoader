@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "bd12.h"
+#include "beer_arch.h"
 
 #include <pthread.h>
 #include <time.h>
@@ -798,15 +799,20 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
 }
 
 
-#define _GNU_SOURCE_PROF
+uint64_t g_bd12_render_tid;
+
 #include <dlfcn.h>
 #include <malloc.h>
-#include <execinfo.h>
 #include <signal.h>
 #include <sys/time.h>
-#include <ucontext.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+/* BEER_BD12_SAMPLE needs glibc backtrace() and x86 register context. */
+#if BEER_HAVE_GLIBC_DIAG
+#define _GNU_SOURCE_PROF
+#include <execinfo.h>
+#include <ucontext.h>
 
 /* BEER_BD12_SAMPLE=1: SIGPROF instruction-pointer histogram, printed with the
  * profile window. Diagnostic only. */
@@ -815,8 +821,6 @@ static struct { uint64_t rip; uint64_t tid; uint64_t count; } g_samples[SAMPLE_S
 
 #define STACK_SLOTS 512
 static struct { void *frames[14]; uint64_t count; } g_stacks[STACK_SLOTS];
-uint64_t g_bd12_render_tid;
-uint64_t g_bd12_render_tid;
 
 static void sample_handler(int sig, siginfo_t *info, void *ctx)
 {
@@ -900,6 +904,10 @@ static void sample_report(void)
     }
     memset(g_samples, 0, sizeof(g_samples));
 }
+#else
+static void sample_start(void) {}
+static void sample_report(void) {}
+#endif
 
 uint64_t g_bd12_drops[BD12_DROP_COUNT];
 static void bd12_report_drops(void)

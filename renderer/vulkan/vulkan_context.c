@@ -188,7 +188,14 @@ int beer_vulkan_context_initialize(void)
     }
 
     const char *stage = "Vulkan loader";
-    g_context.library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    {   /* BEER_VULKAN_LIBRARY=/system/lib64/libvulkan.so picks a specific loader (e.g. Android's own, not Termux's Mesa). */
+        const char *override = getenv("BEER_VULKAN_LIBRARY");
+        if (override && *override) g_context.library = dlopen(override, RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!g_context.library)
+        g_context.library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!g_context.library)   /* Android ships it unversioned */
+        g_context.library = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
     if (!g_context.library) goto fail;
     g_context.GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)
         dlsym(g_context.library, "vkGetInstanceProcAddr");
@@ -197,11 +204,42 @@ int beer_vulkan_context_initialize(void)
     if (!g_context.GetInstanceProcAddr || !create_instance) goto fail;
 
     stage = "shared instance";
-    const char *instance_extensions[] = {
+    /* Enable only the instance extensions this Vulkan stack has: Android, for one, has no VK_KHR_xlib_surface (its
+     * presenter uses VK_KHR_android_surface). If the extension list cannot be queried, request all of them as before. */
+    static const char *const wanted_extensions[] = {
         "VK_KHR_surface",
         "VK_KHR_xlib_surface",
+#ifdef __ANDROID__
+        "VK_KHR_android_surface",
+#endif
         "VK_KHR_get_physical_device_properties2"
     };
+    const char *instance_extensions[4];
+    uint32_t instance_extension_count = 0;
+    {
+        PFN_vkEnumerateInstanceExtensionProperties enumerate_extensions =
+            (PFN_vkEnumerateInstanceExtensionProperties)g_context.GetInstanceProcAddr(
+                NULL, "vkEnumerateInstanceExtensionProperties");
+        uint32_t available_count = 0;
+        VkExtensionProperties *available = NULL;
+        if (enumerate_extensions && enumerate_extensions(NULL, &available_count, NULL) == VK_SUCCESS &&
+            available_count) {
+            available = calloc(available_count, sizeof(*available));
+            if (available && enumerate_extensions(NULL, &available_count, available) != VK_SUCCESS) {
+                free(available);
+                available = NULL;
+            }
+        }
+        for (size_t i = 0; i < sizeof(wanted_extensions) / sizeof(wanted_extensions[0]); ++i) {
+            int present = available == NULL;
+            for (uint32_t k = 0; available && k < available_count; ++k)
+                if (!strcmp(available[k].extensionName, wanted_extensions[i])) { present = 1; break; }
+            if (present) instance_extensions[instance_extension_count++] = wanted_extensions[i];
+            else fprintf(stderr, "[VULKAN] instance extension %s is not available; continuing without it\n",
+                         wanted_extensions[i]);
+        }
+        free(available);
+    }
     /* Request Vulkan 1.3 when the loader reports it so the physical device
      * can expose core 1.2/1.3 features; older stacks stay on 1.0. */
     uint32_t instance_version = VK_API_VERSION_1_0;
@@ -222,7 +260,7 @@ int beer_vulkan_context_initialize(void)
     VkInstanceCreateInfo instance_info = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &application,
-        .enabledExtensionCount = 3,
+        .enabledExtensionCount = instance_extension_count,
         .ppEnabledExtensionNames = instance_extensions
     };
     if (create_instance(&instance_info, NULL, &g_context.instance) != VK_SUCCESS)

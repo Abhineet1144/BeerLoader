@@ -1169,3 +1169,216 @@ int vulkan_presenter_wait_source(void)
     return g_vk.WaitForFences(g_vk.device, 1, &g_vk.submit_fence, VK_TRUE,
                               5000000000ull) == VK_SUCCESS;
 }
+
+/* ---- CPU readback of a GPU image ---------------------------------------------------------------
+ * For presenters without a Vulkan surface (--presenter=x11, and Android until the ANativeWindow
+ * presenter exists): copy the back buffer into a host-visible buffer and hand it to the caller as
+ * tightly packed RGBA8. Uses only the shared context's device and queue, so it works without a
+ * swapchain. The image is returned to source_layout. */
+typedef struct {
+    int tried, ready;
+    VkDevice device;
+    VkQueue queue;
+    VkCommandPool pool;
+    VkCommandBuffer cb;
+    VkFence fence;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    VkDeviceSize size;
+    uint8_t *map;
+    int coherent;
+    uint8_t *out;
+    size_t out_size;
+    PFN_vkAllocateMemory AllocateMemory;
+    PFN_vkFreeMemory FreeMemory;
+    PFN_vkMapMemory MapMemory;
+    PFN_vkInvalidateMappedMemoryRanges InvalidateMappedMemoryRanges;
+    PFN_vkCreateBuffer CreateBuffer;
+    PFN_vkDestroyBuffer DestroyBuffer;
+    PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements;
+    PFN_vkBindBufferMemory BindBufferMemory;
+    PFN_vkResetCommandBuffer ResetCommandBuffer;
+    PFN_vkBeginCommandBuffer BeginCommandBuffer;
+    PFN_vkEndCommandBuffer EndCommandBuffer;
+    PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
+    PFN_vkQueueSubmit QueueSubmit;
+    PFN_vkWaitForFences WaitForFences;
+    PFN_vkResetFences ResetFences;
+    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
+} VulkanReadback;
+
+static VulkanReadback g_rb;
+
+#define RB_LOAD(name) do { \
+    g_rb.name = (PFN_vk##name)get_device(g_rb.device, "vk" #name); \
+    if (!g_rb.name) return 0; \
+} while (0)
+
+static int readback_init(void)
+{
+    if (g_rb.ready) return 1;
+    if (g_rb.tried) return 0;
+    g_rb.tried = 1;
+    if (!beer_vulkan_context_initialize()) return 0;
+    g_rb.device = beer_vulkan_device();
+    g_rb.queue = beer_vulkan_queue();
+    PFN_vkGetDeviceProcAddr get_device = beer_vulkan_get_device_proc_addr();
+    PFN_vkGetInstanceProcAddr get_instance = beer_vulkan_get_instance_proc_addr();
+    if (!g_rb.device || !g_rb.queue || !get_device || !get_instance) return 0;
+    RB_LOAD(AllocateMemory); RB_LOAD(FreeMemory); RB_LOAD(MapMemory);
+    RB_LOAD(InvalidateMappedMemoryRanges); RB_LOAD(CreateBuffer); RB_LOAD(DestroyBuffer);
+    RB_LOAD(GetBufferMemoryRequirements); RB_LOAD(BindBufferMemory); RB_LOAD(ResetCommandBuffer);
+    RB_LOAD(BeginCommandBuffer); RB_LOAD(EndCommandBuffer); RB_LOAD(CmdPipelineBarrier);
+    RB_LOAD(CmdCopyImageToBuffer); RB_LOAD(QueueSubmit); RB_LOAD(WaitForFences); RB_LOAD(ResetFences);
+    g_rb.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)
+        get_instance(beer_vulkan_instance(), "vkGetPhysicalDeviceMemoryProperties");
+    PFN_vkCreateCommandPool create_pool = (PFN_vkCreateCommandPool)get_device(g_rb.device, "vkCreateCommandPool");
+    PFN_vkAllocateCommandBuffers alloc_cb = (PFN_vkAllocateCommandBuffers)get_device(g_rb.device, "vkAllocateCommandBuffers");
+    PFN_vkCreateFence create_fence = (PFN_vkCreateFence)get_device(g_rb.device, "vkCreateFence");
+    if (!g_rb.GetPhysicalDeviceMemoryProperties || !create_pool || !alloc_cb || !create_fence) return 0;
+    VkCommandPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = beer_vulkan_queue_family()
+    };
+    if (create_pool(g_rb.device, &pool_info, NULL, &g_rb.pool) != VK_SUCCESS) return 0;
+    VkCommandBufferAllocateInfo cb_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = g_rb.pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1
+    };
+    if (alloc_cb(g_rb.device, &cb_info, &g_rb.cb) != VK_SUCCESS) return 0;
+    VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (create_fence(g_rb.device, &fence_info, NULL, &g_rb.fence) != VK_SUCCESS) return 0;
+    g_rb.ready = 1;
+    return 1;
+}
+
+static int readback_buffer(VkDeviceSize size)
+{
+    if (g_rb.buffer && g_rb.size >= size) return 1;
+    if (g_rb.buffer) {
+        g_rb.DestroyBuffer(g_rb.device, g_rb.buffer, NULL);
+        g_rb.FreeMemory(g_rb.device, g_rb.memory, NULL);
+        g_rb.buffer = VK_NULL_HANDLE;
+        g_rb.memory = VK_NULL_HANDLE;
+    }
+    VkBufferCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (g_rb.CreateBuffer(g_rb.device, &info, NULL, &g_rb.buffer) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    g_rb.GetBufferMemoryRequirements(g_rb.device, g_rb.buffer, &req);
+    VkPhysicalDeviceMemoryProperties mem;
+    g_rb.GetPhysicalDeviceMemoryProperties(beer_vulkan_physical_device(), &mem);
+    /* Prefer cached memory (CPU reads are slow on uncached); fall back to coherent. */
+    static const VkMemoryPropertyFlags want[] = {
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    };
+    uint32_t type = UINT32_MAX;
+    for (size_t w = 0; w < sizeof(want) / sizeof(want[0]) && type == UINT32_MAX; ++w)
+        for (uint32_t i = 0; i < mem.memoryTypeCount; ++i)
+            if ((req.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & want[w]) == want[w]) {
+                type = i;
+                g_rb.coherent = (want[w] & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+                break;
+            }
+    if (type == UINT32_MAX) return 0;
+    VkMemoryAllocateInfo alloc = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type
+    };
+    if (g_rb.AllocateMemory(g_rb.device, &alloc, NULL, &g_rb.memory) != VK_SUCCESS) return 0;
+    if (g_rb.BindBufferMemory(g_rb.device, g_rb.buffer, g_rb.memory, 0) != VK_SUCCESS) return 0;
+    void *mapped = NULL;
+    if (g_rb.MapMemory(g_rb.device, g_rb.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) return 0;
+    g_rb.map = mapped;
+    g_rb.size = size;
+    return 1;
+}
+
+int vulkan_readback_image_rgba8(uint64_t source_image, uint32_t source_layout, int width, int height,
+                                int bgra, const uint8_t **pixels, int *row_pitch)
+{
+    VkImage source = (VkImage)(uintptr_t)source_image;
+    if (!source || width <= 0 || height <= 0 || beer_vulkan_device_lost()) return 0;
+    if (!readback_init()) return 0;
+    const VkDeviceSize size = (VkDeviceSize)width * (VkDeviceSize)height * 4u;
+    if (!readback_buffer(size)) return 0;
+    if (g_rb.out_size < size) {
+        uint8_t *grown = realloc(g_rb.out, size);
+        if (!grown) return 0;
+        g_rb.out = grown;
+        g_rb.out_size = size;
+    }
+    g_rb.ResetCommandBuffer(g_rb.cb, 0);
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    if (g_rb.BeginCommandBuffer(g_rb.cb, &begin) != VK_SUCCESS) return 0;
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = (VkImageLayout)source_layout, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = source, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+    };
+    g_rb.CmdPipelineBarrier(g_rb.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                            0, NULL, 0, NULL, 1, &barrier);
+    VkBufferImageCopy region = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { (uint32_t)width, (uint32_t)height, 1 }
+    };
+    g_rb.CmdCopyImageToBuffer(g_rb.cb, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_rb.buffer, 1, &region);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = (VkImageLayout)source_layout;
+    VkMemoryBarrier to_host = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT
+    };
+    g_rb.CmdPipelineBarrier(g_rb.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                            0, NULL, 0, NULL, 1, &barrier);
+    g_rb.CmdPipelineBarrier(g_rb.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                            1, &to_host, 0, NULL, 0, NULL);
+    if (g_rb.EndCommandBuffer(g_rb.cb) != VK_SUCCESS) return 0;
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_rb.cb
+    };
+    g_rb.ResetFences(g_rb.device, 1, &g_rb.fence);
+    beer_vulkan_queue_lock();
+    VkResult result = g_rb.QueueSubmit(g_rb.queue, 1, &submit, g_rb.fence);
+    beer_vulkan_queue_unlock();
+    if (result != VK_SUCCESS) {
+        beer_vulkan_record_result(result, "readback submit");
+        return 0;
+    }
+    result = g_rb.WaitForFences(g_rb.device, 1, &g_rb.fence, VK_TRUE, 5000000000ull);
+    if (result != VK_SUCCESS) {
+        beer_vulkan_record_result(result, "readback wait");
+        return 0;
+    }
+    if (!g_rb.coherent) {
+        VkMappedMemoryRange range = {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = g_rb.memory, .size = VK_WHOLE_SIZE
+        };
+        g_rb.InvalidateMappedMemoryRanges(g_rb.device, 1, &range);
+    }
+    const uint32_t *in = (const uint32_t *)g_rb.map;
+    uint32_t *out = (uint32_t *)g_rb.out;
+    const size_t count = (size_t)width * (size_t)height;
+    if (bgra) {
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t p = in[i];
+            out[i] = (p & 0xff00ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16);
+        }
+    } else {
+        memcpy(out, in, count * 4u);
+    }
+    *pixels = g_rb.out;
+    *row_pitch = width * 4;
+    return 1;
+}

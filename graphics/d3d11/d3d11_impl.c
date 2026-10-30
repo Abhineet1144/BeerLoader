@@ -1,3 +1,4 @@
+#include "guest_cpu.h"
 #include "d3d11_compat.h"
 #include "../../platform/xwayland_backend.h"
 #include <stdlib.h>
@@ -105,13 +106,13 @@ static ComObjectHeader* com_get_header(void* obj) {
     return hdr;
 }
 
-static uint32_t __attribute__((ms_abi)) com_addref(void* obj) {
+static uint32_t D3D11_MS_ABI com_addref(void* obj) {
     ComObjectHeader* hdr = com_get_header(obj);
     if (!hdr) return 0;
     return atomic_fetch_add(&hdr->refcount, 1) + 1;
 }
 
-static uint32_t __attribute__((ms_abi)) com_release(void* obj) {
+static uint32_t D3D11_MS_ABI com_release(void* obj) {
     ComObjectHeader* hdr = com_get_header(obj);
     if (!hdr) return 0;
     uint32_t old_count = atomic_fetch_sub(&hdr->refcount, 1);
@@ -142,17 +143,17 @@ static void *g_dxgi_adapter;
 static BeerDxgiDevice *g_dxgi_device;
 static void *g_dxgi_device_vtable[12];
 
-static HRESULT __attribute__((ms_abi)) dxgi_device_query_interface(
+static HRESULT D3D11_MS_ABI dxgi_device_query_interface(
     BeerDxgiDevice *this, REFIID riid, LPVOID *ppvObj);
-static uint32_t __attribute__((ms_abi)) device_addref(ID3D11Device *this);
-static uint32_t __attribute__((ms_abi)) device_release(ID3D11Device *this);
+static uint32_t D3D11_MS_ABI device_addref(ID3D11Device *this);
+static uint32_t D3D11_MS_ABI device_release(ID3D11Device *this);
 
-static uint32_t __attribute__((ms_abi)) dxgi_device_addref(BeerDxgiDevice *this)
+static uint32_t D3D11_MS_ABI dxgi_device_addref(BeerDxgiDevice *this)
 {
     return com_addref(this);
 }
 
-static uint32_t __attribute__((ms_abi)) dxgi_device_release(BeerDxgiDevice *this)
+static uint32_t D3D11_MS_ABI dxgi_device_release(BeerDxgiDevice *this)
 {
     return com_release(this);
 }
@@ -162,11 +163,11 @@ static void addref_external_com_object(void *object)
     if (!object) return;
     void **vtable = *(void ***)object;
     if (!vtable || !vtable[1]) return;
-    typedef uint32_t (__attribute__((ms_abi)) *AddRefFn)(void *);
-    ((AddRefFn)vtable[1])(object);
+    typedef uint32_t (D3D11_MS_ABI *AddRefFn)(void *);
+    BEER_GUEST_CALL(((AddRefFn)vtable[1]), object);
 }
 
-static HRESULT __attribute__((ms_abi)) dxgi_device_get_parent(
+static HRESULT D3D11_MS_ABI dxgi_device_get_parent(
     BeerDxgiDevice *this, REFIID riid, void **ppParent)
 {
     static const uint8_t iid_idxgiadapter[16] = {
@@ -182,7 +183,7 @@ static HRESULT __attribute__((ms_abi)) dxgi_device_get_parent(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) dxgi_device_get_adapter(
+static HRESULT D3D11_MS_ABI dxgi_device_get_adapter(
     BeerDxgiDevice *this, void **ppAdapter)
 {
     if (!ppAdapter) return (HRESULT)0x80070057; /* E_INVALIDARG */
@@ -193,7 +194,7 @@ static HRESULT __attribute__((ms_abi)) dxgi_device_get_adapter(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) dxgi_device_unsupported(
+static HRESULT D3D11_MS_ABI dxgi_device_unsupported(
     BeerDxgiDevice *this, void *a, void *b, void *c)
 {
     (void)this; (void)a; (void)b; (void)c;
@@ -219,7 +220,7 @@ static BeerDxgiDevice *get_dxgi_device(ID3D11Device *device)
     return g_dxgi_device;
 }
 
-static HRESULT __attribute__((ms_abi)) device_query_interface(ID3D11Device* this, REFIID riid, LPVOID* ppvObj) {
+static HRESULT D3D11_MS_ABI device_query_interface(ID3D11Device* this, REFIID riid, LPVOID* ppvObj) {
     /* A D3D11 device exposes ID3D11Device and its documented IDXGIDevice
      * parent. Resource interfaces remain unsupported. */
     static const uint8_t iid_iunknown[16] = {
@@ -251,7 +252,7 @@ static HRESULT __attribute__((ms_abi)) device_query_interface(ID3D11Device* this
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) dxgi_device_query_interface(
+static HRESULT D3D11_MS_ABI dxgi_device_query_interface(
     BeerDxgiDevice *this, REFIID riid, LPVOID *ppvObj)
 {
     static const uint8_t iid_iunknown[16] = {
@@ -280,15 +281,15 @@ void d3d11_device_set_dxgi_adapter(void *adapter)
     if (g_dxgi_device) g_dxgi_device->adapter = adapter;
 }
 
-static uint32_t __attribute__((ms_abi)) device_addref(ID3D11Device* this) {
+static uint32_t D3D11_MS_ABI device_addref(ID3D11Device* this) {
     return com_addref(this);
 }
 
-static uint32_t __attribute__((ms_abi)) device_release(ID3D11Device* this) {
+static uint32_t D3D11_MS_ABI device_release(ID3D11Device* this) {
     return com_release(this);
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_swapchain(ID3D11Device* this, void* pFactory, void* pDesc, void** ppSwapChain) {
+static HRESULT D3D11_MS_ABI device_create_swapchain(ID3D11Device* this, void* pFactory, void* pDesc, void** ppSwapChain) {
     if (!ppSwapChain) return E_NOINTERFACE;
     *ppSwapChain = dxgi_swapchain_create();
     return S_OK;
@@ -323,7 +324,7 @@ static const uint8_t *view_interface_iid(BeerD3D11ViewKind kind)
     return iids[kind];
 }
 
-static HRESULT __attribute__((ms_abi)) view_query_interface(
+static HRESULT D3D11_MS_ABI view_query_interface(
     BeerD3D11View *this, REFIID riid, LPVOID *out)
 {
     static const uint8_t iid_iunknown[16] = {
@@ -344,7 +345,7 @@ static HRESULT __attribute__((ms_abi)) view_query_interface(
     return S_OK;
 }
 
-static void __attribute__((ms_abi)) view_get_device(
+static void D3D11_MS_ABI view_get_device(
     BeerD3D11View *this, ID3D11Device **device)
 {
     if (!device) return;
@@ -352,14 +353,14 @@ static void __attribute__((ms_abi)) view_get_device(
     if (this->device) device_addref(this->device);
 }
 
-static HRESULT __attribute__((ms_abi)) view_private_data_unsupported(
+static HRESULT D3D11_MS_ABI view_private_data_unsupported(
     BeerD3D11View *this, void *a, void *b, void *c)
 {
     (void)this; (void)a; (void)b; (void)c;
     return (HRESULT)0x80004001;
 }
 
-static void __attribute__((ms_abi)) view_get_resource(
+static void D3D11_MS_ABI view_get_resource(
     BeerD3D11View *this, void **resource)
 {
     if (!resource) return;
@@ -367,12 +368,12 @@ static void __attribute__((ms_abi)) view_get_resource(
     addref_external_com_object(this->resource);
 }
 
-static void __attribute__((ms_abi)) view_get_desc(BeerD3D11View *this, void *desc)
+static void D3D11_MS_ABI view_get_desc(BeerD3D11View *this, void *desc)
 {
     if (desc) memcpy(desc, this->desc, this->desc_size);
 }
 
-static uint32_t __attribute__((ms_abi)) view_release(BeerD3D11View *this)
+static uint32_t D3D11_MS_ABI view_release(BeerD3D11View *this)
 {
     ComObjectHeader *header = com_get_header(this);
     if (!header) return 0;
@@ -381,8 +382,8 @@ static uint32_t __attribute__((ms_abi)) view_release(BeerD3D11View *this)
         if (this->resource) {
             void **vtable = *(void ***)this->resource;
             if (vtable && vtable[2]) {
-                typedef uint32_t (__attribute__((ms_abi)) *ReleaseFn)(void *);
-                ((ReleaseFn)vtable[2])(this->resource);
+                typedef uint32_t (D3D11_MS_ABI *ReleaseFn)(void *);
+                BEER_GUEST_CALL(((ReleaseFn)vtable[2]), this->resource);
             }
         }
         free(header);
@@ -438,7 +439,7 @@ static BeerD3D11View *view_create(ID3D11Device *device, void *resource,
     return view;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_rendertarget_view(
+static HRESULT D3D11_MS_ABI device_create_rendertarget_view(
     ID3D11Device *this, void *resource, void *desc, void **out)
 {
     if (!out || !resource) return (HRESULT)0x80070057;
@@ -446,7 +447,7 @@ static HRESULT __attribute__((ms_abi)) device_create_rendertarget_view(
     return *out ? S_OK : (HRESULT)0x8007000e;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_depthstencil_view(
+static HRESULT D3D11_MS_ABI device_create_depthstencil_view(
     ID3D11Device *this, void *resource, void *desc, void **out)
 {
     if (!out || !resource) return (HRESULT)0x80070057;
@@ -579,7 +580,7 @@ static void initialize_default_view_desc(BeerD3D11View *view)
     }
 }
 
-static HRESULT __attribute__((ms_abi)) resource_query_interface(
+static HRESULT D3D11_MS_ABI resource_query_interface(
     BeerD3D11Resource *this, REFIID riid, LPVOID *ppvObj)
 {
     static const uint8_t iid_iunknown[16] = {
@@ -614,7 +615,7 @@ static HRESULT __attribute__((ms_abi)) resource_query_interface(
     return S_OK;
 }
 
-static uint32_t __attribute__((ms_abi)) resource_release(BeerD3D11Resource *this)
+static uint32_t D3D11_MS_ABI resource_release(BeerD3D11Resource *this)
 {
     ComObjectHeader *header = com_get_header(this);
     if (!header) return 0;
@@ -635,7 +636,7 @@ static uint32_t __attribute__((ms_abi)) resource_release(BeerD3D11Resource *this
     return old_count - 1;
 }
 
-static void __attribute__((ms_abi)) resource_get_device(
+static void D3D11_MS_ABI resource_get_device(
     BeerD3D11Resource *this, ID3D11Device **device)
 {
     if (!device) return;
@@ -643,34 +644,34 @@ static void __attribute__((ms_abi)) resource_get_device(
     if (this->device) device_addref(this->device);
 }
 
-static HRESULT __attribute__((ms_abi)) resource_private_data_unsupported(
+static HRESULT D3D11_MS_ABI resource_private_data_unsupported(
     BeerD3D11Resource *this, void *a, void *b, void *c)
 {
     (void)this; (void)a; (void)b; (void)c;
     return (HRESULT)0x80004001;
 }
 
-static void __attribute__((ms_abi)) resource_get_type(
+static void D3D11_MS_ABI resource_get_type(
     BeerD3D11Resource *this, uint32_t *dimension)
 {
     if (dimension) *dimension = this->dimension;
 }
 
-static HRESULT __attribute__((ms_abi)) resource_set_eviction_priority(
+static HRESULT D3D11_MS_ABI resource_set_eviction_priority(
     BeerD3D11Resource *this, uint32_t priority)
 {
     (void)this; (void)priority;
     return S_OK;
 }
 
-static uint32_t __attribute__((ms_abi)) resource_get_eviction_priority(
+static uint32_t D3D11_MS_ABI resource_get_eviction_priority(
     BeerD3D11Resource *this)
 {
     (void)this;
     return 0;
 }
 
-static void __attribute__((ms_abi)) resource_get_desc(
+static void D3D11_MS_ABI resource_get_desc(
     BeerD3D11Resource *this, void *desc)
 {
     if (desc) memcpy(desc, this->desc, this->desc_size);
@@ -926,7 +927,7 @@ static void initialize_resource_data(BeerD3D11Resource *resource,
     }
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_texture2d(ID3D11Device* this, void* pDesc, void* pInitData, void** ppTexture2D) {
+static HRESULT D3D11_MS_ABI device_create_texture2d(ID3D11Device* this, void* pDesc, void* pInitData, void** ppTexture2D) {
     if (!ppTexture2D || !pDesc) return (HRESULT)0x80070057;
     BeerD3D11Resource *resource = resource_create(this, 3, pDesc, 44);
     if (!resource) {
@@ -948,7 +949,7 @@ static HRESULT __attribute__((ms_abi)) device_create_texture2d(ID3D11Device* thi
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_texture3d(
+static HRESULT D3D11_MS_ABI device_create_texture3d(
     ID3D11Device *this, void *pDesc, void *pInitData, void **ppTexture3D)
 {
     if (!ppTexture3D || !pDesc) return (HRESULT)0x80070057;
@@ -962,7 +963,7 @@ static HRESULT __attribute__((ms_abi)) device_create_texture3d(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_buffer(ID3D11Device* this, void* pDesc, void* pInitData, void** ppBuffer) {
+static HRESULT D3D11_MS_ABI device_create_buffer(ID3D11Device* this, void* pDesc, void* pInitData, void** ppBuffer) {
     if (!ppBuffer || !pDesc) return (HRESULT)0x80070057;
     BeerD3D11Resource *resource = resource_create(this, 1, pDesc, 24);
     if (!resource) {
@@ -1024,7 +1025,7 @@ typedef struct {
 
 static void *g_child_vtable[7];
 
-static HRESULT __attribute__((ms_abi)) child_query_interface(
+static HRESULT D3D11_MS_ABI child_query_interface(
     void *object, REFIID riid, LPVOID *out)
 {
     static const uint8_t iid_iunknown[16] = {
@@ -1039,7 +1040,7 @@ static HRESULT __attribute__((ms_abi)) child_query_interface(
     return S_OK;
 }
 
-static void __attribute__((ms_abi)) child_get_device(
+static void D3D11_MS_ABI child_get_device(
     BeerD3D11Shader *object, ID3D11Device **device)
 {
     if (!device) return;
@@ -1084,7 +1085,7 @@ static HRESULT create_shader(ID3D11Device *device, const void *bytecode,
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_input_layout(ID3D11Device* this, void* pInputElementDescs, uint32_t NumElements, void* pShaderBytecode, size_t BytecodeLength, void** ppInputLayout) {
+static HRESULT D3D11_MS_ABI device_create_input_layout(ID3D11Device* this, void* pInputElementDescs, uint32_t NumElements, void* pShaderBytecode, size_t BytecodeLength, void** ppInputLayout) {
     if (!ppInputLayout) return (HRESULT)0x80070057;
     *ppInputLayout = NULL;
     if ((!pInputElementDescs && NumElements) || NumElements > BEER_MAX_INPUT_ELEMENTS ||
@@ -1123,32 +1124,32 @@ static HRESULT __attribute__((ms_abi)) device_create_input_layout(ID3D11Device* 
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_vertex_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppVertexShader) {
+static HRESULT D3D11_MS_ABI device_create_vertex_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppVertexShader) {
     (void)pClassLinkage;
     return create_shader(this, pShaderBytecode, BytecodeLength, ppVertexShader, BEER_SHADER_VERTEX);
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_pixel_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppPixelShader) {
+static HRESULT D3D11_MS_ABI device_create_pixel_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppPixelShader) {
     (void)pClassLinkage;
     return create_shader(this, pShaderBytecode, BytecodeLength, ppPixelShader, BEER_SHADER_PIXEL);
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_geometry_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppGeometryShader) {
+static HRESULT D3D11_MS_ABI device_create_geometry_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppGeometryShader) {
     (void)pClassLinkage;
     return create_shader(this, pShaderBytecode, BytecodeLength, ppGeometryShader, BEER_SHADER_GEOMETRY);
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_hull_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppHullShader) {
+static HRESULT D3D11_MS_ABI device_create_hull_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppHullShader) {
     (void)pClassLinkage;
     return create_shader(this, pShaderBytecode, BytecodeLength, ppHullShader, BEER_SHADER_HULL);
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_domain_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppDomainShader) {
+static HRESULT D3D11_MS_ABI device_create_domain_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppDomainShader) {
     (void)pClassLinkage;
     return create_shader(this, pShaderBytecode, BytecodeLength, ppDomainShader, BEER_SHADER_DOMAIN);
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_compute_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppComputeShader) {
+static HRESULT D3D11_MS_ABI device_create_compute_shader(ID3D11Device* this, void* pShaderBytecode, size_t BytecodeLength, void* pClassLinkage, void** ppComputeShader) {
     (void)pClassLinkage;
     return create_shader(this, pShaderBytecode, BytecodeLength, ppComputeShader, BEER_SHADER_COMPUTE);
 }
@@ -1169,7 +1170,7 @@ typedef struct {
 
 static void *g_pipeline_state_vtable[8];
 
-static HRESULT __attribute__((ms_abi)) pipeline_state_query_interface(
+static HRESULT D3D11_MS_ABI pipeline_state_query_interface(
     BeerD3D11State *this, REFIID riid, LPVOID *ppvObj)
 {
     static const uint8_t iid_iunknown[16] = {
@@ -1201,7 +1202,7 @@ static HRESULT __attribute__((ms_abi)) pipeline_state_query_interface(
     return S_OK;
 }
 
-static void __attribute__((ms_abi)) pipeline_state_get_device(
+static void D3D11_MS_ABI pipeline_state_get_device(
     BeerD3D11State *this, ID3D11Device **device)
 {
     if (!device) return;
@@ -1209,7 +1210,7 @@ static void __attribute__((ms_abi)) pipeline_state_get_device(
     if (this->device) device_addref(this->device);
 }
 
-static void __attribute__((ms_abi)) pipeline_state_get_desc(
+static void D3D11_MS_ABI pipeline_state_get_desc(
     BeerD3D11State *this, void *desc)
 {
     if (desc) memcpy(desc, this->desc, this->desc_size);
@@ -1240,7 +1241,7 @@ static BeerD3D11State *pipeline_state_create(
     return state;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_rasterizer_state(
+static HRESULT D3D11_MS_ABI device_create_rasterizer_state(
     ID3D11Device *this, void *desc, void **out)
 {
     if (!out || !desc) return (HRESULT)0x80070057;
@@ -1248,7 +1249,7 @@ static HRESULT __attribute__((ms_abi)) device_create_rasterizer_state(
     return *out ? S_OK : (HRESULT)0x8007000e;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_blend_state(
+static HRESULT D3D11_MS_ABI device_create_blend_state(
     ID3D11Device *this, void *desc, void **out)
 {
     if (!out || !desc) return (HRESULT)0x80070057;
@@ -1256,7 +1257,7 @@ static HRESULT __attribute__((ms_abi)) device_create_blend_state(
     return *out ? S_OK : (HRESULT)0x8007000e;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_depthstencil_state(
+static HRESULT D3D11_MS_ABI device_create_depthstencil_state(
     ID3D11Device *this, void *desc, void **out)
 {
     if (!out || !desc) return (HRESULT)0x80070057;
@@ -1272,7 +1273,7 @@ typedef struct {
 
 static void *g_sampler_state_vtable[8];
 
-static HRESULT __attribute__((ms_abi)) sampler_query_interface(
+static HRESULT D3D11_MS_ABI sampler_query_interface(
     BeerD3D11SamplerState *this, REFIID riid, LPVOID *ppvObj)
 {
     static const uint8_t iid_iunknown[16] = {
@@ -1292,7 +1293,7 @@ static HRESULT __attribute__((ms_abi)) sampler_query_interface(
     return S_OK;
 }
 
-static void __attribute__((ms_abi)) sampler_get_device(
+static void D3D11_MS_ABI sampler_get_device(
     BeerD3D11SamplerState *this, ID3D11Device **device)
 {
     if (!device) return;
@@ -1300,13 +1301,13 @@ static void __attribute__((ms_abi)) sampler_get_device(
     if (this->device) device_addref(this->device);
 }
 
-static void __attribute__((ms_abi)) sampler_get_desc(
+static void D3D11_MS_ABI sampler_get_desc(
     BeerD3D11SamplerState *this, void *desc)
 {
     if (desc) memcpy(desc, this->desc, sizeof(this->desc));
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_sampler_state(ID3D11Device* this, void* pSamplerDesc, void** ppSamplerState) {
+static HRESULT D3D11_MS_ABI device_create_sampler_state(ID3D11Device* this, void* pSamplerDesc, void** ppSamplerState) {
     if (!ppSamplerState || !pSamplerDesc) return (HRESULT)0x80070057;
     *ppSamplerState = NULL;
     if (!g_sampler_state_vtable[0]) {
@@ -1340,7 +1341,7 @@ typedef struct {
 
 static void *g_query_vtable[9];
 
-static HRESULT __attribute__((ms_abi)) query_query_interface(
+static HRESULT D3D11_MS_ABI query_query_interface(
     BeerD3D11Query *this, REFIID riid, LPVOID *out)
 {
     static const uint8_t iid_iunknown[16] = {
@@ -1369,7 +1370,7 @@ static HRESULT __attribute__((ms_abi)) query_query_interface(
     return S_OK;
 }
 
-static void __attribute__((ms_abi)) query_get_device(
+static void D3D11_MS_ABI query_get_device(
     BeerD3D11Query *this, ID3D11Device **device)
 {
     if (!device) return;
@@ -1377,7 +1378,7 @@ static void __attribute__((ms_abi)) query_get_device(
     if (this->device) device_addref(this->device);
 }
 
-static uint32_t __attribute__((ms_abi)) query_get_data_size(BeerD3D11Query *this)
+static uint32_t D3D11_MS_ABI query_get_data_size(BeerD3D11Query *this)
 {
     switch (this->query) {
     case 0: return 4;  /* D3D11_QUERY_EVENT: BOOL */
@@ -1390,7 +1391,7 @@ static uint32_t __attribute__((ms_abi)) query_get_data_size(BeerD3D11Query *this
     }
 }
 
-static void __attribute__((ms_abi)) query_get_desc(BeerD3D11Query *this, void *desc)
+static void D3D11_MS_ABI query_get_desc(BeerD3D11Query *this, void *desc)
 {
     if (!desc) return;
     ((uint32_t *)desc)[0] = this->query;
@@ -1431,19 +1432,19 @@ static HRESULT create_async_object(ID3D11Device *this, const uint32_t *desc,
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_query(
+static HRESULT D3D11_MS_ABI device_create_query(
     ID3D11Device *this, const uint32_t *desc, void **out)
 {
     return create_async_object(this, desc, out, "Query");
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_predicate(
+static HRESULT D3D11_MS_ABI device_create_predicate(
     ID3D11Device *this, const uint32_t *desc, void **out)
 {
     return create_async_object(this, desc, out, "Predicate");
 }
 
-static HRESULT __attribute__((ms_abi)) device_check_format_support(
+static HRESULT D3D11_MS_ABI device_check_format_support(
     ID3D11Device *this, uint32_t format, uint32_t *support)
 {
     (void)this;
@@ -1496,7 +1497,7 @@ static HRESULT __attribute__((ms_abi)) device_check_format_support(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) device_check_multisample_quality_levels(
+static HRESULT D3D11_MS_ABI device_check_multisample_quality_levels(
     ID3D11Device *this, uint32_t format, uint32_t sample_count,
     uint32_t *quality_levels)
 {
@@ -1509,7 +1510,7 @@ static HRESULT __attribute__((ms_abi)) device_check_multisample_quality_levels(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) device_check_feature_support(
+static HRESULT D3D11_MS_ABI device_check_feature_support(
     ID3D11Device *this, uint32_t feature, void *data, uint32_t data_size)
 {
     (void)this;
@@ -1525,7 +1526,7 @@ static HRESULT __attribute__((ms_abi)) device_check_feature_support(
     return (HRESULT)0x80070057;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_shaderresource_view(
+static HRESULT D3D11_MS_ABI device_create_shaderresource_view(
     ID3D11Device *this, void *resource, void *desc, void **out)
 {
     if (!out || !resource) return (HRESULT)0x80070057;
@@ -1533,7 +1534,7 @@ static HRESULT __attribute__((ms_abi)) device_create_shaderresource_view(
     return *out ? S_OK : (HRESULT)0x8007000e;
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_unorderedaccess_view(
+static HRESULT D3D11_MS_ABI device_create_unorderedaccess_view(
     ID3D11Device *this, void *resource, void *desc, void **out)
 {
     if (!out || !resource) return (HRESULT)0x80070057;
@@ -1545,7 +1546,7 @@ static ID3D11DeviceContext *g_immediate_context;
 static ID3D11DeviceContext *d3d11_device_context_create_typed(
     ID3D11Device *device, uint32_t context_type, uint32_t context_flags);
 
-static void __attribute__((ms_abi)) device_get_immediate_context(ID3D11Device* this, void** ppImmediateContext) {
+static void D3D11_MS_ABI device_get_immediate_context(ID3D11Device* this, void** ppImmediateContext) {
     (void)this;
     if (!ppImmediateContext) return;
     if (!g_immediate_context)
@@ -1557,14 +1558,14 @@ static void __attribute__((ms_abi)) device_get_immediate_context(ID3D11Device* t
             (void *)g_immediate_context);
 }
 
-static HRESULT __attribute__((ms_abi)) device_create_deferred_context(ID3D11Device* this, uint32_t ContextFlags, void** ppDeferredContext) {
+static HRESULT D3D11_MS_ABI device_create_deferred_context(ID3D11Device* this, uint32_t ContextFlags, void** ppDeferredContext) {
     (void)this;
     if (!ppDeferredContext) return (HRESULT)0x80070057;
     *ppDeferredContext = d3d11_device_context_create_typed(this, 1, ContextFlags);
     return *ppDeferredContext ? S_OK : (HRESULT)0x8007000e;
 }
 
-static HRESULT __attribute__((ms_abi)) device_not_implemented(void *this, void *a, void *b, void *c) {
+static HRESULT D3D11_MS_ABI device_not_implemented(void *this, void *a, void *b, void *c) {
     static _Atomic(uint32_t) calls;
     uint32_t call = atomic_fetch_add(&calls, 1) + 1;
     if (call <= 64) {
@@ -1576,27 +1577,27 @@ static HRESULT __attribute__((ms_abi)) device_not_implemented(void *this, void *
     return (HRESULT)0x80004001; /* E_NOTIMPL */
 }
 
-static uint32_t __attribute__((ms_abi)) device_get_feature_level(ID3D11Device *this) {
+static uint32_t D3D11_MS_ABI device_get_feature_level(ID3D11Device *this) {
     (void)this;
     return 0xb000; /* D3D_FEATURE_LEVEL_11_0 */
 }
 
-static uint32_t __attribute__((ms_abi)) device_get_creation_flags(ID3D11Device *this) {
+static uint32_t D3D11_MS_ABI device_get_creation_flags(ID3D11Device *this) {
     (void)this;
     return 0;
 }
 
-static HRESULT __attribute__((ms_abi)) device_get_removed_reason(ID3D11Device *this) {
+static HRESULT D3D11_MS_ABI device_get_removed_reason(ID3D11Device *this) {
     (void)this;
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) device_set_exception_mode(ID3D11Device *this, uint32_t flags) {
+static HRESULT D3D11_MS_ABI device_set_exception_mode(ID3D11Device *this, uint32_t flags) {
     (void)this; (void)flags;
     return S_OK;
 }
 
-static uint32_t __attribute__((ms_abi)) device_get_exception_mode(ID3D11Device *this) {
+static uint32_t D3D11_MS_ABI device_get_exception_mode(ID3D11Device *this) {
     (void)this;
     return 0;
 }
@@ -1710,7 +1711,7 @@ ID3D11Device* d3d11_device_create(void) {
  * ID3D11DeviceContext - Stub implementation
  * ============================================================================ */
 
-static HRESULT __attribute__((ms_abi)) context_query_interface(ID3D11DeviceContext* this, REFIID riid, LPVOID* ppvObj) {
+static HRESULT D3D11_MS_ABI context_query_interface(ID3D11DeviceContext* this, REFIID riid, LPVOID* ppvObj) {
     (void)riid;
     if (!ppvObj) return (HRESULT)0x80070057;
     *ppvObj = this;
@@ -1718,14 +1719,14 @@ static HRESULT __attribute__((ms_abi)) context_query_interface(ID3D11DeviceConte
     return S_OK;
 }
 
-static void __attribute__((ms_abi)) context_get_device(
+static void D3D11_MS_ABI context_get_device(
     ID3D11DeviceContext *this, ID3D11Device **device);
 
-static uint32_t __attribute__((ms_abi)) context_addref(ID3D11DeviceContext* this) {
+static uint32_t D3D11_MS_ABI context_addref(ID3D11DeviceContext* this) {
     return com_addref(this);
 }
 
-static uint32_t __attribute__((ms_abi)) context_release(ID3D11DeviceContext* this) {
+static uint32_t D3D11_MS_ABI context_release(ID3D11DeviceContext* this) {
     ComObjectHeader *header = com_get_header(this);
     if (!header) return 0;
     /* The process-global pointer is only a non-owning cache. Never leave it
@@ -1852,7 +1853,7 @@ typedef struct {
     _Atomic(uint32_t) executed;
 } BeerD3D11CommandList;
 
-static void __attribute__((ms_abi)) context_get_device(
+static void D3D11_MS_ABI context_get_device(
     ID3D11DeviceContext *this, ID3D11Device **device)
 {
     if (!device) return;
@@ -2046,7 +2047,7 @@ static void trace_binding(const char *name, const void *object, uint32_t count)
                 name, call, object, count);
 }
 
-static void __attribute__((ms_abi)) context_ia_set_input_layout(ID3D11DeviceContext* this, void* pInputLayout) {
+static void D3D11_MS_ABI context_ia_set_input_layout(ID3D11DeviceContext* this, void* pInputLayout) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) state_replace_object(&context->state.input_layout, pInputLayout);
     BeerD3D11Command command = { .type = BEER_COMMAND_IA_INPUT_LAYOUT,
@@ -2084,7 +2085,7 @@ static void trace_resource_binding(const char *name, ID3D11DeviceContext *contex
     fputc('\n', stderr);
 }
 
-static void __attribute__((ms_abi)) context_ia_set_vertex_buffers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumBuffers, void* ppVertexBuffers, void* pStrides, void* pOffsets) {
+static void D3D11_MS_ABI context_ia_set_vertex_buffers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumBuffers, void* ppVertexBuffers, void* pStrides, void* pOffsets) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     void *const *buffers = ppVertexBuffers;
     const uint32_t *strides = pStrides, *offsets = pOffsets;
@@ -2134,7 +2135,7 @@ static void __attribute__((ms_abi)) context_ia_set_vertex_buffers(ID3D11DeviceCo
                            buffers, strides, offsets);
 }
 
-static void __attribute__((ms_abi)) context_ia_set_index_buffer(ID3D11DeviceContext* this, void* pIndexBuffer, uint32_t Format, uint32_t Offset) {
+static void D3D11_MS_ABI context_ia_set_index_buffer(ID3D11DeviceContext* this, void* pIndexBuffer, uint32_t Format, uint32_t Offset) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) {
         state_replace_object(&context->state.index_buffer, pIndexBuffer);
@@ -2151,7 +2152,7 @@ static void __attribute__((ms_abi)) context_ia_set_index_buffer(ID3D11DeviceCont
     trace_resource_binding("IASetIndexBuffer", this, 0, 1, objects, formats, offsets);
 }
 
-static void __attribute__((ms_abi)) context_ia_set_primitive_topology(ID3D11DeviceContext* this, uint32_t Topology) {
+static void D3D11_MS_ABI context_ia_set_primitive_topology(ID3D11DeviceContext* this, uint32_t Topology) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) context->state.topology = Topology;
     BeerD3D11Command command = { .type = BEER_COMMAND_IA_TOPOLOGY };
@@ -2164,7 +2165,7 @@ static void __attribute__((ms_abi)) context_ia_set_primitive_topology(ID3D11Devi
                 call, (void *)this, Topology);
 }
 
-static void __attribute__((ms_abi)) context_vs_set_shader(ID3D11DeviceContext* this, void* pVertexShader, void* ppClassInstances, uint32_t NumClassInstances) {
+static void D3D11_MS_ABI context_vs_set_shader(ID3D11DeviceContext* this, void* pVertexShader, void* ppClassInstances, uint32_t NumClassInstances) {
     (void)ppClassInstances;
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) state_replace_object(&context->state.vertex_shader, pVertexShader);
@@ -2185,7 +2186,7 @@ static void set_state_objects(void **slots, uint32_t capacity,
         state_replace_object(&slots[start + i], source ? source[i] : NULL);
 }
 
-static void __attribute__((ms_abi)) context_vs_set_constant_buffers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumBuffers, void* ppConstantBuffers) {
+static void D3D11_MS_ABI context_vs_set_constant_buffers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumBuffers, void* ppConstantBuffers) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) set_state_objects(context->state.vs_constant_buffers,
         BEER_MAX_CONSTANT_BUFFERS, StartSlot, NumBuffers, ppConstantBuffers);
@@ -2193,7 +2194,7 @@ static void __attribute__((ms_abi)) context_vs_set_constant_buffers(ID3D11Device
                            (void *const *)ppConstantBuffers, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_ps_set_shader(ID3D11DeviceContext* this, void* pPixelShader, void* ppClassInstances, uint32_t NumClassInstances) {
+static void D3D11_MS_ABI context_ps_set_shader(ID3D11DeviceContext* this, void* pPixelShader, void* ppClassInstances, uint32_t NumClassInstances) {
     (void)ppClassInstances;
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) state_replace_object(&context->state.pixel_shader, pPixelShader);
@@ -2204,7 +2205,7 @@ static void __attribute__((ms_abi)) context_ps_set_shader(ID3D11DeviceContext* t
     trace_binding("PSSetShader", pPixelShader, NumClassInstances);
 }
 
-static void __attribute__((ms_abi)) context_ps_set_constant_buffers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumBuffers, void* ppConstantBuffers) {
+static void D3D11_MS_ABI context_ps_set_constant_buffers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumBuffers, void* ppConstantBuffers) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) set_state_objects(context->state.ps_constant_buffers,
         BEER_MAX_CONSTANT_BUFFERS, StartSlot, NumBuffers, ppConstantBuffers);
@@ -2212,7 +2213,7 @@ static void __attribute__((ms_abi)) context_ps_set_constant_buffers(ID3D11Device
                            (void *const *)ppConstantBuffers, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_ps_set_shader_resources(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumViews, void* ppShaderResourceViews) {
+static void D3D11_MS_ABI context_ps_set_shader_resources(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumViews, void* ppShaderResourceViews) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) set_state_objects(context->state.ps_shader_resources,
         BEER_MAX_SHADER_RESOURCES, StartSlot, NumViews, ppShaderResourceViews);
@@ -2220,7 +2221,7 @@ static void __attribute__((ms_abi)) context_ps_set_shader_resources(ID3D11Device
                            (void *const *)ppShaderResourceViews, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_ps_set_samplers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumSamplers, void* ppSamplers) {
+static void D3D11_MS_ABI context_ps_set_samplers(ID3D11DeviceContext* this, uint32_t StartSlot, uint32_t NumSamplers, void* ppSamplers) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) set_state_objects(context->state.ps_samplers,
         BEER_MAX_SAMPLERS, StartSlot, NumSamplers, ppSamplers);
@@ -2228,7 +2229,7 @@ static void __attribute__((ms_abi)) context_ps_set_samplers(ID3D11DeviceContext*
                            (void *const *)ppSamplers, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_gs_set_shader(ID3D11DeviceContext* this, void* pGeometryShader, void* ppClassInstances, uint32_t NumClassInstances) {
+static void D3D11_MS_ABI context_gs_set_shader(ID3D11DeviceContext* this, void* pGeometryShader, void* ppClassInstances, uint32_t NumClassInstances) {
     (void)ppClassInstances;
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) state_replace_object(&context->state.geometry_shader, pGeometryShader);
@@ -2250,7 +2251,7 @@ static void capture_indexed_draw_snapshot(const BeerD3D11PipelineState *state,
                                           uint32_t start_index,
                                           int32_t base_vertex);
 
-static void __attribute__((ms_abi)) context_draw_indexed(ID3D11DeviceContext* this, uint32_t IndexCount, uint32_t StartIndexLocation, int32_t BaseVertexLocation) {
+static void D3D11_MS_ABI context_draw_indexed(ID3D11DeviceContext* this, uint32_t IndexCount, uint32_t StartIndexLocation, int32_t BaseVertexLocation) {
     BeerD3D11Command command = { .type = BEER_COMMAND_DRAW_INDEXED };
     command.args.integers.a = IndexCount;
     command.args.integers.b = StartIndexLocation;
@@ -4570,7 +4571,7 @@ static int execute_initial_indexed_draw(const BeerD3D11PipelineState *state,
 
 /* ---- Dead legacy code deleted ---- */
 
-static void __attribute__((ms_abi)) context_draw(ID3D11DeviceContext* this, uint32_t VertexCount, uint32_t StartVertexLocation) {
+static void D3D11_MS_ABI context_draw(ID3D11DeviceContext* this, uint32_t VertexCount, uint32_t StartVertexLocation) {
     BeerD3D11Command command = { .type = BEER_COMMAND_DRAW };
     command.args.integers.a = VertexCount;
     command.args.integers.b = StartVertexLocation;
@@ -4608,7 +4609,7 @@ static void __attribute__((ms_abi)) context_draw(ID3D11DeviceContext* this, uint
     (void)this;
 }
 
-static void __attribute__((ms_abi)) context_draw_indexed_instanced(
+static void D3D11_MS_ABI context_draw_indexed_instanced(
     ID3D11DeviceContext *this, uint32_t index_count, uint32_t instance_count,
     uint32_t start_index, int32_t base_vertex, uint32_t start_instance)
 {
@@ -4630,7 +4631,7 @@ static void __attribute__((ms_abi)) context_draw_indexed_instanced(
     (void)this;
 }
 
-static void __attribute__((ms_abi)) context_draw_instanced(
+static void D3D11_MS_ABI context_draw_instanced(
     ID3D11DeviceContext *this, uint32_t vertex_count, uint32_t instance_count,
     uint32_t start_vertex, uint32_t start_instance)
 {
@@ -4651,7 +4652,7 @@ static void __attribute__((ms_abi)) context_draw_instanced(
     (void)this;
 }
 
-static void __attribute__((ms_abi)) context_draw_auto(ID3D11DeviceContext *this)
+static void D3D11_MS_ABI context_draw_auto(ID3D11DeviceContext *this)
 {
     BeerD3D11Command command = { .type = BEER_COMMAND_DRAW_AUTO };
     if (context_record_command(this, &command)) return;
@@ -4661,7 +4662,7 @@ static void __attribute__((ms_abi)) context_draw_auto(ID3D11DeviceContext *this)
     (void)this;
 }
 
-static void __attribute__((ms_abi)) context_draw_indirect(
+static void D3D11_MS_ABI context_draw_indirect(
     ID3D11DeviceContext *this, void *buffer, uint32_t offset)
 {
     static _Atomic(uint32_t) calls;
@@ -4672,7 +4673,7 @@ static void __attribute__((ms_abi)) context_draw_indirect(
     (void)this;
 }
 
-static void __attribute__((ms_abi)) context_begin(
+static void D3D11_MS_ABI context_begin(
     ID3D11DeviceContext *this, BeerD3D11Query *query)
 {
     if (!query || !com_get_header(query)) return;
@@ -4688,7 +4689,7 @@ static void __attribute__((ms_abi)) context_begin(
     query->ended = 0;
 }
 
-static void __attribute__((ms_abi)) context_end(
+static void D3D11_MS_ABI context_end(
     ID3D11DeviceContext *this, BeerD3D11Query *query)
 {
     if (!query || !com_get_header(query)) return;
@@ -4707,7 +4708,7 @@ static void __attribute__((ms_abi)) context_end(
     }
 }
 
-static HRESULT __attribute__((ms_abi)) context_get_data(
+static HRESULT D3D11_MS_ABI context_get_data(
     ID3D11DeviceContext *this, BeerD3D11Query *query,
     void *data, uint32_t data_size, uint32_t flags)
 {
@@ -4735,7 +4736,7 @@ static HRESULT __attribute__((ms_abi)) context_get_data(
     return S_OK;
 }
 
-static void __attribute__((ms_abi)) context_om_set_render_targets(ID3D11DeviceContext* this, uint32_t NumViews, void* ppRenderTargetViews, void* pDepthStencilView) {
+static void D3D11_MS_ABI context_om_set_render_targets(ID3D11DeviceContext* this, uint32_t NumViews, void* ppRenderTargetViews, void* pDepthStencilView) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (!context) return;
     set_state_objects(context->state.render_targets, BEER_MAX_RENDER_TARGETS,
@@ -4745,7 +4746,7 @@ static void __attribute__((ms_abi)) context_om_set_render_targets(ID3D11DeviceCo
     state_replace_object(&context->state.depth_stencil_view, pDepthStencilView);
 }
 
-static void __attribute__((ms_abi)) context_om_get_render_targets(
+static void D3D11_MS_ABI context_om_get_render_targets(
     ID3D11DeviceContext *this, uint32_t NumViews,
     void **ppRenderTargetViews, void **ppDepthStencilView)
 {
@@ -4773,7 +4774,7 @@ static void __attribute__((ms_abi)) context_om_get_render_targets(
                 ppDepthStencilView ? *ppDepthStencilView : NULL);
 }
 
-static void __attribute__((ms_abi)) context_om_set_blend_state(ID3D11DeviceContext* this, void* pBlendState, void* BlendFactor, uint32_t SampleMask) {
+static void D3D11_MS_ABI context_om_set_blend_state(ID3D11DeviceContext* this, void* pBlendState, void* BlendFactor, uint32_t SampleMask) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (!context) return;
     state_replace_object(&context->state.blend_state, pBlendState);
@@ -4783,19 +4784,19 @@ static void __attribute__((ms_abi)) context_om_set_blend_state(ID3D11DeviceConte
     context->state.sample_mask = SampleMask;
 }
 
-static void __attribute__((ms_abi)) context_om_set_depthstencil_state(ID3D11DeviceContext* this, void* pDepthStencilState, uint32_t StencilRef) {
+static void D3D11_MS_ABI context_om_set_depthstencil_state(ID3D11DeviceContext* this, void* pDepthStencilState, uint32_t StencilRef) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (!context) return;
     state_replace_object(&context->state.depth_stencil_state, pDepthStencilState);
     context->state.stencil_ref = StencilRef;
 }
 
-static void __attribute__((ms_abi)) context_rs_set_state(ID3D11DeviceContext* this, void* pRasterizerState) {
+static void D3D11_MS_ABI context_rs_set_state(ID3D11DeviceContext* this, void* pRasterizerState) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (context) state_replace_object(&context->state.rasterizer_state, pRasterizerState);
 }
 
-static void __attribute__((ms_abi)) context_rs_set_viewports(ID3D11DeviceContext* this, uint32_t NumViewports, void* pViewports) {
+static void D3D11_MS_ABI context_rs_set_viewports(ID3D11DeviceContext* this, uint32_t NumViewports, void* pViewports) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (!context) return;
     uint32_t count = NumViewports < BEER_MAX_VIEWPORTS ? NumViewports : BEER_MAX_VIEWPORTS;
@@ -4814,7 +4815,7 @@ static void __attribute__((ms_abi)) context_rs_set_viewports(ID3D11DeviceContext
     }
 }
 
-static void __attribute__((ms_abi)) context_rs_set_scissor_rects(ID3D11DeviceContext* this, uint32_t NumRects, void* pRects) {
+static void D3D11_MS_ABI context_rs_set_scissor_rects(ID3D11DeviceContext* this, uint32_t NumRects, void* pRects) {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
     if (!context) return;
     uint32_t count = NumRects < BEER_MAX_VIEWPORTS ? NumRects : BEER_MAX_VIEWPORTS;
@@ -4831,7 +4832,7 @@ static uint8_t float_to_unorm8(float value)
     return (uint8_t)(value * 255.0f + 0.5f);
 }
 
-static void __attribute__((ms_abi)) context_clear_rendertarget_view(ID3D11DeviceContext* this, void* pRenderTargetView, void* ColorRGBA);
+static void D3D11_MS_ABI context_clear_rendertarget_view(ID3D11DeviceContext* this, void* pRenderTargetView, void* ColorRGBA);
 
 static uint32_t pack_r10g10b10a2(const float *color)
 {
@@ -4842,7 +4843,7 @@ static uint32_t pack_r10g10b10a2(const float *color)
     return r | (g << 10) | (b << 20) | (a << 30);
 }
 
-static void __attribute__((ms_abi)) context_clear_rendertarget_view(ID3D11DeviceContext* this, void* pRenderTargetView, void* ColorRGBA) {
+static void D3D11_MS_ABI context_clear_rendertarget_view(ID3D11DeviceContext* this, void* pRenderTargetView, void* ColorRGBA) {
     BeerD3D11Command command = { .type = BEER_COMMAND_CLEAR_RENDER_TARGET,
                                  .object = pRenderTargetView };
     if (ColorRGBA) memcpy(command.args.color, ColorRGBA, sizeof(command.args.color));
@@ -4906,7 +4907,7 @@ static void trace_context_operation(const char *name, void *destination, void *s
                 name, call, destination, source);
 }
 
-static void __attribute__((ms_abi)) context_copy_resource(
+static void D3D11_MS_ABI context_copy_resource(
     ID3D11DeviceContext *this, void *destination, void *source)
 {
     trace_context_operation("CopyResource", destination, source);
@@ -5048,7 +5049,7 @@ static void apply_update_subresource(
     (void)source_depth_pitch;
 }
 
-static void __attribute__((ms_abi)) context_update_subresource(
+static void D3D11_MS_ABI context_update_subresource(
     ID3D11DeviceContext *this, void *destination, uint32_t subresource,
     const void *box, const void *source, uint32_t source_row_pitch,
     uint32_t source_depth_pitch)
@@ -5103,7 +5104,7 @@ static void __attribute__((ms_abi)) context_update_subresource(
                              source_row_pitch, source_depth_pitch);
 }
 
-static void __attribute__((ms_abi)) context_copy_subresource_region(
+static void D3D11_MS_ABI context_copy_subresource_region(
     ID3D11DeviceContext *this, void *destination, uint32_t destination_subresource,
     uint32_t destination_x, uint32_t destination_y, uint32_t destination_z,
     void *source, uint32_t source_subresource, const void *source_box)
@@ -5114,7 +5115,7 @@ static void __attribute__((ms_abi)) context_copy_subresource_region(
     context_copy_resource(this, destination, source);
 }
 
-static void __attribute__((ms_abi)) context_resolve_subresource(
+static void D3D11_MS_ABI context_resolve_subresource(
     ID3D11DeviceContext *this, void *destination, uint32_t destination_subresource,
     void *source, uint32_t source_subresource, uint32_t format)
 {
@@ -5141,7 +5142,7 @@ static void trace_shader_stage(const char *stage, ID3D11DeviceContext *this,
     }
 }
 
-static void __attribute__((ms_abi)) context_hs_set_shader_resources(
+static void D3D11_MS_ABI context_hs_set_shader_resources(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *views)
 {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
@@ -5151,7 +5152,7 @@ static void __attribute__((ms_abi)) context_hs_set_shader_resources(
                            (void *const *)views, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_hs_set_shader(
+static void D3D11_MS_ABI context_hs_set_shader(
     ID3D11DeviceContext *this, void *shader, void *class_instances,
     uint32_t class_count)
 {
@@ -5161,7 +5162,7 @@ static void __attribute__((ms_abi)) context_hs_set_shader(
     trace_shader_stage("HSSetShader", this, shader, class_count);
 }
 
-static void __attribute__((ms_abi)) context_hs_set_samplers(
+static void D3D11_MS_ABI context_hs_set_samplers(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *samplers)
 {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
@@ -5171,7 +5172,7 @@ static void __attribute__((ms_abi)) context_hs_set_samplers(
                            (void *const *)samplers, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_hs_set_constant_buffers(
+static void D3D11_MS_ABI context_hs_set_constant_buffers(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *buffers)
 {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
@@ -5181,7 +5182,7 @@ static void __attribute__((ms_abi)) context_hs_set_constant_buffers(
                            (void *const *)buffers, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_ds_set_shader_resources(
+static void D3D11_MS_ABI context_ds_set_shader_resources(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *views)
 {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
@@ -5191,7 +5192,7 @@ static void __attribute__((ms_abi)) context_ds_set_shader_resources(
                            (void *const *)views, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_ds_set_shader(
+static void D3D11_MS_ABI context_ds_set_shader(
     ID3D11DeviceContext *this, void *shader, void *class_instances,
     uint32_t class_count)
 {
@@ -5201,7 +5202,7 @@ static void __attribute__((ms_abi)) context_ds_set_shader(
     trace_shader_stage("DSSetShader", this, shader, class_count);
 }
 
-static void __attribute__((ms_abi)) context_ds_set_samplers(
+static void D3D11_MS_ABI context_ds_set_samplers(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *samplers)
 {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
@@ -5211,7 +5212,7 @@ static void __attribute__((ms_abi)) context_ds_set_samplers(
                            (void *const *)samplers, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_ds_set_constant_buffers(
+static void D3D11_MS_ABI context_ds_set_constant_buffers(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *buffers)
 {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
@@ -5221,14 +5222,14 @@ static void __attribute__((ms_abi)) context_ds_set_constant_buffers(
                            (void *const *)buffers, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_cs_set_shader_resources(
+static void D3D11_MS_ABI context_cs_set_shader_resources(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *views)
 {
     trace_resource_binding("CSSetShaderResources", this, start_slot, count,
                            (void *const *)views, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_cs_set_unordered_access_views(
+static void D3D11_MS_ABI context_cs_set_unordered_access_views(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *views,
     const uint32_t *initial_counts)
 {
@@ -5236,7 +5237,7 @@ static void __attribute__((ms_abi)) context_cs_set_unordered_access_views(
                            (void *const *)views, initial_counts, NULL);
 }
 
-static void __attribute__((ms_abi)) context_cs_set_shader(
+static void D3D11_MS_ABI context_cs_set_shader(
     ID3D11DeviceContext *this, void *shader, void *class_instances,
     uint32_t class_count)
 {
@@ -5244,21 +5245,21 @@ static void __attribute__((ms_abi)) context_cs_set_shader(
     trace_shader_stage("CSSetShader", this, shader, class_count);
 }
 
-static void __attribute__((ms_abi)) context_cs_set_samplers(
+static void D3D11_MS_ABI context_cs_set_samplers(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *samplers)
 {
     trace_resource_binding("CSSetSamplers", this, start_slot, count,
                            (void *const *)samplers, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_cs_set_constant_buffers(
+static void D3D11_MS_ABI context_cs_set_constant_buffers(
     ID3D11DeviceContext *this, uint32_t start_slot, uint32_t count, void *buffers)
 {
     trace_resource_binding("CSSetConstantBuffers", this, start_slot, count,
                            (void *const *)buffers, NULL, NULL);
 }
 
-static void __attribute__((ms_abi)) context_dispatch(
+static void D3D11_MS_ABI context_dispatch(
     ID3D11DeviceContext *this, uint32_t x, uint32_t y, uint32_t z)
 {
     static _Atomic(uint32_t) calls;
@@ -5269,7 +5270,7 @@ static void __attribute__((ms_abi)) context_dispatch(
                 this ? ((BeerD3D11DeviceContext *)this)->type : 0, x, y, z);
 }
 
-static void __attribute__((ms_abi)) context_dispatch_indirect(
+static void D3D11_MS_ABI context_dispatch_indirect(
     ID3D11DeviceContext *this, void *buffer, uint32_t offset)
 {
     static _Atomic(uint32_t) calls;
@@ -5284,7 +5285,7 @@ static void __attribute__((ms_abi)) context_dispatch_indirect(
  * GetContextFlags at slot 7. */
 static void *g_command_list_vtable[8];
 
-static HRESULT __attribute__((ms_abi)) command_list_query_interface(
+static HRESULT D3D11_MS_ABI command_list_query_interface(
     BeerD3D11CommandList *object, REFIID riid, void **output)
 {
     static const uint8_t iid_iunknown[16] = {
@@ -5305,10 +5306,10 @@ static HRESULT __attribute__((ms_abi)) command_list_query_interface(
     return S_OK;
 }
 
-static uint32_t __attribute__((ms_abi)) command_list_release(
+static uint32_t D3D11_MS_ABI command_list_release(
     BeerD3D11CommandList *object);
 
-static void __attribute__((ms_abi)) command_list_get_device(
+static void D3D11_MS_ABI command_list_get_device(
     BeerD3D11CommandList *object, ID3D11Device **device)
 {
     if (!device) return;
@@ -5316,7 +5317,7 @@ static void __attribute__((ms_abi)) command_list_get_device(
     if (*device) device_addref(*device);
 }
 
-static uint32_t __attribute__((ms_abi)) command_list_get_context_flags(
+static uint32_t D3D11_MS_ABI command_list_get_context_flags(
     BeerD3D11CommandList *object)
 {
     return object ? object->context_flags : 0;
@@ -5344,7 +5345,7 @@ static void command_list_vtable_initialize(void)
     g_command_list_vtable[7] = (void *)command_list_get_context_flags;
 }
 
-static void __attribute__((ms_abi)) context_execute_command_list(
+static void D3D11_MS_ABI context_execute_command_list(
     ID3D11DeviceContext *this, BeerD3D11CommandList *command_list,
     int restore_state)
 {
@@ -5532,7 +5533,7 @@ static void __attribute__((ms_abi)) context_execute_command_list(
     pthread_mutex_unlock(&g_immediate_context_replay_lock);
 }
 
-static HRESULT __attribute__((ms_abi)) context_finish_command_list(
+static HRESULT D3D11_MS_ABI context_finish_command_list(
     ID3D11DeviceContext *this, int restore_state, void **command_list)
 {
     static _Atomic(uint32_t) calls;
@@ -5630,9 +5631,10 @@ static HRESULT __attribute__((ms_abi)) context_finish_command_list(
     return S_OK;
 }
 
-static void __attribute__((ms_abi)) context_clear_depthstencil_view(ID3D11DeviceContext* this, void* pDepthStencilView, uint32_t ClearFlags, float Depth, uint8_t Stencil) {
+static void D3D11_MS_ABI context_clear_depthstencil_view(ID3D11DeviceContext* this, void* pDepthStencilView, uint32_t ClearFlags, float Depth, uint8_t Stencil) {
     /* Stub - do nothing */
 }
+BEER_HOST_FLOAT_FN(context_clear_depthstencil_view, 1u << 3)   /* float Depth is the 4th argument */
 
 typedef struct {
     void *data;
@@ -5640,7 +5642,7 @@ typedef struct {
     uint32_t depth_pitch;
 } BeerMappedSubresource;
 
-static HRESULT __attribute__((ms_abi)) context_map(
+static HRESULT D3D11_MS_ABI context_map(
     ID3D11DeviceContext* this, void* pResource, uint32_t Subresource,
     uint32_t MapType, uint32_t MapFlags, void* pMappedResource)
 {
@@ -5735,7 +5737,7 @@ static HRESULT __attribute__((ms_abi)) context_map(
     return S_OK;
 }
 
-static void __attribute__((ms_abi)) context_unmap(
+static void D3D11_MS_ABI context_unmap(
     ID3D11DeviceContext* this, void* pResource, uint32_t Subresource)
 {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)this;
@@ -5811,7 +5813,7 @@ static void __attribute__((ms_abi)) context_unmap(
         free(command.owned_data);
 }
 
-static void __attribute__((ms_abi)) context_clear_state(ID3D11DeviceContext *this)
+static void D3D11_MS_ABI context_clear_state(ID3D11DeviceContext *this)
 {
     static _Atomic(uint32_t) calls;
     uint32_t call = atomic_fetch_add(&calls, 1) + 1;
@@ -5822,30 +5824,30 @@ static void __attribute__((ms_abi)) context_clear_state(ID3D11DeviceContext *thi
     memset(&context->state, 0, sizeof(context->state));
 }
 
-static void __attribute__((ms_abi)) context_flush(ID3D11DeviceContext* this) {
+static void D3D11_MS_ABI context_flush(ID3D11DeviceContext* this) {
     /* CPU-backed operations complete synchronously. */
     (void)this;
 }
 
-static uint32_t __attribute__((ms_abi)) context_get_type(ID3D11DeviceContext *object)
+static uint32_t D3D11_MS_ABI context_get_type(ID3D11DeviceContext *object)
 {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)object;
     return context ? context->type : 0;
 }
 
-static uint32_t __attribute__((ms_abi)) context_get_context_flags(ID3D11DeviceContext *object)
+static uint32_t D3D11_MS_ABI context_get_context_flags(ID3D11DeviceContext *object)
 {
     BeerD3D11DeviceContext *context = (BeerD3D11DeviceContext *)object;
     return context ? context->flags : 0;
 }
 
-static void __attribute__((ms_abi)) context_noop(void *this, ...)
+static void D3D11_MS_ABI context_noop(void *this, ...)
 {
     (void)this;
 }
 
 #define DEFINE_CONTEXT_SLOT_TRACE(slot) \
-    static void __attribute__((ms_abi)) context_trace_slot_##slot(void *this, ...) \
+    static void D3D11_MS_ABI context_trace_slot_##slot(void *this, ...) \
     { \
         static _Atomic(uint32_t) calls; \
         uint32_t call = atomic_fetch_add(&calls, 1) + 1; \
@@ -6140,7 +6142,7 @@ static HRESULT swapchain_recreate_back_buffer(BeerDxgiSwapChain *this)
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_query_interface(
+static HRESULT D3D11_MS_ABI swapchain_query_interface(
     IDXGISwapChain *object, REFIID riid, LPVOID *ppvObj)
 {
     if (!ppvObj) return (HRESULT)0x80070057;
@@ -6152,11 +6154,11 @@ static HRESULT __attribute__((ms_abi)) swapchain_query_interface(
     return S_OK;
 }
 
-static uint32_t __attribute__((ms_abi)) swapchain_addref(IDXGISwapChain *this) {
+static uint32_t D3D11_MS_ABI swapchain_addref(IDXGISwapChain *this) {
     return com_addref(this);
 }
 
-static uint32_t __attribute__((ms_abi)) command_list_release(
+static uint32_t D3D11_MS_ABI command_list_release(
     BeerD3D11CommandList *object)
 {
     ComObjectHeader *header = com_get_header(object);
@@ -6186,7 +6188,7 @@ static uint32_t __attribute__((ms_abi)) command_list_release(
     return old_count - 1;
 }
 
-static uint32_t __attribute__((ms_abi)) swapchain_release(IDXGISwapChain *object) {
+static uint32_t D3D11_MS_ABI swapchain_release(IDXGISwapChain *object) {
     BeerDxgiSwapChain *this = (BeerDxgiSwapChain *)object;
     ComObjectHeader *header = com_get_header(this);
     if (!header) return 0;
@@ -6199,28 +6201,28 @@ static uint32_t __attribute__((ms_abi)) swapchain_release(IDXGISwapChain *object
     return old_count - 1;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_set_private_data(
+static HRESULT D3D11_MS_ABI swapchain_set_private_data(
     IDXGISwapChain *object, REFIID Name, uint32_t DataSize, const void *pData)
 {
     (void)object; (void)Name; (void)DataSize; (void)pData;
     return (HRESULT)0x80004001; /* E_NOTIMPL */
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_set_private_data_interface(
+static HRESULT D3D11_MS_ABI swapchain_set_private_data_interface(
     IDXGISwapChain *object, REFIID Name, const void *pUnknown)
 {
     (void)object; (void)Name; (void)pUnknown;
     return (HRESULT)0x80004001;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_get_private_data(
+static HRESULT D3D11_MS_ABI swapchain_get_private_data(
     IDXGISwapChain *object, REFIID Name, uint32_t *pDataSize, void *pData)
 {
     (void)object; (void)Name; (void)pDataSize; (void)pData;
     return (HRESULT)0x887a0002; /* DXGI_ERROR_NOT_FOUND */
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_get_parent(
+static HRESULT D3D11_MS_ABI swapchain_get_parent(
     IDXGISwapChain *object, REFIID riid, void **ppParent)
 {
     (void)object; (void)riid;
@@ -6229,7 +6231,7 @@ static HRESULT __attribute__((ms_abi)) swapchain_get_parent(
     return E_NOINTERFACE;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_get_device(
+static HRESULT D3D11_MS_ABI swapchain_get_device(
     IDXGISwapChain *object, REFIID riid, void **ppDevice)
 {
     BeerDxgiSwapChain *this = (BeerDxgiSwapChain *)object;
@@ -6328,7 +6330,7 @@ static void dump_presented_frame(BeerD3D11Resource *back_buffer,
             present_count, path, count, limit);
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_present(IDXGISwapChain *object, uint32_t SyncInterval, uint32_t Flags) {
+static HRESULT D3D11_MS_ABI swapchain_present(IDXGISwapChain *object, uint32_t SyncInterval, uint32_t Flags) {
     BeerDxgiSwapChain *this = (BeerDxgiSwapChain *)object;
     uint32_t call = ++this->present_count;
     uint64_t write_serial = this->back_buffer
@@ -6465,7 +6467,7 @@ static HRESULT __attribute__((ms_abi)) swapchain_present(IDXGISwapChain *object,
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_get_buffer(
+static HRESULT D3D11_MS_ABI swapchain_get_buffer(
     IDXGISwapChain *object, uint32_t Buffer, REFIID riid, LPVOID *ppSurface)
 {
     BeerDxgiSwapChain *this = (BeerDxgiSwapChain *)object;
@@ -6484,7 +6486,7 @@ static HRESULT __attribute__((ms_abi)) swapchain_get_buffer(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_set_fullscreen_state(
+static HRESULT D3D11_MS_ABI swapchain_set_fullscreen_state(
     IDXGISwapChain *object, int Fullscreen, void *pTarget)
 {
     (void)pTarget;
@@ -6499,7 +6501,7 @@ static HRESULT __attribute__((ms_abi)) swapchain_set_fullscreen_state(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_get_fullscreen_state(
+static HRESULT D3D11_MS_ABI swapchain_get_fullscreen_state(
     IDXGISwapChain *object, int *pFullscreen, void *ppTarget)
 {
     if (pFullscreen) *pFullscreen = ((BeerDxgiSwapChain *)object)->fullscreen;
@@ -6507,7 +6509,7 @@ static HRESULT __attribute__((ms_abi)) swapchain_get_fullscreen_state(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_get_desc(
+static HRESULT D3D11_MS_ABI swapchain_get_desc(
     IDXGISwapChain *object, void *pDesc)
 {
     if (!pDesc) return (HRESULT)0x80070057;
@@ -6516,7 +6518,7 @@ static HRESULT __attribute__((ms_abi)) swapchain_get_desc(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_resize_buffers(
+static HRESULT D3D11_MS_ABI swapchain_resize_buffers(
     IDXGISwapChain *object, uint32_t BufferCount, uint32_t Width,
     uint32_t Height, uint32_t NewFormat, uint32_t SwapChainFlags)
 {
@@ -6529,7 +6531,7 @@ static HRESULT __attribute__((ms_abi)) swapchain_resize_buffers(
     return swapchain_recreate_back_buffer(this);
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_resize_target(
+static HRESULT D3D11_MS_ABI swapchain_resize_target(
     IDXGISwapChain *object, void *pNewTargetParameters)
 {
     if (!pNewTargetParameters) return (HRESULT)0x80070057;
@@ -6538,19 +6540,19 @@ static HRESULT __attribute__((ms_abi)) swapchain_resize_target(
     return S_OK;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_get_containing_output(IDXGISwapChain *this, void *ppOutput) {
+static HRESULT D3D11_MS_ABI swapchain_get_containing_output(IDXGISwapChain *this, void *ppOutput) {
     (void)this;
     if (!ppOutput) return (HRESULT)0x80070057;
     *(void **)ppOutput = NULL;
     return (HRESULT)0x887a0002;
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_get_frame_statistics(IDXGISwapChain *this, void *pStats) {
+static HRESULT D3D11_MS_ABI swapchain_get_frame_statistics(IDXGISwapChain *this, void *pStats) {
     (void)this; (void)pStats;
     return (HRESULT)0x887a0001; /* DXGI_ERROR_INVALID_CALL in windowed mode */
 }
 
-static HRESULT __attribute__((ms_abi)) swapchain_get_last_present_count(
+static HRESULT D3D11_MS_ABI swapchain_get_last_present_count(
     IDXGISwapChain *object, uint32_t *pLastPresentCount)
 {
     if (!pLastPresentCount) return (HRESULT)0x80070057;

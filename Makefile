@@ -121,6 +121,8 @@ test-input:
 	/tmp/beer-win32-filesystem-policy-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/steam_offline_policy_test.c -o /tmp/beer-steam-offline-policy-test
 	/tmp/beer-steam-offline-policy-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_hash_test.c platform/beer_hash.c -o /tmp/beer-hash-test
+	/tmp/beer-hash-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_environment_test.c platform/win32_environment.c -o /tmp/beer-win32-environment-test
 	/tmp/beer-win32-environment-test
 	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_shared_data_test.c platform/win32_shared_data.c platform/beer_time.c -lm -o /tmp/beer-win32-shared-data-test

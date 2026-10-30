@@ -36,8 +36,9 @@ typedef struct {
     int reusable;
 } Hash;
 
-/* Pseudo-handles Windows defines for the default providers: (BCRYPT_ALG_HANDLE)0x81..0xA1. */
-static int pseudo_handle(uint64_t h) { return h >= 0x81 && h <= 0xF1 && (h & 1); }
+/* Pseudo-handles Windows defines for the default providers: (BCRYPT_ALG_HANDLE)0x11..0xF1, which include
+ * BCRYPT_MD5/SHA1/SHA256/SHA384/SHA512_ALG_HANDLE (0x21..0x61), BCRYPT_RNG_ALG_HANDLE (0x81) and the HMAC set. */
+static int pseudo_handle(uint64_t h) { return h >= 0x11 && h <= 0xF1 && (h & 1); }
 
 static const EVP_MD *md_from_name(const uint16_t *name)
 {

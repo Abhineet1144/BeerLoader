@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "guest_cpu.h"
 #include <time.h>
 /* BD12 COM shim, part 2: command allocators, command lists and pipeline
  * states. Every command list method records straight into a VkCommandBuffer
@@ -928,6 +929,7 @@ static void MS cl_clear_dsv(ComList *l, uint64_t handle, uint32_t flags,
     bd12_cmd_clear_dsv(c, (const BD12Descriptor *)(uintptr_t)handle,
                        clear_aspects, depth, stencil, count, count ? r : NULL);
 }
+BEER_HOST_FLOAT_FN(cl_clear_dsv, 1u << 3)   /* float depth is the 4th argument */
 
 static void MS cl_clear_rtv(ComList *l, uint64_t handle, const float *color,
                             uint32_t n, const int32_t *rects)

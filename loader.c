@@ -52,6 +52,8 @@
 #include "win32_shared_data.h"
 #include "win32_bcrypt.h"
 #include "win32_version.h"
+#include "beer_arch.h"
+#include "guest_cpu.h"
 #include "beer_time.h"
 #include "beer_control.h"
 #include "beer_overlay.h"
@@ -65,6 +67,7 @@
 #include "renderer/vulkan/vulkan_renderer.h"
 #include "platform/xwayland_backend.h"
 #include "renderer/vulkan/vulkan_context.h"
+#include "renderer/vulkan/vulkan_presenter.h"
 #include "platform/directinput_format.h"
 #include "platform/guid_compat.h"
 #include "platform/steam_offline_policy.h"
@@ -734,7 +737,7 @@ static int is_guest_stack_rsp(u64 rsp)
     return rsp > low + 0x200 && rsp < high - 0x200;
 }
 
-static void clamp_rsp_to_entry_baseline(ucontext_t *uc, u64 rsp)
+static void clamp_rsp_to_entry_baseline(beer_guest_ucontext_t *uc, u64 rsp)
 {
     if (g_entry_rsp_limit && rsp > g_entry_rsp_limit)
         uc->uc_mcontext.gregs[REG_RSP] = (greg_t)g_entry_rsp;
@@ -778,7 +781,7 @@ static void seed_guest_entry_frame(u64 ret_target)
         *(u64 *)g_entry_ret_slot = ret_target;
 }
 
-static void reset_rsp_to_entry_baseline(ucontext_t *uc)
+static void reset_rsp_to_entry_baseline(beer_guest_ucontext_t *uc)
 {
     /* Restore the real caller-frame base that the helper expects. If we reset to
      * an offset beneath the frame or to the return-slot itself, the next RET
@@ -804,7 +807,7 @@ static void reset_rsp_to_entry_baseline(ucontext_t *uc)
  * shallow within the guest stack itself. Left untouched otherwise, since
  * blindly resetting a merely-deep-but-valid guest rsp would discard live
  * frames unnecessarily. */
-static void ensure_valid_guest_rsp(ucontext_t *uc)
+static void ensure_valid_guest_rsp(beer_guest_ucontext_t *uc)
 {
     u64 rsp = (u64)uc->uc_mcontext.gregs[REG_RSP];
     if (!is_guest_stack_rsp(rsp))
@@ -930,7 +933,7 @@ static int probe_stack_resume_window(u64 rsp, u64 *ret_out)
     return 0;
 }
 
-static void force_safe_fail_return(ucontext_t *uc, u64 rip)
+static void force_safe_fail_return(beer_guest_ucontext_t *uc, u64 rip)
 {
     u64 target = guest_resume_rip();
     uc->uc_mcontext.gregs[REG_RAX] = 0;
@@ -1158,6 +1161,7 @@ static u64 __attribute__((ms_abi, unused)) get_saved_guest_rsp_from_teb(void)
     return g_saved_guest_rsp;
 }
 
+#if BEER_GUEST_NATIVE
 __asm__(
     ".text\n"
     ".global beer_dispatch_trampoline\n"
@@ -1250,6 +1254,7 @@ __asm__(
     "    mov 0x120(%rsp), %rsp\n"
     "    ret\n"
 );
+#endif
 extern void beer_dispatch_trampoline(void);
 
 /*
@@ -1278,8 +1283,27 @@ stub_dispatch(u64 idx, u64 a1, u64 a2, u64 a3)
  * JMP (not CALL): stub_dispatch returns directly to the Windows caller.
  * ecx = rcx = first Windows x64 argument → idx arrives as parameter 0.
  */
+#if !BEER_GUEST_NATIVE
+/* Emulated guest: every import is  mov r10,rcx ; mov eax,<id> ; syscall ; ret  (R10 carries argument 1 because the
+ * syscall instruction clobbers RCX). The backend hands the id and the argument registers to
+ * beer_guest_import_dispatch(). Ids >= 0x40000000 are the logging stubs for unimplemented imports. */
+static void emit_syscall_thunk(int idx, u32 id)
+{
+    u8 *p = g_tramp + idx * THUNK_SZ;
+    p[0] = 0x49; p[1] = 0x89; p[2] = 0xCA;      /* mov r10, rcx */
+    p[3] = 0xB8; memcpy(p + 4, &id, 4);         /* mov eax, id */
+    p[8] = 0x0F; p[9] = 0x05;                   /* syscall */
+    p[10] = 0xC3;                               /* ret */
+    memset(p + 11, 0xCC, THUNK_SZ - 11);
+}
+#endif
+
 static void emit_thunk(int idx)
 {
+#if !BEER_GUEST_NATIVE
+    emit_syscall_thunk(idx, 0x40000000u | (u32)idx);
+    return;
+#endif
     u8  *p  = g_tramp + idx * THUNK_SZ;
     u64  fn = (u64)stub_dispatch;
 
@@ -1311,6 +1335,12 @@ static void emit_impl_thunk(int idx, u64 fn_ptr)
     u8 *p = g_tramp + idx * THUNK_SZ;
     if (g_api_trace < 0) g_api_trace = getenv("BEER_API_TRACE") != NULL;
     g_impl_real[idx] = fn_ptr;
+#if !BEER_GUEST_NATIVE
+    (void)p;
+    g_impl_targets[idx] = fn_ptr;   /* BEER_API_TRACE's wrapper is native asm; not available under emulation */
+    emit_syscall_thunk(idx, (u32)idx);
+    return;
+#else
     g_impl_targets[idx] = g_api_trace ? (u64)beer_trace_wrap : fn_ptr;
 
     u32 idx32 = (u32)idx;
@@ -1324,7 +1354,134 @@ static void emit_impl_thunk(int idx, u64 fn_ptr)
 
     p[16] = 0xFF; p[17] = 0xE0;      /* jmp rax (back to original JMP) */
     memset(p + 18, 0x90, 6);         /* nop pad */
+#endif
 }
+
+#if !BEER_GUEST_NATIVE
+/* Called by the emulator backend for every guest import thunk. Plays the role of beer_dispatch_trampoline:
+ * records where the guest called from, then calls the implementation with the guest's argument registers and
+ * stack arguments. AArch64 has no Win64 ABI, so implementations are plain C functions taking integer arguments;
+ * the extra arguments the callee does not declare are harmless. (Imports with float/XMM arguments or results
+ * need signature-aware handling; none are used on the first end-to-end path.) */
+typedef u64 (*BeerImportFn)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+typedef u64 (*BeerImportFnF)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+                             double, double, double, double, double, double, double, double);
+
+/* Host functions that take float arguments (Win64: XMM<position>; AAPCS64: s0.. in float order, integers numbered
+ * independently), registered with BEER_HOST_FLOAT_FN. */
+typedef struct { void *fn; unsigned mask; } BeerFloatSig;
+static BeerFloatSig g_float_sigs[64];
+static unsigned g_float_sig_count;
+
+void beer_host_float_signature(void *fn, unsigned mask)
+{
+    if (g_float_sig_count < sizeof(g_float_sigs) / sizeof(g_float_sigs[0]))
+        g_float_sigs[g_float_sig_count++] = (BeerFloatSig){fn, mask & 0xFu};
+}
+
+static unsigned beer_float_mask_of(const void *fn)
+{
+    for (unsigned i = 0; i < g_float_sig_count; ++i)
+        if (g_float_sigs[i].fn == fn) return g_float_sigs[i].mask;
+    return 0;
+}
+
+u64 beer_guest_host_call(u64 fn, const u64 *a, const u64 *xmm)
+{
+    const unsigned mask = beer_float_mask_of((const void *)(uintptr_t)fn);
+    if (!mask)
+        return ((BeerImportFn)(uintptr_t)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                                             a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]);
+    /* A float at position p (< 4) lives in XMM<p> and its integer slot is unused; AAPCS64 numbers integer and
+     * floating-point arguments separately, so drop those positions from the integer list and pass the floats in
+     * order in d0, d1, ... (a float parameter reads the low 32 bits). */
+    u64 b[16];
+    unsigned n = 0;
+    for (unsigned p = 0; p < 16; ++p)
+        if (!(p < 4 && (mask & (1u << p)))) b[n++] = a[p];
+    while (n < 16) b[n++] = 0;
+    double d[8] = {0};
+    unsigned j = 0;
+    for (unsigned p = 0; p < 4; ++p)
+        if (mask & (1u << p)) memcpy(&d[j++], &xmm[p], sizeof(double));
+    return ((BeerImportFnF)(uintptr_t)fn)(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
+                                          b[12], b[13], b[14], b[15], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+}
+
+/* BEER_THREAD_DUMP=1: `kill -USR2 <pid>` prints, for every guest thread, its last import (name + guest return
+ * address), whether it is still inside it, and how many imports it has made: enough to see what each thread of
+ * an emulated guest is blocked on or spinning in without a debugger. */
+typedef struct { _Atomic(u64) calls, last_id, last_ret, enter_ns; _Atomic(int) in_import; pid_t tid; } ThreadTrack;
+#define MAX_TRACKED_THREADS 256
+static ThreadTrack g_tracks[MAX_TRACKED_THREADS];
+static _Atomic(int) g_ntracks;
+static __thread ThreadTrack *t_track;
+static int g_thread_dump_enabled = -1;
+
+static void thread_dump_handler(int sig)
+{
+    (void)sig;
+    const int n = atomic_load(&g_ntracks);
+    for (int i = 0; i < n && i < MAX_TRACKED_THREADS; ++i) {
+        ThreadTrack *t = &g_tracks[i];
+        const u64 id = atomic_load(&t->last_id);
+        const u64 idx = (id & 0x40000000u) ? (id & 0xffffu) : id;
+        const char *name = idx < MAX_STUBS && g_snames[idx] ? g_snames[idx] : "?";
+        fprintf(stderr, "[THREAD-DUMP] tid=%d calls=%llu %s %s ret=0x%llx\n", (int)t->tid,
+                (unsigned long long)atomic_load(&t->calls),
+                atomic_load(&t->in_import) ? "IN " : "after", name, (unsigned long long)atomic_load(&t->last_ret));
+    }
+    fprintf(stderr, "[THREAD-DUMP] end (%d threads)\n", n);
+}
+
+static ThreadTrack *thread_track(void)
+{
+    if (g_thread_dump_enabled < 0) {
+        g_thread_dump_enabled = getenv("BEER_THREAD_DUMP") != NULL;
+        if (g_thread_dump_enabled) signal(SIGUSR2, thread_dump_handler);
+    }
+    if (!g_thread_dump_enabled) return NULL;
+    if (!t_track) {
+        const int slot = atomic_fetch_add(&g_ntracks, 1);
+        if (slot >= MAX_TRACKED_THREADS) return NULL;
+        t_track = &g_tracks[slot];
+        t_track->tid = (pid_t)syscall(SYS_gettid);
+    }
+    return t_track;
+}
+
+static u64 __attribute__((ms_abi)) beer_trace_log(u64 idx, u64 a, u64 b, u64 c, u64 d);
+static u64 __attribute__((ms_abi)) beer_trace_ret(u64 idx, u64 value);
+
+u64 beer_guest_import_dispatch(u64 id, const u64 *a, const u64 *xmm, u64 guest_rsp)
+{
+    g_dispatch_incoming_rsp = guest_rsp;
+    g_dispatch_incoming_return = *(const u64 *)(uintptr_t)guest_rsp;   /* the thunk's return address */
+    ThreadTrack *track = thread_track();
+    if (track) {
+        atomic_fetch_add(&track->calls, 1);
+        atomic_store(&track->last_id, id);
+        atomic_store(&track->last_ret, g_dispatch_incoming_return);
+        atomic_store(&track->in_import, 1);
+    }
+    const u64 prev_saved_rsp = g_saved_guest_rsp;
+    g_saved_guest_rsp = guest_rsp;
+    u64 result = 0;
+    if (id & 0x40000000u) {
+        result = stub_dispatch(id & 0xffffu, a[1], a[2], a[3]);
+    } else if (id < MAX_STUBS && g_impl_targets[id]) {
+        g_dispatch_import_index = id;
+        if (g_api_trace > 0) beer_trace_log(id, a[0], a[1], a[2], a[3]);   /* BEER_API_TRACE under emulation */
+        result = beer_guest_host_call(g_impl_targets[id], a, xmm);
+        if (g_api_trace > 0) beer_trace_ret(id, result);
+    } else {
+        fprintf(stderr, "[IMPORT] unknown import id 0x%llx\n", (unsigned long long)id);
+    }
+    g_saved_guest_rsp = prev_saved_rsp;
+    if (track) atomic_store(&track->in_import, 0);
+    return result;
+}
+#endif
 
 /* BEER_API_TRACE=1: every guest->host API call is logged (name + first four arguments). The wrapper
  * sits between the dispatcher and the real implementation, preserving all argument registers. */
@@ -1457,6 +1614,7 @@ static u64 __attribute__((ms_abi)) beer_trace_ret(u64 idx, u64 value)
     if (t_trace_logged) fprintf(stderr, "        -> %lx\n", value);
     return 0;
 }
+#if BEER_GUEST_NATIVE
 __asm__(
     ".text\n"
     ".global beer_trace_wrap\n"
@@ -1496,6 +1654,7 @@ __asm__(
     "    add $0x98, %rsp\n"
     "    ret\n"
 );
+#endif
 
 /* ── Real implementations (Windows x64 ABI) ────────────────────── */
 #include <time.h>
@@ -1709,7 +1868,7 @@ static inline u64 current_windows_thread_id(void)
 {
     if (g_cached_windows_thread_id) return g_cached_windows_thread_id;
     u64 gs_base = 0;
-    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
+    if (beer_guest_get_gs_base(&gs_base) == 0 && gs_base) {
         WinTEB *teb = (WinTEB *)gs_base;
         if (teb->UniqueThread)
             return g_cached_windows_thread_id = teb->UniqueThread;
@@ -3152,32 +3311,13 @@ static u64 __attribute__((ms_abi)) impl_SetLastError(u32 e) { g_last_error = e; 
 /* ---- Misc ---- */
 static u64 __attribute__((ms_abi)) impl_IsDebuggerPresent(void)    { return 0; }
 static u64 __attribute__((ms_abi)) impl_IsProcessorFeaturePresent(u32 f) {
-    /* Report the host CPU's real features (winnt.h PF_* numbering); engines
+    /* Report the guest-visible features (winnt.h PF_* numbering); engines
      * refuse to start when SSE4.2/AVX/AVX2 look absent. Unlisted features are
-     * false, and FP emulation is never present. */
-    __builtin_cpu_init();
-    switch (f) {
-    case 2:  return 1;                                   /* CMPXCHG8B */
-    case 3:  return __builtin_cpu_supports("mmx") != 0;
-    case 6:  return __builtin_cpu_supports("sse") != 0;
-    case 8:  return 1;                                   /* RDTSC */
-    case 9:  return 1;                                   /* PAE */
-    case 10: return __builtin_cpu_supports("sse2") != 0;
-    case 12: return 1;                                   /* NX */
-    case 13: return __builtin_cpu_supports("sse3") != 0;
-    case 14: return 1;                                   /* CMPXCHG16B */
-    case 17: return __builtin_cpu_supports("xsave") != 0;
-    case 22: return 1;                                   /* RDWRFSGSBASE */
-    case 28: return __builtin_cpu_supports("rdrnd") != 0;
-    case 32: return 1;                                   /* RDTSCP */
-    case 36: return __builtin_cpu_supports("ssse3") != 0;
-    case 37: return __builtin_cpu_supports("sse4.1") != 0;
-    case 38: return __builtin_cpu_supports("sse4.2") != 0;
-    case 39: return __builtin_cpu_supports("avx") != 0;
-    case 40: return __builtin_cpu_supports("avx2") != 0;
-    case 41: return __builtin_cpu_supports("avx512f") != 0;
-    default: return 0;
-    }
+     * false, and FP emulation is never present. Shared with KUSER_SHARED_DATA. */
+    uint8_t features[BEER_PF_COUNT];
+    if (f >= BEER_PF_COUNT) return 0;
+    beer_guest_processor_features(features);
+    return features[f];
 }
 /* Diagnostic helper: scan the current (guest) stack for return-address-shaped
  * values that fall inside the mapped guest image, to reconstruct an
@@ -3293,6 +3433,7 @@ static u64 __attribute__((ms_abi)) impl_UnhandledExceptionFilter(u64 ep) {
  *   rsp   = caller's RSP - 8 (call pushed the return addr)
  * We store all GP regs + RIP + RSP into the Windows CONTEXT struct.
  */
+#if BEER_GUEST_NATIVE
 asm(
 ".global impl_RtlCaptureContext\n"
 ".type   impl_RtlCaptureContext, @function\n"
@@ -3323,11 +3464,21 @@ asm(
 "ret\n"
 ".att_syntax prefix\n"
 );
+#endif
+#if BEER_GUEST_NATIVE
 extern void impl_RtlCaptureContext(void); /* declaration for the table */
 extern void impl_RtlUnwind(void);
 extern void impl_RtlUnwindEx(void);
 extern void impl_RtlRestoreContext(void);
 extern void impl_RaiseException_entry(void);
+#else
+/* Emulated guest: ordinary C functions over beer_guest_caller_regs()/beer_guest_resume() (defined below). */
+u64 __attribute__((ms_abi)) impl_RtlCaptureContext(u8 *ctx);
+u64 __attribute__((ms_abi)) impl_RtlUnwind(u64 target_frame, u64 target_ip, void *record, u64 return_value);
+u64 __attribute__((ms_abi)) impl_RtlUnwindEx(u64 target_frame, u64 target_ip, void *record, u64 return_value);
+u64 __attribute__((ms_abi)) impl_RtlRestoreContext(u8 *ctx, void *record);
+u64 __attribute__((ms_abi)) impl_RaiseException_entry(u32 code, u32 flags, u32 nargs, const u64 *args);
+#endif
 
 /* ── TLS — real per-thread storage via pthread keys ─────────────────
  * Windows TLS must be per-thread. We back each slot with a pthread key.
@@ -3726,15 +3877,15 @@ static void beer_wave_notify(BeerWaveOut *wave, u32 message, u64 param1)
         impl_SetEvent(wave->callback);
     } else if (wave->callback_type == CALLBACK_FUNCTION) {
         u64 gs_base = 0;
-        if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) != 0 || !gs_base) {
+        if (beer_guest_get_gs_base(&gs_base) != 0 || !gs_base) {
             void *teb = alloc_teb_for_thread();
-            if (!teb || syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)teb) != 0) {
+            if (!teb || beer_guest_set_gs_base((u64)teb) != 0) {
                 fprintf(stderr, "[AUDIO] cannot install TEB for wave callback\n");
                 return;
             }
         }
         typedef void __attribute__((ms_abi)) (*WaveCallback)(u64, u32, u64, u64, u64);
-        ((WaveCallback)wave->callback)((u64)wave, message,
+        BEER_GUEST_CALL(((WaveCallback)wave->callback), (u64)wave, message,
                                       wave->callback_instance, param1, 0);
     }
 }
@@ -4283,9 +4434,9 @@ impl_DirectSoundEnumerateW(BeerDsEnumCallbackW callback, void *context)
         0x42, 0x45, 0x45, 0x52, 0x50, 0x57, 0x00, 0x01,
         0x80, 0x00, 0x42, 0x45, 0x45, 0x52, 0x00, 0x01
     };
-    int keep_enumerating = callback(NULL, primary, module, context);
+    int keep_enumerating = BEER_GUEST_CALL(callback, NULL, primary, module, context);
     if (keep_enumerating)
-        keep_enumerating = callback(device_guid, description, module, context);
+        keep_enumerating = BEER_GUEST_CALL(callback, device_guid, description, module, context);
     fprintf(stderr, "[AUDIO] DirectSoundEnumerateW callbacks complete -> %d\n",
             keep_enumerating);
     return BEER_DS_OK;
@@ -4400,7 +4551,7 @@ impl_SteamInternal_ContextInit(void *context_data)
     typedef void __attribute__((ms_abi)) (*ContextPopulate)(void *context);
     ContextPopulate populate = (ContextPopulate)(uintptr_t)fields[0];
     void *context = &fields[2];
-    if (populate) populate(context);
+    if (populate) BEER_GUEST_CALL(populate, context);
     fields[1]++;
     return (u64)context;
 }
@@ -4733,8 +4884,7 @@ impl_SteamAPI_RunCallbacks(void)
         if (!vtable || !vtable[1]) continue;
         typedef void __attribute__((ms_abi)) (*RunCallResult)(
             u64, void *, u32, u64);
-        ((RunCallResult)(uintptr_t)vtable[1])(
-            dispatch->callback, dispatch->result, 0, dispatch->handle);
+        BEER_GUEST_CALL(((RunCallResult)(uintptr_t)vtable[1]), dispatch->callback, dispatch->result, 0, dispatch->handle);
         if (getenv("BEER_FILE_DIAGNOSTICS"))
             fprintf(stderr,
                     "[STEAM] dispatched call=%llu callback-id=%u size=%u\n",
@@ -6217,7 +6367,7 @@ static void d3d11_retain_com_output(void *object)
     void **vtable = *(void ***)object;
     if (!vtable || !vtable[1]) return;
     typedef u32 __attribute__((ms_abi)) (*AddRefFn)(void *);
-    ((AddRefFn)vtable[1])(object);
+    BEER_GUEST_CALL(((AddRefFn)vtable[1]), object);
 }
 
 /*
@@ -7137,8 +7287,7 @@ static uint64_t beer_mf_invoke_on_read_sample(void *callback_object,
     void **vt = *(void ***)callback_object;
     typedef uint64_t __attribute__((ms_abi)) (*OnReadSampleFn)(
         void *, uint64_t, uint32_t, uint32_t, int64_t, void *);
-    uint64_t result = ((OnReadSampleFn)vt[3])(
-        callback_object, hr, stream_index, stream_flags, timestamp, sample);
+    uint64_t result = BEER_GUEST_CALL(((OnReadSampleFn)vt[3]), callback_object, hr, stream_index, stream_flags, timestamp, sample);
     static _Atomic(uint32_t) diag_count;
     if (getenv("BEER_MF_DIAGNOSTICS") &&
         atomic_fetch_add_explicit(&diag_count, 1, memory_order_relaxed) < 32)
@@ -7157,7 +7306,7 @@ static uint64_t beer_mf_invoke_on_flush(void *callback_object,
     if (!callback_object) return 0;
     void **vt = *(void ***)callback_object;
     typedef uint64_t __attribute__((ms_abi)) (*OnFlushFn)(void *, uint32_t);
-    uint64_t result = ((OnFlushFn)vt[4])(callback_object, stream_index);
+    uint64_t result = BEER_GUEST_CALL(((OnFlushFn)vt[4]), callback_object, stream_index);
     if (getenv("BEER_MF_DIAGNOSTICS"))
         fprintf(stderr, "[MF CB] OnFlush cb=%p stream=%u -> %#llx\n",
                 callback_object, stream_index, (unsigned long long)result);
@@ -8804,7 +8953,7 @@ impl_InitOnceExecuteOnce(u64 *once, u64 fn, u64 param, u64 *ctx)
         *once = 1;
         if (fn) {
             typedef u64 __attribute__((ms_abi)) (*InitFn)(u64*, u64, u64*);
-            ((InitFn)fn)(once, param, ctx);
+            BEER_GUEST_CALL(((InitFn)fn), once, param, ctx);
         }
     }
     return 1;
@@ -8866,7 +9015,7 @@ static void *win_thread_trampoline(void *p) {
     /* Give this thread its own private TEB + TLS array so implicit TLS
      * (__declspec(thread) via gs:[0x58][index]) is per-thread, not shared. */
     void *teb = alloc_teb_for_thread();
-    int gs_rc = syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)teb);
+    int gs_rc = beer_guest_set_gs_base((u64)teb);
     if (gs_rc != 0) fprintf(stderr, "[GS] CreateThread: arch_prctl failed: %d\n", gs_rc);
 
     pthread_mutex_lock(&t->mtx);
@@ -8890,7 +9039,7 @@ static void *win_thread_trampoline(void *p) {
     pthread_cleanup_push(thread_done_cleanup, (void *)(intptr_t)id);
 
     typedef u64 __attribute__((ms_abi)) (*WinFn)(u64);
-    u64 exit_code = ((WinFn)t->fn)(t->arg);
+    u64 exit_code = BEER_GUEST_CALL(((WinFn)t->fn), t->arg);
     pthread_mutex_lock(&t->mtx);
     t->exit_code = (u32)exit_code;
     pthread_mutex_unlock(&t->mtx);
@@ -9079,7 +9228,11 @@ impl_TerminateThread(u64 h, u32 code)
     WinThread *t = &g_threads[id];
     pthread_mutex_lock(&t->mtx);
     if (t->started && !t->done) {
+#if defined(__ANDROID__)
+        /* bionic has no pthread_cancel; the thread is only marked finished. */
+#else
         pthread_cancel(t->pt);
+#endif
         t->done = 1;
         pthread_cond_broadcast(&t->cv);
     }
@@ -10623,7 +10776,7 @@ static u64 call_guest_wndproc(u32 message, u64 wparam, u64 lparam)
         fprintf(stderr, "[INPUT] wndproc mouse message 0x%04x wparam=0x%llx\n",
                 message, (unsigned long long)wparam);
     if (!g_window_proc) return message == 0x0081 ? 1 : 0;
-    return ((GuestWndProc)(uintptr_t)g_window_proc)(FAKE_HWND, message, wparam, lparam);
+    return BEER_GUEST_CALL(((GuestWndProc)(uintptr_t)g_window_proc), FAKE_HWND, message, wparam, lparam);
 }
 
 static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
@@ -12574,8 +12727,7 @@ impl_DispatchMessageW(const WIN_MSG *msg)
                 .time = msg->time,
                 .extra_info = 0
             };
-            ((GuestHookProc)(uintptr_t)hook_proc)(
-                0, msg->message, (u64)(uintptr_t)&data);
+            BEER_GUEST_CALL(((GuestHookProc)(uintptr_t)hook_proc), 0, msg->message, (u64)(uintptr_t)&data);
         }
     } else if (beer_win32_message_is_button_transition(msg->message) ||
                msg->message == 0x0200 || msg->message == 0x020a) {
@@ -12590,14 +12742,13 @@ impl_DispatchMessageW(const WIN_MSG *msg)
                 .time = msg->time,
                 .extra_info = 0
             };
-            ((GuestHookProc)(uintptr_t)hook_proc)(
-                0, msg->message, (u64)(uintptr_t)&data);
+            BEER_GUEST_CALL(((GuestHookProc)(uintptr_t)hook_proc), 0, msg->message, (u64)(uintptr_t)&data);
         }
     }
     /* WM_TIMER (0x0113): lParam is the optional timer-proc address */
     if (msg->message == 0x0113 && msg->lParam) {
         typedef void __attribute__((ms_abi)) (*GuestTimerProc)(u64, u32, u64, u32);
-        ((GuestTimerProc)(uintptr_t)msg->lParam)(msg->hwnd, msg->message,
+        BEER_GUEST_CALL(((GuestTimerProc)(uintptr_t)msg->lParam), msg->hwnd, msg->message,
                                                 msg->wParam, msg->time);
         return 0;
     }
@@ -12794,7 +12945,7 @@ static u64 __attribute__((ms_abi))
 impl_CallWindowProcW(u64 proc, u64 hw, u32 msg, u64 wp, u64 lp)
 {
     if (!proc) return impl_DefWindowProcW(hw, msg, wp, lp);
-    return ((GuestWndProc)(uintptr_t)proc)(hw, msg, wp, lp);
+    return BEER_GUEST_CALL(((GuestWndProc)(uintptr_t)proc), hw, msg, wp, lp);
 }
 static u64 window_long_value(s32 index)
 {
@@ -13015,7 +13166,7 @@ impl_EnumDisplayMonitors(u64 hdc, void *clip, MonitorEnumProc proc, u64 data)
     xwayland_get_screen_size(&sw, &sh);
     /* Pass a stack RECT for the monitor bounds */
     s32 rect[4] = {0, 0, sw, sh};
-    return proc(0xD0000002u, (u64)FAKE_HDC, (u64)(uintptr_t)rect, data);
+    return BEER_GUEST_CALL(proc, 0xD0000002u, (u64)FAKE_HDC, (u64)(uintptr_t)rect, data);
 }
 
 /* EnumDisplaySettingsW — reports a single fullscreen mode matching the screen */
@@ -13315,7 +13466,7 @@ impl_EnumSystemLocalesW(u64 callback, u32 flags)
     if (callback) {
         static u16 loc[] = {'0','4','0','9',0}; /* en-US */
         typedef u64 __attribute__((ms_abi)) (*Cb)(u16 *);
-        ((Cb)callback)(loc);
+        BEER_GUEST_CALL(((Cb)callback), loc);
     }
     return 1;
 }
@@ -13363,7 +13514,7 @@ impl_EnumSystemLocalesEx(u64 callback, u32 flags, u64 lparam, void *reserved)
     };
     typedef u64 __attribute__((ms_abi)) (*LocaleEnumProcEx)(u16 *, u32, u64);
     for (size_t i = 0; i < sizeof(locale_names) / sizeof(locale_names[0]); i++) {
-        if (!((LocaleEnumProcEx)callback)(locale_names[i], 0, lparam))
+        if (!BEER_GUEST_CALL(((LocaleEnumProcEx)callback), locale_names[i], 0, lparam))
             break;
     }
     return 1;
@@ -13508,7 +13659,9 @@ static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
     {   /* Where did the guest decide to quit? Dump the code around the caller. */
         const char *dir = getenv("BEER_EXIT_DUMP");
         u64 grsp = 0;
+#if BEER_GUEST_NATIVE
         __asm__ volatile("mov %%fs:g_saved_guest_rsp@tpoff, %0" : "=r"(grsp));
+#endif
         const u64 *gsp = (const u64 *)grsp;
         u64 ret = (u64)__builtin_return_address(0);
         if (grsp > 0x10000) {
@@ -13666,12 +13819,12 @@ static void *tp_work_thread(void *arg)
     WinTPWork *w = (WinTPWork *)arg;
     void *teb = alloc_teb_for_thread();
     if (teb) {
-        int gs_rc = syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)teb);
+        int gs_rc = beer_guest_set_gs_base((u64)teb);
         if (gs_rc != 0) fprintf(stderr, "[GS] TPWork: arch_prctl failed: %d\n", gs_rc);
     }
     guest_dll_notify_thread(2 /* DLL_THREAD_ATTACH */);
     typedef void __attribute__((ms_abi)) (*WorkCB)(u64,u64,u64);
-    ((WorkCB)w->cb)(0 /*instance*/, w->ctx, (u64)w);
+    BEER_GUEST_CALL(((WorkCB)w->cb), 0 /*instance*/, w->ctx, (u64)w);
     guest_dll_notify_thread(3 /* DLL_THREAD_DETACH */);
     pthread_mutex_lock(&w->mtx);
     if (--w->pending == 0) pthread_cond_broadcast(&w->cv);
@@ -13745,7 +13898,7 @@ static void *tp_timer_thread(void *arg)
     WinTPTimer *t = (WinTPTimer *)arg;
     void *teb = alloc_teb_for_thread();
     if (teb) {
-        int gs_rc = syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)teb);
+        int gs_rc = beer_guest_set_gs_base((u64)teb);
         if (gs_rc != 0) fprintf(stderr, "[GS] TPTimer: arch_prctl failed: %d\n", gs_rc);
     }
     guest_dll_notify_thread(2 /* DLL_THREAD_ATTACH */);
@@ -13762,7 +13915,7 @@ static void *tp_timer_thread(void *arg)
         if (t->cancel) break;
         if (r == ETIMEDOUT) {
             pthread_mutex_unlock(&t->mtx);
-            ((TimerCB)t->cb)(0, t->ctx, (u64)t);
+            BEER_GUEST_CALL(((TimerCB)t->cb), 0, t->ctx, (u64)t);
             pthread_mutex_lock(&t->mtx);
             if (t->period_ms == 0) break;
             t->due_100ns = (u64)t->period_ms * 10000ULL;
@@ -13852,7 +14005,7 @@ static void *tp_wait_thread(void *arg)
     WinTPWait *w = (WinTPWait *)arg;
     void *teb = alloc_teb_for_thread();
     if (teb) {
-        int gs_rc = syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)teb);
+        int gs_rc = beer_guest_set_gs_base((u64)teb);
         if (gs_rc != 0) fprintf(stderr, "[GS] TPWait: arch_prctl failed: %d\n", gs_rc);
     }
     guest_dll_notify_thread(2 /* DLL_THREAD_ATTACH */);
@@ -13890,7 +14043,7 @@ static void *tp_wait_thread(void *arg)
     pthread_cond_broadcast(&w->cv);
     pthread_mutex_unlock(&w->mtx);
     if (!canceled && (result == 0 || result == 0x102u))
-        ((WaitCB)w->cb)(0, w->ctx, (u64)w,
+        BEER_GUEST_CALL(((WaitCB)w->cb), 0, w->ctx, (u64)w,
                         result == 0 ? 0u : 258u /* WAIT_TIMEOUT */);
     guest_dll_notify_thread(3 /* DLL_THREAD_DETACH */);
     return NULL;
@@ -14706,7 +14859,7 @@ impl_BinkSetSoundSystem_dispatch(u64 open_callback, u64 parameter)
 {
     if (!g_real_bink_set_sound_system) return 0;
     typedef u64 (__attribute__((ms_abi)) *Fn)(u64, u64);
-    u64 result = ((Fn)g_real_bink_set_sound_system)(open_callback, parameter);
+    u64 result = BEER_GUEST_CALL(((Fn)g_real_bink_set_sound_system), open_callback, parameter);
     fprintf(stderr, "[AUDIO] BinkSetSoundSystem(callback=%p, parameter=%p) -> %llu\n",
             (void *)open_callback, (void *)parameter, (unsigned long long)result);
     return result;
@@ -14717,7 +14870,7 @@ impl_BinkOpen_dispatch(const char *name, u32 flags)
 {
     if (!g_real_bink_open) return 0;
     typedef u64 (__attribute__((ms_abi)) *Fn)(const char *, u32);
-    u64 result = ((Fn)g_real_bink_open)(name, flags);
+    u64 result = BEER_GUEST_CALL(((Fn)g_real_bink_open), name, flags);
     fprintf(stderr, "[AUDIO] BinkOpen(\"%s\", flags=0x%x) -> %p\n",
             name ? name : "(null)", flags, (void *)result);
     return result;
@@ -14729,7 +14882,7 @@ impl_BinkClose_dispatch(void *bink)
     if (!g_real_bink_close) return 0;
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *);
     fprintf(stderr, "[AUDIO] BinkClose(%p)\n", bink);
-    return ((Fn)g_real_bink_close)(bink);
+    return BEER_GUEST_CALL(((Fn)g_real_bink_close), bink);
 }
 
 static void bink_trace_call(const char *name, u64 count, u64 result)
@@ -14743,7 +14896,7 @@ static u64 __attribute__((ms_abi)) impl_BinkWait_dispatch(void *bink)
 {
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *);
     static _Atomic(u64) calls;
-    u64 result = g_real_bink_wait ? ((Fn)g_real_bink_wait)(bink) : 0;
+    u64 result = g_real_bink_wait ? BEER_GUEST_CALL(((Fn)g_real_bink_wait), bink) : 0;
     bink_trace_call("BinkWait", atomic_fetch_add(&calls, 1) + 1, result);
     return result;
 }
@@ -14752,7 +14905,7 @@ static u64 __attribute__((ms_abi)) impl_BinkNextFrame_dispatch(void *bink)
 {
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *);
     static _Atomic(u64) calls;
-    u64 result = g_real_bink_next_frame ? ((Fn)g_real_bink_next_frame)(bink) : 0;
+    u64 result = g_real_bink_next_frame ? BEER_GUEST_CALL(((Fn)g_real_bink_next_frame), bink) : 0;
     bink_trace_call("BinkNextFrame", atomic_fetch_add(&calls, 1) + 1, result);
     return result;
 }
@@ -14773,7 +14926,7 @@ impl_BinkDoFrameAsyncMulti_dispatch(void *bink, u64 threads, u64 thread_count)
     u64 result = 0;
     if (g_real_bink_do_frame) {
         typedef u64 (__attribute__((ms_abi)) *SyncFn)(void *);
-        result = ((SyncFn)g_real_bink_do_frame)(bink);
+        result = BEER_GUEST_CALL(((SyncFn)g_real_bink_do_frame), bink);
         /* Async submission reports whether work was accepted. The synchronous
          * call has completed that work before returning. */
         result = 1;
@@ -14839,7 +14992,7 @@ impl_FMOD_System_setOutput_dispatch(void *system, u32 output)
     if (!system || !g_real_fmod_system_set_output)
         return BEER_FMOD_ERR_INVALID_PARAM;
     typedef u64 (__attribute__((ms_abi)) *SetOutputFn)(void *, u32);
-    u64 result = ((SetOutputFn)g_real_fmod_system_set_output)(system, output);
+    u64 result = BEER_GUEST_CALL(((SetOutputFn)g_real_fmod_system_set_output), system, output);
     fprintf(stderr, "[AUDIO] real FMOD System::setOutput(%u) -> %llu\n",
             output, (unsigned long long)result);
     return result;
@@ -14854,7 +15007,15 @@ static u64 fmod_forward_volume(u64 target, void *object, float volume,
     const char *unmute = getenv("BEER_SEKIRO_AUDIO_UNMUTE");
     if (unmute && *unmute && strcmp(unmute, "0") && applied <= 0.0f)
         applied = 1.0f;
+#if BEER_GUEST_NATIVE
     u64 result = ((Fn)target)(object, applied);
+#else
+    /* Win64 passes the float in XMM1 (second argument position). */
+    u32 applied_bits;
+    memcpy(&applied_bits, &applied, sizeof(applied_bits));
+    const u64 forward_args[2] = {(u64)(uintptr_t)object, (u64)applied_bits};
+    u64 result = beer_guest_call_f((u64)target, forward_args, 2, 1u << 1);
+#endif
     static _Atomic(u32) logs;
     u32 index = atomic_fetch_add_explicit(&logs, 1, memory_order_relaxed);
     if (index < 64 || applied != volume)
@@ -14870,6 +15031,7 @@ impl_FMOD_ChannelGroup_setVolume_dispatch(void *group, float volume)
     return fmod_forward_volume(g_real_fmod_channel_group_set_volume, group,
                                volume, "ChannelGroup");
 }
+BEER_HOST_FLOAT_FN(impl_FMOD_ChannelGroup_setVolume_dispatch, 1u << 1)   /* (void *, float volume) */
 
 static u64 __attribute__((ms_abi))
 impl_FMOD_Event_setVolume_dispatch(void *event, float volume)
@@ -14877,6 +15039,7 @@ impl_FMOD_Event_setVolume_dispatch(void *event, float volume)
     return fmod_forward_volume(g_real_fmod_event_set_volume, event,
                                volume, "Event");
 }
+BEER_HOST_FLOAT_FN(impl_FMOD_Event_setVolume_dispatch, 1u << 1)   /* (void *, float volume) */
 
 static u64 __attribute__((ms_abi))
 impl_FMOD_System_createSound_dispatch(void *system, const char *name_or_data,
@@ -14886,7 +15049,7 @@ impl_FMOD_System_createSound_dispatch(void *system, const char *name_or_data,
         return BEER_FMOD_ERR_INVALID_PARAM;
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *, const char *, u32,
                                               const void *, void **);
-    u64 result = ((Fn)g_real_fmod_system_create_sound)(system, name_or_data, mode,
+    u64 result = BEER_GUEST_CALL(((Fn)g_real_fmod_system_create_sound), system, name_or_data, mode,
                                                        create_info, out);
     static _Atomic(u32) logs;
     u32 index = atomic_fetch_add_explicit(&logs, 1, memory_order_relaxed);
@@ -14906,7 +15069,7 @@ impl_FMOD_EventSystem_preloadFSB_dispatch(void *event_system, const char *name,
         return BEER_FMOD_ERR_INVALID_PARAM;
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *, const char *, int, void *,
                                               unsigned char);
-    u64 result = ((Fn)g_real_fmod_event_preload_fsb)(event_system, name,
+    u64 result = BEER_GUEST_CALL(((Fn)g_real_fmod_event_preload_fsb), event_system, name,
                                                      stream_instance, sound,
                                                      load_into_memory);
     static _Atomic(u32) logs;
@@ -14929,7 +15092,7 @@ impl_FMOD_EventSystem_Create_dispatch(BeerFmodObject **out)
         return BEER_FMOD_ERR_INVALID_PARAM;
     }
     typedef u64 (__attribute__((ms_abi)) *FmodEventSystemCreateFn)(void **);
-    u64 result = ((FmodEventSystemCreateFn)g_real_fmod_event_system_create)((void **)out);
+    u64 result = BEER_GUEST_CALL(((FmodEventSystemCreateFn)g_real_fmod_event_system_create), (void **)out);
     fprintf(stderr, "[AUDIO] real FMOD EventSystem_Create -> result=%llu object=%p\n",
             (unsigned long long)result, out ? (void *)*out : NULL);
     if (!result && out && *out) {
@@ -14947,7 +15110,7 @@ impl_FMOD_EventSystem_Create_dispatch(BeerFmodObject **out)
      * Beer only needs to wrap the stable exported ABI and DirectSound boundary. */
     if (!result && out && *out && g_real_fmod_event_get_system) {
         typedef u64 (__attribute__((ms_abi)) *GetSystemFn)(void *, void **);
-        u64 system_result = ((GetSystemFn)g_real_fmod_event_get_system)(*out,
+        u64 system_result = BEER_GUEST_CALL(((GetSystemFn)g_real_fmod_event_get_system), *out,
                                                 &g_real_fmod_core_system);
         fprintf(stderr, "[AUDIO] real FMOD core System -> result=%llu object=%p\n",
                 (unsigned long long)system_result, g_real_fmod_core_system);
@@ -14983,7 +15146,7 @@ impl_FMOD_EventSystem_update_dispatch(void *event_system)
     event_system = internal ? event_system : fmod_public_event_system(event_system);
     if (!event_system || !target) return BEER_FMOD_ERR_INVALID_PARAM;
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *);
-    u64 result = ((Fn)target)(event_system);
+    u64 result = BEER_GUEST_CALL(((Fn)target), event_system);
     static _Atomic(u32) updates;
     u32 update = atomic_fetch_add_explicit(&updates, 1, memory_order_relaxed) + 1;
     if (update <= 4 || !(update % 600))
@@ -15005,7 +15168,7 @@ impl_FMOD_EventSystem_getEvent_dispatch(void *event_system, const char *name,
     if (!event_system || !name || !out || !target)
         return BEER_FMOD_ERR_INVALID_PARAM;
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *, const char *, u32, void **);
-    u64 result = ((Fn)target)(event_system, name, mode, out);
+    u64 result = BEER_GUEST_CALL(((Fn)target), event_system, name, mode, out);
     /* FMOD Ex event values are opaque encoded handles (Sekiro commonly gets
      * values such as 0xc0001), not COM-style pointers with writable vtables.
      * They must only be passed back through FMOD's exported Event facade. */
@@ -15026,7 +15189,7 @@ impl_FMOD_Event_start_dispatch(void *event)
                ? g_real_fmod_internal_event_start : g_real_fmod_event_start;
     if (!event || !target) return BEER_FMOD_ERR_INVALID_PARAM;
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *);
-    u64 result = ((Fn)target)(event);
+    u64 result = BEER_GUEST_CALL(((Fn)target), event);
     static _Atomic(u32) logs;
     u32 index = atomic_fetch_add_explicit(&logs, 1, memory_order_relaxed);
     if (index < 64)
@@ -15049,7 +15212,7 @@ impl_FMOD_EventSystem_setMediaPath_dispatch(void *event_system, const char *path
     }
     if (!real_set_media_path) return BEER_FMOD_ERR_INVALID_PARAM;
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *, const char *);
-    u64 result = ((Fn)real_set_media_path)(event_system, path);
+    u64 result = BEER_GUEST_CALL(((Fn)real_set_media_path), event_system, path);
     fprintf(stderr, "[AUDIO] real FMOD EventSystem::setMediaPath(\"%s\") -> %llu\n",
             path, (unsigned long long)result);
     return result;
@@ -15068,7 +15231,7 @@ impl_FMOD_EventSystem_load_dispatch(void *event_system, const char *name,
     if (!event_system || !name || !out || !target)
         return BEER_FMOD_ERR_INVALID_PARAM;
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *, const char *, const void *, void **);
-    u64 result = ((Fn)target)(event_system, name, load_info, out);
+    u64 result = BEER_GUEST_CALL(((Fn)target), event_system, name, load_info, out);
     static _Atomic(u32) load_logs;
     u32 log_index = atomic_fetch_add_explicit(&load_logs, 1, memory_order_relaxed);
     if (log_index < 32)
@@ -15086,7 +15249,7 @@ impl_FMOD_EventSystem_getSystemObject_dispatch(void *event_system, void **out)
     event_system = fmod_public_event_system(event_system);
     if (!event_system || !out || !g_real_fmod_event_get_system) return BEER_FMOD_ERR_INVALID_PARAM;
     typedef u64 (__attribute__((ms_abi)) *Fn)(void *, void **);
-    u64 result = ((Fn)g_real_fmod_event_get_system)(event_system, out);
+    u64 result = BEER_GUEST_CALL(((Fn)g_real_fmod_event_get_system), event_system, out);
     if (!result) g_real_fmod_core_system = *out;
     fprintf(stderr, "[AUDIO] real FMOD core System -> result=%llu object=%p\n",
             (unsigned long long)result, out ? *out : NULL);
@@ -15117,7 +15280,7 @@ impl_FMOD_EventSystem_init_dispatch(void *event_system, int max_channels,
      * replaced its real event-pool size with zero. */
     typedef u64 (__attribute__((ms_abi)) *InitFn)(void *, int, u32, void *, u32);
     if (g_real_fmod_initialized) return BEER_FMOD_OK;
-    u64 result = ((InitFn)target)(event_system, max_channels,
+    u64 result = BEER_GUEST_CALL(((InitFn)target), event_system, max_channels,
                                   flags, extra, event_pool_size);
     fprintf(stderr,
             "[AUDIO] real FMOD EventSystem::init channels=%d flags=0x%x pool=%u -> %llu\n",
@@ -15524,7 +15687,7 @@ beer_dinput_device_EnumObjects(BeerDirectInputDevice *self, u64 callback,
         obj.dimension = 0;
         beer_di_set_name(&obj, items[i].name);
         ++delivered;
-        if (!((ObjectCallback)(uintptr_t)callback)(&obj, (void *)(uintptr_t)ref))
+        if (!BEER_GUEST_CALL(((ObjectCallback)(uintptr_t)callback), &obj, (void *)(uintptr_t)ref))
             break; /* DIENUM_STOP */
     }
     if (getenv("BEER_INPUT_DIAGNOSTICS"))
@@ -15963,7 +16126,7 @@ static int beer_dinput_enum_device(BeerDirectInput *self, void *callback,
         instance.usage = usage;
         beer_ascii_to_wide(name, instance.instance_name);
         beer_ascii_to_wide(name, instance.product_name);
-        return ((EnumCallback)callback)(&instance, context) != DIENUM_STOP;
+        return BEER_GUEST_CALL(((EnumCallback)callback), &instance, context) != DIENUM_STOP;
     }
 
     BEER_DIDEVICEINSTANCEA instance;
@@ -15976,7 +16139,7 @@ static int beer_dinput_enum_device(BeerDirectInput *self, void *callback,
     instance.usage = usage;
     snprintf(instance.instance_name, sizeof(instance.instance_name), "%s", name);
     snprintf(instance.product_name, sizeof(instance.product_name), "%s", name);
-    return ((EnumCallback)callback)(&instance, context) != DIENUM_STOP;
+    return BEER_GUEST_CALL(((EnumCallback)callback), &instance, context) != DIENUM_STOP;
 }
 
 static u64 __attribute__((ms_abi))
@@ -16413,7 +16576,7 @@ static u64 __attribute__((ms_abi))
 impl__initterm(void (**first)(void), void (**last)(void))
 {
     if (!first || !last) return 0;
-    for (; first < last; ++first) if (*first) (*first)();
+    for (; first < last; ++first) if (*first) BEER_GUEST_CALL(*first);
     return 0;
 }
 
@@ -16424,7 +16587,7 @@ impl__initterm_e(int (__attribute__((ms_abi)) **first)(void),
     if (!first || !last) return 0;
     for (; first < last; ++first) {
         if (!*first) continue;
-        int result = (*first)();
+        int result = BEER_GUEST_CALL(*first);
         if (result) return (u64)(u32)result;
     }
     return 0;
@@ -16748,7 +16911,7 @@ impl__execute_onexit_table(BeerOnExitTable *table)
     if (!table) return (u64)(u32)-1;
     while (table->first && table->last > table->first) {
         void (*callback)(void) = *--table->last;
-        if (callback) callback();
+        if (callback) BEER_GUEST_CALL(callback);
     }
     free(table->first);
     table->first = table->last = table->end = NULL;
@@ -17883,7 +18046,7 @@ guest_oodle_decompress_trace(const void *compressed, s64 compressed_size,
     if (!g_oodle_decompress) return 0;
     static _Atomic(u32) calls;
     u32 call = atomic_fetch_add(&calls, 1) + 1;
-    s64 result = g_oodle_decompress(
+    s64 result = BEER_GUEST_CALL(g_oodle_decompress,
         compressed, compressed_size, raw, raw_size,
         fuzz_safe, check_crc, verbosity, decode_buffer, decode_buffer_size,
         callback, callback_user, decoder_memory, decoder_memory_size,
@@ -18173,6 +18336,7 @@ typedef u64 (__attribute__((ms_abi)) *GuestNtCall)(u64, u64, u64, u64, u64, u64,
 static u64 call_guest_nested(GuestNtCall fn, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
                              u64 a6, u64 a7, u64 a8, u64 a9, u64 a10)
 {
+#if BEER_GUEST_NATIVE
     u64 saved_top, saved_guest, sp;
     __asm__ volatile("mov %%fs:g_host_call_stack_top@tpoff, %0\n\tmov %%fs:g_saved_guest_rsp@tpoff, %1\n\tmov %%rsp, %2"
                      : "=r"(saved_top), "=r"(saved_guest), "=r"(sp));
@@ -18181,6 +18345,11 @@ static u64 call_guest_nested(GuestNtCall fn, u64 a0, u64 a1, u64 a2, u64 a3, u64
     u64 result = fn(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
     __asm__ volatile("mov %0, %%fs:g_host_call_stack_top@tpoff\n\tmov %1, %%fs:g_saved_guest_rsp@tpoff" :: "r"(saved_top), "r"(saved_guest) : "memory");
     return result;
+#else
+    /* An emulated guest has no shared-stack trampoline: the backend runs the call on the guest stack. */
+    const u64 args[11] = {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10};
+    return beer_guest_call((u64)(uintptr_t)fn, args, 11);
+#endif
 }
 
 static GuestNtCall hooked_ntdll(const char *name)
@@ -18269,11 +18438,11 @@ static void guest_dll_notify_thread(u32 reason)
             typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
             TlsCallback *callbacks = (TlsCallback *)dll->tls_callbacks;
             for (size_t n = 0; n < 64 && callbacks[n]; ++n)
-                callbacks[n](dll->image, reason, NULL);
+                BEER_GUEST_CALL(callbacks[n], dll->image, reason, NULL);
         }
         if (nt->opt.entry_rva) {
             typedef int __attribute__((ms_abi)) (*DllEntry)(void *, u32, void *);
-            ((DllEntry)(dll->image + nt->opt.entry_rva))(dll->image, reason, NULL);
+            BEER_GUEST_CALL(((DllEntry)(dll->image + nt->opt.entry_rva)), dll->image, reason, NULL);
         }
     }
 }
@@ -18294,11 +18463,11 @@ static void guest_dll_initialize_all(void)
             typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
             TlsCallback *callbacks = (TlsCallback *)dll->tls_callbacks;
             for (size_t n = 0; n < 64 && callbacks[n]; ++n)
-                callbacks[n](dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
+                BEER_GUEST_CALL(callbacks[n], dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
         }
         typedef int __attribute__((ms_abi)) (*DllEntry)(void *, u32, void *);
         DllEntry entry = (DllEntry)(dll->image + nt->opt.entry_rva);
-        int result = entry(dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
+        int result = BEER_GUEST_CALL(entry, dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
         dll->entry_called = 1;
         dll->initializing = 0;
         fprintf(stderr, "[PE DLL] %s process attach -> %d\n", dll->name, result);
@@ -18332,9 +18501,7 @@ static void pe_imports(void)
      * relative call targets from IAT thunks, and a high ASLR mapping can overflow
      * that signed displacement into a nearby non-executable address. */
     g_trampsz = (((size_t)MAX_STUBS * THUNK_SZ) + 0xFFFu) & ~(size_t)0xFFF;
-    g_tramp = mmap(NULL, g_trampsz,
-                   PROT_READ | PROT_WRITE | PROT_EXEC,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    g_tramp = beer_mmap_low32_rwx(g_trampsz);
     if (g_tramp == MAP_FAILED) die("mmap(trampoline): %s", strerror(errno));
 
     /* Load bundled native PE dependencies before resolving the executable's
@@ -18785,6 +18952,19 @@ static void *alloc_teb_for_thread(void)
      * a very plausible source of the sporadic worker-thread null derefs
      * seen throughout this project. Fix: always describe the real stack.
      */
+#if !BEER_GUEST_NATIVE
+    {
+        /* An emulated thread runs its guest code on the guest stack the backend allocates for it, not on the pthread's
+         * stack: that is what stack probes (__chkstk) and unwinding must see. */
+        u64 low = 0, high = 0;
+        if (beer_guest_thread_stack(&low, &high) == 0) {
+            teb->StackBase  = high;
+            teb->StackLimit = low;
+            g_current_guest_stack_low = low;
+            g_current_guest_stack_high = high;
+        }
+    }
+#else
     {
         pthread_attr_t attr;
         void  *stackaddr = NULL;
@@ -18803,13 +18983,14 @@ static void *alloc_teb_for_thread(void)
             g_current_guest_stack_high = (u64)stackaddr + (u64)stacksize;
         }
     }
+#endif
     return (void *)teb;
 }
 
 static void set_teb_stack_bounds(u64 stack_low, u64 stack_high)
 {
     u64 gs_base = 0;
-    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) != 0 || !gs_base)
+    if (beer_guest_get_gs_base(&gs_base) != 0 || !gs_base)
         return;
     WinTEB *teb = (WinTEB *)gs_base;
     teb->StackLimit = stack_low;
@@ -18988,7 +19169,7 @@ static void setup_teb_peb(void)
 
     u64 *tls_array = *(u64 **)((u8 *)teb + 0x58);
 
-    if (syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)teb) != 0) {
+    if (beer_guest_set_gs_base((u64)teb) != 0) {
         perror("arch_prctl(ARCH_SET_GS)");
         die("Cannot set GS register (need Linux >= 3.1)");
     }
@@ -19005,7 +19186,7 @@ static void executable_tls_timeout_signal(int signal_number, siginfo_t *info,
     g_executable_tls_fault_signal = signal_number;
     g_executable_tls_fault_address = 0;
     if (context_pointer) {
-        const ucontext_t *context = (const ucontext_t *)context_pointer;
+        const beer_guest_ucontext_t *context = (const beer_guest_ucontext_t *)context_pointer;
         g_executable_tls_fault_rip =
             (u64)context->uc_mcontext.gregs[REG_RIP];
         g_executable_tls_fault_rsp =
@@ -19096,7 +19277,7 @@ static void __attribute__((ms_abi)) executable_tls_process_attach(void)
         if (sigsetjmp(g_executable_tls_fault_env, 1) == 0) {
             g_executable_tls_callback_active = 1;
             if (timeout_ms) executable_tls_arm_timeout(timeout_ms);
-            callbacks[index](g_img, 1 /* DLL_PROCESS_ATTACH */, NULL);
+            BEER_GUEST_CALL(callbacks[index], g_img, 1 /* DLL_PROCESS_ATTACH */, NULL);
             executable_tls_arm_timeout(0);
             g_executable_tls_callback_active = 0;
         } else {
@@ -20212,6 +20393,7 @@ beer_raise_exception_helper(u8 *ctx, u32 code, u32 flags, u32 nargs,
 "movaps xmmword ptr [r10 + 0x280], xmm14\n" \
 "movaps xmmword ptr [r10 + 0x290], xmm15\n"
 
+#if BEER_GUEST_NATIVE
 asm(
 ".pushsection .text\n"
 ".global impl_RtlUnwind\n"
@@ -20235,7 +20417,9 @@ BEER_CONTEXT_CAPTURE_PROLOGUE
 ".att_syntax prefix\n"
 ".popsection\n"
 );
+#endif
 
+#if BEER_GUEST_NATIVE
 asm(
 ".pushsection .text\n"
 ".global impl_RaiseException_entry\n"
@@ -20256,9 +20440,11 @@ BEER_CONTEXT_CAPTURE_PROLOGUE
 ".att_syntax prefix\n"
 ".popsection\n"
 );
+#endif
 
 /* beer_restore_context_asm(rcx = CONTEXT*): load the context and continue at
  * its Rip on its stack. Does not return. */
+#if BEER_GUEST_NATIVE
 asm(
 ".pushsection .text\n"
 ".global beer_restore_context_asm\n"
@@ -20297,8 +20483,10 @@ asm(
 ".att_syntax prefix\n"
 ".popsection\n"
 );
+#endif
 
 /* RtlRestoreContext(ContextRecord=rcx, ExceptionRecord=rdx): never returns. */
+#if BEER_GUEST_NATIVE
 asm(
 ".pushsection .text\n"
 ".global impl_RtlRestoreContext\n"
@@ -20309,6 +20497,7 @@ asm(
 ".att_syntax prefix\n"
 ".popsection\n"
 );
+#endif
 
 /* Guest API calls run on a separate host stack (beer_dispatch_trampoline saves
  * the guest %rsp in TEB.SavedGuestRsp and switches stacks). The CONTEXT built
@@ -20318,6 +20507,10 @@ asm(
  * the right values. Nonvolatile registers are untouched by the trampoline. */
 static void beer_context_fix_caller(u8 *ctx)
 {
+#if !BEER_GUEST_NATIVE
+    (void)ctx;   /* beer_guest_caller_regs() already describes the caller */
+    return;
+#else
     const u64 pc = *(u64 *)(ctx + 0xf8);
     const u64 tramp = (u64)(uintptr_t)beer_dispatch_trampoline;
     if (pc < tramp || pc >= tramp + 0x400) return;
@@ -20326,6 +20519,7 @@ static void beer_context_fix_caller(u8 *ctx)
     if (!saved) return;
     *(u64 *)(ctx + 0xf8) = *(const u64 *)(uintptr_t)saved;
     *(u64 *)(ctx + 0x98) = saved + 8;
+#endif
 }
 
 static const BeerRuntimeFunction *beer_unwind_lookup(u64 control_pc, u64 *image_base)
@@ -20407,7 +20601,7 @@ beer_rtl_unwind_helper(u8 *ctx, u64 target_frame, u64 target_ip,
             dispatcher.language_handler = handler;
             dispatcher.handler_data = handler_data;
             if (at_target) record->flags |= BEER_EXCEPTION_TARGET_UNWIND;
-            const int32_t disposition = ((BeerLanguageHandler)(uintptr_t)handler)(
+            const int32_t disposition = BEER_GUEST_CALL(((BeerLanguageHandler)(uintptr_t)handler),
                 record, establisher, current, &dispatcher);
             if (at_target) record->flags &= ~BEER_EXCEPTION_TARGET_UNWIND;
             if (disposition == BEER_EXCEPTION_DISPOSITION_COLLIDED_UNWIND) {
@@ -20503,7 +20697,7 @@ static u32 beer_signal_exception_code(int sig)
     }
 }
 
-static void beer_context_from_ucontext(u8 *context, const ucontext_t *uc)
+static void beer_context_from_ucontext(u8 *context, const beer_guest_ucontext_t *uc)
 {
     memset(context, 0, 0x4d0);
     *(u32 *)(context + 0x30) = 0x0010001fu; /* CONTEXT_AMD64 | CONTROL | INTEGER */
@@ -20527,7 +20721,7 @@ static void beer_context_from_ucontext(u8 *context, const ucontext_t *uc)
     *(u64 *)(context + 0xf8) = (u64)uc->uc_mcontext.gregs[REG_RIP];
 }
 
-static void beer_context_to_ucontext(ucontext_t *uc, const u8 *context)
+static void beer_context_to_ucontext(beer_guest_ucontext_t *uc, const u8 *context)
 {
     uc->uc_mcontext.gregs[REG_EFL] = (greg_t)*(const u32 *)(context + 0x44);
     uc->uc_mcontext.gregs[REG_RAX] = (greg_t)*(const u64 *)(context + 0x78);
@@ -20549,7 +20743,74 @@ static void beer_context_to_ucontext(ucontext_t *uc, const u8 *context)
     uc->uc_mcontext.gregs[REG_RIP] = (greg_t)*(const u64 *)(context + 0xf8);
 }
 
-static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, ucontext_t *uc)
+#if !BEER_GUEST_NATIVE
+/* The native build implements these as naked asm that builds a CONTEXT from the live registers. Emulated, the
+ * backend already holds the guest's registers. */
+static __thread struct beer_fpstate t_resume_fpregs;
+
+/* Same fields the native prologue stores: nonvolatile registers, Rip/Rsp of the caller, xmm6-xmm15. */
+static void beer_capture_caller_context(u8 *ctx)
+{
+    beer_guest_ucontext_t uc;
+    memset(&uc, 0, sizeof(uc));
+    beer_guest_caller_regs(&uc);
+    beer_context_from_ucontext(ctx, &uc);
+    *(u32 *)(ctx + 0x30) = 0x0010001fu;
+    if (uc.uc_mcontext.fpregs)
+        for (int i = 6; i <= 15; ++i)
+            memcpy(ctx + 0x200 + (i - 6) * 0x10, uc.uc_mcontext.fpregs->_xmm[i].element, 16);
+}
+
+u64 __attribute__((ms_abi)) impl_RtlCaptureContext(u8 *ctx)
+{
+    beer_guest_ucontext_t uc;
+    memset(&uc, 0, sizeof(uc));
+    beer_guest_caller_regs(&uc);
+    beer_context_from_ucontext(ctx, &uc);
+    *(u32 *)(ctx + 0x30) = 0x0010007fu;   /* CONTEXT_ALL as impl_RtlCaptureContext reports natively */
+    return 0;
+}
+
+void __attribute__((ms_abi)) beer_restore_context_asm(void *context)
+{
+    beer_guest_ucontext_t uc;
+    memset(&uc, 0, sizeof(uc));
+    beer_context_to_ucontext(&uc, (const u8 *)context);
+    for (int i = 6; i <= 15; ++i)
+        memcpy(t_resume_fpregs._xmm[i].element, (const u8 *)context + 0x200 + (i - 6) * 0x10, 16);
+    uc.uc_mcontext.fpregs = &t_resume_fpregs;
+    beer_guest_resume(&uc);
+}
+
+u64 __attribute__((ms_abi)) impl_RtlRestoreContext(u8 *ctx, void *record)
+{
+    (void)record;
+    beer_restore_context_asm(ctx);
+    return 0;
+}
+
+u64 __attribute__((ms_abi)) impl_RtlUnwindEx(u64 target_frame, u64 target_ip, void *record, u64 return_value)
+{
+    u8 ctx[0x4d0] __attribute__((aligned(16)));
+    beer_capture_caller_context(ctx);
+    beer_rtl_unwind_helper(ctx, target_frame, target_ip, (BeerExceptionRecord64 *)record, return_value);
+    return 0;
+}
+
+u64 __attribute__((ms_abi)) impl_RtlUnwind(u64 target_frame, u64 target_ip, void *record, u64 return_value)
+{
+    return impl_RtlUnwindEx(target_frame, target_ip, record, return_value);
+}
+
+u64 __attribute__((ms_abi)) impl_RaiseException_entry(u32 code, u32 flags, u32 nargs, const u64 *args)
+{
+    u8 ctx[0x4d0] __attribute__((aligned(16)));
+    beer_capture_caller_context(ctx);
+    return beer_raise_exception_helper(ctx, code, flags, nargs, args);
+}
+#endif
+
+static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, beer_guest_ucontext_t *uc)
 {
     if (g_delivering_vectored_exception) return 0;
 
@@ -20592,7 +20853,7 @@ static int beer_seh_executable(u64 address, void *opaque)
     return is_valid_resume_target(address);
 }
 
-static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
+static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, beer_guest_ucontext_t *uc)
 {
     if (g_delivering_vectored_exception) return 0;
 
@@ -20640,7 +20901,7 @@ int (*g_beer_lazy_fault_hook)(void *addr);   /* BD11's lazily populated deferred
 
 static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
 {
-    ucontext_t *uc = (ucontext_t *)uctx;
+    beer_guest_ucontext_t *uc = (beer_guest_ucontext_t *)uctx;
     u64 rip = (u64)uc->uc_mcontext.gregs[REG_RIP];
     u64 faultaddr = (u64)si->si_addr;
     u64 rsp0 = (u64)uc->uc_mcontext.gregs[REG_RSP];
@@ -21346,7 +21607,7 @@ generic_alloc_skip:
 
     if (g_img && rip >= (u64)g_img + 0x2e918a0 && rip <= (u64)g_img + 0x2e918c0) {
         u64 gs_base = 0;
-        if (syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs_base) == 0 && gs_base) {
+        if (beer_guest_get_gs_base(&gs_base) == 0 && gs_base) {
             u64 stack_base = *(u64 *)(uintptr_t)(gs_base + 0x08);
             if (stack_base) {
                 fprintf(stderr,
@@ -22734,7 +22995,7 @@ generic_alloc_skip:
         }
 
         u64 gs_base = 0;
-        syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs_base);
+        beer_guest_get_gs_base(&gs_base);
         fprintf(stderr, "[SKIP] Null-write at RIP=0x%lx (+0x%lx), advancing %d bytes, gs_base=0x%lx\n",
                 rip, rip - (u64)g_img, skip, gs_base);
         /* Print call stack for diagnosis */
@@ -23055,7 +23316,7 @@ static void on_crash(int sig, siginfo_t *si, void *uctx)
     if (sig == SIGSEGV && g_beer_lazy_fault_hook && g_beer_lazy_fault_hook(si->si_addr)) return;
     on_crash_impl(sig, si, uctx);
 
-    ucontext_t *uc  = (ucontext_t *)uctx;
+    beer_guest_ucontext_t *uc  = (beer_guest_ucontext_t *)uctx;
     u64         rsp = (u64)uc->uc_mcontext.gregs[REG_RSP];
     if (g_entry_rsp_limit && rsp > g_entry_rsp_limit &&
         rsp >= g_guest_stack_low && rsp < g_guest_stack_high) {
@@ -23112,13 +23373,31 @@ static int beer_present_bd12_image(uint64_t image, uint32_t layout,
      * flowing, show that frame instead of the game's (blank) D3D12 backbuffer. */
     beer_control_note_frame();
     beer_control_frame_limit_wait();
+    {   /* BEER_PRESENT_LOG=<n>: log the first n presents (which back buffer, and whether a movie frame replaced it). */
+        static int log_left = -1;
+        static unsigned present_seq;
+        if (log_left < 0) log_left = getenv("BEER_PRESENT_LOG") ? atoi(getenv("BEER_PRESENT_LOG")) : 0;
+        if (log_left > 0) {
+            --log_left;
+            fprintf(stderr, "[PRESENT] #%u image=0x%llx layout=%u %ux%u fmt=%u\n", ++present_seq,
+                    (unsigned long long)image, layout, width, height, dxgi_format);
+        }
+    }
     if (beer_mf_composite_pending_frame()) return 1;
     static uint64_t window_start_ns;
     static uint32_t window_frames;
     static int fps_log = -1;
     if (fps_log < 0) fps_log = getenv("BEER_BD12_FPS") != NULL;
-    int ok = xwayland_window_present_image(image, layout, (int)width,
-                                           (int)height, direct_blit);
+    int ok;
+    if (xwayland_window_cpu_presenter()) {
+        /* --presenter=x11: no Vulkan swapchain, so read the back buffer back and present it from the CPU. */
+        const uint8_t *pixels = NULL;
+        int pitch = 0;
+        ok = vulkan_readback_image_rgba8(image, layout, (int)width, (int)height, direct_blit, &pixels, &pitch) &&
+             xwayland_window_present_rgba8(pixels, (int)width, (int)height, pitch);
+    } else {
+        ok = xwayland_window_present_image(image, layout, (int)width, (int)height, direct_blit);
+    }
     if (fps_log) {
         uint64_t now = beer_monotonic_nanoseconds();
         if (!window_start_ns) {
@@ -23162,6 +23441,7 @@ static volatile unsigned int g_prof_tid[BEER_PROF_MAX];
 static volatile unsigned long long g_prof_ret[BEER_PROF_MAX];
 static volatile unsigned int g_prof_count;
 
+#if BEER_GUEST_NATIVE
 static void prof_sample(int sig, siginfo_t *si, void *uctx)
 {
     (void)sig; (void)si;
@@ -23181,6 +23461,13 @@ static void prof_sample(int sig, siginfo_t *si, void *uctx)
     }
     g_prof_count = i + 1;
 }
+#else
+/* Under an emulator the host PC is not a guest address; sampling is native-only. */
+static void prof_sample(int sig, siginfo_t *si, void *uctx)
+{
+    (void)sig; (void)si; (void)uctx;
+}
+#endif
 
 static void prof_dump(int sig)
 {
@@ -23367,7 +23654,11 @@ int main(int argc, char **argv)
     beer_control_start(exe_arg);
     if (getenv("BEER_PROF_SAMPLE")) prof_start();
 
+#if BEER_GUEST_NATIVE
     sigaction(SIGSEGV, &sa, NULL);
+#else
+    beer_guest_set_fault_handler(on_crash);   /* the backend owns the host signals and calls us with a guest context */
+#endif
     {
         struct sigaction dump;
         memset(&dump, 0, sizeof(dump));
@@ -23375,10 +23666,12 @@ int main(int argc, char **argv)
         dump.sa_flags = SA_SIGINFO | SA_RESTART;
         sigaction(SIGUSR1, &dump, NULL);
     }
+#if BEER_GUEST_NATIVE
     sigaction(SIGBUS,  &sa, NULL);
     sigaction(SIGILL,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);  /* int3 / abort() in Windows CRT */
+#endif
     
     pe_imports();
     setup_teb_peb();
@@ -23411,7 +23704,7 @@ int main(int argc, char **argv)
     u64 entry    = (u64)g_img + nt->opt.entry_rva;
 
     u64 gs_base = 0;
-    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
+    if (beer_guest_get_gs_base(&gs_base) == 0 && gs_base) {
         fprintf(stderr, "[SETUP] Main thread TEB @ %p; host call stack=%p..%p\n",
                 (void *)gs_base, (void *)g_host_call_stack_base,
                 (void *)g_host_call_stack_top);
@@ -23445,11 +23738,15 @@ int main(int argc, char **argv)
     u64 guest_stack_high = (u64)guest_stack + guest_stack_size;
     
     /* Map a guard page below the stack for underflow protection */
+    /* NOREPLACE: whatever lies just below the stack may belong to someone else (inside an Android app it is the
+     * runtime's own memory), and a plain MAP_FIXED would silently overwrite it. */
     void *guard_page = mmap((void *)(guest_stack_low - 0x1000), 0x1000,
                             PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (guard_page != MAP_FAILED) {
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (guard_page == (void *)(guest_stack_low - 0x1000)) {
         guest_stack_low -= 0x1000;  /* Extend stack low boundary to include guard page */
+    } else if (guard_page != MAP_FAILED) {
+        munmap(guard_page, 0x1000);   /* an old kernel ignored NOREPLACE and placed it elsewhere */
     }
     
     /* Reserve 2MB at top for guest runtime, allowing deep recursion */
@@ -23494,7 +23791,7 @@ int main(int argc, char **argv)
     
     /* Verify TEB is clean at entry */
     u64 gs_base_check = 0;
-    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base_check) == 0 && gs_base_check) {
+    if (beer_guest_get_gs_base(&gs_base_check) == 0 && gs_base_check) {
         fprintf(stderr, "[SETUP] dispatcher saved guest RSP at entry: 0x%lx (should be 0)\n",
                 g_saved_guest_rsp);
     }
@@ -23511,6 +23808,7 @@ int main(int argc, char **argv)
     typedef void __attribute__((ms_abi)) (*ExecutableTlsRunner)(void);
     ExecutableTlsRunner tls_runner = executable_tls_process_attach;
     g_executable_entry_address = (u64)(uintptr_t)entry;
+#if BEER_GUEST_NATIVE
     asm volatile (
         "mov %0, %%rsp\n\t"
         "test %2, %2\n\t"
@@ -23532,6 +23830,10 @@ int main(int argc, char **argv)
           "m"(g_executable_entry_address)
         : "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "rsp"
     );
+
+#else
+    beer_guest_enter((u64)(uintptr_t)entry, g_entry_rsp, (u64)(uintptr_t)tls_runner, run_executable_tls);
+#endif
 
     __builtin_unreachable();
 }

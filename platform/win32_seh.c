@@ -1,3 +1,4 @@
+#include "guest_cpu.h"
 #include "win32_seh.h"
 
 #include <stddef.h>
@@ -89,7 +90,7 @@ int beer_seh_dispatch(BeerExceptionRecord64 *record, void *context_record,
             dispatcher.handler_data = handler_data;
             dispatcher.scope_index = 0;
 
-            int32_t disposition = ((BeerLanguageHandler)(uintptr_t)handler)(
+            int32_t disposition = BEER_GUEST_CALL(((BeerLanguageHandler)(uintptr_t)handler),
                 record, establisher_frame, context_record, &dispatcher);
             if (disposition == BEER_EXCEPTION_DISPOSITION_CONTINUE_EXECUTION)
                 return 1;

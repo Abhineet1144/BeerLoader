@@ -1,3 +1,4 @@
+#include "guest_cpu.h"
 #include "win32_vectored_exception.h"
 
 #include <stdatomic.h>
@@ -94,7 +95,7 @@ int beer_veh_dispatch(void *exception_pointers)
     }
 
     for (size_t i = 0; i < count; ++i) {
-        int32_t result = snapshot[i].handler(exception_pointers);
+        int32_t result = BEER_GUEST_CALL(snapshot[i].handler, exception_pointers);
         if (result == BEER_EXCEPTION_CONTINUE_EXECUTION) return 1;
     }
     return 0;

@@ -62,7 +62,11 @@ void bd12_trace_frame_advance(void)
 }
 int bd12_trace_active(void)
 {
-    return g_trace_target >= 0 && g_trace_frame == g_trace_target;
+    /* BEER_BD12_TRACE_COUNT=n traces n consecutive frames starting at the target. */
+    static int count = -1;
+    if (count < 0) count = getenv("BEER_BD12_TRACE_COUNT") ? atoi(getenv("BEER_BD12_TRACE_COUNT")) : 1;
+    if (count < 1) count = 1;
+    return g_trace_target >= 0 && g_trace_frame >= g_trace_target && g_trace_frame < g_trace_target + count;
 }
 
 int bd12_debug_sync_all(void)

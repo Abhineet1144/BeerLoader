@@ -1433,6 +1433,11 @@ int xwayland_window_present_rgba8(const uint8_t *pixels, int width, int height,
     return present_rgba8_internal(NULL, 0, pixels, width, height, row_pitch);
 }
 
+int xwayland_window_cpu_presenter(void)
+{
+    return g_x11.presenter == XWAYLAND_PRESENTER_X11;
+}
+
 int xwayland_window_present_resource_rgba8(const void *resource, uint64_t serial,
                                            const uint8_t *pixels, int width,
                                            int height, int row_pitch)

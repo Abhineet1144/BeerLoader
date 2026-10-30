@@ -1,3 +1,4 @@
+#include "guest_cpu.h"
 #include "win32_unwind.h"
 
 #include <stddef.h>
@@ -122,7 +123,7 @@ const BeerRuntimeFunction *beer_lookup_dynamic_function_entry(uint64_t control_p
                 control_pc - registration->base >= registration->length)
                 continue;
             const BeerRuntimeFunction *entry =
-                registration->callback(control_pc, registration->context);
+                BEER_GUEST_CALL(registration->callback, control_pc, registration->context);
             if (!function_entry_contains(entry, control_pc - registration->base))
                 continue;
             if (image_base) *image_base = registration->base;

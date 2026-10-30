@@ -30,7 +30,10 @@ static inline void beer_vulkan_compute_release_image_mirror(
 
 #include <pthread.h>
 #include <dlfcn.h>
+#include "beer_arch.h"
+#if BEER_HAVE_GLIBC_DIAG
 #include <execinfo.h>
+#endif
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3532,6 +3535,7 @@ void beer_vulkan_graphics_forget_resource(const void *resource)
     for (uint32_t i = 0; i < IMAGE_CACHE_SIZE; ++i) {
         CachedImage *entry = &g_graphics.image_cache[i];
         if (entry->object.resource != resource) continue;
+#if BEER_HAVE_GLIBC_DIAG
         if (entry->object.allocation_size >= 16u * 1024u * 1024u &&
             getenv("BEER_VULKAN_CACHE_TRACE")) {
             void *frames[6];
@@ -3546,6 +3550,7 @@ void beer_vulkan_graphics_forget_resource(const void *resource)
                 fprintf(stderr, "%zx ", (size_t)frames[f] - base);
             fprintf(stderr, "\n");
         }
+#endif
         if (entry->object.allocation_size <= g_graphics.image_cache_bytes)
             g_graphics.image_cache_bytes -= entry->object.allocation_size;
         release_image(&entry->object);

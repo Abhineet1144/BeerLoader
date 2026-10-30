@@ -105,6 +105,8 @@ int xwayland_window_pump_events(void);
  * native XWayland visual without taking ownership of the caller's storage. */
 int xwayland_window_present_rgba8(const uint8_t *pixels, int width, int height,
                                   int row_pitch);
+/* Nonzero when frames must go through the CPU (--presenter=x11): the Vulkan swapchain presenter is off. */
+int xwayland_window_cpu_presenter(void);
 int xwayland_window_present_resource_rgba8(const void *resource, uint64_t serial,
                                            const uint8_t *pixels, int width,
                                            int height, int row_pitch);

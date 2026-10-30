@@ -1,10 +1,12 @@
 #define _GNU_SOURCE
+#include "beer_paths.h"
 #include "win32_nt_section.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -64,7 +66,8 @@ static int create_backing_fd(void)
     fd = (int)syscall(SYS_memfd_create, "beer-nt-section", 1u /* MFD_CLOEXEC */);
     if (fd >= 0) return fd;
 #endif
-    char path[] = "/tmp/beer-nt-section-XXXXXX";
+    char path[512];
+    snprintf(path, sizeof(path), "%s/beer-nt-section-XXXXXX", beer_tmp_dir());
     fd = mkstemp(path);
     if (fd >= 0) {
         unlink(path);

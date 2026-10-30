@@ -29,6 +29,11 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
                                    uint64_t source_image, uint32_t source_layout,
                                    int width, int height, int direct_blit,
                                    int output_width, int output_height);
+/* Copies a GPU image (in source_layout; returned to it) to host memory as tightly packed RGBA8 through
+ * the shared device, with no swapchain. bgra swaps the first and third channel. The returned pointer
+ * stays valid until the next call. For CPU-side presenters. */
+int vulkan_readback_image_rgba8(uint64_t source_image, uint32_t source_layout, int width, int height,
+                                int bgra, const uint8_t **pixels, int *row_pitch);
 void vulkan_presenter_destroy(void);
 int vulkan_presenter_is_active(void);
 /* Waits for the last direct-image blit to stop reading its guest source image. */

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "win32_shared_data.h"
+#include "beer_arch.h"
 #include "beer_time.h"
 
 #include <errno.h>
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -88,28 +90,10 @@ void beer_win32_shared_data_initialize(void *memory, size_t size)
     put_u32(data, 0x270, 0);     /* NtMinorVersion */
 
     /* ProcessorFeatures[] (0x274) uses winnt.h PF_* numbering and must agree with IsProcessorFeaturePresent: runtime
-     * libraries read the array directly. Values come from the host CPU. */
-    __builtin_cpu_init();
-    /* __builtin_cpu_supports needs string literals, so each feature is spelled out. */
-    data[0x274 + 2] = 1;                                              /* CMPXCHG8B */
-    data[0x274 + 3] = __builtin_cpu_supports("mmx") != 0;
-    data[0x274 + 6] = __builtin_cpu_supports("sse") != 0;
-    data[0x274 + 8] = 1;                                              /* RDTSC */
-    data[0x274 + 9] = 1;                                              /* PAE */
-    data[0x274 + 10] = __builtin_cpu_supports("sse2") != 0;
-    data[0x274 + 12] = 1;                                             /* NX */
-    data[0x274 + 13] = __builtin_cpu_supports("sse3") != 0;
-    data[0x274 + 14] = 1;                                             /* CMPXCHG16B */
-    data[0x274 + 17] = __builtin_cpu_supports("xsave") != 0;
-    data[0x274 + 22] = 1;                                             /* RDWRFSGSBASE */
-    data[0x274 + 28] = __builtin_cpu_supports("rdrnd") != 0;
-    data[0x274 + 32] = 1;                                             /* RDTSCP */
-    data[0x274 + 36] = __builtin_cpu_supports("ssse3") != 0;
-    data[0x274 + 37] = __builtin_cpu_supports("sse4.1") != 0;
-    data[0x274 + 38] = __builtin_cpu_supports("sse4.2") != 0;
-    data[0x274 + 39] = __builtin_cpu_supports("avx") != 0;
-    data[0x274 + 40] = __builtin_cpu_supports("avx2") != 0;
-    data[0x274 + 41] = __builtin_cpu_supports("avx512f") != 0;
+     * libraries read the array directly. Both read beer_guest_processor_features(). */
+    uint8_t features[BEER_PF_COUNT];
+    beer_guest_processor_features(features);
+    memcpy(data + 0x274, features, sizeof(features));
 
     put_u16(data, 0x02c, 0x014c); /* ImageNumberLow: IMAGE_FILE_MACHINE_I386 (WOW64 range) */
     put_u16(data, 0x02e, 0x8664); /* ImageNumberHigh: IMAGE_FILE_MACHINE_AMD64 */
@@ -117,7 +101,7 @@ void beer_win32_shared_data_initialize(void *memory, size_t size)
     /* XSTATE_CONFIGURATION (0x3d8): what GetEnabledXStateFeatures / RtlGetEnabledExtendedFeatures report. x87 + SSE,
      * plus AVX when the host has it; area offsets follow the standard XSAVE layout. */
     {
-        const int avx = __builtin_cpu_supports("avx") != 0;
+        const int avx = features[39] != 0;
         const uint64_t enabled = 0x3u | (avx ? 0x4u : 0u);
         put_u64(data, 0x3d8, enabled);                       /* EnabledFeatures */
         put_u64(data, 0x3e0, enabled);                       /* EnabledVolatileFeatures */
@@ -173,13 +157,21 @@ int beer_win32_shared_data_map(void)
     char backing_name[64];
     snprintf(backing_name, sizeof(backing_name), "/beer-kuser-%ld",
              (long)getpid());
+#if defined(__ANDROID__)
+    /* bionic has no shm_open/shm_unlink: an anonymous memfd gives the same sealed-off backing. */
+    (void)backing_name;
+    int fd = (int)syscall(SYS_memfd_create, "beer-kuser", 0u);
+#else
     int fd = shm_open(backing_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+#endif
     if (fd < 0) {
         fprintf(stderr, "[KUSER] unable to create shared-data backing: %s\n",
                 strerror(errno));
         return 0;
     }
+#if !defined(__ANDROID__)
     shm_unlink(backing_name);
+#endif
     if (ftruncate(fd, BEER_WIN32_SHARED_DATA_SIZE) != 0) {
         fprintf(stderr, "[KUSER] unable to size shared-data backing: %s\n",
                 strerror(errno));

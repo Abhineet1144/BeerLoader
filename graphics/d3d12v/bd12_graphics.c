@@ -630,6 +630,10 @@ static int prepare_draw(BD12CmdList *list)
         return 0;
     }
     begin_draw_rendering(list);
+    if (bd12_trace_active())
+        fprintf(stderr, "[TRACE] draw rtv=%u dsv=%d viewport=%u,%dx%d\n", g->rtv_count, g->has_dsv,
+                g->viewport_count, g->viewport_count ? (int)g->viewports[0].width : 0,
+                g->viewport_count ? (int)g->viewports[0].height : 0);
     VkCommandBuffer cb = list->command_buffer;
     if (g->dirty & BD12_DIRTY_PIPELINE)
         device->vk.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
