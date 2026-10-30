@@ -53,17 +53,19 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     /* Merge both stages' reflected bindings into one set-0 layout. */
     const BD12ShaderCode *stages[2] = { &desc->vs, &desc->ps };
     const uint32_t total = desc->vs.binding_count + desc->ps.binding_count;
+    /* +1: room for the texel offsets table (bd12_texel_offset.c). */
     VkDescriptorSetLayoutBinding *layout_bindings =
-        calloc(total ? total : 1, sizeof(*layout_bindings));
-    gp->bindings = calloc(total ? total : 1, sizeof(*gp->bindings));
-    gp->binding_types = calloc(total ? total : 1, sizeof(*gp->binding_types));
+        calloc(total + 1, sizeof(*layout_bindings));
+    gp->bindings = calloc(total + 1, sizeof(*gp->bindings));
+    gp->binding_types = calloc(total + 1, sizeof(*gp->binding_types));
     VkShaderModule modules[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     BD12ShaderBinding *stage_binds[2] = { NULL, NULL };
     uint32_t stage_kept[2] = { 0, 0 };
     gp->bindless = calloc(total ? total : 1, sizeof(*gp->bindless));
     if (!gp->bindless) goto fail;
     uint32_t *dense_spirv[2] = { NULL, NULL };
-    uint32_t next_binding = 0;
+    size_t dense_bytes[2] = { desc->vs.spirv_bytes, desc->ps.spirv_bytes };
+    uint32_t next_binding = 0, offset_slots = 0, offsets_binding = 0;
     if (!layout_bindings || !gp->bindings || !gp->binding_types) goto fail;
     for (int s = 0; s < 2; ++s) {
         if (!stages[s]->spirv) continue;
@@ -86,6 +88,16 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
                                                &next_binding);
         if (!dense_spirv[s]) goto fail;
     }
+    if (device->texel_offset_fixup) {   /* one offsets table for both stages, after their bindings */
+        offsets_binding = next_binding;
+        int applied = 0;
+        for (int s = 0; s < 2; ++s)
+            if (stages[s]->spirv)
+                applied |= bd12_texel_offsets_apply(&dense_spirv[s], &dense_bytes[s], stage_binds[s],
+                                                    stage_kept[s], offsets_binding, &offset_slots);
+        if (applied) ++next_binding;
+        else offset_slots = 0;
+    }
     for (int s = 0; s < 2; ++s) {
         for (uint32_t i = 0; stages[s]->spirv && i < stage_kept[s]; ++i) {
             BD12ShaderBinding b = stage_binds[s][i];
@@ -103,6 +115,17 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
             gp->binding_types[gp->binding_count] = type;
             ++gp->binding_count;
         }
+    }
+    if (offset_slots) {
+        layout_bindings[gp->binding_count] = (VkDescriptorSetLayoutBinding){
+            .binding = offsets_binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
+        };
+        gp->bindings[gp->binding_count] = (BD12ShaderBinding){
+            .type = BD12_RANGE_TEXEL_OFFSETS, .binding = offsets_binding, .count = offset_slots };
+        gp->binding_types[gp->binding_count++] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     }
     VkDescriptorSetLayoutCreateInfo set_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -137,6 +160,8 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     BD12ShaderCode dense_vs = desc->vs, dense_ps = desc->ps;
     dense_vs.spirv = dense_spirv[0];
     dense_ps.spirv = dense_spirv[1];
+    dense_vs.spirv_bytes = dense_bytes[0];
+    dense_ps.spirv_bytes = dense_bytes[1];
     modules[0] = make_module(device, &dense_vs);
     if (!modules[0]) goto fail;
     shader_stages[stage_count++] = (VkPipelineShaderStageCreateInfo){

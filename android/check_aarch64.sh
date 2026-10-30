@@ -16,7 +16,7 @@ if [ -z "$FILES" ]; then
     graphics/d3d11/d3d11_impl.c graphics/d3d12/d3d12_api.c graphics/d3d12/d3d12_shader_translator.c \
     graphics/d3d12v/bd12_device.c graphics/d3d12v/bd12_cmd.c graphics/d3d12v/bd12_descriptors.c graphics/d3d12v/bd12_bind.c \
     graphics/d3d12v/bd12_image.c graphics/d3d12v/bd12_graphics.c graphics/d3d12v/bd12_extra.c graphics/d3d12v/bd12_formats.c \
-    graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c \
+    graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c graphics/d3d12v/bd12_texel_offset.c graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c \
     graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_mirror.c graphics/d3d12v/bd12_rtpipe.c graphics/d3d12v/bd12_ckpt.c \
     graphics/d3d12v/bd12_live.c graphics/d3d12v/bd12_capture.c graphics/d3d12v/bd12_cbtweak.c \
     graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c graphics/d3d11v/bd11_swap.c"

@@ -390,6 +390,24 @@ local `main` of the dev PC, not on GitHub) merged into `apk`.
   TLS callbacks, C++ unwind consolidation and native syscalls under emulation (no test exe has them), the APK build
   (`android/apk/build_native.sh` needs the NDK, not installed on this PC), any game.
 
+## RE8 title screen fixed (2026-10-31)
+
+RE8 now renders its title scene, menus, popups and logo in the APK, without the old flicker.
+- Root cause: Adreno requires texel-buffer view offsets to be multiples of 64 bytes (no single-texel alignment);
+  D3D allows any element. BD12 turned every misaligned view into a null descriptor, so vertex fetches from RE8's
+  sliced raw buffers (`R32_UINT` views) read zeros and no geometry rasterized (empty G-buffer, zero depth).
+  Reproduced on the desktop with `BEER_BD12_TEXEL_ALIGN=64`.
+- Fix (`graphics/d3d12v/bd12_texel_offset.c`): on devices that need it (`texel_offset_fixup`, decided from the
+  Vulkan limits; never on desktop GPUs with single-texel alignment) misaligned views start aligned down; a SPIR-V
+  pass adds the per-binding element offset (from a per-draw read-only storage buffer at an extra set-0 binding) to
+  OpImageFetch/Read/Write/TexelPointer coordinates and subtracts it from OpImageQuerySize.
+  `BEER_BD12_TEXEL_OFFSETS=0/1` overrides. Not yet covered: bindless heap-mirror (set 1) views and the BD11 resolve hook.
+- `shaderDrawParameters` is now enabled (vkd3d-shader reads SV_InstanceID as InstanceIndex - BaseInstance).
+- APK build: `android/apk/build_native.sh` rebuilds everything when a header or `.inc` changed (a stale object with an
+  old `BD12Device` layout crashed in the driver); the debug APK is debuggable (`adb shell run-as com.beer.loader`).
+- Toolchain on the second PC lives on the D: drive (`/mnt/56A4064AA4062CD5/Abhi/android-build`, linked as
+  `../android-sdk` and `../android-deps`).
+
 ## Resuming on another machine (state at the pause, 2026-10-30)
 
 **Nothing is committed.** All work is uncommitted on branch `apk` (new files under `android/`, `platform/`, `tools/`, plus edits to

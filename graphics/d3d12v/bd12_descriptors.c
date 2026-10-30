@@ -64,6 +64,29 @@ VkBufferView bd12_buffer_view(BD12Buffer *buffer, VkFormat format,
     return buffer_view_impl(buffer, format, offset, range, storage, 0);
 }
 
+/* texel_offset_fixup devices: a view whose offset is not aligned starts at the aligned-down offset instead, and
+ * *delta receives the whole elements the shader must add (bd12_texel_offset.c). Otherwise as bd12_buffer_view. */
+VkBufferView bd12_buffer_view_offset(BD12Buffer *buffer, VkFormat format,
+                                     VkDeviceSize offset, VkDeviceSize range,
+                                     int storage, uint32_t *delta)
+{
+    BD12Device *device = buffer->device;
+    *delta = 0;
+    const VkDeviceSize alignment = storage ? device->min_storage_texel_alignment :
+                                             device->min_uniform_texel_alignment;
+    if (!device->texel_offset_fixup || !alignment || !(offset % alignment) || offset >= buffer->size)
+        return bd12_buffer_view(buffer, format, offset, range, storage);
+    uint32_t texel_bytes = 0;
+    bd12_format_block(format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, NULL, &texel_bytes);
+    const VkDeviceSize extra = offset % alignment;
+    if (!texel_bytes || extra % texel_bytes)
+        return bd12_buffer_view(buffer, format, offset, range, storage);
+    if (range == VK_WHOLE_SIZE || offset + range > buffer->size) range = buffer->size - offset;
+    VkBufferView view = bd12_buffer_view(buffer, format, offset - extra, range + extra, storage);
+    if (view) *delta = (uint32_t)(extra / texel_bytes);
+    return view;
+}
+
 VkBufferView bd12_buffer_view_pinned(BD12Buffer *buffer, VkFormat format,
                                      VkDeviceSize offset, VkDeviceSize range,
                                      int storage)

@@ -32,6 +32,7 @@ int bd12_binding_descriptor_type(const BD12ShaderBinding *b,
                                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         return 1;
     case BD12_RANGE_SAMPLER: *type = VK_DESCRIPTOR_TYPE_SAMPLER; return 1;
+    case BD12_RANGE_TEXEL_OFFSETS: *type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; return 1;
     default: return 0;
     }
 }
@@ -69,15 +70,14 @@ BD12ComputePipeline *bd12_compute_pipeline_create_bound(
     BD12Device *device, const uint32_t *spirv, size_t spirv_bytes,
     const BD12ShaderBinding *bindings, uint32_t binding_count)
 {
+    /* +1: room for the texel offsets table (bd12_texel_offset.c). */
     VkDescriptorSetLayoutBinding *layout_bindings =
-        calloc(binding_count ? binding_count : 1, sizeof(*layout_bindings));
-    BD12ShaderBinding *copy = calloc(binding_count ? binding_count : 1,
-                                     sizeof(*copy));
+        calloc(binding_count + 1, sizeof(*layout_bindings));
+    BD12ShaderBinding *copy = calloc(binding_count + 1, sizeof(*copy));
     BD12ShaderBinding *bindless = calloc(binding_count ? binding_count : 1,
                                          sizeof(*bindless));
     uint32_t bindless_count = 0, bindless_words = 0;
-    VkDescriptorType *types = calloc(binding_count ? binding_count : 1,
-                                     sizeof(*types));
+    VkDescriptorType *types = calloc(binding_count + 1, sizeof(*types));
     BD12ComputePipeline *pipeline = NULL;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     uint32_t *dense_spirv = NULL;
@@ -99,6 +99,12 @@ BD12ComputePipeline *bd12_compute_pipeline_create_bound(
     dense_spirv = bd12_densify_bindings(spirv, spirv_bytes, copy, binding_count,
                                         &next_binding);
     if (!dense_spirv) goto done;
+    if (device->texel_offset_fixup) {
+        uint32_t slots = 0;
+        if (bd12_texel_offsets_apply(&dense_spirv, &spirv_bytes, copy, binding_count, next_binding, &slots))
+            copy[binding_count++] = (BD12ShaderBinding){
+                .type = BD12_RANGE_TEXEL_OFFSETS, .binding = next_binding++, .count = slots };
+    }
     spirv = dense_spirv;
     for (uint32_t i = 0; i < binding_count; ++i) {
         if (!bd12_binding_descriptor_type(&copy[i], &types[i])) goto done;
@@ -235,14 +241,18 @@ static VkDescriptorSet allocate_set(BD12CmdAllocator *a,
             VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
         };
-        VkDescriptorPoolSize sizes[7];
+        VkDescriptorPoolSize sizes[8];
+        uint32_t size_count = 0;
         for (int i = 0; i < 6; ++i)
-            sizes[i] = (VkDescriptorPoolSize){ kinds[i], BD12_POOL_DESCRIPTORS };
-        sizes[6] = (VkDescriptorPoolSize){ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 256 };
+            sizes[size_count++] = (VkDescriptorPoolSize){ kinds[i], BD12_POOL_DESCRIPTORS };
+        if (device->rt_enabled)
+            sizes[size_count++] = (VkDescriptorPoolSize){ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 256 };
+        if (device->texel_offset_fixup)   /* one offsets table per set (bd12_texel_offset.c) */
+            sizes[size_count++] = (VkDescriptorPoolSize){ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, BD12_POOL_SETS };
         VkDescriptorPoolCreateInfo pool_info = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .maxSets = BD12_POOL_SETS,
-            .poolSizeCount = device->rt_enabled ? 7u : 6u,
+            .poolSizeCount = size_count,
             .pPoolSizes = sizes
         };
         VkDescriptorPool pool;
@@ -318,6 +328,7 @@ typedef struct {
     BD12Image *image;
     uint32_t view_mip, view_base_layer, view_layers;
     uint64_t as_va;               /* BD12_DESC_SRV_AS */
+    uint32_t delta;               /* texel_offset_fixup: elements the view starts before the D3D offset */
 } Resolved;
 
 static const BD12Descriptor *table_descriptor(BD12CmdList *list,
@@ -490,9 +501,12 @@ static int resolve_one(BD12CmdList *list, BD12BindState *state,
             out->buffer = buffer->buffer;
             out->offset = offset;
             out->range = range;
-            out->view = bd12_buffer_view(buffer, VK_FORMAT_R32_UINT, offset,
-                                         range & ~(VkDeviceSize)3,
-                                         want == BD12_RANGE_UAV);
+            out->view = b->offset_slot ?
+                bd12_buffer_view_offset(buffer, VK_FORMAT_R32_UINT, offset, range & ~(VkDeviceSize)3,
+                                        want == BD12_RANGE_UAV, &out->delta) :
+                bd12_buffer_view(buffer, VK_FORMAT_R32_UINT, offset,
+                                 range & ~(VkDeviceSize)3,
+                                 want == BD12_RANGE_UAV);
             if (!out->view) return 0;
             out->kind = want == BD12_RANGE_SRV ? BD12_DESC_SRV_BUFFER :
                                                  BD12_DESC_UAV_BUFFER;
@@ -516,8 +530,11 @@ static int resolve_one(BD12CmdList *list, BD12BindState *state,
             out->view = d->buffer_view;
             if ((d->kind == BD12_DESC_SRV_BUFFER || d->kind == BD12_DESC_UAV_BUFFER) &&
                 d->source_buffer && !d->buffer_view) {
-                out->view = bd12_buffer_view(d->source_buffer, d->format, d->offset,
-                                             d->range, d->kind == BD12_DESC_UAV_BUFFER);
+                out->view = b->offset_slot ?
+                    bd12_buffer_view_offset(d->source_buffer, d->format, d->offset, d->range,
+                                            d->kind == BD12_DESC_UAV_BUFFER, &out->delta) :
+                    bd12_buffer_view(d->source_buffer, d->format, d->offset,
+                                     d->range, d->kind == BD12_DESC_UAV_BUFFER);
                 if (!out->view) {          /* invalid range/alignment: act as a null descriptor */
                     memset(out, 0, sizeof(*out));
                     return 1;
@@ -558,10 +575,35 @@ static VkDescriptorSet resolve_set_impl(
     VkDescriptorImageInfo image_infos[MAX_INFOS];
     VkAccelerationStructureKHR as_handles[MAX_INFOS];
     VkWriteDescriptorSetAccelerationStructureKHR as_writes[MAX_WRITES];
+    uint32_t deltas[MAX_INFOS];   /* texel_offset_fixup: per offsets-table slot */
     uint32_t write_count = 0, info_count = 0;
     for (uint32_t i = 0; i < binding_count; ++i) {
         const BD12ShaderBinding *b = &bindings[i];
         const VkDescriptorType type = types[i];
+        if (b->type == BD12_RANGE_TEXEL_OFFSETS) {   /* always last: every slot is resolved by now */
+            if (write_count == MAX_WRITES || info_count == MAX_INFOS) {
+                device->vk.UpdateDescriptorSets(device->device, write_count, writes, 0, NULL);
+                write_count = 0;
+                info_count = 0;
+            }
+            const VkDeviceSize bytes = (VkDeviceSize)(b->count ? b->count : 1) * 4;
+            BD12Buffer *scratch = NULL;
+            VkDeviceSize at = 0;
+            void *cpu = NULL;
+            if (b->count > MAX_INFOS || !scratch_alloc(list->allocator, bytes, &scratch, &at, &cpu))
+                return VK_NULL_HANDLE;
+            memcpy(cpu, deltas, bytes);
+            buffer_infos[info_count] = (VkDescriptorBufferInfo){ scratch->buffer, at, bytes };
+            writes[write_count++] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = set,
+                .dstBinding = b->binding,
+                .descriptorCount = 1,
+                .descriptorType = type,
+                .pBufferInfo = &buffer_infos[info_count++]
+            };
+            continue;
+        }
         if (b->count > MAX_INFOS) return VK_NULL_HANDLE;
         if (write_count == MAX_WRITES || info_count + b->count > MAX_INFOS) {
             device->vk.UpdateDescriptorSets(device->device, write_count, writes,
@@ -580,6 +622,7 @@ static VkDescriptorSet resolve_set_impl(
         for (uint32_t e = 0; e < b->count; ++e) {
             Resolved r;
             if (!resolve_one(list, state, b, b->reg + e, &r)) return VK_NULL_HANDLE;
+            if (b->offset_slot && b->offset_slot - 1 + e < MAX_INFOS) deltas[b->offset_slot - 1 + e] = r.delta;
             if (state == &list->graphics && bd12_trace_active() && getenv("BEER_BD12_BIND_LOG") &&
                 list->gfx.pipeline && r.kind == BD12_DESC_UAV_BUFFER && r.source_buffer)
                 fprintf(stderr, "[BINDG] pso=%016llx u%u va=%llx range=%llu\n",
@@ -748,9 +791,29 @@ VkDescriptorSet bd12_resolve_descriptor_set(
     const VkDescriptorType *types, uint32_t binding_count,
     VkDescriptorSetLayout set_layout)
 {
-    if (list->resolve_hook)
-        return list->resolve_hook(list, list->resolve_user, bindings, types, binding_count,
-                                  set_layout, state == &list->compute);
+    if (list->resolve_hook) {
+        /* The hook (BD11) knows only D3D bindings; the offsets table, if any, gets zeros (exact view offsets). */
+        const int table = binding_count && bindings[binding_count - 1].type == BD12_RANGE_TEXEL_OFFSETS;
+        VkDescriptorSet set = list->resolve_hook(list, list->resolve_user, bindings, types,
+                                                 binding_count - (table ? 1 : 0), set_layout,
+                                                 state == &list->compute);
+        if (set && table) {
+            const BD12ShaderBinding *b = &bindings[binding_count - 1];
+            const VkDeviceSize bytes = (VkDeviceSize)(b->count ? b->count : 1) * 4;
+            BD12Buffer *scratch = NULL;
+            VkDeviceSize at = 0;
+            void *cpu = NULL;
+            if (!scratch_alloc(list->allocator, bytes, &scratch, &at, &cpu)) return VK_NULL_HANDLE;
+            memset(cpu, 0, bytes);
+            const VkDescriptorBufferInfo info = { scratch->buffer, at, bytes };
+            const VkWriteDescriptorSet write = {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = b->binding,
+                .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &info
+            };
+            list->device->vk.UpdateDescriptorSets(list->device->device, 1, &write, 0, NULL);
+        }
+        return set;
+    }
     BD12_PROF_BEGIN();
     VkDescriptorSet set = resolve_set_impl(list, state, bindings, types,
                                            binding_count, set_layout);

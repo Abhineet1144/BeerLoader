@@ -128,6 +128,27 @@ BD12Device *bd12_device_create(void)
         modern->uniform_texel_buffer_offset_single_texel;
     device->storage_texel_single_alignment =
         modern->storage_texel_buffer_offset_single_texel;
+    {   /* Diagnostic: BEER_BD12_TEXEL_ALIGN=<bytes> imposes a stricter texel-buffer offset alignment (and no
+         * single-texel relaxation), e.g. 64 to reproduce a mobile GPU's limits on a desktop one. */
+        const char *forced = getenv("BEER_BD12_TEXEL_ALIGN");
+        if (forced && strtoull(forced, NULL, 0)) {
+            device->min_uniform_texel_alignment = device->min_storage_texel_alignment = strtoull(forced, NULL, 0);
+            device->uniform_texel_single_alignment = device->storage_texel_single_alignment = 0;
+            fprintf(stderr, "[BD12] texel buffer offset alignment forced to %llu\n",
+                    (unsigned long long)device->min_uniform_texel_alignment);
+        }
+    }
+    /* D3D buffer views start at any 4-byte element. Where Vulkan needs coarser view offsets (Adreno: 64 bytes),
+     * views start aligned down and shaders add the remainder (bd12_texel_offset.c). Desktop GPUs with single-texel
+     * alignment never need it, so their pipelines and draws are unchanged. BEER_BD12_TEXEL_OFFSETS=0/1 overrides. */
+    device->texel_offset_fixup =
+        (!device->uniform_texel_single_alignment && device->min_uniform_texel_alignment > 4) ||
+        (!device->storage_texel_single_alignment && device->min_storage_texel_alignment > 4);
+    if (getenv("BEER_BD12_TEXEL_OFFSETS")) device->texel_offset_fixup = atoi(getenv("BEER_BD12_TEXEL_OFFSETS")) != 0;
+    if (device->texel_offset_fixup)
+        fprintf(stderr, "[BD12] texel buffer views use shader offsets (alignment uniform=%llu storage=%llu)\n",
+                (unsigned long long)device->min_uniform_texel_alignment,
+                (unsigned long long)device->min_storage_texel_alignment);
 
 
     /* Persistent pipeline cache: driver pipeline compiles dominate first-run loading. */

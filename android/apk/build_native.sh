@@ -26,6 +26,14 @@ if [ "$BEER_X11" = 1 ] || [ ! -f android/android_backend.c ]; then :; else
   SRCS=$(echo "$SRCS" | grep -v '^platform/xwayland_backend.c$'; echo android/android_backend.c)
 fi
 
+# A header newer than the last build (a struct layout change) rebuilds everything: objects compiled against the old
+# layout would otherwise be linked in silently.
+STAMP=$OBJ/.headers.stamp
+if [ ! -f "$STAMP" ] || [ -n "$(find platform graphics renderer audio media android \( -name '*.h' -o -name '*.inc' \) \
+                                    -newer "$STAMP" -print -quit)" ]; then
+  FORCE=1
+fi
+
 compile_c() {
   f=$1; o=$OBJ/$(echo "$f" | tr / _).o
   if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ -n "$FORCE" ]; then
@@ -36,6 +44,7 @@ compile_c() {
 }
 export -f compile_c; export CC INC OBJ FORCE
 echo "$SRCS" | xargs -P 8 -I{} bash -c 'compile_c {}' 
+touch "$STAMP"
 
 FDEFS="-DARCHITECTURE_arm64=1 -DFEX_DISABLE_TELEMETRY=1 -D_LARGEFILE64_SOURCE -DFEXCORE_HAS_PRESERVE_ALL_ATTR=1 -DFEX_HAS_PRESERVE_ALL_ATTR=1 -DHAS_SYSCALL_GETTID=1 -DHAS_SYSCALL_TGKILL=1 -DJIT_ARM64"
 FINC="-Iplatform -Iandroid -I$F/FEXCore/include -I$FB/include -I$F/Source -I$F/FEXHeaderUtils -I$F/External/fmt/include -I$F/External/range-v3/include -I$F/External/unordered_dense/include -I$F/CodeEmitter"

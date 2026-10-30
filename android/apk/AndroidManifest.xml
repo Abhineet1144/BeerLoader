@@ -18,6 +18,7 @@
         android:label="Beer"
         android:hasCode="false"
         android:allowNativeHeapPointerTagging="false"
+        android:debuggable="true"
         android:extractNativeLibs="true"
         android:largeHeap="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">

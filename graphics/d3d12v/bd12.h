@@ -83,6 +83,7 @@ struct BD12Device {
     VkDeviceSize min_storage_texel_alignment;
     int uniform_texel_single_alignment;
     int storage_texel_single_alignment;
+    int texel_offset_fixup;       /* views may start below their D3D offset; shaders add the rest (bd12_texel_offset.c) */
 
     pthread_mutex_t view_lock;    /* guards every BD12Buffer view cache */
     pthread_mutex_t va_lock;
@@ -231,6 +232,7 @@ enum {
     BD12_RANGE_UAV = 1,
     BD12_RANGE_CBV = 2,
     BD12_RANGE_SAMPLER = 3,
+    BD12_RANGE_TEXEL_OFFSETS = 4,  /* pipeline-internal: storage buffer with per-binding texel-view offsets */
     BD12_RANGE_APPEND = 0xffffffffu
 };
 
@@ -339,6 +341,7 @@ typedef struct {
     uint32_t push_word;           /* bindless: push-constant word with the heap index */
     uint32_t heap_class;          /* bindless: heap-mirror binding 0..3 */
     uint32_t is_accel;            /* SRV is a ray tracing acceleration structure */
+    uint32_t offset_slot;         /* texel_offset_fixup: 1 + first slot in the offsets table, 0 = none */
     /* Root parameters that can satisfy this binding, found once per root signature (resolve_one). */
     uint32_t cand_serial;         /* root signature serial the list below was built for (0 = none) */
     uint32_t cand_count;          /* 0xff = too many, scan every parameter */
@@ -672,6 +675,11 @@ void bd12_descriptor_copy(BD12DescriptorHeap *dst, uint32_t dst_index,
 VkBufferView bd12_buffer_view(BD12Buffer *buffer, VkFormat format,
                               VkDeviceSize offset, VkDeviceSize range,
                               int storage);
+/* As bd12_buffer_view; on texel_offset_fixup devices a misaligned view starts aligned down and *delta is the
+ * element count the shader adds back. */
+VkBufferView bd12_buffer_view_offset(BD12Buffer *buffer, VkFormat format,
+                                     VkDeviceSize offset, VkDeviceSize range,
+                                     int storage, uint32_t *delta);
 /* Same, for a view that a long-lived descriptor keeps referencing: never aged out. */
 VkBufferView bd12_buffer_view_pinned(BD12Buffer *buffer, VkFormat format,
                                      VkDeviceSize offset, VkDeviceSize range,
@@ -1002,6 +1010,15 @@ int bd12_cmd_bind_bindless(BD12CmdList *list, BD12BindState *state,
                            VkShaderStageFlags stages,
                            const BD12ShaderBinding *bindless, uint32_t count,
                            uint32_t words);
+
+/* bd12_texel_offset.c: add per-binding texel offsets to a shader's texel-buffer accesses (NULL = leave unchanged). */
+uint32_t *bd12_spirv_texel_offsets(const uint32_t *spirv, size_t spirv_bytes, const uint32_t *bindings,
+                                   const uint32_t *slot_base, uint32_t binding_count, uint32_t offsets_binding,
+                                   size_t *out_bytes);
+/* Assigns offset slots to the texel-buffer bindings among bindings[0..count) (shader stage stage_bindings of
+ * them belong to *spirv) and rewrites *spirv in place; returns the slots used so far (next_slot updated). */
+int bd12_texel_offsets_apply(uint32_t **spirv, size_t *spirv_bytes, BD12ShaderBinding *bindings, uint32_t count,
+                             uint32_t offsets_binding, uint32_t *next_slot);
 
 int bd12_scratch_alloc(BD12CmdAllocator *a, VkDeviceSize size,
                        BD12Buffer **buffer, VkDeviceSize *offset, void **ptr);

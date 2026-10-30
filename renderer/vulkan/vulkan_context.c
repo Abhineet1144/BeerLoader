@@ -501,15 +501,23 @@ int beer_vulkan_context_initialize(void)
     }
     const int core13 = (application.apiVersion >= VK_API_VERSION_1_3 &&
                         physical_properties.apiVersion >= VK_API_VERSION_1_3);
+    VkPhysicalDeviceVulkan11Features v11_supported = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES
+    };
     VkPhysicalDeviceVulkan12Features v12_supported = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &v11_supported
     };
     VkPhysicalDeviceVulkan13Features v13_supported = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
         .pNext = &v12_supported
     };
+    VkPhysicalDeviceVulkan11Features v11_enabled = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES
+    };
     VkPhysicalDeviceVulkan12Features v12_enabled = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &v11_enabled
     };
     VkPhysicalDeviceVulkan13Features v13_enabled = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -565,6 +573,9 @@ int beer_vulkan_context_initialize(void)
                                                 &features2);
         const VkPhysicalDeviceVulkan12Features *s12 = &v12_supported;
         const VkPhysicalDeviceVulkan13Features *s13 = &v13_supported;
+        /* The shader translators read SV_InstanceID as InstanceIndex - BaseInstance (SPIR-V DrawParameters),
+         * which the device must enable; without it BaseInstance is undefined on some drivers (Adreno). */
+        v11_enabled.shaderDrawParameters = v11_supported.shaderDrawParameters;
         v12_enabled.timelineSemaphore = s12->timelineSemaphore;
         v12_enabled.bufferDeviceAddress = s12->bufferDeviceAddress;
         v12_enabled.scalarBlockLayout = s12->scalarBlockLayout;
@@ -607,7 +618,7 @@ int beer_vulkan_context_initialize(void)
         v13_enabled.maintenance4 = s13->maintenance4;
         v13_enabled.shaderDemoteToHelperInvocation =
             s13->shaderDemoteToHelperInvocation;
-        v12_enabled.pNext = feature_chain;
+        v11_enabled.pNext = feature_chain;
         feature_chain = &v13_enabled;
         g_context.timeline_semaphore = v12_enabled.timelineSemaphore;
         g_context.modern.api_version = physical_properties.apiVersion;
@@ -759,14 +770,15 @@ int beer_vulkan_context_initialize(void)
             g_context.pipeline_robustness, g_context.timeline_semaphore);
     fprintf(stderr,
             "[VULKAN] core features: api=%u.%u bda=%d sync2=%d dynrender=%d "
-            "descriptor-indexing=%d scalar-layout=%d\n",
+            "descriptor-indexing=%d scalar-layout=%d draw-parameters=%d\n",
             VK_VERSION_MAJOR(g_context.modern.api_version),
             VK_VERSION_MINOR(g_context.modern.api_version),
             g_context.modern.buffer_device_address,
             g_context.modern.synchronization2,
             g_context.modern.dynamic_rendering,
             g_context.modern.descriptor_indexing,
-            g_context.modern.scalar_block_layout);
+            g_context.modern.scalar_block_layout,
+            (int)v11_enabled.shaderDrawParameters);
     pthread_mutex_unlock(&g_context_lock);
     return 1;
 
