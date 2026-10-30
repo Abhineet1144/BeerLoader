@@ -1,6 +1,7 @@
 #include "beer_control.h"
 #include "beer_time.h"
 #include "beer_memory.h"
+#include "beer_objects.h"
 #include "beer_overlay.h"
 #include "beer_post.h"
 
@@ -341,6 +342,8 @@ static void handle(Session *session, const char *request, char *out, size_t size
         beer_overlay_handle(cmd, request, out, size);
     } else if (!strncmp(cmd, "mem_", 4)) {
         beer_memory_handle(cmd, request, out, size);
+    } else if (!strncmp(cmd, "obj_", 4)) {
+        beer_objects_handle(cmd, request, out, size);
     } else {
         reply_error(out, size, "unknown cmd");
     }

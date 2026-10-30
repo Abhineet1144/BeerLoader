@@ -2409,6 +2409,23 @@ static void lowercase_dll_basename(const char *name, char *out, size_t out_size)
     out[i] = 0;
 }
 
+/* Guest modules for the object scanner (platform/beer_objects.c): index 0 is the executable, then each loaded DLL.
+ * Returns 0 past the end. */
+int beer_guest_module_info(int index, u64 *base, u64 *size, const char **name)
+{
+    if (index == 0) {
+        if (!g_img) return 0;
+        const char *path = g_exe_host_path ? g_exe_host_path : "exe";
+        const char *slash = strrchr(path, '/');
+        *base = (u64)g_img; *size = g_img_size; *name = slash ? slash + 1 : path;
+        return 1;
+    }
+    if (index - 1 >= g_guest_dll_count) return 0;
+    const GuestDll *dll = &g_guest_dlls[index - 1];
+    *base = (u64)dll->image; *size = dll->image_size; *name = dll->name;
+    return 1;
+}
+
 static GuestDll *guest_dll_from_handle(u64 handle)
 {
     for (int i = 0; i < g_guest_dll_count; ++i)

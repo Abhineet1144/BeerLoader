@@ -27,6 +27,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import storage  # noqa: E402
 from memory_window import MemoryWindow  # noqa: E402
+from objects_window import ObjectsWindow  # noqa: E402
 from overlay_page import OverlayPage, flat_message, load_config as load_overlay_config  # noqa: E402
 from display_page import DisplayPage, post_message, load_config as load_display_config  # noqa: E402
 from graphics_window import GraphicsWindow, apply_saved as apply_saved_tweaks  # noqa: E402
@@ -390,6 +391,10 @@ class RunningCard(Adw.PreferencesGroup):
         memory = Gtk.Button(label="Memory…", valign=Gtk.Align.CENTER)
         memory.connect("clicked", lambda _b: MemoryWindow(app, self.path, self.name, self.pid).present())
         actions.add_suffix(memory)
+        objects = Gtk.Button(label="Objects…", valign=Gtk.Align.CENTER,
+                             tooltip_text="Find the player and the objects around it; edit position, rotation, scale and fields")
+        objects.connect("clicked", lambda _b: ObjectsWindow(app, self.path, self.name, self.pid, self.exe).present())
+        actions.add_suffix(objects)
         stop = Gtk.Button(label="Stop", valign=Gtk.Align.CENTER)
         stop.add_css_class("destructive-action")
         stop.connect("clicked", lambda _b: app.stop_game(self.pid))

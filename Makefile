@@ -7,7 +7,7 @@ TARGET = loader
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
 MEDIA_SRCS = media/media_foundation.c
-PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_bcrypt.c platform/win32_version.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
+PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_bcrypt.c platform/win32_version.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
                 platform/win32_nt_section.c platform/win32_virtual_memory.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
                 platform/win32_seh.c
@@ -67,6 +67,10 @@ graphics/d3d11v/%.o: graphics/d3d11v/%.c graphics/d3d11v/bd11.h
 # Memory accessor handles floats (strtod/strtof), which the SSE-less loader flags cannot compile.
 platform/beer_memory.o: platform/beer_memory.c platform/beer_memory.h platform/beer_control.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
+# The object scanner does float math on candidate transforms.
+platform/beer_objects.o: platform/beer_objects.c platform/beer_objects.h platform/beer_control.h
+	$(CC) $(D3D12_ABI_CFLAGS) -O2 -Iplatform -c $< -o $@
 
 graphics/d3d12/d3d12_shader_translator.o: graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_shader_translator.h
 	$(CC) $(RENDER_CFLAGS) -c $< -o $@

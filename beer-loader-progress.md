@@ -1229,3 +1229,19 @@ through DirectSound. Problems found:
 - Control-socket `status` reports `max_frame_ms` and `hitches` (presents >50 ms apart) since the previous request.
   Loading + opening cutscene: 0 hitches, worst frame 36 ms.
 - Seen once since (8 min in, opening cutscene): SIGSEGV reading NULL at img+0x2ea0e89, not yet analysed.
+
+### Addendum 17 — object scanner (2026-10-30)
+
+`platform/beer_objects.c` (control commands `obj_*`, see `beer_objects.h`) and the manager's **Objects…** window
+(`manager/objects_window.py`, maths in `manager/transforms.py`):
+
+- Finds transforms in writable anonymous memory: 4x4 / 3x4 / transposed float matrices (orthogonal, right-handed
+  rows of equal-ish length) and float/double quaternion+translation+scale. Each transform's holder is the nearest
+  earlier pointer to a vtable in a guest module; objects pointing at a holder become entities (RAGE keeps matrices in
+  small fwTransform-like holders). Groups = (vtable, offsets, layout); MSVC RTTI names when present (RDR2 has none).
+  RDR2 gameplay: ~260k transforms, ~10k groups, 14 GB read in ~24 s.
+- `obj_find_player` injects W then S: the controlled character is what moved forward and back. Verified in RDR2
+  (Arthur found; several copies at his position). `obj_near` lists objects around a point.
+- Writing the matrix alone does nothing in RDR2: the game rebuilds it every frame from the physics state.
+  `obj_copies` finds every float/double triple equal to a position and `obj_shift` moves them all, re-writing for
+  hold_ms. Not yet tested in game, and the window's position edits do not use them yet.
