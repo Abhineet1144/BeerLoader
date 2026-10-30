@@ -14,6 +14,7 @@
  * code such as  uc->uc_mcontext.gregs[REG_RIP]  is unchanged. */
 
 #include "beer_arch.h"
+#include "win32_entry.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -80,10 +81,14 @@ uint64_t beer_guest_call(uint64_t fn, const uint64_t *args, unsigned nargs);
  * register of that position (XMM0-XMM3) instead of the integer register, as the Win64 ABI passes it. */
 uint64_t beer_guest_call_f(uint64_t fn, const uint64_t *args, unsigned nargs, unsigned float_mask);
 
-/* Start executing the guest's entry point on the current thread. Does not return.
- * If run_tls_callbacks is set, first call tls_runner(void) as a guest-side prologue would. */
-void beer_guest_enter(uint64_t entry, uint64_t stack_top, uint64_t tls_runner, int run_tls_callbacks)
-    __attribute__((noreturn));
+/* beer_guest_enter(stack, tls, entry) (win32_entry.h, included above) starts the guest's entry point on the current
+ * thread: run the host function tls() first (it calls the executable's TLS callbacks), then enter `entry` with RSP =
+ * stack. Natively it is platform/win32_entry.c; emulated, the backend implements it. Does not return. */
+
+/* Run the guest function `fn` with the nonvolatile registers (RBX, RBP, RSI, RDI, R12-R15) and the stack of `regs`
+ * (the callee's frame is placed below regs' RSP, 16-byte aligned) and Win64 integer arguments; return RAX. Used for
+ * STATUS_UNWIND_CONSOLIDATE, where the C++ runtime's catch-block runner needs the unwound frame's registers. */
+uint64_t beer_guest_call_in_context(const beer_guest_ucontext_t *regs, uint64_t fn, const uint64_t *args, unsigned nargs);
 
 /* The guest stack the calling thread's guest code runs on (allocated on first use). The loader publishes it as the
  * TEB's StackBase/StackLimit: guest stack probes (__chkstk) and unwinding read them. Returns 0 on success. */

@@ -9,7 +9,8 @@ if [ -z "$FILES" ]; then
     platform/beer_hash.c platform/win32_version.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c \
     platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c platform/win32_nt_section.c \
     platform/win32_virtual_memory.c platform/x64_fault_emulation.c platform/win32_vectored_exception.c \
-    platform/win32_unwind.c platform/win32_seh.c \
+    platform/win32_unwind.c platform/win32_seh.c platform/win32_apiset.c platform/win32_gdi.c platform/win32_resource.c \
+    platform/win32_onexit.c platform/win32_crt_init.c \
     renderer/vulkan/vulkan_context.c renderer/vulkan/vulkan_presenter.c renderer/vulkan/vulkan_post.c \
     renderer/vulkan/vulkan_renderer.c renderer/vulkan/vulkan_graphics.c renderer/vulkan/vulkan_indexed_renderer.c \
     graphics/d3d11/d3d11_impl.c graphics/d3d12/d3d12_api.c graphics/d3d12/d3d12_shader_translator.c \

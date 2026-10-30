@@ -1856,6 +1856,4 @@ static const char *const g_kernel32_export_names[] = {
     "lstrlen",
     "lstrlenA",
     "lstrlenW",
-    "wine_get_dos_file_name",
-    "wine_get_unix_file_name",
 };

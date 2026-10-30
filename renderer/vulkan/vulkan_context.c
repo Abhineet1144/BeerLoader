@@ -164,6 +164,19 @@ static void *gpu_keepalive_thread(void *unused)
     }
 }
 
+/* Diagnostic: BEER_VK_DEBUG_UTILS=1 enables VK_EXT_debug_utils and prints every
+ * driver message, including the driver's own reason for a device loss. */
+static VKAPI_ATTR VkBool32 VKAPI_CALL debug_utils_message(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT types,
+    const VkDebugUtilsMessengerCallbackDataEXT *data, void *user)
+{
+    (void)types; (void)user;
+    fprintf(stderr, "[VKDEBUG] sev=0x%x %s\n", (unsigned)severity,
+            data && data->pMessage ? data->pMessage : "(no message)");
+    return VK_FALSE;
+}
+
 #define LOAD_INSTANCE(name) do { \
     g_context.name = (PFN_vk##name)g_context.GetInstanceProcAddr( \
         g_context.instance, "vk" #name); \
@@ -212,9 +225,11 @@ int beer_vulkan_context_initialize(void)
 #ifdef __ANDROID__
         "VK_KHR_android_surface",
 #endif
-        "VK_KHR_get_physical_device_properties2"
+        "VK_KHR_get_physical_device_properties2",
+        "VK_EXT_debug_utils"
     };
-    const char *instance_extensions[4];
+    int debug_utils = getenv("BEER_VK_DEBUG_UTILS") != NULL;
+    const char *instance_extensions[sizeof(wanted_extensions) / sizeof(wanted_extensions[0])];
     uint32_t instance_extension_count = 0;
     {
         PFN_vkEnumerateInstanceExtensionProperties enumerate_extensions =
@@ -231,12 +246,17 @@ int beer_vulkan_context_initialize(void)
             }
         }
         for (size_t i = 0; i < sizeof(wanted_extensions) / sizeof(wanted_extensions[0]); ++i) {
+            int is_debug_utils = !strcmp(wanted_extensions[i], "VK_EXT_debug_utils");
+            if (is_debug_utils && !debug_utils) continue;   /* opt-in diagnostic only */
             int present = available == NULL;
             for (uint32_t k = 0; available && k < available_count; ++k)
                 if (!strcmp(available[k].extensionName, wanted_extensions[i])) { present = 1; break; }
             if (present) instance_extensions[instance_extension_count++] = wanted_extensions[i];
-            else fprintf(stderr, "[VULKAN] instance extension %s is not available; continuing without it\n",
-                         wanted_extensions[i]);
+            else {
+                fprintf(stderr, "[VULKAN] instance extension %s is not available; continuing without it\n",
+                        wanted_extensions[i]);
+                if (is_debug_utils) debug_utils = 0;
+            }
         }
         free(available);
     }
@@ -265,6 +285,26 @@ int beer_vulkan_context_initialize(void)
     };
     if (create_instance(&instance_info, NULL, &g_context.instance) != VK_SUCCESS)
         goto fail;
+    if (debug_utils) {
+        PFN_vkCreateDebugUtilsMessengerEXT create_messenger =
+            (PFN_vkCreateDebugUtilsMessengerEXT)g_context.GetInstanceProcAddr(
+                g_context.instance, "vkCreateDebugUtilsMessengerEXT");
+        VkDebugUtilsMessengerCreateInfoEXT messenger_info = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = debug_utils_message
+        };
+        VkDebugUtilsMessengerEXT messenger;
+        if (!create_messenger || create_messenger(g_context.instance,
+                &messenger_info, NULL, &messenger) != VK_SUCCESS)
+            fprintf(stderr, "[VULKAN] VK_EXT_debug_utils messenger unavailable\n");
+    }
     LOAD_INSTANCE(DestroyInstance);
     LOAD_INSTANCE(EnumeratePhysicalDevices);
     LOAD_INSTANCE(GetPhysicalDeviceQueueFamilyProperties);

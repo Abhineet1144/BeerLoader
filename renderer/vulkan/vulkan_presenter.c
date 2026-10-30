@@ -197,7 +197,10 @@ void vulkan_presenter_destroy(void)
     if (g_vk.surface && g_vk.DestroySurfaceKHR)
         g_vk.DestroySurfaceKHR(g_vk.instance, g_vk.surface, NULL);
     memset(&g_vk, 0, sizeof(g_vk));
-    beer_vulkan_context_destroy();
+    /* The shared Vulkan context is NOT destroyed here: BD12/BD11 keep the VkDevice and its function table for
+     * the life of the process, and a game may destroy one window (a launcher) and create another. Tearing the
+     * context down left BD12 with a dangling device and function pointers into a dlclose()d driver
+     * (vkCreateSemaphore crashed in the driver after the launcher closed). */
 }
 
 static int load_instance_functions(void)

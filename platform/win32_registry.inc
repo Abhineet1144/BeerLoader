@@ -69,14 +69,23 @@ static void reg_seed_locked(void)
     reg_seed_hardware();
     const char *steam_off = getenv("BEER_FAKE_STEAM_REGISTRY");
     if (steam_off && !strcmp(steam_off, "0")) return;
-    reg_add_sz("hkcu\\software\\valve\\steam", "steampath", "c:/program files (x86)/steam");
-    reg_add_sz("hkcu\\software\\valve\\steam", "steamexe", "c:/program files (x86)/steam/steam.exe");
+
+    char steam_root[4096], steam_exe[4096], steam_client[4096], steam_client64[4096];
+    if (!beer_steam_registry_root(g_steam_api_guest_mode, g_exe_path,
+                                  steam_root, sizeof(steam_root)))
+        snprintf(steam_root, sizeof(steam_root), "C:\\Program Files (x86)\\Steam");
+    snprintf(steam_exe, sizeof(steam_exe), "%s\\steam.exe", steam_root);
+    snprintf(steam_client, sizeof(steam_client), "%s\\steamclient.dll", steam_root);
+    snprintf(steam_client64, sizeof(steam_client64), "%s\\steamclient64.dll", steam_root);
+
+    reg_add_sz("hkcu\\software\\valve\\steam", "steampath", steam_root);
+    reg_add_sz("hkcu\\software\\valve\\steam", "steamexe", steam_exe);
     reg_add_sz("hkcu\\software\\valve\\steam", "language", "english");
     reg_add_dword("hkcu\\software\\valve\\steam\\activeprocess", "pid", (u32)getpid());
-    reg_add_sz("hkcu\\software\\valve\\steam\\activeprocess", "steamclientdll", "c:\\program files (x86)\\steam\\steamclient.dll");
-    reg_add_sz("hkcu\\software\\valve\\steam\\activeprocess", "steamclientdll64", "c:\\program files (x86)\\steam\\steamclient64.dll");
+    reg_add_sz("hkcu\\software\\valve\\steam\\activeprocess", "steamclientdll", steam_client);
+    reg_add_sz("hkcu\\software\\valve\\steam\\activeprocess", "steamclientdll64", steam_client64);
     reg_add_sz("hkcu\\software\\valve\\steam\\activeprocess", "universe", "Public");
-    reg_add_sz("hklm\\software\\valve\\steam", "installpath", "C:\\Program Files (x86)\\Steam");
+    reg_add_sz("hklm\\software\\valve\\steam", "installpath", steam_root);
 }
 
 /* Normalise "a\\b/C" -> "a\\b\\c" appended to dst, dropping wow6432node segments. */

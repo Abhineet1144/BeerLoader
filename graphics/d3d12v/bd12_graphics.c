@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "bd12.h"
+#include "bd12_pso.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,26 +40,6 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
         }
     }
     gp->shader_hash = hash;
-    /* Occlusion-proxy pipelines (no colour output, depth test without write, pixel
-     * shader with UAV stores) mark objects visible when their proxy passes the depth
-     * test. Their borderline comparisons against coplanar geometry resolve differently
-     * on this driver than on D3D hardware and made whole batches (floors, characters)
-     * pop in and out, so they always pass: conservative, only occlusion culling is lost.
-     * BEER_BD12_PROXY_ALWAYS=0 restores the application's depth function. */
-    int proxy_always = 0;
-    const char *proxy_env = getenv("BEER_BD12_PROXY_ALWAYS");
-    if ((!proxy_env || atoi(proxy_env)) && desc->rt_count == 0 && desc->depth_test &&
-        !desc->depth_write)
-        for (uint32_t i = 0; i < desc->ps.binding_count; ++i)
-            if (desc->ps.bindings[i].type == BD12_RANGE_UAV) proxy_always = 1;
-    /* BEER_BD12_PROXY_BIAS=<n>: instead of always passing, nudge such proxies n
-     * depth ULPs toward the camera (reverse-Z) so ties against coplanar geometry
-     * resolve as visible while clearly occluded objects are still culled. */
-    float proxy_bias = 0.0f;
-    if (proxy_always && getenv("BEER_BD12_PROXY_BIAS") && atoi(getenv("BEER_BD12_PROXY_BIAS")) > 0) {
-        proxy_bias = (float)atoi(getenv("BEER_BD12_PROXY_BIAS"));
-        proxy_always = 0;
-    }
     if (getenv("BEER_BD12_PSO_LOG"))
         fprintf(stderr, "[PSO] %016llx topo=%d fill=%d cull=%d ccw=%d clip=%d bias=%d depth=%d/%d func=%d "
                 "stencil=%d rt=%u blend0=%d wm0=%x ds=%d samples=%u\n",
@@ -225,10 +206,10 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
         .cullMode = desc->cull_mode,
         .frontFace = desc->front_ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE :
                                        VK_FRONT_FACE_CLOCKWISE,
-        .depthBiasEnable = proxy_bias > 0.0f ? 1 : desc->depth_bias_enable,
-        .depthBiasConstantFactor = proxy_bias > 0.0f ? proxy_bias : desc->depth_bias,
-        .depthBiasClamp = proxy_bias > 0.0f ? 0.0f : desc->depth_bias_clamp,
-        .depthBiasSlopeFactor = proxy_bias > 0.0f ? 0.0f : desc->slope_scaled_bias,
+        .depthBiasEnable = desc->depth_bias_enable,
+        .depthBiasConstantFactor = desc->depth_bias,
+        .depthBiasClamp = desc->depth_bias_clamp,
+        .depthBiasSlopeFactor = desc->slope_scaled_bias,
         .lineWidth = 1.0f
     };
     VkPipelineMultisampleStateCreateInfo multisample = {
@@ -241,7 +222,7 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable = desc->depth_test,
         .depthWriteEnable = desc->depth_write,
-        .depthCompareOp = proxy_always ? VK_COMPARE_OP_ALWAYS : desc->depth_func,
+        .depthCompareOp = desc->depth_func,
         .stencilTestEnable = desc->stencil_test,
         .front = desc->stencil_front,
         .back = desc->stencil_back
@@ -443,7 +424,29 @@ void bd12_cmd_set_scissors(BD12CmdList *list, const VkRect2D *rects,
 void bd12_cmd_set_topology(BD12CmdList *list, VkPrimitiveTopology topology)
 {
     list->gfx.topology = topology;
+    list->gfx.topology_unsupported = 0;
     list->gfx.dirty |= BD12_DIRTY_TOPOLOGY;
+}
+
+void bd12_cmd_set_d3d_topology(BD12CmdList *list, uint32_t d3d_topology)
+{
+    uint32_t patch = 0;
+    VkPrimitiveTopology vk = bd12_topology_to_vk(d3d_topology, &patch);
+    /* BD12 pipelines carry no hull/domain stages, and a patch list without
+     * them is invalid Vulkan (Mesa ANV crashes in vkCmdDraw; NVIDIA tolerates
+     * it). Three-point patches still draw as their untessellated triangles;
+     * other patch sizes have no equivalent and their draws are dropped. */
+    if (vk == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+        bd12_cmd_set_topology(list, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        if (patch != 3) {
+            list->gfx.topology_unsupported = 1;
+            static uint64_t logged;
+            if (!(__atomic_fetch_or(&logged, 1ull << patch, __ATOMIC_RELAXED) & (1ull << patch)))
+                fprintf(stderr, "[BD12] %u-control-point patch list without tessellation: draws dropped\n", patch);
+        }
+        return;
+    }
+    bd12_cmd_set_topology(list, vk);
 }
 
 void bd12_cmd_set_vertex_buffers(BD12CmdList *list, uint32_t start,
@@ -613,6 +616,10 @@ static int prepare_draw(BD12CmdList *list)
     if (!gp || (!list->graphics.root_signature && !list->resolve_hook)) {
         BD12_DROP(BD12_DROP_DRAW_NO_STATE);
         { static unsigned logged; if (logged++ < 5) fprintf(stderr, "[BD12] draw dropped: pipeline=%p root_signature=%p resolve_hook=%p\n", (void *)gp, (void *)list->graphics.root_signature, (void *)(uintptr_t)list->resolve_hook); }
+        return 0;
+    }
+    if (g->topology_unsupported) {
+        BD12_DROP(BD12_DROP_DRAW_PATCH_LIST);
         return 0;
     }
     if (bd12_debug_sync_all()) bd12_cmd_global_barrier(list);

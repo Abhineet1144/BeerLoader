@@ -1,8 +1,59 @@
 #include "win32_virtual_memory.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static void test_string_pointer_probes(void)
+{
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    char *memory = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(memory != MAP_FAILED);
+    memset(memory, 'x', page);
+    assert(mprotect(memory + page, page, PROT_NONE) == 0);
+
+    assert(!beer_is_bad_string_ptr_a(NULL, 0));
+    assert(!beer_is_bad_string_ptr_w(NULL, 0));
+    assert(beer_is_bad_string_ptr_a(NULL, 1));
+    assert(beer_is_bad_string_ptr_w(NULL, 1));
+    assert(beer_is_bad_string_ptr_a(memory + page, 1));
+    assert(beer_is_bad_string_ptr_w((uint16_t *)(memory + page), 1));
+    assert(!beer_is_bad_string_ptr_a(memory, page));
+    assert(beer_is_bad_string_ptr_a(memory, page + 1));
+    assert(!beer_is_bad_string_ptr_w((uint16_t *)memory, page / 2));
+    assert(beer_is_bad_string_ptr_w((uint16_t *)memory, page / 2 + 1));
+
+    /* A terminator before an unreadable page must win over the short read. */
+    memory[page - 1] = 0;
+    assert(!beer_is_bad_string_ptr_a(memory + page - 3, SIZE_MAX));
+    assert(!beer_is_bad_string_ptr_a(memory, SIZE_MAX));
+    assert(beer_is_bad_string_ptr_w((uint16_t *)(memory + page - 2), 2));
+    memory[page - 2] = 0;
+    assert(!beer_is_bad_string_ptr_w((uint16_t *)(memory + page - 4), SIZE_MAX));
+    assert(!beer_is_bad_string_ptr_w((uint16_t *)memory, SIZE_MAX));
+
+    /* UTF-16 counts code units, including unaligned units across page edges. */
+    memory[page - 2] = 'x';
+    memory[page - 1] = 'x';
+    assert(beer_is_bad_string_ptr_w((uint16_t *)(memory + page - 1), 1));
+    assert(mprotect(memory + page, page, PROT_READ | PROT_WRITE) == 0);
+    memory[page - 1] = memory[page] = 0;
+    assert(!beer_is_bad_string_ptr_w((uint16_t *)(memory + page - 1), 1));
+    assert(mprotect(memory, page, PROT_READ) == 0);
+    errno = EDOM;
+    assert(!beer_is_bad_string_ptr_a(memory + page - 1, 1));
+    assert(errno == EDOM);
+    assert(beer_is_bad_string_ptr_a((const char *)(UINTPTR_MAX - 1), SIZE_MAX));
+    assert(beer_is_bad_string_ptr_w((const uint16_t *)(UINTPTR_MAX - 1), SIZE_MAX));
+    assert(errno == EDOM);
+    assert(munmap(memory, page * 2) == 0);
+    assert(beer_is_bad_string_ptr_a(memory, 1));
+}
 
 static void test_allocate_query_protect_release(void)
 {
@@ -45,6 +96,7 @@ int main(void)
 {
     test_allocate_query_protect_release();
     test_reserve_and_validation();
+    test_string_pointer_probes();
     beer_virtual_memory_reset();
     puts("Win32 virtual-memory tests passed");
     return 0;

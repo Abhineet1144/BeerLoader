@@ -85,6 +85,66 @@ static int section_index(uint64_t handle)
     return g_sections[index].used ? index : -1;
 }
 
+
+#define BEER_STATUS_INVALID_IMAGE_FORMAT UINT32_C(0xc000007b)
+#define BEER_SEC_IMAGE UINT32_C(0x01000000)
+
+/* SEC_IMAGE view: the file is laid out at its section RVAs in a private (copy-on-write style) region of
+ * SizeOfImage bytes, like the native image mapper. Relocation and imports stay with the caller. */
+static uint32_t map_image_view(int fd, void **base_address, size_t *view_size, void **mapped_out)
+{
+    uint8_t head[4096];
+    ssize_t got = pread(fd, head, sizeof(head), 0);
+    if (got < 0x40 || head[0] != 'M' || head[1] != 'Z') return BEER_STATUS_INVALID_IMAGE_FORMAT;
+    uint32_t pe;
+    memcpy(&pe, head + 0x3c, 4);
+    if (pe + 0x18 > (uint32_t)got) return BEER_STATUS_INVALID_IMAGE_FORMAT;
+    if (memcmp(head + pe, "PE\0\0", 4) != 0) return BEER_STATUS_INVALID_IMAGE_FORMAT;
+    uint16_t sections, optional_size, magic;
+    memcpy(&sections, head + pe + 6, 2);
+    memcpy(&optional_size, head + pe + 20, 2);
+    memcpy(&magic, head + pe + 24, 2);
+    if ((magic != 0x20b && magic != 0x10b) || pe + 24 + optional_size > (uint32_t)got) return BEER_STATUS_INVALID_IMAGE_FORMAT;
+    uint32_t image_size, headers_size;
+    memcpy(&image_size, head + pe + 24 + 56, 4);
+    memcpy(&headers_size, head + pe + 24 + 60, 4);
+    if (!image_size || image_size > (UINT32_C(1) << 30)) return BEER_STATUS_INVALID_IMAGE_FORMAT;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) page = 4096;
+    size_t length = ((size_t)image_size + (size_t)page - 1) & ~((size_t)page - 1);
+
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    void *requested = *base_address;
+#ifdef MAP_FIXED_NOREPLACE
+    if (requested) flags |= MAP_FIXED_NOREPLACE;
+#endif
+    void *mapped = mmap(requested, length, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (mapped == MAP_FAILED)
+        return requested && (errno == EEXIST || errno == EINVAL)
+            ? BEER_STATUS_CONFLICTING_ADDRESSES : BEER_STATUS_NO_MEMORY;
+    if (requested && mapped != requested) {
+        munmap(mapped, length);
+        return BEER_STATUS_CONFLICTING_ADDRESSES;
+    }
+    if (headers_size > image_size) headers_size = image_size;
+    if (pread(fd, mapped, headers_size, 0) < 0) { /* short header read leaves zeros */ }
+    for (uint16_t i = 0; i < sections; ++i) {
+        uint8_t entry[40];
+        if (pread(fd, entry, sizeof(entry), (off_t)pe + 24 + optional_size + (off_t)i * 40) != (ssize_t)sizeof(entry)) break;
+        uint32_t virtual_size, rva, raw_size, raw_offset;
+        memcpy(&virtual_size, entry + 8, 4); memcpy(&rva, entry + 12, 4);
+        memcpy(&raw_size, entry + 16, 4); memcpy(&raw_offset, entry + 20, 4);
+        if (!raw_size || rva >= image_size) continue;
+        size_t copy = raw_size;
+        if (virtual_size && virtual_size < copy) copy = virtual_size;
+        if (copy > image_size - rva) copy = image_size - rva;
+        if (pread(fd, (uint8_t *)mapped + rva, copy, (off_t)raw_offset) < 0) { /* leave the section zeroed */ }
+    }
+    *mapped_out = mapped;
+    *view_size = length;
+    return BEER_STATUS_SUCCESS;
+}
+
 uint32_t beer_nt_section_create(uint64_t *handle, int file_fd,
                                 int64_t maximum_size, uint32_t protection,
                                 uint32_t allocation_attributes)
@@ -172,6 +232,25 @@ uint32_t beer_nt_section_map(uint64_t handle, void **base_address,
         return BEER_STATUS_INVALID_PARAMETER;
     }
     size_t available = section.size - (size_t)offset_value;
+    if (section.attributes & BEER_SEC_IMAGE) {
+        pthread_mutex_unlock(&g_section_mutex);
+        int image_slot = -1;
+        pthread_mutex_lock(&g_section_mutex);
+        for (int candidate = 0; candidate < BEER_NT_VIEW_CAPACITY; ++candidate)
+            if (!g_views[candidate].used) { image_slot = candidate; break; }
+        pthread_mutex_unlock(&g_section_mutex);
+        if (image_slot < 0) return BEER_STATUS_NO_MEMORY;
+        void *image = NULL;
+        size_t image_length = 0;
+        uint32_t image_status = map_image_view(section.fd, base_address, &image_length, &image);
+        if (image_status != BEER_STATUS_SUCCESS) return image_status;
+        pthread_mutex_lock(&g_section_mutex);
+        g_views[image_slot] = (BeerNtView){.used = 1, .base = image, .size = image_length};
+        pthread_mutex_unlock(&g_section_mutex);
+        *base_address = image;
+        *view_size = image_length;
+        return BEER_STATUS_SUCCESS;
+    }
     size_t length = *view_size ? *view_size : available;
     if (!length || length > available) {
         pthread_mutex_unlock(&g_section_mutex);
@@ -189,7 +268,21 @@ uint32_t beer_nt_section_map(uint64_t handle, void **base_address,
 #ifdef MAP_FIXED_NOREPLACE
     if (requested) flags |= MAP_FIXED_NOREPLACE;
 #endif
-    void *mapped = mmap(requested, length, prot, flags, section.fd, (off_t)offset_value);
+    /* A view can later be made writable with NtProtectVirtualMemory up to the section's own protection, so
+     * map with the section's maximum rights and drop to the requested ones afterwards. */
+    int fd_mode = fcntl(section.fd, F_GETFL);
+    int section_prot = protection_to_posix(section.protection);
+    int map_prot = prot;
+    if (section_prot > 0 && fd_mode >= 0 && (fd_mode & O_ACCMODE) == O_RDWR)
+        map_prot |= section_prot & (PROT_READ | PROT_WRITE);
+    void *mapped = mmap(requested, length, map_prot, flags, section.fd, (off_t)offset_value);
+    if (getenv("BEER_FILE_DIAGNOSTICS"))
+        fprintf(stderr, "[SECTION] map handle=0x%llx prot=0x%x section_prot=0x%x fd_mode=0x%x -> %p len=0x%zx\n",
+                (unsigned long long)handle, protection, section.protection, fd_mode, mapped, length);
+    if (mapped != MAP_FAILED && map_prot != prot && mprotect(mapped, length, prot) != 0) {
+        munmap(mapped, length);
+        mapped = MAP_FAILED;
+    }
     if (mapped == MAP_FAILED)
         return requested && (errno == EEXIST || errno == EINVAL)
             ? BEER_STATUS_CONFLICTING_ADDRESSES : BEER_STATUS_NO_MEMORY;
@@ -226,6 +319,16 @@ uint32_t beer_nt_section_unmap(void *base_address)
     if (index < 0) return BEER_STATUS_INVALID_PARAMETER;
     return munmap(base_address, size) == 0 ? BEER_STATUS_SUCCESS
                                            : BEER_STATUS_INVALID_PARAMETER;
+}
+
+int beer_nt_section_is_image(uint64_t handle)
+{
+    pthread_mutex_lock(&g_section_mutex);
+    int index = section_index(handle);
+    int image = index >= 0 &&
+                (g_sections[index].attributes & UINT32_C(0x01000000)) != 0;
+    pthread_mutex_unlock(&g_section_mutex);
+    return image;
 }
 
 int beer_nt_section_close(uint64_t handle)

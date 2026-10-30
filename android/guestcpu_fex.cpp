@@ -558,13 +558,13 @@ void beer_guest_set_fault_handler(beer_guest_fault_fn fn) {
   g_fault_fn = fn;
 }
 
-void beer_guest_enter(uint64_t entry, uint64_t stack_top, uint64_t tls_runner, int run_tls_callbacks) {
+void beer_guest_enter(uintptr_t stack_top, BeerGuestTlsRunner tls, uintptr_t entry) {
   if (!EnsureInit()) Fatal("FEXCore failed to initialise");
   GuestThread& gt = t_gt;
   if (!AttachThread(gt)) Fatal("cannot create the guest thread");
-  if (run_tls_callbacks)
-    fprintf(stderr, "[GUESTCPU] BEER_EXECUTABLE_TLS is not supported yet under emulation; skipping TLS callbacks (runner=0x%llx)\n",
-            (unsigned long long)tls_runner);
+  // The TLS runner is host code; it calls each guest TLS callback through beer_guest_call (a top-level call on this
+  // thread's guest stack), as the native entry runs them on the initial thread before the image's entry point.
+  if (tls) tls();
 
   auto& st = gt.ts->CurrentFrame->State;
   st.rip = entry;
@@ -615,6 +615,38 @@ uint64_t beer_guest_call_f(uint64_t fn, const uint64_t* args, unsigned nargs, un
 
   const uint64_t result = F->State.gregs[X::REG_RAX];
   memcpy(&F->State, &saved, sizeof saved);   // the guest resumes exactly where it was
+  return result;
+}
+
+uint64_t beer_guest_call_in_context(const beer_guest_ucontext_t* regs, uint64_t fn, const uint64_t* args, unsigned nargs) {
+  GuestThread& gt = t_gt;
+  Frame* F = gt.import_frame;
+  if (!F) Fatal("beer_guest_call_in_context outside an import");
+  if (nargs > 4) Fatal("beer_guest_call_in_context: stack arguments are not supported");
+
+  CPUState saved;
+  memcpy(&saved, &F->State, sizeof saved);
+
+  auto& s = F->State;
+  const auto& g = regs->uc_mcontext.gregs;
+  static const int kNonvolatile[][2] = {
+    {X::REG_RBX, ::REG_RBX}, {X::REG_RBP, ::REG_RBP}, {X::REG_RSI, ::REG_RSI}, {X::REG_RDI, ::REG_RDI},
+    {X::REG_R12, ::REG_R12}, {X::REG_R13, ::REG_R13}, {X::REG_R14, ::REG_R14}, {X::REG_R15, ::REG_R15},
+  };
+  for (const auto& r : kNonvolatile) s.gregs[r[0]] = (uint64_t)g[r[1]];
+  // Same frame as the native beer_call_consolidate_asm: align the unwound RSP down to 16, reserve 0x50, then `call`
+  // (entry RSP = aligned - 0x58). HandleCallback's entry RSP is RSP - 0x10 (see beer_guest_call_f).
+  s.gregs[X::REG_RSP] = (((uint64_t)g[::REG_RSP]) & ~0xFull) - 0x48;
+  static const int kGp[4] = {X::REG_RCX, X::REG_RDX, X::REG_R8, X::REG_R9};
+  for (unsigned i = 0; i < nargs; ++i) s.gregs[kGp[i]] = args[i];
+
+  jmp_buf* prev_jb = gt.resume_jb;
+  g_ctx->HandleCallback(gt.ts, fn);
+  gt.resume_jb = prev_jb;
+  gt.import_frame = F;
+
+  const uint64_t result = F->State.gregs[X::REG_RAX];
+  memcpy(&F->State, &saved, sizeof saved);
   return result;
 }
 

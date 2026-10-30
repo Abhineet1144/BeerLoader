@@ -698,8 +698,7 @@ static void MS cl_resolve(ComList *l, ComResource *dst, uint32_t dsub,
 static void MS cl_set_topology(ComList *l, uint32_t topology)
 {
     LIST_CUR(l);
-    uint32_t patch = 0;
-    bd12_cmd_set_topology(c, bd12_topology_to_vk(topology, &patch));
+    bd12_cmd_set_d3d_topology(c, topology);
 }
 
 static void MS cl_set_viewports(ComList *l, uint32_t n, const VkViewport *v)

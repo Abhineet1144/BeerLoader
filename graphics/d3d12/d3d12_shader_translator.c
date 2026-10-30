@@ -3,6 +3,7 @@
 #include "d3d12_dxil_translator.h"
 
 #include <dlfcn.h>
+#include <glob.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,34 +152,37 @@ static int load_api(void)
     g_api.attempted = 1;
 
     const char *override = getenv("BEER_VKD3D_SHADER_LIBRARY");
-    /* Prefer normal system resolution. Steam runtimes are a useful fallback,
-     * but their versioned directory changes on every runtime update, so never
-     * bake a transient var/tmp path into the loader. */
-    const char *home = getenv("HOME");
-    char steamrt4[4096] = {0};
-    char sniper[4096] = {0};
-    if (home && *home) {
-        snprintf(steamrt4, sizeof(steamrt4),
-                 "%s/.local/share/Steam/steamapps/common/SteamLinuxRuntime_4/"
-                 "steamrt4_platform_4.0.20260928.262390/files/lib/"
-                 "x86_64-linux-gnu/libvkd3d-shader.so.1.19.0", home);
-        snprintf(sniper, sizeof(sniper),
-                 "%s/.local/share/Steam/steamapps/common/"
-                 "SteamLinuxRuntime_sniper/sniper_platform_3.0.20260805.254768/"
-                 "files/lib/x86_64-linux-gnu/libvkd3d-shader.so.1.18.0", home);
-    }
     const char *candidates[] = {
         override,
         "libvkd3d-shader.so.1",
         "libvkd3d-shader.so",
-        steamrt4,
-        sniper,
         NULL
     };
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
         if (!candidates[i] || !*candidates[i]) continue;
         g_api.library = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
         if (g_api.library) break;
+    }
+    /* Steam runtimes are a useful fallback, but their versioned platform
+     * directories change on every runtime update, so search them instead of
+     * baking a version into the loader. Newest match (last in glob order)
+     * first. */
+    const char *home = getenv("HOME");
+    static const char *const runtime_patterns[] = {
+        "%s/.local/share/Steam/steamapps/common/SteamLinuxRuntime_*/"
+        "*_platform_*/files/lib/x86_64-linux-gnu/libvkd3d-shader.so.1*",
+        "%s/.local/share/umu/steamrt*/steamrt*_platform_*/files/lib/"
+        "x86_64-linux-gnu/libvkd3d-shader.so.1*",
+    };
+    for (size_t p = 0; !g_api.library && home && *home &&
+         p < sizeof(runtime_patterns) / sizeof(runtime_patterns[0]); ++p) {
+        char pattern[4096];
+        glob_t found;
+        snprintf(pattern, sizeof(pattern), runtime_patterns[p], home);
+        if (glob(pattern, 0, NULL, &found) != 0) continue;
+        for (size_t i = found.gl_pathc; i-- > 0 && !g_api.library;)
+            g_api.library = dlopen(found.gl_pathv[i], RTLD_NOW | RTLD_LOCAL);
+        globfree(&found);
     }
     if (!g_api.library) {
         set_error("libvkd3d-shader.so.1 was not found; set BEER_VKD3D_SHADER_LIBRARY");
@@ -417,6 +421,72 @@ static uint32_t *spirv_preserve_inf_nan(const uint32_t *in, size_t size,
     return out;
 }
 
+/* D3D guarantees that identical position math gives bit-identical depth across
+ * different vertex shaders (depth-equal passes, occlusion proxies drawn over
+ * the geometry they test). Vulkan only does for outputs decorated Invariant;
+ * without it the driver may contract mul+add into FMA differently per shader
+ * and coplanar depth tests flicker. Decorate the pre-rasterisation Position
+ * output (as DXVK does by default). BEER_SPV_INVARIANT_POSITION=0 disables. */
+static uint32_t *spirv_invariant_position(const uint32_t *in, size_t size,
+                                          size_t *out_size)
+{
+    const size_t n = size / 4;
+    if (n < 6 || in[0] != 0x07230203u) return NULL;
+    int pre_raster = 0;
+    /* Positions of OpDecorate/OpMemberDecorate BuiltIn Position, and output variable ids. */
+    size_t sites[8]; int site_count = 0;
+    uint32_t *outputs = calloc(in[3] ? in[3] : 1, 1);   /* id bound: one byte per id */
+    if (!outputs) return NULL;
+    for (size_t i = 5; i < n; ) {
+        const uint32_t count = in[i] >> 16, op = in[i] & 0xffff;
+        if (!count || i + count > n) { free(outputs); return NULL; }
+        if (op == 15 && count >= 3 && (in[i + 1] == 0 || in[i + 1] == 2 || in[i + 1] == 3))
+            pre_raster = 1;                               /* Vertex, TessellationEvaluation, Geometry */
+        else if (op == 71 && count >= 4 && in[i + 2] == 18) { free(outputs); return NULL; }   /* already Invariant */
+        else if (op == 72 && count >= 5 && in[i + 3] == 18) { free(outputs); return NULL; }
+        else if (((op == 71 && count >= 4 && in[i + 2] == 11 && in[i + 3] == 0) ||
+                  (op == 72 && count >= 5 && in[i + 3] == 11 && in[i + 4] == 0)) && site_count < 8)
+            sites[site_count++] = i;
+        else if (op == 59 && count >= 4 && in[i + 3] == 3 && in[i + 2] < in[3])
+            ((uint8_t *)outputs)[in[i + 2]] = 1;          /* OpVariable ... Output */
+        i += count;
+    }
+    if (!pre_raster || !site_count) { free(outputs); return NULL; }
+    uint32_t *out = malloc(size + (size_t)site_count * 16);
+    if (!out) { free(outputs); return NULL; }
+    size_t o = 0, from = 0, added = 0;
+    for (int k = 0; k < site_count; ++k) {
+        const size_t i = sites[k], count = in[i] >> 16;
+        memcpy(out + o, in + from, (i + count - from) * 4);
+        o += i + count - from;
+        from = i + count;
+        if ((in[i] & 0xffff) == 71) {
+            if (!((uint8_t *)outputs)[in[i + 1]]) continue;   /* gl_in[].Position etc. are inputs */
+            out[o++] = (3u << 16) | 71; out[o++] = in[i + 1]; out[o++] = 18;
+        } else {
+            /* Block member: only vertex shaders, whose per-vertex block is output-only. */
+            int vertex = 0;
+            for (size_t j = 5; j < n; j += in[j] >> 16)
+                if ((in[j] & 0xffff) == 15) { vertex = in[j + 1] == 0; break; }
+            if (!vertex) continue;
+            out[o++] = (4u << 16) | 72; out[o++] = in[i + 1]; out[o++] = in[i + 2]; out[o++] = 18;
+        }
+        ++added;
+    }
+    memcpy(out + o, in + from, (n - from) * 4);
+    o += n - from;
+    free(outputs);
+    if (!added) { free(out); return NULL; }
+    *out_size = o * 4;
+    return out;
+}
+
+static int spirv_invariant_position_enabled(void)
+{
+    const char *e = getenv("BEER_SPV_INVARIANT_POSITION");
+    return !e || atoi(e);
+}
+
 static const BeerD3D12TranslatedShader *translate_locked(
     const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash)
 {
@@ -449,6 +519,13 @@ static const BeerD3D12TranslatedShader *translate_locked(
                                                   entry->shader.spirv_size, &fs);
             if (fc) { free(entry->shader.spirv); entry->shader.spirv = (void *)fc;
                       entry->shader.spirv_size = fs; }
+        }
+        if (spirv_invariant_position_enabled()) {
+            size_t is = 0;
+            uint32_t *inv = spirv_invariant_position((const uint32_t *)entry->shader.spirv,
+                                                     entry->shader.spirv_size, &is);
+            if (inv) { free(entry->shader.spirv); entry->shader.spirv = (void *)inv;
+                       entry->shader.spirv_size = is; }
         }
         if (getenv("BEER_DUMP_SHADERS")) {
             char path[512];
@@ -585,6 +662,12 @@ static const BeerD3D12TranslatedShader *translate_locked(
         uint32_t *fc = spirv_preserve_inf_nan((const uint32_t *)entry->shader.spirv,
                                               spirv.size, &fs);
         if (fc) { free(entry->shader.spirv); entry->shader.spirv = (void *)fc; final_size = fs; }
+    }
+    if (spirv_invariant_position_enabled()) {
+        size_t is = 0;
+        uint32_t *inv = spirv_invariant_position((const uint32_t *)entry->shader.spirv,
+                                                 final_size, &is);
+        if (inv) { free(entry->shader.spirv); entry->shader.spirv = (void *)inv; final_size = is; }
     }
     {
         const char *sync = getenv("BEER_SPV_SYNC");

@@ -233,6 +233,9 @@ typedef struct {
     int xi_opcode;
     int xi_active;
     double xi_carry_x, xi_carry_y;
+    void *(*XIQueryDevice)(Display *, int, int *);
+    void (*XIFreeDeviceInfo)(void *);
+    signed char xi_source_absolute[256]; /* per source device: -1 unknown, 0 relative, 1 absolute */
     int (*QueryExtension)(Display *, const char *, int *, int *, int *);
     int (*GetEventData)(Display *, void *);
     void (*FreeEventData)(Display *, void *);
@@ -345,6 +348,17 @@ static int initialize_locked(void)
     }
     fprintf(stderr, "[XWAYLAND] connected to DISPLAY=%s\n",
             getenv("DISPLAY") ? getenv("DISPLAY") : "(default)");
+    {   /* Plain X11 auto-repeat sends a release before every repeated press,
+         * so a held key looks like rapid tapping to games that poll key state.
+         * Detectable auto-repeat sends repeated presses only. */
+        int (*set_detectable)(Display *, int, int *) =
+            (int (*)(Display *, int, int *))dlsym(g_x11.library,
+                                                  "XkbSetDetectableAutoRepeat");
+        int supported = 0;
+        if (set_detectable) set_detectable(g_x11.display, 1, &supported);
+        if (!supported)
+            fprintf(stderr, "[XWAYLAND] detectable auto-repeat unavailable\n");
+    }
     return 1;
 
 fail:
@@ -353,6 +367,43 @@ fail:
     if (g_x11.library) dlclose(g_x11.library);
     g_x11.library = NULL;
     return 0;
+}
+
+/* XWayland has an absolute slave pointer (positions from wl_pointer, also after
+ * every XWarpPointer) next to the relative one. Raw events from the absolute
+ * device carry screen coordinates, not deltas, and must not move the mouse. */
+static int xi_source_is_absolute_locked(int sourceid)
+{
+    if (sourceid < 0 || sourceid >= 256) return 0;
+    if (g_x11.xi_source_absolute[sourceid] >= 0)
+        return g_x11.xi_source_absolute[sourceid];
+    int absolute = 0;
+    if (g_x11.XIQueryDevice && g_x11.XIFreeDeviceInfo) {
+        typedef struct { int type; int sourceid; } AnyClass;
+        typedef struct {
+            int type; int sourceid; int number; Atom label;
+            double min, max, value; int resolution; int mode;
+        } ValuatorClass;
+        typedef struct {
+            int deviceid; char *name; int use; int attachment; Bool enabled;
+            int num_classes; AnyClass **classes;
+        } DeviceInfo;
+        int count = 0;
+        DeviceInfo *info = g_x11.XIQueryDevice(g_x11.display, sourceid, &count);
+        for (int d = 0; info && d < count; ++d)
+            for (int c = 0; c < info[d].num_classes; ++c) {
+                const ValuatorClass *v = (const ValuatorClass *)info[d].classes[c];
+                if (v->type == 2 /* XIValuatorClass */ && v->number < 2 &&
+                    v->mode == 1 /* XIModeAbsolute */)
+                    absolute = 1;
+            }
+        if (info) g_x11.XIFreeDeviceInfo(info);
+        if (getenv("BEER_INPUT_DIAGNOSTICS"))
+            fprintf(stderr, "[XWAYLAND] raw motion source %d is %s\n", sourceid,
+                    absolute ? "absolute (ignored)" : "relative");
+    }
+    g_x11.xi_source_absolute[sourceid] = (signed char)absolute;
+    return absolute;
 }
 
 /* XInput2 raw motion on the root window: relative deltas that do not stop at
@@ -366,6 +417,9 @@ static void setup_xi_raw_motion_locked(void)
     if (!xi) return;
     g_x11.XIQueryVersion = (int (*)(Display *, int *, int *))dlsym(xi, "XIQueryVersion");
     g_x11.XISelectEvents = (int (*)(Display *, Window, void *, int))dlsym(xi, "XISelectEvents");
+    g_x11.XIQueryDevice = (void *(*)(Display *, int, int *))dlsym(xi, "XIQueryDevice");
+    g_x11.XIFreeDeviceInfo = (void (*)(void *))dlsym(xi, "XIFreeDeviceInfo");
+    memset(g_x11.xi_source_absolute, -1, sizeof(g_x11.xi_source_absolute));
     if (!g_x11.XIQueryVersion || !g_x11.XISelectEvents || !g_x11.GetEventData ||
         !g_x11.FreeEventData)
         return;
@@ -1175,7 +1229,10 @@ int xwayland_window_poll_event(XwaylandEvent *out)
             if (g_x11.xi_active && cookie->extension == g_x11.xi_opcode &&
                 g_x11.GetEventData(g_x11.display, cookie) && cookie->data) {
                 xi = cookie->data;
-                if (xi->evtype == 17 && xi->valuators.mask && xi->raw_values) {
+                if (xi->evtype == 1) /* XI_DeviceChanged: valuator modes may change */
+                    memset(g_x11.xi_source_absolute, -1, sizeof(g_x11.xi_source_absolute));
+                if (xi->evtype == 17 && xi->valuators.mask && xi->raw_values &&
+                    !xi_source_is_absolute_locked(xi->sourceid)) {
                     double dx = 0, dy = 0;
                     int index = 0;
                     for (int bit = 0; bit < xi->valuators.mask_len * 8 && bit < 2; ++bit) {

@@ -209,6 +209,7 @@ typedef struct {
     BD12Device *device;
     VkSemaphore semaphore;
     uint64_t last_use;            /* retire serial of the newest submission that waits on or signals it */
+    uint64_t signaled;            /* highest value signaled or queued; Vulkan timelines only move forward */
 } BD12Fence;
 
 typedef struct {
@@ -275,6 +276,7 @@ typedef struct {
     BD12Descriptor *descriptors;
     uint64_t gpu_base;            /* fake GPU handle range, unique per heap */
     struct BD12HeapMirror *mirror;/* Vulkan mirror for bindless access, lazily */
+    uint32_t sampler_gen;         /* sampler heaps: bumped on every descriptor write/copy */
 } BD12DescriptorHeap;
 
 typedef enum {
@@ -496,6 +498,7 @@ typedef struct {
     VkDeviceSize index_offset;
     VkIndexType index_type;
     VkPrimitiveTopology topology;
+    int topology_unsupported;     /* patch list BD12 cannot draw: draws are dropped */
     float blend_constants[4];
     uint32_t stencil_ref;
     uint32_t dirty;
@@ -603,6 +606,7 @@ BD12Fence *bd12_fence_create(BD12Device *device, uint64_t initial);
 void bd12_fence_destroy(BD12Fence *fence);
 uint64_t bd12_fence_completed(BD12Fence *fence);
 int bd12_fence_signal_cpu(BD12Fence *fence, uint64_t value);
+int bd12_fence_claim(BD12Fence *fence, uint64_t value);
 /* Nonzero when the fence reached value within timeout_ns. */
 int bd12_fence_wait(BD12Fence *fence, uint64_t value, uint64_t timeout_ns);
 
@@ -772,6 +776,8 @@ void bd12_cmd_set_viewports(BD12CmdList *list, const VkViewport *viewports,
 void bd12_cmd_set_scissors(BD12CmdList *list, const VkRect2D *rects,
                            uint32_t count);
 void bd12_cmd_set_topology(BD12CmdList *list, VkPrimitiveTopology topology);
+/* D3D_PRIMITIVE_TOPOLOGY value; patch lists are mapped or dropped (no tessellation stages). */
+void bd12_cmd_set_d3d_topology(BD12CmdList *list, uint32_t d3d_topology);
 void bd12_cmd_set_vertex_buffers(BD12CmdList *list, uint32_t start,
                                  const uint64_t *gpu_va, const uint32_t *sizes,
                                  const uint32_t *strides, uint32_t count);
@@ -943,7 +949,7 @@ enum {
     BD12_DROP_DRAW_NO_STATE, BD12_DROP_DRAW_NO_DESCRIPTORS,
     BD12_DROP_DISPATCH_NO_STATE, BD12_DROP_DISPATCH_NO_DESCRIPTORS,
     BD12_DROP_INDIRECT_MULTI_ARG, BD12_DROP_INDIRECT_DISPATCH_COUNT,
-    BD12_DROP_PSO_FAILED, BD12_DROP_COUNT
+    BD12_DROP_PSO_FAILED, BD12_DROP_DRAW_PATCH_LIST, BD12_DROP_COUNT
 };
 extern uint64_t g_bd12_drops[BD12_DROP_COUNT];
 #define BD12_DROP(reason) __atomic_add_fetch(&g_bd12_drops[reason], 1, __ATOMIC_RELAXED)

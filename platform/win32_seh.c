@@ -2,6 +2,8 @@
 #include "win32_seh.h"
 
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CONTEXT_RSP_OFFSET 0x98u
@@ -37,8 +39,8 @@ int beer_seh_dispatch(BeerExceptionRecord64 *record, void *context_record,
     if (!record || !context_record || !lookup || !max_frames ||
         stack_high <= stack_low)
         return 0;
-    if (record->flags & BEER_EXCEPTION_NONCONTINUABLE)
-        return 0;
+    /* A noncontinuable exception (every C++ throw is raised that way) is still dispatched down the frames:
+     * its handlers unwind to a catch block. Only a handler asking to CONTINUE EXECUTION is illegal. */
 
     uint8_t walk_context[CONTEXT_AMD64_SIZE] __attribute__((aligned(16)));
     memcpy(walk_context, context_record, sizeof(walk_context));
@@ -51,6 +53,9 @@ int beer_seh_dispatch(BeerExceptionRecord64 *record, void *context_record,
 
         uint64_t image_base = 0;
         const BeerRuntimeFunction *entry = lookup(control_pc, &image_base, opaque);
+        if (!entry && getenv("BEER_EXCEPTION_DIAGNOSTICS"))
+            fprintf(stderr, "[SEH] frame %u pc=0x%llx: no runtime function entry\n", frame_index,
+                    (unsigned long long)control_pc);
         if (!entry) {
             uint64_t caller;
             memcpy(&caller, (const void *)(uintptr_t)old_rsp, sizeof(caller));
@@ -71,6 +76,11 @@ int beer_seh_dispatch(BeerExceptionRecord64 *record, void *context_record,
                                                 &handler_data,
                                                 &establisher_frame, &unwind_ok);
         uint64_t new_rsp = context_u64(walk_context, CONTEXT_RSP_OFFSET);
+        if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
+            fprintf(stderr, "[SEH] frame %u pc=0x%llx image=0x%llx entry=%p unwind_ok=%d rsp=0x%llx -> 0x%llx "
+                    "establisher=0x%llx handler=0x%llx\n", frame_index, (unsigned long long)control_pc,
+                    (unsigned long long)image_base, (const void *)entry, unwind_ok, (unsigned long long)old_rsp,
+                    (unsigned long long)new_rsp, (unsigned long long)establisher_frame, (unsigned long long)handler);
         if (!unwind_ok || new_rsp <= old_rsp || new_rsp > stack_high ||
             establisher_frame < stack_low || establisher_frame >= stack_high)
             return 0;
@@ -93,7 +103,7 @@ int beer_seh_dispatch(BeerExceptionRecord64 *record, void *context_record,
             int32_t disposition = BEER_GUEST_CALL(((BeerLanguageHandler)(uintptr_t)handler),
                 record, establisher_frame, context_record, &dispatcher);
             if (disposition == BEER_EXCEPTION_DISPOSITION_CONTINUE_EXECUTION)
-                return 1;
+                return (record->flags & BEER_EXCEPTION_NONCONTINUABLE) ? 0 : 1;
             if (disposition != BEER_EXCEPTION_DISPOSITION_CONTINUE_SEARCH)
                 return 0;
         }

@@ -357,6 +357,26 @@ First working APK: RE8 reaches its title-screen background, full screen, no X11.
 - Still missing in the APK: movie decoding (the loader shells out to `ffmpeg`; use AMediaExtractor/AMediaCodec), real touch/gamepad controls,
   audio (AAudio), a game picker UI.
 
+## Merge of main (2026-10-31)
+
+`origin/main` (3240eb5 "Launch Ghost of Tsushima, Improve Sekiro", d006c2e "Improve PRAGMATA") merged into `apk`.
+- Main's new `platform/win32_entry.c` `beer_guest_enter(stack, tls, entry)` is now the seam's signature too
+  (`guest_cpu.h` includes `win32_entry.h`); the FEX backend implements it and now runs the executable's TLS callbacks
+  (main made them mandatory) instead of skipping them. `win32_entry.c` is x86-only and not in the ARM source list.
+- Main's STATUS_UNWIND_CONSOLIDATE runner (`beer_call_consolidate_asm`) has an emulated version on the new backend call
+  `beer_guest_call_in_context` (nonvolatile registers and stack of the unwound frame).
+- Guest calls in main's new code (`_initterm*`/`_onexit` now in `platform/win32_crt_init.c`/`win32_onexit.c`, the new
+  `InitOnceExecuteOnce`, DllMain/TLS in the guarded DLL init, `QueueUserWorkItem`) go through `BEER_GUEST_CALL`;
+  `beer_call_thread_entry` (native nonvolatile-restoring boundary) is used on x86 only. New x86-only diagnostics reading
+  `g_saved_guest_rsp` are compiled out when emulated.
+- Main's new platform sources (`win32_apiset`, `win32_gdi`, `win32_resource`, `win32_onexit`, `win32_crt_init`) added to
+  `android/check_aarch64.sh`.
+- Checked: desktop build matches main (same warnings; per-function disassembly differs only where the apk branch
+  already used the seam), `make test-input` as on main (`win32_unwind_test` fails on both), the five test exes identical.
+  On the phone: all sources compile for aarch64 (0 errors), `beer_arm` links, the five test exes give the desktop's
+  results, `find_indirect_calls.py` finds no new host->guest calls. Not yet exercised: TLS callbacks and C++ unwind
+  consolidation under emulation (no test exe has them), the APK build, any game.
+
 ## Resuming on another machine (state at the pause, 2026-10-30)
 
 **Nothing is committed.** All work is uncommitted on branch `apk` (new files under `android/`, `platform/`, `tools/`, plus edits to

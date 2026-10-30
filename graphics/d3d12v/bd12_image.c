@@ -693,11 +693,13 @@ int bd12_descriptor_write_sampler(BD12DescriptorHeap *heap, uint32_t index,
     if (index >= heap->count) return 0;
     BD12Descriptor *d = &heap->descriptors[index];
     memset(d, 0, sizeof(*d));
+    ++heap->sampler_gen;
     if (!info) return 1;
     VkSampler sampler = bd12_sampler_get(heap->device, info);
     if (!sampler) return 0;
     d->kind = BD12_DESC_SAMPLER;
     d->sampler = sampler;
+    ++heap->sampler_gen;
     return 1;
 }
 
