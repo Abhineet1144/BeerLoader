@@ -26,6 +26,15 @@ int main(void)
     assert(handle == (uint64_t)-12);
     assert(!params.Environment && !params.CommandLine.Buffer);
 
+    char windows_path[128];
+    assert(beer_windows_path_from_host("/home/player/game/ucrtbase.dll",
+                                       windows_path, sizeof(windows_path)));
+    assert(!strcmp(windows_path, "Z:\\home\\player\\game\\ucrtbase.dll"));
+    assert(beer_windows_path_from_host("C:/Windows/System32/ntdll.dll",
+                                       windows_path, sizeof(windows_path)));
+    assert(!strcmp(windows_path, "C:\\Windows\\System32\\ntdll.dll"));
+    assert(!beer_windows_path_from_host("/path/too/long", windows_path, 4));
+
     uint16_t command[] = {'b', 'e', 'e', 'r', 0};
     params.CommandLine.Length = 8;
     params.CommandLine.MaximumLength = 10;

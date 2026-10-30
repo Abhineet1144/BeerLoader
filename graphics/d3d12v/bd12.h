@@ -77,6 +77,8 @@ struct BD12Device {
     int readback_coherent;
     VkDeviceSize min_uniform_alignment;
     VkDeviceSize max_uniform_range;
+    uint32_t wave_lane_min;       /* Vulkan subgroup size range, reported as D3D12 wave widths */
+    uint32_t wave_lane_max;
     VkDeviceSize min_uniform_texel_alignment;
     VkDeviceSize min_storage_texel_alignment;
     int uniform_texel_single_alignment;

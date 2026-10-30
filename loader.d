@@ -9,8 +9,9 @@ loader.o: loader.c graphics/d3d11/d3d11_compat.h \
  platform/win32_nt_section.h platform/win32_virtual_memory.h \
  platform/win32_entry.h platform/win32_ui_language.h \
  platform/win32_onexit.h platform/win32_crt_init.h \
- platform/win32_process_parameters.h platform/win32_vectored_exception.h \
- platform/win32_unwind.h platform/win32_seh.h platform/win32_unwind.h \
+ platform/win32_process_parameters.h platform/win32_ip_adapter.h \
+ platform/win32_vectored_exception.h platform/win32_unwind.h \
+ platform/win32_seh.h platform/win32_unwind.h platform/win32_syscall.h \
  renderer/vulkan/vulkan_graphics.h renderer/vulkan/vulkan_renderer.h \
  platform/xwayland_backend.h renderer/vulkan/vulkan_context.h \
  platform/directinput_format.h platform/guid_compat.h \
@@ -21,6 +22,7 @@ loader.o: loader.c graphics/d3d11/d3d11_compat.h \
  renderer/vulkan/vulkan_indexed_renderer.h \
  platform/win32_kernel32_export_names.inc platform/win32_registry.inc \
  platform/win32_file_search.inc platform/win32_missing_exports.inc \
+ platform/win32_native_info.inc platform/win32_crypt32.inc \
  platform/win32_missing_exports_table.inc
 graphics/d3d11/d3d11_compat.h:
 graphics/d3d12/d3d12_shader_translator.h:
@@ -46,10 +48,12 @@ platform/win32_ui_language.h:
 platform/win32_onexit.h:
 platform/win32_crt_init.h:
 platform/win32_process_parameters.h:
+platform/win32_ip_adapter.h:
 platform/win32_vectored_exception.h:
 platform/win32_unwind.h:
 platform/win32_seh.h:
 platform/win32_unwind.h:
+platform/win32_syscall.h:
 renderer/vulkan/vulkan_graphics.h:
 renderer/vulkan/vulkan_renderer.h:
 platform/xwayland_backend.h:
@@ -70,4 +74,6 @@ platform/win32_kernel32_export_names.inc:
 platform/win32_registry.inc:
 platform/win32_file_search.inc:
 platform/win32_missing_exports.inc:
+platform/win32_native_info.inc:
+platform/win32_crypt32.inc:
 platform/win32_missing_exports_table.inc:

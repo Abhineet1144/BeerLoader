@@ -310,7 +310,6 @@ static u64 __attribute__((ms_abi)) stub_RtlFreeUnicodeString(u16 *us)
     return 0;
 }
 static u64 __attribute__((ms_abi)) stub_RtlInitUnicodeString(u16 *d, const u16 *s){ if(!d) return 0; size_t n=0; if(s) while(s[n]) ++n; d[0]=(u16)(n*2); d[1]=(u16)(s?n*2+2:0); *(const u16 **)(void*)((u8*)d+8)=s; return 0; }
-static u64 __attribute__((ms_abi)) stub_NtOpenSection(void){ return 0xC0000022u; }
 static u64 __attribute__((ms_abi)) stub_RtlInitString(u16 *d, const char *s){ if(!d) return 0; size_t n=0; if(s) while(s[n]) ++n; d[0]=(u16)n; d[1]=(u16)(s?n+1:0); *(const char **)(void*)((u8*)d+8)=s; return 0; }
 static u64 __attribute__((ms_abi)) stub_PathMatchSpecW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_InitCommonControls(void){ return 0; }
