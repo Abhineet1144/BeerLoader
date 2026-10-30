@@ -51,7 +51,6 @@ LAUNCH_FLAGS = [
     ("no_post", "Disable final-image passes", "BEER_NO_POST", "1", "No effects, overlay blending or screenshots; the overlay falls back to opaque boxes"),
     ("legacy_d3d11", "Use the legacy D3D11 path", "BEER_D3D11_LEGACY", "1", "Old D3D11 renderer instead of BD11 (the default)"),
     ("hide_steam_registry", "Hide the fake Steam registry keys", "BEER_FAKE_STEAM_REGISTRY", "0", "For games that behave differently when Steam looks installed"),
-    ("exe_tls", "Run the exe's TLS callbacks", "BEER_EXECUTABLE_TLS", "1", "Needed by some protected executables"),
     ("known_patches", "Enable known guest-code patches", "BEER_ENABLE_KNOWN_TARGET_PATCHES", "1", ""),
     ("transaction_patches", "Enable transaction patches", "BEER_ENABLE_TRANSACTION_PATCHES", "1", ""),
     ("cpu_staging", "Force CPU staging in the presenter", "BEER_PRESENTER_CPU_STAGING", "1", "Slower, but a useful correctness check"),

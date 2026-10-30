@@ -15,5 +15,8 @@ beer_d3d12_get_debug_interface(const uint8_t *riid, void **debug);
 uint64_t __attribute__((ms_abi))
 beer_d3d12_serialize_versioned_root_signature(const void *description,
                                               void **blob, void **error_blob);
+uint64_t __attribute__((ms_abi))
+beer_d3d12_serialize_root_signature(const void *description, uint32_t version,
+                                    void **blob, void **error_blob);
 
 #endif

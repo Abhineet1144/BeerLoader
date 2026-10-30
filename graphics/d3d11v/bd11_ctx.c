@@ -423,7 +423,8 @@ static void use_srvs(B11Context *ctx, int compute)
 }
 
 uint64_t g_b11_stats[16];
-enum { ST_DRAW, ST_DRAW_SKIPPED, ST_CLEAR_RTV, ST_CLEAR_DSV, ST_COPY, ST_UPDATE, ST_BUFWRITE, ST_REPLAY_OPS, ST_LISTS };
+enum { ST_DRAW, ST_DRAW_SKIPPED, ST_CLEAR_RTV, ST_CLEAR_DSV, ST_COPY, ST_UPDATE, ST_BUFWRITE, ST_REPLAY_OPS, ST_LISTS,
+       ST_INDIRECT };
 
 static int prepare_draw(B11Context *ctx)
 {
@@ -501,8 +502,7 @@ static int prepare_draw(B11Context *ctx)
         bd12_cmd_set_scissors(cmd, sc, n);
     }
     if (ctx->dirty & B11_DIRTY_TOPOLOGY) {
-        uint32_t patch;
-        bd12_cmd_set_topology(cmd, bd12_topology_to_vk(s->topology ? s->topology : 4, &patch));
+        bd12_cmd_set_d3d_topology(cmd, s->topology ? s->topology : 4);
     }
     {   /* A Map(DISCARD) renamed backing changes the VA without any Set* call: re-validate. */
         uint64_t ib_va = 0;
@@ -1013,7 +1013,9 @@ static void b11_trace_cs_outputs(B11Context *ctx, B11Shader *cs, uint32_t gx, ui
     }
 }
 
-static void do_dispatch(B11Context *ctx, uint32_t x, uint32_t y, uint32_t z)
+static void do_dispatch_any(B11Context *ctx, uint32_t x, uint32_t y, uint32_t z, B11Buffer *args, uint32_t offset);
+static void do_dispatch(B11Context *ctx, uint32_t x, uint32_t y, uint32_t z) { do_dispatch_any(ctx, x, y, z, NULL, 0); }
+static void do_dispatch_any(B11Context *ctx, uint32_t x, uint32_t y, uint32_t z, B11Buffer *args, uint32_t offset)
 {
     B11Device *dev = ctx->obj.dev;
     B11Shader *cs = (B11Shader *)ctx->st.shader[B11_STAGE_CS];
@@ -1047,7 +1049,10 @@ static void do_dispatch(B11Context *ctx, uint32_t x, uint32_t y, uint32_t z)
     }
     bd12_cmd_global_barrier(cmd);                 /* earlier draws/copies may feed or read the UAVs */
     bd12_cmd_set_pipeline(cmd, e->compute);
-    if (bd12_cmd_dispatch_bound(cmd, x, y, z)) bd12_cmd_global_barrier(cmd);
+    BD12Buffer *args_backing = args ? b11_buffer_current(args) : NULL;
+    if (args) buffer_mark_used(args);
+    if (args ? (args_backing && bd12_cmd_dispatch_indirect_bound(cmd, args_backing, offset))
+             : bd12_cmd_dispatch_bound(cmd, x, y, z)) bd12_cmd_global_barrier(cmd);
     else {
         static int warned;
         if (warned++ < 5) fprintf(stderr, "[BD11] dispatch dropped (cs=%016llx)\n", (unsigned long long)cs->hash);
@@ -1198,6 +1203,26 @@ static void execute(B11Context *ctx, const B11Op *op)
         if (prepare_draw(ctx)) { bd12_cmd_draw_indexed(b11_cmd(ctx->obj.dev), op->a, op->b, op->c, (int32_t)op->d, op->e); after_draw(ctx); }
         break;
     case B11_OP_DISPATCH: do_dispatch(ctx, op->a, op->b, op->c); break;
+    case B11_OP_DISPATCH_INDIRECT:
+        g_b11_stats[ST_INDIRECT]++;
+        do_dispatch_any(ctx, 0, 0, 0, (B11Buffer *)op->obj[0], op->a);
+        break;
+    case B11_OP_DRAW_INDEXED_INDIRECT:
+    case B11_OP_DRAW_INSTANCED_INDIRECT: {
+        /* The arguments are usually written by a compute pass or a copy right before. */
+        B11Buffer *args = (B11Buffer *)op->obj[0];
+        BD12Buffer *bk = args ? b11_buffer_current(args) : NULL;
+        if (!bk) break;
+        g_b11_stats[ST_INDIRECT]++;
+        buffer_mark_used(args);
+        bd12_cmd_global_barrier(b11_cmd(ctx->obj.dev));
+        trace_draw(ctx, op->type == B11_OP_DRAW_INDEXED_INDIRECT ? "DrawIndexedInstancedIndirect" : "DrawInstancedIndirect", op);
+        if (!prepare_draw(ctx)) break;
+        if (op->type == B11_OP_DRAW_INDEXED_INDIRECT) bd12_cmd_draw_indexed_indirect(b11_cmd(ctx->obj.dev), bk, op->a, 1, 20);
+        else bd12_cmd_draw_indirect(b11_cmd(ctx->obj.dev), bk, op->a, 1, 16);
+        after_draw(ctx);
+        break;
+    }
     case B11_OP_CLEAR_RTV: g_b11_stats[ST_CLEAR_RTV]++; do_clear_rtv(ctx, op); break;
     case B11_OP_CLEAR_UAV_UINT: do_clear_uav(ctx, op, 0); break;
     case B11_OP_CLEAR_UAV_FLOAT: do_clear_uav(ctx, op, 1); break;
@@ -1362,6 +1387,31 @@ static void B11_MS ctx_draw_instanced(B11Context *c, uint32_t count, uint32_t in
 { B11Op op = op_new(B11_OP_DRAW_INSTANCED); op.a = count; op.b = inst; op.c = start; op.d = sinst; ctx_emit(c, &op); }
 static void B11_MS ctx_dispatch(B11Context *c, uint32_t x, uint32_t y, uint32_t z)
 { B11Op op = op_new(B11_OP_DISPATCH); op.a = x; op.b = y; op.c = z; ctx_emit(c, &op); }
+static void B11_MS ctx_draw_indexed_instanced_indirect(B11Context *c, B11Obj *args, uint32_t offset)
+{ if (!args) return; B11Op op = op_new(B11_OP_DRAW_INDEXED_INDIRECT); op.obj[0] = args; op.a = offset; ctx_emit(c, &op); }
+static void B11_MS ctx_draw_instanced_indirect(B11Context *c, B11Obj *args, uint32_t offset)
+{ if (!args) return; B11Op op = op_new(B11_OP_DRAW_INSTANCED_INDIRECT); op.obj[0] = args; op.a = offset; ctx_emit(c, &op); }
+static void B11_MS ctx_dispatch_indirect(B11Context *c, B11Obj *args, uint32_t offset)
+{ if (!args) return; B11Op op = op_new(B11_OP_DISPATCH_INDIRECT); op.obj[0] = args; op.a = offset; ctx_emit(c, &op); }
+/* Not implemented yet: report which ones a game uses (once each). */
+static void B11_MS ctx_copy_structure_count(B11Context *c, B11Obj *dst, uint32_t offset, B11Obj *uav)
+{
+    (void)c; (void)dst; (void)offset; (void)uav;
+    static int warned;
+    if (!warned++) fprintf(stderr, "[BD11] CopyStructureCount not implemented (UAV counters)\n");
+}
+static void B11_MS ctx_so_targets(B11Context *c, uint32_t n, B11Obj *const *t, const uint32_t *o)
+{
+    (void)c; (void)t; (void)o;
+    static int warned;
+    if (n && !warned++) fprintf(stderr, "[BD11] SOSetTargets (stream output) not implemented\n");
+}
+static void B11_MS ctx_draw_auto(B11Context *c)
+{
+    (void)c;
+    static int warned;
+    if (!warned++) fprintf(stderr, "[BD11] DrawAuto (stream output) not implemented\n");
+}
 
 static void B11_MS ctx_ia_layout(B11Context *c, B11Obj *layout)
 {
@@ -1832,17 +1882,32 @@ static void B11_MS ctx_end(B11Context *c, B11Obj *q)
     query->issued = 1;
     query->ended = 1;
 }
+uint64_t g_b11_query_counts[8];   /* GetData per query type, printed with BEER_BD11_STATS */
+
+/* Occlusion results are not measured yet. A count of 1 reads as "barely visible" to engines that
+ * compare against a pixel threshold, so report more samples than any render target has. */
+static uint64_t b11_occlusion_samples(void)
+{
+    static uint64_t samples;
+    if (!samples) {
+        const char *e = getenv("BEER_BD11_OCCLUSION_SAMPLES");
+        samples = e && *e ? strtoull(e, NULL, 0) : (1ull << 24);
+    }
+    return samples;
+}
+
 static B11HR B11_MS ctx_get_data(B11Context *c, B11Obj *q, void *data, uint32_t size, uint32_t flags)
 {
     (void)c; (void)flags;
     if (!q) return B11_E_INVALIDARG;
     B11Query *query = (B11Query *)q;
+    if (query->type < 8) g_b11_query_counts[query->type]++;
     if (!query->ended) return B11_S_FALSE;
     if (!data || !size) return B11_S_OK;
     memset(data, 0, size);
     switch (query->type) {
     case 0: *(uint32_t *)data = 1; break;                                    /* EVENT: done */
-    case 1: *(uint64_t *)data = 1; break;                                    /* OCCLUSION: visible */
+    case 1: *(uint64_t *)data = b11_occlusion_samples(); break;              /* OCCLUSION: visible */
     case 2: { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
               *(uint64_t *)data = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; break; }
     case 3: if (size >= 16) { *(uint64_t *)data = 1000000000ull; ((uint32_t *)data)[2] = 0; } break;  /* DISJOINT */
@@ -1930,7 +1995,9 @@ void b11_context_init_vtable(void)
     v[27] = (void *)ctx_begin; v[28] = (void *)ctx_end; v[29] = (void *)ctx_get_data; v[30] = (void *)ctx_set_predication;
     v[31] = (void *)ctx_gs_srv; v[32] = (void *)ctx_gs_samp;
     v[33] = (void *)ctx_om_rt; v[34] = (void *)ctx_om_rt_uav; v[35] = (void *)ctx_om_blend; v[36] = (void *)ctx_om_depth;
-    v[41] = (void *)ctx_dispatch;
+    v[37] = (void *)ctx_so_targets; v[38] = (void *)ctx_draw_auto;
+    v[39] = (void *)ctx_draw_indexed_instanced_indirect; v[40] = (void *)ctx_draw_instanced_indirect;
+    v[41] = (void *)ctx_dispatch; v[42] = (void *)ctx_dispatch_indirect; v[49] = (void *)ctx_copy_structure_count;
     v[43] = (void *)ctx_rs_state; v[44] = (void *)ctx_rs_viewports; v[45] = (void *)ctx_rs_scissors;
     v[46] = (void *)ctx_copy_region; v[47] = (void *)ctx_copy_resource; v[48] = (void *)ctx_update;
     v[50] = (void *)ctx_clear_rtv; v[51] = (void *)ctx_clear_uav_uint; v[52] = (void *)ctx_clear_uav_float;

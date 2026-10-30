@@ -10,13 +10,6 @@ static u64 __attribute__((ms_abi)) stub_GetConsoleCP(void){ return 437; }
 static u64 __attribute__((ms_abi)) stub_EnumResourceTypesA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumResourceNamesA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumResourceLanguagesA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_FindResourceA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_FindResourceExA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_LoadResource(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SizeofResource(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_LockResource(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_FreeResource(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetEnvironmentVariableA(void){ return 1; }
 static u64 __attribute__((ms_abi)) stub_GlobalAddAtomA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_WritePrivateProfileStringA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetVolumeInformationA(void){ return 0; }
@@ -45,7 +38,18 @@ static u64 __attribute__((ms_abi)) stub_OpenProcess(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetExitCodeProcess(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreateRemoteThread(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_WriteProcessMemory(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetThreadContext(void){ return 0; }
+/* GetThreadContext: Beer cannot read another thread's registers, but it never sets hardware breakpoints, so the debug
+ * registers are reported as clear (CONTEXT_DEBUG_REGISTERS: Dr0-Dr3, Dr6, Dr7 at +0x48..+0x77 of the x64 CONTEXT).
+ * Failing the call left the caller's buffer as stack garbage, which copy protection (RDR2's Arxan TLS callback)
+ * reads as a debugger's breakpoints and answers by sabotaging the game ("Social Club error"). */
+static u64 __attribute__((ms_abi)) beer_GetThreadContext(u64 thread, u8 *context)
+{
+    (void)thread;
+    if (!context) { g_last_error = 998; return 0; }                 /* ERROR_NOACCESS */
+    const u32 flags = *(u32 *)(context + 0x30);
+    if ((flags & 0x100010u) == 0x100010u) memset(context + 0x48, 0, 0x30);
+    return 1;
+}
 static u64 __attribute__((ms_abi)) stub_GlobalDeleteAtom(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DeviceIoControl(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FindClose(void){ return 0; }
@@ -57,7 +61,6 @@ static u64 __attribute__((ms_abi)) stub_IsBadReadPtr(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_IsBadWritePtr(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetThreadLocale(void){ return 0x409; }
 static u64 __attribute__((ms_abi)) stub_SetThreadLocale(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_PostQueuedCompletionStatus(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetThreadContext(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetProcessIdOfThread(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetThreadId(void){ return 0; }
@@ -94,14 +97,11 @@ static u64 __attribute__((ms_abi)) stub_GetClassLongA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetClassLongPtrA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FindWindowA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassNameA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_LoadBitmapA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_LoadImageA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_UnregisterClassW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassInfoW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_InsertMenuItemW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMenuItemInfoW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetMenuItemInfoW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_DrawTextW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DrawStateW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetWindowTextW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetWindowTextLengthW(void){ return 0; }
@@ -143,7 +143,6 @@ static u64 __attribute__((ms_abi)) stub_DeleteMenu(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMenuItemRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_WindowFromDC(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetDCEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetWindowDC(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetWindowRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_InvalidateRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RedrawWindow(void){ return 0; }
@@ -164,7 +163,6 @@ static u64 __attribute__((ms_abi)) stub_GetSysColor(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetSysColorBrush(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetSysColors(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DrawFocusRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_FillRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FrameRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetParent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetParent(void){ return 0; }
@@ -198,37 +196,23 @@ static u64 __attribute__((ms_abi)) stub_CloseServiceHandle(void){ return 1; }
 static u64 __attribute__((ms_abi)) stub_CreateFontIndirectA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumFontFamiliesA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetCharABCWidthsA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetTextExtentPointA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetTextMetricsA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetObjectA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExtTextOutA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateFontIndirectW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumFontFamiliesExW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetCharABCWidthsW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetTextExtentPoint32W(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetTextExtentExPointW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetObjectW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_TextOutW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_ExtTextOutW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetRandomRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Arc(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_BitBlt(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Chord(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CombineRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateBitmap(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreateBrushIndirect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateCompatibleBitmap(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateCompatibleDC(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreateDIBitmap(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreateEllipticRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreatePen(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreatePenIndirect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreatePatternBrush(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreateRectRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreateRoundRectRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateSolidBrush(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_DeleteDC(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_DeleteObject(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Ellipse(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EqualRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExcludeClipRect(void){ return 0; }
@@ -236,20 +220,15 @@ static u64 __attribute__((ms_abi)) stub_ExtCreateRegion(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExtFloodFill(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FillRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetROP2(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetBkColor(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetBitmapBits(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClipBox(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClipRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetCurrentObject(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetDeviceCaps(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetDIBits(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMapMode(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetObjectType(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetPixel(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetRegionData(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetRgnBox(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetTextAlign(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetTextColor(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetViewportExtEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetViewportOrgEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetWindowExtEx(void){ return 0; }
@@ -258,34 +237,21 @@ static u64 __attribute__((ms_abi)) stub_IntersectClipRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_LineTo(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_MaskBlt(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_OffsetRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_PatBlt(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Pie(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_PaintRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_PtInRegion(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RectInRegion(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RectVisible(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Rectangle(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RestoreDC(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RealizePalette(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RoundRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SaveDC(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SelectClipRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExtSelectClipRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SelectObject(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SelectPalette(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetBkColor(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetBkMode(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetMapMode(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetPixel(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetPolyFillMode(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_StretchBlt(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetRectRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetROP2(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetStretchBltMode(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetTextCharacterExtra(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetTextColor(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetTextAlign(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateDIBSection(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetArcDirection(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExtCreatePen(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_MoveToEx(void){ return 0; }
@@ -327,38 +293,6 @@ static u64 __attribute__((ms_abi)) stub_RtlFormatCurrentUserKeyPath(u16 *out)
     return 0;                                                       /* STATUS_SUCCESS */
 }
 static u64 __attribute__((ms_abi)) stub_RtlDosPathNameToNtPathName_U(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RtlFreeUnicodeString(u16 *us)
-{
-    if (!us) return 0;
-    u16 *buffer = *(u16 **)(void *)((u8 *)us + 8);
-    if (buffer) impl_HeapFree(1, 0, buffer);           /* untracked pointers are ignored */
-    us[0] = us[1] = 0;
-    *(u16 **)(void *)((u8 *)us + 8) = NULL;
-    return 0;
-}
-/* ANSI_STRING -> UNICODE_STRING (ANSI code page treated as Latin-1/ASCII, like the rest of Beer's narrow paths). */
-static u64 __attribute__((ms_abi)) beer_RtlAnsiStringToUnicodeString(u16 *dst, const u16 *src, u8 allocate)
-{
-    if (!dst || !src) return 0xC000000Du;                          /* STATUS_INVALID_PARAMETER */
-    u32 length = src[0];
-    const u8 *text = *(const u8 * const *)(const void *)((const u8 *)src + 8);
-    u32 bytes = length * 2;
-    if (bytes + 2 > 0xFFFF) return 0x80000005u;                    /* STATUS_BUFFER_OVERFLOW */
-    u16 *buffer;
-    if (allocate) {
-        buffer = (u16 *)(uintptr_t)impl_HeapAlloc(1, 0, bytes + 2);
-        if (!buffer) return 0xC0000017u;                           /* STATUS_NO_MEMORY */
-        dst[1] = (u16)(bytes + 2);
-        *(u16 **)(void *)((u8 *)dst + 8) = buffer;
-    } else {
-        buffer = *(u16 **)(void *)((u8 *)dst + 8);
-        if (!buffer || dst[1] < bytes) return 0x80000005u;
-    }
-    for (u32 i = 0; i < length; ++i) buffer[i] = text ? text[i] : 0;
-    if (dst[1] >= bytes + 2) buffer[length] = 0;
-    dst[0] = (u16)bytes;
-    return 0;
-}
 
 /* SMBIOS ("RSMB") for GetSystemFirmwareTable: BIOS, system and baseboard structures built from /sys/class/dmi/id,
  * which unprivileged users can read (the raw DMI table needs root). Same approach as Wine. */
@@ -422,7 +356,6 @@ static u64 __attribute__((ms_abi)) beer_EnumSystemFirmwareTables(u32 provider, u
     if (buffer && size >= 4) memset(buffer, 0, 4);                  /* one table, id 0 */
     return 4;
 }
-static u64 __attribute__((ms_abi)) stub_RtlInitUnicodeString(u16 *d, const u16 *s){ if(!d) return 0; size_t n=0; if(s) while(s[n]) ++n; d[0]=(u16)(n*2); d[1]=(u16)(s?n*2+2:0); *(const u16 **)(void*)((u8*)d+8)=s; return 0; }
 static u64 __attribute__((ms_abi)) stub_NtOpenSection(void){ return 0xC0000022u; }
 static u64 __attribute__((ms_abi)) stub_RtlInitString(u16 *d, const char *s){ if(!d) return 0; size_t n=0; if(s) while(s[n]) ++n; d[0]=(u16)n; d[1]=(u16)(s?n+1:0); *(const char **)(void*)((u8*)d+8)=s; return 0; }
 static u64 __attribute__((ms_abi)) stub_PathMatchSpecW(void){ return 0; }
@@ -446,4 +379,3 @@ static u64 __attribute__((ms_abi)) stub_ImageList_DragMove(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_DragShowNolock(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub__TrackMouseEvent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumProcesses(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetThreadDescription(void){ return 0; }

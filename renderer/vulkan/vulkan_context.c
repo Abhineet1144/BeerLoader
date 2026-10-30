@@ -164,6 +164,19 @@ static void *gpu_keepalive_thread(void *unused)
     }
 }
 
+/* Diagnostic: BEER_VK_DEBUG_UTILS=1 enables VK_EXT_debug_utils and prints every
+ * driver message, including the driver's own reason for a device loss. */
+static VKAPI_ATTR VkBool32 VKAPI_CALL debug_utils_message(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT types,
+    const VkDebugUtilsMessengerCallbackDataEXT *data, void *user)
+{
+    (void)types; (void)user;
+    fprintf(stderr, "[VKDEBUG] sev=0x%x %s\n", (unsigned)severity,
+            data && data->pMessage ? data->pMessage : "(no message)");
+    return VK_FALSE;
+}
+
 #define LOAD_INSTANCE(name) do { \
     g_context.name = (PFN_vk##name)g_context.GetInstanceProcAddr( \
         g_context.instance, "vk" #name); \
@@ -200,8 +213,10 @@ int beer_vulkan_context_initialize(void)
     const char *instance_extensions[] = {
         "VK_KHR_surface",
         "VK_KHR_xlib_surface",
-        "VK_KHR_get_physical_device_properties2"
+        "VK_KHR_get_physical_device_properties2",
+        "VK_EXT_debug_utils"
     };
+    const int debug_utils = getenv("BEER_VK_DEBUG_UTILS") != NULL;
     /* Request Vulkan 1.3 when the loader reports it so the physical device
      * can expose core 1.2/1.3 features; older stacks stay on 1.0. */
     uint32_t instance_version = VK_API_VERSION_1_0;
@@ -222,11 +237,31 @@ int beer_vulkan_context_initialize(void)
     VkInstanceCreateInfo instance_info = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &application,
-        .enabledExtensionCount = 3,
+        .enabledExtensionCount = debug_utils ? 4 : 3,
         .ppEnabledExtensionNames = instance_extensions
     };
     if (create_instance(&instance_info, NULL, &g_context.instance) != VK_SUCCESS)
         goto fail;
+    if (debug_utils) {
+        PFN_vkCreateDebugUtilsMessengerEXT create_messenger =
+            (PFN_vkCreateDebugUtilsMessengerEXT)g_context.GetInstanceProcAddr(
+                g_context.instance, "vkCreateDebugUtilsMessengerEXT");
+        VkDebugUtilsMessengerCreateInfoEXT messenger_info = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = debug_utils_message
+        };
+        VkDebugUtilsMessengerEXT messenger;
+        if (!create_messenger || create_messenger(g_context.instance,
+                &messenger_info, NULL, &messenger) != VK_SUCCESS)
+            fprintf(stderr, "[VULKAN] VK_EXT_debug_utils messenger unavailable\n");
+    }
     LOAD_INSTANCE(DestroyInstance);
     LOAD_INSTANCE(EnumeratePhysicalDevices);
     LOAD_INSTANCE(GetPhysicalDeviceQueueFamilyProperties);

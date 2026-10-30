@@ -332,6 +332,7 @@ void bd12_descriptor_copy(BD12DescriptorHeap *dst, uint32_t dst_index,
 {
     if (dst_index + count > dst->count || src_index + count > src->count)
         return;
+    ++dst->sampler_gen;
     memmove(&dst->descriptors[dst_index], &src->descriptors[src_index],
             count * sizeof(*dst->descriptors));
 }

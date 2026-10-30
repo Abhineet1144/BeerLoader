@@ -1,10 +1,305 @@
 # Beer Loader — Active Development Context
 
 RDR2 Path: /mnt/wwn-0x5000c500c67d4454-part1/Games/RDR2/Launcher.exe
+
+## PRAGMATA — guest Steam interface ABI progress (current)
+
+After the app-ID and WinTrust/module-identity fixes, the repeatable crash at
+`steam_api64.dll+0x72a6` was traced to Beer's `ISteamUtils010` vtable, not guest
+code or the GPU. Beer incorrectly placed `GetAPICallResult` in slot 14. Native
+Steam uses slot 13 for `GetAPICallResult` and slot 14 for `RunFrame`; the wrapper's
+no-argument `RunFrame` call was therefore interpreted as a six-argument result
+query and wrote through a garbage output pointer. The slot contract now lives in
+first-party `platform/steam_interface_contract.h` with focused coverage.
+
+That correction removes both the host fault in `steam_utils_get_api_call_result`
+and the subsequent NULL call at `steam_api64.dll+0x72a6`. PRAGMATA now completes
+Steam app-ID/user/apps setup and requests `SteamController008` and
+`SteamInput006`. Beer now returns one coherent offline input object for those
+interfaces: initialization/shutdown succeed, controller enumeration and all other
+operations truthfully return empty/invalid results. A successful 55-second CPU
+run reached this post-Steam stage without the prior crash or an error dialog;
+the process remained active until the external timeout. No Vulkan/BD12 device was
+created, so GPU validation remains pending while the main GPU is unavailable.
+
+The new regression test verifies the ISteamUtils slot order and interface-name
+classification. Loader build, source diagnostics, the focused test and
+`git diff --check` pass. Logs: `/tmp/beer-prag-steam-utils-slot.log` (first proof
+of slot fix), `/tmp/beer-prag-steam-input-1.log` (post-Steam interface progress),
+and `/tmp/beer-prag-steam-loop-prof-2.log` (short post-interface CPU sample).
+
+## PRAGMATA — Steam bootstrap and readable early dialogs (current)
+
+The post-TLS module-enumeration loop was traced to Beer's merged Kernel32/KernelBase
+identity. Publishing a distinct Beer-owned `kernelbase.dll` in `PEB->Ldr` breaks
+that loop and lets successful TLS runs enter ordinary Win32 startup. Guest Steam
+mode (`BEER_STEAM_API_MODE=guest`) now follows the application-local wrapper path.
+A distinct mapped `wintrust.dll` with a real export identity removed the prior fake
+HMODULE collision.
+
+Steam application metadata is now discovered generically from an explicit host
+environment override, root `steam_appid.txt`, or `steam_settings/steam_appid.txt`,
+and published before PEB/process-environment construction. The same resolver is
+used by Beer's Steam ownership state. A current successful run proves the guest
+sees app ID `3357650`, reaches `SteamAPI_Init`, creates Steam interfaces, and passes
+the former `no appID found` failure. Its next failure is inside the guest Steam
+wrapper at `steam_api64.dll+0x72a6`; this is CPU/module work, before graphics.
+
+The small black error window was a separate generic USER32 defect, not a GPU
+error. Beer modeled every `CreateWindowEx` call as the one native top-level window,
+so creating `Static` and `Button` child controls resized/reused that surface and
+never painted their text. Built-in `Static`/`Button` WS_CHILD controls are now
+painted into the parent software-GDI surface and flushed immediately. The change
+is class/WS_CHILD based and contains no title-specific text or executable checks.
+Focused environment and Kernel32 contract tests pass; the loader builds and source
+diagnostics/`git diff --check` are clean. Runtime dialog visual confirmation is
+pending a run that reaches the dialog again; many runs now pass it and fail later.
+Logs: `/tmp/beer-prag-steam-appid.log`, `/tmp/beer-prag-dialog-visible.log`, and
+`/tmp/beer-prag-dialog-visible-2.log`.
+
+RE8 Path: /mnt/56A4064AA4062CD5/Games/Resident Evil - Village8/re8.exe
 Last consolidated: 2026-10-18
+
+## PRAGMATA — latest CPU-only validation (2026-10-30)
+
+Rebuilt and validated the newest CRT/process-state changes. Focused tests pass for
+Win64 process parameters, CRT initializer callback ABI/order, onexit callback ABI,
+UI-language contracts, initial TLS/entry ABI, environment handling, API-set schema,
+Kernel32 ownership, and virtual-memory/string probes. Source diagnostics and
+`git diff --check` are clean.
+
+A clean 210-second PRAGMATA run completed executable TLS callbacks 0 through 3
+naturally. It then remained alive until the external timeout without reaching the
+former immediate second-export-lookup fault at RVA `0xf022e48`, without a fatal
+loader report, and without entering Vulkan/BD12. This is measurable CPU-side
+advancement relative to the earlier deterministic post-TLS fault, but not yet a
+launch fix: no post-entry API activity was observed during the window.
+
+A separate profiled run retained the known nondeterminism and stayed inside TLS
+callback 2 until its 180-second diagnostic watchdog (sampled RIP RVA `0x13324ecb`).
+Thus the current outcomes are: callback-2 slow/fault paths still exist, while a
+successful-TLS path can now survive post-entry for several minutes without the old
+lookup failure. Logs: `/tmp/beer-prag-latest-check.log` and
+`/tmp/beer-prag-profile.log`. GPU-dependent RE8 validation remains deferred.
+
+## PRAGMATA — CRT initialization ABI and native process state (2026-10-30)
+
+Fixed the actual dependency-initialization register corruption. The dispatcher
+used the latest thread-local import index when reporting an outer API's register
+changes, so a nested initializer call made `_initterm`'s corruption appear under
+`_register_onexit_function`. The outer frame now saves its own diagnostic index.
+With that correction the warning identified `_initterm`: its initializer table
+used SysV function pointers, calling real Win64 PE constructors without their
+32-byte home space. Those constructors could overwrite the host frame and its
+saved RSI/RDI. First-party `platform/win32_crt_init.c` retains Win64 callback types
+and is compiled with full ABI/SIMD support, as is the related exit-callback module.
+`_initterm_e` preserves callback order and the first nonzero initializer error.
+An independent callback that writes all home slots reproduces the original ABI
+failure in a negative-control executable and passes with the corrected code at
+both `-O0` and `-O2`. The startup ABI warning is gone in both Pragmata and RE8.
+
+The same callback-type defect existed in `_execute_onexit_table`. Its first-party
+replacement preserves the Win64 callback type and adds checked table growth and
+serialized registration. Tests cover LIFO, callbacks registering more callbacks
+and reallocating the table during execution, and four concurrent registration
+threads (4,000 callbacks), as well as an assembly shadow-space consumer.
+
+Reference-trace correction: raw Wine relay totals include helper processes and
+Wine's own internal callers, so they are not direct evidence that Pragmata needs
+every counted API. Filtering the observed main-thread calls and caller addresses
+identified `GetUserPreferredUILanguages`, which is also a static game import.
+Added the documented size-query/MULTI_SZ contract for Beer's existing en-US UI
+locale, language-name/ID formats, validation and short-buffer errors. Corrected
+`GetUserDefaultLocaleName` to return 6 UTF-16 units including NUL, not 5, and to
+fail on invalid/short buffers. The import summary is now 721 implemented / 545
+zero-stub thunks; Kernel32 remains 315 names because this API was already imported.
+Only reference call observations and Microsoft API documentation were used.
+
+The direct PEB process-parameter audit found `Length` incorrectly at offset 0
+(the MaximumLength slot) with the real Length at +4 and Flags at +8 left zero.
+Added an offset-asserted first-party prefix and initializer: both lengths are set,
+absolute pointers are marked normalized, and initial standard handles/current
+directory agree with Beer's APIs. Structural tests read the literal ABI offsets.
+This does not implement later process-parameter mutations or a full native RTL.
+
+Runtime remains **blocked before graphics**, not fixed. After the initializer
+correction, one three-minute sample completed all four TLS callbacks and stayed
+CPU-bound until timeout; another selected the pre-existing callback-2 FNEM fault.
+After the process-parameter correction, two 90-second samples respectively stalled
+in callback 2 and selected that same fault. No guest code was patched, bypassed,
+instruction-stepped, or forced to continue. Four separate 75-second RE8 gates
+(UI languages, exit callbacks, constructors, process parameters) passed on the
+Intel UHD 770, reaching BD12/BD11 and 2560x1440 swapchains without device loss.
+
+Loader build, CLI smoke and all new focused tests pass. Undefined-behavior checks
+for UI languages, process parameters and onexit pass. The complete input suite
+still stops at the previously documented unwind-test handler assertion; the
+unwinder was not changed. No third-party code or compatibility dependency added.
+
+Logs: `/tmp/beer-prag-dispatch-provenance.log` (corrected attribution),
+`/tmp/beer-prag-crt-init-diagnostic.log`, `/tmp/beer-prag-crt-init-{1,2}.log`,
+`/tmp/beer-prag-process-parameters-{1,2}.log`,
+`/tmp/beer-re8-after-{ui-language,onexit-abi,crt-init-abi,process-parameters}.log`,
+and `/tmp/beer-prag-continuation-input.log`.
+
+## PRAGMATA — string probes and tested initial-thread ABI (2026-10-30)
+
+External Wine call observations included `IsBadStringPtrW` (80 entries), which
+Beer did not implement. Added first-party `IsBadStringPtrA/W` from the documented
+Win32 contract, with maximum-character bounds, ANSI/UTF-16 NUL detection, zero
+length success, and safe failure on inaccessible/unmapped memory. Probes use
+bounded `process_vm_readv` reads rather than changing signal handlers or directly
+dereferencing guest pointers. Complete characters are checked before rejecting a
+partial read, so a NUL immediately before an inaccessible page succeeds. Published
+both implemented names through Beer's own Kernel32 manifest (315 exports in the
+PRAGMATA run). Guard-page, read-only, unaligned UTF-16, cross-page, overflow, and
+unmapped-pointer tests pass, including an undefined-behavior-sanitized build.
+
+The initial-thread handoff also violated Win64 stack alignment: `g_entry_rsp`
+is 8 modulo 16, and subtracting 32 before CALL left the TLS runner entering at
+0 modulo 16 instead of 8. Replaced that inline-C stack switch with a standalone
+assembly boundary in `platform/win32_entry.c`. It reserves 40 bytes before CALL
+(32-byte home space plus a saved PE entry address), restores the exact entry
+RSP, and tail-enters the executable. Unlike the earlier reverted inline-asm
+alignment experiment, the new boundary has an independent regression test that
+uses all four home slots, an aligned SIMD store, volatile-register clobbers, and
+checks TLS ordering, the PE return slot, and exact final RSP across 16 stack
+positions. The test passes under both optimized and loader-style no-SIMD flags.
+
+Runtime results are **not a Pragmata fix confirmation**. A fresh pre-change
+45-second baseline completed all TLS callbacks but did not reach graphics. The
+string-probe-only 90-second run stalled in callback 2. After the ABI correction,
+two of three 90-second attempts completed all four TLS callbacks; the other
+remained in callback 2. All ended only at the external timeout with no graphics
+initialization or conclusive second-lookup outcome. A planned five-minute
+diagnostic run was interrupted before its 120-second snapshot and is not a
+completed soak; it had completed all TLS callbacks when interrupted. Its ABI
+diagnostic initially labeled the RSI/RDI clobber `_register_onexit_function`;
+the follow-up above corrected that attribution to `_initterm` and fixed it.
+
+RE8 passed separate 75-second gates after each increment on the Intel UHD 770:
+ready BD12/BD11 devices, repeated 2560x1440 swapchain activity, no fatal/device-loss
+line, and termination only by external timeout. Loader build, CLI smoke,
+environment, API-set, Kernel32 contract, virtual-memory and entry-ABI tests pass.
+The full `make test-input` run passes those tests and then fails at the already
+documented `platform/win32_unwind_test.c:61` handler assertion; the full suite
+is not green, and that unrelated unwinder failure was not changed here.
+No Wine/Proton code, DLL, export inventory, new compatibility dependency, guest
+RVA patch, forced callback return, or guest instruction skip was added.
+
+Logs: `/tmp/beer-prag-string-probe-baseline.log`,
+`/tmp/beer-prag-string-probe-1.log`, `/tmp/beer-prag-entry-abi-{1..3}.log`,
+`/tmp/beer-prag-entry-abi-long.log` (interrupted),
+`/tmp/beer-re8-after-string-probe.log`, and `/tmp/beer-re8-after-entry-abi.log`.
+
+## RE8 on the Intel iGPU: zero-valued fence signal fixed (2026-10-30)
+
+RE8 died on the Intel UHD 770 (Mesa ANV) right after window creation with
+`device lost during BD12 queue submit`, followed by a SIGSEGV inside
+`libvulkan_intel.so`. It was not a GPU hang: the game calls
+`ID3D12CommandQueue::Signal(fence, 0)` on a fresh fence, which D3D12 allows, and
+BD12 forwarded it as a Vulkan timeline signal of value 0. That is invalid Vulkan;
+NVIDIA ignores it, Mesa reports "Tried to signal a timeline with value 0" and marks
+the device lost. `BD12Fence.signaled` now records the highest value signaled or
+queued, and `bd12_fence_claim` drops any queue or CPU signal that would not advance
+the timeline (checked under `com_submit`'s submit lock, so cross-queue order holds).
+75-second RE8 run on the iGPU: no device loss, no driver messages, ~21-26 fps at
+2560x1440. Not re-verified on the RTX 4070 Ti SUPER (the NVIDIA driver was not
+loaded during this session).
+
+Second iGPU crash (on loading into 3D): SIGSEGV inside `vkCmdDraw` in ANV, an
+`UNREACHABLE` in its polygon-mode switch over primitive topology. BD12 pipelines
+carry no hull/domain stages (`has_tessellation_or_geometry` is recorded but unused),
+yet D3D 33..64 control-point topologies were forwarded as
+`VK_PRIMITIVE_TOPOLOGY_PATCH_LIST`, which is invalid without tessellation. Now
+`bd12_cmd_set_d3d_topology` (used by BD12 and BD11) draws 3-point patches as
+triangle lists and drops other patch sizes (`[BD12 DROP] draw(patch list without
+tessellation)`, each size logged once). User confirmed RE8 gets into 3D on the iGPU.
+Open: RE8 issues 1-control-point patch draws even at the title screen; they are
+dropped now and were presumably drawn somehow on NVIDIA. Real fix: tessellation
+(HS/DS) support in BD12 PSOs.
+
+New diagnostics: `BEER_VK_DEBUG_UTILS=1` (VK_EXT_debug_utils messenger, prints
+driver messages as `[VKDEBUG]`; Mesa reports device-loss reasons only through it),
+and on a device-lost BD12 submit the waits/signals are printed (`[BD12] lost submit`).
+
+## RE8 worker-thread ABI regression fixed (current working tree)
+
+After the PRAGMATA loader changes, RE8 reproducibly reached D3D12 initialization
+and then crashed while a guest worker thread returned to `win_thread_trampoline`.
+The guest fault-recovery path had skipped several guest epilogues, leaving the
+SysV nonvolatile registers used by the pthread C frame corrupted. The first host
+instruction after the guest call (`loader.c`, immediately after the thread entry
+returns) consequently dereferenced a destroyed frame pointer and terminated with
+`Mid-host bad target ... has no valid guest continuation`.
+
+`beer_call_thread_entry` is now a dedicated assembly ABI boundary. It saves the
+host's `RBP`, `RBX`, and `R12-R15`, reserves Windows x64 shadow space, calls the
+guest entry with `RCX=arg`, and restores the host registers unconditionally on
+return. This is generic thread-entry behavior and contains no executable-specific
+addresses. A 75-second RE8 run completed the formerly fatal worker recovery
+sequence, stayed alive until the test timeout, and reported no fatal error or
+Vulkan device loss. Verification log: `/tmp/beer-re8-thread-abi-fix.log`.
 
 This file intentionally contains only active engineering state. Historical run
 transcripts, disproven hypotheses, and stale experiments were removed.
+
+## PRAGMATA — Wine behavioral oracle and stable locale contract (2026-10-28)
+
+Wine was used only as an external behavioral oracle; no Wine DLL, source, address,
+or export inventory was copied into Beer. The same PRAGMATA image progresses through
+D3D12, Streamline, and XeSS there. Its relay trace showed `CompareStringOrdinal` as
+a heavily used documented Kernel32 call (28,212 observed relay entries), while Beer
+neither implemented nor published it.
+
+Beer now implements `CompareStringOrdinal` as a locale-independent UTF-16 ordinal
+comparison, including explicit lengths, NUL-terminated `-1` lengths, invariant ASCII
+case folding, documented CSTR return values, and invalid-parameter failure. It is
+published through the first-party Kernel32 locale contract and covered by standalone
+contract tests. This is a generic Win32 implementation, not a title-specific export.
+
+Result: Kernel32 grows from 292 to 293 owned exports. A successful PRAGMATA sample
+completed all four TLS callbacks and still reached the second exhausted-lookup fault
+at RVA `0xf022e48`; the derived fault moved with the ordinal-table layout to
+`0x2fcc75178`. Therefore `CompareStringOrdinal` is a real missing contract but not the
+specific second lookup target. RE8 passed the mandatory 75-second gate after this
+change: BD12 and BD11 both initialized, 2560x1440 swapchains presented, no guest Steam
+DLL or fatal runtime error appeared, and the run ended only by timeout.
+
+Logs: `/tmp/beer-prag-compare-ordinal-2.log`,
+`/tmp/beer-re8-after-compare-ordinal.log`, and `/tmp/beer-prag-wine-relay.log`.
+
+## PRAGMATA — Wine-observed thread/string contracts (2026-10-28)
+
+The Wine relay was reduced to observed calls only and compared against Beer's own
+implementation table; no Wine export inventory or implementation was copied. Two
+small documented Kernel32 gaps were implemented as first-party contracts:
+
+- `SetThreadDescription`: validates Beer/current-thread handles, validates the
+  UTF-16 description, and applies the host thread name where Linux permits it.
+  The obsolete unconditional-success generated stub was removed so it cannot
+  shadow the real implementation.
+- `lstrcmpA/W` and `lstrcmpiA/W`: return the documented negative/zero/positive
+  ordering, with invariant ASCII case folding for the case-insensitive forms.
+  These functions were among the most visible missing calls in the successful
+  Wine run (`lstrcmpiW` 14,422 relay entries and `lstrcmpA` 3,084 entries).
+
+Both families are published through Beer's first-party Kernel32 contract. The
+synthetic Kernel32 surface increased from 293 to 297 names. PRAGMATA still reaches
+the second exhausted-lookup fault after successful TLS runs; its derived address
+moves with the export layout to `0x2fcc751d8`, so neither family is that lookup's
+specific missing contract. Callback 2 retains its pre-existing intermittent
+slow/sentinel paths.
+
+RE8 passed a mandatory 75-second gate after each increment. The final build reached
+ready BD12 and BD11 devices, presented 2560x1440 swapchains, did not load the guest
+Steam DLL, and ended only at the external timeout. Focused Kernel32-contract,
+shared-data, and NT-section tests pass; implementation names remain unique.
+
+Logs: `/tmp/beer-prag-set-thread-description-{1..3}.log`,
+`/tmp/beer-prag-string-contract-{1..3}.log`,
+`/tmp/beer-re8-after-set-thread-description.log`, and
+`/tmp/beer-re8-after-string-contract.log`.
 
 > **2026-10-24: the old host-snapshot D3D12 path is gone.** BD12 (graphics/d3d12v) is the only D3D12
 > implementation and no longer needs `BEER_D3D12_BD12=1`. Sections below that describe the "scalar bridge", host
@@ -678,7 +973,7 @@ Next: look at the live game and the remaining captures (background layers), then
 ### Open issues list (as of 2026-10-25)
 1. (done) Mouse actions fixed by sending WM_NCHITTEST/answering HTCLIENT; verified by the user, debug code removed.
 2. Ambient/indirect lighting too dark (flashlight/dark scenes) — game CPU likely skipping light-volume draws.
-3. Occlusion-proxy culling disabled by default (BEER_BD12_PROXY_ALWAYS=1) to avoid pop-in; real culling not restored.
+3. (done 2026-10-28) Occlusion-proxy culling restored: root cause was missing Invariant on SPIR-V positions; workaround removed.
 4. Rare startup stall right after swapchain creation (seen ~2 times in dozens of launches) and rare device loss at startup.
 
 ### FIXED: stale/obstructing flashlight shadows (2026-10-25)
@@ -765,6 +1060,69 @@ Fixes: (1) access mapping now treats only READ_DATA/READ_EA/EXECUTE/READ_ATTRIBU
 Repair (user action): let Steam re-verify/re-extract its client package (quit Steam, delete or rename `~/.local/share/Steam/steamclient64.dll`, start Steam; or delete `package/steam_client_steamrt64.installed`). Verify with CRC32 == 1644729272.
 Side effect: while the file is damaged the RE4 Steam-wrapper integrity check fails with error 3 (it passed before the corruption).
 
+### RE4 follow-up — native DLL search ordering (2026-10-27)
+
+Confirmed the Windows-compatible policy boundary without adding an RE4/app-ID
+special case:
+
+- `LoadLibrary` returns only modules already published as process-owned runtime
+  modules before searching. Beer compatibility modules such as
+  `steam_api64.dll` are no longer treated as implicitly preloaded.
+- For unresolved application-private names, Beer now asks an installed guest
+  native file/section hook first. If that hook declines the open,
+  `steam_api64.dll` falls back to Beer's existing coherent process-wide facade
+  before any host-visible same-name PE is loaded. This preserves RE8 while
+  allowing a protector VFS to supply an authoritative image.
+- Windows runtime DLL names (for example `winmm.dll`) stay on Beer's runtime
+  surface and are not substituted by an application-private VFS. This matches
+  normal Windows KnownDLL/system-directory ownership.
+- Removed the host-file-exists short circuit from the native VFS path. On
+  Windows, installed `NtCreateFile`/section hooks observe the loader open even
+  when a same-named disk file exists; host search is the fallback after the hook
+  declines it.
+- Added focused policy tests for preloaded modules, runtime DLL ownership, and
+  compatibility-fallback ordering.
+- Added explicit `SEC_IMAGE` section identity and test coverage. Image views are
+  temporarily writable while Beer applies relocations/imports, then
+  `guest_dll_finish` restores PE section protections.
+
+RE8 passed two 75-second gates after this ordering change, reaching ready BD12
+and BD11 devices without loading its guest `steam_api64.dll` or a fatal loader
+error (`/tmp/beer-re8-native-vfs-final.log`,
+`/tmp/beer-re8-native-vfs-retention.log`).
+
+RE4 no longer reaches the Valve ticket error during this test. Its protected
+bootstrap now stops earlier at the existing nested guest-hook stack boundary
+(RVA `0xe85dac4`): the hook grows below the reserved host-call stack window and
+Beer rejects the resulting RSP. That is the next generic blocker before the
+virtual `steam_api64.dll` open can be observed. Logs:
+`/tmp/beer-re4-native-vfs-retry.log`.
+
+### RE4 bring-up, session 6 — system-module LoadLibrary ordering fixed (2026-10-27)
+Fresh reproduction stopped while a protected virtual-file hook handled
+`LoadLibrary("KERNEL32.dll")`: it returned a second mapping of Beer's synthetic
+kernel32 at an arbitrary address, after which the generic PE loader correctly
+rejected the fixed-base, relocation-free image. This was a loader-ordering bug,
+not an executable requirement. Windows returns the already loaded module before
+opening a file. `prefer_emulated_module()` now applies that rule to the
+process-owned kernel32/kernelbase, user32, ntdll, advapi32 and win32u modules,
+so ANSI and Unicode LoadLibrary paths return the same HMODULEs as
+GetModuleHandle and PEB->Ldr. No executable name, RVA, byte patch, or asset
+special case was added.
+
+Result: RE4 gets past the duplicate-kernel32 failure, completes the protected
+bootstrap, loads the Steam client facade, creates SteamClient017/014, obtains
+SteamUtils007/SteamUser017/STEAMAPPTICKET_INTERFACE_VERSION001, and then
+deliberately exits with `Application load error 6:0000065432`. The remaining
+boundary is the Valve RSA ownership-ticket signature check documented in
+session 5. Beer's locally generated unsigned ticket cannot satisfy it. Producing
+a Valve signature or patching/bypassing that verification is not a generic
+Windows compatibility change, so it was not attempted. Validation: loader
+build, `make smoke-cli`, and `git diff --check` pass. The broad `make test-input`
+suite reaches an existing failure in `win32_unwind_test` at line 61 after all
+earlier input/environment/shared-data/NT-section/VM/VEH tests pass; this change
+does not touch unwind code.
+
 ## DEBUG TOOLS REFERENCE (consolidated 2026-10-25; all opt-in, off by default)
 Standard launch (run in the background, verify with `pgrep -x loader`, stop with `pkill -x loader`; the games drive mount point changes between reboots: check `lsblk`):
 `(BEER_VKD3D_SHADER_LIBRARY=<libvkd3d-shader.so path from the umu steamrt4 runtime> setsid nohup ./loader --audio=fmod "<game exe>" > <log> 2>&1 < /dev/null & disown)`
@@ -780,7 +1138,7 @@ Scratchpad (tmpfs, wiped by reboot) holds logs/captures; never leave a file name
 - BEER_BD12_FPS=1 frame rate line each second; BEER_BD12_PROF / BEER_BD12_SAMPLE / BEER_PROF_SAMPLE profiling; BEER_BD12_TS_LOG GPU timestamp log; BEER_BD12_RES_LOG, BEER_BD12_HEAP_LOG, BEER_BD12_VIEW_LOG (buffer view cache), BEER_BD12_CLEAR_LOG (UAV clears), BEER_BD12_BIND_LOG (bound buffer VAs per draw/dispatch in traced frames), BEER_BD12_INDIRECT_LOG, BEER_BD12_FLIGHT_RECORDER.
 - Trace and capture: BEER_BD12_TRACE=1, BEER_BD12_TRACE_FILE=<file> (touch to trace next present), BEER_BD12_CAPTURE_DIR (output dir for all captures), BEER_BD12_CAPTURE_CS=<hash prefixes> (dump a compute shader's CBV/SRV before and UAV buffers/images after each dispatch), BEER_BD12_CAPTURE_DRAWS=1 (indirect draw counts/args), BEER_BD12_CAPTURE_TWICE, BEER_BD12_CAPTURE_3D=1 (every dispatch that writes a 3D image), BEER_BD12_CAPTURE_RT=1 (every render pass's colour and depth targets as PPM; BEER_BD12_CAPTURE_RT_SCALE=<n> downscale, default 4; BEER_BD12_CAPTURE_RT_DEPTH_ONLY=1 skip colour; BEER_BD12_CAPTURE_DEPTH_MAXPIX=<n> largest depth map to save), BEER_BD12_CAPTURE_SRV_DEPTH=1 (depth textures sampled by traced compute dispatches), BEER_BD12_COPY_LOG=1 ([COPYIMG] image copies and [CLEARDSV] depth clears in traced frames), [SHADOWPASS] lines list depth passes (clear flag, draw count). BEER_BD12_RB_LOG / BEER_BD12_RB_DUMP=all (GPU->CPU readbacks and their contents), BEER_BD12_DUMP_SPIRV, BEER_D3D11_CAPTURE_DIR, BEER_FRAME_DUMP_DIR / _INTERVAL / _LIMIT, BEER_FRAME_CAPTURE_PATH / _MIN_PRESENT.
 - Behaviour switches used as experiments: BEER_BD12_PROXY_ALWAYS=0 (restore real occlusion-proxy depth test), BEER_BD12_PROXY_BIAS=<n>, BEER_BD12_FORCE_INST=1|2, BEER_BD12_INDIRECT_FORCE, BEER_BD12_SYNC_ALL, BEER_BD12_SYNC_SUBMIT, BEER_BD12_NO_IMAGE_ZERO, BEER_BD12_ASYNC_PSO, BEER_SPV_FLOAT_CONTROLS=0, BEER_SPV_SYNC, BEER_NO_RT=1 (disable Vulkan ray tracing), BEER_DXR_PROBE=1 + BEER_DXR_PROBE_SM=<hex>, BEER_DXIL_SPIRV_LIBRARY, BEER_DXIL_VERBOSE.
-- Presenter / Vulkan: BEER_PRESENT_MODE, BEER_PRESENT_TIMING, BEER_PRESENT_SKIP_ALL / _SKIP_FLIP, BEER_PRESENTER_CPU_X11 / _CPU_STAGING, BEER_VULKAN_PERF(+_MIN_US), BEER_VULKAN_GPU_KEEPALIVE, BEER_VULKAN_DEVICE_LOSS_DIR, BEER_VK_CHECKPOINTS, BEER_VULKAN_DRAW_PROVENANCE, BEER_VULKAN_GUI_DRAW_TRACE, BEER_VULKAN_CACHE_TRACE, BEER_VULKAN_COMPOSITOR_SPV / _INDEXED_SPV, BEER_RENDER_DIAGNOSTICS, BEER_D3D11_DIAGNOSTICS, BEER_D3D12_DIAGNOSTICS, BEER_D3D12_STARTUP_TIMING, BEER_DXGI_VRAM_MB / _SHARED_MB, BEER_PHYS_MB.
+- Presenter / Vulkan: BEER_PRESENT_MODE, BEER_PRESENT_TIMING, BEER_PRESENT_SKIP_ALL / _SKIP_FLIP, BEER_PRESENTER_CPU_X11 / _CPU_STAGING, BEER_VULKAN_PERF(+_MIN_US), BEER_VULKAN_GPU_KEEPALIVE, BEER_VULKAN_DEVICE_LOSS_DIR, BEER_VK_CHECKPOINTS, BEER_VK_DEBUG_UTILS (driver messages, incl. Mesa device-loss reasons), BEER_VULKAN_DRAW_PROVENANCE, BEER_VULKAN_GUI_DRAW_TRACE, BEER_VULKAN_CACHE_TRACE, BEER_VULKAN_COMPOSITOR_SPV / _INDEXED_SPV, BEER_RENDER_DIAGNOSTICS, BEER_D3D11_DIAGNOSTICS, BEER_D3D12_DIAGNOSTICS, BEER_D3D12_STARTUP_TIMING, BEER_DXGI_VRAM_MB / _SHARED_MB, BEER_PHYS_MB.
 
 ### Input / window / messages
 BEER_INPUT_DIAGNOSTICS=1 (X11 buttons/keys, raw input, DirectInput state, SetCapture, GetSystemMetrics first queries, DI stub calls), BEER_MESSAGE_DIAGNOSTICS=1 (message queue/take), BEER_RE8_ACTION_TRACE=1 (signature-guarded RE8 raw-edge/action resolver/predicate tracing), BEER_RE8_CURSOR_GATE_BYPASS=1 (signature-guarded RE8 diagnostic workaround; verified to restore aim/fire by accepting the cursor-in-active-viewport predicate), BEER_DI_NO_ENUM=1 (old DirectInput EnumObjects behaviour), BEER_NO_XI2=1, BEER_HOST_CURSOR, BEER_UI_CONTROL_TRACE, BEER_UI_STATE_TRACE, BEER_MAIN_THREAD_DIAGNOSTICS, BEER_EVENT_DIAGNOSTICS, BEER_SYNC_DIAGNOSTICS, BEER_WAIT_DIAGNOSTICS, BEER_SLEEP_DIAGNOSTICS, BEER_THREAD_DIAGNOSTICS.
@@ -802,8 +1160,75 @@ BEER_STEAM_DIAGNOSTICS=1 (ISteamApps calls), BEER_FILE_DIAGNOSTICS, BEER_SAVE_DI
 ### BD11 status (2026-10-25, end of session)
 BD11 is now OPT-IN (`BEER_D3D11_BD11=1`); the legacy D3D11 path is the default again. Findings: the 16-bit index format (DXGI 57 = R16_UINT, 32-bit is 42) was misread and is fixed; with it the Sekiro title composited mostly right but with ghosted/overlapping layers and vertical streaks; later builds rendered black and stuttered the whole PC (cause unknown, readbacks of RT0 were all zero). Splash screens (frames ~107-323) show only black fade polygons; they are probably Bink movies (needs compute Dispatch, not implemented in BD11). New debug env vars: BEER_BD11_FRAMELOG (per-frame draw counts), BEER_BD11_HOSTBUF (host-visible buffers so traces can read them), BEER_BD11_SYNC_DRAWS (flush+wait after each draw; hangs/slow), BEER_BD11_SPLIT_DRAWS, BEER_BD11_DUMP_SHADERS=<dir>, BEER_BD11_DUMP_PRESENT/DUMP_DIR and BEER_BD11_DUMP_DRAWS (readback dumps; unreliable, all-zero output), BEER_BD12_CAPTURE_DEBUG. BD12 RT capture produced no files on BD11 in this session (end_rendering never ran while the trace window was active).
 
-### PRAGMATA first look (2026-10-25)
-`/mnt/FE5007855007443D/Games/PRAGMATA/PRAGMATA.exe` (RE Engine, D3D12, 383 MB exe). The exe carries a VM-style protector (obfuscated junk-instruction code in `.reloc`-range sections, extra sections `.xtls .xcode .00cfg .arch .xtext .xpdata .udata .ecode`; looks Denuvo-like, not verified). Without `BEER_EXECUTABLE_TLS=1` the entry point crashes at once on a NULL VM-state pointer (RVAs 0xdfa42d9/0xdfa42e2/0xe897063, dead recovery cycle abort). With it, TLS callbacks 0 and 1 finish, callback[2] (RVA 0x15903560) spins at 100% CPU for >90 s (polls KUSER_SHARED_DATA around 0x7ffe02e8; looks like a timing/environment loop), then callback[3] and entry crash the same way. Not investigated further; a real fix means understanding the protector's wait condition. Logs: scratchpad prag1-3.log.
+### PRAGMATA native bring-up (2026-10-27)
+`/mnt/FE5007855007443D/Games/PRAGMATA/PRAGMATA.exe` is a 64-bit RE Engine/D3D12 image with four mandatory process-attach TLS callbacks and transformed code sections. The implementation boundary is strict: Beer must not load Wine/Proton/Windows compatibility DLLs, copy foreign export inventories, hardcode title RVAs/branches, or bypass guest faults. The shader translator is the only permitted third-party loader component. `docs/pragmata-compatibility-requirements.md` and the standard-library-only `tools/pe_requirements.py` record the reproducible PE contract.
+
+Generic loader work completed during bring-up:
+- Executable TLS runs unconditionally. A callback fault or watchdog timeout now fails startup closed; callback 3 and entry are never run with partial TLS state. The old NULL-call-success recovery and manager opt-in were removed.
+- Corrected documented x64 `KUSER_SHARED_DATA` offsets (`CyclesPerYield=0x2e6`, `LastSystemRITEventTickCount=0x2f4`, `NumberOfPhysicalPages=0x2f8`, `SharedDataFlags=0x300`, `QpcFrequency=0x310`) with focused assertions.
+- Beer-owned system modules are published in `PEB->Ldr`. Their virtual files support `CreateFileW -> CreateFileMappingW -> MapViewOfFile -> CloseHandle -> UnmapViewOfFile`; callback 1 now maps and parses native synthetic `ntdll.dll` and `win32u.dll` without external files.
+- Removed dispatch entries where old zero stubs shadowed real file-mapping APIs, `WriteFile`, and `GetSystemMetrics`; the current 1,060-name dispatch table has unique names.
+- Synthetic module exports are now module-owned, derived from the guest's module-qualified imports plus Beer's implemented `Nt*`/`Zw*`/`Rtl*`/`Ldr*` aliases. Current catalogs: kernel32 272, user32 109, ntdll 50, advapi32 15, win32u 0. Calls still enter through Beer dispatcher thunks rather than jumping from a guest stack into host C.
+- Corrected malformed synthetic PE layout. Headers occupy `0x0000..0x0fff`, aligned read-only `.edata` begins at RVA `0x1000`, executable `.text` is separate, and raw offsets equal RVAs for Beer-owned file mappings. The old `.edata` at RVA `0x400` overlapped headers and violated `SectionAlignment=0x1000`.
+
+Current runtime state: callbacks 0 and 1 return consistently. Callback 2 remains nondeterministic (natural return, internal fault, or watchdog overrun), but successful runs complete callbacks 2 and 3 and reach entry. The PE `IMAGE_TLS_DIRECTORY64.AddressOfIndex` field is now represented as a 64-bit VA whose target is explicitly written as a 32-bit `DWORD`; it was previously declared as `u64 *`, causing an incorrect eight-byte store that overwrote the adjacent four bytes. A focused PRAGMATA run after this ABI correction still completed callbacks 0/1 and remained in callback 2 until the 30-second diagnostic watchdog, so this real corruption bug was not the sole callback-2 blocker. RE8 was run immediately after the change as the mandatory regression gate; its startup behavior was unchanged from the current working baseline. Logs: `/tmp/beer-prag-tls-index-dword.log` and `/tmp/beer-re8-after-tls-index-fix.log`. The first stable post-TLS fault is now at image RVA `0xef75090`, dereferencing `0x2fcc74f80`. Registers show `R11=R15=fault`, and stack values include Beer kernel32 base/export metadata. Crucially, `0x2fcc74f80 == 3 * 0xfeed0000 + 0x4f80`; moving the synthetic export layout moved this derived address by the same amount. This localizes the remaining contract to how transformed guest code consumes Beer-owned module/export metadata, not graphics or guessed win32u exports. Do not invent a win32u catalog without an observed lookup.
+
+Follow-up tracing decoded the exact failure. RVA `0xef75090` is `mov r9w,[r15]`. Its state record at `RSI` contains kernel32 export pointers: `[RSI+0x48]=[RSI+0x58]=0xfeed1a80` before the transformed arithmetic. The faulting block combines those equal pointers with `R15=0x101122500` and carry set, writes `0x1fdda3500` back to `[RSI+0x48]`, then adds the original `0xfeed1a80`, producing the fault `0x2fcc74f80`. A debugger watch at the producer confirmed these values directly. This is not an absent allocation; it is a bad arithmetic/control-flow path over otherwise valid export metadata. The next investigation must identify the branch/exception state that selects this block, without patching it. Also corrected `IMAGE_DIRECTORY_ENTRY_EXPORT.Size` to span the complete generated metadata (tables plus strings), while keeping executable thunks outside that range; the previous fixed size `0x28` described only the directory header. This standards fix did not change the failing path.
+
+2026-10-27 forwarder correction: the stable resolver state was positioned on `kernel32.dll!RtlLookupFunctionEntry`. Beer had two incomplete representations for native names imported through Kernel32: first a duplicate executable stub in Kernel32, then removal from Kernel32 entirely. Synthetic Kernel32 now retains its declared public names but encodes `Nt*`/`Zw*`/`Rtl*`/`Ldr*` entries as standard PE forwarder strings (`ntdll.<name>`); `GetProcAddress` follows these recursively to Beer's ntdll dispatcher stub. The executable stub remains solely in ntdll. RE8 passed the mandatory 75-second gate and reached a ready BD12 device without loading guest `steam_api64.dll` (`/tmp/beer-re8-after-pe-forwarders.log`). Four PRAGMATA samples still produced the existing split (one TLS completion followed by `0x2fcc74f80`, one transformed callback-2 fault, and two overruns), so correct forwarder semantics did not resolve the transformed state defect. Logs: `/tmp/beer-prag-pe-forwarders-{1..4}.log`. A subsequent diagnostic-only in-process validator was reverted after a single RE8 run encountered its pre-existing nondeterministic startup recovery fault; the final forwarder-only build then passed a fresh 75-second RE8 gate (`/tmp/beer-re8-forwarders-final.log`).
+
+2026-10-27 continuation after the forwarder gate: a fresh native run completed all four TLS callbacks and reproduced the unchanged post-TLS fault at `0xef75090` (`/tmp/beer-prag-provenance-1.log`). A debugger capture at callback 2 entry established that the architectural floating-point state is already the normal Windows process state (`MXCSR=0x1f80`, x87 control word `0x037f`, `DF=0`) and the callback receives `RCX=image base`, `RDX=DLL_PROCESS_ATTACH`, `R8=NULL`; missing x87/SIMD initialization is therefore not the source. The `0x4d454e4600000000` value is deliberately synthesized from four embedded `FNEM` constants in the image, not read from uninitialized loader memory. The two bad transfer consumers remain transformed dispatch sites, so handling the marker as an exception or patching the targets would be title-specific and incorrect. An isolated outer TLS-runner stack-alignment retest (`0x20 -> 0x28`) passed the mandatory RE8 75-second BD12 gate (`/tmp/beer-re8-after-tls-boundary.log`) but made PRAGMATA worse: three of four 35-second samples did not finish callback 2 and the only completion reached the same `0xef75090` fault (`/tmp/beer-prag-tls-boundary-{1..4}.log`). It was reverted. No runtime behavior was retained from this increment.
+
+2026-10-27 load-config continuation: Beer did not process the PE32+ load configuration before TLS. PRAGMATA's `SecurityCookie` VA points into its mapped image and still held the standard AMD64 linker sentinel `0x2b992ddfa232`. Beer now initializes only that documented field, before section protections and TLS, using host entropy masked to the MSVC x64 48-bit cookie domain; existing non-default image cookies are preserved. The first run completed every TLS callback naturally but still reached the unchanged post-TLS fault `0x2fcc74f80`, while three follow-up samples produced two callback-2 overruns and one known `FNEM` transformed transfer. This is therefore a retained generic loader correction, not the remaining root cause. RE8 passed its mandatory 75-second gate, reaching ready BD12 and BD11 devices without a fatal loader error or guest Steam DLL regression. Focused shared-data and NT-section tests pass. Logs: `/tmp/beer-prag-security-cookie-{1..4}.log`, `/tmp/beer-re8-after-security-cookie.log`.
+
+2026-10-27 resolver-provenance continuation: a fresh unmodified run completed all four TLS callbacks and reproduced `RVA 0xef75090` (`/tmp/beer-prag-current.log`). Debugger breakpoints at the transformed block established its exact incoming state (`/tmp/prag-statefull.log`, `/tmp/prag-edges.log`). `R10=0xfeed1970` points to Kernel32's `AddressOfNames[204]`, `R13=0x110` is the exact 272-name export count, and that name is `RtlLookupFunctionEntry`; indices 203 and 205 are `RtlCaptureStackBackTrace` and `RtlPcToFileHeader`. On entry, `[RSI+0x48]=[RSI+0x58]=0xfeed1a80`, the valid `AddressOfNameOrdinals` base. The transformed block itself first changes the slot to `0x1fdda3500`, then to `0x2fcc74f80`, and only afterward dereferences it. Thus the synthetic table is still valid at the incoming edge; the corruption is selected by an indirect transformed control-flow edge, not by an out-of-bounds table cursor or malformed forwarder string. A small generic experiment synchronized `GetLastError`/`SetLastError` with `TEB+0x68`; it produced the identical fault and was fully reverted. No runtime behavior was retained, so no RE8 gate was required for that diagnostic increment.
+
+2026-10-27 continuation: native exception diagnostics show the transformed callback-2 failures are deliberate computed transfers, not ordinary C frames. Examples: RVA `0xd1bb559` executes a `ret` after exchanging its continuation into `[rsp+8]`; the current top word is the non-address value `0x4d454e4600000000`. RVA `0xe10a0ad` executes `jmp r11` with `r11=0x4d454e4600000000`. Neither RVA has a static `.pdata` entry, so first-pass SEH correctly reports zero frames for the former and only the surrounding leaf for the latter; inventing an unwind is not valid. The shared marker means an earlier transformed branch or decode state selected a data value as its next block.
+
+A generic ASLR experiment moved all Beer synthetic modules from their low fixed addresses to host-selected high mappings. On the run that completed TLS, the same RVA `0xef75090` then dereferenced NULL instead of `3*kernel32_base+offset`. This proves the bad arithmetic truncates or otherwise assumes a 32-bit module-base representation; it does not prove that high host mappings are the correct fix. A later controlled rerun, after restoring Beer's Steam facade policy, showed RE8 remained healthy for the 75-second gate with dynamic system-module mappings. PRAGMATA nevertheless regressed: four samples produced two callback-2 watchdog overruns and two transformed bad-continuation faults, with no successful TLS completion. The experiment was therefore reverted for PRAGMATA correctness, not RE8 compatibility. Keep the stable low mappings until the callback-2 state producer is understood. Logs: `/tmp/beer-prag-dynamic-modules.log`, `/tmp/beer-prag-dynamic-{1..4}.log`, `/tmp/beer-re8-dynamic-modules.log`.
+
+2026-10-27 gated continuation: audited the outer handoff into `executable_tls_process_attach`. An isolated `0x20 -> 0x28` stack-reservation experiment tested whether the helper entered with the wrong Windows x64 alignment. RE8 passed the mandatory 60-second D3D12 gate (`/tmp/beer-re8-after-tls-align.log`). Four PRAGMATA samples improved the TLS-completion count from one of three low-base baseline runs to two of four, but callback 2 still produced watchdog overruns and the successful runs reached the unchanged post-TLS fault `0x2fcc74f80`. Because this did not remove either failure mode and inline-C stack assumptions remain involved, the experiment was reverted rather than retained. Logs: `/tmp/beer-prag-tls-align-{1..4}.log`.
+
+Diagnostic breakpoints were then placed immediately before the two known consumers of `0x4d454e4600000000` (RVAs `0xd1bb537` and `0xe10a0a2`) without changing guest memory or control flow. Three debugger runs did not hit either producer-side condition: one remained in callback 2 until the external timeout, while two completed all TLS callbacks and reached `0xef75090`. This narrows the marker path to a less frequent transformed branch and confirms that ordinary successful TLS runs do not pass through those exact consumers with the marker already loaded. The next safe step is a write watch/provenance trace on the callback-2 stack slot or register source, armed only after callback 2 entry; do not add another module-layout or guessed-export change. Logs: `/tmp/prag-marker-gdb-{1..3}.log`.
+
+2026-10-27 exact post-TLS write provenance: bounded instruction stepping and breakpoints across the 85-instruction resolver block corrected the earlier interpretation of the `0xef75090` fault. On entry at `0xef74fd0`, `[RSI+0x48]=[RSI+0x58]=0xfeed1a80` is still the valid Kernel32 `AddressOfNameOrdinals` pointer. The first store at `0xef7502f` writes `0x1fdda3500`. The taken opaque branch at `0xd944d59` then computes `R11=0x2fcc74f80`; when control returns at `0xef75060`, `R13` has been made equal to the state-record base, and the disguised store at `0xef75067` (`[R13+0x30f4c679]` after subtracting `0x30f4c631`) overwrites `[RSI+0x48]` with that final bad pointer. At `0xef75083`, `R15=0`, so `0xef75089` does not add another base: `0xef75090` simply dereferences the already-corrupted slot. The corrupting control-flow decision is therefore at or before the `0xd944d59` path, not at the final read. Logs: `/tmp/prag-step-edge-3.log`, `/tmp/prag-write-trace-2.log`.
+
+2026-10-27 resolver-state producer continuation: hardware watchpoints were armed at entry before the resolver initialized its VM record. `[state+0x58]` first becomes `0xfeed1a80` at RVA `0x1100a2a1`; `[state+0x48]` becomes the same value at RVA `0x13842451`. At the latter write, the live state is coherent: `R12=kernel32 base`, `R10=AddressOfNames[204]`, `R13=272`, `R11=AddressOfNameOrdinals`, and the old slot contains the ordinal-table RVA `0x1a80`. The transformation therefore performs the expected RVA-to-VA conversion exactly once before the later corrupting block. Reading the selected export directly confirms name index 204, ordinal 204, and function RVA `0x2b21`, which lies inside the export directory and contains the valid forwarder string `ntdll.RtlLookupFunctionEntry`. Thus the producer is not supplying a malformed pointer, ordinal, function RVA, or forwarder. The constant-only opaque predicate at `0xef7503e..0xef7505a` deterministically falls through the first branch and takes `JA` to `0xd944d59`; the remaining target is the earlier transformed decision that routes a valid lookup into this block, not any final pointer arithmetic. No loader behavior was changed. Logs: `/tmp/prag-slot-early.log`, `/tmp/prag-loop-context.log`, `/tmp/prag-lookup-state.log`, `/tmp/prag-compare.log`.
+
+2026-10-27 full resolver-iteration continuation: a corrected thread-safe hardware watchpoint on the resolver candidate slot captured the complete Kernel32 pass (`/tmp/prag-candidate-provenance.log`). The transformed code visits all 272 sorted export-name strings in order, from `AcquireSRWLockExclusive` through `lstrcmpiA`; this is a linear enumeration, not a binary lookup stopped on `RtlLookupFunctionEntry`. Each iteration advances the name-RVA cursor by four bytes (`0xfeed1640..0xfeed1a7c`) while retaining the valid ordinal-table VA. After the final name, RVA `0xd5c6508` clears the candidate and name-table state and sets the loop count to the exact export count (`0x110`); only then does control enter `0xef74fd0`. Consequently, the earlier claim that `RtlLookupFunctionEntry` was the selected/matched export was too strong: index 204 was merely the cursor position seen in one intermediate snapshot. The stable failure is an end-of-enumeration/finalization path after the complete synthetic Kernel32 namespace has been scanned. The next target is the accumulated resolver result/signature (state slot `+0x28`, final value `0x28ba420b`) and the expected module identity/export-surface invariant, not the ordinal/function/forwarder tuple at index 204. No loader behavior changed and RE8 was not exposed to a runtime edit. Additional state captures: `/tmp/prag-resolver-exhausted.log`, `/tmp/prag-resolver-request.log`.
+
+Two nearby hypotheses were falsified. `BEER_EXCEPTION_DIAGNOSTICS=1` reports zero frame handlers and an ordinary unhandled access violation only at the final read; an apparent earlier `ret` in wrapped objdump output was actually the last byte of a displacement, so this is not missing exception-driven continuation. Expanding the allocated `PEB_LDR_DATA`/`LDR_DATA_TABLE_ENTRY` tails to zeroed modern sizes produced the same callback-2 overrun/marker split and the identical `0x2fcc74f80` post-TLS fault in four samples; that probe was reverted. Logs: `/tmp/beer-prag-exception-path-{2,3}.log`, `/tmp/beer-prag-ldr-layout-{1..4}.log`.
+
+Validation at this checkpoint: loader builds; CLI smoke, NT section-object, and shared-data tests pass; diagnostics and `git diff --check` pass. The complete `make test-input` suite still reaches the pre-existing `win32_unwind_test.c:61` assertion after all preceding tests pass. Representative traces: `/tmp/beer-prag-aligned-pe-2.log`, `/tmp/beer-prag-aligned-repeat-{1..4}.log`, `/tmp/beer-prag-export-size.log`, `/tmp/prag-state-gdb.log`, and `/tmp/beer-prag-seh-{1..3}.log`.
+
+2026-10-28 kernel32 registry exports (retained): the `0xef75090` fault was a failed export-table lookup. The guest walks
+the complete synthetic kernel32 export table and, on Windows, expects to find the core registry API there (since
+Windows 7, kernel32 re-exports `api-ms-win-core-registry-l1`: `RegOpenKeyExA/W`, `RegQueryValueExA/W`, `RegCloseKey`,
+...). Beer only published names the executable imports, so the lookup ran off the end of the table and later code
+dereferenced a garbage ordinal-table pointer (`3 * AddressOfNameOrdinals`, the signature seen in every run). Fix in
+`fake_pe_exports_build`: Beer's implemented `Reg*` routines (excluding `Register*`) are now exported from both
+kernel32 and advapi32. Generic Windows behavior, Beer-owned implementations only, no executable-specific data.
+Result under gdb: all four TLS callbacks complete and the lookup succeeds (kernel32 285 exports, advapi32 23).
+Outside gdb, callback 2 still sometimes stalls (unchanged, pre-existing nondeterminism).
+
+New stop point: after the entry point, RIP RVA `0xf022e48`, fault `0x2fcc750b8` = `3 * 0xfeed1ae8` (the new kernel32
+ordinal-table VA), i.e. the same "export not found" signature for a second lookup. The lookups are done by the title's
+protection layer. Per project policy we do not reverse-engineer DRM/anti-tamper internals, so this was not traced
+further. The second missing export has not been identified. Next steps that stay within policy: compare Beer's
+synthetic module surfaces against documented Windows module ownership (for example, other API sets that kernel32
+re-exports) and add Beer-implemented routines where Windows documents them, rather than tracing the guest code.
+
+Experiments run and reverted (not retained): exporting every Beer-implemented name from kernel32 (1088 names) and
+a temporary env-gated hook that loaded ~900 kernel32 names from a scratch file. Neither left code in the tree.
+RE8 regression gate completed: the registry-export build reached ready BD12 and BD11 devices and remained active for the full 75-second bounded run (`/tmp/beer-re8-after-prag-registry.log`), with no guest `steam_api64.dll` load or fatal runtime line. A later experiment that added four more registry routines and two unrelated Kernel32 names hit RE8's known nondeterministic worker recovery after BD12 initialization; that entire experiment was reverted, rebuilt, and is not retained.
+
+2026-10-28 follow-up validation: a fresh non-debugger PRAGMATA run completed all four TLS callbacks with the retained 285-export Kernel32 surface, proving the first registry-export correction is active outside gdb. Entry now consistently reaches the second failed-lookup signature at RVA `0xf022e48`, fault `0x2fcc750b8` (`/tmp/beer-prag-after-registry-current.log`). Static inspection of PRAGMATA's own import metadata and embedded documented API strings found several plausible dynamic names, but adding names speculatively is not acceptable: a two-name test did not produce a successful sample, and a broader four-registry-function test tripped the RE8 gate, so both were reverted. The next safe step is to stabilize the Kernel32 contract from a Beer-owned, documented manifest with structural unit coverage, then retest the second lookup one API family at a time rather than deriving a title-specific name from protected code.
+
+2026-10-28 Wine-oracle Local memory contract (retained): a filtered external Wine relay showed the successful PRAGMATA path calling `LocalAlloc` 1,743 times, `LocalFree` 1,635 times, and `LocalReAlloc` 352 times. Beer implemented only the first two, directly through untracked host `malloc`, while its stable synthetic Kernel32 identity omitted the coherent Local-memory family. Added first-party fixed-handle semantics for `LocalAlloc`, `LocalFree`, `LocalReAlloc`, `LocalSize`, `LocalLock`, and `LocalUnlock`, backed by Beer's tracked process heap; movable handles are rejected rather than falsely represented as pointers. Added the six implemented names to the Beer-owned Kernel32 contract and its structural test. No Wine code, export inventory, binary, address, or implementation was copied—the relay was used only to prioritize documented behavior. PRAGMATA's synthetic Kernel32 grew from 297 to 301 names (two names were already imported). A successful-TLS sample still reached the second exhausted lookup at RVA `0xf022e48`; its derived fault moved with the ordinal table to `0x2fcc75238`, so Local memory is not that specific missing contract. Two further samples took the known callback-2 sentinel path. RE8 passed the mandatory 75-second gate: BD12 and BD11 initialized, 2560x1440 swapchains presented, no guest Steam DLL/fatal/device loss, and the process ended only by external timeout. Logs: `/tmp/beer-prag-local-memory-{2..4}.log`, `/tmp/beer-re8-after-local-memory.log`.
+
+2026-10-28 native API-set namespace (retained): Beer previously left `PEB->ApiSetMap` at the documented x64 offset `0x68` NULL and handled API-set names only inside its own `LoadLibrary`/import code. That diverges from Windows 10 for code which reads the PEB directly. Added a first-party version-6 API-set namespace builder (`platform/win32_apiset.c/.h`) and structural unit test. `setup_teb_peb` now publishes a validated process-lifetime map before executable TLS; it contains only core contracts backed by Beer's own Kernel32/NTDLL implementation surface. No foreign DLL, copied namespace, executable name, app ID, or title RVA is used. PRAGMATA still completes all four TLS callbacks in successful samples and reaches the unchanged second lookup at `0xf022e48`, so the NULL namespace was a real ABI omission but not this lookup's root cause. RE8 passed the mandatory 75-second gate after the change, reaching ready BD12 and BD11 devices with no fatal line or guest Steam DLL (`/tmp/beer-re8-after-apiset.log`). Focused environment, API-set, shared-data, and NT-section tests pass.
+
+The same audit found two existing truthful registry implementations, `RegOpenKeyA/W`, which were accidentally absent from `g_impls` and therefore from both documented registry export surfaces. They are now registered; this preserves the existing 285-name PRAGMATA Kernel32 surface because those names were already imported, but makes dynamic dispatch consistent. Three PRAGMATA samples retained the established callback-2 nondeterminism and unchanged second lookup; RE8 again passed the 75-second BD12/BD11 gate (`/tmp/beer-re8-after-regopen.log`). Logs: `/tmp/beer-prag-apiset.log`, `/tmp/beer-prag-regopen-{1..3}.log`.
 
 ### Ghost of Tsushima Director's Cut first bring-up (2026-10-25)
 `/mnt/56A4064AA4062CD5/Games/Ghost of Tsushima DC/GhostOfTsushima.exe` (clean PE sections, no heavy protector; D3D12, Streamline `sl.interposer.dll`, DirectStorage, EOS/Steam). General loader fixes made while getting it going (all in the generic API surface):
@@ -1245,3 +1670,116 @@ through DirectSound. Problems found:
 - Writing the matrix alone does nothing in RDR2: the game rebuilds it every frame from the physics state.
   `obj_copies` finds every float/double triple equal to a position and `obj_shift` moves them all, re-writing for
   hold_ms. Not yet tested in game, and the window's position edits do not use them yet.
+
+- Mouse clicks falling through the game window (2026-10-28): first blamed on gdb, but it also happens in plain runs started from a terminal (intermittent; in one failing Sekiro run Beer received no ButtonPress at all while key and motion events arrived; in an RE8 run XI2 showed the presses delivered to the game window). Cause still unknown; next step is `xwininfo -all`/`xprop` on the live window while it fails. Beer re-grabs the pointer right after FocusOut when the cursor is hidden (`apply_pointer_confine_locked`), worth checking.
+- Camera snapping (2026-10-28): XWayland has an absolute slave pointer (`xwayland-pointer`, valuators absolute, also reports every XWarpPointer) next to `xwayland-relative-pointer`. Beer's XI2 raw motion (selected for all master devices) added the absolute device's screen coordinates as deltas, so each `SetCursorPos(1280,720)` re-centre turned into a ~screen-sized camera jump. Raw motion from sources whose X/Y valuators are absolute is now ignored (`xi_source_is_absolute_locked`, per-source cache via XIQueryDevice).
+- Input fixes (2026-10-28): X11 detectable auto-repeat (held keys no longer arrive as release/press pairs; repeats are WM_KEYDOWN with bit 30 and no DirectInput event); every DirectInput mouse device gets all motion since its own last poll (Sekiro opens 4 mice and 4 keyboards; previously the first poller took everything) and starts from zero at Acquire; DIPROP_AXISMODE honoured (Sekiro uses relative); QueryPerformanceFrequency is 10 MHz like Windows (was 1 GHz).
+- Character turns on the spot but does not walk (2026-10-28): input confirmed correct (W held, direction changes turn him). Not uncapped fps: BD11 shows ~28 fps with sync=1, dips to 9-10. Cause unknown; suspect animation root motion / physics.
+- Pop-in fix (2026-10-28, verified in RE8; in Sekiro it helped but the main cause was the occlusion-query count below): pre-rasterisation SPIR-V (vertex, tess-eval, geometry) now decorates its BuiltIn Position output `Invariant` (`spirv_invariant_position` in d3d12_shader_translator.c, both DXBC and DXIL paths; `BEER_SPV_INVARIANT_POSITION=0` disables). D3D gives bit-identical positions for identical math across different shaders; Vulkan only for Invariant outputs, otherwise FMA contraction can differ per shader and coplanar depth tests (occlusion proxies, depth-equal passes) flicker. DXVK does the same by default. Validated: all 532 Sekiro title-screen modules pass spirv-val (NDK shader-tools), all 87 vertex shaders decorated.
+- FIXED (user verified "perfect", 2026-10-28): Sekiro random pop-in/pop-out on every camera move. Sekiro reads D3D11 occlusion queries every frame (~3800 GetData in 1440 frames) and compares the sample count against a threshold; BD11 answered every occlusion query with 1 sample (= "barely visible"). `ctx_get_data` now reports 16M samples (`BEER_BD11_OCCLUSION_SAMPLES=<n>`); real Vulkan occlusion queries for BD11 would restore the culling benefit. Not the RE8 cause: BD12 already uses real VkQueryPool occlusion queries. Also done: BD11 DrawIndexedInstancedIndirect / DrawInstancedIndirect / DispatchIndirect (Sekiro uses none: indirect=0), one-time warnings for CopyStructureCount / SOSetTargets / DrawAuto (all previously silent no-ops), `[BD11 QUERIES]` per-type counts with BEER_BD11_STATS=1. Tessellated draws are still skipped (3-6% of draws).
+- RE8 occlusion-proxy pop-in ROOT CAUSE FIXED (user verified with the workaround off, 2026-10-28): it was missing position invariance (see the Invariant entry above). The BD12 proxy workaround (`BEER_BD12_PROXY_ALWAYS`, `BEER_BD12_PROXY_BIAS` in bd12_graphics.c) was removed, so RE8 has its GPU occlusion culling back.
+- TODO (user, 2026-10-28): Sekiro shows the same object pop-in/culling artefact as RE8. Fix in both, possibly one shared bug: RE8 was GPU occlusion culling by proxy draws whose depth compare differs from D3D hardware (worked around with BEER_BD12_PROXY_ALWAYS, real cause open: depth bias/precision/MSAA depth/VS invariance). Sekiro is D3D11 (BD11 on BD12): check its occlusion queries/predication and depth-only proxy draws first.
+- Player actions dead (2026-10-28) — FIXED (user verified). Walk/jump/attack/prosthetic did nothing while idle animation and turning worked. Cause: Beer's locale string APIs, from which Sekiro's statically linked CRT builds its ctype/case tables: `GetStringTypeW` ignored the info type and reported lowercase letters as UPPER|ALPHA (no C1_LOWER; uppercase lacked C1_ALPHA; no C1_XDIGIT), so `toupper('a')` stayed 'a'; `CompareStringW/A` ignored NORM_IGNORECASE; `LCMapStringA` always failed; `LCMapStringW` ignored LCMAP_SORTKEY. Rewritten to Windows semantics (CT_CTYPE1/2/3, Latin-1 + C.UTF-8 case mapping, ignore-case/ignore-symbols compare, sort keys, A variants via the W ones). Ruled out on the way: missing imports (none called), file I/O (all reads complete), waits (no timeouts), Oodle shim, input path, fps.
+- `BEER_STEAM_ID=<SteamID64>` overrides Beer's fixed offline SteamID so saves from another account (e.g. a Proton save under the repack's ID 76561197960267366) load.
+- Sekiro gameplay runs at ~10 fps: profile (`BEER_PROF_SAMPLE=wait`, SIGUSR2 starts/stops, /tmp/beer-prof.txt) shows the BD11 deferred-Map lazy scratch (mmap/munmap/mprotect per Map, SIGSEGV per touched page, page diffs at Unmap) dominating worker threads and the main thread waiting on the GPU (NVIDIA ioctl). Fix by renaming DISCARD maps into persistent mapped rings instead of scratch + diff.
+- New diagnostics: `BEER_BD11_FPS=1` (fps, game sync interval, worst frame per second); with `BEER_INPUT_DIAGNOSTICS=1`: `[MOUSE 1s]` per-second DirectInput/cursor summary, per-device mouse values, held keyboard bytes, native focus in/out, raw-motion source classification.
+- Build fix (2026-10-28): the `beer_call_consolidate_asm` top-level asm switched to `.text` without restoring the section, so the following `__thread` variables were emitted outside `.tbss` (`Accessing ... as thread-local object`); it now uses `.pushsection .text` / `.popsection`.
+- `libvkd3d-shader.so.1` (BD12 DXBC VS translation) was found only through hard-coded, versioned Steam runtime paths that a runtime update removed ("VS translation failed ... set BEER_VKD3D_SHADER_LIBRARY", every BD11 pipeline failed). `d3d12_shader_translator.c` now globs `SteamLinuxRuntime_*/*_platform_*` and umu `steamrt*/steamrt*_platform_*` for `x86_64-linux-gnu/libvkd3d-shader.so.1*` (newest first) after the override and system names.
+- Still open in the 3D world: tessellation draws skipped; vkd3d logs `convert_descriptor_info Invalid resource data type 0xf for API version 0x2` repeatedly.
+
+### 32-bit (PE32) executables are not supported; Ghost of Tsushima launcher path (2026-10-27)
+The loader accepts only PE32+ images (`Not PE32+ (64-bit); magic=0x010b` for anything else). `EOSAuthLauncher.exe` in the GoT folder (and `NoDVD/Online Fix/EOSAuthLauncher.exe`) is PE32 (magic 0x10b, 274 KB), so it cannot be started with `./loader`; `GhostOfTsushima.exe` is PE32+. The launcher only reads `OnlineFixEOSAuthLauncher.ini` (`Exe=GhostOfTsushima.exe -AUTH_LOGIN=... -epicapp=... -epicuserid=%userid% ...`) and spawns the game with those arguments. Two gaps follow: (1) no PE32/WOW64 support (a 32-bit loader path: 32-bit address space, x86 thunks, a 32-bit kernel32/user32 surface, far larger than any single fix), and (2) the loader never passes guest command-line arguments: `loader.c` rejects any `-` option (`Unknown option`) and `GetCommandLineA/W` return only the exe path, and `CreateProcess*` of a second image is not a launcher path either. Cheapest route to a launcher-equivalent run is (2): forward everything after the exe (or after `--`) to the guest command line, then start `GhostOfTsushima.exe` directly with the ini's arguments (the game's EOS/Online-Fix DLLs are in its own folder). Not done yet.
+
+### Ghost of Tsushima: GPU/driver checks passed (2026-10-27)
+- `nvapi_QueryInterface` (NVAPI shim in `loader.c`, before `impl_GetProcAddress`): returns function pointers only for ids it implements (Initialize, Unload, GetErrorMessage, GetInterfaceVersionString, EnumPhysicalGPUs, GPU_GetFullName, GPU_GetPCIIdentifiers, SYS_GetDriverAndBranchVersion), answered from `beer_vulkan_host_gpu_info` and only when the host GPU is NVIDIA; unknown ids log `[NVAPI] QueryInterface(0x...) -> NULL` like the real library. `BEER_NVAPI_DIAGNOSTICS=1` logs served calls. GoT queries 0xAD298D3F, 0x33C7358C, 0x593E8644, 0x348FF8E1, 0x35C29134, 0xD995937E, 0x34EF9506, 0x1E9D8A31, 0xAEF96CA1 which are not provided yet (names not identified); its "No installed graphics card" box still appears once (before the SM check), the game then continues.
+- `D3D12SerializeRootSignature` (unversioned, v1.0 desc) added in `graphics/d3d12/d3d12_api.c` on top of the versioned serializer; GoT reached it through `sl.interposer.dll` and used the NULL blob (null-deref crash loop at RVA 0xe78096 is gone).
+- `IDXGIAdapter::CheckInterfaceSupport` (vtable slot 9) now reports UMD 32.0.15.7200.
+- BD12 `CheckFeatureSupport(OPTIONS)` was zeroed by an early return that shadowed the `BEER_DXR_FEATURES` block, so "GPU is not supported" could not be avoided; the early return is now skipped when `BEER_DXR_FEATURES` is set (default behaviour unchanged).
+- With `BEER_DXR_PROBE=1 BEER_DXR_FEATURES=1 BEER_DXR_PROBE_SM=66`: no GPU-unsupported box; the only remaining box is "newer drivers (>= 552.44) ... current driver (version )" i.e. the driver version string is empty (source not CheckInterfaceSupport; likely NVAPI or registry, unidentified). The game then loads FSR3/XeSS/DLSS DLLs (`ffxGetInterfaceDX12`, `xessD3D12CreateContext` are stubs returning 0), stubs `CreateFontW`/`LoadBitmapW` return 0, and the game calls `ExitProcess(1)` from RVA 0x4bde62 (cause not yet found). One earlier run crashed in host libc (null) during startup before DXGI; two reruns did not reproduce it. RE8 45 s gate: no fatal/device loss, but the log shows heavy `[BD12 DROP]` counts (PSO compile failed) that were not compared against a baseline.
+Logs: scratchpad got5/got6/got7_*.log. Next: identify the NVAPI ids (hand-derived from the game's own call sites, not copied export tables), find the driver-version source, then the `ExitProcess(1)` reason (likely after the failed font/bitmap creation or a failed FFX/XeSS/DLSS init).
+
+### Ghost of Tsushima: why it exits, guest command line (2026-10-27)
+- Guest command line: the loader now forwards everything after the executable to the guest (`GetCommandLineA/W`, PEB `ProcessParameters->CommandLine`, `CommandLineToArgvW`), formatted `"<exe>" arg1 ...` with Windows quoting; with no extra arguments nothing changes (still the bare path). Verified: GoT's `ExitProcess` stack shows argc 11 with the ini arguments. This is the launcher-equivalent for `OnlineFixEOSAuthLauncher.ini` (`./loader ... GhostOfTsushima.exe -AUTH_LOGIN=... -epicapp=...`), but it did not change the outcome below.
+- Root cause of `ExitProcess(1)` (found with gdb: hardware breakpoints on guest RVAs work because guest code runs natively; a gdb Python script can arm software breakpoints on every `call` of a function once the image is mapped): main init (`0x1404bbc80`) -> `NxApp` virtual init (`0x140421f80`) runs the game's OWN launcher window (`0x140452680`: init `0x140451400` then a `PeekMessage` loop until the launcher state is "continue"=2; the game logs `NxApp: Launcher state is not continue` and exits with state 3 when init fails). The launcher init fails because Beer has no GDI at all: `LoadBitmapW(0x69)` returns 0 and the following `GetObjectW(bitmap,0x20,&BITMAP)` must be nonzero; `CreateFontW` also returns 0 (all from the generated stubs in `win32_missing_exports_table.inc`). No `CreateCompatibleDC/CreateDIBSection/SelectObject/BitBlt/StretchBlt/TextOutW/DrawTextW/GetObjectW/LoadBitmapW/CreateFontW` implementations exist anywhere in loader.c.
+- Needed next (smallest useful GDI): GDI object table (HBITMAP/HDC/HFONT/HBRUSH/HPEN), `LoadBitmapW` from the PE's RT_BITMAP resources, `GetObjectW`, `CreateFontW` (+ `GetDeviceCaps`, `MulDiv` already used), memory DCs with `CreateCompatibleDC/Bitmap/DIBSection`, `SelectObject`, `BitBlt/StretchBlt/StretchDIBits/SetDIBitsToDevice` onto the window DC via the existing RGBA presenter (`xwayland_window_present_rgba8`), text via a bitmap font (overlay font data exists). The launcher window then needs mouse hit-testing to reach "Play" (the game handles WM_LBUTTON itself). RE8 30 s smoke after the argument-parsing change: no fatal/device loss.
+
+### Software GDI + PE resources (2026-10-27)
+New `platform/win32_gdi.{c,h}` and `platform/win32_resource.{c,h}` (wired into `PLATFORM_SRCS`, registered in `g_impls`; the generated stubs for every name implemented were removed from `win32_missing_exports*.inc`, because the first match in the table wins).
+- Resources: `FindResourceW/A/ExW/ExA`, `LoadResource`, `LockResource`, `SizeofResource`, `FreeResource` walk the mapped PE resource directory (reads go through `process_vm_readv`, so synthetic module handles fail cleanly). `beer_resource_set_default_module` is set after the exe is mapped (NULL hmodule).
+- GDI: object table (bitmap/font/brush/pen, stock objects 0-19), memory DCs, window DC = `FAKE_HDC`, 32bpp top-down surfaces, DIB sections (24/32bpp, real `ppvBits`), `LoadBitmapW/A` + `LoadImageW/A` (IMAGE_BITMAP from resources, DIBs 1/4/8/16/24/32bpp, no RLE), `GetObjectW`, `CreateFontW/A/IndirectW`, `CreateSolidBrush/Pen`, `SelectObject`, `BitBlt/StretchBlt/PatBlt` (common ROPs), `StretchDIBits/SetDIBitsToDevice`, `AlphaBlend/TransparentBlt`, `TextOut*/ExtTextOutW/DrawText*/GetTextExtent*/GetTextMetricsW` (monospace bitmap glyphs from `overlay_font.h`, nearest of 3 sizes, ASCII only), `FillRect`, `Rectangle`, `Get/SetPixel`, `GetDeviceCaps` (96 dpi, desktop size), `GdiFlush`. Drawing on the window DC marks it dirty and `ReleaseDC`/`EndPaint`/`GdiFlush` convert BGRA->RGBA and present through `xwayland_window_present_rgba8`; nothing is presented unless GDI actually drew.
+- Not done: clipping regions, `SetViewportOrg`/mapping modes, paths, `GetDIBits`/`SetDIBits`/`CreateDIBitmap`, palettes, real font rasterisation (proportional/TrueType, non-ASCII), multiple native windows (the backend still has one window), `SaveDC/RestoreDC` are no-ops.
+- Ghost of Tsushima: its own launcher window (790x445, Play/Options/Quit, artwork) now renders correctly (screenshot taken with `xwd -name <title>` and converted with PIL; `xwd -root` fails under XWayland). Clicking Play delivered WM_LBUTTON at the right client coordinates in one run and the game left the launcher and continued init (Vulkan/DXGI re-init, NVAPI queries 0xAEF96CA1 / 0xAC1CA9E0 not provided); a second run was not conclusive (no input diagnostics). Next: run it by hand with `BEER_INPUT_DIAGNOSTICS=1`, click Play, and follow the post-launcher init.
+
+### Ghost of Tsushima after the launcher (2026-10-27, continued)
+- Launcher: renders and accepts Play (mouse or Enter). Clicks passed through the window only on runs started under gdb (both gdb runs); plain launches, including `--presenter=x11` and the default Vulkan presenter, received them. Use keyboard when running under gdb.
+- After Play the game destroys the launcher, creates its render/worker threads and a 2560x1440 game window (seen once, in a slowed API-trace run) and then crashed in `ID3D12CommandQueue::Signal` with a NULL fence (`queue_signal` in `bd12_com.c`; now returns `E_INVALIDARG` and logs `[BD12] ID3D12CommandQueue::Signal(... null argument)`; `CreateFence` logs an unsupported IID instead of failing silently).
+- Without tracing the game usually idles after Play with no window. Cause found: worker thread (guest entry `0x1404235a0`, created by `_beginthreadex` from the NxApp init at `0x1404227f9`) copies a 0x30-byte argument block from the creator's stack (event handles `e000000d`/`e000000e`), calls `0x14040a940`, which raises `RaiseException(0x406D1388)` (SetThreadName idiom), then waits `INFINITE` on the first handle and exits the thread if the wait returns non-zero. In failing runs that wait is issued on garbage (`0x40a95d00000001`), the loader returns WAIT_FAILED for the unknown handle and the thread ends, so the creator waits forever on `e000000e`. The argument block in memory is intact at that point (`BEER_THREAD_DIAGNOSTICS=1` dumps it at create, start and failure), so a callee-saved register (rbx or r12) is corrupted inside the thread's prologue. Skipping the 0x406D1388 dispatch (`BEER_SKIP_THREADNAME_EXCEPTION=1`) got one run past it (then a SIGILL later); restoring rbx/rbp/rsi/rdi/r12-r15 from the captured CONTEXT on `RaiseException` return (kept: asm entry + `beer_raise_regs_clobbered` flag) did not fix it, and the thread runs fine in other runs, so the failure is intermittent and may be a thread-startup race (two threads, ids 10 and 11, start within microseconds) rather than the exception path. The unwinder reports `entry=0x14352862c handler=0x0` for the frame (odd function entry, no handler).
+- New env diagnostics: `BEER_THREAD_DIAGNOSTICS` now also logs thread done and argument dumps; unknown-handle waits always log `[WAIT] WaitForSingleObject(...) on an unknown handle`.
+- RE8 40 s gate after these changes: no fatal/SIGILL/device loss (same heavy `[BD12 DROP]` PSO-compile-failure counts as before, still not compared to a baseline).
+Next: find what changes rbx/r12 in the worker prologue (watch the register at `0x1404235ea` in gdb with keyboard input, or log registers around each API return in that thread), then the NVAPI ids 0xAEF96CA1 / 0xAC1CA9E0 and the DXIL path.
+
+### Root cause of the post-launcher worker-thread hang: nested RtlUnwindEx context (2026-10-27)
+- Symptom: after Play, GoT's init thread (`0x1404235a0`) waited on a garbage handle (`0x40a95d00000001` = rbx at entry of a game function) and exited, so the creating thread waited forever and no window appeared.
+- Cause: the thread-name idiom `RaiseException(0x406D1388)` sits inside the game's `__try/__except`. Beer dispatches it, the guest `__C_specific_handler` (running nested on the host-call stack) calls `RtlUnwindEx` to resume at the `__except` landing pad. `beer_context_fix_caller` rewrote the captured CONTEXT's `Rip/Rsp` from `g_saved_guest_rsp` whenever the return address was inside the trampoline, but that value belongs to the OUTERMOST dispatch (the `RaiseException` call site) while the registers were the handler's (rbx = its scope-table pointer). `RtlUnwindEx` then resumed in the right function with the wrong `rbx`.
+- Fix: `beer_dispatch_trampoline` now exports `beer_tramp_outer_ret` / `beer_tramp_nested_ret` (the return points after its two `call *%r10`s). `beer_context_fix_caller` rewrites from `g_saved_guest_rsp` only for the outer path; for the nested path it reads the trampoline's exact incoming `%rsp` (stored 0x120 above the frame base) and takes `Rip` from the guest return address there.
+- Also added: `RaiseException` entry restores rbx/rbp/rsi/rdi/r12-r15 from the captured CONTEXT on return (flag `beer_raise_regs_clobbered`); `BEER_CHECK_NONVOLATILE=1` makes the outer trampoline path report any API whose host implementation returns with changed rbx/rbp/rsi/rdi/r12-r15 (`[ABI] ...`): it found `_register_onexit_function` changing rsi/rdi (a host implementation without `ms_abi`; not fixed); `BEER_SKIP_THREADNAME_EXCEPTION=1` skips 0x406D1388 dispatch (experiment only).
+- Result: no more WAIT_FAILED; GoT creates its 2560x1440 game window and two swapchains (`CreateSwapChain #1/#2`), then crashes inside the NVIDIA driver (`libnvidia-glcore`, FA 0x0/0x8, via `queue_signal` -> `bd12_queue_submit` -> `vkQueueSubmit2` in one run, and elsewhere in another; the second run crashed before window creation, so it is a race between threads using Vulkan). `queue_signal` now validates the fence (`kind`, inner semaphore) and logs `invalid fence` instead of passing garbage to Vulkan; no such message appeared, so the crashing submit used a valid-looking fence.
+- Next for GoT: serialize/inspect concurrent Vulkan use (queue lock covers submit; check descriptor/command-pool/BD12 object creation from several threads), identify the driver crash call (gdb with keyboard input; `bt` stops at the driver, so use a `VK_LAYER_KHRONOS_validation` run or `BEER_VULKAN_TRACE`-style logging), then NVAPI ids 0xAEF96CA1 / 0xAC1CA9E0, DXIL, and SM6.6.
+
+### GoT driver crash after the launcher: shared Vulkan context destroyed with the window (2026-10-27)
+- Symptom: after Play, `vkCreateSemaphore` (inside `bd12_fence_create`) or `vkQueueSubmit2` (from `queue_signal`) crashed inside the NVIDIA/Intel driver, in varying places; `[VULKAN] shared device initialized` was logged twice per run.
+- Cause: `vulkan_presenter_destroy()` (run when the launcher window is destroyed) called `beer_vulkan_context_destroy()`, which destroys the VkDevice/VkInstance and `dlclose`s libvulkan, although BD12 (created by the game's GPU checks before the launcher closes) keeps the VkDevice and its `vkGetDeviceProcAddr` function table for the life of the process. The next window re-created the context; BD12 then called function pointers into a closed driver (the pointer resolved into `libvulkan_intel.so`, this laptop has an Intel iGPU too) or used a destroyed device. The validation layer (`VK_LAYER_PATH` with a manifest pointing at Steam's `libVkLayer_khronos_validation.so`, `VK_INSTANCE_LAYERS`, `DISABLE_MANGOHUD=1`) reported `vkDestroyDevice` with live BD12 objects (VkSemaphore, VkPipelineCache), which confirmed it.
+- Fix: the presenter no longer destroys the shared context (renderer/vulkan/vulkan_presenter.c); the process-lifetime context is shared by BD12/BD11/presenter.
+- Also kept: `dev_create_fence` / `queue_signal` validate their COM object kind and log `non-BD12 object` / `invalid fence` instead of crashing.
+- Result: one Vulkan context for the whole run; GoT creates its 2560x1440 window and two swapchains (`CreateSwapChain #1/#2`) and stays alive. RE8 45 s gate: see below.
+- Next blocker: right after `GetBuffer #2` the game calls `WaitForSingleObject(NULL, INFINITE)` (caller `0x140413a43`, per-frame event array in the graphics backend object, mode field `[+0x7c]==1`) and then null-dereferences (`FA=0x15xx/0x16xx`, recovered by the loader). The per-frame events are never created, so an earlier step of the game's D3D12/DXGI setup is failing silently. DXGI facts seen: the factory refuses `QueryInterface` for IDXGIFactory2 (`50c83a1c-...`) and IDXGIFactory5 (`7632e1f5-...`); the swapchain object (the D3D11 `BeerDxgiSwapChain`) exposes only IUnknown/IDXGISwapChain (vtable of 18 slots), so QI for IDXGISwapChain1-4 fails and a call to e.g. `GetCurrentBackBufferIndex` (slot 36) would read past the vtable. A DXGI 1.2-1.4 layer (Factory2/4/5 QI, `CreateSwapChainForHwnd`, SwapChain1-3 incl. `GetCurrentBackBufferIndex`, frame-latency waitable object) is the likely next work, together with finding which game step fails (`BEER_COM_DIAGNOSTICS=1` logs DXGI QI refusals).
+
+### GoT after Play, session 2 (2026-10-28) — state at pause
+Fixed since the driver-crash entry: BD12 DXGI swapchain (IDXGISwapChain1-4), DStorage runtime-load support (static TLS for later-loaded DLLs, DllMain on LoadLibrary, IOCP, DuplicateHandle of events, thread pools, volume APIs, NCrypt stubs, noncontinuable C++ throw dispatch, `STATUS_UNWIND_CONSOLIDATE`, E_NOTIMPL feature queries), `OpenThread` for non-table threads, real `SystemTimeToFileTime` / `SystemTimeToTzSpecificLocalTime`, `GetCursorInfo` / `GetPhysicalCursorPos` / `PhysicalToLogicalPoint`.
+Current stop: guest null-deref at RVA 0xbc12c5/0xbc1308 (SIGSEGV with FA=0, "dead recovery cycle"). Those wrappers call a global function pointer at RVA 0x34db308 and use the returned object's vtable. The pointer is filled by the function at RVA 0xbc0e80 either from an engine singleton (path A) or by `LoadLibraryW("steamnetworkingsockets")` + `GetProcAddress("SteamNetworkingSockets_LibV12")` (path B). The crash follows `[STEAM] SteamNetworkingSockets012 unavailable in offline profile`, and steamnetworkingsockets.dll is in the game folder but no `[PE DLL] loaded` line appears for it. Next: run with `BEER_DLL_DIAGNOSTICS=1` to see whether that LoadLibrary fails, and give the game a real/no-op ISteamNetworkingSockets object if so. Not yet verified: window still black; RE8 gate not re-run after these changes.
+
+### RE4 bring-up, session 7 — SEC_IMAGE sections now laid out like the native image mapper (2026-10-28)
+RE4's Enigma stub writes an embedded stub DLL to `C:\Windows\Temp\evb*.tmp`, then does `ZwCreateFile` + `ZwCreateSection(SEC_IMAGE)` + `ZwMapViewOfSection` on it and `VirtualProtect`s/zero-fills SizeOfImage bytes of the view. Beer mapped the 0x600-byte file flat and read-only, so the fill faulted (`RVA 0xe85dac4`, which my first reading mislabelled as the host-stack boundary).
+Fix (`platform/win32_nt_section.c`): SEC_IMAGE views are now a private region of SizeOfImage bytes with the headers and each section copied to its RVA (PE32/PE32+, invalid images -> STATUS_INVALID_IMAGE_FORMAT at map time); non-image views are mapped with the section's maximum rights and then reduced to the requested protection so a later NtProtectVirtualMemory can raise them. New unit test `test_image_section_layout`; `BEER_FILE_DIAGNOSTICS` logs `[SECTION] map ...`.
+Result: RE4 again reaches the Valve wrapper's ownership-ticket check (`Application load error 6:0000065432`), the boundary documented in sessions 5/6; nothing further was attempted there (no ticket forging, no patching of the check).
+Also fixed while gating on RE8: a DllMain run at LoadLibrary time executes on the host-call stack, but the TEB StackLimit/StackBase still described the guest stack, so `__chkstk` (AkConvolutionReverb.dll) probed unmapped pages and RE8 died after a bogus `[SYNC] Generic alloc` recovery. `guest_dll_initialize_all` now points the TEB stack bounds at the host-call stack for the duration. RE8 gate: 50 s run, no crash/fatal, BD12 and BD11 devices ready.
+
+2026-10-28 Wine-oracle file/time, file-search, and environment contracts (retained): after the user confirmed the RE8 run was intentionally closed and healthy, the pending file-time increment was revalidated instead of being reverted. Beer now has truthful `GetFileTime`/`CompareFileTime` behavior and publishes its implemented seven-function FILETIME contract. A successful PRAGMATA run completed all four TLS callbacks with 304 Kernel32 exports and retained the second exhausted-lookup stop at RVA `0xf022e48`, fault `0x2fcc75280`; this family is not the lookup target. The next Wine-observed coherent family was directory enumeration: Beer already had real `FindFirstFileA/W`, `FindFirstFileExA/W`, `FindNextFileA/W`, and `FindClose` implementations, but exposed them only through workload imports. Publishing that seven-name first-party contract grew the PRAGMATA surface to 307; a successful sample again reached `0xf022e48`, fault `0x2fcc752c8`. Finally, Beer lacked ANSI environment lookup and both real set/delete variants, and a generated `SetEnvironmentVariableA` success stub shadowed any real implementation. Added case-insensitive Windows environment lookup, ANSI/Wide get and set/delete semantics, removed the shadowing stub, published the four-name environment contract, and extended environment tests. PRAGMATA reached the same second lookup with 310 exports and fault `0x2fcc75310`. No Wine code, DLL, address, or export inventory was copied; Wine calls only prioritized documented APIs Beer implements itself. RE8 passed the combined mandatory 75-second gate: ready BD12/BD11 devices, repeated 2560x1440 swapchain presentation, no guest Steam DLL/fatal/device-loss line, and termination only by external timeout. Logs: `/tmp/beer-prag-file-time-1.log`, `/tmp/beer-prag-file-search-{1..3}.log`, `/tmp/beer-prag-environment-1.log`, `/tmp/beer-re8-after-file-env.log`.
+
+2026-10-29 CPU-only continuation while the primary GPU is unavailable: the current Beer baseline was rebuilt and run without requesting a graphics backend. PRAGMATA completed all four executable TLS callbacks and reproduced the same pre-graphics second Kernel32 lookup at RVA `0xf022e48`, fault `0x2fcc75310`; no Vulkan/BD12 initialization occurred before the stop. This confirms the current investigation is CPU/loader-only and does not require the repaired GPU. A fresh external Wine relay (observation only; no Wine code/data imported) showed the successful process calls documented `ExpandEnvironmentStringsW` 40 times and `ExpandEnvironmentStringsA` 9 times, while Beer had neither implementation. Added first-party ANSI/Wide `%NAME%` expansion with case-insensitive lookup, unknown-variable preservation, documented required-size semantics, and focused tests. Kernel32 now publishes 312 Beer-owned exports. Subsequent PRAGMATA samples exercised the pre-existing callback-2 nondeterminism: two selected the known `FNEM` sentinel transfer, several remained CPU-bound in callback 2 for 45-240 seconds, and four completed callbacks 2 and 3 but did not reach the second lookup within their bounded runs. No Vulkan/BD12 initialization occurred. The environment contract is structurally validated, but its effect on the second lookup remains runtime-pending until a conclusive successful-path sample is obtained. Logs: `/tmp/beer-prag-gpu-off-baseline.log`, `/tmp/beer-prag-expand-env-{1..12}.log`, `/tmp/beer-prag-expand-env-240.log`, and `/tmp/beer-prag-expand-env-cpu-sample.log`.
+
+2026-10-30 CPU-only Wine-oracle follow-up: a fresh 35-second relay captured observed calls only and was compared with Beer's implementation table. `QueueUserWorkItem` was the most frequent missing documented Kernel32 contract (114 calls). Beer now implements it generically with a detached worker, per-thread TEB/GS setup, DLL thread attach/detach notifications, the existing protected guest/host ABI call boundary, Win32 BOOL/error behavior, and a stable first-party Kernel32 export. No Wine implementation, DLL, export inventory, constant, or title-specific data was copied. The loader and focused environment/Kernel32 contract tests pass. Four 75-second PRAGMATA samples did not conclusively reach the post-TLS resolver: one selected the known callback-2 `FNEM` transfer and three remained active in callback 2. Therefore this increment's effect on the second lookup remains runtime-pending. Logs: `/tmp/prag-wine-cpu-relay.log` and `/tmp/beer-prag-queue-work-{1..4}.log`. The GPU-dependent RE8 gate remains deferred until suitable graphics hardware is available.
+
+2026-10-30 validation after newly added changes: rebuilt the loader serially and reviewed the new initial TLS/entry assembly boundary, `VirtualAlloc2`/aligned allocation support, `IsBadStringPtrA/W`, and the expanded first-party Kernel32 contract. Focused CPU tests pass for initial TLS/entry ABI, environment handling, API-set schema, Kernel32 contracts, and virtual memory/string probes; source diagnostics and `git diff --check` pass. The complete `make test-input` run passes every preceding test and still stops at the pre-existing `platform/win32_unwind_test.c:61` handler assertion. PRAGMATA now exposes 315 Beer-owned Kernel32 exports. Three serial CPU-only samples retained the known callback-2 split: one 75-second watchdog, one `FNEM` invalid continuation, and one run that completed all four TLS callbacks and remained active for the full 85-second external bound without reaching the old immediate second-lookup fault at RVA `0xf022e48`. This is encouraging but not yet conclusive because no API, Vulkan, or BD12 activity occurred during that successful-TLS window. Logs: `/tmp/beer-prag-after-new-changes.log`, `/tmp/beer-prag-updated-{1..3}.log`, and `/tmp/beer-test-input-after-new-changes.log`. GPU-dependent RE8 validation remains deferred.
+
+### Merge of main (3240eb5: PRAGMATA, Ghost of Tsushima, Sekiro) into main2 (2026-10-30)
+
+Conflict resolutions (both sides kept unless noted):
+- Command line: main's argument builder (`g_cmdline_a/w`, `beer_set_guest_arguments`); `--cmdline=` (child loaders
+  created by CreateProcess) now overrides it through `beer_set_command_line`.
+- Fake system DLLs: main's per-module export tables. main2's direct-syscall support moved onto ntdll's own list
+  (Nt*/Zw* stubs `mov r10,rcx; mov eax,ssn`, `g_ssn_names`), other stubs keep the `xchg ax,ax` anti-hook prefix,
+  and kernel32/kernelbase export every Beer-implemented name the real modules export (`g_kernel32_export_names`), so
+  by-hash resolvers find GetSystemFirmwareTable etc.
+- Duplicates resolved by keeping the more complete implementation: main2's WinVerifyTrust, overlapped I/O (pipes;
+  IOCP errors pass through), named file mappings, NVAPI (`win32_nvapi.inc`); main's GetCursorInfo, InitOnce*,
+  NtQuerySystemInformation (+ SystemKernelDebuggerInformation 0x23), DllMain guard (merged into
+  `guest_dll_initialize_one` with dependency-first ordering), exception record allocation (+ int 2dh decoding).
+- GetModuleHandle names are normalised like Windows (base name, `.dll` appended) and the executable's own name
+  resolves to its image (RDR2's 1911.dll imports from RDR2.exe; main returned NULL and mapped a second copy).
+- Executable TLS: main runs process-attach callbacks by default. A faulting callback no longer exits (release the
+  loader lock, continue to entry; `BEER_EXECUTABLE_TLS_STRICT=1` restores fail-fast); `BEER_NO_EXECUTABLE_TLS=1`
+  skips them; main2's thread-attach callbacks became opt-in (`BEER_EXE_THREAD_TLS=1`): RDR2's Arxan thread callback
+  left a worker spinning. Heap handles now point at a minimal `_HEAP` header (Flags = HEAP_GROWABLE): Arxan's TLS
+  anti-debug read PEB->ProcessHeap->Flags and faulted on the old fake handle 1.
+- GetThreadContext reports clear debug registers instead of failing (callers read stack garbage as breakpoints).
+- D3D12 CheckFeatureSupport answers FEATURE_LEVELS, FORMAT_SUPPORT (from vkGetPhysicalDeviceFormatProperties) and
+  GPU_VIRTUAL_ADDRESS_SUPPORT truthfully instead of main's zeroed "unsupported".
+
+**Open regression (RDR2):** with the merged tree RDR2 reaches its main menu, but Story shows "Social Club failed to
+load" / the quit alert. API comparison against a clean pre-merge build (3fc9b46, setarch -R) located it: the game's
+adapter-setup InitOnce callback (img+0x2675a94: D3D12/DXGI/Vulkan probing, then SMBIOS via GetSystemFirmwareTable)
+fails and is retried ~65k times; after D3D12CreateDevice the merged build also calls D3D11CreateDevice and creates a
+second BD12 device, which the pre-merge build never does. Not CheckFeatureSupport (E_NOTIMPL experiment unchanged)
+and not the executable TLS callbacks (unchanged with BEER_NO_EXECUTABLE_TLS=1). Suspect main's BD12/DXGI changes
+(bd12_com.c +457 lines, swapchain/factory plumbing); reverting graphics/ alone does not link.

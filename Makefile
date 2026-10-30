@@ -1,5 +1,5 @@
 CC     = gcc
-CFLAGS = -O0 -Wall -Wextra -m64 -g -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan -Ithird_party/dxil-spirv -include platform/beer_env.h
+CFLAGS = -O0 -Wall -Wextra -m64 -gdwarf-4 -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan -Ithird_party/dxil-spirv -include platform/beer_env.h
 RENDER_CFLAGS = $(filter-out -O0,$(CFLAGS)) -O3 -march=native
 LDFLAGS = -lpthread -ldl -lcrypto -lz -lm
 TARGET = loader
@@ -7,8 +7,8 @@ TARGET = loader
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
 MEDIA_SRCS = media/media_foundation.c
-PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_bcrypt.c platform/win32_version.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
-                platform/win32_nt_section.c platform/win32_virtual_memory.c \
+PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_gdi.c platform/win32_resource.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
+				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
                 platform/win32_seh.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
@@ -72,6 +72,14 @@ platform/beer_memory.o: platform/beer_memory.c platform/beer_memory.h platform/b
 platform/beer_objects.o: platform/beer_objects.c platform/beer_objects.h platform/beer_control.h
 	$(CC) $(D3D12_ABI_CFLAGS) -O2 -Iplatform -c $< -o $@
 
+# This CRT entry point calls host libc and real Win64 guest callbacks. Compile
+# with full ABI support so the host transition also preserves XMM6-XMM15.
+platform/win32_onexit.o: platform/win32_onexit.c platform/win32_onexit.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
+platform/win32_crt_init.o: platform/win32_crt_init.c platform/win32_crt_init.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
 graphics/d3d12/d3d12_shader_translator.o: graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_shader_translator.h
 	$(CC) $(RENDER_CFLAGS) -c $< -o $@
 
@@ -119,6 +127,21 @@ test-d3d11: $(filter-out loader.o,$(OBJS))
 	rm -f /tmp/beer-d3d11-lifetime-test
 
 test-input:
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_process_parameters_test.c -o /tmp/beer-win32-process-parameters-test
+	/tmp/beer-win32-process-parameters-test
+	rm -f /tmp/beer-win32-process-parameters-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_crt_init_test.c platform/win32_crt_init.c -o /tmp/beer-win32-crt-init-test
+	/tmp/beer-win32-crt-init-test
+	rm -f /tmp/beer-win32-crt-init-test
+	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_onexit_test.c platform/win32_onexit.c -o /tmp/beer-win32-onexit-test
+	/tmp/beer-win32-onexit-test
+	rm -f /tmp/beer-win32-onexit-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_ui_language_test.c -o /tmp/beer-win32-ui-language-test
+	/tmp/beer-win32-ui-language-test
+	rm -f /tmp/beer-win32-ui-language-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_entry_test.c platform/win32_entry.c -o /tmp/beer-win32-entry-test
+	/tmp/beer-win32-entry-test
+	rm -f /tmp/beer-win32-entry-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/directinput_format_test.c -o /tmp/beer-directinput-format-test
 	/tmp/beer-directinput-format-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/window_style_policy_test.c -o /tmp/beer-window-style-policy-test
@@ -133,6 +156,10 @@ test-input:
 	/tmp/beer-steam-offline-policy-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_environment_test.c platform/win32_environment.c -o /tmp/beer-win32-environment-test
 	/tmp/beer-win32-environment-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_apiset_test.c platform/win32_apiset.c -o /tmp/beer-win32-apiset-test
+	/tmp/beer-win32-apiset-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_kernel32_contract_test.c -o /tmp/beer-win32-kernel32-contract-test
+	/tmp/beer-win32-kernel32-contract-test
 	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_shared_data_test.c platform/win32_shared_data.c platform/beer_time.c -lm -o /tmp/beer-win32-shared-data-test
 	/tmp/beer-win32-shared-data-test
 	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_nt_section_test.c platform/win32_nt_section.c -o /tmp/beer-win32-nt-section-test
@@ -147,7 +174,7 @@ test-input:
 	/tmp/beer-win32-unwind-test
 	$(CC) -O2 -Wall -Wextra -no-pie -Wl,--section-start=.beer_test_handler=0x500000 -Iplatform platform/win32_seh_test.c platform/win32_seh.c platform/win32_unwind.c -o /tmp/beer-win32-seh-test
 	/tmp/beer-win32-seh-test
-	rm -f /tmp/beer-directinput-format-test /tmp/beer-window-style-policy-test /tmp/beer-window-icon-policy-test /tmp/beer-guid-compat-test /tmp/beer-win32-filesystem-policy-test /tmp/beer-steam-offline-policy-test /tmp/beer-win32-environment-test /tmp/beer-win32-shared-data-test /tmp/beer-win32-nt-section-test /tmp/beer-win32-virtual-memory-test /tmp/beer-x64-fault-emulation-test /tmp/beer-win32-vectored-exception-test /tmp/beer-win32-unwind-test /tmp/beer-win32-seh-test
+	rm -f /tmp/beer-directinput-format-test /tmp/beer-window-style-policy-test /tmp/beer-window-icon-policy-test /tmp/beer-guid-compat-test /tmp/beer-win32-filesystem-policy-test /tmp/beer-steam-offline-policy-test /tmp/beer-win32-environment-test /tmp/beer-win32-apiset-test /tmp/beer-win32-shared-data-test /tmp/beer-win32-nt-section-test /tmp/beer-win32-virtual-memory-test /tmp/beer-x64-fault-emulation-test /tmp/beer-win32-vectored-exception-test /tmp/beer-win32-unwind-test /tmp/beer-win32-seh-test
 
 test-renderer:
 	$(CC) -O2 -Wall -Wextra -Irenderer/vulkan renderer/vulkan/target_mirror_test.c -o /tmp/beer-target-mirror-test
