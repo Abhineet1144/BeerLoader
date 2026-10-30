@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /* A successfully initialized local Steam runtime has an authenticated local
  * user even when network services are unavailable. CSteamID carries an
@@ -66,6 +67,20 @@ static inline int beer_steam_storage_normalize_path(const char *name,
     return 1;
 }
 
+static inline uint32_t beer_steam_parse_app_id_text(const char *text)
+{
+    if (!text) return 0;
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') ++text;
+    uint64_t value = 0;
+    const char *start = text;
+    while (*text >= '0' && *text <= '9') {
+        value = value * 10u + (uint32_t)(*text++ - '0');
+        if (value > UINT32_MAX) return 0;
+    }
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') ++text;
+    return text != start && !*text && value ? (uint32_t)value : 0;
+}
+
 static inline uint64_t beer_steam_local_user_logged_on(int runtime_initialized)
 {
     return runtime_initialized ? 1u : 0u;
@@ -74,6 +89,35 @@ static inline uint64_t beer_steam_local_user_logged_on(int runtime_initialized)
 static inline uint64_t beer_steam_local_user_id(void)
 {
     return BEER_STEAM_LOCAL_USER_ID;
+}
+
+/* Steam's application-local wrappers compare the registry installation root
+ * with their own module directory before selecting an adjacent private
+ * backend. In explicit guest-module mode, expose that application directory;
+ * compatibility-facade mode retains Beer's synthetic client installation.
+ * This is module policy, not executable-name or app-ID detection. */
+static inline int beer_steam_registry_root(int guest_module_mode,
+                                           const char *windows_executable,
+                                           char *root,
+                                           size_t capacity)
+{
+    static const char compatibility_root[] = "C:\\Program Files (x86)\\Steam";
+    if (!root || !capacity) return 0;
+    const char *source = compatibility_root;
+    size_t length = sizeof(compatibility_root) - 1u;
+    if (guest_module_mode) {
+        if (!windows_executable || !*windows_executable) return 0;
+        const char *slash = NULL;
+        for (const char *cursor = windows_executable; *cursor; ++cursor)
+            if (*cursor == '\\' || *cursor == '/') slash = cursor;
+        if (!slash || slash == windows_executable) return 0;
+        source = windows_executable;
+        length = (size_t)(slash - windows_executable);
+    }
+    if (length + 1u > capacity) return 0;
+    memcpy(root, source, length);
+    root[length] = '\0';
+    return 1;
 }
 
 #endif

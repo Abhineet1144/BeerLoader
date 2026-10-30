@@ -143,7 +143,16 @@ HR MS com_obj_get_device(ComObj *self, const uint8_t *riid, void **out)
     *out = device;
     return HR_OK;
 }
-static HR MS obj_notimpl(void) { return HR_E_NOTIMPL; }
+static HR MS obj_notimpl(void)
+{
+    /* Names the guest caller of an unimplemented COM method (COM calls reach here without a trampoline). */
+    static unsigned logged;
+    if (logged < 32) {
+        ++logged;
+        fprintf(stderr, "[BD12] unimplemented COM method called from guest code at %p\n", __builtin_return_address(0));
+    }
+    return HR_E_NOTIMPL;
+}
 static HR MS obj_ok(void) { return HR_OK; }
 
 /* Device state: deferred destruction, submission --------------------------- */
@@ -316,9 +325,12 @@ VkResult com_submit(ComDevice *dev, BD12CmdList *const *lists, uint32_t count,
     if (wait_count > 8 || signal_count > 7)
         return VK_ERROR_INITIALIZATION_FAILED;
     memcpy(all_waits, waits, wait_count * sizeof(*waits));
-    memcpy(all_signals, signals, signal_count * sizeof(*signals));
     BD12_PROF_BEGIN();
     pthread_mutex_lock(&dev->submit_lock);
+    total_signals = 0;
+    for (uint32_t i = 0; i < signal_count; ++i)
+        if (bd12_fence_claim(signals[i].fence, signals[i].value))
+            all_signals[total_signals++] = signals[i];
     const uint64_t previous = dev->serial;
     const uint64_t serial = previous + 1;
     if (previous)
@@ -434,8 +446,17 @@ static uint64_t MS fence_completed(ComFence *f)
 {
     return bd12_fence_completed(f->fence);
 }
+static int fence_diag(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_FENCE_DIAGNOSTICS") != NULL;
+    return on;
+}
 static HR MS fence_set_event(ComFence *f, uint64_t value, uint64_t event)
 {
+    if (fence_diag())
+        fprintf(stderr, "[FENCE] SetEventOnCompletion fence=%p value=%llu completed=%llu event=0x%llx\n", (void *)f,
+                (unsigned long long)value, (unsigned long long)bd12_fence_completed(f->fence), (unsigned long long)event);
     if (bd12_fence_completed(f->fence) >= value) {
         SignalEventFn signal = beer_d3d12_get_event_signaler();
         if (signal && event) signal(event);
@@ -450,6 +471,8 @@ static HR MS fence_set_event(ComFence *f, uint64_t value, uint64_t event)
 }
 static HR MS fence_signal(ComFence *f, uint64_t value)
 {
+    if (fence_diag())
+        fprintf(stderr, "[FENCE] CPU Signal fence=%p value=%llu\n", (void *)f, (unsigned long long)value);
     return bd12_fence_signal_cpu(f->fence, value) ? HR_OK : HR_E_FAIL;
 }
 static void *fence_vtable[11] = {
@@ -509,13 +532,26 @@ static void MS queue_execute(ComQueue *q, uint32_t count, ComObj *const *lists)
 
 static HR MS queue_signal(ComQueue *q, ComFence *f, uint64_t value)
 {
+    if (q && q->obj.kind != COM_QUEUE)
+        fprintf(stderr, "[BD12] ID3D12CommandQueue::Signal on a non-queue object %p (kind=%d)\n", (void *)q, (int)q->obj.kind);
+    if (!q || q->obj.kind != COM_QUEUE || !f || f->obj.kind != COM_FENCE || !f->fence) {
+        fprintf(stderr, "[BD12] ID3D12CommandQueue::Signal(queue=%p fence=%p kind=%d inner=%p, %llu): invalid fence\n",
+                (void *)q, (void *)f, f ? (int)f->obj.kind : -1, f ? (void *)f->fence : NULL,
+                (unsigned long long)value);
+        return HR_E_INVALIDARG;
+    }
     BD12FenceOp s = { f->fence, value };
+    if (fence_diag())
+        fprintf(stderr, "[FENCE] queue %p Signal fence=%p value=%llu\n", (void *)q, (void *)f, (unsigned long long)value);
     return com_submit(q->obj.dev, NULL, 0, NULL, 0, &s, 1) == VK_SUCCESS ?
            HR_OK : HR_E_FAIL;
 }
 static HR MS queue_wait(ComQueue *q, ComFence *f, uint64_t value)
 {
+    if (!q || !f) return HR_E_INVALIDARG;
     BD12FenceOp w = { f->fence, value };
+    if (fence_diag())
+        fprintf(stderr, "[FENCE] queue %p Wait fence=%p value=%llu\n", (void *)q, (void *)f, (unsigned long long)value);
     return com_submit(q->obj.dev, NULL, 0, &w, 1, NULL, 0) == VK_SUCCESS ?
            HR_OK : HR_E_FAIL;
 }
@@ -572,6 +608,7 @@ static uint32_t MS dl_release(void *iface)
     return com_release(&queue_from_downlevel(iface)->obj);
 }
 
+static HR present_epilogue(ComQueue *q, ComResource *texture);
 static HR MS dl_present(void *iface, ComObj *list, ComResource *texture,
                         uint64_t window, uint32_t flags)
 {
@@ -584,6 +621,14 @@ static HR MS dl_present(void *iface, ComObj *list, ComResource *texture,
     }
     BD12CmdList *recorded = com_list_finish(list);
     if (recorded) com_submit(dev, &recorded, 1, NULL, 0, NULL, 0);
+    return present_epilogue(q, texture);
+}
+
+/* Everything after the recorded work is submitted: epoch advance, capture hooks, then hand the image to the
+ * presenter. Shared by the downlevel Present and the DXGI swapchain. */
+static HR present_epilogue(ComQueue *q, ComResource *texture)
+{
+    ComDevice *dev = q->obj.dev;
     if (getenv("BEER_BD12_TS_LOG")) {
         extern BD12Buffer *g_ts_dst; extern VkDeviceSize g_ts_offset; extern uint32_t g_ts_count;
         static unsigned frame;
@@ -1208,7 +1253,7 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
     (void)self;
     if (!data || !size) return HR_E_INVALIDARG;
     { static unsigned seen_mask; if (feature < 32 && !(seen_mask & (1u << feature))) { seen_mask |= 1u << feature; fprintf(stderr, "[BD12] CheckFeatureSupport feature=%u size=%u\n", feature, size); } }
-    if (feature == 0 && size >= 60) {
+    if (feature == 0 && size >= 60 && !getenv("BEER_DXR_FEATURES")) {
         memset(data, 0, size);
         return HR_OK;
     }
@@ -1258,6 +1303,17 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
         memset(data, 0, size);
         return HR_OK;
     default:
+        /* Every other defined D3D12_FEATURE answers "not supported" (all-zero data) with success, as a driver
+         * does; E_NOTIMPL is fatal to callers such as DirectStorage that probe EXISTING_HEAPS, SERIALIZATION,
+         * CROSS_NODE, ... Values outside the enumeration stay invalid. */
+        {
+            static uint64_t logged;
+            if (feature < 64 && !(logged & (1ull << feature))) {
+                logged |= 1ull << feature;
+                fprintf(stderr, "[BD12] CheckFeatureSupport feature=%u size=%u -> zeroed (unsupported)\n", feature, size);
+            }
+        }
+        if (feature < 64) { memset(data, 0, size); return HR_OK; }
         return HR_E_NOTIMPL;
     }
 }
@@ -1335,6 +1391,7 @@ static void MS dev_create_cbv(ComDevice *self, const uint8_t *desc,
     if (!buffer) return;
     BD12DescriptorHeap heap = temp_heap(self, dest);
     bd12_descriptor_write_cbv(&heap, 0, buffer, offset, size);
+    bd12_mirror_note((const void *)(uintptr_t)dest, 1);
 }
 
 static VkFormat view_format(const ComResource *r, uint32_t dxgi)
@@ -1694,14 +1751,24 @@ static HR MS dev_create_fence(ComDevice *self, uint64_t initial, uint32_t flags,
     (void)flags;
     if (!out) return HR_E_INVALIDARG;
     *out = NULL;
-    if (!com_iid_equal(riid, iid_fence) && !com_iid_equal(riid, com_iid_iunknown))
+    if (!self || self->obj.kind != COM_DEVICE || !self->bd) {
+        fprintf(stderr, "[BD12] ID3D12Device::CreateFence on a non-BD12 object %p (kind=%d vtable=%p)\n",
+                (void *)self, self ? (int)self->obj.kind : -1, self ? (void *)self->obj.vtable : NULL);
+        return HR_E_INVALIDARG;
+    }
+    if (!com_iid_equal(riid, iid_fence) && !com_iid_equal(riid, com_iid_iunknown)) {
+        fprintf(stderr, "[BD12] CreateFence: unsupported IID %08x-%04x-%04x\n",
+                *(const uint32_t *)riid, *(const uint16_t *)(riid + 4), *(const uint16_t *)(riid + 6));
         return HR_E_NOINTERFACE;
+    }
     ComFence *f = calloc(1, sizeof(*f));
     if (!f) return HR_E_OUTOFMEMORY;
     f->fence = bd12_fence_create(self->bd, initial);
     if (!f->fence) { free(f); return HR_E_FAIL; }
     com_obj_init(&f->obj, COM_FENCE, fence_vtable, self, fence_destroy);
     *out = f;
+    if (fence_diag())
+        fprintf(stderr, "[FENCE] create fence=%p initial=%llu\n", (void *)f, (unsigned long long)initial);
     return HR_OK;
 }
 
@@ -2108,6 +2175,37 @@ static void MS dev_rt_prebuild(ComDevice *self, const void *inputs, uint64_t *in
 static uint32_t MS dev_check_matching_identifier(void) { return 0; /* compatible */ }
 static void MS dev_remove_device(void) {}
 
+/* ID3D12Device4::CreateCommandList1(NodeMask, Type, Flags, riid, ppCommandList): a list that starts CLOSED. It is
+ * built over a private allocator (the list keeps it alive) and closed straight away; the caller Reset()s it with
+ * its own allocator before recording. */
+static HR MS dev_create_list1(ComDevice *self, uint32_t node, uint32_t type, uint32_t flags,
+                              const uint8_t *riid, void **out)
+{
+    (void)node; (void)flags;
+    if (!out) return HR_E_INVALIDARG;
+    *out = NULL;
+    void *allocator = NULL;
+    HR hr = com_create_allocator(self, type, com_iid_iunknown, &allocator);
+    if (hr != HR_OK || !allocator) return hr ? hr : HR_E_FAIL;
+    void *list = NULL;
+    hr = com_create_list(self, type, allocator, NULL, riid, &list);
+    com_release(allocator);                        /* the list holds its own reference */
+    if (hr != HR_OK || !list) return hr ? hr : HR_E_FAIL;
+    void **vtable = *(void ***)list;
+    ((HR (MS *)(void *))vtable[9])(list);          /* ID3D12GraphicsCommandList::Close */
+    *out = list;
+    return HR_OK;
+}
+
+/* ID3D12Device5 meta commands: none are exposed (vendor GPU decompression etc.). */
+static HR MS dev_enumerate_meta_commands(ComDevice *self, uint32_t *count, void *descs)
+{
+    (void)self; (void)descs;
+    if (count) *count = 0;
+    return HR_OK;
+}
+static HR MS dev_meta_command_invalid(void) { return HR_E_INVALIDARG; }
+
 static void *device_vtable[65] = {
     [0] = dev_query, [1] = dev_add_ref, [2] = dev_release,
     [3] = com_obj_get_private, [4] = com_obj_set_private, [5] = com_obj_set_private_iface,
@@ -2129,14 +2227,361 @@ static void *device_vtable[65] = {
     [43] = dev_get_luid, [44] = obj_notimpl, [45] = obj_notimpl,
     [46] = obj_ok, [47] = dev_create_pso,
     /* Device3 */ [48] = obj_notimpl, [49] = obj_notimpl, [50] = obj_ok,
-    /* Device4 */ [51] = obj_notimpl, [52] = obj_notimpl,
+    /* Device4 */ [51] = dev_create_list1, [52] = obj_notimpl,
     [53] = dev_create_committed1, [54] = dev_create_heap1,
     [55] = obj_notimpl, [56] = obj_notimpl,
     /* Device5 */ [57] = obj_notimpl, [58] = dev_remove_device,
-    [59] = obj_notimpl, [60] = obj_notimpl, [61] = obj_notimpl,
+    [59] = dev_enumerate_meta_commands, [60] = dev_meta_command_invalid, [61] = dev_meta_command_invalid,
     [62] = dev_create_state_object, [63] = dev_rt_prebuild,
     [64] = dev_check_matching_identifier,
 };
+
+
+/* DXGI swap chain (IDXGISwapChain1-4) over BD12 textures ---------------------------------------------------- */
+static const uint8_t iid_dxgi_object[16] = IID(0xb8, 0x2f, 0xc2, 0xae, 0xf3, 0x76, 0x39, 0x46, 0x9b, 0xe0, 0x28, 0xeb, 0x43, 0xa6, 0x7a, 0x2e);
+static const uint8_t iid_dxgi_subobject[16] = IID(0x79, 0x03, 0x3e, 0x3d, 0xde, 0xf9, 0x58, 0x4d, 0xbb, 0x6c, 0x18, 0xd6, 0x29, 0x92, 0xf1, 0xa6);
+static const uint8_t iid_swapchain[16] = IID(0xa0, 0x36, 0x0d, 0x31, 0xe7, 0xd2, 0x0a, 0x4c, 0xaa, 0x04, 0x6a, 0x9d, 0x23, 0xb8, 0x88, 0x6a);
+static const uint8_t iid_swapchain1[16] = IID(0xf7, 0x45, 0x0a, 0x79, 0x42, 0x0d, 0x76, 0x48, 0x98, 0x3a, 0x0a, 0x55, 0xcf, 0xe6, 0xf4, 0xaa);
+static const uint8_t iid_swapchain2[16] = IID(0xc4, 0x2a, 0xbe, 0xa8, 0x9f, 0x19, 0x46, 0x49, 0xb3, 0x31, 0x79, 0x59, 0x9f, 0xb9, 0x8d, 0xe7);
+static const uint8_t iid_swapchain3[16] = IID(0xdb, 0x9b, 0xd9, 0x94, 0xf8, 0xf1, 0xb0, 0x4a, 0xb2, 0x36, 0x7d, 0xa0, 0x17, 0x0e, 0xda, 0xb1);
+static const uint8_t iid_swapchain4[16] = IID(0x5a, 0x5d, 0x58, 0x3d, 0x4a, 0xbd, 0x9e, 0x48, 0xb1, 0xf4, 0x3d, 0xbc, 0xb6, 0x45, 0x2f, 0xfb);
+
+#define COM_SWAPCHAIN_KIND (COM_KIND_COUNT + 1)
+#define SC_MAX_BUFFERS 16
+#define HR_DXGI_INVALID_CALL UINT64_C(0x887a0001)
+
+typedef struct ComSwapChain {
+    ComObj obj;
+    ComQueue *queue;
+    uint64_t hwnd;
+    uint32_t width, height, format, buffer_count, flags, usage, swap_effect, windowed;
+    uint32_t sample_count, sample_quality;
+    ComResource *buffers[SC_MAX_BUFFERS];
+    uint32_t index, present_count, max_latency, fullscreen, source_w, source_h;
+    uint64_t waitable;
+} ComSwapChain;
+
+static uint64_t (*g_event_factory)(void);
+static void *g_dxgi_factory_object;
+void bd12_com_set_event_factory(uint64_t (*fn)(void)) { g_event_factory = fn; }
+void bd12_com_set_dxgi_factory(void *factory) { g_dxgi_factory_object = factory; }
+
+static void swapchain_release_buffers(ComSwapChain *sc)
+{
+    for (uint32_t i = 0; i < SC_MAX_BUFFERS; ++i)
+        if (sc->buffers[i]) { com_release(&sc->buffers[i]->obj); sc->buffers[i] = NULL; }
+}
+
+static HR swapchain_create_buffers(ComSwapChain *sc)
+{
+    ComDevice *dev = sc->queue->obj.dev;
+    for (uint32_t i = 0; i < sc->buffer_count; ++i) {
+        uint8_t props[20] = {0}, desc[56] = {0};
+        uint32_t heap_default = 1, one = 1, flags = 1;                    /* ALLOW_RENDER_TARGET */
+        if (sc->usage & 0x80) flags |= 4;                                 /* DXGI_USAGE_UNORDERED_ACCESS */
+        uint32_t dimension = 3;                                           /* TEXTURE2D */
+        uint64_t width = sc->width;
+        uint16_t depth = 1, mips = 1;
+        memcpy(props, &heap_default, 4);
+        memcpy(desc, &dimension, 4);
+        memcpy(desc + 16, &width, 8);
+        memcpy(desc + 24, &sc->height, 4);
+        memcpy(desc + 28, &depth, 2);
+        memcpy(desc + 30, &mips, 2);
+        memcpy(desc + 32, &sc->format, 4);
+        memcpy(desc + 36, &one, 4);
+        memcpy(desc + 48, &flags, 4);
+        void *out = NULL;
+        HR hr = create_resource(dev, NULL, 0, props, 0, desc, 0 /* COMMON == PRESENT */, iid_resource, &out);
+        if (hr != HR_OK || !out) {
+            swapchain_release_buffers(sc);
+            return hr ? hr : HR_E_FAIL;
+        }
+        sc->buffers[i] = out;
+    }
+    return HR_OK;
+}
+
+static void swapchain_destroy(ComObj *o)
+{
+    ComSwapChain *sc = (ComSwapChain *)o;
+    swapchain_release_buffers(sc);
+    if (sc->queue) com_release(&sc->queue->obj);
+    free(sc);
+}
+
+static HR MS sc_query(ComSwapChain *sc, const uint8_t *riid, void **out)
+{
+    if (!out) return HR_E_INVALIDARG;
+    *out = NULL;
+    if (!riid) return HR_E_NOINTERFACE;
+    if (com_iid_equal(riid, com_iid_iunknown) || com_iid_equal(riid, iid_dxgi_object) ||
+        com_iid_equal(riid, iid_dxgi_subobject) || com_iid_equal(riid, iid_swapchain) ||
+        com_iid_equal(riid, iid_swapchain1) || com_iid_equal(riid, iid_swapchain2) ||
+        com_iid_equal(riid, iid_swapchain3) || com_iid_equal(riid, iid_swapchain4)) {
+        com_add_ref(&sc->obj);
+        *out = sc;
+        return HR_OK;
+    }
+    if (getenv("BEER_COM_DIAGNOSTICS"))
+        fprintf(stderr, "[BD12 QI] swapchain refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+                riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6], riid[8], riid[9],
+                riid[10], riid[11], riid[12], riid[13], riid[14], riid[15]);
+    return HR_E_NOINTERFACE;
+}
+static uint32_t MS sc_add_ref(ComSwapChain *sc) { return com_add_ref(&sc->obj); }
+static uint32_t MS sc_release(ComSwapChain *sc) { return com_release(&sc->obj); }
+static HR MS sc_set_private(ComSwapChain *sc, const uint8_t *g, uint32_t n, const void *d) { (void)sc; (void)g; (void)n; (void)d; return HR_OK; }
+static HR MS sc_set_private_iface(ComSwapChain *sc, const uint8_t *g, void *i) { (void)sc; (void)g; (void)i; return HR_OK; }
+static HR MS sc_get_private(ComSwapChain *sc, const uint8_t *g, uint32_t *n, void *d) { (void)sc; (void)g; (void)d; if (n) *n = 0; return HR_NOT_FOUND; }
+static HR MS sc_get_parent(ComSwapChain *sc, const uint8_t *riid, void **out)
+{
+    (void)sc; (void)riid;
+    if (!out) return HR_E_INVALIDARG;
+    *out = NULL;
+    if (!g_dxgi_factory_object) return HR_E_NOINTERFACE;
+    *out = g_dxgi_factory_object;           /* the loader's factory is process-lifetime */
+    return HR_OK;
+}
+static HR MS sc_get_device(ComSwapChain *sc, const uint8_t *riid, void **out)
+{
+    if (!out) return HR_E_INVALIDARG;
+    if (com_iid_equal(riid, iid_queue)) return com_obj_query(&sc->queue->obj, riid, out, iid_queue, NULL);
+    return com_obj_query(&sc->queue->obj.dev->obj, riid, out, iid_device, iid_device1);
+}
+
+static HR MS sc_present(ComSwapChain *sc, uint32_t sync, uint32_t flags)
+{
+    (void)sync; (void)flags;
+    if (fence_diag() && (sc->present_count < 5 || sc->present_count % 300 == 0))
+        fprintf(stderr, "[FENCE] swapchain %p Present #%u sync=%u flags=0x%x presenter=%p\n", (void *)sc,
+                sc->present_count, sync, flags, (void *)g_presenter);
+    /* DXGI_PRESENT_TEST only asks whether presenting would succeed (occlusion probe): it neither shows the
+     * back buffer nor advances the buffer index. Treating it as a real present doubles every frame. */
+    if (flags & 0x1u) return HR_OK;
+    ComResource *texture = sc->buffers[sc->index % (sc->buffer_count ? sc->buffer_count : 1)];
+    HR hr = texture ? present_epilogue(sc->queue, texture) : HR_E_FAIL;
+    sc->index = (sc->index + 1) % (sc->buffer_count ? sc->buffer_count : 1);
+    ++sc->present_count;
+    return hr == HR_E_NOTIMPL ? HR_OK : hr;     /* no presenter attached: nothing to show, not an error */
+}
+static HR MS sc_present1(ComSwapChain *sc, uint32_t sync, uint32_t flags, const void *params)
+{
+    (void)params;
+    return sc_present(sc, sync, flags);
+}
+static HR MS sc_get_buffer(ComSwapChain *sc, uint32_t index, const uint8_t *riid, void **out)
+{
+    if (!out) return HR_E_INVALIDARG;
+    *out = NULL;
+    if (index >= sc->buffer_count || !sc->buffers[index]) return HR_DXGI_INVALID_CALL;
+    return com_obj_query(&sc->buffers[index]->obj, riid, out, iid_resource, NULL);
+}
+static HR MS sc_set_fullscreen(ComSwapChain *sc, int32_t fullscreen, void *target)
+{
+    (void)target;
+    sc->fullscreen = fullscreen != 0;
+    return HR_OK;
+}
+static HR MS sc_get_fullscreen(ComSwapChain *sc, int32_t *fullscreen, void **target)
+{
+    if (fullscreen) *fullscreen = (int32_t)sc->fullscreen;
+    if (target) *target = NULL;
+    return HR_OK;
+}
+static HR MS sc_get_desc(ComSwapChain *sc, uint8_t *d)
+{
+    if (!d) return HR_E_INVALIDARG;
+    memset(d, 0, 72);
+    uint32_t one = 1, zero = 0, sixty = 60;
+    memcpy(d + 0, &sc->width, 4); memcpy(d + 4, &sc->height, 4);
+    memcpy(d + 8, &sixty, 4); memcpy(d + 12, &one, 4);
+    memcpy(d + 16, &sc->format, 4); memcpy(d + 20, &zero, 4); memcpy(d + 24, &zero, 4);
+    memcpy(d + 28, &sc->sample_count, 4); memcpy(d + 32, &sc->sample_quality, 4);
+    memcpy(d + 36, &sc->usage, 4); memcpy(d + 40, &sc->buffer_count, 4);
+    memcpy(d + 48, &sc->hwnd, 8);
+    uint32_t windowed = sc->fullscreen ? 0 : 1;
+    memcpy(d + 56, &windowed, 4); memcpy(d + 60, &sc->swap_effect, 4); memcpy(d + 64, &sc->flags, 4);
+    return HR_OK;
+}
+static HR swapchain_resize(ComSwapChain *sc, uint32_t count, uint32_t w, uint32_t h, uint32_t format,
+                           uint32_t flags)
+{
+    uint32_t old_count = sc->buffer_count, old_w = sc->width, old_h = sc->height, old_fmt = sc->format;
+    if (count) sc->buffer_count = count > SC_MAX_BUFFERS ? SC_MAX_BUFFERS : count;
+    if (w) sc->width = w;
+    if (h) sc->height = h;
+    if (format) sc->format = format;
+    sc->flags = flags;
+    swapchain_release_buffers(sc);
+    HR hr = swapchain_create_buffers(sc);
+    if (hr != HR_OK) {
+        sc->buffer_count = old_count; sc->width = old_w; sc->height = old_h; sc->format = old_fmt;
+        swapchain_create_buffers(sc);
+    }
+    sc->index = 0;
+    return hr;
+}
+static HR MS sc_resize_buffers(ComSwapChain *sc, uint32_t count, uint32_t w, uint32_t h, uint32_t format,
+                               uint32_t flags)
+{
+    return swapchain_resize(sc, count, w, h, format, flags);
+}
+static HR MS sc_resize_target(ComSwapChain *sc, const void *mode) { (void)sc; (void)mode; return HR_OK; }
+static HR MS sc_get_containing_output(ComSwapChain *sc, void **out)
+{
+    (void)sc;
+    if (out) *out = NULL;
+    return HR_NOT_FOUND;
+}
+static HR MS sc_get_frame_statistics(ComSwapChain *sc, void *stats) { (void)sc; (void)stats; return HR_DXGI_INVALID_CALL; }
+static HR MS sc_get_last_present_count(ComSwapChain *sc, uint32_t *count)
+{
+    if (!count) return HR_E_INVALIDARG;
+    *count = sc->present_count;
+    return HR_OK;
+}
+static HR MS sc_get_desc1(ComSwapChain *sc, uint8_t *d)
+{
+    if (!d) return HR_E_INVALIDARG;
+    memset(d, 0, 48);
+    memcpy(d + 0, &sc->width, 4); memcpy(d + 4, &sc->height, 4); memcpy(d + 8, &sc->format, 4);
+    memcpy(d + 16, &sc->sample_count, 4); memcpy(d + 20, &sc->sample_quality, 4);
+    memcpy(d + 24, &sc->usage, 4); memcpy(d + 28, &sc->buffer_count, 4);
+    memcpy(d + 36, &sc->swap_effect, 4);   /* AlphaMode (40) stays DXGI_ALPHA_MODE_UNSPECIFIED */
+    memcpy(d + 44, &sc->flags, 4);
+    return HR_OK;
+}
+static HR MS sc_get_fullscreen_desc(ComSwapChain *sc, uint8_t *d)
+{
+    if (!d) return HR_E_INVALIDARG;
+    memset(d, 0, 20);
+    uint32_t sixty = 60, one = 1, windowed = sc->fullscreen ? 0 : 1;
+    memcpy(d + 0, &sixty, 4); memcpy(d + 4, &one, 4); memcpy(d + 16, &windowed, 4);
+    return HR_OK;
+}
+static HR MS sc_get_hwnd(ComSwapChain *sc, uint64_t *hwnd)
+{
+    if (!hwnd) return HR_E_INVALIDARG;
+    *hwnd = sc->hwnd;
+    return HR_OK;
+}
+static HR MS sc_get_core_window(ComSwapChain *sc, const uint8_t *riid, void **out)
+{
+    (void)sc; (void)riid;
+    if (out) *out = NULL;
+    return HR_DXGI_INVALID_CALL;
+}
+static uint32_t MS sc_is_temp_mono(ComSwapChain *sc) { (void)sc; return 0; }
+static HR MS sc_get_restrict(ComSwapChain *sc, void **out) { (void)sc; if (out) *out = NULL; return HR_OK; }
+static HR MS sc_set_bg(ComSwapChain *sc, const void *color) { (void)sc; (void)color; return HR_OK; }
+static HR MS sc_get_bg(ComSwapChain *sc, float *color)
+{
+    (void)sc;
+    if (color) color[0] = color[1] = color[2] = color[3] = 0.0f;
+    return HR_OK;
+}
+static HR MS sc_set_rotation(ComSwapChain *sc, uint32_t r) { (void)sc; (void)r; return HR_OK; }
+static HR MS sc_get_rotation(ComSwapChain *sc, uint32_t *r) { (void)sc; if (r) *r = 1; return HR_OK; }
+static HR MS sc_set_source_size(ComSwapChain *sc, uint32_t w, uint32_t h) { sc->source_w = w; sc->source_h = h; return HR_OK; }
+static HR MS sc_get_source_size(ComSwapChain *sc, uint32_t *w, uint32_t *h)
+{
+    if (w) *w = sc->source_w ? sc->source_w : sc->width;
+    if (h) *h = sc->source_h ? sc->source_h : sc->height;
+    return HR_OK;
+}
+static HR MS sc_set_max_latency(ComSwapChain *sc, uint32_t n)
+{
+    if (!n || n > 16) return HR_E_INVALIDARG;
+    sc->max_latency = n;
+    return HR_OK;
+}
+static HR MS sc_get_max_latency(ComSwapChain *sc, uint32_t *n)
+{
+    if (!n) return HR_E_INVALIDARG;
+    *n = sc->max_latency;
+    return HR_OK;
+}
+static uint64_t MS sc_get_waitable(ComSwapChain *sc) { return sc->waitable; }
+static HR MS sc_set_matrix(ComSwapChain *sc, const void *m) { (void)sc; (void)m; return HR_DXGI_INVALID_CALL; }
+static HR MS sc_get_matrix(ComSwapChain *sc, void *m) { (void)sc; (void)m; return HR_DXGI_INVALID_CALL; }
+static uint32_t MS sc_get_current_index(ComSwapChain *sc) { return sc->index; }
+static HR MS sc_check_color_space(ComSwapChain *sc, uint32_t space, uint32_t *support)
+{
+    (void)sc;
+    if (!support) return HR_E_INVALIDARG;
+    *support = (space == 0 || space == 1) ? 1u : 0u;   /* sRGB / scRGB: DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT */
+    return HR_OK;
+}
+static HR MS sc_set_color_space(ComSwapChain *sc, uint32_t space) { (void)sc; return space <= 1 ? HR_OK : HR_E_INVALIDARG; }
+static HR MS sc_resize_buffers1(ComSwapChain *sc, uint32_t count, uint32_t w, uint32_t h, uint32_t format,
+                                uint32_t flags, const uint32_t *masks, void *const *queues)
+{
+    (void)masks; (void)queues;
+    return swapchain_resize(sc, count, w, h, format, flags);
+}
+static HR MS sc_set_hdr(ComSwapChain *sc, uint32_t type, uint32_t size, const void *data)
+{
+    (void)sc; (void)type; (void)size; (void)data;
+    return HR_OK;
+}
+
+static void *swapchain_vtable[41] = {
+    [0] = sc_query, [1] = sc_add_ref, [2] = sc_release,
+    [3] = sc_set_private, [4] = sc_set_private_iface, [5] = sc_get_private, [6] = sc_get_parent,
+    [7] = sc_get_device, [8] = sc_present, [9] = sc_get_buffer, [10] = sc_set_fullscreen,
+    [11] = sc_get_fullscreen, [12] = sc_get_desc, [13] = sc_resize_buffers, [14] = sc_resize_target,
+    [15] = sc_get_containing_output, [16] = sc_get_frame_statistics, [17] = sc_get_last_present_count,
+    [18] = sc_get_desc1, [19] = sc_get_fullscreen_desc, [20] = sc_get_hwnd, [21] = sc_get_core_window,
+    [22] = sc_present1, [23] = sc_is_temp_mono, [24] = sc_get_restrict, [25] = sc_set_bg,
+    [26] = sc_get_bg, [27] = sc_set_rotation, [28] = sc_get_rotation,
+    [29] = sc_set_source_size, [30] = sc_get_source_size, [31] = sc_set_max_latency,
+    [32] = sc_get_max_latency, [33] = sc_get_waitable, [34] = sc_set_matrix, [35] = sc_get_matrix,
+    [36] = sc_get_current_index, [37] = sc_check_color_space, [38] = sc_set_color_space,
+    [39] = sc_resize_buffers1, [40] = sc_set_hdr,
+};
+
+int bd12_com_is_queue(const void *object)
+{
+    return object && *(void *const *)object == (void *)queue_vtable;
+}
+
+/* desc: DXGI_SWAP_CHAIN_DESC (72 bytes). */
+uint64_t bd12_com_create_swapchain(void *queue_object, const uint8_t *desc, void **out)
+{
+    if (!out || !desc || !bd12_com_is_queue(queue_object)) return HR_E_INVALIDARG;
+    *out = NULL;
+    ComQueue *queue = queue_object;
+    ComSwapChain *sc = calloc(1, sizeof(*sc));
+    if (!sc) return HR_E_OUTOFMEMORY;
+    memcpy(&sc->width, desc + 0, 4);
+    memcpy(&sc->height, desc + 4, 4);
+    memcpy(&sc->format, desc + 16, 4);
+    memcpy(&sc->sample_count, desc + 28, 4);
+    memcpy(&sc->sample_quality, desc + 32, 4);
+    memcpy(&sc->usage, desc + 36, 4);
+    memcpy(&sc->buffer_count, desc + 40, 4);
+    memcpy(&sc->hwnd, desc + 48, 8);
+    memcpy(&sc->windowed, desc + 56, 4);
+    memcpy(&sc->swap_effect, desc + 60, 4);
+    memcpy(&sc->flags, desc + 64, 4);
+    if (!sc->buffer_count) sc->buffer_count = 2;
+    if (sc->buffer_count > SC_MAX_BUFFERS) sc->buffer_count = SC_MAX_BUFFERS;
+    if (!sc->width || !sc->height || !sc->format) { free(sc); return HR_E_INVALIDARG; }
+    sc->max_latency = 1;
+    sc->fullscreen = !sc->windowed;
+    com_add_ref(&queue->obj);
+    sc->queue = queue;
+    com_obj_init(&sc->obj, COM_SWAPCHAIN_KIND, swapchain_vtable, queue->obj.dev, swapchain_destroy);
+    HR hr = swapchain_create_buffers(sc);
+    if (hr != HR_OK) { swapchain_destroy(&sc->obj); return hr; }
+    if ((sc->flags & 0x40 /* FRAME_LATENCY_WAITABLE_OBJECT */) && g_event_factory) sc->waitable = g_event_factory();
+    fprintf(stderr, "[BD12] swapchain %ux%u format=%u buffers=%u hwnd=%llx flags=0x%x waitable=%llx\n", sc->width,
+            sc->height, sc->format, sc->buffer_count, (unsigned long long)sc->hwnd, sc->flags,
+            (unsigned long long)sc->waitable);
+    *out = sc;
+    return HR_OK;
+}
 
 uint64_t MS beer_bd12_create_device(const uint8_t *riid, void **out)
 {

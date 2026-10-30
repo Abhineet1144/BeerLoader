@@ -11,6 +11,27 @@ int main(void)
     uint8_t unknown[16] = {0};
     int flags = -1;
 
+    assert(beer_module_is_preloaded_system_dll("kernel32.dll"));
+    assert(beer_module_is_preloaded_system_dll("kernelbase.dll"));
+    assert(beer_module_is_preloaded_system_dll("user32.dll"));
+    assert(beer_module_is_preloaded_system_dll("ntdll.dll"));
+    assert(beer_module_is_preloaded_system_dll("advapi32.dll"));
+    assert(beer_module_is_preloaded_system_dll("win32u.dll"));
+    assert(beer_module_is_preloaded_system_dll("wintrust.dll"));
+    assert(!beer_module_is_preloaded_system_dll("steam_api64.dll"));
+    assert(!beer_module_is_preloaded_system_dll("game.dll"));
+    assert(!beer_module_is_preloaded_system_dll(NULL));
+    assert(beer_module_prefers_compat_fallback("steam_api64.dll"));
+    assert(!beer_module_prefers_compat_fallback("steamclient64.dll"));
+    assert(!beer_module_prefers_compat_fallback("game.dll"));
+    assert(!beer_module_prefers_compat_fallback(NULL));
+    assert(beer_module_is_windows_runtime_dll("kernel32.dll"));
+    assert(beer_module_is_windows_runtime_dll("winmm.dll"));
+    assert(beer_module_is_windows_runtime_dll("api-ms-win-core-file-l1-1-0.dll"));
+    assert(!beer_module_is_windows_runtime_dll("steam_api64.dll"));
+    assert(!beer_module_is_windows_runtime_dll("game.dll"));
+    assert(!beer_module_is_windows_runtime_dll(NULL));
+
     assert(beer_classify_known_folder(saved_games) == BEER_KNOWN_FOLDER_SAVED_GAMES);
     assert(beer_classify_known_folder(local_appdata) == BEER_KNOWN_FOLDER_LOCAL_APPDATA);
     assert(beer_classify_known_folder(unknown) == BEER_KNOWN_FOLDER_UNKNOWN);

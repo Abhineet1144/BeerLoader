@@ -34,11 +34,15 @@ typedef struct BeerMemoryBasicInformation {
 
 void *beer_virtual_alloc(void *address, size_t size, uint32_t allocation_type,
                          uint32_t protection);
+void *beer_virtual_alloc_aligned(size_t size, size_t alignment, uint32_t allocation_type,
+                                 uint32_t protection);
 int beer_virtual_free(void *address, size_t size, uint32_t free_type);
 int beer_virtual_protect(void *address, size_t size, uint32_t new_protection,
                          uint32_t *old_protection);
 size_t beer_virtual_query(const void *address, BeerMemoryBasicInformation *info,
                           size_t info_size);
+int beer_is_bad_string_ptr_a(const char *string, size_t maximum);
+int beer_is_bad_string_ptr_w(const uint16_t *string, size_t maximum);
 void beer_virtual_memory_reset(void);
 
 #endif

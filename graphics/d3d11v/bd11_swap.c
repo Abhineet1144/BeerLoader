@@ -4,6 +4,7 @@
 #include "bd11.h"
 #include "../d3d12v/bd12_com.h"
 
+#include <time.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -218,14 +219,44 @@ static B11HR B11_MS sc_present(B11Swap *s, uint32_t sync, uint32_t flags)
                         (unsigned long long)g_bd12_drops[4], (unsigned long long)g_bd12_drops[5], (unsigned long long)g_bd12_drops[BD12_DROP_PSO_FAILED]);
         }
         if (stats && s->present_count % 120 == 0)
-            fprintf(stderr, "[BD11 STATS] frame=%u draws=%llu skipped=%llu clearRTV=%llu clearDSV=%llu update=%llu bufwrite=%llu lists=%llu ops=%llu\n",
+            fprintf(stderr, "[BD11 STATS] frame=%u draws=%llu skipped=%llu clearRTV=%llu clearDSV=%llu update=%llu bufwrite=%llu lists=%llu ops=%llu indirect=%llu\n",
                     s->present_count, (unsigned long long)g_b11_stats[0], (unsigned long long)g_b11_stats[1],
                     (unsigned long long)g_b11_stats[2], (unsigned long long)g_b11_stats[3], (unsigned long long)g_b11_stats[5],
-                    (unsigned long long)g_b11_stats[6], (unsigned long long)g_b11_stats[8], (unsigned long long)g_b11_stats[7]);
+                    (unsigned long long)g_b11_stats[6], (unsigned long long)g_b11_stats[8], (unsigned long long)g_b11_stats[7],
+                    (unsigned long long)g_b11_stats[9]);
+        if (stats && s->present_count % 120 == 0) {
+            extern uint64_t g_b11_query_counts[8];
+            fprintf(stderr, "[BD11 QUERIES] getdata event=%llu occlusion=%llu timestamp=%llu disjoint=%llu stats=%llu predicate=%llu\n",
+                    (unsigned long long)g_b11_query_counts[0], (unsigned long long)g_b11_query_counts[1],
+                    (unsigned long long)g_b11_query_counts[2], (unsigned long long)g_b11_query_counts[3],
+                    (unsigned long long)g_b11_query_counts[4], (unsigned long long)g_b11_query_counts[5]);
+        }
     }
     Bd12ImagePresenter presenter = bd12_com_get_image_presenter();
     if (presenter && s->back->image)
         presenter(s->back->image->image, bd12_layout_for_state(BD12_STATE_PRESENT, 0), s->width, s->height, s->format);
+    {   /* BEER_BD11_FPS=1: presents per second and the sync interval the game asks for. */
+        static int fps_log = -1;
+        if (fps_log < 0) fps_log = getenv("BEER_BD11_FPS") != NULL;
+        if (fps_log) {
+            static uint64_t window_start_ns, worst_ns, last_ns;
+            static uint32_t frames;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+            if (last_ns && now - last_ns > worst_ns) worst_ns = now - last_ns;
+            last_ns = now;
+            if (!window_start_ns) window_start_ns = now;
+            ++frames;
+            if (now - window_start_ns >= 1000000000ull) {
+                fprintf(stderr, "[BD11 FPS] %.1f fps sync=%u worst=%.1f ms\n",
+                        frames * 1e9 / (double)(now - window_start_ns), sync, worst_ns / 1e6);
+                window_start_ns = now;
+                frames = 0;
+                worst_ns = 0;
+            }
+        }
+    }
     return B11_S_OK;
 }
 

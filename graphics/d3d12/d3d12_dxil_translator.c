@@ -216,19 +216,40 @@ static int bindless_class(const dxil_spv_d3d_binding *d, uint32_t type)
 }
 
 /* Registers a bindless array and fills its Vulkan binding. */
+/* Heap-mirror classes beyond the SRV/UAV arrays: uniform buffers (set 1 binding 4) and the sampler heap
+ * (set 1 binding 5). SM 6.6 ResourceDescriptorHeap / SamplerDescriptorHeap access arrives with all-ones
+ * register fields; the index then comes straight from the shader. */
+#define HEAP_CLASS_CBV 4u
+#define HEAP_CLASS_SAMPLER 5u
+
+static int is_heap_access(const dxil_spv_d3d_binding *d)
+{
+    return d->register_space == UINT32_MAX && d->register_index == UINT32_MAX;
+}
+
+static int assign_bindless_class(Collect *c, uint32_t type, const dxil_spv_d3d_binding *d,
+                                 dxil_spv_vulkan_binding *out, uint32_t heap_class);
 static int assign_bindless(Collect *c, uint32_t type, const dxil_spv_d3d_binding *d,
                            dxil_spv_vulkan_binding *out)
+{
+    return assign_bindless_class(c, type, d, out, (uint32_t)bindless_class(d, type));
+}
+
+static int assign_bindless_class(Collect *c, uint32_t type, const dxil_spv_d3d_binding *d,
+                                 dxil_spv_vulkan_binding *out, uint32_t heap_class)
 {
     BeerD3D12TranslatedShader *s = c->shader;
     /* The same bindless array seen again (another entry point of a shared collection) keeps its word. */
     for (uint32_t i = 0; i < s->descriptor_count; ++i) {
         const BeerD3D12ShaderDescriptor *e = &s->descriptors[i];
-        if (e->bindless && e->type == type && e->register_space == d->register_space && e->register_index == d->register_index) {
+        if (e->bindless && e->type == type && e->register_space == d->register_space &&
+            e->register_index == d->register_index && e->heap_class == heap_class) {
             memset(out, 0, sizeof(*out));
             out->set = 1; out->binding = e->heap_class; out->root_constant_index = e->push_word;
             out->bindless.use_heap = DXIL_SPV_TRUE;
             const int untyped_again = d->kind == DXIL_SPV_RESOURCE_KIND_RAW_BUFFER || d->kind == DXIL_SPV_RESOURCE_KIND_STRUCTURED_BUFFER;
-            out->descriptor_type = untyped_again ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER : DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
+            out->descriptor_type = heap_class == HEAP_CLASS_CBV ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_UBO :
+                                   untyped_again ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER : DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
             return 1;
         }
     }
@@ -244,7 +265,7 @@ static int assign_bindless(Collect *c, uint32_t type, const dxil_spv_d3d_binding
         .register_index = d->register_index,
         .resource_type = resource_type(d->kind), .count = 1,
         .bindless = 1, .push_word = word,
-        .heap_class = (uint32_t)bindless_class(d, type)
+        .heap_class = heap_class
     };
     memset(out, 0, sizeof(*out));
     out->set = 1;
@@ -254,7 +275,8 @@ static int assign_bindless(Collect *c, uint32_t type, const dxil_spv_d3d_binding
     out->bindless.heap_root_offset = 0;   /* static offset; the index comes from the push word */
     const int untyped = d->kind == DXIL_SPV_RESOURCE_KIND_RAW_BUFFER ||
                         d->kind == DXIL_SPV_RESOURCE_KIND_STRUCTURED_BUFFER;
-    out->descriptor_type = untyped ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER :
+    out->descriptor_type = heap_class == HEAP_CLASS_CBV ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_UBO :
+                           untyped ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER :
                                      DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
     return 1;
 }
@@ -293,6 +315,10 @@ static dxil_spv_bool sampler_cb(void *user, const dxil_spv_d3d_binding *d,
                                 dxil_spv_vulkan_binding *out)
 {
     Collect *c = user;
+    if (is_heap_access(d)) {
+        assign_bindless_class(c, BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER, d, out, HEAP_CLASS_SAMPLER);
+        return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
+    }
     fill(out, assign(c, BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER, d), d);
     return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
 }
@@ -327,6 +353,10 @@ static dxil_spv_bool cbv_cb(void *user, const dxil_spv_d3d_binding *d,
     Collect *c = user;
     memset(out, 0, sizeof(*out));
     out->push_constant = DXIL_SPV_FALSE;
+    if (is_heap_access(d)) {
+        assign_bindless_class(c, BEER_D3D12_SHADER_DESCRIPTOR_CBV, d, &out->vulkan.uniform_binding, HEAP_CLASS_CBV);
+        return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
+    }
     out->vulkan.uniform_binding.set = 0;
     out->vulkan.uniform_binding.binding =
         assign(c, BEER_D3D12_SHADER_DESCRIPTOR_CBV, d);

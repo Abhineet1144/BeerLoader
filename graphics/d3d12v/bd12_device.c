@@ -639,6 +639,7 @@ BD12Fence *bd12_fence_create(BD12Device *device, uint64_t initial)
     BD12Fence *fence = calloc(1, sizeof(*fence));
     if (!fence) return NULL;
     fence->device = device;
+    fence->signaled = initial;
     VkSemaphoreTypeCreateInfo type = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
@@ -673,8 +674,23 @@ uint64_t bd12_fence_completed(BD12Fence *fence)
     return value;
 }
 
+/* D3D12 allows Signal with a value the fence already has (RE8 signals 0 on a
+ * fresh fence); a Vulkan timeline signal must exceed every earlier one, and
+ * Mesa reports a violation as device loss. Returns 0 when the signal cannot
+ * advance the timeline and must be dropped. */
+int bd12_fence_claim(BD12Fence *fence, uint64_t value)
+{
+    uint64_t current = __atomic_load_n(&fence->signaled, __ATOMIC_ACQUIRE);
+    while (value > current)
+        if (__atomic_compare_exchange_n(&fence->signaled, &current, value, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return 1;
+    return 0;
+}
+
 int bd12_fence_signal_cpu(BD12Fence *fence, uint64_t value)
 {
+    if (!bd12_fence_claim(fence, value)) return 1;
     VkSemaphoreSignalInfo info = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
         .semaphore = fence->semaphore,
@@ -792,7 +808,16 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
     beer_vulkan_queue_unlock();
     __atomic_add_fetch(&queue->submit_count, 1, __ATOMIC_RELAXED);
     beer_vulkan_record_result(result, "BD12 queue submit");
-    if (result == VK_ERROR_DEVICE_LOST) bd12_ckpt_dump();
+    if (result == VK_ERROR_DEVICE_LOST) {
+        bd12_ckpt_dump();
+        fprintf(stderr, "[BD12] lost submit: %u command buffer(s)\n", command_count);
+        for (uint32_t i = 0; i < wait_count; ++i)
+            fprintf(stderr, "[BD12]   wait sem=%p value=%llu\n", (void *)wait_infos[i].semaphore,
+                    (unsigned long long)wait_infos[i].value);
+        for (uint32_t i = 0; i < signal_count; ++i)
+            fprintf(stderr, "[BD12]   signal sem=%p value=%llu\n", (void *)signal_infos[i].semaphore,
+                    (unsigned long long)signal_infos[i].value);
+    }
     if (storage != (void *)stack_storage) free(storage);
     return result;
 }
@@ -913,7 +938,8 @@ static void bd12_report_drops(void)
         "draw(no pipeline/root signature)", "draw(descriptor resolve failed)",
         "dispatch(no pipeline/root signature)", "dispatch(descriptor resolve failed)",
         "ExecuteIndirect(multi-argument signature)",
-        "ExecuteIndirect dispatch(count buffer ignored)", "PSO(compile failed)" };
+        "ExecuteIndirect dispatch(count buffer ignored)", "PSO(compile failed)",
+        "draw(patch list without tessellation)" };
     uint64_t total = 0;
     for (int i = 0; i < BD12_DROP_COUNT; ++i) total += g_bd12_drops[i];
     if (total == last_total) return;

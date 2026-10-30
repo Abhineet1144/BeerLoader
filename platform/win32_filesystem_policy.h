@@ -4,6 +4,51 @@
 #include <stdint.h>
 #include <string.h>
 
+/* LoadLibrary first returns modules that the process loader has already
+ * published. All other names proceed through DLL search/native file opens;
+ * compatibility modules are fallbacks and are not implicitly preloaded. */
+static inline int beer_module_is_preloaded_system_dll(const char *lower_name)
+{
+    return lower_name &&
+           (!strcmp(lower_name, "kernel32.dll") ||
+            !strcmp(lower_name, "kernelbase.dll") ||
+            !strcmp(lower_name, "user32.dll") ||
+            !strcmp(lower_name, "ntdll.dll") ||
+            !strcmp(lower_name, "advapi32.dll") ||
+            !strcmp(lower_name, "win32u.dll") ||
+            !strcmp(lower_name, "wintrust.dll"));
+}
+
+/* Beer supplies process-wide compatibility state for selected runtime APIs.
+ * Their fallback is considered only after the native DLL-open path (including
+ * guest hooks) declines the module, and before loading an incompatible second
+ * implementation from a host-visible file. */
+static inline int beer_module_prefers_compat_fallback(const char *lower_name)
+{
+    return lower_name && !strcmp(lower_name, "steam_api64.dll");
+}
+
+/* These names belong to the Windows runtime rather than the application DLL
+ * search directory. A guest PE already loaded for one of them remains valid,
+ * but an unresolved name falls back to Beer's process runtime instead of a
+ * protector's application-private virtual filesystem. */
+static inline int beer_module_is_windows_runtime_dll(const char *lower_name)
+{
+    static const char *const names[] = {
+        "kernel32.dll", "kernelbase.dll", "user32.dll", "ntdll.dll",
+        "advapi32.dll", "win32u.dll", "gdi32.dll", "shell32.dll",
+        "ole32.dll", "oleaut32.dll", "comctl32.dll", "uxtheme.dll",
+        "dwmapi.dll", "msimg32.dll", "shlwapi.dll", "shfolder.dll",
+        "version.dll", "setupapi.dll", "comdlg32.dll", "imm32.dll",
+        "winmm.dll", "hid.dll", "crypt32.dll", "psapi.dll", "ws2_32.dll"
+    };
+    if (!lower_name) return 0;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+        if (!strcmp(lower_name, names[i])) return 1;
+    return !strncmp(lower_name, "api-ms-", 7) ||
+           !strncmp(lower_name, "ext-ms-", 7);
+}
+
 /* GUID bytes use the in-memory Win32 layout: Data1/Data2/Data3 are little
  * endian, while Data4 is stored in declaration order. */
 static inline int beer_guid_equal(const void *value, const uint8_t expected[16])

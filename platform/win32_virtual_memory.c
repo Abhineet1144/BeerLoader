@@ -6,9 +6,58 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
-#define BEER_VM_CAPACITY 1024u
+#define BEER_VM_CAPACITY 16384u
+
+/* IsBadStringPtr is an obsolete snapshot probe, not a lifetime guarantee.
+ * Read through the kernel rather than dereferencing guest memory or borrowing
+ * the process-wide fault handler. A partial read can still contain the NUL
+ * before an inaccessible page, so examine complete characters before failing. */
+static int bad_string_pointer(const void *string, size_t maximum, size_t width)
+{
+    uintptr_t address = (uintptr_t)string;
+    int saved_errno = errno;
+    int bad = 0;
+    while (maximum) {
+        unsigned char bytes[256];
+        size_t count = maximum < sizeof(bytes) / width ?
+                       maximum : sizeof(bytes) / width;
+        size_t available = (UINTPTR_MAX - address) / width;
+        if (count > available) count = available;
+        if (!address || !count) { bad = 1; break; }
+        size_t length = count * width;
+        struct iovec local = {bytes, length};
+        struct iovec remote = {(void *)address, length};
+        ssize_t got;
+        do {
+            got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        } while (got < 0 && errno == EINTR);
+        if (got <= 0) { bad = 1; break; }
+        for (size_t i = 0; i + width <= (size_t)got; i += width) {
+            if (!bytes[i] && (width == 1 || !bytes[i + 1])) {
+                errno = saved_errno;
+                return 0;
+            }
+        }
+        if ((size_t)got != length) { bad = 1; break; }
+        address += length;
+        maximum -= count;
+    }
+    errno = saved_errno;
+    return bad;
+}
+
+int beer_is_bad_string_ptr_a(const char *string, size_t maximum)
+{
+    return bad_string_pointer(string, maximum, 1);
+}
+
+int beer_is_bad_string_ptr_w(const uint16_t *string, size_t maximum)
+{
+    return bad_string_pointer(string, maximum, 2);
+}
 
 typedef struct BeerAllocation {
     void *base;
@@ -78,8 +127,8 @@ static BeerAllocation *find_allocation_locked(const void *address)
 
 uint64_t g_beer_vm_live_bytes;   /* mapped by VirtualAlloc, not yet released */
 
-void *beer_virtual_alloc(void *address, size_t size, uint32_t allocation_type,
-                         uint32_t protection)
+static void *virtual_alloc_aligned(void *address, size_t size, uint32_t allocation_type,
+                                   uint32_t protection, size_t alignment)
 {
     if (!size || !(allocation_type & (BEER_MEM_RESERVE | BEER_MEM_COMMIT))) {
         errno = EINVAL;
@@ -124,7 +173,8 @@ void *beer_virtual_alloc(void *address, size_t size, uint32_t allocation_type,
     if (!address) {
         /* Windows reserves in 64 KiB allocation-granularity units and returns
          * 64 KiB-aligned bases; runtimes and allocators rely on that. */
-        const size_t granularity = 65536;
+        size_t granularity = 65536;
+        if (alignment > granularity) granularity = alignment;
         size_t region = align_up_size(mapped_size, granularity);
         if (!region) { errno = ENOMEM; return NULL; }
         size_t span = region + granularity;
@@ -165,6 +215,20 @@ void *beer_virtual_alloc(void *address, size_t size, uint32_t allocation_type,
         return NULL;
     }
     return mapped;
+}
+
+void *beer_virtual_alloc(void *address, size_t size, uint32_t allocation_type,
+                         uint32_t protection)
+{
+    return virtual_alloc_aligned(address, size, allocation_type, protection, 0);
+}
+
+/* VirtualAlloc2 with an alignment requirement (power of two, 0 = allocation granularity). */
+void *beer_virtual_alloc_aligned(size_t size, size_t alignment, uint32_t allocation_type,
+                                 uint32_t protection)
+{
+    if (alignment & (alignment - 1)) { errno = EINVAL; return NULL; }
+    return virtual_alloc_aligned(NULL, size, allocation_type, protection, alignment);
 }
 
 int beer_virtual_free(void *address, size_t size, uint32_t free_type)

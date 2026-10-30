@@ -199,4 +199,10 @@ Bd12ImagePresenter bd12_com_get_image_presenter(void);
 
 uint64_t MS beer_bd12_create_device(const uint8_t *riid, void **device);
 
+/* DXGI swap chain over BD12 textures (ID3D12CommandQueue as the creation "device"). */
+int bd12_com_is_queue(const void *object);
+uint64_t bd12_com_create_swapchain(void *queue, const uint8_t *desc, void **out);
+void bd12_com_set_event_factory(uint64_t (*fn)(void));   /* creates a signaled manual-reset event handle */
+void bd12_com_set_dxgi_factory(void *factory);
+
 #endif

@@ -6145,8 +6145,14 @@ static HRESULT __attribute__((ms_abi)) swapchain_query_interface(
 {
     if (!ppvObj) return (HRESULT)0x80070057;
     *ppvObj = NULL;
-    if (!iid_equal(riid, iid_iunknown) && !iid_equal(riid, iid_idxgiswapchain))
+    if (!iid_equal(riid, iid_iunknown) && !iid_equal(riid, iid_idxgiswapchain)) {
+        if (getenv("BEER_COM_DIAGNOSTICS") && riid) {
+            const uint8_t *g = (const uint8_t *)riid;
+            fprintf(stderr, "[DXGI QI] swapchain refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+                    g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+        }
         return E_NOINTERFACE;
+    }
     *ppvObj = object;
     com_addref(object);
     return S_OK;

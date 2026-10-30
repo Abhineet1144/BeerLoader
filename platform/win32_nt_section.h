@@ -22,6 +22,7 @@ uint32_t beer_nt_section_map(uint64_t handle, void **base_address,
                              size_t *view_size, uint32_t inherit_disposition,
                              uint32_t allocation_type, uint32_t protection);
 uint32_t beer_nt_section_unmap(void *base_address);
+int beer_nt_section_is_image(uint64_t handle);
 int beer_nt_section_close(uint64_t handle);
 void beer_nt_section_reset(void);
 

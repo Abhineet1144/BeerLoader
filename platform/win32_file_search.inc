@@ -485,6 +485,13 @@ static u64 __attribute__((ms_abi)) beer_NtSetInformationFile(u64 h, void *iosb, 
         return 0;
     }
     if (klass == 19) { nt_set_iosb(iosb, 0, 0); return 0; } /* FileAllocationInformation */
+    if (klass == 41 && length >= 4) {                       /* FileIoCompletionNotificationInformation */
+        impl_SetFileCompletionNotificationModes(h, (u8)*(const u32 *)info);
+        nt_set_iosb(iosb, 0, 0);
+        return 0;
+    }
+    if (getenv("BEER_IOCP_DIAGNOSTICS"))
+        fprintf(stderr, "[NT] NtSetInformationFile class=%u length=%u not supported\n", klass, length);
     return 0xC0000003u;
 }
 
@@ -639,11 +646,25 @@ static u64 __attribute__((ms_abi)) beer_GetExitCodeProcess(u64 process, u32 *cod
 }
 
 /* ---- Message boxes: nothing to show headlessly; record the text and answer like a dismissed box. ---- */
+/* The guest call chain of a message box names the code that raised it (return addresses on the guest stack). */
+static void beer_log_guest_stack(const char *tag)
+{
+    u64 rsp = 0;
+    __asm__ volatile("mov %%fs:g_saved_guest_rsp@tpoff, %0" : "=r"(rsp));
+    if (!rsp) return;
+    fprintf(stderr, "[%s] guest stack:", tag);
+    for (int i = 0; i < 96; ++i) {
+        u64 v = ((const u64 *)rsp)[i];
+        if (v > 0x10000000ULL && v < 0x7fffffffffffULL) fprintf(stderr, " %llx", (unsigned long long)v);
+    }
+    fprintf(stderr, "\n");
+}
 static u64 beer_message_box_result(u32 type)
 {
     switch (type & 0xF) {
     case 4: case 3: return 7;                               /* Yes/No(/Cancel): answer No */
     case 5: return 2;                                       /* Retry/Cancel */
+    case 2: return 5;                                       /* Abort/Retry/Ignore: Ignore (CRT assertions continue) */
     default: return 1;                                      /* OK / OK-Cancel */
     }
 }
@@ -651,6 +672,7 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxA(u64 owner, const char *text,
 {
     (void)owner;
     fprintf(stderr, "[MSGBOX] \"%s\": %s\n", title ? title : "", text ? text : "");
+    beer_log_guest_stack("MSGBOX");
     return beer_message_box_result(type);
 }
 static u64 __attribute__((ms_abi)) beer_MessageBoxW(u64 owner, const u16 *text, const u16 *title, u32 type)
@@ -659,6 +681,7 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxW(u64 owner, const u16 *text, 
     char t[512], c[1024];
     reg_narrow(title, t, sizeof(t)); reg_narrow(text, c, sizeof(c));
     fprintf(stderr, "[MSGBOX] \"%s\": %s\n", t, c);
+    beer_log_guest_stack("MSGBOX");
     return beer_message_box_result(type);
 }
 

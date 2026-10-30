@@ -5,9 +5,27 @@
 
 int main(void)
 {
+    assert(beer_steam_parse_app_id_text("3357650\n") == 3357650u);
+    assert(beer_steam_parse_app_id_text("  2050650 \r\n") == 2050650u);
+    assert(beer_steam_parse_app_id_text("0") == 0u);
+    assert(beer_steam_parse_app_id_text("3357650x") == 0u);
+    assert(beer_steam_parse_app_id_text("99999999999") == 0u);
+    assert(beer_steam_parse_app_id_text(NULL) == 0u);
     assert(!beer_steam_local_user_logged_on(0));
     assert(beer_steam_local_user_logged_on(1));
     assert(beer_steam_local_user_id() == UINT64_C(0x0110000100000001));
+
+    char registry_root[256];
+    assert(beer_steam_registry_root(0, NULL, registry_root, sizeof(registry_root)));
+    assert(!strcmp(registry_root, "C:\\Program Files (x86)\\Steam"));
+    assert(beer_steam_registry_root(
+        1, "Z:\\mnt\\Games\\PRAGMATA\\PRAGMATA.exe",
+        registry_root, sizeof(registry_root)));
+    assert(!strcmp(registry_root, "Z:\\mnt\\Games\\PRAGMATA"));
+    assert(!beer_steam_registry_root(1, "PRAGMATA.exe",
+                                     registry_root, sizeof(registry_root)));
+    assert(!beer_steam_registry_root(1, "Z:\\PRAGMATA.exe", registry_root, 2));
+
     assert(BEER_STEAM_REMOTE_STORAGE_FILE_WRITE_SLOT == 0u);
     assert(BEER_STEAM_REMOTE_STORAGE_FILE_READ_SLOT == 1u);
     assert(BEER_STEAM_REMOTE_STORAGE_FILE_WRITE_ASYNC_SLOT == 2u);

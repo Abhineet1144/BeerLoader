@@ -20,7 +20,14 @@ typedef struct BD12HeapMirror {
     VkDescriptorPool pool;
     VkDescriptorSet set;
     pthread_mutex_t lock;
+    const BD12DescriptorHeap *sampler_heap;   /* sampler heap currently mirrored into binding 5 */
+    uint32_t sampler_gen;
 } BD12HeapMirror;
+
+/* Binding 4 mirrors constant buffers; binding 5 holds the bound sampler heap (at most 2048 entries). */
+#define MIRROR_BINDINGS 6u
+#define MIRROR_SAMPLERS 2048u
+#define MIRROR_COUNT_OF(i) ((i) == 5u ? MIRROR_SAMPLERS : BD12_MIRROR_COUNT)
 
 #define MAX_HEAPS 64
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -33,22 +40,23 @@ static int g_layout_failed;
 static BD12Image **g_pending;
 static size_t g_pending_count, g_pending_capacity;
 
-static const VkDescriptorType k_types[4] = {
+static const VkDescriptorType k_types[MIRROR_BINDINGS] = {
     VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-    VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+    VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLER
 };
 
 VkDescriptorSetLayout bd12_mirror_layout(BD12Device *device)
 {
     pthread_mutex_lock(&g_lock);
     if (!g_layout && !g_layout_failed) {
-        VkDescriptorSetLayoutBinding bindings[4];
-        VkDescriptorBindingFlags flags[4];
-        for (uint32_t i = 0; i < 4; ++i) {
+        VkDescriptorSetLayoutBinding bindings[MIRROR_BINDINGS];
+        VkDescriptorBindingFlags flags[MIRROR_BINDINGS];
+        for (uint32_t i = 0; i < MIRROR_BINDINGS; ++i) {
             bindings[i] = (VkDescriptorSetLayoutBinding){
                 .binding = i,
                 .descriptorType = k_types[i],
-                .descriptorCount = BD12_MIRROR_COUNT,
+                .descriptorCount = MIRROR_COUNT_OF(i),
                 .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT |
                               (device->rt_enabled ? (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                                                      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
@@ -60,14 +68,14 @@ VkDescriptorSetLayout bd12_mirror_layout(BD12Device *device)
         }
         VkDescriptorSetLayoutBindingFlagsCreateInfo flag_info = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
-            .bindingCount = 4,
+            .bindingCount = MIRROR_BINDINGS,
             .pBindingFlags = flags
         };
         VkDescriptorSetLayoutCreateInfo info = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = &flag_info,
             .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
-            .bindingCount = 4,
+            .bindingCount = MIRROR_BINDINGS,
             .pBindings = bindings
         };
         if (device->vk.CreateDescriptorSetLayout(device->device, &info, NULL,
@@ -126,6 +134,7 @@ static void write_range(BD12DescriptorHeap *heap, uint32_t first, uint32_t count
     enum { CHUNK = 128 };
     VkWriteDescriptorSet writes[CHUNK];
     VkDescriptorImageInfo images[CHUNK];
+    VkDescriptorBufferInfo buffers[CHUNK];
     VkBufferView views[CHUNK];
     uint32_t n = 0;
     pthread_mutex_lock(&mirror->lock);
@@ -138,9 +147,28 @@ static void write_range(BD12DescriptorHeap *heap, uint32_t first, uint32_t count
         case BD12_DESC_UAV_IMAGE: binding = 1; break;
         case BD12_DESC_SRV_BUFFER: binding = 2; break;
         case BD12_DESC_UAV_BUFFER: binding = 3; break;
+        case BD12_DESC_CBV: binding = 4; break;
         default: continue;
         }
         if (!bd12_descriptor_alive(d)) continue;
+        if (binding == 4) {
+            if (!d->buffer) continue;
+            buffers[n] = (VkDescriptorBufferInfo){ d->buffer, d->offset, d->range };
+            writes[n] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = mirror->set,
+                .dstBinding = 4,
+                .dstArrayElement = i,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &buffers[n]
+            };
+            if (++n == CHUNK) {
+                device->vk.UpdateDescriptorSets(device->device, n, writes, 0, NULL);
+                n = 0;
+            }
+            continue;
+        }
         VkBufferView buffer_view = d->buffer_view;
         if (binding >= 2 && !buffer_view && d->source_buffer)
             buffer_view = bd12_buffer_view_pinned(d->source_buffer, d->format, d->offset,
@@ -204,14 +232,14 @@ static BD12HeapMirror *mirror_ensure(BD12DescriptorHeap *heap)
     BD12HeapMirror *mirror = calloc(1, sizeof(*mirror));
     if (!mirror) return NULL;
     pthread_mutex_init(&mirror->lock, NULL);
-    VkDescriptorPoolSize sizes[4];
-    for (uint32_t i = 0; i < 4; ++i)
-        sizes[i] = (VkDescriptorPoolSize){ k_types[i], BD12_MIRROR_COUNT };
+    VkDescriptorPoolSize sizes[MIRROR_BINDINGS];
+    for (uint32_t i = 0; i < MIRROR_BINDINGS; ++i)
+        sizes[i] = (VkDescriptorPoolSize){ k_types[i], MIRROR_COUNT_OF(i) };
     VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
         .maxSets = 1,
-        .poolSizeCount = 4,
+        .poolSizeCount = MIRROR_BINDINGS,
         .pPoolSizes = sizes
     };
     VkDescriptorSetAllocateInfo alloc = {
@@ -275,6 +303,36 @@ int bd12_mirror_prepare(BD12CmdList *list)
     return 1;
 }
 
+/* SamplerDescriptorHeap[] access indexes this array: it follows the sampler heap the list has bound. */
+static void mirror_refresh_samplers(BD12HeapMirror *mirror, BD12Device *device, const BD12DescriptorHeap *samplers)
+{
+    if (!samplers || samplers->type != 1) return;
+    pthread_mutex_lock(&mirror->lock);
+    if (mirror->sampler_heap == samplers && mirror->sampler_gen == samplers->sampler_gen) {
+        pthread_mutex_unlock(&mirror->lock);
+        return;
+    }
+    enum { CHUNK = 128 };
+    VkWriteDescriptorSet writes[CHUNK];
+    VkDescriptorImageInfo infos[CHUNK];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < samplers->count && i < MIRROR_SAMPLERS; ++i) {
+        const BD12Descriptor *d = &samplers->descriptors[i];
+        if (d->kind != BD12_DESC_SAMPLER || !d->sampler) continue;
+        infos[n] = (VkDescriptorImageInfo){ d->sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+        writes[n] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = mirror->set, .dstBinding = 5, .dstArrayElement = i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &infos[n]
+        };
+        if (++n == CHUNK) { device->vk.UpdateDescriptorSets(device->device, n, writes, 0, NULL); n = 0; }
+    }
+    if (n) device->vk.UpdateDescriptorSets(device->device, n, writes, 0, NULL);
+    mirror->sampler_heap = samplers;
+    mirror->sampler_gen = samplers->sampler_gen;
+    pthread_mutex_unlock(&mirror->lock);
+}
+
 int bd12_cmd_bind_bindless(BD12CmdList *list, BD12BindState *state,
                            VkPipelineBindPoint point, VkPipelineLayout layout,
                            VkShaderStageFlags stages,
@@ -292,6 +350,7 @@ int bd12_cmd_bind_bindless(BD12CmdList *list, BD12BindState *state,
             values[bindless[i].push_word] = index;
     }
     BD12Device *device = list->device;
+    mirror_refresh_samplers(heap->mirror, device, list->heaps[1]);
     device->vk.CmdBindDescriptorSets(list->command_buffer, point, layout, 1, 1,
                                      &heap->mirror->set, 0, NULL);
     if (words)

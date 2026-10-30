@@ -252,3 +252,20 @@ beer_d3d12_serialize_versioned_root_signature(const void *description,
     *blob = object;
     return BEER_S_OK;
 }
+
+/* D3D12SerializeRootSignature takes a version-1.0 D3D12_ROOT_SIGNATURE_DESC; wrap it as the
+ * versioned description and share the serializer above. */
+uint64_t __attribute__((ms_abi))
+beer_d3d12_serialize_root_signature(const void *description, uint32_t version,
+                                    void **blob, void **error_blob)
+{
+    (void)version;
+    if (blob) *blob = NULL;
+    if (error_blob) *error_blob = NULL;
+    if (!description || !blob) return BEER_E_INVALIDARG;
+    uint8_t versioned[48] = {0};
+    uint32_t v1 = 1;
+    memcpy(versioned, &v1, sizeof(v1));
+    memcpy(versioned + 8, description, 40);
+    return beer_d3d12_serialize_versioned_root_signature(versioned, blob, error_blob);
+}
