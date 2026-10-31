@@ -45,5 +45,15 @@
             android:launchMode="singleTask">
             <meta-data android:name="android.app.lib_name" android:value="beer" />
         </activity>
+        <!-- The game as the start screen opens it: the native activity plus the on-screen controller (beer.pad). -->
+        <activity
+            android:name="com.beer.loader.GameActivity"
+            android:exported="true"
+            android:label="Beer"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|uiMode|density|navigation"
+            android:launchMode="singleTask">
+            <meta-data android:name="android.app.lib_name" android:value="beer" />
+        </activity>
     </application>
 </manifest>

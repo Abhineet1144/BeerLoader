@@ -24,8 +24,11 @@ cp "$FFMPEG/ffmpeg" "$STAGE/lib/arm64-v8a/libffmpeg.so"
 cp "$FFMPEG/ffprobe" "$STAGE/lib/arm64-v8a/libffprobe.so"
 "$STRIP" --strip-unneeded "$STAGE"/lib/arm64-v8a/*.so
 
+# BEER_APK_PACKAGE=<id> installs under another package id (a separate app with its own data), e.g. one a phone's
+# game booster gives full performance to. Class names stay com.beer.loader.*.
 "$BT/aapt2" link -o "$OUT/beer-unsigned.apk" --manifest android/apk/AndroidManifest.xml -I "$JAR" \
-    --min-sdk-version 30 --target-sdk-version 35 --version-code 1 --version-name 0.1
+    --min-sdk-version 30 --target-sdk-version 35 --version-code 1 --version-name 0.1 \
+    ${BEER_APK_PACKAGE:+--rename-manifest-package "$BEER_APK_PACKAGE"}
 # The start screen (Java, no resources): javac against android.jar, then d8 to classes.dex at the APK root.
 rm -rf "$OUT/classes" && mkdir -p "$OUT/classes" "$OUT/dex"
 javac -nowarn -source 11 -target 11 -cp "$JAR" -d "$OUT/classes" $(find android/apk/java -name '*.java') 2> "$OUT/javac.log" ||

@@ -87,6 +87,7 @@ struct BD12Device {
 
     pthread_mutex_t view_lock;    /* guards every BD12Buffer view cache */
     pthread_mutex_t va_lock;
+    pthread_rwlock_t buffer_lock; /* held shared while binding a re-resolved buffer, exclusive while destroying one */
     BD12VaEntry *va_table;        /* sorted by va */
     size_t va_count, va_capacity;
 

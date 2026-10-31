@@ -13,6 +13,7 @@
 #include "xwayland_backend.h"
 #include "vulkan_context.h"
 #include "beer_overlay.h"
+#include "beer_gamepad.h"
 
 #include <android/input.h>
 #include <android/log.h>
@@ -143,9 +144,128 @@ static void emit_pointer(XwaylandEventType type, float x, float y, unsigned butt
     push_event(&e);
 }
 
+/* Touch as a touchpad: dragging moves the cursor by the finger's movement (games read the mouse as relative motion, so
+ * the cursor must not jump to where a finger lands), a short tap is a left click at the cursor, and a two-finger tap is
+ * a right click (the "back" of many PC menus). A tap must stay within TAP_SLOP pixels and TAP_NS of its press; anything
+ * longer or further is a drag. `pointers` is the number of fingers down. Also fed by the on-screen pad's view for
+ * touches that land outside its controls. */
+static void touchpad_event(int action, float x, float y, int pointers, int64_t time_ns)
+{
+    enum { TAP_SLOP = 24 };
+    const int64_t TAP_NS = 300000000;
+    static float down_x, down_y, last_x, last_y, cursor_x = -1, cursor_y = -1;
+    static int64_t down_time;
+    static int moved, max_pointers;
+    if (cursor_x < 0) { cursor_x = A.width / 2.0f; cursor_y = A.height / 2.0f; }
+    switch (action) {
+    case AMOTION_EVENT_ACTION_DOWN:
+        down_x = last_x = x; down_y = last_y = y;
+        down_time = time_ns;
+        moved = 0;
+        max_pointers = 1;
+        break;
+    case AMOTION_EVENT_ACTION_POINTER_DOWN:
+        if (pointers > max_pointers) max_pointers = pointers;
+        break;
+    case AMOTION_EVENT_ACTION_MOVE:
+        if (fabsf(x - down_x) > TAP_SLOP || fabsf(y - down_y) > TAP_SLOP) moved = 1;
+        if (max_pointers == 1) {
+            cursor_x = fminf(fmaxf(cursor_x + (x - last_x), 0), (float)(A.width > 0 ? A.width - 1 : 0));
+            cursor_y = fminf(fmaxf(cursor_y + (y - last_y), 0), (float)(A.height > 0 ? A.height - 1 : 0));
+            emit_pointer(XWAYLAND_EVENT_POINTER_MOTION, cursor_x, cursor_y, 0);
+        }
+        last_x = x; last_y = y;
+        break;
+    case AMOTION_EVENT_ACTION_UP:
+        if (!moved && time_ns - down_time <= TAP_NS * (max_pointers > 1 ? 2 : 1)) {
+            const unsigned button = max_pointers > 1 ? 3 : 1;   /* X11: 1 left, 3 right */
+            emit_pointer(XWAYLAND_EVENT_BUTTON_DOWN, cursor_x, cursor_y, button);
+            usleep(50000);   /* hold it across a few frames: games that poll the mouse once per frame see it */
+            emit_pointer(XWAYLAND_EVENT_BUTTON_UP, cursor_x, cursor_y, button);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* A physical gamepad (Bluetooth/USB): Android key codes for its buttons, joystick axes for sticks, triggers and hat. */
+static BeerGamepadState g_physical_pad;
+
+static uint16_t gamepad_button(int keycode)
+{
+    switch (keycode) {
+    case AKEYCODE_BUTTON_A: return BEER_PAD_A;
+    case AKEYCODE_BUTTON_B: return BEER_PAD_B;
+    case AKEYCODE_BUTTON_X: return BEER_PAD_X;
+    case AKEYCODE_BUTTON_Y: return BEER_PAD_Y;
+    case AKEYCODE_BUTTON_L1: return BEER_PAD_LEFT_SHOULDER;
+    case AKEYCODE_BUTTON_R1: return BEER_PAD_RIGHT_SHOULDER;
+    case AKEYCODE_BUTTON_THUMBL: return BEER_PAD_LEFT_THUMB;
+    case AKEYCODE_BUTTON_THUMBR: return BEER_PAD_RIGHT_THUMB;
+    case AKEYCODE_BUTTON_START: return BEER_PAD_START;
+    case AKEYCODE_BUTTON_SELECT: return BEER_PAD_BACK;
+    case AKEYCODE_DPAD_UP: return BEER_PAD_DPAD_UP;
+    case AKEYCODE_DPAD_DOWN: return BEER_PAD_DPAD_DOWN;
+    case AKEYCODE_DPAD_LEFT: return BEER_PAD_DPAD_LEFT;
+    case AKEYCODE_DPAD_RIGHT: return BEER_PAD_DPAD_RIGHT;
+    default: return 0;
+    }
+}
+
+static int16_t axis16(float v, int invert)
+{
+    if (invert) v = -v;
+    if (v > 1.0f) v = 1.0f;
+    if (v < -1.0f) v = -1.0f;
+    return (int16_t)(v * 32767.0f);
+}
+
+static int gamepad_event(AInputEvent *event)
+{
+    const int type = AInputEvent_getType(event);
+    BeerGamepadState *p = &g_physical_pad;
+    if (type == AINPUT_EVENT_TYPE_KEY) {
+        const int keycode = AKeyEvent_getKeyCode(event);
+        const int down = AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_DOWN;
+        if (keycode == AKEYCODE_BUTTON_L2) p->left_trigger = down ? 255 : 0;
+        else if (keycode == AKEYCODE_BUTTON_R2) p->right_trigger = down ? 255 : 0;
+        else {
+            const uint16_t bit = gamepad_button(keycode);
+            if (!bit) return 0;
+            p->buttons = down ? (uint16_t)(p->buttons | bit) : (uint16_t)(p->buttons & ~bit);
+        }
+    } else {
+        p->lx = axis16(AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_X, 0), 0);
+        p->ly = axis16(AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Y, 0), 1);
+        p->rx = axis16(AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Z, 0), 0);
+        p->ry = axis16(AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RZ, 0), 1);
+        const float lt = fmaxf(AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_LTRIGGER, 0),
+                               AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_BRAKE, 0));
+        const float rt = fmaxf(AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RTRIGGER, 0),
+                               AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_GAS, 0));
+        p->left_trigger = (uint8_t)(fminf(fmaxf(lt, 0), 1) * 255);
+        p->right_trigger = (uint8_t)(fminf(fmaxf(rt, 0), 1) * 255);
+        const float hx = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_HAT_X, 0);
+        const float hy = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_HAT_Y, 0);
+        p->buttons &= (uint16_t)~(BEER_PAD_DPAD_UP | BEER_PAD_DPAD_DOWN | BEER_PAD_DPAD_LEFT | BEER_PAD_DPAD_RIGHT);
+        if (hx < -0.5f) p->buttons |= BEER_PAD_DPAD_LEFT;
+        if (hx > 0.5f) p->buttons |= BEER_PAD_DPAD_RIGHT;
+        if (hy < -0.5f) p->buttons |= BEER_PAD_DPAD_UP;
+        if (hy > 0.5f) p->buttons |= BEER_PAD_DPAD_DOWN;
+    }
+    beer_gamepad_update(BEER_PAD_SOURCE_PHYSICAL, 1, p);
+    return 1;
+}
+
 static int handle_input_event(AInputEvent *event)
 {
     const int type = AInputEvent_getType(event);
+    const int32_t source = AInputEvent_getSource(event);
+    if ((source & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD ||
+        ((source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK && type == AINPUT_EVENT_TYPE_MOTION)) {
+        if (gamepad_event(event)) return 1;
+    }
     if (type == AINPUT_EVENT_TYPE_KEY) {
         const KeyMap *map = find_key(AKeyEvent_getKeyCode(event));
         if (!map) return 0;
@@ -160,56 +280,34 @@ static int handle_input_event(AInputEvent *event)
         return 1;
     }
     if (type == AINPUT_EVENT_TYPE_MOTION) {
-        /* Touch as a touchpad: dragging moves the cursor by the finger's movement (games read the mouse as relative
-         * motion, so the cursor must not jump to where a finger lands), a short tap is a left click at the cursor, and
-         * a two-finger tap is a right click (the "back" of many PC menus). A tap must stay within TAP_SLOP pixels and
-         * TAP_NS of its press; anything longer or further is a drag. */
-        enum { TAP_SLOP = 24 };
-        const int64_t TAP_NS = 300000000;
-        static float down_x, down_y, last_x, last_y, cursor_x = -1, cursor_y = -1;
-        static int64_t down_time;
-        static int moved, max_pointers;
-        if (cursor_x < 0) { cursor_x = A.width / 2.0f; cursor_y = A.height / 2.0f; }
         const int action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
-        const float x = AMotionEvent_getX(event, 0), y = AMotionEvent_getY(event, 0);
-        switch (action) {
-        case AMOTION_EVENT_ACTION_DOWN:
-            down_x = last_x = x; down_y = last_y = y;
-            down_time = AMotionEvent_getEventTime(event);
-            moved = 0;
-            max_pointers = 1;
-            break;
-        case AMOTION_EVENT_ACTION_POINTER_DOWN:
-            if ((int)AMotionEvent_getPointerCount(event) > max_pointers)
-                max_pointers = (int)AMotionEvent_getPointerCount(event);
-            break;
-        case AMOTION_EVENT_ACTION_MOVE:
-            if (fabsf(x - down_x) > TAP_SLOP || fabsf(y - down_y) > TAP_SLOP) moved = 1;
-            if (max_pointers == 1) {
-                cursor_x = fminf(fmaxf(cursor_x + (x - last_x), 0), (float)(A.width > 0 ? A.width - 1 : 0));
-                cursor_y = fminf(fmaxf(cursor_y + (y - last_y), 0), (float)(A.height > 0 ? A.height - 1 : 0));
-                emit_pointer(XWAYLAND_EVENT_POINTER_MOTION, cursor_x, cursor_y, 0);
-            }
-            last_x = x; last_y = y;
-            break;
-        case AMOTION_EVENT_ACTION_UP: {
-            const int tap = !moved && AMotionEvent_getEventTime(event) - down_time <= TAP_NS * (max_pointers > 1 ? 2 : 1);
-            if (tap) {
-                const unsigned button = max_pointers > 1 ? 3 : 1;   /* X11: 1 left, 3 right */
-                emit_pointer(XWAYLAND_EVENT_BUTTON_DOWN, cursor_x, cursor_y, button);
-                usleep(50000);   /* hold it across a few frames: games that poll the mouse once per frame see it */
-                emit_pointer(XWAYLAND_EVENT_BUTTON_UP, cursor_x, cursor_y, button);
-            }
-            break;
-        }
-        case AMOTION_EVENT_ACTION_POINTER_UP:
-        case AMOTION_EVENT_ACTION_CANCEL:
-            break;
-        default: return 0;
-        }
+        if (action != AMOTION_EVENT_ACTION_DOWN && action != AMOTION_EVENT_ACTION_POINTER_DOWN &&
+            action != AMOTION_EVENT_ACTION_MOVE && action != AMOTION_EVENT_ACTION_UP &&
+            action != AMOTION_EVENT_ACTION_POINTER_UP && action != AMOTION_EVENT_ACTION_CANCEL)
+            return 0;
+        touchpad_event(action, AMotionEvent_getX(event, 0), AMotionEvent_getY(event, 0),
+                       (int)AMotionEvent_getPointerCount(event), AMotionEvent_getEventTime(event));
         return 1;
     }
     return 0;
+}
+
+/* The on-screen pad (android/apk/java/.../PadView.java) reports the whole controller state, and passes touches that miss
+ * its controls on to the touchpad. */
+JNIEXPORT void JNICALL Java_com_beer_loader_PadView_nativePad(JNIEnv *env, jclass cls, jboolean connected, jint buttons,
+                                                             jint lt, jint rt, jint lx, jint ly, jint rx, jint ry)
+{
+    (void)env; (void)cls;
+    const BeerGamepadState state = { (uint16_t)buttons, (uint8_t)lt, (uint8_t)rt, (int16_t)lx, (int16_t)ly,
+                                     (int16_t)rx, (int16_t)ry };
+    beer_gamepad_update(BEER_PAD_SOURCE_ONSCREEN, connected, &state);
+}
+
+JNIEXPORT void JNICALL Java_com_beer_loader_PadView_nativeTouch(JNIEnv *env, jclass cls, jint action, jfloat x, jfloat y,
+                                                               jint pointers, jlong time_ns)
+{
+    (void)env; (void)cls;
+    touchpad_event(action, x, y, pointers, time_ns);
 }
 
 static int input_callback(int fd, int events, void *data)
@@ -335,12 +433,18 @@ static void request_all_files_access(ANativeActivity *activity)
 
     jclass uri_class = (*env)->FindClass(env, "android/net/Uri");
     jmethodID parse = (*env)->GetStaticMethodID(env, uri_class, "parse", "(Ljava/lang/String;)Landroid/net/Uri;");
-    jobject uri = (*env)->CallStaticObjectMethod(env, uri_class, parse, (*env)->NewStringUTF(env, "package:com.beer.loader"));
+    jclass activity_class = (*env)->GetObjectClass(env, activity->clazz);
+    jmethodID package_name = (*env)->GetMethodID(env, activity_class, "getPackageName", "()Ljava/lang/String;");
+    jstring package = (*env)->CallObjectMethod(env, activity->clazz, package_name);
+    const char *package_chars = package ? (*env)->GetStringUTFChars(env, package, NULL) : NULL;
+    char uri_text[256];
+    snprintf(uri_text, sizeof(uri_text), "package:%s", package_chars ? package_chars : "com.beer.loader");
+    if (package_chars) (*env)->ReleaseStringUTFChars(env, package, package_chars);
+    jobject uri = (*env)->CallStaticObjectMethod(env, uri_class, parse, (*env)->NewStringUTF(env, uri_text));
     jclass intent_class = (*env)->FindClass(env, "android/content/Intent");
     jmethodID init = (*env)->GetMethodID(env, intent_class, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V");
     jobject intent = (*env)->NewObject(env, intent_class, init,
         (*env)->NewStringUTF(env, "android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION"), uri);
-    jclass activity_class = (*env)->GetObjectClass(env, activity->clazz);
     jmethodID start = (*env)->GetMethodID(env, activity_class, "startActivity", "(Landroid/content/Intent;)V");
     (*env)->CallVoidMethod(env, activity->clazz, start, intent);
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);

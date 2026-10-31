@@ -284,36 +284,57 @@ uint64_t CallSlot(const CPUState& st, uint64_t ret) {
   return 0;
 }
 
-// Points every slot holding `fn` in the loader's initialized data (.data, .data.rel.ro: the static COM vtables) at its
+// Points every slot holding `fn` in the loader's .data and .data.rel.ro (where the static COM vtables live) at its
 // thunk. Used once per function when the faulting call went through a register (`call rax`), which names no slot.
-// .bss is not scanned: the thunk and statistics tables live there.
+// Only those two sections: .got holds the same addresses for the loader's own calls to exported functions, and .bss
+// holds the thunk and statistics tables.
 std::set<uint64_t> g_scanned_fns;
-int PatchDataSegment(struct dl_phdr_info* info, size_t, void* data) {
-  if ((void*)info->dlpi_addr != (void*)&__ehdr_start) return 0;
-  const uint64_t fn = *(const uint64_t*)data, thunk = ((const uint64_t*)data)[1];
-  for (int i = 0; i < info->dlpi_phnum; ++i) {
-    const ElfW(Phdr)& ph = info->dlpi_phdr[i];
-    if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_W)) continue;
-    const uint64_t lo = (info->dlpi_addr + ph.p_vaddr + 7) & ~7ull, hi = info->dlpi_addr + ph.p_vaddr + ph.p_filesz;
-    for (uint64_t a = lo; a + 8 <= hi; a += 8) {
-      if (*(const uint64_t*)a != fn) continue;
-      if (mprotect((void*)(a & ~(kPage - 1)), kPage, PROT_READ | PROT_WRITE) != 0) continue;
-      uint64_t expected = fn;
-      __atomic_compare_exchange_n((uint64_t*)a, &expected, thunk, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+std::vector<std::pair<uint64_t, uint64_t>> g_vtable_sections;   // [start, end) in memory
+
+void FindVtableSections() {
+  Dl_info self{};
+  if (!dladdr((void*)&FindVtableSections, &self) || !self.dli_fname) return;
+  FILE* f = fopen(self.dli_fname, "rb");
+  if (!f) return;
+  ElfW(Ehdr) eh{};
+  std::vector<ElfW(Shdr)> sh;
+  std::vector<char> names;
+  if (fread(&eh, sizeof eh, 1, f) == 1 && eh.e_shentsize == sizeof(ElfW(Shdr)) && eh.e_shstrndx < eh.e_shnum) {
+    sh.resize(eh.e_shnum);
+    if (fseek(f, (long)eh.e_shoff, SEEK_SET) == 0 && fread(sh.data(), sizeof(ElfW(Shdr)), sh.size(), f) == sh.size()) {
+      names.resize(sh[eh.e_shstrndx].sh_size + 1);
+      if (fseek(f, (long)sh[eh.e_shstrndx].sh_offset, SEEK_SET) != 0 ||
+          fread(names.data(), 1, names.size() - 1, f) != names.size() - 1)
+        names.clear();
     }
   }
-  return 1;
+  fclose(f);
+  for (const auto& s : sh) {
+    if (names.empty() || s.sh_name >= names.size() - 1) continue;
+    const char* name = names.data() + s.sh_name;
+    if (strcmp(name, ".data") && strcmp(name, ".data.rel.ro")) continue;
+    const uint64_t lo = (uint64_t)self.dli_fbase + s.sh_addr;
+    g_vtable_sections.push_back({lo, lo + s.sh_size});
+  }
 }
 
 void PatchAllSlots(uint64_t fn) {
   {
     std::scoped_lock lk(g_thunk_lock);
     if (!g_scanned_fns.insert(fn).second) return;   // already scanned
+    static bool found = false;
+    if (!found) { FindVtableSections(); found = true; }
   }
   const uint64_t thunk = ThunkFor(fn);
   if (!thunk) return;
-  uint64_t args[2] = {fn, thunk};
-  dl_iterate_phdr(PatchDataSegment, args);
+  for (const auto& [lo, hi] : g_vtable_sections) {
+    for (uint64_t a = (lo + 7) & ~7ull; a + 8 <= hi; a += 8) {
+      if (*(const uint64_t*)a != fn) continue;
+      if (mprotect((void*)(a & ~(kPage - 1)), kPage, PROT_READ | PROT_WRITE) != 0) continue;
+      uint64_t expected = fn;
+      __atomic_compare_exchange_n((uint64_t*)a, &expected, thunk, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
+  }
 }
 
 // After a faulting call from the guest to host function `fn`: point the slot it came from at a thunk.
@@ -505,7 +526,7 @@ void ChainOrDie(int sig, siginfo_t* si, void* uc) {
 
 void HostSignal(int sig, siginfo_t* si, void* uc_) {
   // Host code called a vtable slot that now holds a guest thunk: run the real host function instead.
-  if (sig == SIGSEGV && IsThunkAddress(((ucontext_t*)uc_)->uc_mcontext.pc)) {
+  if (IsThunkAddress(((ucontext_t*)uc_)->uc_mcontext.pc)) {   // SIGSEGV or SIGILL, depending on the kernel
     auto* huc = (ucontext_t*)uc_;
     huc->uc_mcontext.pc = g_thunk_fn[(huc->uc_mcontext.pc - (uint64_t)g_thunk_area) / kThunkSize].load();
     return;

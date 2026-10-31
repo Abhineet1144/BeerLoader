@@ -73,6 +73,7 @@ BD12Device *bd12_device_create(void)
     device->queue_family = beer_vulkan_queue_family();
     device->modern = modern;
     pthread_mutex_init(&device->va_lock, NULL);
+    pthread_rwlock_init(&device->buffer_lock, NULL);
     pthread_mutex_init(&device->view_lock, NULL);
     pthread_mutex_init(&device->zero_lock, NULL);
 
@@ -294,6 +295,7 @@ void bd12_device_destroy(BD12Device *device)
     free(device->samplers);
     free(device->va_table);
     pthread_mutex_destroy(&device->va_lock);
+    pthread_rwlock_destroy(&device->buffer_lock);
     pthread_mutex_destroy(&device->view_lock);
     free(device);
 }
@@ -519,12 +521,15 @@ static void heap_destroy_impl(BD12Heap *heap)
 
 /* GPU virtual address table ---------------------------------------------- */
 
-static size_t va_lower_bound(const BD12Device *device, uint64_t va)
+/* Placed resources can alias, so several buffers may start at one VA. Entries
+ * are kept sorted with the newest of equal VAs last, and a lookup returns the
+ * newest buffer starting at or below the address. */
+static size_t va_upper_bound(const BD12Device *device, uint64_t va)
 {
     size_t lo = 0, hi = device->va_count;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (device->va_table[mid].va < va) lo = mid + 1; else hi = mid;
+        if (device->va_table[mid].va <= va) lo = mid + 1; else hi = mid;
     }
     return lo;
 }
@@ -543,7 +548,7 @@ static int va_insert(BD12Device *device, BD12Buffer *buffer)
         device->va_table = grown;
         device->va_capacity = capacity;
     }
-    size_t index = va_lower_bound(device, buffer->va);
+    size_t index = va_upper_bound(device, buffer->va);
     memmove(&device->va_table[index + 1], &device->va_table[index],
             (device->va_count - index) * sizeof(*device->va_table));
     device->va_table[index] = (BD12VaEntry){ buffer->va, buffer->size, buffer };
@@ -555,11 +560,14 @@ static int va_insert(BD12Device *device, BD12Buffer *buffer)
 static void va_remove(BD12Device *device, const BD12Buffer *buffer)
 {
     pthread_mutex_lock(&device->va_lock);
-    size_t index = va_lower_bound(device, buffer->va);
-    if (index < device->va_count && device->va_table[index].buffer == buffer) {
-        memmove(&device->va_table[index], &device->va_table[index + 1],
-                (device->va_count - index - 1) * sizeof(*device->va_table));
+    /* Search every entry sharing this VA: an aliased buffer may not be first. */
+    for (size_t index = va_upper_bound(device, buffer->va); index > 0 &&
+         device->va_table[index - 1].va == buffer->va; --index) {
+        if (device->va_table[index - 1].buffer != buffer) continue;
+        memmove(&device->va_table[index - 1], &device->va_table[index],
+                (device->va_count - index) * sizeof(*device->va_table));
         --device->va_count;
+        break;
     }
     pthread_mutex_unlock(&device->va_lock);
 }
@@ -569,12 +577,10 @@ BD12Buffer *bd12_va_resolve(BD12Device *device, uint64_t va,
 {
     BD12Buffer *found = NULL;
     pthread_mutex_lock(&device->va_lock);
-    size_t index = va_lower_bound(device, va);
-    if (index < device->va_count && device->va_table[index].va == va)
-        ++index;
+    size_t index = va_upper_bound(device, va);
     if (index > 0) {
         const BD12VaEntry *entry = &device->va_table[index - 1];
-        if (va >= entry->va && va - entry->va < entry->size) {
+        if (va - entry->va < entry->size) {
             found = entry->buffer;
             if (offset) *offset = va - entry->va;
         }
@@ -656,7 +662,11 @@ void bd12_buffer_destroy(BD12Buffer *buffer)
     if (!buffer) return;
     BD12Device *device = buffer->device;
     bd12_live_remove(buffer);
+    /* A list recording on another thread may be re-binding this buffer right
+     * now (live_buffer in bd12_graphics.c); wait for it to finish. */
+    pthread_rwlock_wrlock(&device->buffer_lock);
     va_remove(device, buffer);
+    pthread_rwlock_unlock(&device->buffer_lock);
     bd12_rt_buffer_release(buffer);
     for (uint32_t i = 0; i < buffer->view_count; ++i)
         device->vk.DestroyBufferView(device->device, buffer->views[i].view,

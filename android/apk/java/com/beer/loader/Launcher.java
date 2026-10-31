@@ -376,8 +376,9 @@ public class Launcher extends Activity {
             try (FileOutputStream out = new FileOutputStream(session)) {
                 out.write(s.toString().getBytes(StandardCharsets.UTF_8));
             }
-            Intent intent = new Intent(this, android.app.NativeActivity.class);
+            Intent intent = new Intent(this, GameActivity.class);
             intent.putExtra(SESSION_EXTRA, session.getAbsolutePath());
+            intent.putExtra(GameActivity.PAD_EXTRA, config.optJSONObject("controller").optBoolean("onscreen", true));
             startActivity(intent);
         } catch (Exception e) {
             new AlertDialog.Builder(this).setMessage("Cannot start: " + e).setPositiveButton("OK", null).show();

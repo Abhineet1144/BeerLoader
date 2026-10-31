@@ -68,6 +68,7 @@
 #include "beer_time.h"
 #include "beer_control.h"
 #include "beer_overlay.h"
+#include "beer_gamepad.h"
 #include "beer_post.h"
 #include "win32_nt_section.h"
 #include "win32_virtual_memory.h"
@@ -14138,28 +14139,52 @@ impl_SendInput(u32 count, const WIN_INPUT *inputs, s32 size)
     return count;
 }
 
+/* XInput: user 0 is Beer's virtual controller (platform/beer_gamepad.c), connected while an input source feeds it
+ * (the Android on-screen pad, a physical gamepad). Without one every user reports ERROR_DEVICE_NOT_CONNECTED. */
 static u64 __attribute__((ms_abi))
-impl_XInputGetStateDisconnected(u32 user_index, void *state)
+impl_XInputGetState(u32 user_index, void *state)
 {
-    (void)user_index;
+    BeerGamepadState pad;
+    uint32_t packet = 0;
     if (state) memset(state, 0, 16); /* XINPUT_STATE */
-    return 1167; /* ERROR_DEVICE_NOT_CONNECTED */
+    if (user_index != 0 || !beer_gamepad_read(&pad, &packet)) return 1167; /* ERROR_DEVICE_NOT_CONNECTED */
+    if (!state) return 87;
+    u8 *out = state;
+    memcpy(out, &packet, 4);                 /* dwPacketNumber */
+    memcpy(out + 4, &pad.buttons, 2);        /* XINPUT_GAMEPAD */
+    out[6] = pad.left_trigger;
+    out[7] = pad.right_trigger;
+    memcpy(out + 8, &pad.lx, 2);
+    memcpy(out + 10, &pad.ly, 2);
+    memcpy(out + 12, &pad.rx, 2);
+    memcpy(out + 14, &pad.ry, 2);
+    return 0;
 }
 
 static u64 __attribute__((ms_abi))
-impl_XInputGetCapabilitiesDisconnected(u32 user_index, u32 flags,
-                                       void *capabilities)
+impl_XInputGetCapabilities(u32 user_index, u32 flags, void *capabilities)
 {
-    (void)user_index;
     (void)flags;
     if (capabilities) memset(capabilities, 0, 20); /* XINPUT_CAPABILITIES */
-    return 1167; /* ERROR_DEVICE_NOT_CONNECTED */
+    if (user_index != 0 || !beer_gamepad_read(NULL, NULL)) return 1167;
+    if (!capabilities) return 87;
+    u8 *out = capabilities;
+    out[0] = 1;                              /* Type: XINPUT_DEVTYPE_GAMEPAD */
+    out[1] = 1;                              /* SubType: XINPUT_DEVSUBTYPE_GAMEPAD */
+    const u16 buttons = 0xF3FF, axis = 0xFFFF;
+    memcpy(out + 4, &buttons, 2);            /* Gamepad: the controls it has */
+    out[6] = out[7] = 0xFF;
+    for (int i = 0; i < 4; ++i) memcpy(out + 8 + i * 2, &axis, 2);
+    memcpy(out + 16, &axis, 2);              /* Vibration: both motors */
+    memcpy(out + 18, &axis, 2);
+    return 0;
 }
 
 static u64 __attribute__((ms_abi))
-impl_XInputDisconnected(u32 user_index, void *state_or_vibration)
+impl_XInputSetState(u32 user_index, void *vibration)
 {
-    return impl_XInputGetStateDisconnected(user_index, state_or_vibration);
+    (void)vibration;   /* rumble is not forwarded */
+    return user_index == 0 && beer_gamepad_read(NULL, NULL) ? 0 : 1167;
 }
 
 /* XInputEnable is ordinal 5 in XInput 1.3. It is a void process-wide policy
@@ -20379,8 +20404,9 @@ static ImplEntry g_impls[] = {
     {"GetRawInputDeviceInfoW",                (ImplFn)impl_GetRawInputDeviceInfoW},
     {"GetRawInputData",                       (ImplFn)impl_GetRawInputData},
     {"SendInput",                             (ImplFn)impl_SendInput},
-    {"XInputGetState",                        (ImplFn)impl_XInputDisconnected},
-    {"XInputSetState",                        (ImplFn)impl_XInputDisconnected},
+    {"XInputGetState",                        (ImplFn)impl_XInputGetState},
+    {"XInputSetState",                        (ImplFn)impl_XInputSetState},
+    {"XInputGetCapabilities",                 (ImplFn)impl_XInputGetCapabilities},
     {"SetCapture",                            (ImplFn)impl_SetCapture},
     {"ReleaseCapture",                        (ImplFn)impl_ReleaseCapture},
     {"SetFocus",                              (ImplFn)impl_SetFocus},
@@ -21333,6 +21359,9 @@ static GuestDll *guest_dll_load(const char *name)
         char lower_name[64];
         lowercase_dll_basename(name, lower_name, sizeof(lower_name));
         if (!strncmp(lower_name, "api-ms-", 7) || !strncmp(lower_name, "ext-ms-", 7)) return NULL;
+        /* The Steam client library is only ever mapped as a data image whose exports are Beer's Steam
+         * emulation (steam_client_module); never execute it, whatever path the caller names. */
+        if (!strcmp(lower_name, "steamclient64.dll")) return NULL;
     }
 
     char path[PATH_MAX];
@@ -21905,14 +21934,13 @@ static void pe_imports(void)
             ImplFn real = fn_only ? find_impl(fn_only) : NULL;
             if (!real && import_by_ordinal && !strcasecmp(dll, "xinput1_3.dll")) {
                 u16 ordinal = (u16)(ilt[i] & 0xffff);
-                /* XInput 1.3 exposes state/capability helpers by ordinal.
-                 * Beer has no controller backend yet, so all observed probes
-                 * report ERROR_DEVICE_NOT_CONNECTED instead of false success
-                 * with untouched output structures. */
+                /* XInput 1.3 exposes its functions by ordinal. */
                 if (ordinal == 2)
-                    real = (ImplFn)impl_XInputGetStateDisconnected;
+                    real = (ImplFn)impl_XInputGetState;
+                else if (ordinal == 3)
+                    real = (ImplFn)impl_XInputSetState;
                 else if (ordinal == 4)
-                    real = (ImplFn)impl_XInputGetCapabilitiesDisconnected;
+                    real = (ImplFn)impl_XInputGetCapabilities;
                 else if (ordinal == 5)
                     real = (ImplFn)impl_XInputEnable;
             }
@@ -22062,13 +22090,17 @@ static void pe_imports(void)
         if (!dll || !dll[0]) break;
         FakePeModule *owner = fake_pe_module_for_import(dll);
         if (!owner) continue;
-        u64 *ilt = rva_ptr(d->orig_ilt ? d->orig_ilt : d->iat_rva);
         u64 *iat = rva_ptr(d->iat_rva);
-        for (int i = 0; ilt[i]; i++) {
-            if (ilt[i] & (1ull << 63)) continue;              /* by ordinal */
+        for (int i = 0; iat[i]; i++) {
+            /* The slot holds a dispatcher thunk; its index names the import ("dll!name"). The name
+             * table cannot be used: without OriginalFirstThunk it is the IAT, already overwritten. */
             if (iat[i] < (u64)(uintptr_t)g_tramp || iat[i] >= (u64)(uintptr_t)g_tramp + g_trampsz)
                 continue;
-            const char *fn = (const char *)rva_ptr((u32)ilt[i] + 2);
+            u64 index = (iat[i] - (u64)(uintptr_t)g_tramp) / THUNK_SZ;
+            const char *label = index < (u64)g_nstubs ? g_snames[index] : NULL;
+            const char *bang = label ? strchr(label, '!') : NULL;
+            if (!bang || bang[1] == '#') continue;            /* by ordinal */
+            const char *fn = bang + 1;
             u64 address = fake_pe_export_address(owner->base, fn);
             for (size_t m = 0; address && m < sizeof(g_fake_pe_modules) / sizeof(*g_fake_pe_modules); ++m) {
                 u64 base = g_fake_pe_modules[m].base;

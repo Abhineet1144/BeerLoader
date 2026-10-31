@@ -686,6 +686,7 @@ static int prepare_draw(BD12CmdList *list)
         VkDeviceSize offsets[BD12_MAX_VERTEX_BUFFERS];
         VkDeviceSize sizes[BD12_MAX_VERTEX_BUFFERS];
         VkDeviceSize strides[BD12_MAX_VERTEX_BUFFERS];
+        pthread_rwlock_rdlock(&device->buffer_lock);
         for (uint32_t i = 0; i < gp->vertex_slot_count; ++i) {
             g->vertex_buffers[i].buffer = live_buffer(device, g->vertex_buffers[i].va,
                                                       g->vertex_buffers[i].buffer);
@@ -698,6 +699,7 @@ static int prepare_draw(BD12CmdList *list)
         if (gp->vertex_slot_count)
             device->vk.CmdBindVertexBuffers2(cb, 0, gp->vertex_slot_count,
                                              buffers, offsets, sizes, strides);
+        pthread_rwlock_unlock(&device->buffer_lock);
     }
     if (g->dirty & BD12_DIRTY_BLEND)
         device->vk.CmdSetBlendConstants(cb, g->blend_constants);
@@ -711,7 +713,9 @@ static int prepare_draw(BD12CmdList *list)
 /* A buffer bound earlier may have been released since (resources are destroyed
  * once the GPU is done with submitted work, but a list can keep its binding
  * state across that point). Passing a destroyed VkBuffer to the driver crashes
- * it, so re-resolve the GPU VA and bind nothing if the buffer is gone. */
+ * it, so re-resolve the GPU VA and bind nothing if the buffer is gone.
+ * Callers hold buffer_lock shared from here through the bind, so a release on
+ * another thread cannot destroy the buffer in between. */
 static VkBuffer live_buffer(BD12Device *device, uint64_t va, VkBuffer expected)
 {
     if (!va || !expected) return VK_NULL_HANDLE;
@@ -724,9 +728,11 @@ static void bind_index(BD12CmdList *list)
 {
     BD12GfxState *g = &list->gfx;
     if (!(g->dirty & BD12_DIRTY_INDEX)) return;
+    pthread_rwlock_rdlock(&list->device->buffer_lock);
     g->index_buffer = live_buffer(list->device, g->index_va, g->index_buffer);
     list->device->vk.CmdBindIndexBuffer(list->command_buffer, g->index_buffer,
                                         g->index_offset, g->index_type);
+    pthread_rwlock_unlock(&list->device->buffer_lock);
     g->dirty &= ~BD12_DIRTY_INDEX;
 }
 

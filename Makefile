@@ -10,7 +10,7 @@ MEDIA_SRCS = media/media_foundation.c
 PLATFORM_SRCS = platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_gdi.c platform/win32_resource.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
-                platform/win32_seh.c platform/win32_syscall.c
+                platform/win32_seh.c platform/win32_syscall.c platform/beer_gamepad.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
                renderer/vulkan/vulkan_post.c \
