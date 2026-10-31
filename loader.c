@@ -21254,6 +21254,57 @@ static u64 guest_dll_export(GuestDll *dll, const char *name)
     return 0;
 }
 
+/* One function, one address: on Windows an import slot holds the exporting module's own export address, the
+ * same one GetProcAddress returns, and inline-hooking modules (cracks, anti-cheat) patch that address expecting
+ * every caller to pass through it.  Beer's fake system DLLs export stubs that jump to the dispatch thunks, so once
+ * those images exist, import slots that still hold a thunk are pointed at the matching export.  (RDR2's 1911.dll
+ * hooks kernel32 exports this way; with the slots left on the thunks its hooks never ran -> "Social Club error".) */
+static u64 fake_pe_base_for_import(const char *lower)
+{
+    if (!strcmp(lower, "kernel32.dll")) return HMOD_K32;
+    if (!strcmp(lower, "kernelbase.dll")) return HMOD_KBASE;
+    if (!strcmp(lower, "ntdll.dll")) return HMOD_NTDLL;
+    if (!strcmp(lower, "user32.dll")) return HMOD_USER32;
+    if (!strcmp(lower, "advapi32.dll")) return HMOD_ADVAPI;
+    if (!strcmp(lower, "win32u.dll")) return HMOD_WIN32U;
+    if (!strncmp(lower, "api-ms-win-core-", 16) || !strncmp(lower, "ext-ms-win-", 11)) return HMOD_KBASE;
+    return 0;
+}
+
+static void fake_pe_rebind_imports(u8 *image)
+{
+    if (!image || !g_tramp) return;
+    fake_pe_exports_build();                 /* the export images must exist; imports are resolved by now */
+    if (!g_fake_pe_ready) return;
+    NtHdrs64 *nt = (NtHdrs64 *)(image + ((DosHdr *)image)->lfanew);
+    DataDir *dir = &nt->opt.dirs[DIR_IMPORT];
+    if (!dir->rva || !dir->size) return;
+    int mem = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+    if (mem < 0) return;
+    unsigned rebound = 0;
+    for (ImportDesc *d = (ImportDesc *)(image + dir->rva); d->name_rva; ++d) {
+        char lower[64];
+        lowercase_dll_basename((const char *)(image + d->name_rva), lower, sizeof(lower));
+        const u64 module = fake_pe_base_for_import(lower);
+        if (!module || !d->iat_rva) continue;
+        u64 *iat = (u64 *)(image + d->iat_rva);
+        const u64 *names = (const u64 *)(image + (d->orig_ilt ? d->orig_ilt : d->iat_rva));
+        for (size_t i = 0; iat[i]; ++i) {
+            const u64 entry = names[i];
+            if (!entry || (entry >> 63)) continue;                                  /* by ordinal */
+            if (iat[i] < (u64)(uintptr_t)g_tramp || iat[i] >= (u64)(uintptr_t)g_tramp + g_trampsz) continue;
+            const char *name = (const char *)(image + (u32)entry + 2);
+            u64 exported = fake_pe_export_address(module, name);
+            if (!exported && module == HMOD_KBASE) exported = fake_pe_export_address(HMOD_K32, name);
+            if (!exported) continue;
+            if (pwrite(mem, &exported, sizeof(exported), (off_t)(uintptr_t)&iat[i]) == (ssize_t)sizeof(exported)) ++rebound;
+        }
+    }
+    close(mem);
+    if (rebound && getenv("BEER_DLL_DIAGNOSTICS"))
+        fprintf(stderr, "[PE] %u import slots of image %p now hold the system DLLs' export addresses\n", rebound, (void *)image);
+}
+
 static void guest_dll_resolve_imports(GuestDll *dll)
 {
     NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
@@ -21338,7 +21389,7 @@ static void guest_dll_resolve_imports(GuestDll *dll)
             }
             ++g_nstubs;
         }
-    }
+    }    fake_pe_rebind_imports(dll->image);   /* DLLs loaded after start-up: same addresses as GetProcAddress */
 }
 
 static GuestDll *guest_dll_finish(GuestDll *dll);
@@ -22539,6 +22590,8 @@ static void setup_teb_peb(void)
     ldr->Length = sizeof(*ldr);
     ldr->Initialized = 1;
     init_peb_loader_data(ldr);
+    fake_pe_rebind_imports(g_img);
+    for (int i = 0; i < g_guest_dll_count; ++i) fake_pe_rebind_imports(g_guest_dlls[i].image);
 
     size_t path_chars = 0;
     while (g_exe_path_w[path_chars]) ++path_chars;

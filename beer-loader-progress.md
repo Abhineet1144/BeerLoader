@@ -1,6 +1,7 @@
 # Beer Loader — Active Development Context
 
 RDR2 Path: /mnt/wwn-0x5000c500c67d4454-part1/Games/RDR2/Launcher.exe
+Sekiro Path: /mnt/wwn-0x5000c500c67d4454-part1/Games/Sekiro - Shadows Die Twice/Sekiro.exe
 
 ## PRAGMATA — guest Steam interface ABI progress (current)
 
@@ -1783,3 +1784,20 @@ fails and is retried ~65k times; after D3D12CreateDevice the merged build also c
 second BD12 device, which the pre-merge build never does. Not CheckFeatureSupport (E_NOTIMPL experiment unchanged)
 and not the executable TLS callbacks (unchanged with BEER_NO_EXECUTABLE_TLS=1). Suspect main's BD12/DXGI changes
 (bd12_com.c +457 lines, swapchain/factory plumbing); reverting graphics/ alone does not link.
+
+### RDR2 after the merge: Social Club error fixed (2026-10-31)
+
+- Cause: "One function, one address" was lost. main's GetProcAddress returns the export stub inside the fake system
+  DLL image (`fake_pe_export_address`), while import slots still held Beer's dispatch thunks. RDR2's 1911.dll hooks
+  kernel32 exports by patching the GetProcAddress address (5-byte jmp); pre-merge it patched the thunks (0x4000xxxx)
+  that every import also used, after the merge it patched the stubs (0xfeeexxxx) that no import used, so the crack's
+  Social Club/activation redirections never ran and the game reported "Social Club failed to load".
+- Fix (generic): `fake_pe_rebind_imports` points every import slot that still holds a dispatch thunk for a fake
+  system module (kernel32, kernelbase incl. api-ms-win-core/ext-ms-win sets, ntdll, user32, advapi32, win32u) at that
+  module's export, right after the PEB is populated (export images are built there) and for DLLs resolved later.
+  Imports, GetProcAddress and export-table walks now agree, as on Windows.
+- Found by API-call diffs against a clean pre-merge build (worktree of 3fc9b46, run with `setarch -R`): the
+  `VirtualProtect(addr, 5, PAGE_EXECUTE_READWRITE)` patch sites moved from thunks to stubs.
+- RDR2 still needs `BEER_NO_EXECUTABLE_TLS=1` (main runs exe TLS callbacks by default; RDR2's Arxan callback then
+  leaves a worker spinning in Sleep(0) with no frames).
+- VariantInit/VariantClear stubs from main, dropped while resolving the missing-exports conflict, are restored.

@@ -297,6 +297,8 @@
     {"RtlFormatCurrentUserKeyPath", (ImplFn)stub_RtlFormatCurrentUserKeyPath},
     {"RtlDosPathNameToNtPathName_U", (ImplFn)beer_RtlDosPathNameToNtPathName_U},
     {"GetSystemFirmwareTable", (ImplFn)beer_GetSystemFirmwareTable},
+    {"VariantClear", (ImplFn)stub_VariantClear},
+    {"VariantInit", (ImplFn)stub_VariantInit},
     {"EnumSystemFirmwareTables", (ImplFn)beer_EnumSystemFirmwareTables},
     {"NtOpenSection", (ImplFn)stub_NtOpenSection},
     {"RtlInitString", (ImplFn)stub_RtlInitString},

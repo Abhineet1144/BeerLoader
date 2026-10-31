@@ -379,3 +379,5 @@ static u64 __attribute__((ms_abi)) stub_ImageList_DragMove(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_DragShowNolock(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub__TrackMouseEvent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumProcesses(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_VariantClear(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_VariantInit(void){ return 0; }
