@@ -1531,7 +1531,9 @@ u64 beer_guest_host_call(u64 fn, const u64 *a, const u64 *xmm)
 /* BEER_THREAD_DUMP=1: `kill -USR2 <pid>` prints, for every guest thread, its last import (name + guest return
  * address), whether it is still inside it, and how many imports it has made: enough to see what each thread of
  * an emulated guest is blocked on or spinning in without a debugger. */
-typedef struct { _Atomic(u64) calls, last_id, last_ret, enter_ns; _Atomic(int) in_import; pid_t tid; } ThreadTrack;
+typedef struct { _Atomic(u64) calls, last_id, last_ret, enter_ns, last_arg; _Atomic(int) in_import; pid_t tid; u32 win_tid; } ThreadTrack;
+static void describe_wait_handle(u64 h, int critical_section, char *out, size_t size);   /* thread dump: waited object */
+static inline u64 current_windows_thread_id(void);
 #define MAX_TRACKED_THREADS 256
 static ThreadTrack g_tracks[MAX_TRACKED_THREADS];
 static _Atomic(int) g_ntracks;
@@ -1547,11 +1549,23 @@ static void thread_dump_handler(int sig)
         const u64 id = atomic_load(&t->last_id);
         const u64 idx = (id & 0x40000000u) ? (id & 0xffffu) : (id & BEER_IMPORT_ID_IMPL) ? (id & 0xffffu) : MAX_STUBS;
         const char *name = idx < MAX_STUBS && g_snames[idx] ? g_snames[idx] : (id < BEER_IMPORT_ID_IMPL ? "<syscall>" : "?");
-        fprintf(stderr, "[THREAD-DUMP] tid=%d calls=%llu %s %s ret=0x%llx\n", (int)t->tid,
-                (unsigned long long)atomic_load(&t->calls),
-                atomic_load(&t->in_import) ? "IN " : "after", name, (unsigned long long)atomic_load(&t->last_ret));
+        char what[160] = "";
+        if (atomic_load(&t->in_import))
+            describe_wait_handle(atomic_load(&t->last_arg), strstr(name, "CriticalSection") != NULL, what, sizeof(what));
+        /* One write() per line, never stdio: the interrupted thread may hold the stderr lock. */
+        char line[512];
+        const int len = snprintf(line, sizeof(line),
+                                 "[THREAD-DUMP] tid=%d win=%u calls=%llu %s %s ret=0x%llx arg0=0x%llx %s\n", (int)t->tid,
+                                 t->win_tid, (unsigned long long)atomic_load(&t->calls),
+                                 atomic_load(&t->in_import) ? "IN " : "after", name,
+                                 (unsigned long long)atomic_load(&t->last_ret),
+                                 (unsigned long long)atomic_load(&t->last_arg), what);
+        if (len > 0) (void)!write(2, line, (size_t)len < sizeof(line) ? (size_t)len : sizeof(line) - 1);
     }
-    fprintf(stderr, "[THREAD-DUMP] end (%d threads)\n", n);
+    char end[64];
+    const int len = snprintf(end, sizeof(end), "[THREAD-DUMP] end (%d threads)\n", n);
+    if (len > 0) (void)!write(2, end, (size_t)len);
+    beer_guest_dump_registers();
 }
 
 static ThreadTrack *thread_track(void)
@@ -1566,6 +1580,7 @@ static ThreadTrack *thread_track(void)
         if (slot >= MAX_TRACKED_THREADS) return NULL;
         t_track = &g_tracks[slot];
         t_track->tid = (pid_t)syscall(SYS_gettid);
+        t_track->win_tid = (u32)current_windows_thread_id();
     }
     return t_track;
 }
@@ -1582,6 +1597,7 @@ u64 beer_guest_import_dispatch(u64 id, const u64 *a, const u64 *xmm, u64 guest_r
         atomic_fetch_add(&track->calls, 1);
         atomic_store(&track->last_id, id);
         atomic_store(&track->last_ret, g_dispatch_incoming_return);
+        atomic_store(&track->last_arg, a[0]);
         atomic_store(&track->in_import, 1);
     }
     const u64 prev_saved_rsp = g_saved_guest_rsp;
@@ -8454,6 +8470,26 @@ static int sem_id_from_handle(u64 h)
     return id;
 }
 
+#if !BEER_GUEST_NATIVE   /* the thread dump exists only under emulation */
+static void describe_wait_handle(u64 h, int critical_section, char *out, size_t size)
+{
+    const int eid = event_id_from_handle(h);
+    if (eid >= 0) {
+        const WinEvent *ev = &g_events[eid];
+        snprintf(out, size, "(event signaled=%d manual=%d waiters=%u created@0x%llx last-set@0x%llx)", ev->signaled,
+                 ev->manual_reset, ev->waiter_count, (unsigned long long)ev->creator_rip,
+                 (unsigned long long)ev->last_signaler_rip);
+    } else if (sem_id_from_handle(h) >= 0) {
+        snprintf(out, size, "(semaphore count=%u)", g_sem_val[sem_id_from_handle(h)]);
+    } else if (critical_section && h >= 0x10000 && h < 0x00007fffffffffffULL &&
+               ((const WIN_CS *)(uintptr_t)h)->Magic == WIN_CS_MAGIC) {
+        const WIN_CS *cs = (const WIN_CS *)(uintptr_t)h;   /* EnterCriticalSection argument */
+        snprintf(out, size, "(critical section owner=%llu recursion=%d)", (unsigned long long)cs->OwningThread,
+                 cs->RecursionCount);
+    }
+}
+#endif
+
 static int calc_abs_deadline(struct timespec *ts, u32 ms)
 {
     if (clock_gettime(CLOCK_REALTIME, ts) != 0) return -1;
@@ -12239,6 +12275,7 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
          * synchronous for now, but its result and event follow the completed
          * Windows OVERLAPPED contract. */
         u64 offset = ((u64)overlapped->OffsetHigh << 32) | overlapped->Offset;
+        beer_guest_memory_will_change(buf, n);   /* the kernel writes it: no write-protected code pages there */
         received = offset <= (u64)INT64_MAX
             ? pread(fd, buf, n, (off_t)offset) : -1;
         overlapped->Internal = received < 0 ? (u64)(u32)errno : 0;
@@ -12267,6 +12304,7 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
             return 0;
         }
     } else {
+        beer_guest_memory_will_change(buf, n);
         received = read(fd, buf, n);
     }
 

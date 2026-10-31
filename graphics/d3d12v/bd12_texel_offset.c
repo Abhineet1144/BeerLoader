@@ -59,11 +59,11 @@ static int has_result_type(uint32_t op)
     return (op >= 109 && op <= 202) || op == 245;
 }
 
-typedef struct { uint32_t slot_base, index_id, tracked; } Tracked;
+typedef struct { uint32_t slot_base, index_id, tracked, table; } Tracked;   /* table: 0 = set 0, 1 = heap mirror */
 
 uint32_t *bd12_spirv_texel_offsets(const uint32_t *in, size_t in_bytes, const uint32_t *bindings,
                                    const uint32_t *slot_base, uint32_t binding_count, uint32_t offsets_binding,
-                                   size_t *out_bytes)
+                                   int bindless, size_t *out_bytes)
 {
     const size_t words = in_bytes / 4;
     if (words < 5 || in[0] != 0x07230203u) return NULL;
@@ -99,25 +99,34 @@ uint32_t *bd12_spirv_texel_offsets(const uint32_t *in, size_t in_bytes, const ui
         if (has_result_type(op) && wc >= 3 && a[1] < bound && !type_of[a[1]]) type_of[a[1]] = a[0];
         at += wc;
     }
-    /* Set-0 variables of the given texel-buffer bindings. */
+    /* Set-0 variables of the given texel-buffer bindings; with `bindless`, also the heap mirror's texel arrays
+     * (set 1, bindings 2 and 3), whose offsets table is indexed by heap slot. */
+    int use_table[2] = { 0, 0 };
     for (size_t at = 5; at < words;) {
         const uint32_t op = in[at] & 0xffffu, wc = in[at] >> 16;
         const uint32_t *a = in + at + 1;
         if (op == OP_VARIABLE && wc >= 4 && a[1] < bound && binding_of[a[1]] && set_of[a[1]] <= 1) {
             for (uint32_t i = 0; i < binding_count; ++i)
                 if (bindings[i] + 1 == binding_of[a[1]]) {
-                    tracked[a[1]] = (Tracked){ slot_base[i], 0, 1 };
+                    tracked[a[1]] = (Tracked){ slot_base[i], 0, 1, 0 };
+                    use_table[0] = 1;
                     break;
                 }
+        } else if (bindless && op == OP_VARIABLE && wc >= 4 && a[1] < bound && set_of[a[1]] == 2 &&
+                   (binding_of[a[1]] == 3 || binding_of[a[1]] == 4)) {
+            tracked[a[1]] = (Tracked){ 0, 0, 1, 1 };
+            use_table[1] = 1;
         }
         at += wc;
     }
+    if (!use_table[0] && !use_table[1]) goto done;
 
     /* Fresh ids for the offset table declarations and per-use temporaries. */
     uint32_t next = bound;
     const uint32_t new_uint = uint_type ? 0 : next++;
     if (!uint_type) uint_type = new_uint;
-    const uint32_t rt_array = next++, block = next++, ptr_block = next++, ptr_uint = next++, table = next++;
+    const uint32_t rt_array = next++, block = next++, ptr_block = next++, ptr_uint = next++;
+    const uint32_t tables[2] = { use_table[0] ? next++ : 0, use_table[1] ? next++ : 0 };
     consts = calloc(slots + 1, sizeof(*consts));
     if (!consts) goto done;
     for (uint32_t i = 0; i <= slots; ++i) consts[i] = next++;   /* consts[0] = 0u (member index), consts[1+k] = k */
@@ -136,13 +145,14 @@ uint32_t *bd12_spirv_texel_offsets(const uint32_t *in, size_t in_bytes, const ui
             extension_done = 1;
         }
         if (!annotations_done && ((op >= 19 && op <= 39) || op == OP_CONSTANT || op == OP_VARIABLE)) {
-            const uint32_t d[][4] = {
-                { rt_array, DEC_ARRAY_STRIDE, 4 }, { block, DEC_BLOCK }, { table, DEC_DESCRIPTOR_SET, 0 },
-                { table, DEC_BINDING, offsets_binding },
-            };
-            if (!put_op(&out, OP_DECORATE, 3, d[0]) || !put_op(&out, OP_DECORATE, 2, d[1]) ||
-                !put_op(&out, OP_DECORATE, 3, d[2]) || !put_op(&out, OP_DECORATE, 3, d[3]))
-                goto done;
+            const uint32_t d[][4] = { { rt_array, DEC_ARRAY_STRIDE, 4 }, { block, DEC_BLOCK } };
+            if (!put_op(&out, OP_DECORATE, 3, d[0]) || !put_op(&out, OP_DECORATE, 2, d[1])) goto done;
+            for (int t = 0; t < 2; ++t) {
+                if (!tables[t]) continue;
+                const uint32_t ds[] = { tables[t], DEC_DESCRIPTOR_SET, (uint32_t)t },
+                               bd[] = { tables[t], DEC_BINDING, t ? BD12_MIRROR_OFFSETS_BINDING : offsets_binding };
+                if (!put_op(&out, OP_DECORATE, 3, ds) || !put_op(&out, OP_DECORATE, 3, bd)) goto done;
+            }
             const uint32_t m0[] = { block, 0, DEC_OFFSET, 0 }, m1[] = { block, 0, DEC_NON_WRITABLE };
             if (!put_op(&out, OP_MEMBER_DECORATE, 4, m0) || !put_op(&out, OP_MEMBER_DECORATE, 3, m1)) goto done;
             annotations_done = 1;
@@ -153,12 +163,14 @@ uint32_t *bd12_spirv_texel_offsets(const uint32_t *in, size_t in_bytes, const ui
                 if (!put_op(&out, OP_TYPE_INT, 3, t)) goto done;
             }
             const uint32_t ra[] = { rt_array, uint_type }, st[] = { block, rt_array },
-                           pb[] = { ptr_block, SC_STORAGE_BUFFER, block }, pu[] = { ptr_uint, SC_STORAGE_BUFFER, uint_type },
-                           var[] = { ptr_block, table, SC_STORAGE_BUFFER };
+                           pb[] = { ptr_block, SC_STORAGE_BUFFER, block }, pu[] = { ptr_uint, SC_STORAGE_BUFFER, uint_type };
             if (!put_op(&out, OP_TYPE_RUNTIME_ARRAY, 2, ra) || !put_op(&out, OP_TYPE_STRUCT, 2, st) ||
-                !put_op(&out, OP_TYPE_POINTER, 3, pb) || !put_op(&out, OP_TYPE_POINTER, 3, pu) ||
-                !put_op(&out, OP_VARIABLE, 3, var))
+                !put_op(&out, OP_TYPE_POINTER, 3, pb) || !put_op(&out, OP_TYPE_POINTER, 3, pu))
                 goto done;
+            for (int t = 0; t < 2; ++t) {
+                const uint32_t var[] = { ptr_block, tables[t], SC_STORAGE_BUFFER };
+                if (tables[t] && !put_op(&out, OP_VARIABLE, 3, var)) goto done;
+            }
             for (uint32_t i = 0; i <= slots; ++i) {
                 const uint32_t c[] = { uint_type, consts[i], i ? i - 1 : 0 };
                 if (!put_op(&out, OP_CONSTANT, 3, c)) goto done;
@@ -166,16 +178,17 @@ uint32_t *bd12_spirv_texel_offsets(const uint32_t *in, size_t in_bytes, const ui
             globals_done = 1;
         }
         if (op == OP_ENTRY_POINT && version >= 0x10400) {   /* SPIR-V 1.4+: every global is in the interface */
-            if (!put(&out, ((wc + 1) << 16) | op)) goto done;
+            const uint32_t extra = (tables[0] != 0) + (tables[1] != 0);
+            if (!put(&out, ((wc + extra) << 16) | op)) goto done;
             for (uint32_t i = 0; i < wc - 1; ++i) if (!put(&out, a[i])) goto done;
-            if (!put(&out, table)) goto done;
+            for (int t = 0; t < 2; ++t) if (tables[t] && !put(&out, tables[t])) goto done;
             at += wc;
             continue;
         }
         /* Propagate tracked pointers/images. */
         if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && wc >= 5 && a[2] < bound &&
             tracked[a[2]].tracked && !tracked[a[2]].index_id && a[1] < bound)
-            tracked[a[1]] = (Tracked){ tracked[a[2]].slot_base, a[3], 1 };
+            tracked[a[1]] = (Tracked){ tracked[a[2]].slot_base, a[3], 1, tracked[a[2]].table };
         else if ((op == OP_LOAD || op == OP_COPY_OBJECT) && wc >= 4 && a[2] < bound && tracked[a[2]].tracked &&
                  a[1] < bound)
             tracked[a[1]] = tracked[a[2]];
@@ -198,7 +211,8 @@ uint32_t *bd12_spirv_texel_offsets(const uint32_t *in, size_t in_bytes, const ui
             continue;
         }
         any_use = 1;
-        /* slot = base + index; offset = table[slot] (as the coordinate's integer type). */
+        /* slot = base + index (set 0) or the heap index itself (mirror); offset = table[slot] as the coordinate's
+         * integer type. */
         uint32_t slot = consts[1 + t->slot_base];
         if (t->index_id) {
             uint32_t index = t->index_id;
@@ -207,11 +221,15 @@ uint32_t *bd12_spirv_texel_offsets(const uint32_t *in, size_t in_bytes, const ui
                 if (!put_op(&out, OP_BITCAST, 3, b)) goto done;
                 index = next++;
             }
-            const uint32_t add[] = { uint_type, next, consts[1 + t->slot_base], index };
-            if (!put_op(&out, OP_IADD, 4, add)) goto done;
-            slot = next++;
+            if (t->table) {
+                slot = index;
+            } else {
+                const uint32_t add[] = { uint_type, next, consts[1 + t->slot_base], index };
+                if (!put_op(&out, OP_IADD, 4, add)) goto done;
+                slot = next++;
+            }
         }
-        const uint32_t chain[] = { ptr_uint, next, table, consts[0], slot };
+        const uint32_t chain[] = { ptr_uint, next, tables[t->table], consts[0], slot };
         if (!put_op(&out, OP_ACCESS_CHAIN, 5, chain)) goto done;
         const uint32_t load[] = { uint_type, next + 1, next };
         if (!put_op(&out, OP_LOAD, 3, load)) goto done;
@@ -270,8 +288,8 @@ int bd12_texel_offsets_apply(uint32_t **spirv, size_t *spirv_bytes, BD12ShaderBi
         *next_slot += b->count ? b->count : 1;
     }
     size_t bytes = 0;
-    uint32_t *patched = n ? bd12_spirv_texel_offsets(*spirv, *spirv_bytes, numbers, bases, n, offsets_binding,
-                                                     &bytes) : NULL;
+    /* Heap-mirror texel arrays (bindless) are found by the pass itself; their table is BD12_MIRROR_OFFSETS_BINDING. */
+    uint32_t *patched = bd12_spirv_texel_offsets(*spirv, *spirv_bytes, numbers, bases, n, offsets_binding, 1, &bytes);
     if (!patched) {   /* nothing to rewrite (or unparsable): the stage keeps exact view offsets */
         for (uint32_t i = 0; i < count; ++i) bindings[i].offset_slot = 0;
         *next_slot = first_slot;

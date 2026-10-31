@@ -136,6 +136,14 @@ static uint64_t __attribute__((ms_abi)) wasapi_query(void *self, const void *iid
     return S_OK;
 }
 
+/* Diagnostic: BEER_WASAPI_NO_DEVICE=1 answers like Windows with no audio endpoints (E_NOTFOUND, empty collection). */
+static int wasapi_no_device(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = getenv("BEER_WASAPI_NO_DEVICE") && strcmp(getenv("BEER_WASAPI_NO_DEVICE"), "0");
+    return cached;
+}
+
 static uint64_t __attribute__((ms_abi)) enumerator_get_default(void *self,
                                                                uint32_t flow,
                                                                uint32_t role,
@@ -143,6 +151,7 @@ static uint64_t __attribute__((ms_abi)) enumerator_get_default(void *self,
 {
     (void)flow; (void)role;
     if (!device) return E_POINTER;
+    if (wasapi_no_device()) { *device = NULL; return 0x80070490u; }   /* HRESULT_FROM_WIN32(ERROR_NOT_FOUND) */
     BeerWasapi *owner = wasapi_interface(self)->owner;
     wasapi_add_ref(&owner->device);
     *device = &owner->device;
@@ -154,7 +163,7 @@ static uint64_t __attribute__((ms_abi)) collection_get_count(void *self,
 {
     (void)self;
     if (!count) return E_POINTER;
-    *count = 1;
+    *count = wasapi_no_device() ? 0 : 1;
     return S_OK;
 }
 

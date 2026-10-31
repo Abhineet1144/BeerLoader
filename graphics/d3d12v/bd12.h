@@ -680,6 +680,8 @@ VkBufferView bd12_buffer_view(BD12Buffer *buffer, VkFormat format,
 VkBufferView bd12_buffer_view_offset(BD12Buffer *buffer, VkFormat format,
                                      VkDeviceSize offset, VkDeviceSize range,
                                      int storage, uint32_t *delta);
+VkBufferView bd12_buffer_view_offset_pinned(BD12Buffer *buffer, VkFormat format, VkDeviceSize offset,
+                                            VkDeviceSize range, int storage, uint32_t *delta);
 /* Same, for a view that a long-lived descriptor keeps referencing: never aged out. */
 VkBufferView bd12_buffer_view_pinned(BD12Buffer *buffer, VkFormat format,
                                      VkDeviceSize offset, VkDeviceSize range,
@@ -1014,7 +1016,9 @@ int bd12_cmd_bind_bindless(BD12CmdList *list, BD12BindState *state,
 /* bd12_texel_offset.c: add per-binding texel offsets to a shader's texel-buffer accesses (NULL = leave unchanged). */
 uint32_t *bd12_spirv_texel_offsets(const uint32_t *spirv, size_t spirv_bytes, const uint32_t *bindings,
                                    const uint32_t *slot_base, uint32_t binding_count, uint32_t offsets_binding,
-                                   size_t *out_bytes);
+                                   int bindless, size_t *out_bytes);
+/* Heap mirror (set 1) binding of the per-heap-slot texel offsets table (texel_offset_fixup devices only). */
+#define BD12_MIRROR_OFFSETS_BINDING 6u
 /* Assigns offset slots to the texel-buffer bindings among bindings[0..count) (shader stage stage_bindings of
  * them belong to *spirv) and rewrites *spirv in place; returns the slots used so far (next_slot updated). */
 int bd12_texel_offsets_apply(uint32_t **spirv, size_t *spirv_bytes, BD12ShaderBinding *bindings, uint32_t count,

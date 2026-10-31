@@ -17,6 +17,7 @@
 #include "win32_entry.h"
 
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
@@ -42,6 +43,9 @@ static inline int beer_guest_set_gs_base(uint64_t base)
 
 /* Natively the guest calls host functions directly with the Win64 ABI; nothing to register. */
 #define BEER_HOST_FLOAT_FN(fn, mask)
+
+/* The CPU runs the guest's code itself, so code changes need no notification. */
+static inline void beer_guest_memory_will_change(const void *address, size_t size) { (void)address; (void)size; }
 
 #else
 
@@ -117,6 +121,14 @@ uint64_t beer_guest_import_dispatch(uint64_t id, const uint64_t args[16], const 
  * xmm[0..3] are the low 64 bits of XMM0-XMM3, where Win64 passes float arguments by position. Host functions that take
  * floats are registered with BEER_HOST_FLOAT_FN so each float reaches the callee's floating-point register. */
 uint64_t beer_guest_host_call(uint64_t fn, const uint64_t args[16], const uint64_t xmm[4]);
+
+/* Guest memory in [address, address + size) is about to change protection, be freed or be written by the kernel (a file
+ * read), or was just rewritten (FlushInstructionCache): discard translated code from it and give back write access to
+ * pages the backend write-protected to detect self-modifying code. Call it before the change. */
+void beer_guest_memory_will_change(const void *address, size_t size);
+
+/* Diagnostic (thread dump): every guest thread prints its current guest RIP and registers. */
+void beer_guest_dump_registers(void);
 
 /* Declares that the host function `fn` takes float arguments at the argument positions set in `mask` (bit i = the
  * (i+1)th argument, positions 0-3 only). Emulated hosts need it because Win64 and AAPCS64 place floats differently. */

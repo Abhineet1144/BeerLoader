@@ -31,7 +31,13 @@ static u64 __attribute__((ms_abi)) stub_GlobalReAlloc(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GlobalSize(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GlobalLock(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GlobalUnlock(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_FlushInstructionCache(void){ return 1; }
+/* The guest rewrote code in [base, base + size): an emulator backend discards its translations (no-op natively). */
+static u64 __attribute__((ms_abi)) stub_FlushInstructionCache(u64 process, const void *base, u64 size)
+{
+    (void)process;
+    if (base && size) beer_guest_memory_will_change(base, (size_t)size);
+    return 1;
+}
 static u64 __attribute__((ms_abi)) stub_VirtualAllocEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VirtualProtectEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_HeapDestroy(void){ return 1; }

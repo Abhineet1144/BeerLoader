@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "win32_virtual_memory.h"
+#include "guest_cpu.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -161,6 +162,7 @@ static void *virtual_alloc_aligned(void *address, size_t size, uint32_t allocati
                 errno = EEXIST;
                 return NULL;
             }
+            beer_guest_memory_will_change((void *)requested, mapped_size);
             if (mprotect((void *)requested, mapped_size, host_protection) != 0) return NULL;
             return address;
         }
@@ -247,13 +249,16 @@ int beer_virtual_free(void *address, size_t size, uint32_t free_type)
         g_beer_vm_live_bytes -= allocation_size;
         memset(allocation, 0, sizeof(*allocation));
         pthread_mutex_unlock(&g_allocation_mutex);
+        beer_guest_memory_will_change(base, allocation_size);
         return munmap(base, allocation_size) == 0;
     }
     if (free_type == BEER_MEM_DECOMMIT && size) {
         size_t page = page_size();
         uintptr_t base = align_down((uintptr_t)address, page);
         size_t length = align_up_size((uintptr_t)address - base + size, page);
-        if (!length || mprotect((void *)base, length, PROT_NONE) != 0) return 0;
+        if (!length) return 0;
+        beer_guest_memory_will_change((void *)base, length);
+        if (mprotect((void *)base, length, PROT_NONE) != 0) return 0;
         (void)madvise((void *)base, length, MADV_DONTNEED);
         return 1;
     }
@@ -339,7 +344,9 @@ int beer_virtual_protect(void *address, size_t size, uint32_t new_protection,
     size_t page = page_size();
     uintptr_t base = align_down((uintptr_t)address, page);
     size_t length = align_up_size((uintptr_t)address - base + size, page);
-    if (!length || mprotect((void *)base, length, host_protection) != 0) return 0;
+    if (!length) return 0;
+    beer_guest_memory_will_change((void *)base, length);
+    if (mprotect((void *)base, length, host_protection) != 0) return 0;
     if (old_protection) *old_protection = info.protect;
     return 1;
 }

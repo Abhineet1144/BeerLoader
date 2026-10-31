@@ -101,7 +101,7 @@ BD12ComputePipeline *bd12_compute_pipeline_create_bound(
     if (!dense_spirv) goto done;
     if (device->texel_offset_fixup) {
         uint32_t slots = 0;
-        if (bd12_texel_offsets_apply(&dense_spirv, &spirv_bytes, copy, binding_count, next_binding, &slots))
+        if (bd12_texel_offsets_apply(&dense_spirv, &spirv_bytes, copy, binding_count, next_binding, &slots) && slots)
             copy[binding_count++] = (BD12ShaderBinding){
                 .type = BD12_RANGE_TEXEL_OFFSETS, .binding = next_binding++, .count = slots };
     }

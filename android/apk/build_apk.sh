@@ -12,12 +12,16 @@ STRIP=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
 OUT=android/apk/out
 DXIL=${DXIL_SPIRV_DIR:-$ROOT/android-deps/dxil-spirv}/build-ndk/libdxil-spirv-c-shared.so
 VKD3D=android/apk/prebuilt/libvkd3d-shader.so
+FFMPEG=${FFMPEG_BUILD_DIR:-$ROOT/android-deps/ffmpeg-build}   # ffmpeg/ffprobe executables (see ANDROID_PORT.md)
 KEY=${BEER_KEYSTORE:-$ROOT/android-deps/beer-debug.jks}
 
 STAGE=$OUT/stage; rm -rf "$STAGE"; mkdir -p "$STAGE/lib/arm64-v8a"
 cp "$OUT/lib/arm64-v8a/libbeer.so" "$STAGE/lib/arm64-v8a/"
 cp "$DXIL" "$STAGE/lib/arm64-v8a/libdxil-spirv-c-shared.so"
 cp "$VKD3D" "$STAGE/lib/arm64-v8a/libvkd3d-shader.so"
+# Executables are shipped as lib*.so: Android only installs (and allows executing) files named like libraries.
+cp "$FFMPEG/ffmpeg" "$STAGE/lib/arm64-v8a/libffmpeg.so"
+cp "$FFMPEG/ffprobe" "$STAGE/lib/arm64-v8a/libffprobe.so"
 "$STRIP" --strip-unneeded "$STAGE"/lib/arm64-v8a/*.so
 
 "$BT/aapt2" link -o "$OUT/beer-unsigned.apk" --manifest android/apk/AndroidManifest.xml -I "$JAR" \

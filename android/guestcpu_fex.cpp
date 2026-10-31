@@ -28,14 +28,20 @@ extern "C" {
 #include "guest_cpu.h"
 }
 
+#include <atomic>
 #include <cerrno>
+#include <pthread.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <malloc.h>
 #include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <map>
+#include <set>
+#include <vector>
 #include <signal.h>
 #include <sys/mman.h>
 #include <ucontext.h>
@@ -118,6 +124,267 @@ struct sigaction g_prev_action[NSIG];
 std::once_flag g_init_once;
 bool g_init_ok = false;
 
+// ---- Self-modifying code detection (SMCChecks=MTRACK, the default) ---------------------------------------------
+// Modelled on FEX's Windows InvalidationTracker. A guest page FEX translates code from is write-protected if the
+// guest may write it; the first write (guest or host code) faults, its translations are discarded and the page gets its
+// protection back. Protection changes, frees and kernel writes (file reads) go through beer_guest_memory_will_change().
+// Lock order: FEX's code invalidation mutex, then g_smc_lock.
+bool g_smc = false;
+std::mutex g_smc_lock;
+std::set<uint64_t> g_smc_code_pages;           // pages FEX has translated code from
+std::map<uint64_t, int> g_smc_trapped;         // write-protected pages -> their protection before
+struct SmcMapRange { uint64_t lo, hi; int prot; };
+std::vector<SmcMapRange> g_smc_maps;           // /proc/self/maps snapshot, refreshed after protection changes
+bool g_smc_maps_dirty = true;
+std::mutex g_threads_lock;
+std::vector<FEXCore::Core::InternalThreadState*> g_threads;   // every guest thread state (FEX threads are never freed)
+std::vector<pid_t> g_thread_tids;                              // their host thread ids (register dumps)
+constexpr uint64_t kPage = 4096;
+
+void SmcRefreshMaps() {
+  g_smc_maps.clear();
+  if (FILE* f = fopen("/proc/self/maps", "re")) {
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+      unsigned long lo, hi;
+      char perms[8];
+      if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3) continue;
+      const int prot = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) | (perms[2] == 'x' ? PROT_EXEC : 0);
+      g_smc_maps.push_back({lo, hi, prot});
+    }
+    fclose(f);
+  }
+  g_smc_maps_dirty = false;
+}
+
+int SmcPageProt(uint64_t page) {   // -1 = not mapped
+  size_t lo = 0, hi = g_smc_maps.size();
+  while (lo < hi) {
+    const size_t mid = (lo + hi) / 2;
+    if (g_smc_maps[mid].hi <= page) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < g_smc_maps.size() && g_smc_maps[lo].lo <= page ? g_smc_maps[lo].prot : -1;
+}
+
+void SmcInvalidateLocked(uint64_t start, uint64_t length) {   // code invalidation mutex held exclusively
+  g_ctx->InvalidateCodeBuffersCodeRange(start, length);
+  std::scoped_lock lk(g_threads_lock);
+  for (auto* t : g_threads) g_ctx->InvalidateThreadCachedCodeRange(t, start, length);
+}
+
+void SmcMarkCodePage(FEXCore::Core::InternalThreadState*, uint64_t start, uint64_t length) {
+  if (!g_smc) return;
+  std::scoped_lock lk(g_smc_lock);
+  for (uint64_t page = start & ~(kPage - 1); page < start + length; page += kPage) {
+    if (page >= g_host_lo && page < g_host_hi) continue;
+    g_smc_code_pages.insert(page);
+    if (g_smc_trapped.count(page)) continue;
+    if (g_smc_maps_dirty) SmcRefreshMaps();
+    const int prot = SmcPageProt(page);   // host protection == guest protection (beer_virtual_protect uses mprotect)
+    if (prot >= 0 && (prot & PROT_WRITE) && mprotect((void*)page, kPage, prot & ~PROT_WRITE) == 0)
+      g_smc_trapped[page] = prot;   // if mprotect fails the page stays untracked (as with SMC detection off)
+  }
+}
+
+// A write fault on a trapped page: discard its code and let the write through. Called from the signal handler.
+bool SmcHandleWriteFault(uint64_t address) {
+  if (!g_smc) return false;
+  const uint64_t page = address & ~(kPage - 1);
+  {   // cheap pre-check without the code mutex
+    std::scoped_lock lk(g_smc_lock);
+    if (!g_smc_trapped.count(page)) return false;
+  }
+  std::scoped_lock code(g_ctx->GetCodeInvalidationMutex());
+  std::scoped_lock lk(g_smc_lock);
+  auto it = g_smc_trapped.find(page);
+  if (it != g_smc_trapped.end()) {   // another thread may have handled it meanwhile
+    SmcInvalidateLocked(page, kPage);
+    mprotect((void*)page, kPage, it->second);
+    g_smc_trapped.erase(it);
+    g_smc_code_pages.erase(page);
+  }
+  return true;
+}
+
+// ---- Guest thunks for host functions reached through vtables -------------------------------------------------
+// A guest call to a host address (a COM method of a Beer object) faults and is turned into a host call in DeliverFault:
+// correct, but one signal per call. The first such call through a memory slot (`call [reg+disp]`, the vtable entry)
+// rewrites the slot to a guest thunk `mov r10,rcx ; mov eax,kThunkIdBase|n ; syscall ; ret`, which HandleSyscall
+// serves like an import. Vtables are shared per class, so one fault fixes the method for every object. The thunk area
+// is not executable for the host: host code calling through a patched slot faults in HostSignal and continues at the
+// real function. BEER_GUEST_THUNKS=0 keeps every call on the fault path.
+constexpr uint32_t kThunkIdBase = 0x10000000u;
+constexpr uint32_t kThunkSize = 16, kMaxThunks = 65536;
+uint8_t* g_thunk_area = nullptr;               // kMaxThunks * kThunkSize bytes, PROT_READ|PROT_WRITE
+std::atomic<uint64_t> g_thunk_fn[kMaxThunks];  // host function behind each thunk
+std::atomic<uint32_t> g_thunk_count{0};
+std::mutex g_thunk_lock;
+std::map<uint64_t, uint32_t> g_thunk_of;       // host function -> thunk index
+bool g_thunks_enabled = true;
+
+bool IsThunkAddress(uint64_t a) {
+  return g_thunk_area && a >= (uint64_t)g_thunk_area && a < (uint64_t)g_thunk_area + (uint64_t)kMaxThunks * kThunkSize;
+}
+
+uint64_t ThunkFor(uint64_t fn) {   // 0 if no thunk can be made
+  std::scoped_lock lk(g_thunk_lock);
+  if (!g_thunk_area) {
+    void* area = mmap(nullptr, (size_t)kMaxThunks * kThunkSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 0;
+    g_thunk_area = (uint8_t*)area;
+  }
+  auto it = g_thunk_of.find(fn);
+  if (it != g_thunk_of.end()) return (uint64_t)g_thunk_area + (uint64_t)it->second * kThunkSize;
+  const uint32_t n = g_thunk_count.load();
+  if (n >= kMaxThunks) return 0;
+  g_thunk_fn[n].store(fn);
+  uint8_t* t = g_thunk_area + (size_t)n * kThunkSize;
+  const uint32_t id = kThunkIdBase | n;
+  const uint8_t code[] = {0x49, 0x89, 0xCA,                                           // mov r10, rcx
+                          0xB8, (uint8_t)id, (uint8_t)(id >> 8), (uint8_t)(id >> 16), (uint8_t)(id >> 24),   // mov eax, id
+                          0x0F, 0x05, 0xC3};                                          // syscall ; ret
+  memcpy(t, code, sizeof code);   // a fresh slot: no translated code to invalidate
+  g_thunk_of[fn] = n;
+  g_thunk_count.store(n + 1);
+  return (uint64_t)t;
+}
+
+// The memory slot read by the guest `call qword ptr [...]` (FF /2) that ends at `ret`, or 0. `regs` are the guest
+// registers at the call (RSP still includes the pushed return address).
+uint64_t CallSlot(const CPUState& st, uint64_t ret) {
+  for (uint32_t len = 2; len <= 8; ++len) {
+    const uint8_t* p = (const uint8_t*)(ret - len);
+    uint32_t i = 0, rex = 0;
+    if ((p[i] & 0xF0) == 0x40) rex = p[i++];
+    if (p[i++] != 0xFF) continue;
+    const uint8_t modrm = p[i++];
+    const uint32_t mod = modrm >> 6, reg = (modrm >> 3) & 7, rm = modrm & 7;
+    if (reg != 2 || mod == 3) continue;
+    auto gpr = [&](uint32_t n) -> uint64_t {
+      return n == 4 ? st.gregs[X::REG_RSP] + 8 : st.gregs[n];   // RSP as it was before the call pushed ret
+    };
+    uint64_t ea = 0;
+    if (rm == 4) {   // SIB
+      const uint8_t sib = p[i++];
+      const uint32_t scale = sib >> 6, index = ((sib >> 3) & 7) | ((rex & 2) << 2), base = (sib & 7) | ((rex & 1) << 3);
+      if (index != 4) ea += gpr(index) << scale;
+      if ((sib & 7) == 5 && mod == 0) { int32_t d; memcpy(&d, p + i, 4); i += 4; ea += (int64_t)d; }
+      else ea += gpr(base);
+    } else if (rm == 5 && mod == 0) {   // RIP-relative
+      int32_t d; memcpy(&d, p + i, 4); i += 4;
+      ea = ret + (int64_t)d;
+    } else {
+      ea = gpr(rm | ((rex & 1) << 3));
+    }
+    if (mod == 1) { ea += (int64_t)(int8_t)p[i]; i += 1; }
+    else if (mod == 2) { int32_t d; memcpy(&d, p + i, 4); ea += (int64_t)d; i += 4; }
+    if (i == len) return ea;
+  }
+  return 0;
+}
+
+// Points every slot holding `fn` in the loader's initialized data (.data, .data.rel.ro: the static COM vtables) at its
+// thunk. Used once per function when the faulting call went through a register (`call rax`), which names no slot.
+// .bss is not scanned: the thunk and statistics tables live there.
+std::set<uint64_t> g_scanned_fns;
+int PatchDataSegment(struct dl_phdr_info* info, size_t, void* data) {
+  if ((void*)info->dlpi_addr != (void*)&__ehdr_start) return 0;
+  const uint64_t fn = *(const uint64_t*)data, thunk = ((const uint64_t*)data)[1];
+  for (int i = 0; i < info->dlpi_phnum; ++i) {
+    const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+    if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_W)) continue;
+    const uint64_t lo = (info->dlpi_addr + ph.p_vaddr + 7) & ~7ull, hi = info->dlpi_addr + ph.p_vaddr + ph.p_filesz;
+    for (uint64_t a = lo; a + 8 <= hi; a += 8) {
+      if (*(const uint64_t*)a != fn) continue;
+      if (mprotect((void*)(a & ~(kPage - 1)), kPage, PROT_READ | PROT_WRITE) != 0) continue;
+      uint64_t expected = fn;
+      __atomic_compare_exchange_n((uint64_t*)a, &expected, thunk, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
+  }
+  return 1;
+}
+
+void PatchAllSlots(uint64_t fn) {
+  {
+    std::scoped_lock lk(g_thunk_lock);
+    if (!g_scanned_fns.insert(fn).second) return;   // already scanned
+  }
+  const uint64_t thunk = ThunkFor(fn);
+  if (!thunk) return;
+  uint64_t args[2] = {fn, thunk};
+  dl_iterate_phdr(PatchDataSegment, args);
+}
+
+// After a faulting call from the guest to host function `fn`: point the slot it came from at a thunk.
+void PatchCallSlot(const CPUState& st, uint64_t fn) {
+  if (!g_thunks_enabled) return;
+  const uint64_t ret = *(const uint64_t*)st.gregs[X::REG_RSP];
+  const uint64_t slot = CallSlot(st, ret);
+  // Only vtables inside the loader's own image are patched (static COM vtables, some in read-only .data.rel.ro):
+  // their pages can safely be made writable. A slot anywhere else keeps the fault path. Checked before reading the
+  // slot: a `call reg` can mis-decode as a memory form with a meaningless address.
+  Dl_info where{};
+  if (!slot || (slot & 7) || slot < g_host_hi || !dladdr((void*)slot, &where) || where.dli_fbase != (void*)&__ehdr_start ||
+      *(const uint64_t*)slot != fn) {
+    PatchAllSlots(fn);   // a register call (or a slot outside the loader): find the vtable entries by value
+    return;
+  }
+  const uint64_t thunk = ThunkFor(fn);
+  if (!thunk) return;
+  const uint64_t page = slot & ~(kPage - 1);
+  if (mprotect((void*)page, kPage, PROT_READ | PROT_WRITE) != 0) return;
+  uint64_t expected = fn;
+  __atomic_compare_exchange_n((uint64_t*)slot, &expected, thunk, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
+// BEER_GUESTCPU_STATS=1: every 5 s, guest->host calls per second by path (syscall imports vs faulting calls into host
+// code such as COM vtables) and the busiest host functions of the faulting path (libbeer.so offsets for llvm-symbolizer).
+bool g_stats = false;
+std::atomic<uint64_t> g_stat_imports{0}, g_stat_host_calls{0};
+constexpr uint32_t kStatSlots = 1024;
+std::atomic<uint64_t> g_stat_fn[kStatSlots], g_stat_count[kStatSlots];
+void StatHostCall(uint64_t fn) {
+  g_stat_host_calls.fetch_add(1, std::memory_order_relaxed);
+  for (uint32_t i = 0, slot = (uint32_t)((fn >> 4) * 0x9E3779B1u) % kStatSlots; i < kStatSlots; ++i, slot = (slot + 1) % kStatSlots) {
+    uint64_t seen = g_stat_fn[slot].load(std::memory_order_relaxed);
+    if (!seen && g_stat_fn[slot].compare_exchange_strong(seen, fn)) seen = fn;
+    if (seen == fn) { g_stat_count[slot].fetch_add(1, std::memory_order_relaxed); return; }
+  }
+}
+void* StatReporter(void*) {
+  Dl_info self{};
+  dladdr((void*)&StatHostCall, &self);
+  const uint64_t base = (uint64_t)self.dli_fbase;
+  uint64_t last_imports = 0, last_calls = 0;
+  for (;;) {
+    sleep(5);
+    const uint64_t imports = g_stat_imports.load(), calls = g_stat_host_calls.load();
+    fprintf(stderr, "[GUESTCPU STATS] imports/s=%llu host-calls/s=%llu (faulting path)\n",
+            (unsigned long long)(imports - last_imports) / 5, (unsigned long long)(calls - last_calls) / 5);
+    last_imports = imports;
+    last_calls = calls;
+    for (int top = 0; top < 12; ++top) {   // busiest functions of the last interval; counters reset as reported
+      uint32_t best = kStatSlots;
+      uint64_t best_count = 0;
+      for (uint32_t i = 0; i < kStatSlots; ++i) {
+        const uint64_t c = g_stat_count[i].load(std::memory_order_relaxed);
+        if (c > best_count) { best_count = c; best = i; }
+      }
+      if (best == kStatSlots) break;
+      const uint64_t fn = g_stat_fn[best].load();
+      g_stat_count[best].fetch_sub(best_count, std::memory_order_relaxed);
+      Dl_info info{};
+      dladdr((void*)fn, &info);
+      fprintf(stderr, "[GUESTCPU STATS]   %8llu/s  +0x%llx %s\n", (unsigned long long)best_count / 5,
+              (unsigned long long)(fn - base), info.dli_sname ? info.dli_sname : "");
+    }
+  }
+  return nullptr;
+}
+
+void SmcMarkCodePage(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length);
+
 class BeerSyscallHandler final : public FEXCore::HLE::SyscallHandler {
 public:
   void HandleSyscall(Frame* F) override;
@@ -131,6 +398,11 @@ public:
     if (Address < g_host_lo) return {0, g_host_lo, true};
     if (Address < g_host_hi) return {Address, 0, false};
     return {g_host_hi, UINT64_MAX - g_host_hi, true};
+  }
+  // SMCChecks=MTRACK: FEX reports each guest page it starts translating code from (called with the code
+  // invalidation mutex held shared).
+  void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+    SmcMarkCodePage(Thread, Start, Length);
   }
 };
 
@@ -187,6 +459,11 @@ bool AttachThread(GuestThread& gt) {
   if (gt.ts) return true;
   gt.ts = g_ctx->CreateThread();
   if (!gt.ts) return false;
+  {
+    std::scoped_lock lk(g_threads_lock);
+    g_threads.push_back(gt.ts);
+    g_thread_tids.push_back((pid_t)syscall(SYS_gettid));
+  }
   auto& st = gt.ts->CurrentFrame->State;
 
   auto* gdt = new CPUState::gdt_segment[32]();
@@ -227,6 +504,14 @@ void ChainOrDie(int sig, siginfo_t* si, void* uc) {
 }
 
 void HostSignal(int sig, siginfo_t* si, void* uc_) {
+  // Host code called a vtable slot that now holds a guest thunk: run the real host function instead.
+  if (sig == SIGSEGV && IsThunkAddress(((ucontext_t*)uc_)->uc_mcontext.pc)) {
+    auto* huc = (ucontext_t*)uc_;
+    huc->uc_mcontext.pc = g_thunk_fn[(huc->uc_mcontext.pc - (uint64_t)g_thunk_area) / kThunkSize].load();
+    return;
+  }
+  // A write to a page write-protected for SMC detection, by guest or host code: discard its code, retry the write.
+  if (sig == SIGSEGV && si->si_code == SEGV_ACCERR && SmcHandleWriteFault((uint64_t)si->si_addr)) return;
   auto* uc = (ucontext_t*)uc_;
   GuestThread& gt = t_gt;
   const uint64_t pc = uc->uc_mcontext.pc;
@@ -314,7 +599,44 @@ void HostSignal(int sig, siginfo_t* si, void* uc_) {
   uc->uc_mcontext.regs[28] = (uint64_t)F;
 }
 
+// Thread dump (BEER_THREAD_DUMP): print the interrupted thread's guest registers when it is inside JIT code.
+const int kRegsSignal = SIGRTMIN + 10;
+void GuestRegsSignal(int, siginfo_t*, void* uc_) {
+  auto* uc = (ucontext_t*)uc_;
+  GuestThread& gt = t_gt;
+  const uint64_t pc = uc->uc_mcontext.pc;
+  char line[512];
+  int n;
+  if (!gt.ts || !g_ctx->IsAddressInCodeBuffer(gt.ts, pc)) {
+    n = snprintf(line, sizeof line, "[GUEST-REGS] tid=%d not in guest code (host pc=0x%llx)\n", (int)syscall(SYS_gettid),
+                 (unsigned long long)pc);
+  } else {
+    const auto& cfg = g_signals.GetConfig();
+    uint64_t r[16] = {};
+    for (size_t i = 0; i < cfg.SRAGPRCount && i < 16; i++) r[i] = uc->uc_mcontext.regs[cfg.SRAGPRMapping[i]];
+    n = snprintf(line, sizeof line,
+                 "[GUEST-REGS] tid=%d rip=0x%llx rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rbp=%llx rsp=%llx "
+                 "r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+                 (int)syscall(SYS_gettid), (unsigned long long)g_ctx->RestoreRIPFromHostPC(gt.ts, pc),
+                 (unsigned long long)r[X::REG_RAX], (unsigned long long)r[X::REG_RBX], (unsigned long long)r[X::REG_RCX],
+                 (unsigned long long)r[X::REG_RDX], (unsigned long long)r[X::REG_RSI], (unsigned long long)r[X::REG_RDI],
+                 (unsigned long long)r[X::REG_RBP], (unsigned long long)r[X::REG_RSP], (unsigned long long)r[X::REG_R8],
+                 (unsigned long long)r[X::REG_R9], (unsigned long long)r[X::REG_R10], (unsigned long long)r[X::REG_R11],
+                 (unsigned long long)r[X::REG_R12], (unsigned long long)r[X::REG_R13], (unsigned long long)r[X::REG_R14],
+                 (unsigned long long)r[X::REG_R15]);
+  }
+  if (n > 0) (void)!write(2, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
+}
+
 void InstallSignals() {
+  {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = GuestRegsSignal;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(kRegsSignal, &sa, nullptr);
+  }
   for (unsigned sig : kSignals) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -355,6 +677,8 @@ void DeliverFault(Frame* F, GuestThread& gt) {
       for (int i = 0; i < 12; ++i) a[4 + i] = stack_args[i];
       uint64_t x[4];
       for (int i = 0; i < 4; ++i) x[i] = faulting.xmm.sse.data[i][0];
+      if (__builtin_expect(g_stats, 0)) StatHostCall(faulting.rip);
+      PatchCallSlot(faulting, faulting.rip);
       const uint64_t result = beer_guest_host_call(faulting.rip, a, x);
       memcpy(&F->State, &faulting, sizeof(faulting));   // nested guest calls restored it already; be explicit
       F->State.gregs[X::REG_RAX] = result;
@@ -413,13 +737,17 @@ void BeerSyscallHandler::HandleSyscall(Frame* F) {
   uint64_t x[4];
   for (int i = 0; i < 4; ++i) x[i] = s.xmm.sse.data[i][0];   // Win64 float arguments (XMM0-3 by position)
 
+  if (__builtin_expect(g_stats, 0)) g_stat_imports.fetch_add(1, std::memory_order_relaxed);
   Frame* prev_frame = gt.import_frame;
   jmp_buf* prev_jb = gt.resume_jb;
   jmp_buf jb;
   gt.import_frame = F;
   gt.resume_jb = &jb;
   if (_setjmp(jb) == 0) {
-    const uint64_t result = beer_guest_import_dispatch(id, a, x, rsp);
+    const uint32_t thunk = (uint32_t)id - kThunkIdBase;
+    const uint64_t result = thunk < kMaxThunks && (uint32_t)id >= kThunkIdBase
+        ? beer_guest_host_call(g_thunk_fn[thunk].load(std::memory_order_relaxed), a, x)
+        : beer_guest_import_dispatch(id, a, x, rsp);
     F->State.gregs[X::REG_RAX] = result;
     F->State.rip = resume;
   }
@@ -430,12 +758,33 @@ void BeerSyscallHandler::HandleSyscall(Frame* F) {
 
 // ---- context initialisation --------------------------------------------------------------------------------
 void InitOnce() {
+  g_thunks_enabled = !getenv("BEER_GUEST_THUNKS") || atoi(getenv("BEER_GUEST_THUNKS")) != 0;
+  if (getenv("BEER_GUESTCPU_STATS")) {
+    g_stats = true;
+    pthread_t reporter;
+    if (pthread_create(&reporter, nullptr, StatReporter, nullptr) == 0) pthread_detach(reporter);
+  }
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);
   FEXCore::Config::Initialize();
   FEXCore::Config::Load();
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "0");   // TODO: write-fault based SMC tracking
+  // Self-modifying code: write-fault tracking (SmcMarkCodePage / SmcHandleWriteFault). BEER_FEX_SMCCHECKS=0 turns it off.
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "1");
+  // BEER_FEX_<OPTION>=<value> sets any FEXCore option (e.g. BEER_FEX_TSOENABLED=0, BEER_FEX_MAXINST=500) for
+  // measuring emulation trade-offs; launch.txt passes it as env:BEER_FEX_...=...
+  {
+    static const struct { const char* env; FEXCore::Config::ConfigOption option; } kOptions[] = {
+#define OPT_BASE(type, group, enum, json, default) {"BEER_FEX_" #enum, FEXCore::Config::CONFIG_##enum},
+#include <FEXCore/Config/ConfigValues.inl>
+    };
+    for (const auto& o : kOptions)
+      if (const char* value = getenv(o.env)) {
+        FEXCore::Config::Set(o.option, value);
+        fprintf(stderr, "[GUESTCPU] FEX option %s = %s\n", o.env + 9, value);
+      }
+  }
+  g_smc = !getenv("BEER_FEX_SMCCHECKS") || atoi(getenv("BEER_FEX_SMCCHECKS")) == FEXCore::Config::CONFIG_SMC_MTRACK;
 
   g_host_lo = (uint64_t)&__ehdr_start;
   g_host_hi = (uint64_t)&etext;
@@ -574,6 +923,34 @@ void beer_guest_enter(uintptr_t stack_top, BeerGuestTlsRunner tls, uintptr_t ent
 
   g_ctx->ExecuteThread(gt.ts);   // returns only if the guest executes `hlt` (EnableExitOnHLT is not set): never in practice
   Fatal("the guest's entry point returned");
+}
+
+void beer_guest_dump_registers(void) {   // async-signal-safe enough for a diagnostic: no allocation, only tgkill
+  const pid_t pid = getpid();
+  for (size_t i = 0; i < g_thread_tids.size(); ++i) syscall(SYS_tgkill, pid, g_thread_tids[i], kRegsSignal);
+}
+
+void beer_guest_memory_will_change(const void* address, size_t size) {
+  if (!g_smc || !g_ctx || !size) return;
+  const uint64_t lo = (uint64_t)address & ~(kPage - 1);
+  const uint64_t hi = ((uint64_t)address + size + kPage - 1) & ~(kPage - 1);
+  {   // nothing translated from this range (file reads into data buffers, most protection changes): only note it
+    std::scoped_lock lk(g_smc_lock);
+    g_smc_maps_dirty = true;
+    auto it = g_smc_code_pages.lower_bound(lo);
+    if (it == g_smc_code_pages.end() || *it >= hi) return;
+  }
+  std::scoped_lock code(g_ctx->GetCodeInvalidationMutex());
+  std::scoped_lock lk(g_smc_lock);
+  SmcInvalidateLocked(lo, hi - lo);
+  for (auto it = g_smc_code_pages.lower_bound(lo); it != g_smc_code_pages.end() && *it < hi;) {
+    auto trapped = g_smc_trapped.find(*it);
+    if (trapped != g_smc_trapped.end()) {   // give the caller (and the kernel) the protection the guest set
+      mprotect((void*)trapped->first, kPage, trapped->second);
+      g_smc_trapped.erase(trapped);
+    }
+    it = g_smc_code_pages.erase(it);
+  }
 }
 
 uint64_t beer_guest_call(uint64_t fn, const uint64_t* args, unsigned nargs) {

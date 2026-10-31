@@ -783,6 +783,13 @@ static void mf_probe_stream_header(BeerMfShell *byte_stream)
     fputc('\n', stderr);
 }
 
+/* The ffmpeg/ffprobe executables: BEER_FFMPEG / BEER_FFPROBE when set (the Android app bundles them), else PATH. */
+static const char *mf_tool(const char *variable, const char *fallback)
+{
+    const char *path = getenv(variable);
+    return path && *path ? path : fallback;
+}
+
 static void mf_probe_stream_with_ffmpeg(BeerMfShell *byte_stream)
 {
     if (!getenv("BEER_MF_PROBE_STREAM") || !byte_stream || !byte_stream->owner)
@@ -819,9 +826,9 @@ static void mf_probe_stream_with_ffmpeg(BeerMfShell *byte_stream)
             (unsigned long long)total, path);
     char command[1024];
     snprintf(command, sizeof(command),
-             "ffprobe -v error -show_entries format=format_name,duration "
+             "'%s' -v error -show_entries format=format_name,duration "
              "-show_entries stream=index,codec_name,codec_type,width,height "
-             "-of compact=p=0:nk=0 '%s' 2>&1", path);
+             "-of compact=p=0:nk=0 '%s' 2>&1", mf_tool("BEER_FFPROBE", "ffprobe"), path);
     FILE *probe = popen(command, "r");
     if (probe) {
         char line[512];
@@ -1383,10 +1390,10 @@ static void mf_probe_decoder_metadata(BeerMfSourceReader *self)
     if (!self || !self->decoder_input_path) return;
     char command[1024];
     snprintf(command, sizeof(command),
-             "ffprobe -v error -select_streams v:0 "
+             "'%s' -v error -select_streams v:0 "
              "-show_entries stream=width,height,avg_frame_rate,start_time "
              "-show_entries format=duration -of default=nw=1 '%s' 2>/dev/null",
-             self->decoder_input_path);
+             mf_tool("BEER_FFPROBE", "ffprobe"), self->decoder_input_path);
     FILE *probe = popen(command, "r");
     if (!probe) return;
     char line[256];
@@ -1471,7 +1478,7 @@ static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
         close(video_pipe[0]); close(video_pipe[1]);
         close(audio_pipe[0]); close(audio_pipe[1]);
         MF_DECODER_NICE();
-        execlp("ffmpeg", "ffmpeg", "-nostdin", "-v", "error", MF_DECODER_THREAD_ARGS "-i",
+        execlp(mf_tool("BEER_FFMPEG", "ffmpeg"), "ffmpeg", "-nostdin", "-v", "error", MF_DECODER_THREAD_ARGS "-i",
                self->decoder_input_path, "-map", "0:v:0", "-an", "-sn",
                "-vsync", "0", "-pix_fmt", "nv12", "-f", "rawvideo",
                "pipe:1", (char *)NULL);
@@ -1491,7 +1498,7 @@ static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
         close(video_pipe[0]); close(video_pipe[1]);
         close(audio_pipe[0]); close(audio_pipe[1]);
         MF_DECODER_NICE();
-        execlp("ffmpeg", "ffmpeg", "-nostdin", "-v", "error", MF_DECODER_THREAD_ARGS "-i",
+        execlp(mf_tool("BEER_FFMPEG", "ffmpeg"), "ffmpeg", "-nostdin", "-v", "error", MF_DECODER_THREAD_ARGS "-i",
                self->decoder_input_path, "-map", "0:a:0", "-vn", "-sn",
                "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1",
                (char *)NULL);

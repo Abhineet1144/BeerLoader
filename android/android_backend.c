@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -158,19 +159,50 @@ static int handle_input_event(AInputEvent *event)
         return 1;
     }
     if (type == AINPUT_EVENT_TYPE_MOTION) {
+        /* Touch as a touchpad: dragging moves the cursor by the finger's movement (games read the mouse as relative
+         * motion, so the cursor must not jump to where a finger lands), a short tap is a left click at the cursor, and
+         * a two-finger tap is a right click (the "back" of many PC menus). A tap must stay within TAP_SLOP pixels and
+         * TAP_NS of its press; anything longer or further is a drag. */
+        enum { TAP_SLOP = 24 };
+        const int64_t TAP_NS = 300000000;
+        static float down_x, down_y, last_x, last_y, cursor_x = -1, cursor_y = -1;
+        static int64_t down_time;
+        static int moved, max_pointers;
+        if (cursor_x < 0) { cursor_x = A.width / 2.0f; cursor_y = A.height / 2.0f; }
         const int action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
         const float x = AMotionEvent_getX(event, 0), y = AMotionEvent_getY(event, 0);
         switch (action) {
         case AMOTION_EVENT_ACTION_DOWN:
-            emit_pointer(XWAYLAND_EVENT_POINTER_MOTION, x, y, 0);
-            emit_pointer(XWAYLAND_EVENT_BUTTON_DOWN, x, y, 1);
+            down_x = last_x = x; down_y = last_y = y;
+            down_time = AMotionEvent_getEventTime(event);
+            moved = 0;
+            max_pointers = 1;
+            break;
+        case AMOTION_EVENT_ACTION_POINTER_DOWN:
+            if ((int)AMotionEvent_getPointerCount(event) > max_pointers)
+                max_pointers = (int)AMotionEvent_getPointerCount(event);
             break;
         case AMOTION_EVENT_ACTION_MOVE:
-            emit_pointer(XWAYLAND_EVENT_POINTER_MOTION, x, y, 0);
+            if (fabsf(x - down_x) > TAP_SLOP || fabsf(y - down_y) > TAP_SLOP) moved = 1;
+            if (max_pointers == 1) {
+                cursor_x = fminf(fmaxf(cursor_x + (x - last_x), 0), (float)(A.width > 0 ? A.width - 1 : 0));
+                cursor_y = fminf(fmaxf(cursor_y + (y - last_y), 0), (float)(A.height > 0 ? A.height - 1 : 0));
+                emit_pointer(XWAYLAND_EVENT_POINTER_MOTION, cursor_x, cursor_y, 0);
+            }
+            last_x = x; last_y = y;
             break;
-        case AMOTION_EVENT_ACTION_UP:
+        case AMOTION_EVENT_ACTION_UP: {
+            const int tap = !moved && AMotionEvent_getEventTime(event) - down_time <= TAP_NS * (max_pointers > 1 ? 2 : 1);
+            if (tap) {
+                const unsigned button = max_pointers > 1 ? 3 : 1;   /* X11: 1 left, 3 right */
+                emit_pointer(XWAYLAND_EVENT_BUTTON_DOWN, cursor_x, cursor_y, button);
+                usleep(50000);   /* hold it across a few frames: games that poll the mouse once per frame see it */
+                emit_pointer(XWAYLAND_EVENT_BUTTON_UP, cursor_x, cursor_y, button);
+            }
+            break;
+        }
+        case AMOTION_EVENT_ACTION_POINTER_UP:
         case AMOTION_EVENT_ACTION_CANCEL:
-            emit_pointer(XWAYLAND_EVENT_BUTTON_UP, x, y, 1);
             break;
         default: return 0;
         }
@@ -433,6 +465,12 @@ static void *loader_thread(void *unused)
             setenv("BEER_VKD3D_SHADER_LIBRARY", value, 0);
             snprintf(value, sizeof(value), "%s/libdxil-spirv-c-shared.so", libdir);
             setenv("BEER_DXIL_SPIRV_LIBRARY", value, 0);
+            /* The video decoders (media/media_foundation.c) are executables packaged as lib*.so so that Android
+             * installs them executable in the same directory. */
+            snprintf(value, sizeof(value), "%s/libffmpeg.so", libdir);
+            setenv("BEER_FFMPEG", value, 0);
+            snprintf(value, sizeof(value), "%s/libffprobe.so", libdir);
+            setenv("BEER_FFPROBE", value, 0);
         }
     }
     setenv("BEER_VULKAN_LIBRARY", "libvulkan.so", 0);
@@ -871,8 +909,9 @@ static int present_common(VkImage source, VkImageLayout layout, uint32_t w, uint
     }
     beer_vulkan_queue_unlock();
     if (r != VK_SUCCESS) { beer_vulkan_record_result(r, "present submit"); return 0; }
-    /* The caller may release the source image as soon as we return, so wait for the blit to finish reading it. */
-    P.WaitForFences(P.device, 1, &P.fence, VK_TRUE, timeout_ns);
+    /* No wait here: the next present waits for this fence before reusing the command buffer, so the CPU can record
+     * the next frame while the GPU finishes this one. The source is a swapchain back buffer, which D3D12 lets the
+     * game release only after it has waited for the GPU itself. */
     return 1;
 }
 

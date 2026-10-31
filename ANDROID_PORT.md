@@ -408,6 +408,22 @@ RE8 now renders its title scene, menus, popups and logo in the APK, without the 
 - Toolchain on the second PC lives on the D: drive (`/mnt/56A4064AA4062CD5/Abhi/android-build`, linked as
   `../android-sdk` and `../android-deps`).
 
+## RE8 gameplay on the phone (2026-10-31)
+
+RE8 now reaches gameplay in the APK: videos play, the 3D world renders, ~30 fps at 1080p and 50-60 fps at the lowest
+Image Quality, GPU-bound (kgsl gpubusy ~95%).
+- Loading hang: the game's audio mixer, slow under emulation, held its audio engine's lock almost permanently and starved
+  the sound-bank requests loading waits for. Workaround until audio is done: `env:BEER_WASAPI_NO_DEVICE=1` (no endpoint).
+- Videos: ffmpeg/ffprobe built for Android (`../android-deps/ffmpeg-build`, minimal LGPL build) ship as
+  `libffmpeg.so`/`libffprobe.so`; `BEER_FFMPEG`/`BEER_FFPROBE` point media_foundation.c at them.
+- Speed: guest calls into Beer's COM objects patch their vtable slot to a `syscall` thunk on first use (no signal per call);
+  the Android presenter no longer waits for the GPU at each present. `BEER_GUEST_THUNKS=0` disables the thunks.
+- Texel-view offset fix extended to the bindless heap mirror (binding 6). Self-modifying-code detection (FEX MTRACK with
+  write-fault tracking) is on; RE8 itself does not need it.
+- Touch is a touchpad: drag moves the cursor, tap = left click, two-finger tap = right click.
+- Diagnostics: `BEER_THREAD_DUMP=1` + `kill -USR2` now shows Windows thread ids, waited events/semaphores/critical
+  sections with owners, and each thread's guest registers; `BEER_GUESTCPU_STATS=1`; `BEER_FEX_<OPTION>=value`.
+
 ## Resuming on another machine (state at the pause, 2026-10-30)
 
 **Nothing is committed.** All work is uncommitted on branch `apk` (new files under `android/`, `platform/`, `tools/`, plus edits to

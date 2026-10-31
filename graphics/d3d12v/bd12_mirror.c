@@ -22,6 +22,7 @@ typedef struct BD12HeapMirror {
     pthread_mutex_t lock;
     const BD12DescriptorHeap *sampler_heap;   /* sampler heap currently mirrored into binding 5 */
     uint32_t sampler_gen;
+    BD12Buffer *offsets;                      /* texel_offset_fixup: per-slot texel view offset (binding 6) */
 } BD12HeapMirror;
 
 /* Binding 4 mirrors constant buffers; binding 5 holds the bound sampler heap (at most 2048 entries). */
@@ -50,13 +51,15 @@ VkDescriptorSetLayout bd12_mirror_layout(BD12Device *device)
 {
     pthread_mutex_lock(&g_lock);
     if (!g_layout && !g_layout_failed) {
-        VkDescriptorSetLayoutBinding bindings[MIRROR_BINDINGS];
-        VkDescriptorBindingFlags flags[MIRROR_BINDINGS];
-        for (uint32_t i = 0; i < MIRROR_BINDINGS; ++i) {
+        /* texel_offset_fixup adds binding 6: the per-slot offsets of texel views created below their D3D offset. */
+        const uint32_t binding_count = MIRROR_BINDINGS + (device->texel_offset_fixup ? 1u : 0u);
+        VkDescriptorSetLayoutBinding bindings[MIRROR_BINDINGS + 1];
+        VkDescriptorBindingFlags flags[MIRROR_BINDINGS + 1];
+        for (uint32_t i = 0; i < binding_count; ++i) {
             bindings[i] = (VkDescriptorSetLayoutBinding){
                 .binding = i,
-                .descriptorType = k_types[i],
-                .descriptorCount = MIRROR_COUNT_OF(i),
+                .descriptorType = i < MIRROR_BINDINGS ? k_types[i] : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = i < MIRROR_BINDINGS ? MIRROR_COUNT_OF(i) : 1u,
                 .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT |
                               (device->rt_enabled ? (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                                                      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
@@ -68,14 +71,14 @@ VkDescriptorSetLayout bd12_mirror_layout(BD12Device *device)
         }
         VkDescriptorSetLayoutBindingFlagsCreateInfo flag_info = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
-            .bindingCount = MIRROR_BINDINGS,
+            .bindingCount = binding_count,
             .pBindingFlags = flags
         };
         VkDescriptorSetLayoutCreateInfo info = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = &flag_info,
             .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
-            .bindingCount = MIRROR_BINDINGS,
+            .bindingCount = binding_count,
             .pBindings = bindings
         };
         if (device->vk.CreateDescriptorSetLayout(device->device, &info, NULL,
@@ -107,6 +110,7 @@ void bd12_mirror_heap_unregister(BD12DescriptorHeap *heap)
     BD12HeapMirror *mirror = heap->mirror;
     if (mirror) {
         heap->device->vk.DestroyDescriptorPool(heap->device->device, mirror->pool, NULL);
+        if (mirror->offsets) bd12_buffer_destroy(mirror->offsets);
         pthread_mutex_destroy(&mirror->lock);
         free(mirror);
         heap->mirror = NULL;
@@ -170,9 +174,13 @@ static void write_range(BD12DescriptorHeap *heap, uint32_t first, uint32_t count
             continue;
         }
         VkBufferView buffer_view = d->buffer_view;
+        uint32_t delta = 0;
         if (binding >= 2 && !buffer_view && d->source_buffer)
-            buffer_view = bd12_buffer_view_pinned(d->source_buffer, d->format, d->offset,
-                                                  d->range, binding == 3);
+            buffer_view = mirror->offsets ?
+                bd12_buffer_view_offset_pinned(d->source_buffer, d->format, d->offset, d->range, binding == 3, &delta) :
+                bd12_buffer_view_pinned(d->source_buffer, d->format, d->offset,
+                                        d->range, binding == 3);
+        if (binding >= 2 && mirror->offsets) ((uint32_t *)mirror->offsets->cpu)[i] = delta;
         if ((binding < 2 && !d->image_view) || (binding >= 2 && !buffer_view))
             continue;
         if (binding < 2) {
@@ -232,14 +240,15 @@ static BD12HeapMirror *mirror_ensure(BD12DescriptorHeap *heap)
     BD12HeapMirror *mirror = calloc(1, sizeof(*mirror));
     if (!mirror) return NULL;
     pthread_mutex_init(&mirror->lock, NULL);
-    VkDescriptorPoolSize sizes[MIRROR_BINDINGS];
+    VkDescriptorPoolSize sizes[MIRROR_BINDINGS + 1];
     for (uint32_t i = 0; i < MIRROR_BINDINGS; ++i)
         sizes[i] = (VkDescriptorPoolSize){ k_types[i], MIRROR_COUNT_OF(i) };
+    sizes[MIRROR_BINDINGS] = (VkDescriptorPoolSize){ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
     VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
         .maxSets = 1,
-        .poolSizeCount = MIRROR_BINDINGS,
+        .poolSizeCount = MIRROR_BINDINGS + (device->texel_offset_fixup ? 1u : 0u),
         .pPoolSizes = sizes
     };
     VkDescriptorSetAllocateInfo alloc = {
@@ -259,6 +268,23 @@ static BD12HeapMirror *mirror_ensure(BD12DescriptorHeap *heap)
     /* Descriptors written before the mirror existed are not replayed: heap
      * slots routinely keep handles of destroyed resources, and handing those to
      * the driver crashes it. Mirrors are therefore created with the heap. */
+    if (device->texel_offset_fixup) {
+        const VkDeviceSize bytes = (VkDeviceSize)BD12_MIRROR_COUNT * 4;
+        mirror->offsets = bd12_buffer_create_committed(device, BD12_HEAP_UPLOAD, bytes);
+        if (!mirror->offsets || !mirror->offsets->cpu) {
+            if (mirror->offsets) bd12_buffer_destroy(mirror->offsets);
+            device->vk.DestroyDescriptorPool(device->device, mirror->pool, NULL);
+            goto fail;
+        }
+        memset(mirror->offsets->cpu, 0, bytes);
+        const VkDescriptorBufferInfo info = { mirror->offsets->buffer, 0, bytes };
+        const VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = mirror->set,
+            .dstBinding = BD12_MIRROR_OFFSETS_BINDING, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &info
+        };
+        device->vk.UpdateDescriptorSets(device->device, 1, &write, 0, NULL);
+    }
     heap->mirror = mirror;
     fprintf(stderr, "[BD12] descriptor heap mirror created (%u slots)\n",
             heap->count < BD12_MIRROR_COUNT ? heap->count : BD12_MIRROR_COUNT);

@@ -90,13 +90,11 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     }
     if (device->texel_offset_fixup) {   /* one offsets table for both stages, after their bindings */
         offsets_binding = next_binding;
-        int applied = 0;
         for (int s = 0; s < 2; ++s)
             if (stages[s]->spirv)
-                applied |= bd12_texel_offsets_apply(&dense_spirv[s], &dense_bytes[s], stage_binds[s],
-                                                    stage_kept[s], offsets_binding, &offset_slots);
-        if (applied) ++next_binding;
-        else offset_slots = 0;
+                bd12_texel_offsets_apply(&dense_spirv[s], &dense_bytes[s], stage_binds[s], stage_kept[s],
+                                         offsets_binding, &offset_slots);
+        if (offset_slots) ++next_binding;   /* set-0 table; the heap mirror's table needs no set-0 binding */
     }
     for (int s = 0; s < 2; ++s) {
         for (uint32_t i = 0; stages[s]->spirv && i < stage_kept[s]; ++i) {
