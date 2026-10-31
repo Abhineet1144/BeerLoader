@@ -55,6 +55,8 @@ int main(void)
     assert(!strcmp(beer_kernel32_runtime_function_exports[3], "RtlDeleteFunctionTable"));
     assert(!strcmp(beer_kernel32_runtime_function_exports[10], "RtlVirtualUnwind"));
     assert(BEER_KERNEL32_CRT_RUNTIME_EXPORT_COUNT == 49);
+    assert(BEER_KERNEL32_CONSOLE_EXPORT_COUNT == 2);
+    assert(!strcmp(beer_kernel32_console_exports[1], "ReadConsoleW"));
     for (size_t i = 1; i < BEER_KERNEL32_CRT_RUNTIME_EXPORT_COUNT; ++i)
         assert(strcmp(beer_kernel32_crt_runtime_exports[i - 1],
                       beer_kernel32_crt_runtime_exports[i]) < 0);

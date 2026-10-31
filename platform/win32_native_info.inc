@@ -260,8 +260,21 @@ impl_NtDelayExecution(u32 alertable, const s64 *interval)
     return NT_STATUS_SUCCESS;
 }
 
-/* NtRaiseHardError: Beer has no system hard-error UI. Report the error and its string parameters
- * and answer as a dismissed dialog, like the MessageBox implementation. */
+/* Copy a guest UTF-16 string to ASCII without trusting the pointer (diagnostic text only). */
+static void native_safe_narrow(u64 address, char *out, size_t size)
+{
+    size_t n = 0;
+    while (address >= 0x10000 && n + 1 < size) {
+        u16 ch = 0;
+        struct iovec local = { &ch, 2 }, remote = { (void *)(uintptr_t)(address + n * 2), 2 };
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 2 || !ch) break;
+        out[n++] = ch < 0x80 ? (char)ch : '?';
+    }
+    out[n] = 0;
+}
+
+/* NtRaiseHardError: report the error and its string parameters. A STATUS_SERVICE_NOTIFICATION is shown
+ * as a message box (beer_message_dialog); without a display it is answered as a dismissed dialog. */
 static u64 __attribute__((ms_abi))
 impl_NtRaiseHardError(u32 error_status, u32 parameter_count, u32 unicode_mask,
                       const u64 *parameters, u32 response_option, u32 *response)
@@ -284,6 +297,32 @@ impl_NtRaiseHardError(u32 error_status, u32 parameter_count, u32 unicode_mask,
     }
     fputc('\n', stderr);
     if (!response) return NT_STATUS_ACCESS_VIOLATION;
+    /* STATUS_SERVICE_NOTIFICATION carries a MessageBox: text, caption and MB_* type. Show it and map
+     * the IDxxx answer to the HARDERROR_RESPONSE values. */
+    if (error_status == 0x50000018u && parameters && parameter_count >= 3 && (unicode_mask & 3) == 3) {
+        char text[2048], caption[256];
+        for (int which = 0; which < 2; ++which) {
+            u8 unicode[16] = {0};
+            struct iovec local = { unicode, 16 }, remote = { (void *)(uintptr_t)parameters[which], 16 };
+            char *out = which ? caption : text;
+            size_t size = which ? sizeof(caption) : sizeof(text);
+            out[0] = 0;
+            if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == 16) {
+                u64 buffer;
+                memcpy(&buffer, unicode + 8, 8);
+                native_safe_narrow(buffer, out, size);
+                u16 length;
+                memcpy(&length, unicode, 2);
+                if ((size_t)length / 2 < size) out[length / 2] = 0;
+            }
+        }
+        int chosen = beer_message_box_dialog(caption, text, (unsigned)parameters[2]);
+        if (chosen >= 0) {
+            static const u32 response_for_id[12] = { 0, 6, 3, 2, 7, 4, 8, 5, 0, 0, 9, 10 };
+            *response = chosen < 12 ? response_for_id[chosen] : 6;
+            return NT_STATUS_SUCCESS;
+        }
+    }
     switch (response_option) {
     case 0: *response = 4; break;   /* OptionAbortRetryIgnore -> ResponseIgnore */
     case 1: case 2: case 7: *response = 6; break;   /* Ok, OkCancel, OkNoWait -> ResponseOk */
@@ -398,18 +437,20 @@ static u64 __attribute__((ms_abi)) name(type *path)                             
 PATH_REMOVE_FILE_SPEC(impl_PathRemoveFileSpecW, u16)
 PATH_REMOVE_FILE_SPEC(impl_PathRemoveFileSpecA, char)
 
-/* Copy a guest UTF-16 string to ASCII without trusting the pointer (diagnostic text only). */
-static void native_safe_narrow(u64 address, char *out, size_t size)
-{
-    size_t n = 0;
-    while (address >= 0x10000 && n + 1 < size) {
-        u16 ch = 0;
-        struct iovec local = { &ch, 2 }, remote = { (void *)(uintptr_t)(address + n * 2), 2 };
-        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 2 || !ch) break;
-        out[n++] = ch < 0x80 ? (char)ch : '?';
-    }
-    out[n] = 0;
+/* shlwapi PathFindFileName{A,W}: return a pointer into the caller-owned path,
+ * immediately after its last DOS separator. A trailing separator returns the
+ * terminating NUL; a path without a separator returns the original pointer. */
+#define PATH_FIND_FILE_NAME(name, type)                                                        \
+static u64 __attribute__((ms_abi)) name(const type *path)                                      \
+{                                                                                               \
+    if (!path) return 0;                                                                         \
+    const type *base = path;                                                                     \
+    for (const type *cursor = path; *cursor; ++cursor)                                          \
+        if (*cursor == '\\' || *cursor == '/') base = cursor + 1;                              \
+    return (u64)(uintptr_t)base;                                                                 \
 }
+PATH_FIND_FILE_NAME(impl_PathFindFileNameW, u16)
+PATH_FIND_FILE_NAME(impl_PathFindFileNameA, char)
 
 /* ---- ShellExecuteExW: Beer cannot start another Windows program. Report the request and fail
  * the documented way (FALSE, hInstApp = SE_ERR_NOASSOC, no process). ---- */
@@ -467,8 +508,8 @@ static u64 __attribute__((ms_abi)) impl_LoadStringW(u64 module, u32 id, u16 *buf
     return copy;
 }
 
-/* ---- comctl32 TaskDialogIndirect (ordinal 345): Beer has no dialog UI. Report the dialog's text and
- * answer like a dismissed dialog, as the MessageBox implementation does. TASKDIALOGCONFIG is declared
+/* ---- comctl32 TaskDialogIndirect (ordinal 345): shown with beer_message_dialog (answered with the
+ * default button when no display is available). TASKDIALOGCONFIG is declared
  * with 1-byte packing: hInstance@0x0c pszWindowTitle@0x1c pszMainInstruction@0x2c pszContent@0x34.
  * MAKEINTRESOURCE strings are looked up in hInstance's string table. ---- */
 static void task_dialog_text(const u8 *config, size_t offset, char *out, size_t size)
@@ -504,7 +545,49 @@ impl_TaskDialogIndirect(const u8 *config, s32 *button, s32 *radio_button, u32 *v
         for (int i = 0; i < 12; ++i)
             fprintf(stderr, "[TASKDIALOG]   +0x%02x = 0x%llx\n", i * 8, (unsigned long long)*(const u64 *)(config + i * 8));
     beer_log_guest_stack("TASKDIALOG");
-    if (button) *button = 1;                /* IDOK */
+    /* Buttons: custom TASKDIALOG_BUTTON { int id; PCWSTR text; } (packed, 12 bytes) from cButtons@0x3c
+     * and pButtons@0x40, then the common buttons from dwCommonButtons@0x18. */
+    int ids[8];
+    const char *labels[8];
+    static char custom_labels[8][64];
+    int count = 0, cancel = -1;
+    u32 custom_count, common, flags;
+    u64 custom;
+    s32 default_id;
+    memcpy(&custom_count, config + 0x3c, 4);
+    memcpy(&custom, config + 0x40, 8);
+    memcpy(&common, config + 0x18, 4);
+    memcpy(&flags, config + 0x14, 4);
+    memcpy(&default_id, config + 0x48, 4);
+    for (u32 i = 0; custom && i < custom_count && count < 8; ++i) {
+        u8 entry[12];
+        struct iovec local = { entry, 12 }, remote = { (void *)(uintptr_t)(custom + i * 12), 12 };
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 12) break;
+        u64 text_address;
+        memcpy(&ids[count], entry, 4);
+        memcpy(&text_address, entry + 4, 8);
+        native_safe_narrow(text_address, custom_labels[count], sizeof(custom_labels[count]));
+        labels[count] = custom_labels[count];
+        ++count;
+    }
+    static const struct { u32 flag; int id; const char *label; } common_buttons[] = {
+        { 0x01, 1, "OK" }, { 0x02, 6, "Yes" }, { 0x04, 7, "No" },
+        { 0x10, 4, "Retry" }, { 0x08, 2, "Cancel" }, { 0x20, 8, "Close" },
+    };
+    for (size_t i = 0; i < sizeof(common_buttons) / sizeof(*common_buttons) && count < 8; ++i)
+        if (common & common_buttons[i].flag) {
+            if (common_buttons[i].id == 2) cancel = count;
+            ids[count] = common_buttons[i].id;
+            labels[count++] = common_buttons[i].label;
+        }
+    if (!count) { ids[count] = 1; labels[count++] = "OK"; }
+    if (cancel < 0 && (flags & 0x8)) cancel = count - 1;   /* TDF_ALLOW_DIALOG_CANCELLATION */
+    int default_index = 0;
+    for (int i = 0; i < count; ++i) if (ids[i] == default_id) default_index = i;
+    static char body[3200];
+    snprintf(body, sizeof(body), "%s%s%s", instruction, instruction[0] && content[0] ? "\n\n" : "", content);
+    int chosen = beer_message_dialog(title, body, ids, labels, count, default_index, cancel);
+    if (button) *button = chosen >= 0 ? chosen : ids[default_index];
     if (radio_button) *radio_button = 0;
     if (verification_checked) *verification_checked = 0;
     return 0;                               /* S_OK */
@@ -512,3 +595,196 @@ impl_TaskDialogIndirect(const u8 *config, s32 *button, s32 *radio_button, u32 *v
 
 /* InitCommonControlsEx: Beer's controls need no class registration. */
 static u64 __attribute__((ms_abi)) impl_InitCommonControlsEx(const void *init) { return init ? 1 : 0; }
+
+/* ---- WinRT strings (HSTRING), first-party. NULL is the empty string. A reference string
+ * (WindowsCreateStringReference) lives in the caller's 24-byte HSTRING_HEADER and points at the
+ * caller's NUL-terminated buffer; WindowsCreateString/Duplicate allocate a reference-counted copy. ---- */
+typedef struct {
+    u32 flags;                  /* 1 = reference string in a caller HSTRING_HEADER */
+    u32 length;                 /* UTF-16 code units, excluding the terminator */
+    const u16 *buffer;
+    _Atomic(u32) references;    /* heap strings only */
+} BeerHString;
+_Static_assert(sizeof(BeerHString) <= 24, "HSTRING_HEADER is 24 bytes on x64");
+
+#define BEER_E_INVALIDARG 0x80070057u
+#define BEER_E_OUTOFMEMORY 0x8007000Eu
+
+static u64 hstring_new(const u16 *source, u32 length, BeerHString **out)
+{
+    BeerHString *string = malloc(sizeof(*string) + ((size_t)length + 1) * 2);
+    if (!string) return BEER_E_OUTOFMEMORY;
+    u16 *text = (u16 *)(string + 1);
+    if (length) memcpy(text, source, (size_t)length * 2);
+    text[length] = 0;
+    string->flags = 0;
+    string->length = length;
+    string->buffer = text;
+    atomic_store(&string->references, 1);
+    *out = string;
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_WindowsCreateString(const u16 *source, u32 length, BeerHString **out)
+{
+    if (!out || (!source && length)) return BEER_E_INVALIDARG;
+    *out = NULL;
+    return length ? hstring_new(source, length, out) : 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_WindowsCreateStringReference(const u16 *source, u32 length, BeerHString *header, BeerHString **out)
+{
+    if (!out || !header || (!source && length)) return BEER_E_INVALIDARG;
+    *out = NULL;
+    if (!length) return 0;
+    if (source[length] != 0) return BEER_E_INVALIDARG;   /* the source must be NUL-terminated at length */
+    memset(header, 0, 24);
+    header->flags = 1;
+    header->length = length;
+    header->buffer = source;
+    *out = header;
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_WindowsDeleteString(BeerHString *string)
+{
+    if (string && !(string->flags & 1) && atomic_fetch_sub(&string->references, 1) == 1) free(string);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_WindowsDuplicateString(BeerHString *string, BeerHString **out)
+{
+    if (!out) return BEER_E_INVALIDARG;
+    *out = NULL;
+    if (!string) return 0;
+    if (string->flags & 1) return hstring_new(string->buffer, string->length, out);
+    atomic_fetch_add(&string->references, 1);
+    *out = string;
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_WindowsGetStringRawBuffer(const BeerHString *string, u32 *length)
+{
+    static const u16 empty[1] = { 0 };
+    if (length) *length = string ? string->length : 0;
+    return (u64)(uintptr_t)(string ? string->buffer : empty);
+}
+
+static u64 __attribute__((ms_abi)) impl_WindowsGetStringLen(const BeerHString *string)
+{
+    return string ? string->length : 0;
+}
+
+/* ---- Windows.Gaming.UI.GameBar (IGameBarStatics), first-party. Beer has no Game Bar overlay, so it is
+ * never visible and never redirects input; its change events can be registered but never fire, exactly
+ * what a never-opened Game Bar reports. The statics object is a process-lifetime singleton. ---- */
+typedef struct { const void *const *vtable; } BeerWinRtObject;
+
+static const u8 g_iid_iunknown[16]     = { 0,0,0,0, 0,0, 0,0, 0xC0,0,0,0,0,0,0,0x46 };
+static const u8 g_iid_iinspectable[16] = { 0xE0,0xE2,0x86,0xAF, 0x2D,0xB1, 0x6A,0x4C, 0x9C,0x5A,0xD7,0xAA,0x65,0x10,0x1E,0x90 };
+static const u8 g_iid_iagile[16]       = { 0x94,0x2B,0xEA,0x94, 0xCC,0xE9, 0xE0,0x49, 0xC0,0xFF,0xEE,0x64,0xCA,0x8F,0x5B,0x90 };
+static const u8 g_iid_game_bar_statics[16] = { 0x92,0xA2,0xB9,0x1D, 0x78,0xCC, 0x73,0x41, 0xBE,0x45,0xB6,0x1E,0x67,0x28,0x3E,0xA7 };
+static _Atomic(s64) g_winrt_event_token = 1;
+
+static u64 __attribute__((ms_abi)) game_bar_query_interface(BeerWinRtObject *self, const u8 *iid, void **out)
+{
+    if (!out) return 0x80004003u;               /* E_POINTER */
+    *out = NULL;
+    if (!iid) return 0x80070057u;
+    if (memcmp(iid, g_iid_iunknown, 16) && memcmp(iid, g_iid_iinspectable, 16) &&
+        memcmp(iid, g_iid_iagile, 16) && memcmp(iid, g_iid_game_bar_statics, 16))
+        return 0x80004002u;                     /* E_NOINTERFACE */
+    *out = self;
+    return 0;
+}
+static u64 __attribute__((ms_abi)) game_bar_add_ref(BeerWinRtObject *self) { (void)self; return 2; }
+static u64 __attribute__((ms_abi)) game_bar_release(BeerWinRtObject *self) { (void)self; return 1; }
+static u64 __attribute__((ms_abi)) game_bar_get_iids(BeerWinRtObject *self, u32 *count, void **iids)
+{
+    (void)self;
+    if (!count || !iids) return 0x80004003u;
+    *count = 0;                                 /* no additional interfaces beyond IGameBarStatics' own */
+    *iids = NULL;
+    return 0;
+}
+static u64 __attribute__((ms_abi)) game_bar_get_runtime_class_name(BeerWinRtObject *self, BeerHString **name)
+{
+    (void)self;
+    static const u16 class_name[] = { 'W','i','n','d','o','w','s','.','G','a','m','i','n','g','.',
+                                      'U','I','.','G','a','m','e','B','a','r' };
+    if (!name) return 0x80004003u;
+    return impl_WindowsCreateString(class_name, (u32)(sizeof(class_name) / 2), name);
+}
+static u64 __attribute__((ms_abi)) game_bar_get_trust_level(BeerWinRtObject *self, u32 *level)
+{
+    (void)self;
+    if (!level) return 0x80004003u;
+    *level = 0;                                 /* BaseTrust */
+    return 0;
+}
+static u64 __attribute__((ms_abi)) game_bar_add_event(BeerWinRtObject *self, void *handler, s64 *token)
+{
+    (void)self;
+    if (!handler || !token) return 0x80004003u;
+    *token = atomic_fetch_add(&g_winrt_event_token, 1);
+    return 0;
+}
+static u64 __attribute__((ms_abi)) game_bar_remove_event(BeerWinRtObject *self, s64 token)
+{
+    (void)self; (void)token;
+    return 0;
+}
+static u64 __attribute__((ms_abi)) game_bar_get_false(BeerWinRtObject *self, u8 *value)
+{
+    (void)self;
+    if (!value) return 0x80004003u;
+    *value = 0;
+    return 0;
+}
+/* IUnknown, IInspectable, then IGameBarStatics: add_/remove_VisibilityChanged,
+ * add_/remove_IsInputRedirectedChanged, get_Visible, get_IsInputRedirected. */
+static const void *const g_game_bar_statics_vtable[] = {
+    (const void *)game_bar_query_interface, (const void *)game_bar_add_ref, (const void *)game_bar_release,
+    (const void *)game_bar_get_iids, (const void *)game_bar_get_runtime_class_name,
+    (const void *)game_bar_get_trust_level,
+    (const void *)game_bar_add_event, (const void *)game_bar_remove_event,
+    (const void *)game_bar_add_event, (const void *)game_bar_remove_event,
+    (const void *)game_bar_get_false, (const void *)game_bar_get_false,
+};
+static BeerWinRtObject g_game_bar_statics = { g_game_bar_statics_vtable };
+
+/* ---- WinRT activation. Beer provides only the runtime classes implemented here; any other class
+ * answers REGDB_E_CLASSNOTREG with a NULL factory (the native result for an unregistered class), and
+ * is logged so missing classes are visible. ---- */
+static u64 __attribute__((ms_abi)) impl_RoGetActivationFactory(const BeerHString *class_id, const u8 *iid, void **factory)
+{
+    char name[256];
+    u32 length = 0;
+    const u16 *text = (const u16 *)(uintptr_t)impl_WindowsGetStringRawBuffer(class_id, &length);
+    size_t n = 0;
+    for (; n < length && n + 1 < sizeof(name); ++n) name[n] = text[n] < 0x80 ? (char)text[n] : '?';
+    name[n] = 0;
+    if (!factory) return 0x80004003u;           /* E_POINTER */
+    *factory = NULL;
+    if (!strcmp(name, "Windows.Gaming.UI.GameBar"))
+        return game_bar_query_interface(&g_game_bar_statics, iid, factory);
+    fprintf(stderr, "[WINRT] RoGetActivationFactory(\"%s\") -> REGDB_E_CLASSNOTREG (class not provided)\n", name);
+    return 0x80040154u;                         /* REGDB_E_CLASSNOTREG */
+}
+
+/* ---- ReadConsoleA/W: Beer attaches no console to the process, so every handle is a non-console
+ * handle and the read fails as on Windows (FALSE, ERROR_INVALID_HANDLE, nothing read). ---- */
+static u64 __attribute__((ms_abi))
+impl_ReadConsoleW(u64 console, void *buffer, u32 count, u32 *read, const void *control)
+{
+    (void)console; (void)buffer; (void)count; (void)control;
+    if (read) *read = 0;
+    g_last_error = 6;                           /* ERROR_INVALID_HANDLE */
+    return 0;
+}
+static u64 __attribute__((ms_abi))
+impl_ReadConsoleA(u64 console, void *buffer, u32 count, u32 *read, const void *control)
+{
+    return impl_ReadConsoleW(console, buffer, count, read, control);
+}

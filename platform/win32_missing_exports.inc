@@ -31,7 +31,6 @@ static u64 __attribute__((ms_abi)) stub_GlobalReAlloc(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GlobalSize(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GlobalLock(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GlobalUnlock(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_FlushInstructionCache(void){ return 1; }
 static u64 __attribute__((ms_abi)) stub_VirtualAllocEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VirtualProtectEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_HeapDestroy(void){ return 1; }
@@ -56,15 +55,12 @@ static u64 __attribute__((ms_abi)) stub_SetThreadLocale(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetThreadContext(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetProcessIdOfThread(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetThreadId(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateToolhelp32Snapshot(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Process32FirstW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Process32NextW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Process32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Module32First(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Module32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DebugBreak(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Thread32First(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Thread32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayCreate(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayRedim(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayGetUBound(void){ return 0; }

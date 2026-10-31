@@ -1,5 +1,36 @@
 # Beer Loader — Active Development Context
 
+## Status 2026-11-01: PRAGMATA and RE4 both stop only at RE Engine's GPU check (Intel UHD 770)
+
+- **PRAGMATA:** unchanged. It shows the TaskDialog "RE ENGINE - Aborted: Unsupported graphics card" after
+  BD12 device creation and the feature queries.
+- **RE4:** now gets past the Steam ticket check, creates its 1920x1080 window and the BD12 device, then
+  calls FatalAppExitW("Your GPU was not supported. Please check your GPU Driver.") during the feature
+  queries. The earlier mid-startup NULL read (exe RVA 0x3af9295, recovered by the old ret-emu skip, which
+  launched CrashReport.exe) came from incomplete WinRT stubs and is fixed:
+  - HSTRING family, first-party: WindowsCreateString, WindowsCreateStringReference (caller 24-byte
+    HSTRING_HEADER), WindowsDeleteString, WindowsDuplicateString, WindowsGetStringRawBuffer and
+    WindowsGetStringLen. The old stub returned S_OK without producing a string.
+  - RoGetActivationFactory: provides `Windows.Gaming.UI.GameBar` (IGameBarStatics
+    1DB9A292-CC78-4173-BE45-B61E67283EA7). Get_Visible and get_IsInputRedirected report FALSE; the
+    change events register tokens and never fire, as for a never-opened Game Bar. Any other class
+    answers REGDB_E_CLASSNOTREG with a NULL factory and is logged as `[WINRT]`.
+- **Real dialogs:** new `platform/beer_message_dialog.{h,c}` (libX11 via dlopen, own display
+  connection, no X headers, so the ARM64 build is unaffected). MessageBoxA/W (MB_* button sets and
+  defaults), TaskDialogIndirect (custom and common buttons, default button, cancellation),
+  FatalAppExitA/W and NtRaiseHardError(STATUS_SERVICE_NOTIFICATION) now show a modal window with the
+  title, wrapped text and buttons, and return the button actually chosen (mouse, Tab/arrows+Enter,
+  Escape/close). **`BEER_DIALOGS=0`** keeps the old automatic answer for unattended runs. With no
+  display the automatic answer is used as well. Verified: the window is created centred at the
+  computed size; GNOME refuses screen capture from the shell, so the pixels were not machine-checked.
+- RE8 75 s gate passed (BD12 ready, 2560x1440 swapchains, no fatal). Focused tests pass up to the
+  pre-existing unwind assertion.
+- **Launch parameters:** none are required. PRAGMATA reaches the same point in both Steam modes (default
+  compat facade, or `BEER_STEAM_API_MODE=guest`). In compat mode the protector reported *"ReadConsoleW could not
+  be located in KERNEL32.dll"* (a hard-error dialog). In guest mode the name was only present by accident,
+  through another DLL's imports. ReadConsoleA/W are now implemented (no console attached:
+  FALSE/ERROR_INVALID_HANDLE) and published through `beer_kernel32_console_exports`.
+
 ## PRAGMATA — past all protection stages; stops at RE Engine "Unsupported graphics card" (2026-10-31, current)
 
 Current end state, on the Intel UHD 770 (the NVIDIA driver is not loaded): both
@@ -1632,3 +1663,52 @@ Also fixed while gating on RE8: a DllMain run at LoadLibrary time executes on th
 The pending `GetAdaptersAddresses` correction was completed and validated under a cgroup limit of 6 GiB RAM plus 1 GiB swap. Beer now returns one self-contained Windows x64 `IP_ADAPTER_ADDRESSES` record backed by the first active non-loopback host interface, including a real interface index, MAC address, MTU, interface type, operational status, link speed, and an IPv4 `IP_ADAPTER_UNICAST_ADDRESS`/`SOCKET_ADDRESS` when available. The previous implementation returned `ERROR_NO_DATA`/an unusable truncated prefix. New first-party layout coverage is in `platform/win32_ip_adapter.{h,test.c}` and is wired into `make test-input`.
 
 Validation: serial loader build passes under the cap; the focused adapter layout test passes; source diagnostics and `git diff --check` pass. A 150-second capped PRAGMATA guest-Steam run still raises the deliberate `Fatal Error: Initialization error 3`. Its stack remains entirely inside the manually mapped `Citrus.dll` (not D3DKMT/GPU telemetry), including stable RVAs `0x525b17`, `0x53cc7d`, `0x53e4b0`, and `0x481d34`. Therefore the malformed adapter record was a genuine generic Windows-contract defect but is not the decisive Citrus initialization condition. No GPU spoof or Citrus-specific bypass was added. Log: `/tmp/beer-prag-ip-adapter-final.log`.
+
+### RE4 re-check after the native-services work (2026-10-31, later)
+
+The steamclient64 crash in the read-only check below came from this session's loader changes, not from RE4:
+- Absolute Windows paths now resolve in `guest_dll_load`, so `LoadLibrary("c:\program files (x86)\steam\steamclient64.dll")`
+  loaded and *executed* the real Steam client through the prefix symlink. `guest_dll_load` now refuses
+  `steamclient64.dll`, so it is again only the data image backed by Beer's Steam emulation.
+- The import-rebinding pass read names through the descriptor's name table. Without OriginalFirstThunk that
+  table is the IAT, already overwritten, which caused a host fault at startup (masked by the `[SYNC] Generic
+  alloc` recovery). Names now come from the thunk index (`g_snames`).
+- Separately, the tracked `xwayland_backend.o`/`vulkan_presenter.o` were stale (same mtime as their sources,
+  missing `xwayland_window_cpu_presenter`/`vulkan_readback_image_rgba8`); touching the sources rebuilt them.
+
+Result: RE4 again stops at the documented Valve-wrapper ownership-ticket check, `Steam Error: Application load
+error 6:0000065432` followed by TerminateProcess(54). CrashHandler.dll now loads as an application-local
+module and tries to start `CrashReport.exe` as its out-of-process monitor; Beer refuses (SE_ERR_NOASSOC) and
+startup continues. As before, the ticket check was not bypassed. Log: `/tmp/beer-re4-check-3.log`.
+
+### RE4 read-only status check (2026-10-31)
+
+Checked `/mnt/56A4064AA4062CD5/Games/Resident Evil 4/re4.exe` with the existing loader binary, without rebuilding or changing runtime code. The installation is present and internally consistent at the metadata level: `steam_appid.txt` and `steam_emu.ini` both identify app `2050650`; the package contains the larger application-local `steam_api64.dll` and the smaller `steam_api64.rne` original library. The run used the approved shader translator and a 6 GiB RAM / 1 GiB swap cap; no OOM occurred.
+
+Current behavior differs from the earlier session-7 ticket-check boundary. Beer starts in offline-facade mode, maps the executable and bundled MSVC runtime DLLs, then later loads `steamclient64.dll` at its preferred base. Startup does not reach Vulkan, BD11, or BD12. The guest crash handler attempts to launch `CrashReport.exe` through unsupported `ShellExecuteExW`, and the terminal fault is a null access inside `steamclient64.dll` at module RVA `0x8aa9f9`. This is currently a Steam/runtime-module path failure, not a graphics failure. No RE4 process remains. Log: `/tmp/beer-re4-status-20261031-054514.log`.
+
+This check used the already-built loader because the workspace contained unrelated existing changes (`android/guestcpu_fex.cpp` and `android/apk/out/`). The status therefore describes that binary exactly and should be reconfirmed after the next deliberate loader rebuild.
+
+### Native Windows compatibility boundary for RE4 and protected VFS work
+
+The project policy is now explicit in `docs/windows-loader-compatibility-policy.md`. RE4 may expose generic loader defects, but it must never select behavior by executable name, app ID, hash, RVA, byte signature, protection brand, or package-specific asset. Beer will not patch guest code, force branches, forge ownership tickets/signatures, or reproduce a package's bypass logic.
+
+The acceptable investigation is native Windows compatibility: preserve already loaded/KnownDLL module identity, then route unresolved application-private opens through the same native file/section layer that Windows uses, including guest-installed `Nt*`/`Zw*` hooks. If that layer supplies an image, normal relocation, import binding, TLS, `DllMain`, protection, path identity, and `PEB->Ldr` publication apply. If it declines, normal application search and explicit Beer fallback policy continue. This rule must be covered by title-independent virtual-file/section tests before being retained for RE4.
+
+The intended RE4 outcome is therefore not a Beer-created crack. Its existing package-visible module arrangement should be selected naturally if Beer's Windows file/section semantics are correct. RE8 and other facade-mode titles remain mandatory regression gates when runtime work resumes.
+
+### RE4 application-proxy thread bootstrap and graphics checkpoint (current)
+
+The application-local proxy path now exercises the documented thread bootstrap it uses on Windows. Beer had real `CreateToolhelp32Snapshot`, `Thread32First`, `Thread32Next`, and `FlushInstructionCache` implementations later in `g_impls`, but older generated zero stubs with the same names appeared first; `find_impl()` therefore returned the stubs. The duplicate table entries were removed so the real contracts are reachable. `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, process_id)` now ignores `process_id`, matching Windows' thread-snapshot contract.
+
+A 6 GiB RAM / 1 GiB swap capped RE4 run confirms the proxy now calls `CreateToolhelp32Snapshot`, enumerates its Windows-visible thread list, and flushes its patched instruction range. The package proceeds through the application-local `winmm.dll`/`steam_api64.dll` chain, reaches DXGI/D3D12 initialization, and creates a BD12 device on the Intel UHD 770. The previous ownership-ticket stop is no longer the active blocker. The current deliberate exit is the RE Engine message `Your GPU was not supported. Please check your GPU Driver.` after `CheckFeatureSupport`; this is a graphics-feature reporting boundary, not the loader/thread bootstrap.
+
+RE8 passed the mandatory 75-second gate after this correction: ready BD12 and BD11 devices, repeated 2560x1440 swapchain creation/presentation, no fatal loader error, and termination only by the external timeout. Focused filesystem/Kernel32 contract tests, CLI smoke tests, diagnostics, and `git diff --check` pass. Logs: `/tmp/beer-re4-toolhelp.log`, `/tmp/beer-re8-after-toolhelp.log`.
+
+### Chained Together address-wait and Steam boundary (current)
+
+The previous direct-shipping-executable run was trapped in a busy loop because `WaitOnAddress` resolved to a zero stub and returned immediately (about 58 million calls in the bounded trace). Beer now has a first-party address-wait backend in `platform/win32_address_wait.{c,h}` with focused concurrency coverage in `platform/win32_address_wait_test.c`. It supports Windows' 1/2/4/8-byte comparisons, immediate return when the value differs, zero/finite/infinite timeout behavior, and `WakeByAddressSingle`/`WakeByAddressAll`. The three real implementations are registered exactly once and are part of `make test-input`.
+
+Validation under the 6 GiB RAM / 1 GiB swap cap: the standalone address-wait test passes, the serial loader build passes, source diagnostics are clean, and the 120-second direct launch no longer spins in `WaitOnAddress`. The shipping executable completes both TLS callbacks, initializes Steam metadata for app `2567870`, obtains the local Steam user ID, requests `SteamUtils010`, `SteamUser023`, `SteamFriends017`, `STEAMREMOTESTORAGE_INTERFACE_VERSION016`, `STEAMUSERSTATS_INTERFACE_VERSION012`, and `STEAMAPPS_INTERFACE_VERSION008`, and reaches DXGI plus ready BD12/BD11 devices on the Intel UHD 770.
+
+The first remaining service boundary is now Steam online/user services rather than synchronization or graphics. Beer reports these interfaces unavailable: `SteamMatchMakingServers002`, `SteamNetworking006`, and `SteamMatchMaking009`. This is the expected point at which a title that requires a live Steam user/session needs an official-session broker or truthful implementations backed by a real authenticated service; Beer must not fabricate remote users, lobbies, ownership, or networking state. Log: `/tmp/beer-chained-address-wait.log`.

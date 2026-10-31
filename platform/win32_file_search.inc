@@ -828,7 +828,8 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxA(u64 owner, const char *text,
     touch_trace_disarm();
     fprintf(stderr, "[MSGBOX] \"%s\": %s\n", title ? title : "", text ? text : "");
     beer_log_guest_stack("MSGBOX");
-    return beer_message_box_result(type);
+    int chosen = beer_message_box_dialog(title, text, type);
+    return chosen >= 0 ? (u64)chosen : beer_message_box_result(type);
 }
 static u64 __attribute__((ms_abi)) beer_MessageBoxW(u64 owner, const u16 *text, const u16 *title, u32 type)
 {
@@ -838,7 +839,8 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxW(u64 owner, const u16 *text, 
     reg_narrow(title, t, sizeof(t)); reg_narrow(text, c, sizeof(c));
     fprintf(stderr, "[MSGBOX] \"%s\": %s\n", t, c);
     beer_log_guest_stack("MSGBOX");
-    return beer_message_box_result(type);
+    int chosen = beer_message_box_dialog(t, c, type);
+    return chosen >= 0 ? (u64)chosen : beer_message_box_result(type);
 }
 
 /* ---- NtQueryAttributesFile / NtQueryFullAttributesFile (existence probes of NT-level VFS layers) ---- */

@@ -4,14 +4,15 @@ loader.o: loader.c graphics/d3d11/d3d11_compat.h \
  platform/win32_shared_data.h platform/win32_apiset.h \
  platform/win32_kernel32_contract.h platform/win32_bcrypt.h \
  platform/win32_version.h platform/win32_gdi.h platform/win32_resource.h \
- platform/win32_string_ordinal.h platform/beer_time.h \
- platform/beer_control.h platform/beer_overlay.h platform/beer_post.h \
- platform/win32_nt_section.h platform/win32_virtual_memory.h \
- platform/win32_entry.h platform/win32_ui_language.h \
- platform/win32_onexit.h platform/win32_crt_init.h \
- platform/win32_process_parameters.h platform/win32_ip_adapter.h \
- platform/win32_vectored_exception.h platform/win32_unwind.h \
- platform/win32_seh.h platform/win32_unwind.h platform/win32_syscall.h \
+ platform/win32_string_ordinal.h platform/win32_address_wait.h \
+ platform/beer_time.h platform/beer_control.h platform/beer_overlay.h \
+ platform/beer_post.h platform/win32_nt_section.h \
+ platform/win32_virtual_memory.h platform/win32_entry.h \
+ platform/win32_ui_language.h platform/win32_onexit.h \
+ platform/win32_crt_init.h platform/win32_process_parameters.h \
+ platform/win32_ip_adapter.h platform/win32_vectored_exception.h \
+ platform/win32_unwind.h platform/win32_seh.h platform/win32_unwind.h \
+ platform/win32_syscall.h platform/beer_message_dialog.h \
  renderer/vulkan/vulkan_graphics.h renderer/vulkan/vulkan_renderer.h \
  platform/xwayland_backend.h renderer/vulkan/vulkan_context.h \
  platform/directinput_format.h platform/guid_compat.h \
@@ -37,6 +38,7 @@ platform/win32_version.h:
 platform/win32_gdi.h:
 platform/win32_resource.h:
 platform/win32_string_ordinal.h:
+platform/win32_address_wait.h:
 platform/beer_time.h:
 platform/beer_control.h:
 platform/beer_overlay.h:
@@ -54,6 +56,7 @@ platform/win32_unwind.h:
 platform/win32_seh.h:
 platform/win32_unwind.h:
 platform/win32_syscall.h:
+platform/beer_message_dialog.h:
 renderer/vulkan/vulkan_graphics.h:
 renderer/vulkan/vulkan_renderer.h:
 platform/xwayland_backend.h:

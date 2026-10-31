@@ -25,7 +25,76 @@ static inline int beer_module_is_preloaded_system_dll(const char *lower_name)
  * implementation from a host-visible file. */
 static inline int beer_module_prefers_compat_fallback(const char *lower_name)
 {
-    return lower_name && !strcmp(lower_name, "steam_api64.dll");
+    return lower_name &&
+           (!strcmp(lower_name, "steam_api64.dll") ||
+            !strcmp(lower_name, "steamclient64.dll"));
+}
+
+/* Some compatibility modules use a backing PE only for module/file identity.
+ * They must never execute as guest code: their exports are implemented by Beer
+ * and loading a second runtime creates two conflicting process-wide clients. */
+static inline int beer_module_may_execute_guest_image(const char *lower_name)
+{
+    return lower_name && strcmp(lower_name, "steamclient64.dll");
+}
+
+/* Identity-backed compatibility modules expose a byte-identical backing PE at
+ * their advertised path while Beer owns execution of their exports. An exact
+ * path request may return that identity, unlike an ordinary basename facade. */
+static inline int beer_module_has_compat_file_identity(const char *lower_name)
+{
+    return lower_name && !strcmp(lower_name, "steamclient64.dll");
+}
+
+/* An explicit DOS/UNC path is an instruction to load that image, not a module
+ * basename search. Compatibility fallbacks may satisfy unresolved basename
+ * requests, but must never replace a caller-selected application file. */
+static inline int beer_module_path_is_explicit(const char *name)
+{
+    return name && (strchr(name, '\\') || strchr(name, '/') ||
+                    (name[0] && name[1] == ':'));
+}
+
+/* An explicit Windows system-directory path identifies the runtime DLL even
+ * when an application-local proxy with the same basename is already loaded.
+ * Windows can therefore keep both module identities distinct. Normalize only
+ * ASCII case and slash direction here; actual file lookup remains elsewhere. */
+static inline int beer_module_path_is_system_directory(const char *name)
+{
+    if (!name) return 0;
+    char normalized[512];
+    size_t length = strlen(name);
+    if (length >= sizeof(normalized)) return 0;
+    for (size_t i = 0; i <= length; ++i) {
+        char c = name[i];
+        if (c == '/') c = '\\';
+        if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+        normalized[i] = c;
+    }
+    return !strncmp(normalized, "c:\\windows\\system32\\", 20) ||
+           !strncmp(normalized, "c:\\windows\\syswow64\\", 20);
+}
+
+/* A compatibility module may satisfy an unresolved basename search, but an
+ * explicit path selects a concrete file. Returning a facade for that request
+ * would violate Windows loader identity and hide application-local proxies. */
+static inline int beer_module_may_use_compat_fallback(const char *name,
+                                                       const char *lower_name)
+{
+    return !beer_module_path_is_explicit(name) &&
+           beer_module_prefers_compat_fallback(lower_name);
+}
+
+/* Static imports use normal application-directory search unless the module is
+ * already a process-owned KnownDLL identity or an API-set contract. Having a
+ * Beer implementation for one imported symbol does not suppress a local proxy
+ * DLL: Windows loads the module first and only then binds its exports. */
+static inline int beer_module_may_load_application_local(const char *lower_name)
+{
+    return lower_name &&
+           !beer_module_is_preloaded_system_dll(lower_name) &&
+           strncmp(lower_name, "api-ms-", 7) &&
+           strncmp(lower_name, "ext-ms-", 7);
 }
 
 /* These names belong to the Windows runtime rather than the application DLL
@@ -88,6 +157,18 @@ static inline BeerKnownFolder beer_classify_known_folder(const void *rfid)
     if (beer_guid_equal(rfid, local)) return BEER_KNOWN_FOLDER_LOCAL_APPDATA;
     if (beer_guid_equal(rfid, program_data)) return BEER_KNOWN_FOLDER_PROGRAM_DATA;
     return BEER_KNOWN_FOLDER_UNKNOWN;
+}
+
+/* A Win32 read-only OPEN_EXISTING request may be satisfied through an
+ * installed native NT file hook before Beer falls back to the host filesystem.
+ * Mutating opens remain on the ordinary path until virtual write-through has
+ * a complete handle-lifetime implementation. */
+static inline int beer_file_open_may_use_native_hook(uint32_t access,
+                                                      uint32_t creation)
+{
+    const uint32_t GENERIC_WRITE = 0x40000000u;
+    const uint32_t GENERIC_ALL = 0x10000000u;
+    return creation == 3u && !(access & (GENERIC_WRITE | GENERIC_ALL));
 }
 
 static inline int beer_creation_disposition_flags(uint32_t creation,

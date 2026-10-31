@@ -206,6 +206,18 @@ static const char *const beer_kernel32_crt_runtime_exports[] = {
     (sizeof(beer_kernel32_crt_runtime_exports) / \
      sizeof(beer_kernel32_crt_runtime_exports[0]))
 
+/* Console input APIs. Beer gives the process no console; the implementations
+ * report that truthfully, and the names are published so import resolvers find
+ * them in Kernel32 regardless of which DLLs the process happens to load. */
+static const char *const beer_kernel32_console_exports[] = {
+    "ReadConsoleA",
+    "ReadConsoleW",
+};
+
+#define BEER_KERNEL32_CONSOLE_EXPORT_COUNT \
+    (sizeof(beer_kernel32_console_exports) / \
+     sizeof(beer_kernel32_console_exports[0]))
+
 enum {
     BEER_APP_POLICY_THREAD_INITIALIZATION_NONE = 0,
     BEER_APP_POLICY_THREAD_INITIALIZATION_INITIALIZE_WINRT = 1,
