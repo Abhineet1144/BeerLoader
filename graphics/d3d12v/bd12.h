@@ -62,6 +62,7 @@ typedef struct {
 struct BD12Device {
     VkInstance instance;
     VkPhysicalDevice physical_device;
+    PFN_vkGetPhysicalDeviceFormatProperties get_format_properties;   /* CheckFeatureSupport(FORMAT_SUPPORT) */
     VkDevice device;
     VkQueue queue;
     uint32_t queue_family;
@@ -398,6 +399,7 @@ typedef struct {
     uint32_t scratch_count, scratch_capacity;
     uint32_t scratch_current;
     VkDeviceSize scratch_offset;
+    struct BD12SetCache *set_cache;   /* descriptor sets written so far, reused for identical contents */
 } BD12CmdAllocator;
 
 /* Graphics pipelines (M4) -------------------------------------------------- */
@@ -425,6 +427,8 @@ typedef struct {
 
 typedef struct {
     BD12ShaderCode vs, ps;        /* ps.spirv may be NULL (depth-only) */
+    BD12ShaderCode hs, ds, gs;    /* optional; hs and ds come together */
+    uint32_t patch_control_points; /* tessellation input patch size */
     const BD12VertexAttribute *attributes;
     uint32_t attribute_count;
     VkPrimitiveTopology topology;
@@ -459,6 +463,8 @@ typedef struct {
     uint32_t binding_count;
     uint32_t vertex_slot_count;   /* highest used vertex buffer slot + 1 */
     uint64_t shader_hash;         /* combined SPIR-V hash for diagnostics */
+    VkShaderStageFlags stages;    /* every stage the pipeline carries */
+    int tessellated;              /* draws must use a patch list */
 } BD12GraphicsPipeline;
 
 #define BD12_MAX_VERTEX_BUFFERS 16
@@ -500,7 +506,9 @@ typedef struct {
     VkDeviceSize index_offset;
     VkIndexType index_type;
     VkPrimitiveTopology topology;
-    int topology_unsupported;     /* patch list BD12 cannot draw: draws are dropped */
+    uint32_t patch_points;        /* control points when topology is a patch list */
+    VkPrimitiveTopology bound_topology; /* last value given to the command buffer */
+    VkDescriptorSet bound_set;    /* set 0 last bound; valid while the pipeline is not dirty */
     float blend_constants[4];
     uint32_t stencil_ref;
     uint32_t dirty;
@@ -745,6 +753,15 @@ int bd12_binding_descriptor_type(const BD12ShaderBinding *binding,
 /* Allocates a descriptor set from the allocator's record-time pools (valid until it is reset). */
 VkDescriptorSet bd12_allocate_descriptor_set(BD12CmdAllocator *allocator,
                                              VkDescriptorSetLayout layout);
+/* A set holding exactly `writes` (their dstSet is ignored and overwritten): an identical set written earlier
+ * from this allocator in the same frame, or a fresh one. Most draws bind the same resources as a recent draw,
+ * and vkAllocateDescriptorSets + vkUpdateDescriptorSets per draw dominated driver time. */
+VkDescriptorSet bd12_descriptor_set_for_writes(BD12CmdAllocator *allocator,
+                                               VkDescriptorSetLayout layout,
+                                               VkWriteDescriptorSet *writes,
+                                               uint32_t count);
+void bd12_set_cache_clear(BD12CmdAllocator *allocator);
+void bd12_set_cache_free(BD12CmdAllocator *allocator);
 VkDescriptorSet bd12_resolve_descriptor_set(
     BD12CmdList *list, BD12BindState *state, const BD12ShaderBinding *bindings,
     const VkDescriptorType *types, uint32_t binding_count,
@@ -933,6 +950,8 @@ extern uint64_t g_bd12_prof_ns[BD12_PROF_COUNT];
 extern uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
 static inline uint64_t bd12_prof_now(void)
 {
+    /* Per-draw timing is only read with BEER_BD12_PROF; skip the clock read on every draw otherwise. */
+    if (!getenv("BEER_BD12_PROF")) return 0;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -941,6 +960,9 @@ static inline uint64_t bd12_prof_now(void)
 #define BD12_PROF_END(id) do { g_bd12_prof_ns[id] += bd12_prof_now() - bd12_prof_t0_; \
                                ++g_bd12_prof_calls[id]; } while (0)
 void bd12_prof_report(void);
+/* Recorded-command counters for the per-frame stats lines (BEER_BD11_STATS): barriers, render passes. */
+extern uint64_t g_bd12_cmd_counts[4];
+enum { BD12_COUNT_BARRIER, BD12_COUNT_RENDER_PASS, BD12_COUNT_SUBMIT };
 
 
 /* Work BD12 silently could not execute. Every site that skips a draw or

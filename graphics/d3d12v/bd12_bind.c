@@ -546,10 +546,9 @@ static VkDescriptorSet resolve_set_impl(
 {
     if (!set_layout || !state->root_signature) return VK_NULL_HANDLE;
     BD12Device *device = list->device;
-    BD12_PROF_BEGIN();
-    VkDescriptorSet set = allocate_set(list->allocator, set_layout);
-    BD12_PROF_END(BD12_PROF_ALLOC_SET);
-    if (!set) return VK_NULL_HANDLE;
+    /* Allocated up front only when the writes overflow the local arrays; otherwise the finished writes go
+     * through the allocator's set cache. */
+    VkDescriptorSet set = VK_NULL_HANDLE;
 
     enum { MAX_WRITES = 64, MAX_INFOS = 256 };
     VkWriteDescriptorSet writes[MAX_WRITES];
@@ -564,6 +563,8 @@ static VkDescriptorSet resolve_set_impl(
         const VkDescriptorType type = types[i];
         if (b->count > MAX_INFOS) return VK_NULL_HANDLE;
         if (write_count == MAX_WRITES || info_count + b->count > MAX_INFOS) {
+            if (!set && !(set = allocate_set(list->allocator, set_layout))) return VK_NULL_HANDLE;
+            for (uint32_t k = 0; k < write_count; ++k) writes[k].dstSet = set;
             device->vk.UpdateDescriptorSets(device->device, write_count, writes,
                                             0, NULL);
             write_count = 0;
@@ -673,13 +674,16 @@ static VkDescriptorSet resolve_set_impl(
             w->pTexelBufferView = &views[info_count];
         info_count += b->count;
     }
-    if (write_count) {
-        const uint64_t t_update = bd12_prof_now();
+    const uint64_t t_update = bd12_prof_now();
+    if (!set) {
+        set = bd12_descriptor_set_for_writes(list->allocator, set_layout, writes, write_count);
+    } else if (write_count) {
+        for (uint32_t k = 0; k < write_count; ++k) writes[k].dstSet = set;
         device->vk.UpdateDescriptorSets(device->device, write_count, writes, 0,
                                         NULL);
-        g_bd12_prof_ns[BD12_PROF_UPDATE_SETS] += bd12_prof_now() - t_update;
-        ++g_bd12_prof_calls[BD12_PROF_UPDATE_SETS];
     }
+    g_bd12_prof_ns[BD12_PROF_UPDATE_SETS] += bd12_prof_now() - t_update;
+    ++g_bd12_prof_calls[BD12_PROF_UPDATE_SETS];
     return set;
 }
 
@@ -836,3 +840,156 @@ int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
     return 1;
 }
 
+
+/* Descriptor set reuse -------------------------------------------------------
+ * Keyed by the exact descriptor contents (handles, offsets, ranges, layouts),
+ * so a hit is the same set a fresh write would produce. Entries live until the
+ * allocator is reset (when its pools are) and only within one device epoch:
+ * views are recycled after they go unused for several epochs, so a handle
+ * value seen this frame still names the same object. */
+#define BD12_SET_CACHE_SLOTS 4096u          /* power of two */
+#define BD12_SET_CACHE_MAX_KEY 1024u        /* words; larger sets are not cached */
+
+typedef struct {
+    uint64_t hash;
+    VkDescriptorSetLayout layout;
+    VkDescriptorSet set;
+    uint32_t key_offset, key_words;
+} BD12SetCacheEntry;
+
+struct BD12SetCache {
+    BD12SetCacheEntry slots[BD12_SET_CACHE_SLOTS];
+    uint32_t used;
+    uint64_t epoch;
+    uint64_t *keys;
+    size_t key_used, key_capacity;
+};
+
+void bd12_set_cache_clear(BD12CmdAllocator *allocator)
+{
+    struct BD12SetCache *c = allocator->set_cache;
+    if (!c || !c->used) return;
+    memset(c->slots, 0, sizeof(c->slots));
+    c->used = 0;
+    c->key_used = 0;
+}
+
+void bd12_set_cache_free(BD12CmdAllocator *allocator)
+{
+    struct BD12SetCache *c = allocator->set_cache;
+    if (!c) return;
+    free(c->keys);
+    free(c);
+    allocator->set_cache = NULL;
+}
+
+/* Serialises the writes into key words; 0 when they do not fit. */
+static uint32_t set_key(VkDescriptorSetLayout layout, const VkWriteDescriptorSet *writes,
+                        uint32_t count, uint64_t *key)
+{
+    uint32_t n = 0;
+    key[n++] = (uint64_t)(uintptr_t)layout;
+    for (uint32_t i = 0; i < count; ++i) {
+        const VkWriteDescriptorSet *w = &writes[i];
+        if (n + 2 + (size_t)w->descriptorCount * 3 > BD12_SET_CACHE_MAX_KEY) return 0;
+        key[n++] = (uint64_t)w->dstBinding | (uint64_t)w->descriptorType << 32;
+        key[n++] = (uint64_t)w->dstArrayElement | (uint64_t)w->descriptorCount << 32;
+        for (uint32_t e = 0; e < w->descriptorCount; ++e) {
+            switch (w->descriptorType) {
+            case VK_DESCRIPTOR_TYPE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+                key[n++] = (uint64_t)(uintptr_t)w->pImageInfo[e].sampler;
+                key[n++] = (uint64_t)(uintptr_t)w->pImageInfo[e].imageView;
+                key[n++] = (uint64_t)w->pImageInfo[e].imageLayout;
+                break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+                key[n++] = (uint64_t)(uintptr_t)w->pBufferInfo[e].buffer;
+                key[n++] = w->pBufferInfo[e].offset;
+                key[n++] = w->pBufferInfo[e].range;
+                break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                key[n++] = (uint64_t)(uintptr_t)w->pTexelBufferView[e];
+                break;
+            case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+                const VkWriteDescriptorSetAccelerationStructureKHR *as = w->pNext;
+                if (!as || as->sType != VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR)
+                    return 0;
+                key[n++] = (uint64_t)(uintptr_t)as->pAccelerationStructures[e];
+                break;
+            }
+            default:
+                return 0;
+            }
+        }
+    }
+    return n;
+}
+
+static VkDescriptorSet write_new_set(BD12CmdAllocator *allocator, VkDescriptorSetLayout layout,
+                                     VkWriteDescriptorSet *writes, uint32_t count)
+{
+    VkDescriptorSet set = allocate_set(allocator, layout);
+    if (!set) return VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < count; ++i) writes[i].dstSet = set;
+    if (count)
+        allocator->device->vk.UpdateDescriptorSets(allocator->device->device, count, writes, 0, NULL);
+    return set;
+}
+
+VkDescriptorSet bd12_descriptor_set_for_writes(BD12CmdAllocator *allocator,
+                                               VkDescriptorSetLayout layout,
+                                               VkWriteDescriptorSet *writes,
+                                               uint32_t count)
+{
+    if (getenv("BEER_BD12_NO_SET_CACHE")) return write_new_set(allocator, layout, writes, count);
+    uint64_t key[BD12_SET_CACHE_MAX_KEY];
+    const uint32_t words = set_key(layout, writes, count, key);
+    if (!words) return write_new_set(allocator, layout, writes, count);
+    struct BD12SetCache *c = allocator->set_cache;
+    if (!c) {
+        c = allocator->set_cache = calloc(1, sizeof(*c));
+        if (!c) return write_new_set(allocator, layout, writes, count);
+    }
+    const uint64_t epoch = allocator->device->epoch;
+    if (c->epoch != epoch || c->used >= BD12_SET_CACHE_SLOTS / 2) {
+        bd12_set_cache_clear(allocator);
+        c->epoch = epoch;
+    }
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (uint32_t i = 0; i < words; ++i) {
+        hash ^= key[i];
+        hash *= UINT64_C(0x100000001b3);
+        hash ^= hash >> 29;
+    }
+    if (!hash) hash = 1;
+    uint32_t slot = (uint32_t)hash & (BD12_SET_CACHE_SLOTS - 1);
+    for (;; slot = (slot + 1) & (BD12_SET_CACHE_SLOTS - 1)) {
+        BD12SetCacheEntry *e = &c->slots[slot];
+        if (!e->hash) break;
+        if (e->hash == hash && e->layout == layout && e->key_words == words &&
+            !memcmp(c->keys + e->key_offset, key, words * sizeof(uint64_t)))
+            return e->set;
+    }
+    VkDescriptorSet set = write_new_set(allocator, layout, writes, count);
+    if (!set) return VK_NULL_HANDLE;
+    if (c->key_used + words > c->key_capacity) {
+        size_t capacity = c->key_capacity ? c->key_capacity * 2 : 65536;
+        while (capacity < c->key_used + words) capacity *= 2;
+        uint64_t *grown = realloc(c->keys, capacity * sizeof(uint64_t));
+        if (!grown) return set;
+        c->keys = grown;
+        c->key_capacity = capacity;
+    }
+    memcpy(c->keys + c->key_used, key, words * sizeof(uint64_t));
+    c->slots[slot] = (BD12SetCacheEntry){ hash, layout, set, (uint32_t)c->key_used, words };
+    c->key_used += words;
+    ++c->used;
+    return set;
+}

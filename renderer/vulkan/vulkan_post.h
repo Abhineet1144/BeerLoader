@@ -14,6 +14,14 @@
 VkImage vulkan_post_apply(VkCommandBuffer cmd, VkImage upload, uint32_t width, uint32_t height,
                           uint32_t output_width, uint32_t output_height, int *overlay_done);
 
+/* Runs the passes on a device the guest created (the Vulkan mapper) instead of the shared one.  Call before the first
+ * vulkan_post_apply; returns 0 when post-processing is already bound to another device. */
+int vulkan_post_bind_device(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+                            PFN_vkGetInstanceProcAddr get_instance, PFN_vkGetDeviceProcAddr get_device);
+
+/* Nonzero while a recorded screenshot has not been collected yet. */
+int vulkan_post_screenshot_waiting(void);
+
 /* Finishes a screenshot recorded by an earlier frame once its GPU work is complete (call after the
  * presenter's fence wait). */
 void vulkan_post_collect(void);

@@ -67,6 +67,13 @@ static void reg_seed_locked(void)
 {
     if (g_reg_value_count) return;
     reg_seed_hardware();
+    {   /* Launchers look for their sibling launcher through its install folder: point it at the game directory. */
+        char folder[160];
+        snprintf(folder, sizeof(folder), "%s", g_exe_path ? g_exe_path : "");
+        char *slash = strrchr(folder, '\\');
+        if (slash) *slash = 0;
+        if (folder[0]) reg_add_sz("hklm\\software\\rockstar games\\launcher", "installfolder", folder);
+    }
     const char *steam_off = getenv("BEER_FAKE_STEAM_REGISTRY");
     if (steam_off && !strcmp(steam_off, "0")) return;
 
@@ -210,4 +217,26 @@ static void reg_narrow(const u16 *w, char *out, size_t cap)
     size_t i = 0;
     for (; w && w[i] && i + 1 < cap; ++i) out[i] = (char)(w[i] > 0x7f ? '?' : w[i]);
     out[i] = 0;
+}
+
+/* RegGetValueA/W: open the optional subkey, query the value, enforce the RRF_RT_* type filter. */
+static u64 reg_get_value(u64 key, const char *subkey, const char *value, u32 flags, u32 *type, void *data,
+                         u32 *size, int wide)
+{
+    u64 opened = 0, use = key, status;
+    if (subkey && *subkey) {
+        status = reg_open(key, subkey, &opened);
+        if (status) return status;
+        use = opened;
+    }
+    u32 found = 0;
+    status = reg_query(use, value ? value : "", &found, data, size, wide);
+    if (opened) reg_close(opened);
+    if (status == 0) {
+        if (type) *type = found;
+        if ((flags & 0xFFFFu) != 0 && !(found == 1 && (flags & 0x2u)) && !(found == 4 && (flags & 0x10u)) &&
+            (flags & 0xFFFFu) != 0xFFFFu)
+            return 1630;                                          /* ERROR_UNSUPPORTED_TYPE */
+    }
+    return status;
 }

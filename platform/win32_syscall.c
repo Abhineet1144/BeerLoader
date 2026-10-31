@@ -281,7 +281,7 @@ static void beer_win32_syscall_signal(int sig, siginfo_t *info, void *context)
         status = BEER_STATUS_NOT_IMPLEMENTED;
     }
 
-    if (g_trace < 0) g_trace = getenv("BEER_API_TRACE") != NULL;
+    if (g_trace < 0) g_trace = getenv("BEER_API_TRACE") != NULL || getenv("BEER_SYSCALL_DIAGNOSTICS") != NULL;
     if (g_trace || !service || !service->fn) {
         static _Atomic uint8_t invalid_reported[BEER_WIN32_SYSCALL_CAPACITY];
         int first = service ? !service->reported

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include "bd12.h"
 
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -127,6 +128,7 @@ void bd12_cmd_allocator_destroy(BD12CmdAllocator *allocator)
     for (uint32_t i = 0; i < allocator->scratch_count; ++i)
         bd12_buffer_destroy(allocator->scratch[i]);
     free(allocator->scratch);
+    bd12_set_cache_free(allocator);
     device->vk.DestroyCommandPool(device->device, allocator->pool, NULL);
     free(allocator);
 }
@@ -138,6 +140,7 @@ int bd12_cmd_allocator_reset(BD12CmdAllocator *allocator)
         device->vk.ResetDescriptorPool(device->device,
                                        allocator->descriptor_pools[i], 0);
     allocator->descriptor_pool_current = 0;
+    bd12_set_cache_clear(allocator);
     allocator->scratch_current = 0;
     allocator->scratch_offset = 0;
     return device->vk.ResetCommandPool(device->device, allocator->pool, 0) ==
@@ -306,6 +309,7 @@ static void buffer_barrier(BD12CmdList *list, BD12Buffer *buffer,
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &barrier
     };
+    g_bd12_cmd_counts[BD12_COUNT_BARRIER]++;
     list->device->vk.CmdPipelineBarrier2(list->command_buffer, &dependency);
 }
 

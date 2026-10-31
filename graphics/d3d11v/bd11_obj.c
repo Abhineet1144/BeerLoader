@@ -206,11 +206,15 @@ typedef struct { const void *mem; uint32_t pitch, slice; } B11SubData;
 static void buffer_destroy(B11Obj *o)
 {
     B11Buffer *b = (B11Buffer *)o;
-    for (uint32_t i = 0; i < b->backing_count; ++i)
-        if (b->backing[i]) b11_defer(o->dev, free_buffer_fn, b->backing[i]);
+    for (uint32_t i = 0; i < b->backing_count; ++i) {
+        if (!b->backing[i]) continue;
+        if (b->renamed) b11_slice_retire(o->dev, b->backing[i]);
+        else b11_defer(o->dev, free_buffer_fn, b->backing[i]);
+    }
     free(b->backing);
     free(b->backing_serial);
     free(b->shadow);
+    free(b->versions_copy);
     free(b);
 }
 
@@ -248,10 +252,31 @@ BD12Buffer *b11_buffer_current(B11Buffer *b)
 
 /* Returns the backing the next write goes to. discard: take a fresh (or idle) backing so work
  * already in flight keeps reading the old contents. */
+void b11_buffer_rename(B11Buffer *b, BD12Buffer *slice)
+{
+    B11Device *dev = b->obj.dev;
+    if (b->renamed) {
+        if (b->backing[0] != slice) b11_slice_retire(dev, b->backing[0]);
+    } else {
+        for (uint32_t i = 0; i < b->backing_count; ++i)
+            if (b->backing[i]) b11_defer(dev, free_buffer_fn, b->backing[i]);
+        b->renamed = 1;
+    }
+    b->backing[0] = slice;
+    b->backing_serial[0] = 0;
+    b->backing_count = 1;
+    b->current = 0;
+    b->versions_copy_valid = 0;   /* the new version was written elsewhere (a deferred Map) */
+}
+
 BD12Buffer *b11_buffer_write_backing(B11Buffer *b, int discard)
 {
     B11Device *dev = b->obj.dev;
     if (!discard || b->desc.usage != B11_USAGE_DYNAMIC) return b11_buffer_current(b);
+    if (b->renamed) {                               /* versions are upload slices: take a fresh one */
+        BD12Buffer *slice = b11_slice_get(dev, b->desc.byte_width);
+        if (slice) { b11_buffer_rename(b, slice); return slice; }
+    }
     const uint64_t done = bd12_fence_completed(dev->retire);
     for (uint32_t i = 1; i <= b->backing_count; ++i) {
         const uint32_t idx = (b->current + i) % b->backing_count;

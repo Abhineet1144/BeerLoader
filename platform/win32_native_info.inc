@@ -56,68 +56,6 @@ static u32 native_info_copy(void *buffer, u32 length, u32 *return_length, const 
 static _Atomic(u32) g_process_hard_error_mode = 1;
 
 static u64 __attribute__((ms_abi))
-impl_NtQueryInformationProcess(u64 process, u32 info_class, void *buffer, u32 length, u32 *return_length)
-{
-    if (!native_is_current_process(process)) return NT_STATUS_INVALID_HANDLE;
-    WinTEB *teb = native_current_teb();
-    switch (info_class) {
-    case 0: {   /* ProcessBasicInformation */
-        struct {
-            u32 ExitStatus; u32 _pad0;
-            u64 PebBaseAddress;
-            u64 AffinityMask;
-            s32 BasePriority; u32 _pad1;
-            u64 UniqueProcessId;
-            u64 InheritedFromUniqueProcessId;
-        } info = { NT_STATUS_PENDING, 0, teb ? teb->ProcEnvBlk : 0,
-                   win_processor_mask(), 8, 0, (u64)getpid(), (u64)getppid() };
-        _Static_assert(sizeof(info) == 0x30, "PROCESS_BASIC_INFORMATION Win64 size");
-        return native_info_copy(buffer, length, return_length, &info, sizeof(info));
-    }
-    case 7: {   /* ProcessDebugPort: no debug port is attached */
-        u64 port = 0;
-        return native_info_copy(buffer, length, return_length, &port, sizeof(port));
-    }
-    case 12: {  /* ProcessDefaultHardErrorMode, as last set (Windows starts processes with 1) */
-        u32 mode = atomic_load(&g_process_hard_error_mode);
-        return native_info_copy(buffer, length, return_length, &mode, sizeof(mode));
-    }
-    case 26: {  /* ProcessWow64Information: a native 64-bit process */
-        u64 wow64 = 0;
-        return native_info_copy(buffer, length, return_length, &wow64, sizeof(wow64));
-    }
-    case 29: {  /* ProcessBreakOnTermination: not a critical process */
-        u32 critical = 0;
-        return native_info_copy(buffer, length, return_length, &critical, sizeof(critical));
-    }
-    case 30: {  /* ProcessDebugObjectHandle: no debug object exists */
-        if (return_length) *return_length = sizeof(u64);
-        if (length != sizeof(u64)) return NT_STATUS_INFO_LENGTH_MISMATCH;
-        if (!buffer) return NT_STATUS_ACCESS_VIOLATION;
-        *(u64 *)buffer = 0;
-        return NT_STATUS_PORT_NOT_SET;
-    }
-    case 31: {  /* ProcessDebugFlags: NoDebugInherit is set when no debugger is attached */
-        u32 flags = 1;
-        return native_info_copy(buffer, length, return_length, &flags, sizeof(flags));
-    }
-    case 36: {  /* ProcessCookie: a per-process random value, stable for the process lifetime */
-        static u32 cookie;
-        if (!cookie) {
-            u32 value = 0;
-            if (getrandom(&value, sizeof(value), 0) != (ssize_t)sizeof(value)) value = (u32)getpid() * 2654435761u;
-            cookie = value ? value : 1;
-        }
-        return native_info_copy(buffer, length, return_length, &cookie, sizeof(cookie));
-    }
-    default:
-        native_info_unsupported("NtQueryInformationProcess", info_class);
-        if (return_length) *return_length = 0;
-        return NT_STATUS_INVALID_INFO_CLASS;
-    }
-}
-
-static u64 __attribute__((ms_abi))
 impl_NtSetInformationProcess(u64 process, u32 info_class, const void *buffer, u32 length)
 {
     if (!native_is_current_process(process)) return NT_STATUS_INVALID_HANDLE;
@@ -219,25 +157,6 @@ impl_NtSetInformationThreadNative(u64 thread, u32 info_class, const void *info, 
         return NT_STATUS_SUCCESS;
     }
     return impl_NtSetInformationThread(thread, info_class, (void *)(uintptr_t)info, size);
-}
-
-static u64 __attribute__((ms_abi))
-impl_NtQueryVirtualMemory(u64 process, const void *address, u32 info_class, void *buffer,
-                          u64 length, u64 *return_length)
-{
-    if (!native_is_current_process(process)) return NT_STATUS_INVALID_HANDLE;
-    if (info_class != 0) {      /* MemoryBasicInformation only */
-        native_info_unsupported("NtQueryVirtualMemory", info_class);
-        return NT_STATUS_INVALID_INFO_CLASS;
-    }
-    if (length < sizeof(BeerMemoryBasicInformation)) return NT_STATUS_INFO_LENGTH_MISMATCH;
-    if (!buffer) return NT_STATUS_ACCESS_VIOLATION;
-    if ((u64)(uintptr_t)address > 0x00007FFFFFFEFFFFull) return NT_STATUS_INVALID_PARAMETER;
-    size_t written = beer_virtual_query(address, (BeerMemoryBasicInformation *)buffer,
-                                        sizeof(BeerMemoryBasicInformation));
-    if (!written) return NT_STATUS_INVALID_PARAMETER;
-    if (return_length) *return_length = written;
-    return NT_STATUS_SUCCESS;
 }
 
 static u64 __attribute__((ms_abi))
@@ -452,24 +371,6 @@ static u64 __attribute__((ms_abi)) name(const type *path)                       
 PATH_FIND_FILE_NAME(impl_PathFindFileNameW, u16)
 PATH_FIND_FILE_NAME(impl_PathFindFileNameA, char)
 
-/* ---- ShellExecuteExW: Beer cannot start another Windows program. Report the request and fail
- * the documented way (FALSE, hInstApp = SE_ERR_NOASSOC, no process). ---- */
-static u64 __attribute__((ms_abi)) impl_ShellExecuteExW(u8 *info)
-{
-    if (!info || *(const u32 *)info < 0x70) { g_last_error = 87; return 0; }
-    char verb[128] = "", file[512] = "", parameters[512] = "", directory[512] = "";
-    native_safe_narrow(*(const u64 *)(info + 0x10), verb, sizeof(verb));
-    native_safe_narrow(*(const u64 *)(info + 0x18), file, sizeof(file));
-    native_safe_narrow(*(const u64 *)(info + 0x20), parameters, sizeof(parameters));
-    native_safe_narrow(*(const u64 *)(info + 0x28), directory, sizeof(directory));
-    fprintf(stderr, "[SHELL] ShellExecuteExW(mask=0x%x verb=\"%s\" file=\"%s\" params=\"%s\" dir=\"%s\") -> "
-                    "not supported\n", *(const u32 *)(info + 4), verb, file, parameters, directory);
-    beer_log_guest_stack("SHELL");
-    *(u64 *)(info + 0x38) = 31;     /* hInstApp = SE_ERR_NOASSOC */
-    *(u64 *)(info + 0x68) = 0;      /* hProcess */
-    g_last_error = 1155;            /* ERROR_NO_ASSOCIATION */
-    return 0;
-}
 
 /* ---- String-table resources (RT_STRING = 6). String id N lives in block N/16 + 1 as entry N%16; a
  * block is 16 consecutive { u16 length; u16 text[length]; } records. ---- */
@@ -787,4 +688,68 @@ static u64 __attribute__((ms_abi))
 impl_ReadConsoleA(u64 console, void *buffer, u32 count, u32 *read, const void *control)
 {
     return impl_ReadConsoleW(console, buffer, count, read, control);
+}
+
+/* SwitchToThread: yield the processor to another ready thread. Linux does not report whether another
+ * thread ran, so the call answers TRUE (a switch was requested) only when the host yield succeeded. */
+static u64 __attribute__((ms_abi)) impl_SwitchToThread(void)
+{
+    return sched_yield() == 0 ? 1 : 0;
+}
+
+/* PROPVARIANT (24 bytes on Win64): vt at +0, value at +8. Strings returned by property stores are
+ * CoTaskMem (host heap) allocations; BSTRs belong to the OleAut32 allocator. */
+static u64 __attribute__((ms_abi)) impl_PropVariantClear(u8 *value)
+{
+    if (!value) return 0;
+    u16 vt = *(u16 *)value;
+    void *data = *(void **)(value + 8);
+    if ((vt == 30 || vt == 31) && data) free(data);                       /* VT_LPSTR / VT_LPWSTR */
+    else if (vt == 8 && data) impl_SysFreeString(data);                   /* VT_BSTR */
+    else if ((vt == 9 || vt == 13) && data)                               /* VT_DISPATCH / VT_UNKNOWN */
+        ((u64 (__attribute__((ms_abi)) *)(void *))(*(void ***)data)[2])(data);
+    else if (vt != 0 && vt != 1 && vt != 2 && vt != 3 && vt != 4 && vt != 5 && vt != 10 &&
+             vt != 11 && vt != 16 && vt != 17 && vt != 18 && vt != 19 && vt != 20 && vt != 21 &&
+             vt != 22 && vt != 23 && vt != 64)
+        return 0x80070057;                                                /* E_INVALIDARG: unsupported vt */
+    memset(value, 0, 24);
+    return 0;
+}
+
+/* PropVariantToStringAlloc: string and integer variants convert to a new CoTaskMem string;
+ * VT_EMPTY yields an empty string, other types report TYPE_E_TYPEMISMATCH. */
+static u64 __attribute__((ms_abi)) impl_PropVariantToStringAlloc(const u8 *value, u16 **out)
+{
+    if (!out) return 0x80004003;                                          /* E_POINTER */
+    *out = NULL;
+    if (!value) return 0x80070057;
+    u16 vt = *(const u16 *)value;
+    const u8 *data = value + 8;
+    char number[32];
+    const char *narrow = NULL;
+    const u16 *wide = NULL;
+    switch (vt) {
+    case 0: case 1: narrow = ""; break;                                   /* VT_EMPTY / VT_NULL */
+    case 31: case 8: wide = *(const u16 *const *)data; if (!wide) narrow = ""; break;
+    case 30: narrow = *(const char *const *)data; if (!narrow) narrow = ""; break;
+    case 2:  snprintf(number, sizeof(number), "%d", *(const int16_t *)data); narrow = number; break;
+    case 18: snprintf(number, sizeof(number), "%u", *(const uint16_t *)data); narrow = number; break;
+    case 3: case 22: snprintf(number, sizeof(number), "%d", *(const int32_t *)data); narrow = number; break;
+    case 19: case 23: snprintf(number, sizeof(number), "%u", *(const uint32_t *)data); narrow = number; break;
+    case 20: snprintf(number, sizeof(number), "%lld", (long long)*(const int64_t *)data); narrow = number; break;
+    case 21: snprintf(number, sizeof(number), "%llu", (unsigned long long)*(const uint64_t *)data); narrow = number; break;
+    case 16: snprintf(number, sizeof(number), "%d", *(const int8_t *)data); narrow = number; break;
+    case 17: snprintf(number, sizeof(number), "%u", *data); narrow = number; break;
+    case 11: narrow = *(const int16_t *)data ? "1" : "0"; break;          /* VT_BOOL */
+    default: return 0x80028CA0;                                           /* TYPE_E_TYPEMISMATCH */
+    }
+    size_t length = 0;
+    if (wide) while (wide[length]) length++;
+    else length = strlen(narrow);
+    u16 *copy = malloc((length + 1) * sizeof(u16));
+    if (!copy) return 0x8007000E;                                         /* E_OUTOFMEMORY */
+    for (size_t i = 0; i < length; i++) copy[i] = wide ? wide[i] : (u8)narrow[i];
+    copy[length] = 0;
+    *out = copy;
+    return 0;
 }

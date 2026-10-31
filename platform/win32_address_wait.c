@@ -108,8 +108,11 @@ static void address_wake(const void *address, int all)
     BeerAddressWaitBucket *bucket = address_bucket(address);
     pthread_mutex_lock(&bucket->mutex);
     ++bucket->generation;
-    if (all) pthread_cond_broadcast(&bucket->condition);
-    else pthread_cond_signal(&bucket->condition);
+    /* Buckets are shared by unrelated addresses, so a single signal could wake a waiter on another
+     * address and leave the intended one asleep. Wake every waiter in the bucket; the others see a
+     * spurious wake, which WaitOnAddress permits. WakeByAddressSingle therefore never loses a wake. */
+    (void)all;
+    pthread_cond_broadcast(&bucket->condition);
     pthread_mutex_unlock(&bucket->mutex);
 }
 

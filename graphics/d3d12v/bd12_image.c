@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "bd12.h"
 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -371,6 +372,7 @@ static void image_barrier(BD12CmdList *list, BD12Image *image,
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &barrier
     };
+    g_bd12_cmd_counts[BD12_COUNT_BARRIER]++;
     list->device->vk.CmdPipelineBarrier2(list->command_buffer, &dependency);
 }
 

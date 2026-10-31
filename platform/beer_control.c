@@ -1,11 +1,13 @@
 #include "beer_control.h"
 #include "beer_time.h"
 #include "beer_memory.h"
+#include "beer_objects.h"
 #include "beer_overlay.h"
 #include "beer_post.h"
 
 #include <ctype.h>
 #include <errno.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -34,7 +36,7 @@ typedef struct {
 static Setting settings[] = {
     { "time_scale", "Game speed", "Multiplier for the clocks the game sees (0.05 = very slow, 10 = ten times faster).",
       SET_FLOAT, 50, 10000, 1000, 1000 },
-    { "fps_limit", "Frame cap", "Maximum frames per second the game may present (0 = no cap). Applies to D3D12 games.",
+    { "fps_limit", "Frame cap", "Maximum frames per second the game may present (0 = no cap). Applies to D3D12 and Vulkan games.",
       SET_INT, 0, 1000, 0, 0 },
     { "paused", "Pause game time", "Freezes the clocks the game sees. Rendering and input keep running.",
       SET_BOOL, 0, 1, 0, 0 },
@@ -69,9 +71,22 @@ static uint64_t wall_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Frame pacing since the last status request: the longest present-to-present gap and the number over 50 ms
+ * (a visible hitch).  The average fps hides stutter. */
+static _Atomic uint64_t g_last_present_ns, g_max_frame_ns, g_hitches;
+
 void beer_control_note_frame(void)
 {
     atomic_fetch_add_explicit(&g_frames, 1, memory_order_relaxed);
+    const uint64_t now = wall_ns();
+    const uint64_t last = atomic_exchange_explicit(&g_last_present_ns, now, memory_order_relaxed);
+    if (last && now > last) {
+        const uint64_t gap = now - last;
+        uint64_t max = atomic_load_explicit(&g_max_frame_ns, memory_order_relaxed);
+        while (gap > max && !atomic_compare_exchange_weak_explicit(&g_max_frame_ns, &max, gap, memory_order_relaxed,
+                                                                   memory_order_relaxed)) {}
+        if (gap > 50000000ull) atomic_fetch_add_explicit(&g_hitches, 1, memory_order_relaxed);
+    }
     beer_overlay_note_frame();
 }
 
@@ -189,6 +204,8 @@ static void format_milli(char *out, size_t size, int32_t milli)
     snprintf(out, size, "%s%d.%03d", milli < 0 ? "-" : "", (int)(abs(milli) / 1000), (int)(abs(milli) % 1000));
 }
 
+void beer_control_inject_key(unsigned vk, unsigned dik, int extended, int down);   /* loader.c */
+
 static void json_escape(char *out, size_t size, const char *text)
 {
     size_t i = 0;
@@ -238,6 +255,16 @@ static void handle(Session *session, const char *request, char *out, size_t size
         char exe[600];
         json_escape(exe, sizeof(exe), g_exe);
         snprintf(out, size, "{\"ok\":true,\"protocol\":1,\"pid\":%d,\"exe\":\"%s\"}\n", (int)getpid(), exe);
+    } else if (!strcmp(cmd, "trim")) {
+        /* Hands free memory inside the host allocator's arenas back to the system. */
+        uint64_t ticks, before, after, threads;
+        read_proc(&ticks, &before, &threads);
+        const uint64_t start = wall_ns();
+        malloc_trim(0);
+        const uint64_t took = wall_ns() - start;
+        read_proc(&ticks, &after, &threads);
+        snprintf(out, size, "{\"ok\":true,\"rss_before_mb\":%llu,\"rss_after_mb\":%llu,\"ms\":%llu}\n",
+                 (unsigned long long)(before / 1024), (unsigned long long)(after / 1024), (unsigned long long)(took / 1000000));
     } else if (!strcmp(cmd, "status")) {
         uint64_t ticks, rss, threads;
         read_proc(&ticks, &rss, &threads);
@@ -253,16 +280,19 @@ static void handle(Session *session, const char *request, char *out, size_t size
             cpu_total_x10 = cpu_x10 / (uint64_t)(logical > 0 ? logical : 1);   /* share of the whole machine */
         }
         session->last = (Sample){ ticks, now, frames };
+        const uint64_t max_frame_ns = atomic_exchange(&g_max_frame_ns, 0);
+        const uint64_t hitches = atomic_exchange(&g_hitches, 0);
         char scale[24];
         format_milli(scale, sizeof(scale), (int32_t)atomic_load(&settings[0].value));
         snprintf(out, size,
-                 "{\"ok\":true,\"pid\":%d,\"uptime_s\":%llu,\"frames\":%llu,\"fps\":%llu.%llu,\"cpu_percent\":%llu.%llu,\"cpu_cores\":%llu.%llu,\"rss_mb\":%llu,\"threads\":%llu,\"time_scale\":%s,\"fps_limit\":%d,\"paused\":%s}\n",
+                 "{\"ok\":true,\"pid\":%d,\"uptime_s\":%llu,\"frames\":%llu,\"fps\":%llu.%llu,\"cpu_percent\":%llu.%llu,\"cpu_cores\":%llu.%llu,\"rss_mb\":%llu,\"threads\":%llu,\"time_scale\":%s,\"fps_limit\":%d,\"paused\":%s,\"max_frame_ms\":%llu,\"hitches\":%llu}\n",
                  (int)getpid(), (unsigned long long)((now - g_start_ns) / 1000000000ull), (unsigned long long)frames,
                  (unsigned long long)(fps_x10 / 10), (unsigned long long)(fps_x10 % 10),
                  (unsigned long long)(cpu_total_x10 / 10), (unsigned long long)(cpu_total_x10 % 10),
                  (unsigned long long)(cpu_x10 / 1000), (unsigned long long)((cpu_x10 / 100) % 10),
                  (unsigned long long)(rss / 1024), (unsigned long long)threads, scale,
-                 (int)atomic_load(&settings[1].value), atomic_load(&settings[2].value) ? "true" : "false");
+                 (int)atomic_load(&settings[1].value), atomic_load(&settings[2].value) ? "true" : "false",
+                 (unsigned long long)(max_frame_ns / 1000000u), (unsigned long long)hitches);
     } else if (!strcmp(cmd, "settings")) {
         size_t used = (size_t)snprintf(out, size, "{\"ok\":true,\"settings\":[");
         for (size_t i = 0; i < SETTING_COUNT && used + 600 < size; ++i) {
@@ -294,6 +324,16 @@ static void handle(Session *session, const char *request, char *out, size_t size
             return;
         }
         reply_error(out, size, "unknown setting");
+    } else if (!strcmp(cmd, "key")) {
+        /* {"cmd":"key","vk":13,"dik":28,"down":1}: one key transition, delivered like a real keyboard event
+         * (lets scripts drive menus in headless runs and on compositors that ignore synthetic X input). */
+        int32_t vk = 0, dik = 0, down = 1000, extended = 0;
+        if (!beer_json_milli(request, "vk", &vk)) { reply_error(out, size, "key needs vk"); return; }
+        beer_json_milli(request, "dik", &dik);
+        beer_json_milli(request, "down", &down);
+        beer_json_milli(request, "extended", &extended);
+        beer_control_inject_key((unsigned)(vk / 1000), (unsigned)(dik / 1000), extended != 0, down != 0);
+        snprintf(out, size, "{\"ok\":true}\n");
     } else if (!strncmp(cmd, "gfx_", 4)) {
         bd12_cbt_handle(cmd, request, out, size);
     } else if (!strncmp(cmd, "post_", 5) || !strcmp(cmd, "screenshot")) {
@@ -302,6 +342,8 @@ static void handle(Session *session, const char *request, char *out, size_t size
         beer_overlay_handle(cmd, request, out, size);
     } else if (!strncmp(cmd, "mem_", 4)) {
         beer_memory_handle(cmd, request, out, size);
+    } else if (!strncmp(cmd, "obj_", 4)) {
+        beer_objects_handle(cmd, request, out, size);
     } else {
         reply_error(out, size, "unknown cmd");
     }
@@ -367,11 +409,35 @@ static void *accept_thread(void *opaque)
     return NULL;
 }
 
+/* Games allocate and free heavily from many threads, and glibc keeps freed memory inside its per-thread arenas: RDR2
+ * held ~400 MB of free arena memory after start-up.  Handing it back periodically costs ~60 ms of background work and
+ * no frame time.  BEER_NO_MALLOC_TRIM=1 disables it; BEER_MALLOC_TRIM_S sets the interval (default 20 s). */
+static void *trim_thread(void *arg)
+{
+    const unsigned interval = (unsigned)(uintptr_t)arg;
+    for (;;) {
+        sleep(interval);
+        malloc_trim(0);
+    }
+    return NULL;
+}
+
+static void start_trim_thread(void)
+{
+    if (getenv("BEER_NO_MALLOC_TRIM")) return;
+    const char *value = getenv("BEER_MALLOC_TRIM_S");
+    int interval = value ? atoi(value) : 20;
+    if (interval <= 0) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, trim_thread, (void *)(uintptr_t)interval) == 0) pthread_detach(thread);
+}
+
 void beer_control_start(const char *exe_path)
 {
     if (g_listen_fd >= 0) return;
     snprintf(g_exe, sizeof(g_exe), "%s", exe_path ? exe_path : "");
     g_start_ns = wall_ns();
+    start_trim_thread();
     const char *initial = getenv("BEER_TIME_SCALE");
     if (initial) {
         char json[64];

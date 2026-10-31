@@ -222,6 +222,13 @@ static u64 __attribute__((ms_abi)) beer_GetFileAttributesExW(const u16 *name, u3
     if (!name || !data || level != 0) { g_last_error = 87; return 0; }
     char narrow[PATH_MAX], host[PATH_MAX];
     beer_utf16_to_utf8(name, narrow, sizeof(narrow));
+    {   /* BEER_CALLER_MATCH=<substring>: show which guest code asks about matching paths. */
+        const char *match = getenv("BEER_CALLER_MATCH");
+        if (match && *match && strstr(narrow, match)) {
+            fprintf(stderr, "[CALLER] GetFileAttributesExW(%s) t%ld\n", narrow, (long)syscall(SYS_gettid));
+            dbg_dump_guest_callchain("GetFileAttributesExW");
+        }
+    }
     struct stat sb;
     if (synthetic_system_module_base(narrow)) {
         /* CreateFile on this name opens Beer's generated module image (see synthetic_system_module_file),
@@ -456,6 +463,29 @@ static u64 __attribute__((ms_abi)) beer_NtClose(u64 h)
     return impl_CloseHandle(h) ? 0 : 0xC0000008u;
 }
 
+/* Loader lock: protection code takes it (often after locating it by walking ntdll's export table) before reading
+ * PEB->Ldr module lists. One process-wide recursive lock; the cookie only has to round-trip. */
+static pthread_mutex_t g_loader_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+static u64 __attribute__((ms_abi)) beer_LdrLockLoaderLock(u32 flags, u32 *disposition, u64 *cookie)
+{
+    if (flags & 2) {                                    /* LDR_LOCK_LOADER_LOCK_FLAG_TRY_ONLY */
+        int acquired = pthread_mutex_trylock(&g_loader_lock) == 0;
+        if (disposition) *disposition = acquired ? 1 : 2;   /* LOCK_ACQUIRED / LOCK_NOT_ACQUIRED */
+        if (cookie) *cookie = acquired ? 0x1D11ull : 0;
+        return 0;
+    }
+    pthread_mutex_lock(&g_loader_lock);
+    if (disposition) *disposition = 1;
+    if (cookie) *cookie = 0x1D11ull;
+    return 0;
+}
+static u64 __attribute__((ms_abi)) beer_LdrUnlockLoaderLock(u32 flags, u64 cookie)
+{
+    (void)flags;
+    if (!cookie) return 0;
+    return pthread_mutex_unlock(&g_loader_lock) == 0 ? 0 : 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
+}
+
 static u64 __attribute__((ms_abi)) beer_NtQueryInformationFile(u64 h, void *iosb, u8 *info, u32 length, u32 klass)
 {
     int fd = fh_get(h);
@@ -644,11 +674,21 @@ static u64 __attribute__((ms_abi)) beer_OpenProcess(u32 access, u32 inherit, u32
 {
     (void)access; (void)inherit;
     if (pid == (u32)impl_GetCurrentProcessId()) return BEER_OWN_PROCESS_HANDLE;
+    if (pid && kill((pid_t)pid, 0) == 0) {                  /* another live process (guest children included) */
+        u64 handle = beer_proc_alloc((pid_t)pid, 0);
+        if (handle) return handle;
+        return 0;
+    }
     g_last_error = 87;                                      /* ERROR_INVALID_PARAMETER: no such process */
     return 0;
 }
 static u64 __attribute__((ms_abi)) beer_GetExitCodeProcess(u64 process, u32 *code)
 {
+    BeerProc *p = beer_proc_from_handle(process);
+    if (p) {
+        if (code) *code = beer_proc_exited(p) ? p->exit_code : 259u;   /* STILL_ACTIVE */
+        return 1;
+    }
     if (process != BEER_OWN_PROCESS_HANDLE && process != (u64)-1) { g_last_error = 6; return 0; }
     if (code) *code = 259;                                  /* STILL_ACTIVE */
     return 1;

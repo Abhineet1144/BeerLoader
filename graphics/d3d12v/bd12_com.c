@@ -1309,6 +1309,54 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
         return HR_OK;
     }
     switch (feature) {
+    case 2:                                         /* FEATURE_LEVELS: the highest requested level up to 12_1 */
+        if (size >= 24) {
+            uint8_t *d = data;
+            const uint32_t count = *(uint32_t *)d;
+            const uint32_t *requested = *(const uint32_t **)(d + 8);
+            uint32_t best = 0;
+            for (uint32_t i = 0; requested && i < count; ++i)
+                if (requested[i] <= 0xc100u && requested[i] > best) best = requested[i];
+            *(uint32_t *)(d + 16) = best;
+            return best ? HR_OK : HR_E_INVALIDARG;
+        }
+        return HR_E_INVALIDARG;
+    case 3:                                         /* FORMAT_SUPPORT: from the Vulkan format's features */
+        if (size >= 12) {
+            uint32_t *f = data;
+            const uint32_t format = f[0];
+            f[1] = f[2] = 0;
+            const VkFormat vk = bd12_dxgi_to_vk(format);
+            if (vk == VK_FORMAT_UNDEFINED || !self->bd->get_format_properties) return HR_OK;
+            VkFormatProperties props;
+            self->bd->get_format_properties(self->bd->physical_device, vk, &props);
+            const VkFormatFeatureFlags t = props.optimalTilingFeatures, b = props.bufferFeatures;
+            uint32_t s1 = 0, s2 = 0;
+            if (t & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+                s1 |= 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x1000 | 0x800000;   /* textures, load, sample, mip, gather */
+            if (t & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) s1 |= 0x400;      /* sample comparison */
+            if (t & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) s1 |= 0x4000 | 0x40000 | 0x200000 | 0x400000;
+            if (t & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) s1 |= 0x8000;
+            if (t & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) s1 |= 0x20 | 0x80 | 0x10000;
+            if (t & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) { s1 |= 0x40000000; s2 |= 0x40 | 0x80; }  /* typed UAV load/store */
+            if (t & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT) s2 |= 0x3f;                    /* UAV atomics */
+            if (b & (VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) s1 |= 0x1 | 0x100;
+            if (b & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) s1 |= 0x2;
+            if (format == 42 || format == 57) s1 |= 0x4;                              /* R32_UINT / R16_UINT indices */
+            if (format == 10 || format == 24 || format == 28 || format == 29 || format == 87 || format == 91)
+                s1 |= 0x80000;                                                        /* swapchain formats: display */
+            f[1] = s1;
+            f[2] = s2;
+            return HR_OK;
+        }
+        return HR_E_INVALIDARG;
+    case 6:                                         /* GPU_VIRTUAL_ADDRESS_SUPPORT: bits per resource / per process */
+        if (size >= 8) {
+            ((uint32_t *)data)[0] = 40;
+            ((uint32_t *)data)[1] = 40;
+            return HR_OK;
+        }
+        return HR_E_INVALIDARG;
     case 7: case 8: case 12: case 18: case 19:
     case 21: case 23: case 27: case 30: case 32:
         memset(data, 0, size);

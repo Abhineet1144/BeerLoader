@@ -1,5 +1,5 @@
 CC     = gcc
-CFLAGS = -O0 -Wall -Wextra -m64 -gdwarf-4 -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan -Ithird_party/dxil-spirv
+CFLAGS = -O0 -Wall -Wextra -m64 -gdwarf-4 -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan -Ithird_party/dxil-spirv -include platform/beer_env.h
 RENDER_CFLAGS = $(filter-out -O0,$(CFLAGS)) -O3 -march=native
 LDFLAGS = -lpthread -ldl -lcrypto -lz -lm
 TARGET = loader
@@ -7,13 +7,15 @@ TARGET = loader
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
 MEDIA_SRCS = media/media_foundation.c
-PLATFORM_SRCS = platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
+PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
                 platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
                renderer/vulkan/vulkan_post.c \
+               renderer/vulkan/vulkan_bridge.c \
+               renderer/vulkan/vulkan_map.c \
                renderer/vulkan/vulkan_renderer.c \
                renderer/vulkan/vulkan_graphics.c \
                renderer/vulkan/vulkan_indexed_renderer.c
@@ -40,6 +42,10 @@ DEPS = $(OBJS:.o=.d)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
 
+# Hot: every BEER_* switch lookup goes through it.
+platform/beer_env.o: platform/beer_env.c platform/beer_env.h
+	$(CC) $(RENDER_CFLAGS) -c $< -o $@
+
 graphics/d3d11/d3d11_impl.o: graphics/d3d11/d3d11_impl.c
 	$(CC) $(RENDER_CFLAGS) -c $< -o $@
 
@@ -61,6 +67,10 @@ graphics/d3d11v/%.o: graphics/d3d11v/%.c graphics/d3d11v/bd11.h
 # Memory accessor handles floats (strtod/strtof), which the SSE-less loader flags cannot compile.
 platform/beer_memory.o: platform/beer_memory.c platform/beer_memory.h platform/beer_control.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
+# The object scanner does float math on candidate transforms.
+platform/beer_objects.o: platform/beer_objects.c platform/beer_objects.h platform/beer_control.h
+	$(CC) $(D3D12_ABI_CFLAGS) -O2 -Iplatform -c $< -o $@
 
 # This CRT entry point calls host libc and real Win64 guest callbacks. Compile
 # with full ABI support so the host transition also preserves XMM6-XMM15.

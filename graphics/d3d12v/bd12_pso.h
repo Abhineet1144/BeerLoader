@@ -17,9 +17,8 @@ typedef struct {
 
 typedef struct {
     void *root_signature;                       /* guest COM pointer */
-    const uint8_t *vs, *ps, *cs;
-    size_t vs_size, ps_size, cs_size;
-    int has_tessellation_or_geometry;
+    const uint8_t *vs, *ps, *cs, *hs, *ds, *gs;
+    size_t vs_size, ps_size, cs_size, hs_size, ds_size, gs_size;
     const uint8_t *input_elements;              /* D3D12_INPUT_ELEMENT_DESC[] */
     uint32_t input_count;
     uint32_t alpha_to_coverage, independent_blend;

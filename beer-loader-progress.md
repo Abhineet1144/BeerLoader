@@ -240,6 +240,9 @@ spoof or guest patch has been added. Logs:
 `/tmp/beer-pragmata-dstorage-bootstrap.log`, and
 `/tmp/beer-pragmata-dstorage-strings.log`.
 
+RDR2 Path: /mnt/wwn-0x5000c500c67d4454-part1/Games/RDR2/Launcher.exe
+Sekiro Path: /mnt/wwn-0x5000c500c67d4454-part1/Games/Sekiro - Shadows Die Twice/Sekiro.exe
+
 ## PRAGMATA — guest Steam interface ABI progress (current)
 
 After the app-ID and WinTrust/module-identity fixes, the repeatable crash at
@@ -1577,6 +1580,338 @@ Ideas not done: cache candidate root parameters per shader binding (skip scannin
 - Sekiro loading took 2000 ms/frame: `ctx_unmap` byte-scanned multi-MB streaming buffers (and `ctx_map` copied them) on every deferred `Map`, hundreds per frame. Deferred Map(DISCARD/NO_OVERWRITE/WRITE) now hands out a PROT_NONE scratch; first touch faults into `b11_lazy_fault` (hook in `on_crash`, filled from the live buffer or zeros) and Unmap only inspects dirty pages. Frame time 2000 ms -> ~18 ms.
 - Persistent VkPipelineCache (`~/.cache/beer/pipelines-<vendor>-<device>-<driver>.bin`, `BEER_NO_PIPELINE_CACHE=1` disables); saved after 25 new pipelines (>=20 s apart) and at exit.
 - Event/semaphore tables raised (131072/65536), semaphore slots reused: Sekiro panicked with "DLPlainConditionSignal: Failed Create Event" when the old tables filled.
+
+## RDR2 bring-up (started 2026-10-26)
+
+Entry point is `Launcher.exe` (Razor1911 launcher substitute, dynamic MSVC CRT), which is supposed to serve `\\.\pipe\RDR2Launcher_Pipe` and start `RDR2.exe` as a child. `RDR2.exe` itself is a statically linked, Arxan-style self-decrypting exe (file code is encrypted; disassemble from a live dump, e.g. `gdb -batch` with `handle SIGTRAP stop`, `dump binary memory`) plus `1911.dll` (crack, loads and attaches fine). Game uses `12on7\D3D12.DLL` (served by the fake D3D12, BD12 comes up fine on the RTX 2070 SUPER) and `vulkan-1.dll`/FSR/DLSS DLLs that are never touched so far.
+
+Direct `loader RDR2.exe` findings, in the order the game hit them (all fixed generically unless marked):
+- **`\\?\C:\...` paths** (`resolve_windows_host_path`): the Win32 file-namespace prefix was not stripped, so `CreateDirectoryW` of `\\?\C:\Users\Player\AppData\Local\Rockstar Games` failed and the game could not create `exit_file.dat`. `\\?\`, `\\.\` and `\??\` prefixes are now stripped for every caller of the resolver.
+- **`GetPhysicallyInstalledSystemMemory`** was a zero stub; now returns installed RAM in KiB from `sysconf`.
+- **`WSAStartup`** always returned wVersion 2.2. RDR2 asks for 2.0 and demands exactly 2.0 (`cmp al,2` / high byte == 0), otherwise it quits with "Game exited unexpectedly!" (rage fatal error file hash 0x82F6A12F line 0xFD; the same fatal-error dump goes to `%LOCALAPPDATA%\Rockstar Games\Red Dead Redemption 2\exit_file.dat`). wVersion is now the requested version capped at 2.2 (1.x capped at 1.1).
+- The int3/SIGTRAP at RVA 0x25b520d seen in the first runs is just the instruction after the game's `exit(0)` call (the process was already dying), not a trap check.
+- Next failure (open): `ERR_NO_LAUNCHER: Please run Red Dead Redemption 2 from the Rockstar Games Launcher`. The game looks for a launcher process (`WinVerifyTrust`, `CreateToolhelp32Snapshot`/`Process32First`), reads `HKLM\SOFTWARE\WOW6432Node\Rockstar Games\Launcher\InstallFolder` (`RegGetValueW`) and tries `ShellExecuteExW`. Those are zero stubs today, so RDR2 has to be started through `Launcher.exe`.
+
+Diagnostics added: `BEER_DEBUG_CRASH=1` now also prints every stack word that points into the main image as a candidate return address (`stack+0x.. -> image RVA 0x..`), useful for packed games with no unwind data until decrypted.
+
+Launcher.exe status: it imports the dynamic CRT (UCRT api-sets, `VCRUNTIME140`, `VCRUNTIME140_1`, `MSVCP140` iostreams, C++ exceptions), D3D12/DXGI/DComposition and winmm. Without the Microsoft runtime DLLs the loader stubs them to 0 and the process spins in `__C_specific_handler` forever (30M log lines in 30 s). The loader already supports bundled runtime DLLs through `BEER_DLL_PATH` (default `~/.local/share/beer/runtime`, see the RE4 notes above), but that directory does not exist on this machine. Wine's builtin `ucrtbase`/`msvcp140`/`vcruntime140_1` from `~/.wine` were tried and are NOT suitable: they import `__wine_dbg_header`/`__wine_dbg_output` from ntdll and then crash in `EnterCriticalSection` on statically initialised Wine critical sections. Genuine Microsoft copies are needed (RE8's `Win64/` folder has them), then the remaining work is multi-process support (`CreateProcess` of a second loader, named pipes, Toolhelp snapshots, registry values).
+
+Build note: `third_party/` is gitignored; `third_party/dxil-spirv` must be cloned and `make dxil-spirv` run before `make` links (the `.d` files depend on `dxil_spirv_c.h`).
+
+### RDR2 bring-up, session 2 (2026-10-26): launcher path, runtime DLLs, multi-process, graphics probes
+Everything below is generic loader work; RDR2 is only the test case.
+
+**Runtime DLLs.** `~/.local/share/beer/runtime/` now holds genuine Microsoft `ucrtbase.dll`, `msvcp140.dll`, `vcruntime140.dll`, `concrt140.dll`, `vccorlib140.dll` (extracted from the 2017 vc_redist) and `vcruntime140_1.dll` (from `~/.wine`, it has no Wine-specific imports). `api-ms-win-crt-*` imports of guest DLLs load `ucrtbase.dll` lazily (`g_loading_ucrtbase` guard). Guest DLL `DllMain` calls are now dependency ordered (1911.dll crashed in static init when its CRT had not initialised yet). `RtlPcToFileHeader` also searches guest DLLs (msvcp140's `__ExceptionPtr` copy faulted on a null image base). Any `oo2core_*_win64.dll` is now treated as the required real Oodle DLL (was hard-coded to one version).
+
+**Multi-process model** (`platform/win32_process.inc`). A guest process is a host loader process (pid = host pid). `CreateProcessA/W` resolves the exe (MZ magic check), builds `loader [forwarded -- options] --cmdline=<full command line> <exe>` and `posix_spawn`s `/proc/self/exe`; `GetCommandLineA/W` and the PEB command line come from `--cmdline`. Process handles are `0xD1000000+`, snapshot handles `0xD2000000+`. Each loader writes `$XDG_RUNTIME_DIR/beer/<pid>.proc` (ppid, exe name, Windows path, image base) so `CreateToolhelp32Snapshot`/`Process32First/Next(W)`, `OpenProcess`, `GetProcessId`, `GetExitCodeProcess`, `K32EnumProcessModules(Ex)`, `GetModuleFileNameEx`, `GetModuleBaseName`, `QueryFullProcessImageName`, `GetProcessImageFileName` work across processes (stale files from crashed loaders are cleaned by the snapshot). `TerminateProcess` kills a child. Named pipes are `AF_UNIX` sockets in `$XDG_RUNTIME_DIR/beer/pipe-<name>.sock` (`CreateNamedPipe`, `ConnectNamedPipe` incl. overlapped, implicit accept on first read/write returning ERROR_PIPE_LISTENING until a client connects, `CreateFile("\\.\pipe\..")` client, `WaitNamedPipe`, `PeekNamedPipe`, `SetNamedPipeHandleState`, `DisconnectNamedPipe`). With this the Rockstar launcher check passes: RDR2.exe is started by `Launcher.exe`, finds its parent via Toolhelp, `RegGetValue(HKLM\SOFTWARE\Rockstar Games\Launcher, InstallFolder)` (seeded with the exe's folder; `RegGetValueA/W` added) and loads its rpf archives.
+
+**Other fixes found on the way.** `SHGetFolderPath` CSIDL 0x05/0x28/0x23/0x24 (Documents, profile, ProgramData, Windows) were wrong or missing; `RegisterClassA/W` were zero stubs (only the Ex variants worked, so a plain-class window never got created); `QueryDisplayConfig`, `GetDisplayConfigBufferSizes`, `DisplayConfigGetDeviceInfo` (source name, target name, preferred mode, adapter name, base type, advanced colour = off, SDR white level) and `GetDpiForMonitor` were zero stubs that left their outputs unwritten, which made RDR2's monitor enumeration loop and then crash (`platform/win32_display_config.inc`); `Direct3DCreate9`/`Direct3DCreate9Ex` return a minimal adapter-query-only `IDirect3D9Ex` (`platform/win32_d3d9.inc`, `CreateDevice` reports D3DERR_NOTAVAILABLE); `GetPhysicallyInstalledSystemMemory`, `WSAStartup` (see above).
+
+**NVAPI** (`platform/win32_nvapi.inc`). `nvapi_QueryInterface(id)` was missing, which made RDR2 stop with "Minimum Recommended Hardware Check Failure ... requires driver 511.79 or newer". It now serves Initialize, Unload, GetErrorMessage, GetInterfaceVersionString, SYS_GetDriverAndBranchVersion (driver from `/proc/driver/nvidia/version`, 595.91 -> 59591, `BEER_SPOOF_NVAPI_DRIVER` overrides), EnumPhysicalGPUs, GPU_GetFullName / GetPCIIdentifiers / frame buffer size / GPU type / system type / bus id, EnumNvidiaDisplayHandle. Initialize fails with NVAPI_NVIDIA_DEVICE_NOT_FOUND when the (possibly spoofed) vendor is not 0x10de. Unknown ids are logged once as `[NVAPI] interface 0x... is not implemented`. RDR2 asks for 0xAD298D3F, 0x33C7358C, 0x593E8644, 0x34EF9506, 0xC7026A87, 0xDCB616C3, 0xAE457190, 0x1E9D8A31 (not identified yet; all optional so far).
+
+**Where RDR2 stands.** Launcher -> RDR2.exe -> rage init -> hardware check passes -> graphics: it probes both the D3D12 adapter (`12on7\D3D12.DLL`, BD12 device comes up, `CheckFeatureSupport` runs) and the Vulkan adapter (`vkCreateInstance` through the mapper below succeeds, `vkEnumeratePhysicalDeviceGroups`, `vkGetPhysicalDeviceProperties(2)` and memory properties are called). It then never calls `vkCreateDevice`/`vkCreateWin32SurfaceKHR`: with `kSettingAPI_Vulkan` the process crashes in its own code (null object, RVA 0x2c8363f and following, ends in `__fastfail`), with `kSettingAPI_DX12` it shows `ERR_GFX_D3D_INIT`. The cause is not found yet; the first thing to check is the result of its Vulkan physical-device selection and what the D3D12 adapter is missing (SM 6.6 / ResourceBindingTier, see the GoT notes above). `system.xml` lives in the prefix (`Documents/Rockstar Games/Red Dead Redemption 2/Settings/system.xml`, copied from the Steam compatdata); the DX12 variant is saved next to it as `system.xml.dx12.bak`.
+
+### Vulkan-on-Vulkan mapper (2026-10-26)
+Native Vulkan games get the same manager features as the D3D12 core. Files: `renderer/vulkan/vulkan_bridge.c` (the built-in `vulkan-1.dll`: Microsoft x64 -> System V ABI thunks, instance/device/layer/surface translation, see its header comment) and `renderer/vulkan/vulkan_map.c` (what Beer does to the calls).
+
+Why not share the loader's Vulkan device like BD12 does: the shared device has one queue and a fixed extension list, a Vulkan guest chooses its own extensions, features, queues and threads. So the guest owns its `VkInstance`/`VkDevice` and the mapper intercepts:
+- `vkQueuePresentKHR` (frame boundary): `beer_control_note_frame()` (fps counter, overlay frame graph), `beer_control_frame_limit_wait()` (live frame cap), then, when effects, the overlay or a screenshot are active, the same compute passes the D3D12 presenter uses (`vulkan_post_apply`, re-bound to the guest device with `vulkan_post_bind_device`) are recorded and submitted on the presenting queue (waits for the guest's semaphores, signals its own, the present waits on that). When nothing is active the recording is dropped and the present is untouched.
+- `vkCreateSwapchainKHR`: adds `TRANSFER_SRC|DST` usage when the surface supports it (falls back to the exact create-info when the driver refuses). The format is never changed. RGBA8 UNORM/sRGB: raw `vkCmdCopyImage`; BGRA8 UNORM: blit (swizzles); BGRA8 sRGB: raw copy into a BGRA8 UNORM staging image, then blit (no sRGB decode/encode). Other formats (HDR, 10-bit, float) run without effects. A first attempt that re-created sRGB swapchains as UNORM + mutable format was dropped because a guest that clears or blits straight into the swapchain image would lose the sRGB encode.
+- `vkGetPhysicalDeviceProperties(2/2KHR)` and `vkGetPhysicalDeviceMemoryProperties(2/2KHR)`: `BEER_SPOOF_GPU_NAME/_VENDOR/_DEVICE/_VRAM_MB` (shared helper `beer_vulkan_gpu_spoof`, DXGI uses the same one).
+- `vkGetDeviceQueue(2)` / `vkDestroyDevice` / `vkDestroySwapchainKHR`: queue->family registry and cleanup.
+Everything else is forwarded through the ABI bridge.
+
+Verified with `tests/vulkan_guest/vkclear.exe` (freestanding Windows exe: window, instance, device, swapchain, clear + present; build with `tests/vulkan_guest/build.sh`, needs clang + lld-link + llvm-dlltool; run `./loader --cmdline='vkclear.exe [srgb] frames=N' tests/vulkan_guest/vkclear.exe`): channel order and values correct for BGRA UNORM and BGRA sRGB swapchains (sRGB clears come out sRGB-encoded), brightness and colour-blind effects change the output, `screenshot` (clean and with overlay) writes the PNG, the overlay box is drawn, `fps_limit` 60 gives 60.0 fps (uncapped ~180), the Khronos validation layer (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`) reports nothing from the mapper (only the test's own semaphore reuse).
+
+Debugging: `BEER_VKBRIDGE_TRACE=1` logs every entry point the guest resolves, `=2` also logs every call (`[VKCALL] name`, floats variants are not traced); `BEER_NO_POST=1` disables the swapchain/effects hooks; `BEER_ALLOW_GUEST_VULKAN=1` uses a guest-provided `vulkan-1.dll` instead; `BEER_GUEST_VULKAN=0` hides Vulkan from guests. Not done: multi-swapchain presents (effects skipped), HDR swapchains, pause/time-scale (handled by the time layer, not the mapper), tweaks for guest pipelines (the constant-buffer tweak tool is D3D12 only), `VK_KHR_present_wait`/present-id pass through untouched, guest debug callbacks and layers are dropped, allocators are ignored.
+
+Gotchas found:
+- `make clean` removes the tracked `renderer/vulkan/shaders/*.spv` and `glslc` (a path into another machine's NDK) is missing here, so the next `make` fails until they are restored with `git restore -- renderer/vulkan/shaders/*.spv`. Something ran `make clean` three times during this session while the game was running (not this session's commands); do not run it here.
+- The freestanding test exe must be built with `-O0`: with `-O1` clang kept a struct in a stack slot that it also used for a spilled xmm register in the loop (the guest saw its `VkCommandBufferBeginInfo` zeroed on the second frame). If a Windows guest ever shows this, check the guest's own stack slot reuse before suspecting the bridge.
+
+### RDR2 bring-up, session 3 (2026-10-26): non-determinism, stack/ABI bugs, audio, window
+RDR2 now gets through input, Vulkan device + swapchain creation, the first presents (mapper active) and audio init; the next failure is the game's window/display-mode selection (below). Findings, all generic:
+
+- **Runs were non-deterministic because of ASLR.** The game took different graphics start-up paths depending on where the host placed heaps/stacks (about 70 % of runs never reached `vkCreateDevice`). `main()` now re-execs once with `personality(ADDR_NO_RANDOMIZE)` (set `BEER_ASLR=1` to keep randomisation). With it every run takes the same path; gdb sessions match normal runs.
+- **`InitOnceExecuteOnce` was not thread safe** (a second thread returned while the callback was still running, the callback's result and context were ignored). Now blocks other callers until the callback finished, stores the context, and a failed callback leaves the once retryable.
+- **`impl_XInputGetState/SetState` "disconnected" overran the guest stack.** One shared function memset 16 bytes into the caller's buffer, but `XInputSetState` passes a 4-byte `XINPUT_VIBRATION`; the memset clobbered a saved `rsi` in RDR2's frame (loop counter garbage, crashes at 0x14263cdda). Real XInput does not touch the buffer on failure; neither do we now.
+- **Vulkan calls run on the thread's host call stack.** Guest worker threads can have small stacks and Vulkan drivers use a lot; every thunk (forwarded command or Beer's own override such as `vkQueuePresentKHR`) now enters through `beer_vk_common`, which switches to `g_host_call_stack_top`, copies the 12 stack-argument slots, calls, and returns on the guest stack. Thunks carry a `{host, entry, name}` record (`VkThunk`) instead of embedding the target.
+- **DXGI/Vulkan device pairing.** RDR2 finds the Vulkan device whose `VkPhysicalDeviceIDProperties::deviceLUID` equals the DXGI adapter LUID (it compares the sign-extended 32-bit low part against the full 64-bit LUID). Linux drivers report no LUID, so the mapper reports the DXGI one (only for the host GPU, not for llvmpipe), and Beer's LUIDs now have HighPart 0 (`vendor<<16|device`, positive).
+- **`CM_Get_Device_Interface_List*`** (cfgmgr32) are still zero stubs; the game only uses them to read VRAM through D3DKMT, which also fails, harmlessly.
+- **WASAPI**: RDR2's audio mixer needs `IMMDevice::OpenPropertyStore` (friendly name), `IMMDevice::GetId`, and `IAudioClient::GetService(IAudioSessionControl)`. Added minimal `IPropertyStore` and `IAudioSessionControl` objects; unsupported interface requests are now logged (`[WASAPI] ... E_NOINTERFACE`).
+- **DPI APIs**: `AdjustWindowRectExForDpi`, `GetDpiForSystem/Window`, `EnableNonClientDpiScaling`, `SetDialog*DpiChangeBehavior`, `SetProcessDpiAwareness(Context)`, `SetProcessDPIAware`, `GetThreadDpiAwarenessContext`, `AreDpiAwarenessContextsEqual` (96 dpi, identity scaling).
+- **Zero-sized `CreateWindowEx`** (engines create hidden 0x0 probe windows) no longer fails; the native window gets at least 1 px.
+- Diagnostics added: `BEER_CRASH_CODE`, `BEER_CRASH_RANGES=START:LEN,...` (hex dumps of guest memory at the first fault: pipe through `xxd -r -p` + `objdump -D -b binary -mi386:x86-64 --adjust-vma=`), `BEER_DUMP_RANGE`, `BEER_VKBRIDGE_TRACE=1|2|3` (resolves / every call with the guest return address / plus call-site code), `BEER_WINDOW_DIAGNOSTICS`, `[STUB]` lines show the caller address, `[NVAPI]` unknown interfaces. Debugging recipe that worked: gdb with `set follow-fork-mode child` + `follow-exec-mode same`, a Python breakpoint on `beer_vkbridge_trace_call` that creates the real probes on its second hit (hardware breakpoints cannot be set before the guest image is decrypted; there are only 4), watchpoints via `gdb.Breakpoint(expr, gdb.BP_WATCHPOINT, gdb.WP_WRITE)`.
+
+**Open (next step).** The game computes its window from the display-mode record `adapter+0x198+output*0x110` (RECT at +0x40: left, top, right, bottom). Its display match function (0x1426d5f60, QueryDisplayConfig/EnumDisplayDevices based) returns false here, so the fallback fills the RECT with uninitialised data and `CreateWindowExW` gets garbage x/y/w/h (then `ERROR:FFFFFFFF`, hash 0xE1BD3165 line 0x30F). d5f60 must return true on Windows; find which comparison fails (candidates: source-name vs `EnumDisplayDevicesW` name, the `PCI\VEN_xxxx&DEV_xxxx` parse against the DXGI adapter desc at +0x100/+0x104, `DisplayConfigGetDeviceInfo` types the game asks for).
+
+### RDR2 bring-up, session 4 (2026-10-26): the game renders
+With the fixes below RDR2 (Vulkan API, `Launcher.exe`) creates a 2560x1440 window, a Vulkan device and swapchain, initialises audio and input, and renders ~190 frames through the Vulkan mapper (render passes, submits, presents, NvLL latency markers) before a crash inside its copy-protection code.
+
+Fixed (all generic):
+- **`EnumDisplaySettingsW` returned the DEVMODEA layout.** DEVMODEW has 64-byte name fields, so `dmBitsPerPel/PelsWidth/PelsHeight/DisplayFrequency` are at 168/172/176/184 (A: 104/108/112/120). The game found no valid display mode and fell back to uninitialised data. A and W now have separate layouts (`enum_display_settings`).
+- **`SetRect`, `OffsetRect`, `InflateRect`, `IntersectRect` were no-op stubs** (the window size is computed with `SetRect` + `AdjustWindowRectEx`, so `CreateWindowEx` got garbage x/y/w/h). Implemented the whole user32 RECT family.
+- `DISPLAYCONFIG_PATH_INFO.sourceInfo.modeInfoIdx` is now a plain index (0), not the packed `cloneGroupId=0xFFFF` form (the game indexes the mode array with it).
+- `getaddrinfo`/`GetAddrInfoW`/`freeaddrinfo` (zero stubs reported success without writing `*result`); only NULL/localhost/dotted IPv4 resolve, the rest fail with WSAHOST_NOT_FOUND (offline by default).
+- `SHGetSpecialFolderPathA/W` and CSIDL Program Files; `NtQueryInformationProcess` (basic info, debug port/object/flags look "not debugged"), `NtQueryVirtualMemory` (class 0 = VirtualQuery), `NtOpenProcess` (self), `NtQuerySystemInformation(SystemKernelDebuggerInformation)` no longer reports a kernel debugger, `GetNativeSystemInfo`, `Get/SetThreadGroupAffinity`, `SetDefaultDllDirectories`, `SetThreadStackGuarantee`, `Thread32First/Next` over `/proc/self/task`.
+- API trace lines (`BEER_API_TRACE`) now carry the host thread id (`[API n tTID]`), the first SIGSEGV line prints its thread.
+
+**Open: copy-protection (Arxan) crash after ~24 s / ~190 frames.** An obfuscated guard stub in the second `.text` (RVA 0x6033000+, e.g. 0x1470a411b `mov %rax,(%rcx)`) overwrites its caller's return address (slot at `rbp+8` of the calling frame) with `0x186d30a12`; the `ret` then jumps there (RIP=FA=0x186d30a12, thread != main). The value is identical in every run and with ASLR on or off, so it is a pure function of the image/environment, and it is exactly `0x146d30a12 + 0x40000000` (0x146d30a12 is a valid in-image address, so something contributes +0x40000000 too much; candidates: a Win32 constant or an API result that is 0x4000xxxx here, e.g. our fake export/trampoline addresses live at 0x40dc....). The routine is control-flow-flattened (`push rbp; lea rbp,[..]; xchg rbp,(rsp); ret` gadgets), so find the inputs dynamically: record with gdb (`record full` from a breakpoint just before the guard runs), or compare a run of the same exe under Wine. The stubs `UuidCreateSequential`, `GetSystemDefaultLocaleName`, `OpenProcessToken/AdjustTokenPrivileges`, `WinVerifyTrust`, `EventRegister`, `HeapSetInformation`, `SetHandleCount` are still zero-return stubs and are the first candidates (output buffers left uninitialised).
+
+Handy: `tests/vulkan_guest` still passes after all of this; `make` can fail with "glslc: No such file" because something deletes the tracked `.spv` files (restore: `git restore -- renderer/vulkan/shaders/*.spv`).
+
+## Session 5 addendum: why RDR2 shows "Social Club failed to load"
+
+- The game never touches the registry or the Launcher pipe for this. Right before the dialog the game main thread calls
+  `SHGetSpecialFolderPathA(CSIDL 0x26)` and then `GetFileAttributesW("C:\Program Files\Rockstar Games\Social Club\socialclub.dll")`
+  (string table in RDR2.exe also holds `\Rockstar Games\`, `Social Club`, `Social Club Debug`, `\socialclub.dll`).
+  The prefix's `Program Files` is empty, so the check fails (0xffffffff) and the game shows the error.
+- The dialog itself says Accept opens Rockstar support and then quits, Cancel quits: with a missing Social Club both buttons end the game by design.
+  So Enter -> quit is the game's intended behaviour, not an input bug.
+- Fix needed: a real Social Club install in the prefix (`socialclub.dll` etc. under `drive_c/Program Files/Rockstar Games/Social Club`).
+  The repack does not ship it (`_Redist` has only DirectX/VC++ redistributables).
+- New diagnostics: `BEER_PIPE_DIAGNOSTICS=1` hex-dumps named-pipe traffic (the game never connects to `RDR2Launcher_Pipe`);
+  control-socket `mem_regions`/`mem_read` can be used to search the live process for strings (ptrace/`/proc/pid/mem` are blocked by Yama).
+- Note: heavy `BEER_API_TRACE` runs change timing; one traced run crashed after audio init, untraced runs did not.
+
+### Session 5 addendum 2: Social Club present -> "Error code: 16"
+
+- `ShellExecuteA/W/ExA/ExW` are real now (URLs/documents go to `xdg-open`; `.exe` returns SE_ERR_NOASSOC). Accept on the
+  Social Club dialog opens the Rockstar support URL and then the game exits by design.
+- Copying a real `Program Files/Rockstar Games/Social Club` (from another Proton prefix, `compatdata/3240220`) into the Beer prefix
+  moves the dialog from "incomplete installation" to "Social Club failed to initialize. Error code: 16".
+  `socialclub.dll` is still never mapped: right after the file check the game runs an Authenticode check:
+  `WinVerifyTrust` (stub, returns 0) -> `WTHelperProvDataFromStateData(NULL)` (stub, NULL) -> `CryptQueryObject` (stub, fails).
+  Next step: a real wintrust/crypt32 signer layer (state handle, `CRYPT_PROVIDER_DATA`/SGNR/CERT chain, cert store + `CertGetNameStringW`)
+  built on libcrypto's PKCS7 parser over the PE security directory.
+
+### Session 5 addendum 3: the crack's inline hooks never fired (root cause of the Social Club dialog)
+
+- Reference run: `GE-Proton9-2` (`~/Desktop/GamesScripts/RDR2.sh`, which needs the full `Launcher.exe` path with `proton run`) reaches the RDR2
+  main menu in ~35 s **without any Social Club install and without any dialog**. So the dialog was never about a missing Social Club.
+- The Razor1911 module `1911.dll` (loaded by RDR2.exe) inline-hooks `LoadLibraryExA/W`, `GetFileAttributesW`, `CreateFileW/A` by patching
+  5 bytes at the address `GetProcAddress(kernel32, name)` returns (it also suspends the other threads via Thread32*/OpenThread first).
+  Beer gave every IAT slot its own thunk, so the address `GetProcAddress` returned (first thunk created for that name) was *not* the
+  one the game's import table uses (`0x40005f88` vs `0x40001680` for GetFileAttributesW): the hooks were installed but no game call went through them.
+  Fix: an import reuses the thunk an earlier import/GetProcAddress already created for the same function (`loader.c`, `guest_dll_resolve_imports`).
+- With hooks live the Social Club dialog is gone. Also done: `GetProcAddress` by ordinal (previously crashed in `guest_dll_export`),
+  `WinVerifyTrust` (missing file -> 2, existing -> 0, STATEACTION_CLOSE -> 0), `GetFileAttributes` error 3 for a missing parent directory.
+- Reading the game's own code (`mem_read` over the control socket + objdump): the Social Club init function builds
+  `<ProgramFiles>\Rockstar Games\Social Club\socialclub.dll`, `GetFileAttributesW`, then verifies the Authenticode signer
+  (`WinVerifyTrust` + `WTHelperProvDataFromStateData` + cert name compare); error code 1 = not found, 16 = signature mismatch.
+- Open: the game now stops at "ACTIVATION REQUIRED - Verifying game ownership failed and your offline activation data could not be loaded".
+  The game connects to `RDR2Launcher_Pipe` and sends `<u32 13>"SCSI:26285943"`; the Beer-side Launcher just logs it (no reply is written; Wine behaves the same
+  as far as the pipe goes). Next: compare what Wine does between the pipe write and the menu (hooked `CreateFileW` paths, `.1911\...\profile\Player`, `Software\Rockstar Games\InstallGUID`).
+- Tools added: `BEER_CALLER_DIAGNOSTICS=<substr>` dumps the guest call chain when `GetFileAttributes*` is called with a matching path;
+  `BEER_PIPE_DIAGNOSTICS=1`; failed `LoadLibrary*` calls are now logged.
+
+### Session 5 addendum 4: matching Proton, what is now known about "ACTIVATION REQUIRED"
+
+Reference behaviour (GE-Proton9-2, `~/Desktop/GamesScripts/RDR2.sh`, run with the full `Launcher.exe` path): menu in ~35 s, no dialog, no Social Club, no network traffic
+besides `getaddrinfo(<hostname>)` -> 127.0.1.1. Launcher.exe stays alive polling `\\.\pipe\RDR2Launcher_Pipe`; the game sends `<u32 13>"SCSI:26285943"` (identical under Beer and Proton;
+Launcher.exe only answers messages that start with `INIT:`, so no reply is expected).
+
+Verified identical between Proton and Beer: `cfg.dat` (byte-identical, regenerated on demand), the hook installation order (first hooked `GetFileAttributesW` for the Social Club path
+triggers 1911.dll's lazy patching of the game functions `0x142615114` signer check, `0x1426127cc`, `0x142616dc0`), the pipe handshake, the Social Club probes.
+
+Fixed this session (all generic): shared thunk per imported function (inline hooks now fire), `GetProcAddress` by ordinal, `WinVerifyTrust`, `GetFileAttributes` error 3,
+`GetFileVersionInfo*` error 2 for missing files, real name resolution in `getaddrinfo` (own hostname used to fail with WSAHOST_NOT_FOUND), `ShellExecute*`,
+WMI (`platform/win32_wmi.inc`: Win32_Processor/Win32_VideoController rows, every other class an empty set, `IClientSecurity` blanket) and the Windows Firewall COM chain
+(`HNetCfg.FwMgr` -> LocalPolicy -> CurrentProfile -> AuthorizedApplications -> Item) that used to fail with E_FAIL.
+
+Still different (leads, in order of suspicion):
+1. Proton's game process runs anti-debug/guard threads that call `NtQueryInformationProcess` classes 7, 0x1e, 0x1f, 0x1a, 0x0c, 0x00, 0x25, 0x2b, 0x03, 0x15 hundreds of times
+   and one worker that wakes the main thread through `RtlWaitOnAddress`/`NtAlertThreadByThreadId` right before it opens `\\.\PhysicalDrive0..9` and
+   `HKCU\Software\Rockstar Games\InstallGUID`. Under Beer only class 0x1e is ever queried (`BEER_NT_DIAGNOSTICS=1`), no PhysicalDrive access happens and `WaitOnAddress`/`WakeByAddress*` are
+   not implemented. That worker (hardware/ownership check) never runs or never reports back, which would explain "offline activation data could not be loaded".
+2. `GetFileInformationByHandleExW` / `SetFileInformationByHandleW` still resolve to NULL (Proton exports both).
+3. Beer `OpenThread` rejects the host thread ids that `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` hands out (1911.dll suspends threads while patching).
+4. Missing NtQueryInformationProcess classes 3/0x0c/0x15/0x25/0x2b return STATUS_INVALID_INFO_CLASS.
+
+New diagnostics: `BEER_CALLER_DIAGNOSTICS=<path substring>`, `BEER_PIPE_DIAGNOSTICS=1`, `BEER_NT_DIAGNOSTICS=1`, `BEER_SPIN_DIAGNOSTICS=1`, `BEER_HOOK_PROBE=1`, `BEER_PROCESS_DIAGNOSTICS=1`.
+Note: the Launcher process shows up as comm `exe` (not `loader`), `pkill -x loader` only kills the game.
+
+### Session 5 addendum 5: headless runs, in-process debugging tools, what the activation screen depends on
+
+New run modes and tools (all generic):
+- `BEER_HEADLESS=1`: no X/Wayland session needed. `xwayland_backend.c` answers every window call with a virtual 2560x1440 window, the Vulkan bridge
+  creates `VK_EXT_headless_surface` surfaces and answers surface support/format/present-mode/capability queries itself, and `vulkan_map.c` provides a virtual swapchain
+  (own images, round-robin acquire, present drains the guest semaphores) so overlay, effects and `screenshot` over the control socket keep working. The game runs to its legal
+  screen and the activation screen without a desktop (used while the user's session was logged out).
+- `BEER_BP=0xaddr,...` (+`BEER_BP_DELAY`): one-shot guest breakpoints (int3 written after the delay; first hit logs thread, argument registers and code-looking return addresses).
+- `BEER_THREAD_DUMP_AT=<s>`: every thread prints its host and guest stack code addresses (`[TDUMP]`).
+- Control socket `mem_read`/`mem_regions` is enough to dump the whole decrypted 121 MB RDR2.exe image (`rdr2_img.bin`), which can then be disassembled/searched with objdump.
+- Real overlapped I/O for named pipes (`ReadFile` with OVERLAPPED stays pending, `GetOverlappedResult(Ex)`, `CancelIo(Ex)`); previously `GetOverlappedResult` was a zero-returning stub hit ~6700 times per run.
+
+Static findings (1911.dll and the dumped game image):
+- 1911.dll hooks three game functions through trampolines in a page at `0x13fff0000`: `0x142615114` (signer check) -> 1911 `0x18006f5f0`,
+  `0x1426127cc` -> `0x18006f110`, `0x142616dc0` -> `0x18006f1a0`. The last two are in the game's crypto module (PBKDF2-style: 2000 iterations, 16-byte salt, 32-byte key) -
+  the key derivation/decryption of the offline activation data. `0x18006f1a0` -> `0x18006b830` -> `0x180015ae0` -> `0x180014230` -> `0x180015620`, which runs
+  `whoami.exe`/`hostname.exe` through `CreatePipe` + `CreateProcessA` (machine/user fingerprint) - the process Proton shows the game spawning.
+- Under Beer none of those hooks is ever entered (breakpoints on `0x18006f110/1a0/5f0`, `0x180015ae0/15620/14230` never hit in 100 s), so the fingerprint/activation provisioning never runs.
+  Which game code calls `0x1426127cc` (vtable slot 4 of the class constructed at `0x1426116dd`, vtable `0x14361f2a0`) / `0x142616dc0` (no static caller) is the open question.
+- `1911.dll` also needs `GetFileSecurityW`, `AccessCheck`, `DuplicateToken`, `MapGenericMask`, `CreatePipe`, `SetHandleInformation`, `CreateTimerQueueTimer`,
+  `DeleteTimerQueueTimer` - none of them is implemented in Beer yet (they would be zero-returning stubs when reached).
+- The game's `Settings\*_<profileid>.bin` files are plain XML UI settings, not activation data; `cfg.dat` is identical in both prefixes.
+
+### Session 5 addendum 6: breakpoints with expected byte, SC manager flow
+
+- `BEER_BP` entries can carry the expected first byte (`0xaddr:48`); the breakpoint thread retries for 3 minutes and arms only when the (Arxan-decrypted) byte matches, so it survives lazy code decryption.
+- Game SC manager: `0x1427c8a5c` (init) -> `0x1427cd5c8` (find/load socialclub.dll) ; failures are recorded with `0x1427f7dc4(obj, code)` (codes 5, 0xb, 0x12, 0x13, 0x14, 0x10, 1).
+  In the current Beer flow `0x1427cd5da` is hit (caller `0x1427c8a7d`) but the error setter is never called, so the "ACTIVATION REQUIRED" screen does not come from the Social Club manager.
+- `activationDataThing` (RDR2.exe string at `0x143421700`) is just a field name in the save-game structure, not the ownership check.
+- Next step: find the code that shows the screen's text key (GXT key not present in process memory as text) by breakpointing UI/message-box creation entry points, or compare the thread
+  list of a Proton run (the guest worker that runs `whoami`/`hostname` and wakes the main thread through `NtAlertThreadByThreadId`) with `BEER_THREAD_DUMP_AT` output.
+
+### Session 5 addendum 7: security/pipe/timer APIs, title.rgl
+
+- Implemented (platform/win32_advapi_misc.inc): `DuplicateToken(Ex)`, `GetFileSecurityW/A` (empty self-relative descriptor), `AccessCheck` (always granted), `MapGenericMask`,
+  `CreatePipe` (host pipe wrapped in file handles; `ReadFile` reports ERROR_BROKEN_PIPE at EOF), `SetHandleInformation`, `CreateTimerQueue(Timer)`/`DeleteTimerQueue(Timer|Ex)`
+  (host thread with its own TEB that calls the guest callback). `CreateProcess` answers `whoami.exe`/`hostname.exe` in-process (output goes to the redirected stdout handle), since there is no Windows system dir.
+- Result: with all of this in place the crack's hooks (`0x18006f5f0/110/1a0`) and the whoami path (`0x180015620/15ae0/14230`) are still never entered (breakpoints, 75 s), the screen is unchanged.
+  So the divergence is earlier than anything these APIs affect.
+- `title.rgl` (RGLM header, 2000 bytes) and `index.bin` are not opened by the game under Proton either (traced 70 s); they are not part of this check.
+- Proton prefix registry has no Rockstar keys; nothing to copy from compatdata (cfg.dat, Player, ProfileSettings and the Settings XML files were all tried, see addenda 3 and 5).
+
+### Session 5 addendum 8: Win32 file mappings, Wine relay findings
+
+- `CreateFileMappingA/W`, `OpenFileMappingA/W`, `MapViewOfFile(Ex)`, `UnmapViewOfFile` are real now (they were silent zero stubs), built on the NT section module;
+  named page-file mappings live in `/dev/shm/beer-map-<name>` so separate Beer processes share them (`BEER_NT_SECTION_DIAGNOSTICS=1` logs them). RDR2/1911.dll do not use them in this phase.
+- Wine relay tracing (registry `HKCU\Software\Wine\Debug` "RelayInclude" works in GE-Proton9-2; "RelayFromInclude" does not) shows 1911.dll's
+  inline hooks in action under Proton: every game `CreateFileW` goes through the hook, which compares the name against "cfg.dat"; the game then creates
+  `DxDiagProvider` (dxdiagn.dll) and `WbemLocator` and reads `Software\Wine\VR`. With relay enabled the game terminates itself shortly after (`TerminateProcess(-1,0)`
+  from 0x140136b29), so relay cannot follow the activation phase.
+- Proton cannot run the game without a desktop session (no DISPLAY -> crash into winedbg within 20 s), so Proton comparisons need the user logged in.
+
+### Session 5 addendum 9 – hooks verified live, exe thread-attach TLS
+- `BEER_BP` now accepts `module.dll+0xoff[:byte]` (resolved once the DLL is mapped) and restores bytes through /proc/self/mem (the old direct write faulted on read-only DLL text, which made earlier "hook never entered" conclusions WRONG). With the fix: 1911's inline hooks (LoadLibraryExW/A, CreateFileW/A, GetFileAttributesW) ARE entered in Beer, via thunk -> detour page 0x3fff0f.. -> 1911 hook fn.
+- `BEER_THUNK_NAMES=1` prints thunk index/address/name.
+- New: the executable's own TLS callbacks now get DLL_THREAD_ATTACH/DETACH on new threads (Windows does; Arxan's per-thread anti-debug runs there). Only NtQueryInformationProcess class 0x1e is seen per thread (Proton also does 7 and 0x1f); `BEER_NO_EXE_THREAD_TLS=1` disables.
+- Still open: 1911's `_beginthreadex` site (1911.dll+0x5ea1d) never runs in Beer; ACTIVATION REQUIRED persists. Proton's startup threads (net poll / DXVK display query / cfg.dat+whoami) are not reproduced.
+
+### Session 5 addendum 10 – ACTIVATION REQUIRED fixed (game reaches Brightness Calibration)
+Root cause: RAGE reads the crack's offline activation (`%APPDATA%\.1911\Red Dead Redemption 2\profile\cfg.dat`) through
+its own hook-proof file path: function 0x1425b7da4 validates the PEB (BeingDebugged == 0, **PEB->Ldr->Length == 0x58**),
+walks `InLoadOrderModuleList` hashing lowercased BaseDllName (FNV-1a 64) to find ntdll/kernel32/**kernelbase**, parses
+their export tables by name hash, then calls LdrLockLoaderLock / RtlGetNtVersionNumbers / RtlInitUnicodeString /
+NtCreateFile / NtReadFile directly (Proton relay: `NtCreateFile(... cfg.dat) ret=1424eb30d`). In Beer the check returned
+2 (Ldr Length was 0x40), then 8 (RtlGetNtVersionNumbers not exported) → cfg.dat never read → activation dialog.
+Found with: `BEER_CALLER_MATCH` call chains, `BEER_BP` with fast polling (`BEER_BP_POLL_US`, code is decrypted only while
+it runs), Wine `RelayInclude` on ntdll functions, and a hash scan of the decrypted RDR2 image against every Proton
+system-DLL export (lists all by-hash imports: GetSystemFirmwareTable, LdrGetDllHandle, LdrGetProcedureAddress,
+LdrLock/UnlockLoaderLock, NtClose, NtCreateFile, NtQueryInformationProcess, NtQuerySystemInformation,
+NtQueryVirtualMemory, NtReadFile, RtlAnsiStringToUnicodeString, RtlGetNtVersionNumbers, RtlInitUnicodeString).
+Generic fixes:
+- PEB_LDR_DATA is the real 0x58 bytes (Length 0x58); LDR entries padded to the Win10 size with Flags/LoadCount/HashLinks/TimeDateStamp; KERNELBASE.dll entry added (same fake image as kernel32).
+- New exports: RtlGetNtVersionNumbers, LdrLockLoaderLock/LdrUnlockLoaderLock, RtlAnsiStringToUnicodeString, GetSystemFirmwareTable/EnumSystemFirmwareTables (SMBIOS from /sys/class/dmi/id).
+- RtlLookupFunctionEntry searches every guest DLL's .pdata, not only the EXE's.
+- ntdll Nt*/Zw* fake exports now begin like Windows syscall stubs (`mov r10,rcx; mov eax,ssn`); guest `syscall` with those numbers is emulated through a seccomp SIGSYS trap (Proton has the same for RDR2). Every guest thread gets a signal stack.
+- Diagnostics: BEER_HWBP (needs perf_event_paranoid<=2), BEER_CALLER_MATCH, BEER_CHAIN_DEPTH, BEER_SYSCALL_DIAGNOSTICS.
+
+### Session 5 addendum 11 – keyboard input in RDR2 (first-run setup screens now navigable)
+- RAGE polls its DirectInput keyboard (`GetDeviceState`, like Proton: ~5700 calls) only while its own "window active"
+  flag is set, and that flag is driven by WM_ACTIVATEAPP/WM_ACTIVATE. Beer never sent the activation burst: RAGE calls
+  SetFocus on the hidden window (sets `g_window_focused`, WM_SETFOCUS only), the native fullscreen window is already
+  mapped, and both ShowWindow and X FOCUS_IN gated the burst on "not focused"/"was hidden". New `g_window_activated`
+  tracks activation separately; ShowWindow/FOCUS_IN deliver WM_ACTIVATEAPP/WM_NCACTIVATE/WM_ACTIVATE once per activation.
+- Raw input: unknown HID usages in RegisterRawInputDevices are accepted (no longer fail the whole array).
+- Control socket `key` command (`{"cmd":"key","vk":13,"dik":28,"down":1}`) injects a key exactly like a real X event
+  (GNOME/mutter does not deliver xdotool XTest keys to Xwayland clients). Diagnostics: BEER_WNDPROC_DIAGNOSTICS,
+  DirectInput Acquire caller/refusal logging.
+
+### Session 5 addendum 12 – RDR2 reaches story mode
+On the desktop (DISPLAY=:0) with key injection, RDR2 now goes: legal screens → Brightness/Subtitles/Audio first-run
+setup → tintype loading screens → opening story cutscene (Colter, Dutch/Hosea/Arthur, opening credits); ~6 minutes with
+no errors. Open issue: in headless mode (BEER_HEADLESS=1, virtual swapchain) the game stops with ERR_GFX_STATE right
+after the intro Bink videos close, i.e. when the 3D renderer starts using the swapchain; desktop runs are unaffected.
+
+### Addendum 13 — RDR2 intermittent start-up crash (2026-10-28)
+
+- A user launch crashed at RIP `0x1426c0d92` reading `[NULL+0x20]` right after `[VKMAP] swapchain ...`: RAGE's
+  buffer factory (`0x14269e2f8` → device vtable `+0x110` = `0x1426980f0` → `0x142670570`) returned false and the
+  caller dereferences the result unchecked. That routine fails on any non-zero result of vkCreateBuffer,
+  vkBindBufferMemory, vkMapMemory and friends, or of its own suballocator.
+- Not reproduced in 23 desktop launches (file output, and pty output drained at terminal speed). GPU memory was ample.
+- The Vulkan bridge now logs `[VKERR] <command> -> <VkResult>` for every failing create/allocate/bind/map/submit/wait
+  command (thread-local current thunk, checked after the host call; costs nothing on success). Normal RDR2 runs show
+  one late `vkAllocateMemory -> -2` and `vkAllocateDescriptorSets -> VK_ERROR_OUT_OF_POOL_MEMORY`, both handled by
+  the game.
+- Separately, 1 of 23 launches hung inside RDR2.exe's Arxan start-up (log stops after `[ENTRY] Before TLS/entry
+  handoff`). Not yet investigated.
+- **Root cause found** (same day): the crash is deterministic when the loader is started from a desktop terminal
+  (Alacritty under GNOME) whose soft `RLIMIT_NOFILE` is 1024. NVIDIA backs each `vkAllocateMemory` with file
+  descriptors, RDR2 exceeds 1024 during start-up, the driver returns `VK_ERROR_OUT_OF_DEVICE_MEMORY` (20 `[VKERR]`
+  lines in the failing log), the buffer factory fails and the game dereferences NULL. My test shells inherited
+  524288 from VS Code, which is why it never reproduced. `main` now raises the soft file limit to the hard limit
+  (as Wine does); verified with `ulimit -Sn 1024`.
+
+### Addendum 14 — RDR2 performance and memory (2026-10-28)
+
+Measured with the built-in sampler (`BEER_PROF_SAMPLE=1`; each SIGUSR2 now dumps `/tmp/beer-prof.txt` and starts
+a new interval) and the control socket's `status` (keep one connection open: fps/cpu are deltas per connection).
+
+- **getenv was ~23% of all CPU.** Diagnostic `getenv("BEER_...")` checks sit on hot paths (Sleep, HeapAlloc,
+  QueryPerformanceCounter...), and glibc's getenv scans the environment with strncmp each time. `platform/beer_env.h`
+  is force-included into every loader object: literal names are cached per call site (one load), other BEER_* names
+  in a lock-free table, non-BEER names still go to libc (the loader setenv()s APPDATA etc.). Main-menu CPU halved.
+- **glibc arenas kept ~400 MB of freed memory** (92 threads, dozens of 64 MB arenas). A background `malloc_trim`
+  every 20 s (`BEER_NO_MALLOC_TRIM`, `BEER_MALLOC_TRIM_S`) keeps RDR2 at ~5.6 GB instead of growing past 6 GB;
+  the control socket has a `trim` command. VirtualAlloc was checked: commits are lazy, decommit uses MADV_DONTNEED.
+- `Sleep(0)` now yields like Windows.
+- Gameplay (prologue ride, Ultra preset at 2560x1440 on an RTX 2070 SUPER): 33–36 fps with the GPU at 98%, i.e.
+  GPU-bound at those settings. RDR2 compiles pipelines on its own background thread (libnvidia-gpucomp); that is
+  not on the frame path. The user's 5 fps coincided with RAM exhausted (15 GB total, swap full, game ~6 GB) and Ultra
+  textures near the 8 GB VRAM limit.
+- Still open: a ~60 s stretch after "Story" with no presents (fps 0, CPU flat at 1.5 cores) while the world loads;
+  the loader is still built at -O0 with SIMD disabled.
+
+### Addendum 15 — RDR2 audio: separate streams, WASAPI clock follows the sound server (2026-10-29)
+
+RDR2 plays its game audio through WASAPI (shared mode, 48 kHz stereo S16, asks for a 10 ms buffer) and Bink videos
+through DirectSound. Problems found:
+
+- **One Pulse stream for everything.** WASAPI and every DirectSound buffer appended into the same pa_simple stream,
+  so during videos game and video PCM were concatenated (twice real-time: the queue grew, the game's audio thread
+  blocked), and a DirectSound Stop (BinkClose) flushed the game's audio too. `audio_backend` now has
+  `BeerAudioStream` objects: one per WASAPI client, one per DirectSound buffer (opened on Play, closed on the last
+  Release), plus the default stream for waveOut. PipeWire mixes them.
+- **WASAPI position was wall-clock time.** padding = submitted - position kept the game only one buffer ahead of real
+  time, so the server held almost nothing and PipeWire (~21 ms quanta) found it empty on nearly every cycle:
+  36,541 underruns in ~3.5 min with `BEER_AUDIO_DIAGNOSTICS=1`. The position now follows the server
+  (`beer_audio_stream_bytes_heard` = handed over - pa_simple_get_latency) plus a 40 ms margin
+  (`BEER_AUDIO_LATENCY_MS`): the server holds ~55–60 ms, drift-free against the sound card. Shared-mode buffers are
+  at least 30 ms (three periods, as Wine's drivers do). Same run afterwards: 54 underruns, all in one burst while
+  the game initialised, none through videos, menu, loading and the opening cutscene.
+
+### Addendum 16 — loading stalls: Bink decoded on the caller (2026-10-29)
+
+- RDR2's intro cards ("Even the west had mostly been tamed") are Bink videos played while the world loads; they ran
+  at ~1 fps (CPU 1.5 cores, GPU 5%, almost no disk wait). Beer had replaced BinkDoFrameAsyncMulti/Wait and
+  BinkStartAsyncThread with a synchronous BinkDoFrame on the caller (added for Sekiro/RE8 when Bink's workers spun),
+  so whole-frame decodes ran on the game's movie/render path. With Bink's native workers the loading phase runs at
+  40–60 fps. The synchronous path remains behind `BEER_BINK_SYNC=1`.
+- Stub calls log their first 16 calls and then powers of two (`BEER_STUB_LOG_ALL=1` for all): RDR2 called
+  ResetWriteWatch ~1300 times a second, an unbuffered stderr write each (logs shrank from >100 MB to ~1 MB).
+- Control-socket `status` reports `max_frame_ms` and `hitches` (presents >50 ms apart) since the previous request.
+  Loading + opening cutscene: 0 hitches, worst frame 36 ms.
+- Seen once since (8 min in, opening cutscene): SIGSEGV reading NULL at img+0x2ea0e89, not yet analysed.
+
+### Addendum 17 — object scanner (2026-10-30)
+
+`platform/beer_objects.c` (control commands `obj_*`, see `beer_objects.h`) and the manager's **Objects…** window
+(`manager/objects_window.py`, maths in `manager/transforms.py`):
+
+- Finds transforms in writable anonymous memory: 4x4 / 3x4 / transposed float matrices (orthogonal, right-handed
+  rows of equal-ish length) and float/double quaternion+translation+scale. Each transform's holder is the nearest
+  earlier pointer to a vtable in a guest module; objects pointing at a holder become entities (RAGE keeps matrices in
+  small fwTransform-like holders). Groups = (vtable, offsets, layout); MSVC RTTI names when present (RDR2 has none).
+  RDR2 gameplay: ~260k transforms, ~10k groups, 14 GB read in ~24 s.
+- `obj_find_player` injects W then S: the controlled character is what moved forward and back. Verified in RDR2
+  (Arthur found; several copies at his position). `obj_near` lists objects around a point.
+- Writing the matrix alone does nothing in RDR2: the game rebuilds it every frame from the physics state.
+  `obj_copies` finds every float/double triple equal to a position and `obj_shift` moves them all, re-writing for
+  hold_ms. Not yet tested in game, and the window's position edits do not use them yet.
+
 - Mouse clicks falling through the game window (2026-10-28): first blamed on gdb, but it also happens in plain runs started from a terminal (intermittent; in one failing Sekiro run Beer received no ButtonPress at all while key and motion events arrived; in an RE8 run XI2 showed the presses delivered to the game window). Cause still unknown; next step is `xwininfo -all`/`xprop` on the live window while it fails. Beer re-grabs the pointer right after FocusOut when the cursor is hidden (`apply_pointer_confine_locked`), worth checking.
 - Camera snapping (2026-10-28): XWayland has an absolute slave pointer (`xwayland-pointer`, valuators absolute, also reports every XWarpPointer) next to `xwayland-relative-pointer`. Beer's XI2 raw motion (selected for all master devices) added the absolute device's screen coordinates as deltas, so each `SetCursorPos(1280,720)` re-centre turned into a ~screen-sized camera jump. Raw motion from sources whose X/Y valuators are absolute is now ignored (`xi_source_is_absolute_locked`, per-source cache via XIQueryDevice).
 - Input fixes (2026-10-28): X11 detectable auto-repeat (held keys no longer arrive as release/press pairs; repeats are WM_KEYDOWN with bit 30 and no DirectInput event); every DirectInput mouse device gets all motion since its own last poll (Sekiro opens 4 mice and 4 keyboards; previously the first poller took everything) and starts from zero at Acquire; DIPROP_AXISMODE honoured (Sekiro uses relative); QueryPerformanceFrequency is 10 MHz like Windows (was 1 GHz).
@@ -1712,3 +2047,143 @@ The previous direct-shipping-executable run was trapped in a busy loop because `
 Validation under the 6 GiB RAM / 1 GiB swap cap: the standalone address-wait test passes, the serial loader build passes, source diagnostics are clean, and the 120-second direct launch no longer spins in `WaitOnAddress`. The shipping executable completes both TLS callbacks, initializes Steam metadata for app `2567870`, obtains the local Steam user ID, requests `SteamUtils010`, `SteamUser023`, `SteamFriends017`, `STEAMREMOTESTORAGE_INTERFACE_VERSION016`, `STEAMUSERSTATS_INTERFACE_VERSION012`, and `STEAMAPPS_INTERFACE_VERSION008`, and reaches DXGI plus ready BD12/BD11 devices on the Intel UHD 770.
 
 The first remaining service boundary is now Steam online/user services rather than synchronization or graphics. Beer reports these interfaces unavailable: `SteamMatchMakingServers002`, `SteamNetworking006`, and `SteamMatchMaking009`. This is the expected point at which a title that requires a live Steam user/session needs an official-session broker or truthful implementations backed by a real authenticated service; Beer must not fabricate remote users, lobbies, ownership, or networking state. Log: `/tmp/beer-chained-address-wait.log`.
+
+### Merge of main (3240eb5: PRAGMATA, Ghost of Tsushima, Sekiro) into main2 (2026-10-30)
+
+Conflict resolutions (both sides kept unless noted):
+- Command line: main's argument builder (`g_cmdline_a/w`, `beer_set_guest_arguments`); `--cmdline=` (child loaders
+  created by CreateProcess) now overrides it through `beer_set_command_line`.
+- Fake system DLLs: main's per-module export tables. main2's direct-syscall support moved onto ntdll's own list
+  (Nt*/Zw* stubs `mov r10,rcx; mov eax,ssn`, `g_ssn_names`), other stubs keep the `xchg ax,ax` anti-hook prefix,
+  and kernel32/kernelbase export every Beer-implemented name the real modules export (`g_kernel32_export_names`), so
+  by-hash resolvers find GetSystemFirmwareTable etc.
+- Duplicates resolved by keeping the more complete implementation: main2's WinVerifyTrust, overlapped I/O (pipes;
+  IOCP errors pass through), named file mappings, NVAPI (`win32_nvapi.inc`); main's GetCursorInfo, InitOnce*,
+  NtQuerySystemInformation (+ SystemKernelDebuggerInformation 0x23), DllMain guard (merged into
+  `guest_dll_initialize_one` with dependency-first ordering), exception record allocation (+ int 2dh decoding).
+- GetModuleHandle names are normalised like Windows (base name, `.dll` appended) and the executable's own name
+  resolves to its image (RDR2's 1911.dll imports from RDR2.exe; main returned NULL and mapped a second copy).
+- Executable TLS: main runs process-attach callbacks by default. A faulting callback no longer exits (release the
+  loader lock, continue to entry; `BEER_EXECUTABLE_TLS_STRICT=1` restores fail-fast); `BEER_NO_EXECUTABLE_TLS=1`
+  skips them; main2's thread-attach callbacks became opt-in (`BEER_EXE_THREAD_TLS=1`): RDR2's Arxan thread callback
+  left a worker spinning. Heap handles now point at a minimal `_HEAP` header (Flags = HEAP_GROWABLE): Arxan's TLS
+  anti-debug read PEB->ProcessHeap->Flags and faulted on the old fake handle 1.
+- GetThreadContext reports clear debug registers instead of failing (callers read stack garbage as breakpoints).
+- D3D12 CheckFeatureSupport answers FEATURE_LEVELS, FORMAT_SUPPORT (from vkGetPhysicalDeviceFormatProperties) and
+  GPU_VIRTUAL_ADDRESS_SUPPORT truthfully instead of main's zeroed "unsupported".
+
+**Open regression (RDR2):** with the merged tree RDR2 reaches its main menu, but Story shows "Social Club failed to
+load" / the quit alert. API comparison against a clean pre-merge build (3fc9b46, setarch -R) located it: the game's
+adapter-setup InitOnce callback (img+0x2675a94: D3D12/DXGI/Vulkan probing, then SMBIOS via GetSystemFirmwareTable)
+fails and is retried ~65k times; after D3D12CreateDevice the merged build also calls D3D11CreateDevice and creates a
+second BD12 device, which the pre-merge build never does. Not CheckFeatureSupport (E_NOTIMPL experiment unchanged)
+and not the executable TLS callbacks (unchanged with BEER_NO_EXECUTABLE_TLS=1). Suspect main's BD12/DXGI changes
+(bd12_com.c +457 lines, swapchain/factory plumbing); reverting graphics/ alone does not link.
+
+### RDR2 after the merge: Social Club error fixed (2026-10-31)
+
+- Cause: "One function, one address" was lost. main's GetProcAddress returns the export stub inside the fake system
+  DLL image (`fake_pe_export_address`), while import slots still held Beer's dispatch thunks. RDR2's 1911.dll hooks
+  kernel32 exports by patching the GetProcAddress address (5-byte jmp); pre-merge it patched the thunks (0x4000xxxx)
+  that every import also used, after the merge it patched the stubs (0xfeeexxxx) that no import used, so the crack's
+  Social Club/activation redirections never ran and the game reported "Social Club failed to load".
+- Fix (generic): `fake_pe_rebind_imports` points every import slot that still holds a dispatch thunk for a fake
+  system module (kernel32, kernelbase incl. api-ms-win-core/ext-ms-win sets, ntdll, user32, advapi32, win32u) at that
+  module's export, right after the PEB is populated (export images are built there) and for DLLs resolved later.
+  Imports, GetProcAddress and export-table walks now agree, as on Windows.
+- Found by API-call diffs against a clean pre-merge build (worktree of 3fc9b46, run with `setarch -R`): the
+  `VirtualProtect(addr, 5, PAGE_EXECUTE_READWRITE)` patch sites moved from thunks to stubs.
+- RDR2 still needs `BEER_NO_EXECUTABLE_TLS=1` (main runs exe TLS callbacks by default; RDR2's Arxan callback then
+  leaves a worker spinning in Sleep(0) with no frames).
+- VariantInit/VariantClear stubs from main, dropped while resolving the missing-exports conflict, are restored.
+
+### Sekiro after the merge: invisible objects and 10 fps fixed (2026-10-31)
+
+Gameplay went from ~9 fps to ~40-45 fps in the same scenes (60 fps cap reached on the title and menus), and loading
+screens from ~10 fps to ~40-60 fps; tessellated objects render again. Everything below is generic (BD11 = every D3D11
+game, BD12/loader = every game). Measure with `BEER_BD11_FPS=1` (fps, worst frame, `gpu-wait` and `present` ms per
+second) and `BEER_BD11_STATS=1` (now also barriers/render passes per frame and deferred Map types/sizes).
+
+- **Invisible objects = tessellation.** BD12 pipelines only had VS/PS and BD11 skipped every draw with HS/DS bound
+  (Sekiro: 73 HS / 88 DS / 28 GS). `BD12GraphicsPipelineDesc` now carries hs/ds/gs (five stages, per-stage descriptor
+  bindings, `VkPipelineTessellationStateCreateInfo` with the patch size read from the hull shader's
+  `dcl_input_control_point_count`, push constants for all stages). The D3D12 PSO parser keeps DS/HS/GS bytecode
+  (graphics desc and pipeline streams). Patch-list topology is resolved per draw against the bound pipeline (a
+  pipeline without tessellation still draws 3-point patches as triangles). If an extra stage fails to translate or
+  the pipeline fails, BD12 retries with VS/PS only (the old behaviour) instead of losing the draw.
+- **Present waited for the GPU every frame** (`b11_flush(dev, 1)`), so CPU recording and GPU rendering never
+  overlapped. Present now submits and only blocks when the GPU is `BEER_BD11_FRAME_LATENCY` frames behind (default
+  2, 1 = old behaviour). The command-allocator ring grew from 3 to 16. STAGING Map now waits only for GPU work that
+  really uses that resource (staging->GPU copies record a use serial). 9 -> 21 fps.
+- **~25,000 pipeline barriers per frame** (counted per call site): every buffer UpdateSubresource was a
+  barrier + vkCmdUpdateBuffer + barrier, plus a redundant third barrier in BD11, and each barrier also ended the
+  render pass. Small (<= 64 KiB) DEFAULT constant/vertex/index buffers (no SRV/UAV/stream-out views) are now
+  *renamed*: the update writes a fresh host-visible slice on the CPU (copying the rest of the previous version) and
+  the buffer points at it; no GPU copy, no barrier. A GPU copy into such a buffer moves it back to device memory.
+  `BEER_BD11_NO_RENAME=1` disables it. Barriers 25k -> ~550 per frame, 21 -> 33 fps.
+- **Upload slice pool** (`b11_slice_get/retire`, bd11_dev.c): power-of-two slices 256 B .. 32 MiB placed in shared
+  4 MiB+ UPLOAD heaps, recycled when the retire fence passes. Also replaces the committed buffer (vkAllocateMemory +
+  heap zero fill) every texture/large-buffer UpdateSubresource created.
+- **Deferred-context Map**: DISCARD now hands the game a fresh slice (no PROT_NONE scratch, SIGSEGV per page,
+  mmap/munmap or page diff) and records `B11_OP_BUFFER_RENAME`, which makes the slice the buffer's contents when the
+  list executes; later NO_OVERWRITE maps of that buffer in the same list write into the same slice. The lazy scratch
+  remains for maps without an earlier discard in the list (`BEER_BD11_LAZY_MAPS=1` forces it everywhere). Buffer
+  SRV/UAV views resolve against the buffer's current version, so renamed dynamic buffers no longer read a stale
+  VkBuffer (this was already wrong for the old DISCARD ring). 33 -> ~40 fps.
+- **Descriptor set reuse (BD12, all games)**: `bd12_descriptor_set_for_writes` keys sets by their exact contents
+  (handles, offsets, ranges, layouts) per command allocator and device epoch, so draws with the same bindings reuse a
+  set instead of vkAllocateDescriptorSets + vkUpdateDescriptorSets; unchanged sets are not re-bound
+  (`BEER_BD12_NO_SET_CACHE=1` disables). BD12's per-draw timing clock now only runs with `BEER_BD12_PROF`.
+- **Loader**: glibc's per-thread malloc cache is raised to 1024 chunks per size via `GLIBC_TUNABLES` on the existing
+  re-exec (D3D11 deferred-context workers spent a third of their time on contended malloc arena locks;
+  `BEER_MALLOC_TUNE=0` opts out). CreateEvent reuses closed ids from a FIFO instead of scanning the table.
+  EnterCriticalSection skips the two locked compare-and-swaps once the section is initialised.
+  WaitForMultipleObjects sleeps on a futex that SetEvent/PulseEvent/ReleaseSemaphore/ReleaseMutex bump instead of a
+  fixed 1 ms nanosleep (still a 1 ms poll for thread/process/timer handles).
+- Merge fallout fixed on the way: FMOD queried IMMEndpoint on Beer's WASAPI device, got E_NOINTERFACE and crashed;
+  the device now implements IMMEndpoint (GetDataFlow = eRender). libvkd3d-shader (DXBC translation) is also found in
+  Debian/Ubuntu Steam installs (`~/.steam/debian-installation`, `~/.steam/steam`), snap and flatpak Steam; without it
+  no Sekiro shader translated.
+- Where the time goes now (Sekiro gameplay, ~42 fps): the D3D11 render thread that replays command lists runs ~67% of
+  wall time (23% inside the NVIDIA driver recording Vulkan, the rest BD11 op replay: `apply_state`, `execute`,
+  `use_srvs`, cache misses on objects recorded by other threads) and the game's main thread waits for it; GPU ~50%,
+  no GPU waits. Next steps: cheaper op replay (fewer refcount atomics, tracking the highest bound SRV slot, avoiding
+  per-op payload mallocs) or recording replay into several command buffers in parallel.
+- RDR2 (Vulkan renderer, not BD12) re-checked with these changes: reaches the main menu at ~52 fps.
+
+### Sekiro: sound, E key, stack probes (2026-10-31)
+- **No sound** had four causes, all generic:
+  1. `IMMDeviceEnumerator::GetDevice` was unimplemented. FMOD gave up on WASAPI and the game never called `EventSystem::init`.
+  2. WASAPI accepted only `WAVE_FORMAT_PCM`. FMOD Ex uses `WAVE_FORMAT_EXTENSIBLE` (16-bit PCM for the first system, 32-bit float for later ones). Both are accepted now; float clients are always converted to PCM16 on `ReleaseBuffer`.
+  3. `CreateWaitableTimer*` were stubs returning NULL, and FMOD's mixer needs one. Timers are now events signalled by one host thread: `SetWaitableTimer(Ex)`, `CancelWaitableTimer`, periodic and absolute or relative due times. Completion routines (APCs) are not run.
+  4. `GetBuffer(0)` failed. Windows allows it when the buffer is full. FMOD took the failure as a lost device (`FMOD_ERR_OUTPUT_DRIVERCALL`) and closed and reopened its output about once a second, so almost nothing played.
+  - Checked by recording Beer's PipeWire stream: one stable stream with real signal.
+- **Crash once audio worked: TEB stack bounds during API calls.** Implementations run on the 1 MiB host call stack, but `gs:0x8`/`gs:0x10` still described the guest stack. FMOD's `EventSystem::load`, called from Beer's FMOD hook, probes with `__chkstk` against `StackLimit` and hit the guest stack's guard page. The dispatch trampoline now switches the TEB bounds to the host stack on the outermost entry and restores them on return.
+- **E key "works only sometimes".** The DirectInput press latch was shared: the first of Sekiro's four keyboard (and mouse) devices to poll cleared it, so a tap between two polls was lost on the other three. Presses are now counted, and each device remembers the counts it has reported.
+- **Render-thread replay (untested in gameplay at commit time).**
+  - Renamed buffers keep a cached CPU copy, so partial `UpdateSubresource` calls no longer read the old upload slice (write-combined memory, very slow to read).
+  - SRV binding keeps each bound view's resource plus a per-stage high-water mark, so `unbind_hazards`, `use_srvs` and state clears scan only used slots without dereferencing views. Rebinding the same view is skipped.
+- `BEER_THREAD_DIAGNOSTICS` now prints the requested stack size.
+- **Open:**
+  - In the last two runs the game called `ExitProcess(0)` after a few Enter presses on the title menu, probably a menu "Quit" selection. Not yet confirmed to be unrelated to the replay changes.
+  - Gameplay frame rate is about 30–40 fps in combat.
+
+### Merge of origin/main2 (RDR2, Sekiro, audio, manager) into main (PRAGMATA, RE4) (2026-11-01)
+- **Syscalls, one mechanism.** main2's seccomp trap on the 0x1000+ range is removed. Normal `Nt*` calls through ntdll use main2's direct stubs, which jump straight to the implementation with no signal. Stubs for services that have a Windows 19045 number also carry the real number (`4C 8B D1 B8 <ssn> 48 B8 <impl> FF E0`). Syscall User Dispatch traps only direct `syscall` instructions (protected titles), so only those pay the signal cost. `BEER_NO_SYSCALL_EMULATION` disables both; `BEER_SYSCALL_DIAGNOSTICS` traces. If SUD is unavailable (FEX/Android), install fails quietly and the stubs still work.
+- **Duplicate implementations, one kept each:**
+  - `WaitOnAddress`: platform/win32_address_wait.c. The wake path now always broadcasts, so a bucket collision can no longer lose a wake.
+  - `ShellExecuteEx*`: main2's `beer_shell_open`. The SHELLEXECUTEINFO offsets are corrected (`hInstApp` +0x38, `hProcess` +0x68), and logging is added.
+  - `NtQueryInformationProcess` / `NtQueryVirtualMemory`: main2's, plus current-process checks, classes 12/29/36, and real `/proc/self/status` VM counters.
+  - Toolhelp: main2's snapshot. Thread entries come from the loader's guest thread table (Windows TIDs).
+- **Stubs that shadowed real code** (the missing-exports table is searched first): `Process32*`, `RtlInitUnicodeString`, `NtOpenSection` and `SetEnvironmentVariableW` were removed.
+- **Fake-module export rebinding:** names are now taken from the thunk index, not the IAT, and rebinding is deferred until the fake export tables are ready. An early build had left user32 with 0 exports. Ordinal imports no longer crash the shared-thunk loop.
+- **New impls exposed by the merge:**
+  - `SwitchToThread`.
+  - `PropVariantToStringAlloc` and `PropVariantClear`. PRAGMATA reads the WASAPI endpoint name through these. The generic S_OK stub left the string unset and the game crashed in `wcslen(NULL)`.
+- **Checked:**
+  - `make test-input` passes, up to the pre-existing unwind assertion.
+  - RE8 75 s gate passes (BD12/BD11 ready, no fatal).
+  - Sekiro runs.
+  - RE4 reaches its GPU check.
+  - PRAGMATA again reaches "Unsupported graphics card" (parked until the NVIDIA GPU returns).
+  - RDR2 was not tested: it is not installed on this machine.

@@ -22,7 +22,21 @@ typedef struct {
     uint32_t width, height, format;
     int fullscreen;
     uint32_t present_count;
+    uint64_t frame_serial[8];     /* retire serial of recent presents, for the frame-latency limit */
 } B11Swap;
+
+/* Frames the CPU may run ahead of the GPU. DXGI defaults to 3; 2 keeps input latency lower while CPU recording
+ * and GPU rendering still overlap. BEER_BD11_FRAME_LATENCY=1..8 overrides (1 = the old fully serialised present). */
+static uint32_t frame_latency(void)
+{
+    static uint32_t latency;
+    if (!latency) {
+        const char *e = getenv("BEER_BD11_FRAME_LATENCY");
+        const int v = e ? atoi(e) : 2;
+        latency = v < 1 ? 1 : v > 8 ? 8 : (uint32_t)v;
+    }
+    return latency;
+}
 
 typedef struct { void **vtable; _Atomic uint32_t refs; B11Device *dev; } B11DxgiDevice;
 
@@ -154,7 +168,15 @@ static B11HR B11_MS sc_present(B11Swap *s, uint32_t sync, uint32_t flags)
     b11_cmd(dev);
     b11_texture_use(dev->immediate, s->back, BD12_STATE_PRESENT);
     pthread_mutex_unlock(&dev->lock);
-    b11_flush(dev, 1);
+    /* Submit without waiting: the presenter's blit is queued behind this frame on the same queue. Only block
+     * once the GPU is `latency` frames behind, so the CPU records the next frame while this one renders. */
+    b11_flush(dev, 0);
+    {
+        const uint32_t latency = frame_latency();
+        s->frame_serial[s->present_count % 8] = dev->serial;
+        if (s->present_count + 1 >= latency)
+            b11_wait_serial(dev, s->frame_serial[(s->present_count + 1 - latency) % 8]);
+    }
     BD12Buffer *dump = NULL;
     const char *dump_list = getenv("BEER_BD11_DUMP_PRESENT");   /* comma list of present numbers, files go to BEER_BD11_DUMP_DIR */
     if (dump_list && s->back->image && s->format == 28) {
@@ -225,6 +247,18 @@ static B11HR B11_MS sc_present(B11Swap *s, uint32_t sync, uint32_t flags)
                     (unsigned long long)g_b11_stats[6], (unsigned long long)g_b11_stats[8], (unsigned long long)g_b11_stats[7],
                     (unsigned long long)g_b11_stats[9]);
         if (stats && s->present_count % 120 == 0) {
+            fprintf(stderr, "[BD11 STATS] per frame: barriers=%llu render-passes=%llu\n",
+                    (unsigned long long)(g_bd12_cmd_counts[BD12_COUNT_BARRIER] / 120),
+                    (unsigned long long)(g_bd12_cmd_counts[BD12_COUNT_RENDER_PASS] / 120));
+            g_bd12_cmd_counts[BD12_COUNT_BARRIER] = g_bd12_cmd_counts[BD12_COUNT_RENDER_PASS] = 0;
+            extern uint64_t g_b11_map_stats[8][3];
+            fprintf(stderr, "[BD11 STATS] deferred maps per frame (<=64K/<=1M/larger): write=%llu/%llu/%llu discard=%llu/%llu/%llu no-overwrite=%llu/%llu/%llu\n",
+                    (unsigned long long)(g_b11_map_stats[2][0] / 120), (unsigned long long)(g_b11_map_stats[2][1] / 120), (unsigned long long)(g_b11_map_stats[2][2] / 120),
+                    (unsigned long long)(g_b11_map_stats[4][0] / 120), (unsigned long long)(g_b11_map_stats[4][1] / 120), (unsigned long long)(g_b11_map_stats[4][2] / 120),
+                    (unsigned long long)(g_b11_map_stats[5][0] / 120), (unsigned long long)(g_b11_map_stats[5][1] / 120), (unsigned long long)(g_b11_map_stats[5][2] / 120));
+            memset(g_b11_map_stats, 0, sizeof(g_b11_map_stats));
+        }
+        if (stats && s->present_count % 120 == 0) {
             extern uint64_t g_b11_query_counts[8];
             fprintf(stderr, "[BD11 QUERIES] getdata event=%llu occlusion=%llu timestamp=%llu disjoint=%llu stats=%llu predicate=%llu\n",
                     (unsigned long long)g_b11_query_counts[0], (unsigned long long)g_b11_query_counts[1],
@@ -233,8 +267,14 @@ static B11HR B11_MS sc_present(B11Swap *s, uint32_t sync, uint32_t flags)
         }
     }
     Bd12ImagePresenter presenter = bd12_com_get_image_presenter();
-    if (presenter && s->back->image)
+    static uint64_t present_ns;
+    if (presenter && s->back->image) {
+        struct timespec a, b;
+        clock_gettime(CLOCK_MONOTONIC, &a);
         presenter(s->back->image->image, bd12_layout_for_state(BD12_STATE_PRESENT, 0), s->width, s->height, s->format);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        present_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
+    }
     {   /* BEER_BD11_FPS=1: presents per second and the sync interval the game asks for. */
         static int fps_log = -1;
         if (fps_log < 0) fps_log = getenv("BEER_BD11_FPS") != NULL;
@@ -249,8 +289,11 @@ static B11HR B11_MS sc_present(B11Swap *s, uint32_t sync, uint32_t flags)
             if (!window_start_ns) window_start_ns = now;
             ++frames;
             if (now - window_start_ns >= 1000000000ull) {
-                fprintf(stderr, "[BD11 FPS] %.1f fps sync=%u worst=%.1f ms\n",
-                        frames * 1e9 / (double)(now - window_start_ns), sync, worst_ns / 1e6);
+                extern uint64_t g_b11_wait_ns;
+                fprintf(stderr, "[BD11 FPS] %.1f fps sync=%u worst=%.1f ms gpu-wait=%.1f ms/s present=%.1f ms/s\n",
+                        frames * 1e9 / (double)(now - window_start_ns), sync, worst_ns / 1e6,
+                        __atomic_exchange_n(&g_b11_wait_ns, 0, __ATOMIC_RELAXED) / 1e6, present_ns / 1e6);
+                present_ns = 0;
                 window_start_ns = now;
                 frames = 0;
                 worst_ns = 0;

@@ -40,6 +40,12 @@ static const uint8_t iid_audio_client[16] = {
 static const uint8_t iid_render_client[16] = {
     0xfc,0xac,0x94,0xf2,0x46,0x31,0x83,0x44,0xa7,0xbf,0xad,0xdc,0xa7,0xc2,0x60,0xe2
 };
+static const uint8_t iid_session_control[16] = {   /* IAudioSessionControl */
+    0x99,0xa5,0xb1,0xf4,0x66,0x72,0x19,0x43,0xa8,0xca,0xe7,0x0a,0xcb,0x11,0xe8,0xcd
+};
+static const uint8_t iid_endpoint[16] = {           /* IMMEndpoint */
+    0x88,0x97,0xe0,0x1b,0x94,0x68,0x89,0x40,0x85,0x86,0x9a,0x2a,0x6c,0x26,0x5a,0xc5
+};
 static const uint8_t iid_audio_clock[16] = {
     0x4f,0x31,0x63,0xcd,0xba,0x3f,0x1b,0x4a,0x81,0x2c,0xef,0x96,0x35,0x87,0x28,0xe7
 };
@@ -68,13 +74,18 @@ struct BeerWasapi {
     BeerWasapiInterface audio_client;
     BeerWasapiInterface render_client;
     BeerWasapiInterface audio_clock;
+    BeerWasapiInterface session;          /* IAudioSessionControl */
+    BeerWasapiInterface property_store;   /* IPropertyStore of the endpoint */
+    BeerWasapiInterface endpoint;         /* IMMEndpoint of the device */
     WaveFormat format;
     uint32_t buffer_frames;
     uint32_t acquired_frames;
     size_t acquired_capacity;
     int float_staging;            /* the engine mixes floats in place: sticky once seen (a packet's tail can be silent) */
+    int float_client;             /* initialised with a 32-bit float format: every packet is converted to PCM16 */
     uint8_t *acquired_buffer;
     atomic_uint_fast64_t submitted_frames;
+    BeerAudioStream *stream;      /* this client's own sound-server stream */
     atomic_uint_fast64_t event_handle;
     atomic_uint_fast64_t clock_frames;
     atomic_int started;
@@ -106,6 +117,7 @@ static uint64_t __attribute__((ms_abi)) wasapi_release(void *self)
         if (atomic_exchange_explicit(&owner->worker_running, 0,
                                      memory_order_acq_rel))
             pthread_join(owner->worker, NULL);
+        beer_audio_stream_close(owner->stream);
         free(owner->acquired_buffer);
         free(owner);
     }
@@ -120,7 +132,20 @@ static void *select_interface(BeerWasapi *owner, const void *iid)
     if (guid_equal(iid, iid_audio_client)) return &owner->audio_client;
     if (guid_equal(iid, iid_render_client)) return &owner->render_client;
     if (guid_equal(iid, iid_audio_clock)) return &owner->audio_clock;
+    if (guid_equal(iid, iid_session_control)) return &owner->session;
+    if (guid_equal(iid, iid_endpoint)) return &owner->endpoint;
     return NULL;
+}
+
+/* Interfaces the compat layer does not provide: logged (a few times) so a game's failed probe is visible. */
+static void wasapi_log_unsupported(const char *what, const void *iid)
+{
+    static _Atomic(unsigned) count;
+    if (atomic_fetch_add(&count, 1) >= 24) return;
+    const uint8_t *g = iid;
+    if (!g) { fprintf(stderr, "[WASAPI] %s\n", what); return; }
+    fprintf(stderr, "[WASAPI] %s {%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x} -> E_NOINTERFACE\n", what,
+            g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
 }
 
 static uint64_t __attribute__((ms_abi)) wasapi_query(void *self, const void *iid,
@@ -130,7 +155,7 @@ static uint64_t __attribute__((ms_abi)) wasapi_query(void *self, const void *iid
     *output = NULL;
     BeerWasapi *owner = wasapi_interface(self)->owner;
     void *selected = select_interface(owner, iid);
-    if (!selected) return E_NOINTERFACE;
+    if (!selected) { wasapi_log_unsupported("QueryInterface", iid); return E_NOINTERFACE; }
     wasapi_add_ref(selected);
     *output = selected;
     return S_OK;
@@ -143,6 +168,21 @@ static uint64_t __attribute__((ms_abi)) enumerator_get_default(void *self,
 {
     (void)flow; (void)role;
     if (!device) return E_POINTER;
+    BeerWasapi *owner = wasapi_interface(self)->owner;
+    wasapi_add_ref(&owner->device);
+    *device = &owner->device;
+    return S_OK;
+}
+
+/* GetDevice(id): there is one render endpoint, so every id names it. FMOD looks the default device up again by
+ * the id GetId returned and gives up on WASAPI (silence) when this fails. */
+static uint64_t __attribute__((ms_abi)) enumerator_get_device(void *self,
+                                                              const uint16_t *id,
+                                                              void **device)
+{
+    if (!device) return E_POINTER;
+    *device = NULL;
+    if (!id) return E_POINTER;
     BeerWasapi *owner = wasapi_interface(self)->owner;
     wasapi_add_ref(&owner->device);
     *device = &owner->device;
@@ -182,8 +222,6 @@ static uint64_t __attribute__((ms_abi)) enumerator_enum_endpoints(
     return S_OK;
 }
 
-static uint64_t __attribute__((ms_abi)) enumerator_notimpl(void *self, ...)
-{ (void)self; return E_FAIL; }
 static uint64_t __attribute__((ms_abi)) enumerator_notify(void *self, void *callback)
 { (void)self; (void)callback; return S_OK; }
 
@@ -219,14 +257,79 @@ static uint64_t __attribute__((ms_abi)) device_activate(void *self, const void *
 
 static uint64_t __attribute__((ms_abi)) device_get_state(void *self, uint32_t *state)
 { (void)self; if (!state) return E_POINTER; *state = 1; return S_OK; }
-static uint64_t __attribute__((ms_abi)) device_notimpl(void *self, ...)
-{ (void)self; return E_FAIL; }
+/* Strings handed to the guest are released with CoTaskMemFree (free). */
+static uint16_t *wasapi_wide_dup(const char *text)
+{
+    size_t n = strlen(text);
+    uint16_t *wide = calloc(n + 1, sizeof(*wide));
+    for (size_t i = 0; wide && i < n; ++i) wide[i] = (uint8_t)text[i];
+    return wide;
+}
 
+static uint64_t __attribute__((ms_abi)) device_open_property_store(void *self, uint32_t access, void **store)
+{
+    (void)access;
+    if (!store) return E_POINTER;
+    BeerWasapi *owner = wasapi_interface(self)->owner;
+    wasapi_add_ref(&owner->property_store);
+    *store = &owner->property_store;
+    return S_OK;
+}
+
+static uint64_t __attribute__((ms_abi)) device_get_id(void *self, uint16_t **id)
+{
+    (void)self;
+    if (!id) return E_POINTER;
+    *id = wasapi_wide_dup("{0.0.0.00000000}.{beer00000-0000-0000-0000-000000000001}");
+    return *id ? S_OK : E_FAIL;
+}
+
+/* IPropertyStore: every value is the endpoint's friendly name (PKEY_Device_FriendlyName and its siblings). */
+static uint64_t __attribute__((ms_abi)) store_get_count(void *self, uint32_t *count)
+{ (void)self; if (!count) return E_POINTER; *count = 0; return S_OK; }
+static uint64_t __attribute__((ms_abi)) store_get_at(void *self, uint32_t index, void *key)
+{ (void)self; (void)index; (void)key; return E_FAIL; }
+static uint64_t __attribute__((ms_abi)) store_get_value(void *self, const void *key, uint8_t *value)
+{
+    (void)self; (void)key;
+    if (!value) return E_POINTER;
+    memset(value, 0, 24);                                  /* PROPVARIANT */
+    *(uint16_t *)value = 31;                               /* VT_LPWSTR */
+    *(uint16_t **)(value + 8) = wasapi_wide_dup("Beer Audio Output");
+    return S_OK;
+}
+static uint64_t __attribute__((ms_abi)) store_ok(void *self, ...)
+{ (void)self; return S_OK; }
+
+/* IAudioSessionControl: one always-active session; names and notifications are accepted and ignored. */
+static uint64_t __attribute__((ms_abi)) session_get_state(void *self, int *state)
+{ (void)self; if (!state) return E_POINTER; *state = 1; return S_OK; }   /* AudioSessionStateActive */
+static uint64_t __attribute__((ms_abi)) session_get_string(void *self, uint16_t **text)
+{ (void)self; if (!text) return E_POINTER; *text = wasapi_wide_dup(""); return *text ? S_OK : E_FAIL; }
+static uint64_t __attribute__((ms_abi)) session_get_grouping(void *self, uint8_t *guid)
+{ (void)self; if (!guid) return E_POINTER; memset(guid, 0, 16); return S_OK; }
+static uint64_t __attribute__((ms_abi)) session_ok(void *self, ...)
+{ (void)self; return S_OK; }
+
+/* Mono or stereo 16-bit PCM (returns 1) or 32-bit float (returns 2): WAVE_FORMAT_PCM / WAVE_FORMAT_IEEE_FLOAT, or
+ * WAVE_FORMAT_EXTENSIBLE with the matching KSDATAFORMAT_SUBTYPE (FMOD Ex always uses the extensible form, and asks
+ * for float in the systems it opens after the first). Float packets are converted to PCM16 in ReleaseBuffer. */
 static int supported_format(const WaveFormat *format)
 {
-    return format && format->tag == 1 && format->channels >= 1 &&
-           format->channels <= 2 && format->rate && format->bits == 16 &&
-           format->block_align == format->channels * 2u;
+    if (!format || format->channels < 1 || format->channels > 2 || !format->rate ||
+        (format->bits != 16 && format->bits != 32) ||
+        format->block_align != format->channels * (format->bits / 8u))
+        return 0;
+    const int kind = format->bits == 16 ? 1 : 2;
+    if (format->tag == (kind == 1 ? 1 : 3)) return kind;
+    if (format->tag != 0xfffe || format->extra < 22) return 0;
+    static const uint8_t subtype_tail[14] = {0x00,0x00, 0x00,0x00, 0x10,0x00,
+                                             0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71};
+    const uint8_t *extensible = (const uint8_t *)format + sizeof(*format);
+    uint16_t valid_bits;
+    memcpy(&valid_bits, extensible, sizeof(valid_bits));
+    return (valid_bits == 0 || valid_bits == format->bits) &&
+           extensible[6] == (kind == 1 ? 1 : 3) && !memcmp(extensible + 8, subtype_tail, 14) ? kind : 0;
 }
 
 static uint64_t __attribute__((ms_abi)) audio_client_initialize(
@@ -244,12 +347,25 @@ static uint64_t __attribute__((ms_abi)) audio_client_initialize(
             format ? format->channels : 0, format ? format->rate : 0,
             format ? format->bits : 0);
     if (owner->initialized) return AUDCLNT_E_ALREADY_INITIALIZED;
-    if (!supported_format(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    const int kind = supported_format(format);
+    if (!kind) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    /* The stream is always PCM16; a float client's packets are converted on release. */
     owner->format = *format;
+    owner->format.tag = 1;
+    owner->format.extra = 0;
+    owner->format.bits = 16;
+    owner->format.block_align = (uint16_t)(format->channels * 2u);
+    owner->format.average_bytes = format->rate * owner->format.block_align;
+    owner->float_client = kind == 2;
+    owner->float_staging = kind == 2;
     uint64_t duration = buffer_duration > 0 ? (uint64_t)buffer_duration : UINT64_C(1000000);
+    /* Shared mode never hands out less than a few device periods (Wine's drivers use three): RDR2 asks for one 10 ms
+     * period, and with exactly 10 ms any scheduling hiccup leaves its mixer no room to write ahead. */
+    if (share_mode == 0 && duration < UINT64_C(300000)) duration = UINT64_C(300000);
     owner->buffer_frames = (uint32_t)((duration * format->rate + 9999999u) / 10000000u);
     if (owner->buffer_frames < format->rate / 100u) owner->buffer_frames = format->rate / 100u;
-    if (!beer_audio_init(format->rate, format->channels)) return E_FAIL;
+    owner->stream = beer_audio_stream_open(format->rate, format->channels, "WASAPI");
+    if (!owner->stream) return E_FAIL;
     owner->initialized = 1;
     return S_OK;
 }
@@ -309,6 +425,19 @@ static uint64_t __attribute__((ms_abi)) audio_client_get_period(void *self,
     int64_t *default_period, int64_t *minimum_period)
 { (void)self; if(default_period)*default_period=100000; if(minimum_period)*minimum_period=100000; return S_OK; }
 
+/* Audio kept queued at the sound server beyond the client's own buffer (BEER_AUDIO_LATENCY_MS, default 40). */
+static unsigned latency_margin_ms(void)
+{
+    static int margin = -1;
+    if (margin < 0) {
+        const char *value = getenv("BEER_AUDIO_LATENCY_MS");
+        margin = value ? atoi(value) : 40;
+        if (margin < 0) margin = 0;
+        if (margin > 500) margin = 500;
+    }
+    return (unsigned)margin;
+}
+
 static void *wasapi_event_worker(void *opaque)
 {
     BeerWasapi *owner = opaque;
@@ -336,7 +465,20 @@ static void *wasapi_event_worker(void *opaque)
                                                 memory_order_relaxed);
         uint64_t submitted = atomic_load_explicit(&owner->submitted_frames,
                                                   memory_order_acquire);
-        uint64_t advanced = current + (uint64_t)elapsed_ns * rate / 1000000000ull;
+        /* The device position follows what the sound server has really played, plus a fixed margin.  The game
+         * keeps padding = submitted - position below its buffer size, so the server always holds margin + buffer
+         * of audio.  A wall-clock position let the game run only ~a buffer ahead of real time: PipeWire, which
+         * pulls ~21 ms quanta, found the stream empty on nearly every cycle (crackling, dropouts).  Following the
+         * server also keeps it locked to the sound card's clock over long sessions. */
+        int exact = 0;
+        uint64_t heard = beer_audio_stream_bytes_heard(owner->stream, &exact);
+        uint64_t advanced;
+        if (exact && owner->format.block_align) {
+            advanced = heard / owner->format.block_align + (uint64_t)latency_margin_ms() * rate / 1000u;
+            if (advanced < current) advanced = current;
+        } else {
+            advanced = current + (uint64_t)elapsed_ns * rate / 1000000000ull;
+        }
         if (advanced > submitted) advanced = submitted;
         atomic_store_explicit(&owner->clock_frames, advanced,
                               memory_order_release);
@@ -381,7 +523,7 @@ static uint64_t __attribute__((ms_abi)) audio_client_reset(void *self)
 {
     BeerWasapi *owner=wasapi_interface(self)->owner;
     if(!owner->initialized)return AUDCLNT_E_NOT_INITIALIZED;
-    beer_audio_reset();
+    beer_audio_stream_reset(owner->stream);
     atomic_store_explicit(&owner->submitted_frames, 0, memory_order_release);
     atomic_store_explicit(&owner->clock_frames, 0, memory_order_release);
     return S_OK;
@@ -406,11 +548,13 @@ static uint64_t __attribute__((ms_abi)) audio_client_get_service(void *self,
     *service = NULL;
     BeerWasapi *owner = wasapi_interface(self)->owner;
     void *selected = select_interface(owner, iid);
-    if (selected != &owner->render_client && selected != &owner->audio_clock)
+    if (selected != &owner->render_client && selected != &owner->audio_clock && selected != &owner->session) {
+        wasapi_log_unsupported("IAudioClient::GetService", iid);
         return E_NOINTERFACE;
+    }
     if (getenv("BEER_WASAPI_DIAGNOSTICS"))
         fprintf(stderr, "[WASAPI] IAudioClient::GetService -> %s\n",
-                selected == &owner->render_client ? "render" : "clock");
+                selected == &owner->render_client ? "render" : selected == &owner->session ? "session" : "clock");
     wasapi_add_ref(selected);
     *service = selected;
     return S_OK;
@@ -424,7 +568,9 @@ static uint64_t __attribute__((ms_abi)) render_get_buffer(void *self, uint32_t f
     BeerWasapi *owner = wasapi_interface(self)->owner;
     if (!owner->initialized) return AUDCLNT_E_NOT_INITIALIZED;
     if (owner->acquired_buffer) return AUDCLNT_E_OUT_OF_ORDER;
-    if (!frames || frames > owner->buffer_frames) return AUDCLNT_E_BUFFER_SIZE_ERROR;
+    /* Zero frames is a valid request (the buffer is full): FMOD makes it every time it has filled the whole buffer
+     * and treats a failure as a lost device, closing and reopening its output about once a second. */
+    if (frames > owner->buffer_frames) return AUDCLNT_E_BUFFER_SIZE_ERROR;
     /* Reserve engine-mix staging capacity in addition to the endpoint's
      * declared PCM payload. Some clients perform an in-place float-to-PCM
      * conversion in the render packet; ReleaseBuffer still submits only the
@@ -432,7 +578,7 @@ static uint64_t __attribute__((ms_abi)) render_get_buffer(void *self, uint32_t f
     size_t staging_align = (size_t)owner->format.channels * sizeof(float);
     if (staging_align < owner->format.block_align)
         staging_align = owner->format.block_align;
-    size_t capacity = (size_t)frames * staging_align;
+    size_t capacity = (size_t)(frames ? frames : 1) * staging_align;
     owner->acquired_buffer = calloc(1, capacity);
     if (!owner->acquired_buffer) return E_FAIL;
     owner->acquired_frames = frames;
@@ -483,6 +629,7 @@ static int convert_float_staging_packet(BeerWasapi *owner, uint32_t frames)
     size_t pcm_bytes = samples * sizeof(int16_t);
     if (owner->acquired_capacity < float_bytes || pcm_bytes >= float_bytes)
         return 0;
+    if (owner->float_client) goto convert;
 
     /* A PCM16 client normally writes only the declared packet bytes. Some
      * engine mixers use the extra endpoint buffer capacity as an in-place
@@ -508,6 +655,7 @@ static int convert_float_staging_packet(BeerWasapi *owner, uint32_t frames)
     if (finite_unit_samples < samples * 7u / 8u) return 0;
 
     owner->float_staging = 1;
+convert:
     for (size_t sample = 0; sample < samples; ++sample) {
         uint32_t bits;
         int16_t pcm;
@@ -596,7 +744,7 @@ static uint64_t __attribute__((ms_abi)) render_release_buffer(void *self,
          * restart after the gap clicks. */
         if (flags & 2u) memset(owner->acquired_buffer, 0, bytes);
         else convert_float_staging_packet(owner, frames);
-        if (!beer_audio_submit(owner->acquired_buffer, bytes, NULL, NULL))
+        if (!beer_audio_stream_submit(owner->stream, owner->acquired_buffer, bytes, 1, NULL, NULL))
             return E_FAIL;
     }
     owner->submitted_frames += frames;
@@ -626,11 +774,7 @@ static uint64_t __attribute__((ms_abi)) clock_get_position(void *self,
 {
     BeerWasapi *owner = wasapi_interface(self)->owner;
     if (!position) return E_POINTER;
-    uint64_t device_position = atomic_load_explicit(&owner->clock_frames,
-                                                    memory_order_acquire);
-    uint32_t align = owner->format.block_align ? owner->format.block_align : 4;
-    uint64_t played_position = beer_audio_bytes_played() / align;
-    *position = device_position > played_position ? device_position : played_position;
+    *position = atomic_load_explicit(&owner->clock_frames, memory_order_acquire);
     if (qpc) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -654,7 +798,7 @@ static uint64_t __attribute__((ms_abi)) clock_get_characteristics(void *self,
 
 static void *enumerator_vtable[8] = {
     wasapi_query, wasapi_add_ref, wasapi_release, enumerator_enum_endpoints,
-    enumerator_get_default, enumerator_notimpl, enumerator_notify, enumerator_notify
+    enumerator_get_default, enumerator_get_device, enumerator_notify, enumerator_notify
 };
 static void *collection_vtable[5] = {
     wasapi_query, wasapi_add_ref, wasapi_release,
@@ -662,7 +806,20 @@ static void *collection_vtable[5] = {
 };
 static void *device_vtable[7] = {
     wasapi_query, wasapi_add_ref, wasapi_release, device_activate,
-    device_notimpl, device_notimpl, device_get_state
+    device_open_property_store, device_get_id, device_get_state
+};
+static void *property_store_vtable[8] = {
+    wasapi_query, wasapi_add_ref, wasapi_release, store_get_count, store_get_at, store_get_value, store_ok, store_ok
+};
+/* The only endpoint is the render device: eRender (0). */
+static uint64_t __attribute__((ms_abi)) endpoint_get_data_flow(void *self, uint32_t *flow)
+{ (void)self; if (!flow) return E_POINTER; *flow = 0; return S_OK; }
+static void *endpoint_vtable[4] = {
+    wasapi_query, wasapi_add_ref, wasapi_release, endpoint_get_data_flow
+};
+static void *session_vtable[12] = {
+    wasapi_query, wasapi_add_ref, wasapi_release, session_get_state, session_get_string, session_ok,
+    session_get_string, session_ok, session_get_grouping, session_ok, session_ok, session_ok
 };
 static void *audio_client_vtable[15] = {
     wasapi_query, wasapi_add_ref, wasapi_release, audio_client_initialize,
@@ -697,6 +854,9 @@ uint64_t beer_wasapi_create_instance(const void *class_id, const void *interface
     owner->audio_client = (BeerWasapiInterface){audio_client_vtable, owner};
     owner->render_client = (BeerWasapiInterface){render_client_vtable, owner};
     owner->audio_clock = (BeerWasapiInterface){audio_clock_vtable, owner};
+    owner->session = (BeerWasapiInterface){session_vtable, owner};
+    owner->property_store = (BeerWasapiInterface){property_store_vtable, owner};
+    owner->endpoint = (BeerWasapiInterface){endpoint_vtable, owner};
     atomic_init(&owner->event_handle, 0);
     atomic_init(&owner->clock_frames, 0);
     atomic_init(&owner->started, 0);

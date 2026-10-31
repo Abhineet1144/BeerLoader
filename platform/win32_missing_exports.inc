@@ -3,14 +3,12 @@
 static u64 __attribute__((ms_abi)) stub_GetConsoleMode(u64 h, u32 *mode){ (void)h; if(mode)*mode=0; return 0; }
 static u64 __attribute__((ms_abi)) stub_ReadProcessMemory(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RemoveDirectoryW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetEnvironmentVariableW(void){ return 1; }
 static u64 __attribute__((ms_abi)) stub_GetConsoleOutputCP(void){ return 437; }
 static u64 __attribute__((ms_abi)) stub_GetThreadPriority(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetConsoleCP(void){ return 437; }
 static u64 __attribute__((ms_abi)) stub_EnumResourceTypesA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumResourceNamesA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumResourceLanguagesA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateFileMappingA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GlobalAddAtomA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_WritePrivateProfileStringA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetVolumeInformationA(void){ return 0; }
@@ -38,16 +36,25 @@ static u64 __attribute__((ms_abi)) stub_OpenProcess(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetExitCodeProcess(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreateRemoteThread(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_WriteProcessMemory(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetThreadContext(void){ return 0; }
+/* GetThreadContext: Beer cannot read another thread's registers, but it never sets hardware breakpoints, so the debug
+ * registers are reported as clear (CONTEXT_DEBUG_REGISTERS: Dr0-Dr3, Dr6, Dr7 at +0x48..+0x77 of the x64 CONTEXT).
+ * Failing the call left the caller's buffer as stack garbage, which copy protection (RDR2's Arxan TLS callback)
+ * reads as a debugger's breakpoints and answers by sabotaging the game ("Social Club error"). */
+static u64 __attribute__((ms_abi)) beer_GetThreadContext(u64 thread, u8 *context)
+{
+    (void)thread;
+    if (!context) { g_last_error = 998; return 0; }                 /* ERROR_NOACCESS */
+    const u32 flags = *(u32 *)(context + 0x30);
+    if ((flags & 0x100010u) == 0x100010u) memset(context + 0x48, 0, 0x30);
+    return 1;
+}
 static u64 __attribute__((ms_abi)) stub_GlobalDeleteAtom(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DeviceIoControl(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FindClose(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_MulDiv(s32 a, s32 b, s32 c){ if(!c) return (u64)(s64)-1; return (u64)(s64)(s32)(((int64_t)a*b + (c/2))/c); }
 static u64 __attribute__((ms_abi)) stub_FileTimeToDosDateTime(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_PeekNamedPipe(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VirtualLock(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VirtualUnlock(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_MapViewOfFileEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_IsBadReadPtr(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_IsBadWritePtr(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetThreadLocale(void){ return 0x409; }
@@ -55,9 +62,6 @@ static u64 __attribute__((ms_abi)) stub_SetThreadLocale(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetThreadContext(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetProcessIdOfThread(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetThreadId(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Process32FirstW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Process32NextW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_Process32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Module32First(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Module32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DebugBreak(void){ return 0; }
@@ -71,12 +75,9 @@ static u64 __attribute__((ms_abi)) stub_SafeArrayGetElement(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayPutElement(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayPtrOfIndex(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VariantChangeTypeEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_VariantClear(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_VariantCopy(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_VariantInit(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharUpperBuffW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharLowerBuffW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RegisterClassA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_UnregisterClassA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassInfoA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RegisterClipboardFormatA(void){ return 0; }
@@ -94,7 +95,6 @@ static u64 __attribute__((ms_abi)) stub_GetClassLongA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetClassLongPtrA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FindWindowA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassNameA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RegisterClassW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_UnregisterClassW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassInfoW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_InsertMenuItemW(void){ return 0; }
@@ -162,10 +162,6 @@ static u64 __attribute__((ms_abi)) stub_GetSysColorBrush(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetSysColors(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DrawFocusRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FrameRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_InflateRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_IntersectRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_OffsetRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetParent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetParent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumWindows(void){ return 0; }
@@ -273,7 +269,6 @@ static u64 __attribute__((ms_abi)) stub_GetDCOrgEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DragQueryFileA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DragQueryFileW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExtractAssociatedIconW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_ShellExecuteW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DragFinish(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_OleUninitialize(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CLSIDFromProgID(void){ return 0; }
@@ -296,16 +291,69 @@ static u64 __attribute__((ms_abi)) stub_RtlFormatCurrentUserKeyPath(u16 *out)
     return 0;                                                       /* STATUS_SUCCESS */
 }
 static u64 __attribute__((ms_abi)) stub_RtlDosPathNameToNtPathName_U(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RtlFreeUnicodeString(u16 *us)
+
+/* SMBIOS ("RSMB") for GetSystemFirmwareTable: BIOS, system and baseboard structures built from /sys/class/dmi/id,
+ * which unprivileged users can read (the raw DMI table needs root). Same approach as Wine. */
+static size_t beer_smbios_string(char *out, size_t room, const char *field, const char *fallback)
 {
-    if (!us) return 0;
-    u16 *buffer = *(u16 **)(void *)((u8 *)us + 8);
-    if (buffer) impl_HeapFree(1, 0, buffer);           /* untracked pointers are ignored */
-    us[0] = us[1] = 0;
-    *(u16 **)(void *)((u8 *)us + 8) = NULL;
-    return 0;
+    char path[96], value[128] = "";
+    snprintf(path, sizeof(path), "/sys/class/dmi/id/%s", field);
+    FILE *f = fopen(path, "r");
+    if (f) { if (!fgets(value, sizeof(value), f)) value[0] = 0; fclose(f); }
+    value[strcspn(value, "\n")] = 0;
+    if (!value[0]) snprintf(value, sizeof(value), "%s", fallback);
+    size_t n = strlen(value) + 1;
+    if (n > room) return 0;
+    memcpy(out, value, n);
+    return n;
 }
-static u64 __attribute__((ms_abi)) stub_RtlInitUnicodeString(u16 *d, const u16 *s){ if(!d) return 0; size_t n=0; if(s) while(s[n]) ++n; d[0]=(u16)(n*2); d[1]=(u16)(s?n*2+2:0); *(const u16 **)(void*)((u8*)d+8)=s; return 0; }
+static size_t beer_build_smbios(u8 *t, size_t room)
+{
+    size_t n = 0;
+    #define SMB_STR(field, fb) do { size_t k = beer_smbios_string((char *)t + n, room - n, field, fb); if (!k) return 0; n += k; } while (0)
+    if (room < 512) return 0;
+    /* Type 0: BIOS information */
+    u8 *h = t + n; memset(h, 0, 0x18); h[0] = 0; h[1] = 0x18; h[4] = 1; h[5] = 2; h[8] = 3; h[9] = 0xFF;
+    h[10] = 0x08; h[0x14] = 0x03; h[0x15] = 0x0D; n += 0x18;
+    SMB_STR("bios_vendor", "American Megatrends Inc."); SMB_STR("bios_version", "1.0"); SMB_STR("bios_date", "01/01/2020"); t[n++] = 0;
+    /* Type 1: system information (UUID zero: product_uuid is root-only) */
+    h = t + n; memset(h, 0, 0x1B); h[0] = 1; h[1] = 0x1B; h[2] = 1; h[4] = 1; h[5] = 2; h[6] = 3; h[7] = 4;
+    h[0x18] = 6; h[0x19] = 5; h[0x1A] = 6; n += 0x1B;
+    SMB_STR("sys_vendor", "System manufacturer"); SMB_STR("product_name", "System Product Name");
+    SMB_STR("product_version", "1.0"); SMB_STR("product_serial", "Default string");
+    SMB_STR("product_sku", "Default string"); SMB_STR("product_family", "Default string"); t[n++] = 0;
+    /* Type 2: baseboard */
+    h = t + n; memset(h, 0, 0x0F); h[0] = 2; h[1] = 0x0F; h[2] = 2; h[4] = 1; h[5] = 2; h[6] = 3; h[7] = 4; h[8] = 5;
+    h[9] = 0x09; h[0x0D] = 0x0A; n += 0x0F;
+    SMB_STR("board_vendor", "Default string"); SMB_STR("board_name", "Default string"); SMB_STR("board_version", "1.0");
+    SMB_STR("board_serial", "Default string"); SMB_STR("board_asset_tag", "Default string"); t[n++] = 0;
+    /* Type 127: end of table */
+    if (room - n < 6) return 0;
+    h = t + n; h[0] = 127; h[1] = 4; h[2] = 3; h[3] = 0; h[4] = 0; h[5] = 0; n += 6;
+    #undef SMB_STR
+    return n;
+}
+static u64 __attribute__((ms_abi)) beer_GetSystemFirmwareTable(u32 provider, u32 id, u8 *buffer, u32 size)
+{
+    (void)id;
+    if (provider != 0x52534D42u) { g_last_error = 1; return 0; }   /* only 'RSMB'; ERROR_INVALID_FUNCTION */
+    u8 table[2048];
+    size_t length = beer_build_smbios(table, sizeof(table));
+    u32 needed = (u32)(8 + length);                                 /* RawSMBIOSData header */
+    if (!buffer || size < needed) { g_last_error = 122; return needed; }   /* ERROR_INSUFFICIENT_BUFFER */
+    buffer[0] = 0; buffer[1] = 2; buffer[2] = 8; buffer[3] = 0;     /* SMBIOS 2.8 */
+    u32 len32 = (u32)length;
+    memcpy(buffer + 4, &len32, 4);
+    memcpy(buffer + 8, table, length);
+    g_last_error = 0;
+    return needed;
+}
+static u64 __attribute__((ms_abi)) beer_EnumSystemFirmwareTables(u32 provider, u8 *buffer, u32 size)
+{
+    if (provider != 0x52534D42u) { g_last_error = 1; return 0; }
+    if (buffer && size >= 4) memset(buffer, 0, 4);                  /* one table, id 0 */
+    return 4;
+}
 static u64 __attribute__((ms_abi)) stub_RtlInitString(u16 *d, const char *s){ if(!d) return 0; size_t n=0; if(s) while(s[n]) ++n; d[0]=(u16)n; d[1]=(u16)(s?n+1:0); *(const char **)(void*)((u8*)d+8)=s; return 0; }
 static u64 __attribute__((ms_abi)) stub_PathMatchSpecW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_InitCommonControls(void){ return 0; }
@@ -328,5 +376,5 @@ static u64 __attribute__((ms_abi)) stub_ImageList_DragMove(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_DragShowNolock(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub__TrackMouseEvent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumProcesses(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_EnumProcessModules(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetModuleFileNameExW(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_VariantClear(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_VariantInit(void){ return 0; }

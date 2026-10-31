@@ -918,7 +918,7 @@ static int host_gpu_info_real(BeerHostGpuInfo *out)
     snprintf(out->name, sizeof(out->name), "%s", props.deviceName);
     out->vendor_id = props.vendorID;
     out->device_id = props.deviceID;
-    out->luid = ((uint64_t)props.vendorID << 32) | props.deviceID;
+    out->luid = (((uint64_t)props.vendorID << 16) | props.deviceID) & 0x7fffffffu;   /* HighPart 0, like Windows LUIDs */
 
     PFN_vkGetPhysicalDeviceMemoryProperties get_memory =
         (PFN_vkGetPhysicalDeviceMemoryProperties)g_context.GetInstanceProcAddr(
@@ -992,19 +992,36 @@ static int host_gpu_info_real(BeerHostGpuInfo *out)
 
 /* What the guest is told about the GPU. BEER_SPOOF_GPU_NAME / _VENDOR / _DEVICE (hex) / _VRAM_MB override
  * the identity DXGI and the display-device APIs report; the real Vulkan device still does the rendering. */
+int beer_vulkan_real_gpu_ids(uint32_t *vendor, uint32_t *device)
+{
+    BeerHostGpuInfo info;
+    if (!host_gpu_info_real(&info)) return 0;
+    *vendor = info.vendor_id;
+    *device = info.device_id;
+    return 1;
+}
+
+int beer_vulkan_gpu_spoof(char *name, size_t name_size, uint32_t *vendor, uint32_t *device, uint64_t *vram_bytes)
+{
+    const char *n = getenv("BEER_SPOOF_GPU_NAME");
+    const char *v = getenv("BEER_SPOOF_GPU_VENDOR");
+    const char *d = getenv("BEER_SPOOF_GPU_DEVICE");
+    const char *m = getenv("BEER_SPOOF_GPU_VRAM_MB");
+    int mask = 0;
+    if (n && *n && name) { snprintf(name, name_size, "%s", n); mask |= 1; }
+    if (v && *v && vendor) { *vendor = (uint32_t)strtoul(v, NULL, 16); mask |= 2; }
+    if (d && *d && device) { *device = (uint32_t)strtoul(d, NULL, 16); mask |= 4; }
+    if (m && *m && vram_bytes) { *vram_bytes = strtoull(m, NULL, 10) * 1024ull * 1024ull; mask |= 8; }
+    return mask;
+}
+
 int beer_vulkan_host_gpu_info(BeerHostGpuInfo *out)
 {
     const int have = host_gpu_info_real(out);
     if (!have) return 0;
-    const char *name = getenv("BEER_SPOOF_GPU_NAME");
-    const char *vendor = getenv("BEER_SPOOF_GPU_VENDOR");
-    const char *device = getenv("BEER_SPOOF_GPU_DEVICE");
-    const char *vram = getenv("BEER_SPOOF_GPU_VRAM_MB");
-    if (name && *name) snprintf(out->name, sizeof(out->name), "%s", name);
-    if (vendor && *vendor) out->vendor_id = (uint32_t)strtoul(vendor, NULL, 16);
-    if (device && *device) out->device_id = (uint32_t)strtoul(device, NULL, 16);
-    if (vram && *vram) out->dedicated_video_memory = strtoull(vram, NULL, 10) * 1024ull * 1024ull;
-    if ((vendor && *vendor) || (device && *device))
-        out->luid = ((uint64_t)out->vendor_id << 32) | out->device_id;
+    const int mask = beer_vulkan_gpu_spoof(out->name, sizeof(out->name), &out->vendor_id, &out->device_id,
+                                           &out->dedicated_video_memory);
+    if (mask & (2 | 4))
+        out->luid = (((uint64_t)out->vendor_id << 16) | out->device_id) & 0x7fffffffu;
     return 1;
 }

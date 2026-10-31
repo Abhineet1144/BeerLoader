@@ -25,11 +25,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <sys/personality.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <netdb.h>
+#include <linux/futex.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <ifaddrs.h>
@@ -39,6 +48,13 @@
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
 #include <time.h>
 #include <ucontext.h>
 #include <locale.h>
@@ -68,6 +84,7 @@
 #include "beer_control.h"
 #include "beer_overlay.h"
 #include "beer_post.h"
+#include "vulkan_bridge.h"
 #include "win32_nt_section.h"
 #include "win32_virtual_memory.h"
 #include "win32_entry.h"
@@ -240,6 +257,7 @@ static __thread GuestDll *t_guest_dll_init_dll;
 static GuestDll g_guest_dlls[MAX_GUEST_DLLS];
 static int g_guest_dll_count;
 static GuestDll *g_loading_guest_dll;
+static int g_loading_ucrtbase;
 /* Real bundled FMOD is the normal audio path. The compatibility object graph
  * remains available only as an explicit --audio=compat troubleshooting mode. */
 static int g_use_guest_fmod = 1;
@@ -281,13 +299,23 @@ static void guest_dll_initialize_all(void);
 static int iocp_from_handle(u64 h);
 static int dup_ref_add(u64 handle);
 static u64 guest_dll_export(GuestDll *dll, const char *name);
-static u64 guest_dll_export_ordinal(GuestDll *dll, u16 ordinal);
 typedef u64 (*ImplFn)(void);
 static ImplFn winsock_ordinal_impl(u16 ordinal);
 static int resolve_windows_host_path(const char *name, char *output, size_t output_size);
 static u64 virtual_fs_open_readonly_file(const char *name, u32 access,
                                           u32 share, u32 attrs);
 static int virtual_fs_query_attributes(const char *name, u32 *attributes);
+
+/* Child processes, Toolhelp snapshots and named pipes (platform/win32_process.inc). */
+static int beer_is_vulkan_module(const char *lname);
+static u64 beer_proc_wait(u64 h, u32 ms);
+static int beer_proc_poll(u64 h);
+static int beer_proc_terminate(u64 h, u32 code);
+static int beer_proc_close(u64 h);
+static int beer_pipe_is_pipe(u64 h);
+static int beer_pipe_ensure_connected(u64 h);
+static u64 beer_pipe_open_client(const char *name);
+static void beer_pipe_released(u32 id);
 
 /* Forward declarations: these are fully declared later (g_tramp/g_trampsz
  * in the stub infrastructure section, image_addr_is_exec near the PE
@@ -1109,6 +1137,12 @@ _Static_assert(HOST_CALL_STACK_SIZE == 1048576,
 __thread u64 g_host_call_stack_base;
 __thread u64 g_host_call_stack_top;
 __thread u64 g_saved_guest_rsp;
+/* The TEB stack bounds (gs:0x8 StackBase, gs:0x10 StackLimit) of the guest stack, kept while an outermost API call
+ * runs on the host call stack. During that call the TEB describes the host call stack instead: Windows code that an
+ * implementation calls back into (FMOD's EventSystem::load from Beer's FMOD hook) probes its frames with __chkstk
+ * against StackLimit, and with the guest stack's limit above the host stack it probed the guest stack's guard page. */
+__thread u64 g_teb_guest_stack_base;
+__thread u64 g_teb_guest_stack_limit;
 /* Import-dispatch provenance used to diagnose nested guest/host transitions.
  * The trampoline records these before changing RSP or consuming r10. */
 __thread u64 g_dispatch_import_index;
@@ -1224,6 +1258,20 @@ __asm__(
     "    cmp $" HOST_CALL_STACK_SIZE_STR ", %rax\n"
     "    jb 1f\n"                           /* (rsp - base) < SIZE => already on it */
     "    mov %rsp, %fs:g_saved_guest_rsp@tpoff\n"              /* Save to TEB SavedGuestRsp @ 0xA0 */
+    /* TEB stack bounds -> host call stack (kept as they are if they already describe it: a guest context resumed
+     * without returning through here left them switched, and the guest values saved then are still current). */
+    "    mov %gs:0x10, %rax\n"
+    "    cmp %fs:g_host_call_stack_base@tpoff, %rax\n"
+    "    je 5f\n"
+    "    mov %rax, %fs:g_teb_guest_stack_limit@tpoff\n"
+    "    mov %gs:0x8, %rax\n"
+    "    mov %rax, %fs:g_teb_guest_stack_base@tpoff\n"
+    "    mov %fs:g_host_call_stack_base@tpoff, %rax\n"
+    "    mov %rax, %gs:0x10\n"
+    "    mov %fs:g_host_call_stack_top@tpoff, %rax\n"
+    "    add $256, %rax\n"
+    "    mov %rax, %gs:0x8\n"
+    "5:\n"
     "    mov %fs:g_host_call_stack_top@tpoff, %rsp\n"              /* Switch to HostCallStackTop from TEB @ 0xB0 */
     "    and $-16, %rsp\n"                  /* Guarantee Windows ABI pre-call alignment */
     "    lea g_impl_targets(%rip), %r11\n"
@@ -1336,6 +1384,10 @@ __asm__(
      * any observable nonvolatile state. The old helper returned guest RSP in
      * RAX and the subsequent `pop %rax` replaced every API result with the
      * caller's continuation address. */
+    "    mov %fs:g_teb_guest_stack_limit@tpoff, %r11\n"
+    "    mov %r11, %gs:0x10\n"
+    "    mov %fs:g_teb_guest_stack_base@tpoff, %r11\n"
+    "    mov %r11, %gs:0x8\n"
     "    mov %fs:g_saved_guest_rsp@tpoff, %rsp\n"
     "    movq $0, %fs:g_saved_guest_rsp@tpoff\n"              /* No outer dispatch remains active after restore */
     "    pop %r11\n"
@@ -1386,9 +1438,15 @@ extern void beer_dispatch_trampoline(void);
 static u64 __attribute__((ms_abi))
 stub_dispatch(u64 idx, u64 a1, u64 a2, u64 a3)
 {
+    /* Each stub logs its first 16 calls, then only at powers of two: some are called thousands of times a second
+     * (RDR2: ResetWriteWatch, ActivateKeyboardLayout, NvLL_VK_SetLatencyMarker), and an unbuffered stderr write per
+     * call cost CPU and grew logs by ~100 MB.  BEER_STUB_LOG_ALL=1 logs every call. */
+    static _Atomic(u32) calls[MAX_STUBS];
+    const u32 n = idx < MAX_STUBS ? atomic_fetch_add_explicit(&calls[idx], 1, memory_order_relaxed) + 1 : 1;
+    if (n > 16 && (n & (n - 1)) && !getenv("BEER_STUB_LOG_ALL")) return 0;
     const char *name = (idx < (u64)g_nstubs) ? g_snames[idx] : "??";
-    fprintf(stderr, "[STUB] %-60s  (0x%lx, 0x%lx, 0x%lx) -> 0\n",
-            name, a1, a2, a3);
+    fprintf(stderr, "[STUB] %-60s  (0x%lx, 0x%lx, 0x%lx) -> 0  from %p  #%u\n",
+            name, a1, a2, a3, __builtin_return_address(0), n);
     return 0;
 }
 
@@ -1434,6 +1492,7 @@ static void emit_thunk(int idx)
 static void emit_impl_thunk(int idx, u64 fn_ptr)
 {
     u8 *p = g_tramp + idx * THUNK_SZ;
+    if (getenv("BEER_THUNK_NAMES")) fprintf(stderr, "[THUNK] %d 0x%llx %s\n", idx, (unsigned long long)(0x40000000ull + (u64)idx * THUNK_SZ), g_snames[idx] ? g_snames[idx] : "?");
     if (g_api_trace < 0) g_api_trace = getenv("BEER_API_TRACE") != NULL;
     g_impl_real[idx] = fn_ptr;
     g_impl_targets[idx] = g_api_trace ? (u64)beer_trace_wrap : fn_ptr;
@@ -1500,7 +1559,7 @@ beer_trace_log(u64 idx, u64 a, u64 b, u64 c, u64 d)
     if (pass) {
         t_trace_logged = 1;
         const char *name = idx < MAX_STUBS && g_snames[idx] ? g_snames[idx] : "?";
-        fprintf(stderr, "[API %u] %s(%lx, %lx, %lx, %lx)", k, name, a, b, c, d);
+        fprintf(stderr, "[API %u t%ld] %s(%lx, %lx, %lx, %lx)", k, (long)syscall(SYS_gettid), name, a, b, c, d);
         int win_args = strstr(name, "CreateWindowEx") != NULL ||
                        strstr(name, "DrawText") || strstr(name, "TextOut") ||
                        strstr(name, "SetWindowText") || strstr(name, "MessageBox") ||
@@ -1882,6 +1941,11 @@ static pthread_mutex_t *cs_get_or_create_mutex(WIN_CS *cs)
 {
     if (!cs_ptr_is_valid(cs))
         return &g_fallback_cs_mutex;
+    /* Initialised already (every Enter/Leave after the first): plain loads, no locked compare-and-swap bouncing
+     * the line between threads that contend for the same section. */
+    pthread_mutex_t *ready = __atomic_load_n(&cs->Mutex, __ATOMIC_ACQUIRE);
+    if (ready && __atomic_load_n(&cs->Magic, __ATOMIC_RELAXED) == WIN_CS_MAGIC)
+        return ready;
 
     /* Double-checked init using __sync builtins to be safe against races
      * on InitializeCriticalSection itself being called concurrently. */
@@ -2026,15 +2090,17 @@ static u64 __attribute__((ms_abi))
 impl_RtlLookupFunctionEntry(u64 ControlPc, u64 *ImageBase, void *History)
 {
     (void)History;
-    NtHdrs64 *nt  = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
-    u64 base = (u64)g_img;
-    u64 top  = base + nt->opt.sz_image;
-
-    if (ControlPc >= base && ControlPc < top) {
+    /* The executable and every loaded guest DLL: stack walks and C++ unwinding pass through runtime and plugin DLLs. */
+    for (int module = -1; module < g_guest_dll_count; ++module) {
+        u8 *image = module < 0 ? g_img : g_guest_dlls[module].image;
+        if (!image) continue;
+        NtHdrs64 *nt  = (NtHdrs64 *)(image + ((DosHdr *)image)->lfanew);
+        u64 base = (u64)image;
+        if (ControlPc < base || ControlPc >= base + nt->opt.sz_image) continue;
         u32 rva = (u32)(ControlPc - base);
         DataDir *pd = &nt->opt.dirs[3]; /* IMAGE_DIRECTORY_ENTRY_EXCEPTION */
         if (pd->size) {
-            RUNTIME_FUNC *funcs = (RUNTIME_FUNC *)(g_img + pd->rva);
+            RUNTIME_FUNC *funcs = (RUNTIME_FUNC *)(image + pd->rva);
             int lo = 0, hi = (int)(pd->size / sizeof(RUNTIME_FUNC)) - 1;
             while (lo <= hi) {
                 int mid = (lo + hi) / 2;
@@ -2046,6 +2112,7 @@ impl_RtlLookupFunctionEntry(u64 ControlPc, u64 *ImageBase, void *History)
                 }
             }
         }
+        break;
     }
 
     return (u64)(uintptr_t)beer_lookup_dynamic_function_entry(ControlPc, ImageBase);
@@ -2150,6 +2217,16 @@ static void beer_set_guest_arguments(int count, char **args)
     g_guest_argv_w[argc] = NULL;
     g_guest_argc = argc;
     for (size_t i = 0; i <= len; ++i) g_cmdline_w[i] = (u8)g_cmdline_a[i];
+}
+
+/* Full guest command line when the process was started with --cmdline= (children made by CreateProcess):
+ * replaces the line built from the loader's arguments. */
+static void beer_set_command_line(const char *line)
+{
+    size_t n = strnlen(line, sizeof(g_cmdline_a) - 1);
+    memcpy(g_cmdline_a, line, n);
+    g_cmdline_a[n] = 0;
+    for (size_t i = 0; i <= n; ++i) g_cmdline_w[i] = (u8)g_cmdline_a[i];
 }
 
 static char g_prefix_path[PATH_MAX];
@@ -2531,6 +2608,23 @@ static void lowercase_dll_basename(const char *name, char *out, size_t out_size)
     out[i] = 0;
 }
 
+/* Guest modules for the object scanner (platform/beer_objects.c): index 0 is the executable, then each loaded DLL.
+ * Returns 0 past the end. */
+int beer_guest_module_info(int index, u64 *base, u64 *size, const char **name)
+{
+    if (index == 0) {
+        if (!g_img) return 0;
+        const char *path = g_exe_host_path ? g_exe_host_path : "exe";
+        const char *slash = strrchr(path, '/');
+        *base = (u64)g_img; *size = g_img_size; *name = slash ? slash + 1 : path;
+        return 1;
+    }
+    if (index - 1 >= g_guest_dll_count) return 0;
+    const GuestDll *dll = &g_guest_dlls[index - 1];
+    *base = (u64)dll->image; *size = dll->image_size; *name = dll->name;
+    return 1;
+}
+
 static GuestDll *guest_dll_from_handle(u64 handle)
 {
     for (int i = 0; i < g_guest_dll_count; ++i)
@@ -2673,6 +2767,7 @@ static int build_guest_dll_path(const char *name, char *out, size_t out_size)
 #define HMOD_WINTRUST ((u64)0xFEE10000)
 #define HMOD_STEAM    ((u64)0xFEE50000)
 #define HMOD_KBASE    ((u64)0xFEE90000)
+#define HMOD_VULKAN   0x14F000000ULL   /* built-in vulkan-1.dll (renderer/vulkan/vulkan_bridge.c) */
 #define HMOD_K32     ((u64)0xFEED0000)
 #define HMOD_USER32  ((u64)0xFEF10000)
 #define HMOD_NTDLL   ((u64)0xFEF50000)
@@ -2757,6 +2852,12 @@ static FakePeModule g_fake_pe_modules[] = {
     { HMOD_ADVAPI, "advapi32.dll", NULL, 0, 0 },
     { HMOD_WIN32U, "win32u.dll", NULL, 0, 0 },
 };
+
+/* Direct system calls from guest code (packers and protectors such as Arxan and RDR2's 1911.dll read an
+ * ntdll stub's service number, or carry the Windows build's numbers, and execute `syscall` themselves) are
+ * served by platform/win32_syscall.c. ntdll's Nt/Zw stubs keep the native prefix "mov r10,rcx; mov eax,n"
+ * so the number is readable, then jump straight to the dispatcher thunk: an ordinary call never traps, and
+ * only code that issues `syscall` itself pays for the signal. */
 static volatile int g_fake_pe_ready;
 
 static FakePeModule *fake_pe_module_from_base(u64 base)
@@ -2905,6 +3006,13 @@ static u64 steam_client_module(void)
 }
 
 static u64 dll_name_to_handle(const char *lname, int create_fallback) {
+    /* The executable is a module too: GetModuleHandle/LoadLibrary of its own name returns its image instead of
+     * mapping a second copy (RDR2's 1911.dll imports from RDR2.exe). */
+    if (g_exe_host_path && g_img) {
+        const char *slash = strrchr(g_exe_host_path, '/');
+        const char *exe = slash ? slash + 1 : g_exe_host_path;
+        if (!strcasecmp(exe, lname)) return HMOD_EXE;
+    }
     int system_module = !strcmp(lname,"kernel32.dll") || !strcmp(lname,"kernelbase.dll") ||
                         !strcmp(lname,"user32.dll") || !strcmp(lname,"ntdll.dll") ||
                         !strcmp(lname,"advapi32.dll") || !strcmp(lname,"win32u.dll") ||
@@ -2927,6 +3035,7 @@ static u64 dll_name_to_handle(const char *lname, int create_fallback) {
         u64 steam = steam_client_module();
         if (steam) return steam;
     }
+    if (beer_is_vulkan_module(lname) && !getenv("BEER_ALLOW_GUEST_VULKAN")) return HMOD_VULKAN;
     if (!strncmp(lname, "api-ms-", 7) || !strncmp(lname, "ext-ms-", 7)) {
         /* API-set contract: CRT contracts live in the bundled ucrtbase image, the rest in kernel32. */
         GuestDll *ucrt = !strncmp(lname, "api-ms-win-crt-", 15) ? guest_dll_find("ucrtbase.dll") : NULL;
@@ -2966,16 +3075,29 @@ static u64 dll_name_to_handle(const char *lname, int create_fallback) {
     return 0;
 }
 
+/* GetModuleHandle names: the base name of a path, lower-case, ".dll" appended when there is no extension (a
+ * trailing '.' means "no extension"), as the Windows loader does. */
+static void module_lookup_name(const char *name, const u16 *wide, char *out, size_t size)
+{
+    char raw[1024];
+    size_t n = 0;
+    for (; n + 1 < sizeof(raw) && (name ? name[n] : wide[n]); ++n) raw[n] = name ? name[n] : (char)(wide[n] & 0x7f);
+    raw[n] = 0;
+    const char *base = raw;
+    for (const char *p = raw; *p; ++p) if (*p == '\\' || *p == '/') base = p + 1;
+    size_t i = 0;
+    for (; base[i] && i + 5 < size; ++i) out[i] = (char)((base[i] >= 'A' && base[i] <= 'Z') ? base[i] + 32 : base[i]);
+    out[i] = 0;
+    if (i && out[i - 1] == '.') out[i - 1] = 0;
+    else if (!strchr(out, '.')) strcat(out, ".dll");
+}
+
 static u64 __attribute__((ms_abi))
 impl_GetModuleHandleA(const char *name)
 {
     if (!name) return HMOD_EXE;
     char lname[64];
-    lowercase_dll_basename(name, lname, sizeof(lname));
-    /* Windows accepts a module basename with or without the conventional .dll
-     * suffix. Normalize only the query; loader-list identities remain complete. */
-    if (!strchr(lname, '.') && strlen(lname) + 4 < sizeof(lname))
-        strcat(lname, ".dll");
+    module_lookup_name(name, NULL, lname, sizeof(lname));
     u64 h = dll_name_to_handle(lname, 0);
     if (!h) fprintf(stderr, "[IMPL] GetModuleHandleA(\"%s\") -> NULL\n", name);
     return h;
@@ -2985,14 +3107,8 @@ static u64 __attribute__((ms_abi))
 impl_GetModuleHandleW(const u16 *name)
 {
     if (!name) return HMOD_EXE;
-    char narrow[PATH_MAX]; size_t i;
-    for (i = 0; i + 1 < sizeof(narrow) && name[i]; ++i)
-        narrow[i] = (char)(name[i] > 0x7f ? '?' : name[i]);
-    narrow[i] = 0;
     char lname[64];
-    lowercase_dll_basename(narrow, lname, sizeof(lname));
-    if (!strchr(lname, '.') && strlen(lname) + 4 < sizeof(lname))
-        strcat(lname, ".dll");
+    module_lookup_name(NULL, name, lname, sizeof(lname));
     u64 h = dll_name_to_handle(lname, 0);
     if (!h) fprintf(stderr, "[IMPL] GetModuleHandleW(\"%s\") -> NULL\n", lname);
     return h;
@@ -3100,88 +3216,7 @@ static u64 msvcrt_export(const char *name)
     return (u64)c;
 }
 
-/* ---- NVAPI (nvapi64.dll) ----
- * nvapi_QueryInterface maps a hashed function id to a function pointer and returns NULL for ids it does
- * not know, exactly like the real library. Only identification calls are provided, answered from the
- * Vulkan host GPU (the same source as the DXGI adapter), so titles that gate on "an NVIDIA GPU is
- * present" can proceed. Nothing here touches rendering. NvAPI_Status: 0 OK, -6 device not found. */
-#define NVAPI_GPU_HANDLE 0x6e760001ULL
-static int nvapi_host_gpu(BeerHostGpuInfo *gpu)
-{
-    return beer_vulkan_host_gpu_info(gpu) && gpu->vendor_id == 0x10de;
-}
-static int __attribute__((ms_abi)) nvapi_Initialize(void) { return 0; }
-static int __attribute__((ms_abi)) nvapi_Unload(void) { return 0; }
-static int __attribute__((ms_abi)) nvapi_GetErrorMessage(int status, char *text)
-{
-    if (!text) return -5;
-    snprintf(text, 64, status == 0 ? "NVAPI_OK" : "NVAPI_ERROR (%d)", status);
-    return 0;
-}
-static int __attribute__((ms_abi)) nvapi_GetInterfaceVersionString(char *text)
-{
-    if (!text) return -5;
-    snprintf(text, 64, "NVidia Complete Version 1.0");
-    return 0;
-}
-static int __attribute__((ms_abi)) nvapi_EnumPhysicalGPUs(u64 *handles, u32 *count)
-{
-    BeerHostGpuInfo gpu;
-    if (!handles || !count) return -5;
-    if (!nvapi_host_gpu(&gpu)) { *count = 0; return -6; }
-    handles[0] = NVAPI_GPU_HANDLE;
-    *count = 1;
-    return 0;
-}
-static int __attribute__((ms_abi)) nvapi_GPU_GetFullName(u64 handle, char *name)
-{
-    BeerHostGpuInfo gpu;
-    if (handle != NVAPI_GPU_HANDLE || !name) return -5;
-    if (!nvapi_host_gpu(&gpu)) return -6;
-    snprintf(name, 64, "%s", gpu.name);
-    return 0;
-}
-static int __attribute__((ms_abi)) nvapi_GPU_GetPCIIdentifiers(u64 handle, u32 *device, u32 *subsystem,
-                                                               u32 *revision, u32 *ext_device)
-{
-    BeerHostGpuInfo gpu;
-    if (handle != NVAPI_GPU_HANDLE) return -5;
-    if (!nvapi_host_gpu(&gpu)) return -6;
-    if (device) *device = (gpu.device_id << 16) | gpu.vendor_id;
-    if (subsystem) *subsystem = 0;
-    if (revision) *revision = gpu.revision;
-    if (ext_device) *ext_device = gpu.device_id;
-    return 0;
-}
-static int __attribute__((ms_abi)) nvapi_SYS_GetDriverAndBranchVersion(u32 *version, char *branch)
-{
-    if (!version || !branch) return -5;
-    *version = 57200;
-    snprintf(branch, 64, "r572_00");
-    return 0;
-}
-
-static u64 __attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
-{
-    static const struct { u32 id; const char *name; void *fn; } table[] = {
-        {0x0150E828, "NvAPI_Initialize", (void *)nvapi_Initialize},
-        {0xD22BDD7E, "NvAPI_Unload", (void *)nvapi_Unload},
-        {0x6C2D048C, "NvAPI_GetErrorMessage", (void *)nvapi_GetErrorMessage},
-        {0x01053FA5, "NvAPI_GetInterfaceVersionString", (void *)nvapi_GetInterfaceVersionString},
-        {0xE5AC921F, "NvAPI_EnumPhysicalGPUs", (void *)nvapi_EnumPhysicalGPUs},
-        {0xCEEE8E9F, "NvAPI_GPU_GetFullName", (void *)nvapi_GPU_GetFullName},
-        {0x2DDFB66E, "NvAPI_GPU_GetPCIIdentifiers", (void *)nvapi_GPU_GetPCIIdentifiers},
-        {0x2926AAAD, "NvAPI_SYS_GetDriverAndBranchVersion", (void *)nvapi_SYS_GetDriverAndBranchVersion},
-    };
-    for (size_t i = 0; i < sizeof(table) / sizeof(*table); ++i)
-        if (table[i].id == id) {
-            if (getenv("BEER_NVAPI_DIAGNOSTICS")) fprintf(stderr, "[NVAPI] %s\n", table[i].name);
-            return (u64)table[i].fn;
-        }
-    fprintf(stderr, "[NVAPI] QueryInterface(0x%08X) -> NULL (not provided)\n", id);
-    return 0;
-}
-
+static u64 guest_dll_export_by_ordinal(GuestDll *dll, u32 ordinal);
 static u64 __attribute__((ms_abi))
 impl_GetProcAddress(u64 hmod, const char *procname)
 {
@@ -3194,7 +3229,7 @@ impl_GetProcAddress(u64 hmod, const char *procname)
     if ((uintptr_t)procname <= 0xffffu) {
         u16 ordinal = (u16)(uintptr_t)procname;
         GuestDll *ordinal_guest = guest_dll_from_handle(hmod);
-        u64 address = ordinal_guest ? guest_dll_export_ordinal(ordinal_guest, ordinal) : 0;
+        u64 address = ordinal_guest ? guest_dll_export_by_ordinal(ordinal_guest, ordinal) : 0;
         const char *compat_name = NULL;
         for (int i = 0; !address && i < g_fake_dll_count; ++i)
             if (g_fake_dll_cache[i].handle == hmod &&
@@ -3236,6 +3271,11 @@ impl_GetProcAddress(u64 hmod, const char *procname)
         g_last_error = address ? 0 : 127;
         return address;
     }
+    if (hmod == HMOD_VULKAN) {
+        u64 address = (u64)beer_vkbridge_get_proc(procname);
+        if (!address) g_last_error = 127;
+        return address;
+    }
     {
         u64 exported = fake_pe_export_address(hmod, procname);
         if (exported) return exported;
@@ -3269,6 +3309,7 @@ impl_GetProcAddress(u64 hmod, const char *procname)
     if (guest) {
         u64 address = guest_dll_export(guest, procname);
         if (address) return address;
+        fprintf(stderr, "[IMPL] GetProcAddress(%s, \"%s\") -> NULL (not exported by the module)\n", guest->name, procname);
         g_last_error = 127;
         return 0;
     }
@@ -3354,12 +3395,28 @@ impl_GetProcAddress(u64 hmod, const char *procname)
 }
 
 /* ---- Heap / memory ---- */
+/* Heap handles point at a minimal x64 _HEAP header, as on Windows. Allocation ignores the handle, but code that
+ * inspects the process heap (PEB->ProcessHeap, anti-debug checks of Flags/ForceFlags in copy protection such as
+ * RDR2's Arxan TLS callback) must read a heap that is not being debugged: Flags = HEAP_GROWABLE, ForceFlags = 0. */
+static u8 g_process_heap_header[0x400] __attribute__((aligned(0x1000)));
+static u8 g_created_heap_header[0x400] __attribute__((aligned(0x1000)));
+
+static u64 heap_header(u8 *header)
+{
+    if (*(u32 *)(header + 0x10) != 0xFFEEFFEEu) {
+        *(u32 *)(header + 0x10) = 0xFFEEFFEEu;   /* SegmentSignature */
+        *(u32 *)(header + 0x70) = 0x2u;          /* Flags: HEAP_GROWABLE */
+        *(u32 *)(header + 0x74) = 0;             /* ForceFlags */
+    }
+    return (u64)(uintptr_t)header;
+}
+
 static u64 __attribute__((ms_abi))
-impl_GetProcessHeap(void) { return 0x1; /* non-null fake handle */ }
+impl_GetProcessHeap(void) { return heap_header(g_process_heap_header); }
 
 static u64 __attribute__((ms_abi))
 impl_HeapCreate(u32 opts, u64 initSz, u64 maxSz)
-    { (void)opts; (void)initSz; (void)maxSz; return 0x2; }
+    { (void)opts; (void)initSz; (void)maxSz; return heap_header(g_created_heap_header); }
 
 /*
  * Guard-page heap allocator for HeapAlloc/HeapReAlloc/HeapFree/HeapSize.
@@ -3798,11 +3855,21 @@ static void dbg_dump_guest_callchain(const char *tag) {
     fprintf(stderr, "[CHAIN:%s] rsp=0x%lx\n", tag, rsp);
     u64 *sp = (u64 *)rsp;
     int printed = 0;
-    for (int i = 0; i < 200 && printed < 24; i++) {
+    int depth = getenv("BEER_CHAIN_DEPTH") ? atoi(getenv("BEER_CHAIN_DEPTH")) : 24;
+    for (int i = 0; i < depth * 10 && printed < depth; i++) {
         u64 v = sp[i];
         if (v >= (u64)g_img && v < (u64)g_img + g_img_size) {
             fprintf(stderr, "[CHAIN:%s]   [%3d] img+0x%lx\n", tag, i, v - (u64)g_img);
             printed++;
+            continue;
+        }
+        for (int d = 0; d < g_guest_dll_count; ++d) {
+            const GuestDll *dll = &g_guest_dlls[d];
+            if (dll->image && v >= (u64)dll->image && v < (u64)dll->image + dll->image_size) {
+                fprintf(stderr, "[CHAIN:%s]   [%3d] %s+0x%lx\n", tag, i, dll->name, v - (u64)dll->image);
+                printed++;
+                break;
+            }
         }
     }
 }
@@ -4038,12 +4105,31 @@ static int prefer_emulated_module(const char *lower_name)
 }
 
 static u64 virtual_fs_load_library(const char *name);
+
+/* vulkan-1.dll (and the versioned copies some engines probe for, e.g. vulkan-1-1-1-70-1.dll) is a built-in
+ * module: the shipped Khronos loader would need a Windows ICD, so the guest talks to the host's libvulkan through
+ * renderer/vulkan/vulkan_bridge.c.  BEER_GUEST_VULKAN=0 hides Vulkan entirely, BEER_ALLOW_GUEST_VULKAN=1 loads
+ * the game's own copy of the DLL instead. */
+static int beer_is_vulkan_module(const char *lname) { return !strncmp(lname, "vulkan-1", 8); }
+static int beer_native_dll_unsupported(const char *lname)
+{
+    if (!beer_is_vulkan_module(lname)) return 0;
+    const char *allow = getenv("BEER_ALLOW_GUEST_VULKAN");
+    if (allow && *allow && strcmp(allow, "0")) return 0;
+    const char *bridge = getenv("BEER_GUEST_VULKAN");
+    if ((!bridge || strcmp(bridge, "0")) && beer_vkbridge_available()) return 0;
+    fprintf(stderr, "[IMPL] LoadLibrary(\"%s\") -> not found (no usable host Vulkan)\n", lname);
+    return 1;
+}
+
 static u64 __attribute__((ms_abi))
 impl_LoadLibraryA(const char *name)
 {
     if (!name) { g_last_error = 126; return 0; }
     char lname[64];
     lowercase_dll_basename(name, lname, sizeof(lname));
+    if (beer_native_dll_unsupported(lname)) { g_last_error = 126; return 0; }
+    if (beer_is_vulkan_module(lname) && !getenv("BEER_ALLOW_GUEST_VULKAN")) return HMOD_VULKAN;
     if (prefer_emulated_module(lname)) {
         u64 handle = dll_name_to_handle(lname, 1);
         g_last_error = handle ? 0 : 126;
@@ -4099,6 +4185,7 @@ impl_LoadLibraryA(const char *name)
         }
         return h;
     }
+    fprintf(stderr, "[IMPL] LoadLibraryA(\"%s\") -> not found\n", name);
     g_last_error = 126; return 0;
 }
 static u64 __attribute__((ms_abi))
@@ -4111,6 +4198,8 @@ impl_LoadLibraryW(const u16 *name)
     narrow[i] = 0;
     char lname[64];
     lowercase_dll_basename(narrow, lname, sizeof(lname));
+    if (beer_native_dll_unsupported(lname)) { g_last_error = 126; return 0; }
+    if (beer_is_vulkan_module(lname) && !getenv("BEER_ALLOW_GUEST_VULKAN")) return HMOD_VULKAN;
     if (prefer_emulated_module(lname)) {
         u64 handle = dll_name_to_handle(lname, 1);
         g_last_error = handle ? 0 : 126;
@@ -4166,6 +4255,7 @@ impl_LoadLibraryW(const u16 *name)
         }
         return h;
     }
+    fprintf(stderr, "[IMPL] LoadLibraryW(\"%s\") -> not found\n", narrow);
     g_last_error = 126; return 0;
 }
 static u64 __attribute__((ms_abi))
@@ -4242,25 +4332,6 @@ impl_RemoveDllDirectory(u64 cookie)
 
 static u64 __attribute__((ms_abi)) impl_FreeLibrary(u64 h) { (void)h; return 1; }
 
-/* WinVerifyTrust is dynamically resolved from wintrust.dll. Beer does not
- * manufacture a signature verdict: the application-local file selected by
- * normal module search is accepted as the process's trust input, while an
- * absent/non-file subject remains a provider failure. This models the loader
- * contract needed by local compatibility wrappers without claiming that an
- * arbitrary file has a Microsoft/Valve signature. */
-static void crypt_wintrust_signature_settings(const u8 *trust_data);
-static s64 __attribute__((ms_abi))
-impl_WinVerifyTrust(u64 hwnd, const void *action, const void *trust_data)
-{
-    (void)hwnd;
-    (void)action;
-    if (!trust_data) return (s64)0x800B0003u; /* TRUST_E_SUBJECT_FORM_UNKNOWN */
-    if (getenv("BEER_TRUST_DIAGNOSTICS"))
-        fprintf(stderr, "[WINTRUST] local-file trust request accepted\n");
-    crypt_wintrust_signature_settings(trust_data);
-    return 0; /* ERROR_SUCCESS */
-}
-
 /* ---- Process affinity / CPU info ---- */
 static u32 win_processor_count(void)
 {
@@ -4312,6 +4383,15 @@ static u64 fill_windows_version(WIN_OSVERSIONINFOEXW *info)
 }
 static u64 __attribute__((ms_abi)) impl_RtlGetVersion(WIN_OSVERSIONINFOEXW *info)
     { return fill_windows_version(info); }
+/* Undocumented but widely used (RAGE resolves it by hash): same version as RtlGetVersion; the build carries the
+ * 0xF0000000 "free build" marker, as on Windows. */
+static u64 __attribute__((ms_abi)) impl_RtlGetNtVersionNumbers(u32 *major, u32 *minor, u32 *build)
+{
+    if (major) *major = 10;
+    if (minor) *minor = 0;
+    if (build) *build = 0xF0000000u | 19045u;
+    return 0;
+}
 static u64 __attribute__((ms_abi)) impl_GetVersionExW(WIN_OSVERSIONINFOEXW *info)
 {
     if (!info || (info->size != 276 && info->size != 284)) { g_last_error = 87; return 0; }
@@ -4881,6 +4961,7 @@ struct BeerDirectSoundBuffer {
     u32 playing;
     u32 volume;
     u32 pan;
+    BeerAudioStream *stream;   /* this buffer's own sound-server stream, opened on Play */
 };
 
 enum {
@@ -4928,11 +5009,23 @@ static u64 __attribute__((ms_abi)) beer_ds_release(void *self)
     return refs;
 }
 
+static u64 __attribute__((ms_abi)) beer_dsb_release(BeerDirectSoundBuffer *buffer)
+{
+    if (!buffer) return 0;
+    u32 refs = atomic_fetch_sub_explicit(&buffer->refs, 1, memory_order_acq_rel) - 1;
+    if (!refs) {
+        beer_audio_stream_close(buffer->stream);
+        free(buffer->data);
+        free(buffer);
+    }
+    return refs;
+}
+
 static u64 __attribute__((ms_abi))
 beer_dsb_get_current_position(BeerDirectSoundBuffer *buffer, u32 *play, u32 *write)
 {
     if (!buffer || !buffer->size) return BEER_DSERR_INVALIDPARAM;
-    u32 position = (u32)(beer_audio_bytes_played() % buffer->size);
+    u32 position = (u32)(beer_audio_stream_bytes_played(buffer->stream) % buffer->size);
     if (play) *play = position;
     if (write) *write = (position + buffer->size / 4u) % buffer->size;
     return BEER_DS_OK;
@@ -4994,7 +5087,7 @@ beer_dsb_lock(BeerDirectSoundBuffer *buffer, u32 offset, u32 bytes,
     if (!buffer || !buffer->data || !part1 || !bytes1 || !part2 || !bytes2)
         return BEER_DSERR_INVALIDPARAM;
     if (flags & BEER_DSBLOCK_FROMWRITECURSOR)
-        offset = (u32)((beer_audio_bytes_played() + buffer->size / 4u) % buffer->size);
+        offset = (u32)((beer_audio_stream_bytes_played(buffer->stream) + buffer->size / 4u) % buffer->size);
     if ((flags & BEER_DSBLOCK_ENTIREBUFFER) || !bytes) bytes = buffer->size;
     offset %= buffer->size;
     if (bytes > buffer->size) bytes = buffer->size;
@@ -5012,7 +5105,8 @@ beer_dsb_play(BeerDirectSoundBuffer *buffer, u32 reserved1, u32 priority, u32 fl
 {
     (void)reserved1; (void)priority;
     if (!buffer || !buffer->data) return BEER_DSERR_INVALIDPARAM;
-    if (!beer_audio_init(buffer->rate, buffer->channels)) return BEER_DSERR_INVALIDPARAM;
+    if (!buffer->stream) buffer->stream = beer_audio_stream_open(buffer->rate, buffer->channels, "DirectSound");
+    if (!buffer->stream) return BEER_DSERR_INVALIDPARAM;
     buffer->playing = 1;
     buffer->flags = (buffer->flags & ~BEER_DSBSTATUS_LOOPING) |
                     ((flags & BEER_DSBPLAY_LOOPING) ? BEER_DSBSTATUS_LOOPING : 0);
@@ -5021,7 +5115,7 @@ beer_dsb_play(BeerDirectSoundBuffer *buffer, u32 reserved1, u32 priority, u32 fl
      * never observed room for the next mix block. Seed one quarter-ring now;
      * subsequent Lock/Unlock writes keep the host queue and cursor moving. */
     u32 seed_bytes = buffer->size / 4u;
-    if (!seed_bytes || !beer_audio_submit(buffer->data, seed_bytes, NULL, NULL)) {
+    if (!seed_bytes || !beer_audio_stream_submit(buffer->stream, buffer->data, seed_bytes, 0, NULL, NULL)) {
         buffer->playing = 0;
         return BEER_DSERR_INVALIDPARAM;
     }
@@ -5036,6 +5130,11 @@ beer_dsb_set_format(BeerDirectSoundBuffer *buffer, const BeerWaveFormat *format)
 {
     if (!buffer || !format || format->format_tag != WAVE_FORMAT_PCM || format->bits_per_sample != 16)
         return WAVERR_BADFORMAT;
+    if (buffer->stream && (buffer->rate != format->samples_per_sec || buffer->channels != format->channels)) {
+        beer_audio_stream_close(buffer->stream);   /* reopened in the new format on the next Play */
+        buffer->stream = NULL;
+        buffer->playing = 0;
+    }
     buffer->rate = format->samples_per_sec;
     buffer->channels = format->channels;
     buffer->bits = format->bits_per_sample;
@@ -5048,7 +5147,7 @@ static u64 __attribute__((ms_abi)) beer_dsb_set_pan(BeerDirectSoundBuffer *b, s3
 static u64 __attribute__((ms_abi)) beer_dsb_set_frequency(BeerDirectSoundBuffer *b, u32 v)
     { if (!b || !v) return BEER_DSERR_INVALIDPARAM; b->rate = v; return 0; }
 static u64 __attribute__((ms_abi)) beer_dsb_stop(BeerDirectSoundBuffer *b)
-    { if (!b) return BEER_DSERR_INVALIDPARAM; b->playing = 0; beer_audio_reset(); return 0; }
+    { if (!b) return BEER_DSERR_INVALIDPARAM; b->playing = 0; beer_audio_stream_reset(b->stream); return 0; }
 static void beer_pcm_measure(const void *data, u32 bytes, u64 *nonzero, u32 *peak)
 {
     if (!data || !bytes) return;
@@ -5076,9 +5175,9 @@ beer_dsb_unlock(BeerDirectSoundBuffer *buffer, void *part1, u32 bytes1,
         u32 ring_peak = 0;
         beer_pcm_measure(buffer->data, buffer->size, &ring_nonzero, &ring_peak);
         int submitted = 1;
-        if (part1 && bytes1) submitted = beer_audio_submit_nowait(part1, bytes1);
+        if (part1 && bytes1) submitted = beer_audio_stream_submit(buffer->stream, part1, bytes1, 0, NULL, NULL);
         if (submitted && part2 && bytes2)
-            submitted = beer_audio_submit_nowait(part2, bytes2);
+            submitted = beer_audio_stream_submit(buffer->stream, part2, bytes2, 0, NULL, NULL);
         if (!submitted) return BEER_DSERR_INVALIDPARAM;
         static _Atomic(u32) unlocks;
         static _Atomic(u64) nonzero_samples;
@@ -5108,7 +5207,7 @@ static u64 __attribute__((ms_abi)) beer_dsb_noop(void *b, u64 a, u64 c, u64 d)
     { (void)a; (void)c; (void)d; return b ? BEER_DS_OK : BEER_DSERR_INVALIDPARAM; }
 
 static void *g_direct_sound_buffer_vtable[24] = {
-    (void *)beer_ds_query, (void *)beer_ds_addref, (void *)beer_ds_release,
+    (void *)beer_ds_query, (void *)beer_ds_addref, (void *)beer_dsb_release,
     (void *)beer_dsb_get_caps, (void *)beer_dsb_get_current_position,
     (void *)beer_dsb_get_format, (void *)beer_dsb_get_volume,
     (void *)beer_dsb_get_pan, (void *)beer_dsb_get_frequency,
@@ -6597,6 +6696,97 @@ impl_CreateDXGIFactory2(u32 flags, u64 riid, u64 **ppFactory)
 static __thread s32 g_wsa_last_error;
 static __thread u32 g_wsa_startup_count;
 
+/* ---- getaddrinfo family.  Beer runs offline by default, so only addresses that need no resolver are answered:
+ * a NULL node (wildcard, or loopback with AI_PASSIVE clear), "localhost" and dotted IPv4; any other name fails with
+ * WSAHOST_NOT_FOUND (a zero-returning stub reported success without writing *result and the game then followed
+ * the garbage pointer).  ADDRINFOA/W (x64): flags, family, socktype, protocol (int), addrlen (size_t), canonname,
+ * addr, next -- note canonname comes before addr, unlike glibc. ---- */
+typedef struct { s32 flags, family, socktype, protocol; u64 addrlen; u64 canonname; u64 addr; u64 next; } WinAddrInfo;
+
+static int win_getaddrinfo_common(const char *node, const char *service, const WinAddrInfo *hints, u64 *result)
+{
+    if (!result) return 10014;                                 /* WSAEFAULT */
+    *result = 0;
+    u32 ip = 0;
+    const int passive = hints && (hints->flags & 1);
+    if (!node || !*node) ip = passive ? 0 : htonl(INADDR_LOOPBACK);
+    else if (!strcasecmp(node, "localhost")) ip = htonl(INADDR_LOOPBACK);
+    else {
+        struct in_addr parsed;
+        if (inet_pton(AF_INET, node, &parsed) != 1) {
+            /* A name: ask the host resolver (this is how a game finds out its own address from the machine name,
+             * which it treats as "no network" when it fails). IPv4 only; a literal-free numeric lookup of the
+             * service keeps the call from touching the network for ports. */
+            struct addrinfo host_hints = {0}, *found = NULL;
+            host_hints.ai_family = AF_INET;
+            host_hints.ai_socktype = hints && hints->socktype ? hints->socktype : 0;
+            const int rc = getaddrinfo(node, NULL, &host_hints, &found);
+            if (rc != 0 || !found) return 11001;                    /* WSAHOST_NOT_FOUND */
+            WinAddrInfo *head = NULL, **tail = &head;
+            const u16 resolved_port = service ? htons((u16)atoi(service)) : 0;
+            for (struct addrinfo *a = found; a; a = a->ai_next) {
+                if (a->ai_family != AF_INET) continue;
+                if (hints && hints->socktype && a->ai_socktype != hints->socktype) continue;
+                WinAddrInfo *entry = calloc(1, sizeof(*entry));
+                struct sockaddr_in *address = calloc(1, sizeof(*address));
+                if (!entry || !address) { free(entry); free(address); break; }
+                *address = *(struct sockaddr_in *)a->ai_addr;
+                address->sin_port = resolved_port;
+                entry->family = AF_INET;
+                entry->socktype = hints && hints->socktype ? hints->socktype : 1;
+                entry->protocol = entry->socktype == 2 ? 17 : 6;
+                entry->addrlen = sizeof(*address);
+                entry->addr = (u64)(uintptr_t)address;
+                if (hints && (hints->flags & 2) && !head) entry->canonname = (u64)(uintptr_t)strdup(node);
+                *tail = entry;
+                tail = (WinAddrInfo **)&entry->next;
+            }
+            freeaddrinfo(found);
+            if (!head) return 11001;
+            *result = (u64)(uintptr_t)head;
+            return 0;
+        }
+        ip = parsed.s_addr;
+    }
+    u16 port = service ? htons((u16)atoi(service)) : 0;
+    const int socktype = hints && hints->socktype ? hints->socktype : 1;
+    WinAddrInfo *info = calloc(1, sizeof(*info));
+    struct sockaddr_in *sa = calloc(1, sizeof(*sa));
+    if (!info || !sa) { free(info); free(sa); return 8; }           /* WSA_NOT_ENOUGH_MEMORY */
+    sa->sin_family = AF_INET;
+    sa->sin_port = port;
+    sa->sin_addr.s_addr = ip;
+    info->family = AF_INET;
+    info->socktype = socktype;
+    info->protocol = socktype == 2 ? 17 : 6;
+    info->addrlen = sizeof(*sa);
+    info->addr = (u64)(uintptr_t)sa;
+    *result = (u64)(uintptr_t)info;
+    return 0;
+}
+static u64 __attribute__((ms_abi))
+impl_getaddrinfo(const char *node, const char *service, const WinAddrInfo *hints, u64 *result)
+    { return (u64)win_getaddrinfo_common(node, service, hints, result); }
+static u64 __attribute__((ms_abi))
+impl_GetAddrInfoW(const u16 *node, const u16 *service, const WinAddrInfo *hints, u64 *result)
+{
+    char n[256] = "", sv[32] = "";
+    for (size_t i = 0; node && node[i] && i + 1 < sizeof(n); ++i) n[i] = (char)node[i];
+    for (size_t i = 0; service && service[i] && i + 1 < sizeof(sv); ++i) sv[i] = (char)service[i];
+    return (u64)win_getaddrinfo_common(node ? n : NULL, service ? sv : NULL, hints, result);
+}
+static u64 __attribute__((ms_abi)) impl_freeaddrinfo(u64 list)
+{
+    while (list) {
+        WinAddrInfo *info = (WinAddrInfo *)(uintptr_t)list;
+        list = info->next;
+        free((void *)(uintptr_t)info->addr);
+        free((void *)(uintptr_t)info->canonname);
+        free(info);
+    }
+    return 0;
+}
+
 static u64 __attribute__((ms_abi))
 impl_WSAStartup(u32 version, u8 *wsadata)
 {
@@ -6609,8 +6799,13 @@ impl_WSAStartup(u32 version, u8 *wsadata)
         g_wsa_last_error = 10092; /* WSAVERNOTSUPPORTED */
         return 10092;
     }
+    /* wVersion is the version the caller is expected to use: the requested one, capped at
+     * 2.2. Callers check it exactly (RDR2 asks for 2.0 and fails on anything but 2.0). */
+    u16 granted = requested;
+    if ((requested & 0xffu) == 2u && (requested >> 8) > 2u) granted = 0x0202;
+    else if ((requested & 0xffu) == 1u && (requested >> 8) > 1u) granted = 0x0101;
     memset(wsadata, 0, 408);
-    *(u16 *)(wsadata + 0) = 0x0202; /* wVersion */
+    *(u16 *)(wsadata + 0) = granted; /* wVersion */
     *(u16 *)(wsadata + 2) = 0x0202; /* wHighVersion */
     memcpy(wsadata + 4, "Beer Winsock 2.2", 17);
     memcpy(wsadata + 261, "Running", 8);
@@ -7074,6 +7269,15 @@ impl_NtQuerySystemInformation(u32 cls, void *buf, u32 sz, u32 *retsz)
         STATUS_INVALID_INFO_CLASS = 0xC0000003u
     };
 
+    /* SystemKernelDebuggerInformation: { KernelDebuggerEnabled, KernelDebuggerNotPresent }.  Copy-protection code
+     * (RDR2) asks; zero would claim a kernel debugger is attached. */
+    if (cls == 0x23) {
+        if (retsz) *retsz = 2;
+        if (!buf || sz < 2) return STATUS_INFO_LENGTH_MISMATCH;
+        ((u8 *)buf)[0] = 0;
+        ((u8 *)buf)[1] = 1;
+        return 0;
+    }
     if (cls == SystemBasicInformation) {
         /* SYSTEM_BASIC_INFORMATION on Win64. Several runtimes use these
          * addresses and sizing values directly; reporting success with an
@@ -7354,6 +7558,20 @@ static const char *beer_csidl_path(s32 csidl)
         return beer_roaming_appdata_path();
     case 0x1c: /* CSIDL_LOCAL_APPDATA */
         return beer_local_appdata_path();
+    case 0x05: /* CSIDL_PERSONAL (My Documents) */
+        return g_documents;
+    case 0x28: /* CSIDL_PROFILE */
+        return g_user_profile;
+    case 0x23: /* CSIDL_COMMON_APPDATA */
+        return g_program_data;
+    case 0x24: /* CSIDL_WINDOWS */
+        return g_windows_dir;
+    case 0x26: /* CSIDL_PROGRAM_FILES */
+    case 0x2b: /* CSIDL_PROGRAM_FILES_COMMON */
+        return "C:\\Program Files";
+    case 0x2a: /* CSIDL_PROGRAM_FILESX86 */
+    case 0x2c: /* CSIDL_PROGRAM_FILES_COMMONX86 */
+        return "C:\\Program Files (x86)";
     default:
         return beer_roaming_appdata_path();
     }
@@ -7389,6 +7607,113 @@ impl_SHGetFolderPathA(u64 hwnd, s32 csidl, u64 tok, u32 flags, char *buf)
     strcpy(buf, path);
     fprintf(stderr, "[SHELL] SHGetFolderPathA(csidl=0x%x) -> %s\n", csidl, path);
     return 0;
+}
+
+/* SHGetSpecialFolderPath: the older BOOL-returning spelling of SHGetFolderPath. */
+static u64 __attribute__((ms_abi))
+impl_SHGetSpecialFolderPathW(u64 hwnd, u16 *buf, s32 csidl, u32 create)
+{
+    (void)hwnd; (void)create;
+    return copy_ascii_to_wide_path(buf, 260, beer_csidl_path(csidl)) ? 1 : 0;
+}
+static u64 __attribute__((ms_abi))
+impl_SHGetSpecialFolderPathA(u64 hwnd, char *buf, s32 csidl, u32 create)
+{
+    (void)hwnd; (void)create;
+    const char *path = beer_csidl_path(csidl);
+    if (!buf || strlen(path) >= 260) return 0;
+    strcpy(buf, path);
+    return 1;
+}
+
+static int wide_to_host_path(const u16 *path, char *out, size_t size);
+static void crypt_wintrust_signature_settings(const u8 *trust_data);
+static void beer_log_guest_stack(const char *tag);
+/* WinVerifyTrust (x64 WINTRUST_DATA: dwUnionChoice @32, pFile @40, dwStateAction @48, hWVTStateData @56;
+ * WINTRUST_FILE_INFO: pcwszFilePath @8). Beer cannot validate Authenticode chains, so a file that exists verifies and a
+ * missing one reports ERROR_FILE_NOT_FOUND the way wintrust does (games probe optional signed DLLs this way). */
+static u64 __attribute__((ms_abi)) impl_WinVerifyTrust(u64 hwnd, const void *action, u8 *data)
+{
+    (void)hwnd; (void)action;
+    if (!data) return 87;
+    const u32 choice = *(u32 *)(data + 32), state_action = *(u32 *)(data + 48);
+    if (state_action == 2) return 0;                                  /* WTD_STATEACTION_CLOSE */
+    if (choice != 1) return 0;                                        /* WTD_CHOICE_FILE only */
+    const u8 *file = *(u8 **)(data + 40);
+    const u16 *path = file ? *(const u16 **)(file + 8) : NULL;
+    char host[PATH_MAX];
+    if (!path || !wide_to_host_path(path, host, sizeof(host))) return 2;
+    if (access(host, F_OK) != 0) return 2;
+    crypt_wintrust_signature_settings(data);   /* nested-signature count read from the file itself */
+    return 0;
+}
+
+/* ShellExecute*: URLs and documents are handed to the desktop (xdg-open), like Windows hands them to the default
+ * handler. Returns an HINSTANCE > 32 on success; executables are not launched here (SE_ERR_NOASSOC). */
+static int wide_to_host_path(const u16 *path, char *out, size_t size);
+extern char **environ;
+static u64 beer_shell_open(const char *verb, const char *file)
+{
+    if (!file || !*file) return 2;                                   /* SE_ERR_FNF */
+    if (verb && *verb && strcasecmp(verb, "open") && strcasecmp(verb, "edit") && strcasecmp(verb, "print")) return 31;
+    size_t len = strlen(file);
+    if (len > 4 && !strcasecmp(file + len - 4, ".exe")) return 31;
+    char host[1100];
+    if (!strncasecmp(file, "http://", 7) || !strncasecmp(file, "https://", 8) || !strncasecmp(file, "mailto:", 7)) snprintf(host, sizeof(host), "%s", file);
+    else {
+        u16 wide[520]; size_t i = 0;
+        for (; file[i] && i < 519; ++i) wide[i] = (u8)file[i];
+        wide[i] = 0;
+        if (!wide_to_host_path(wide, host, sizeof(host))) return 2;
+    }
+    fprintf(stderr, "[SHELL] ShellExecute open %s\n", host);
+    pid_t child;
+    char *argv[] = { (char *)"xdg-open", host, NULL };
+    if (posix_spawnp(&child, "xdg-open", NULL, NULL, argv, environ) != 0) return 31;
+    return 33;
+}
+static u64 __attribute__((ms_abi))
+impl_ShellExecuteA(u64 hwnd, const char *verb, const char *file, const char *params, const char *dir, s32 show)
+{
+    (void)hwnd; (void)params; (void)dir; (void)show;
+    return beer_shell_open(verb, file);
+}
+static u64 __attribute__((ms_abi))
+impl_ShellExecuteW(u64 hwnd, const u16 *verb, const u16 *file, const u16 *params, const u16 *dir, s32 show)
+{
+    (void)hwnd; (void)params; (void)dir; (void)show;
+    char v[32] = "", f[1100] = "";
+    for (size_t i = 0; verb && verb[i] && i < 31; ++i) v[i] = (char)verb[i];
+    for (size_t i = 0; file && file[i] && i < 1099; ++i) f[i] = (char)file[i];
+    return beer_shell_open(v, f);
+}
+/* SHELLEXECUTEINFO (x64): lpVerb at 16, lpFile at 24, hInstApp at 48. */
+static u64 __attribute__((ms_abi)) impl_ShellExecuteExA(u8 *info)
+{
+    if (!info) return 0;
+    u64 r = beer_shell_open(*(const char **)(info + 16), *(const char **)(info + 24));
+    /* SHELLEXECUTEINFO (x64): lpVerb@0x10 lpFile@0x18 hInstApp@0x38 hProcess@0x68. No process is
+     * created, so hProcess is NULL even with SEE_MASK_NOCLOSEPROCESS. */
+    *(u64 *)(info + 0x38) = r;
+    if (*(const u32 *)info >= 0x70) *(u64 *)(info + 0x68) = 0;
+    if (r <= 32) g_last_error = r == 2 ? 2 : 1155;                   /* ERROR_NO_ASSOCIATION */
+    return r > 32;
+}
+static u64 __attribute__((ms_abi)) impl_ShellExecuteExW(u8 *info)
+{
+    if (!info) return 0;
+    const u16 *vw = *(const u16 **)(info + 16), *fw = *(const u16 **)(info + 24);
+    char v[32] = "", f[1100] = "";
+    for (size_t i = 0; vw && vw[i] && i < 31; ++i) v[i] = (char)vw[i];
+    for (size_t i = 0; fw && fw[i] && i < 1099; ++i) f[i] = (char)fw[i];
+    u64 r = beer_shell_open(v, f);
+    fprintf(stderr, "[SHELL] ShellExecuteExW(mask=0x%x verb=\"%s\" file=\"%s\") -> %llu\n",
+            *(const u32 *)(info + 4), v, f, (unsigned long long)r);
+    if (r <= 32) beer_log_guest_stack("SHELL");
+    *(u64 *)(info + 0x38) = r;                                       /* hInstApp */
+    if (*(const u32 *)info >= 0x70) *(u64 *)(info + 0x68) = 0;       /* hProcess: none created */
+    if (r <= 32) g_last_error = r == 2 ? 2 : 1155;
+    return r > 32;
 }
 
 static u64 __attribute__((ms_abi))
@@ -7482,12 +7807,21 @@ impl_CoInitializeSecurity(void *security_descriptor, s32 authentication_services
     static _Atomic(u32) initialized;
     return atomic_exchange(&initialized, 1) ? UINT64_C(0x80010119) : 0;
 }
+#include "platform/win32_wmi.inc"
 static u64 __attribute__((ms_abi))
 impl_CoCreateInstance(const u8 *rclsid, u64 outer, u32 ctx,
                       const u8 *riid, void **ppv)
 {
     (void)outer;
     if (ppv) *ppv = NULL;
+    if (ppv && beer_wmi_create_instance(rclsid, riid, ppv)) {
+        fprintf(stderr, "[COM] CoCreateInstance WbemLocator -> %p\n", *ppv);
+        return 0;
+    }
+    if (ppv && beer_fw_create_instance(rclsid, riid, ppv)) {
+        fprintf(stderr, "[COM] CoCreateInstance HNetCfg.FwMgr -> %p\n", *ppv);
+        return 0;
+    }
     u64 wasapi_result = beer_wasapi_create_instance(rclsid, riid, ppv);
     if (wasapi_result == 0) {
         fprintf(stderr, "[COM] CoCreateInstance MMDeviceEnumerator -> %p\n",
@@ -8420,6 +8754,17 @@ typedef struct {
 
 static WinEvent g_events[MAX_EVENTS];
 static int g_event_cnt = 1;
+/* Closed event ids, reused oldest first (a FIFO keeps a just-closed handle value unused for a while). CreateEvent
+ * used to scan the table from slot 1; games that create and close events every frame made that scan hot. */
+static int g_event_free[MAX_EVENTS];
+static unsigned g_event_free_head, g_event_free_tail;
+
+static void event_release_id_locked(int id)
+{
+    if (!g_events[id].used) return;
+    g_events[id].used = 0;
+    g_event_free[g_event_free_tail++ % MAX_EVENTS] = id;
+}
 static pthread_mutex_t g_event_table_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static u32 g_sem_val[MAX_SEMS];
@@ -8465,11 +8810,9 @@ static u64 event_alloc(int manual, int initial)
 {
     pthread_mutex_lock(&g_event_table_mtx);
     int id = 0;
-    for (int candidate = 1; candidate < g_event_cnt; ++candidate) {
-        if (!g_events[candidate].used) {
-            id = candidate;
-            break;
-        }
+    while (!id && g_event_free_head != g_event_free_tail) {
+        const int candidate = g_event_free[g_event_free_head++ % MAX_EVENTS];
+        if (!g_events[candidate].used) id = candidate;
     }
     if (!id) {
         if (g_event_cnt >= MAX_EVENTS) {
@@ -8525,6 +8868,20 @@ static u64 __attribute__((ms_abi))
 impl_CreateEventW(u64 sa, u32 manual, u32 initial, u64 name)
     { (void)sa;(void)name; return event_alloc((int)manual, (int)initial); }
 
+/* Multiple-object waits poll their handles. Instead of sleeping a fixed 1 ms between polls (which added up to a
+ * millisecond to every hand-off between a game's job threads, several times a frame), they sleep on this counter,
+ * which every event set, semaphore release and mutex release bumps. Handle kinds that do not bump it (threads,
+ * processes, timers) are still caught by the 1 ms poll. */
+static _Atomic u32 g_wait_wake_seq;
+static _Atomic u32 g_wait_multi_waiters;
+
+static void wait_multi_notify(void)
+{
+    atomic_fetch_add(&g_wait_wake_seq, 1);
+    if (atomic_load(&g_wait_multi_waiters))
+        syscall(SYS_futex, (u32 *)&g_wait_wake_seq, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
+}
+
 static u64 __attribute__((ms_abi))
 impl_SetEvent(u64 h)
 {
@@ -8543,6 +8900,7 @@ impl_SetEvent(u64 h)
     if (ev->manual_reset) pthread_cond_broadcast(&ev->cv);
     else pthread_cond_signal(&ev->cv);
     pthread_mutex_unlock(&ev->mtx);
+    wait_multi_notify();
     return 1;
 }
 
@@ -8618,6 +8976,162 @@ impl_PulseEvent(u64 h)
     else pthread_cond_signal(&ev->cv);
     ev->signaled = 0;
     pthread_mutex_unlock(&ev->mtx);
+    wait_multi_notify();
+    return 1;
+}
+
+/* Waitable timers are events (same handle space, so every wait path takes them) that one host thread sets when
+ * they come due, and again every period for periodic timers. FMOD's WASAPI output paces its mixer with one and
+ * fails to initialise (no sound) without it. Completion routines (APCs) are not run. */
+#define BEER_MAX_TIMERS 256
+static struct {
+    u64 handle;          /* 0 = free slot */
+    u64 due_ns;          /* CLOCK_MONOTONIC; 0 = not armed */
+    u64 period_ns;
+} g_timers[BEER_MAX_TIMERS];
+static pthread_mutex_t g_timer_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_timer_cv;
+static int g_timer_thread_started;
+
+static u64 timer_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+
+static void *timer_thread_main(void *unused)
+{
+    (void)unused;
+    pthread_mutex_lock(&g_timer_mtx);
+    for (;;) {
+        u64 now = timer_now_ns(), next = 0;
+        for (int i = 0; i < BEER_MAX_TIMERS; ++i) {
+            if (!g_timers[i].handle || !g_timers[i].due_ns) continue;
+            if (g_timers[i].due_ns <= now) {
+                /* Under g_timer_mtx, so CloseHandle (which forgets the timer first) never races a late signal. */
+                impl_SetEvent(g_timers[i].handle);
+                if (g_timers[i].period_ns) {
+                    g_timers[i].due_ns += g_timers[i].period_ns;
+                    if (g_timers[i].due_ns <= now) g_timers[i].due_ns = now + g_timers[i].period_ns;
+                } else {
+                    g_timers[i].due_ns = 0;
+                }
+            }
+            if (g_timers[i].due_ns && (!next || g_timers[i].due_ns < next)) next = g_timers[i].due_ns;
+        }
+        if (!next) {
+            pthread_cond_wait(&g_timer_cv, &g_timer_mtx);
+        } else {
+            struct timespec ts = { (time_t)(next / 1000000000ull), (long)(next % 1000000000ull) };
+            pthread_cond_timedwait(&g_timer_cv, &g_timer_mtx, &ts);
+        }
+    }
+    return NULL;
+}
+
+static int timer_slot_locked(u64 h)
+{
+    for (int i = 0; i < BEER_MAX_TIMERS; ++i)
+        if (g_timers[i].handle == h) return i;
+    return -1;
+}
+
+static u64 beer_timer_create(int manual)
+{
+    u64 h = event_alloc(manual, 0);
+    if (!h) return 0;
+    pthread_mutex_lock(&g_timer_mtx);
+    if (!g_timer_thread_started) {
+        pthread_condattr_t attr;
+        pthread_condattr_init(&attr);
+        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        pthread_cond_init(&g_timer_cv, &attr);
+        pthread_condattr_destroy(&attr);
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, timer_thread_main, NULL) == 0) {
+            pthread_detach(thread);
+            g_timer_thread_started = 1;
+        }
+    }
+    int slot = timer_slot_locked(0);
+    if (slot >= 0) g_timers[slot] = (typeof(g_timers[0])){ h, 0, 0 };
+    pthread_mutex_unlock(&g_timer_mtx);
+    if (slot < 0 || !g_timer_thread_started) {
+        fprintf(stderr, "[SYNC] waitable timer table exhausted (%d)\n", BEER_MAX_TIMERS);
+        g_last_error = 4;
+        return 0;
+    }
+    return h;
+}
+
+/* CloseHandle: the timer stops before its event is released. */
+static void beer_timer_forget(u64 h)
+{
+    pthread_mutex_lock(&g_timer_mtx);
+    int slot = timer_slot_locked(h);
+    if (slot >= 0) g_timers[slot].handle = 0;
+    pthread_mutex_unlock(&g_timer_mtx);
+}
+
+static u64 __attribute__((ms_abi))
+impl_CreateWaitableTimerW(u64 sa, u32 manual, u64 name)
+    { (void)sa; (void)name; return beer_timer_create(manual != 0); }
+
+static u64 __attribute__((ms_abi))
+impl_CreateWaitableTimerExW(u64 sa, u64 name, u32 flags, u32 access)
+{
+    (void)sa; (void)name; (void)access;
+    /* CREATE_WAITABLE_TIMER_MANUAL_RESET=1, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION=2. */
+    return beer_timer_create((flags & 1u) != 0);
+}
+
+/* due: negative = relative, in 100 ns units; positive = absolute FILETIME (UTC). period in ms, 0 = one-shot. */
+static u64 __attribute__((ms_abi))
+impl_SetWaitableTimer(u64 h, const s64 *due, s32 period, u64 routine, u64 arg, u32 resume)
+{
+    (void)arg; (void)resume;
+    if (!due || period < 0) { g_last_error = 87; return 0; }
+    if (routine) {
+        static int warned;
+        if (!warned++) fprintf(stderr, "[SYNC] SetWaitableTimer completion routine not supported (timer still signals)\n");
+    }
+    u64 now = timer_now_ns(), when;
+    if (*due <= 0) {
+        when = now + (u64)(-*due) * 100u;
+    } else {
+        struct timespec rt;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        const s64 unix_100ns = *due - 116444736000000000ll;
+        const s64 now_100ns = (s64)rt.tv_sec * 10000000ll + rt.tv_nsec / 100;
+        when = unix_100ns > now_100ns ? now + (u64)(unix_100ns - now_100ns) * 100u : now;
+    }
+    pthread_mutex_lock(&g_timer_mtx);
+    int slot = timer_slot_locked(h);
+    if (slot < 0) { pthread_mutex_unlock(&g_timer_mtx); g_last_error = 6; return 0; }
+    impl_ResetEvent(h);                    /* setting a timer makes it non-signaled */
+    g_timers[slot].due_ns = when ? when : 1;
+    g_timers[slot].period_ns = (u64)period * 1000000u;
+    pthread_cond_signal(&g_timer_cv);
+    pthread_mutex_unlock(&g_timer_mtx);
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_SetWaitableTimerEx(u64 h, const s64 *due, s32 period, u64 routine, u64 arg, u64 wake_context, u32 tolerable)
+{
+    (void)wake_context; (void)tolerable;
+    return impl_SetWaitableTimer(h, due, period, routine, arg, 0);
+}
+
+static u64 __attribute__((ms_abi))
+impl_CancelWaitableTimer(u64 h)
+{
+    pthread_mutex_lock(&g_timer_mtx);
+    int slot = timer_slot_locked(h);
+    if (slot >= 0) g_timers[slot].due_ns = 0;
+    pthread_mutex_unlock(&g_timer_mtx);
+    if (slot < 0) { g_last_error = 6; return 0; }
     return 1;
 }
 
@@ -8696,6 +9210,8 @@ beer_wait_single_raw(u64 h, u32 ms)
     g_dbg_wait_kind = 2; g_dbg_wait_handle = h; g_dbg_wait_ms = ms;
     u64 trc = thread_wait_handle(h, ms);
     if (trc != (u64)-2) { g_dbg_wait_kind = 0; return trc; }
+    u64 prc = beer_proc_wait(h, ms);
+    if (prc != (u64)-2) { g_dbg_wait_kind = 0; return prc; }
 
     int mid = win_mutex_id(h);
     if (mid >= 0) { u64 r = win_mutex_wait(mid, ms); g_dbg_wait_kind = 0; return r; }
@@ -8850,7 +9366,7 @@ impl_WSACloseEvent(u64 handle)
     WinEvent *event = &g_events[eid];
     pthread_mutex_destroy(&event->mtx);
     pthread_cond_destroy(&event->cv);
-    event->used = 0;
+    event_release_id_locked(eid);
     pthread_mutex_unlock(&g_event_table_mtx);
     return 1;
 }
@@ -8915,6 +9431,9 @@ static int wait_handle_poll(u64 handle, int consume)
         return signaled;
     }
 
+    int process_state = beer_proc_poll(handle);
+    if (process_state != -2) return process_state;
+
     g_last_error = 6; /* ERROR_INVALID_HANDLE */
     return -1;
 }
@@ -8943,12 +9462,16 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
     struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
     int traced = 0;
+    atomic_fetch_add(&g_wait_multi_waiters, 1);
+    u64 result;
     for (;;) {
+        /* Read the wake counter before polling: a signal after the poll changes it and ends the futex wait. */
+        const u32 seq = atomic_load(&g_wait_wake_seq);
         if (all) {
             int ready = 1;
             for (u32 i = 0; i < n; ++i) {
                 int state = wait_handle_poll(handles[i], 0);
-                if (state < 0) return 0xFFFFFFFFu;
+                if (state < 0) { result = 0xFFFFFFFFu; goto done; }
                 if (!state) { ready = 0; break; }
             }
             if (ready) {
@@ -8956,13 +9479,13 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
                  * pass safely performs auto-reset/semaphore consumption. */
                 for (u32 i = 0; i < n; ++i)
                     (void)wait_handle_poll(handles[i], 1);
-                return 0; /* WAIT_OBJECT_0 */
+                { result = 0; goto done; } /* WAIT_OBJECT_0 */
             }
         } else {
             for (u32 i = 0; i < n; ++i) {
                 int state = wait_handle_poll(handles[i], 1);
-                if (state < 0) return 0xFFFFFFFFu;
-                if (state) return i; /* WAIT_OBJECT_0 + index */
+                if (state < 0) { result = 0xFFFFFFFFu; goto done; }
+                if (state) { result = i; goto done; } /* WAIT_OBJECT_0 + index */
             }
         }
 
@@ -8974,7 +9497,7 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
         else
             elapsed_ms -= (u64)(started.tv_nsec - now.tv_nsec) / 1000000u;
         if (ms == 0 || (ms != 0xFFFFFFFFu && elapsed_ms >= ms))
-            return 0x102u; /* WAIT_TIMEOUT */
+            { result = 0x102u; goto done; } /* WAIT_TIMEOUT */
 
         if (!traced && getenv("BEER_SYNC_DIAGNOSTICS")) {
             traced = 1;
@@ -8986,8 +9509,11 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
                     (unsigned)impl_GetCurrentThreadId());
         }
         struct timespec delay = {0, 1000000L};
-        nanosleep(&delay, NULL);
+        syscall(SYS_futex, (u32 *)&g_wait_wake_seq, FUTEX_WAIT_PRIVATE, seq, &delay, NULL, 0);
     }
+done:
+    atomic_fetch_sub(&g_wait_multi_waiters, 1);
+    return result;
 }
 
 static u64 __attribute__((ms_abi))
@@ -9045,6 +9571,7 @@ static u64 __attribute__((ms_abi)) impl_ReleaseMutex(u64 h)
         if (--m->count == 0) { m->owner = 0; pthread_cond_signal(&m->cv); }
     } else g_last_error = 288;   /* ERROR_NOT_OWNER */
     pthread_mutex_unlock(&m->mtx);
+    if (ok && !m->count) wait_multi_notify();
     return ok;
 }
 static u64 __attribute__((ms_abi)) impl_OpenMutexA(u32 a, u32 b, const char *n)
@@ -9053,6 +9580,14 @@ static u64 __attribute__((ms_abi)) impl_OpenMutexA(u32 a, u32 b, const char *n)
 /* ---- Sleep / Timing ---- */
 static u64 __attribute__((ms_abi)) impl_Sleep_inner(u32 ms);
 static u64 __attribute__((ms_abi)) impl_Sleep(u32 ms) {
+    if (getenv("BEER_SPIN_DIAGNOSTICS")) {
+        /* A thread that keeps calling Sleep is usually spin-waiting on a flag another thread should set. */
+        static __thread u32 sleeps;
+        if (++sleeps == 300000) {
+            fprintf(stderr, "[SPIN] tid %ld has called Sleep(%u) %u times\n", (long)syscall(SYS_gettid), ms, sleeps);
+            dbg_dump_guest_callchain("SPIN");
+        }
+    }
     g_dbg_wait_kind = 1; g_dbg_wait_ms = ms;
     const u64 r = impl_Sleep_inner(ms);
     g_dbg_wait_kind = 0;
@@ -9083,6 +9618,7 @@ static u64 __attribute__((ms_abi)) impl_Sleep_inner(u32 ms) {
                     (unsigned)impl_GetCurrentThreadId());
     }
     if (ms) { struct timespec ts = {ms/1000, (ms%1000)*1000000L}; nanosleep(&ts,NULL); }
+    else sched_yield();   /* Sleep(0) gives up the rest of the time slice */
     return 0;
 }
 static u64 __attribute__((ms_abi)) impl_SleepEx(u32 ms, u32 alertable) {
@@ -9487,6 +10023,9 @@ static s32 g_window_outer_y;
 static s32 g_window_outer_width;
 static s32 g_window_outer_height;
 static int g_window_focused;
+/* The activation burst (WM_ACTIVATEAPP/WM_NCACTIVATE/WM_ACTIVATE) is tracked apart from keyboard focus: a game that
+ * calls SetFocus on its still-hidden window gets WM_SETFOCUS only, and must still be activated when it is shown. */
+static int g_window_activated;
 
 #define WINDOW_PROPERTY_CAPACITY 256
 #define WINDOW_PROPERTY_NAME_CAPACITY 128
@@ -9541,6 +10080,27 @@ impl_RegisterClassExA(const WIN_WNDCLASSEX *window_class)
 static u64 __attribute__((ms_abi))
 impl_RegisterClassExW(const WIN_WNDCLASSEX *window_class)
     { return register_window_class(window_class, "RegisterClassExW"); }
+/* WNDCLASSA/W (72 bytes, no cbSize and no small icon) is the same registration as RegisterClassEx. */
+static u64 register_plain_window_class(const u8 *window_class, const char *api)
+{
+    if (!window_class) { g_last_error = 87; return 0; }
+    WIN_WNDCLASSEX ex = { .cbSize = sizeof(ex) };
+    ex.style = *(const u32 *)(window_class + 0);
+    ex.lpfnWndProc = *(const u64 *)(window_class + 8);
+    ex.cbClsExtra = *(const s32 *)(window_class + 16);
+    ex.cbWndExtra = *(const s32 *)(window_class + 20);
+    ex.hInstance = *(const u64 *)(window_class + 24);
+    ex.hIcon = *(const u64 *)(window_class + 32);
+    ex.hCursor = *(const u64 *)(window_class + 40);
+    ex.hbrBackground = *(const u64 *)(window_class + 48);
+    ex.lpszMenuName = *(const u64 *)(window_class + 56);
+    ex.lpszClassName = *(const u64 *)(window_class + 64);
+    return register_window_class(&ex, api);
+}
+static u64 __attribute__((ms_abi))
+impl_RegisterClassA(const u8 *window_class) { return register_plain_window_class(window_class, "RegisterClassA"); }
+static u64 __attribute__((ms_abi))
+impl_RegisterClassW(const u8 *window_class) { return register_plain_window_class(window_class, "RegisterClassW"); }
 static u64 __attribute__((ms_abi))
 impl_GetDesktopWindow(void) { return FAKE_DESKTOP_HWND; }
 static u64 __attribute__((ms_abi))
@@ -9566,7 +10126,10 @@ impl_ShowWindow(u64 hw, u32 cmd) {
         /* Deliver the activation burst when transitioning from hidden → visible
          * and the window has not been activated yet (g_window_focused == 0).
          * This covers the pattern: CreateWindowEx(no WS_VISIBLE) + ShowWindow. */
-        if (visible && !was_visible && !g_window_focused) {
+        /* Keyed on activation, not on native visibility: fullscreen windows are mapped at creation, so the
+         * first ShowWindow can find the native window already visible. */
+        if (visible && !g_window_activated) {
+            g_window_activated = 1;
             /* WM_WINDOWPOSCHANGING */
             {
                 u64 wpos[7];
@@ -10494,109 +11057,21 @@ static int g_thread_cnt = 1;
 /* Toolhelp thread snapshots are immutable lists of Windows-visible thread IDs.
  * Host renderer/audio helper pthreads are not guest process threads and must
  * not leak into this list. */
-#define MAX_THREAD_SNAPSHOTS 32
-#define THREAD_SNAPSHOT_HANDLE_BASE 0xB3000000u
-typedef struct BeerThreadSnapshot {
-    int used;
-    u32 count;
-    u32 cursor;
-    u32 tids[MAX_THREADS];
-} BeerThreadSnapshot;
-static BeerThreadSnapshot g_thread_snapshots[MAX_THREAD_SNAPSHOTS];
-static pthread_mutex_t g_thread_snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static int thread_snapshot_id(u64 handle)
+/* The guest's threads as Windows sees them: the calling thread and every live Beer-created thread, by
+ * their Windows thread IDs (the ones GetCurrentThreadId and OpenThread use). Host-only threads, such as
+ * graphics and audio workers, are not guest threads. Used by Toolhelp thread snapshots. */
+static u32 beer_guest_thread_ids(u32 *out, u32 capacity)
 {
-    u32 value = (u32)handle;
-    if ((value & 0xFFFFFF00u) != THREAD_SNAPSHOT_HANDLE_BASE) return -1;
-    u32 index = value - THREAD_SNAPSHOT_HANDLE_BASE;
-    if (index >= MAX_THREAD_SNAPSHOTS || !g_thread_snapshots[index].used) return -1;
-    return (int)index;
-}
-
-/* THREADENTRY32's public Win64 layout is 28 bytes. */
-typedef struct BeerThreadEntry32 {
-    u32 size;
-    u32 usage;
-    u32 thread_id;
-    u32 owner_process_id;
-    s32 base_priority;
-    s32 delta_priority;
-    u32 flags;
-} BeerThreadEntry32;
-
-static u64 __attribute__((ms_abi))
-impl_CreateToolhelp32Snapshot(u32 flags, u32 process_id)
-{
-    const u32 TH32CS_SNAPTHREAD = 0x00000004u;
-    /* th32ProcessID is ignored for TH32CS_SNAPTHREAD, as on Windows. */
-    (void)process_id;
-    if (!(flags & TH32CS_SNAPTHREAD)) {
-        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
-        return INVALID_HANDLE_VALUE64;
-    }
-    pthread_mutex_lock(&g_thread_snapshot_mutex);
-    int index = -1;
-    for (int i = 0; i < MAX_THREAD_SNAPSHOTS; ++i)
-        if (!g_thread_snapshots[i].used) { index = i; break; }
-    if (index < 0) {
-        pthread_mutex_unlock(&g_thread_snapshot_mutex);
-        g_last_error = 8;
-        return INVALID_HANDLE_VALUE64;
-    }
-    BeerThreadSnapshot *snapshot = &g_thread_snapshots[index];
-    memset(snapshot, 0, sizeof(*snapshot));
-    snapshot->used = 1;
-    snapshot->tids[snapshot->count++] = (u32)current_windows_thread_id();
-    for (int i = 1; i < g_thread_cnt && snapshot->count < MAX_THREADS; ++i) {
-        if (!g_threads[i].used) continue;
+    u32 count = 0;
+    if (capacity) out[count++] = (u32)current_windows_thread_id();
+    for (int i = 1; i < g_thread_cnt && count < capacity; ++i) {
+        if (!g_threads[i].used || g_threads[i].done) continue;
         u32 tid = g_threads[i].tid;
         int duplicate = 0;
-        for (u32 j = 0; j < snapshot->count; ++j)
-            if (snapshot->tids[j] == tid) { duplicate = 1; break; }
-        if (!duplicate) snapshot->tids[snapshot->count++] = tid;
+        for (u32 j = 0; j < count; ++j) if (out[j] == tid) { duplicate = 1; break; }
+        if (!duplicate) out[count++] = tid;
     }
-    pthread_mutex_unlock(&g_thread_snapshot_mutex);
-    g_last_error = 0;
-    return (u64)(THREAD_SNAPSHOT_HANDLE_BASE + (u32)index);
-}
-
-static u64 thread_snapshot_next(u64 handle, BeerThreadEntry32 *entry, int first)
-{
-    int index = thread_snapshot_id(handle);
-    if (index < 0 || !entry || entry->size < sizeof(*entry)) {
-        g_last_error = index < 0 ? 6u : 24u; /* INVALID_HANDLE / BAD_LENGTH */
-        return 0;
-    }
-    pthread_mutex_lock(&g_thread_snapshot_mutex);
-    BeerThreadSnapshot *snapshot = &g_thread_snapshots[index];
-    if (first) snapshot->cursor = 0;
-    if (snapshot->cursor >= snapshot->count) {
-        pthread_mutex_unlock(&g_thread_snapshot_mutex);
-        g_last_error = 18; /* ERROR_NO_MORE_FILES */
-        return 0;
-    }
-    u32 size = entry->size;
-    memset(entry, 0, sizeof(*entry));
-    entry->size = size;
-    entry->thread_id = snapshot->tids[snapshot->cursor++];
-    entry->owner_process_id = (u32)getpid();
-    entry->base_priority = 8; /* THREAD_PRIORITY_NORMAL */
-    pthread_mutex_unlock(&g_thread_snapshot_mutex);
-    g_last_error = 0;
-    return 1;
-}
-
-static u64 __attribute__((ms_abi))
-impl_Thread32First(u64 snapshot, BeerThreadEntry32 *entry)
-{
-    return thread_snapshot_next(snapshot, entry, 1);
-}
-
-static u64 __attribute__((ms_abi))
-impl_Thread32Next(u64 snapshot, BeerThreadEntry32 *entry)
-{
-    return thread_snapshot_next(snapshot, entry, 0);
+    return count;
 }
 
 /* Forward declaration — alloc_teb_for_thread() is defined later near TEB setup.
@@ -10798,10 +11273,10 @@ impl_CreateThread(u64 attr, u64 stack, u64 fn, u64 arg, u32 flags, u32 *tid)
     t->suspended = (flags & 0x4) ? 1 : 0; /* CREATE_SUSPENDED */
     if (getenv("BEER_THREAD_DIAGNOSTICS"))
         fprintf(stderr,
-                "[THREAD] create id=%u fn=0x%llx arg=0x%llx flags=0x%x "
+                "[THREAD] create id=%u fn=0x%llx arg=0x%llx flags=0x%x stack=0x%llx "
                 "creator=0x%llx\n",
                 t->tid, (unsigned long long)t->fn,
-                (unsigned long long)t->arg, flags,
+                (unsigned long long)t->arg, flags, (unsigned long long)stack,
                 (unsigned long long)t->creator_rip);
     if (getenv("BEER_THREAD_DIAGNOSTICS")) diag_dump_thread_arg("create", arg);
     pthread_mutex_init(&t->mtx, NULL);
@@ -11293,6 +11768,7 @@ static int fh_close(u64 h) {
     }
     pthread_mutex_unlock(&g_fh_mtx);
     if (fd < 0) return 0;
+    beer_pipe_released(id);
     close(fd);
     iocp_forget_file(h);
     return 1;
@@ -11310,6 +11786,10 @@ static int resolve_windows_host_path(const char *name, char *output,
         normalized[i] = name[i] == '\\' ? '/' : name[i];
 
     const char *input = normalized;
+    /* Win32 file-namespace / device prefixes (\\?\C:\x, \\.\C:\x, \??\C:\x) only switch
+     * off path normalisation; the rest is an ordinary drive path. */
+    if (!strncmp(input, "//?/", 4) || !strncmp(input, "//./", 4)) input += 4;
+    else if (!strncmp(input, "/??/", 4)) input += 4;
     char resolved[PATH_MAX];
     size_t used = 0;
     if (((input[0] >= 'A' && input[0] <= 'Z') ||
@@ -11770,6 +12250,8 @@ impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
         return INVALID_HANDLE_VALUE64;
     }
 
+    if (name[0] == '\\' && name[1] == '\\' && strncasecmp(name + 4, "pipe\\", 5) == 0)
+        return beer_pipe_open_client(name);
     if (beer_file_open_may_use_native_hook(access, creation)) {
         u64 hooked = virtual_fs_open_readonly_file(name, access, share, attrs);
         if (hooked != INVALID_HANDLE_VALUE64) return hooked;
@@ -11842,60 +12324,6 @@ impl_CreateFileW(const u16 *name, u32 access, u32 share, u64 security,
     narrow[i] = 0;
     return impl_CreateFileA(narrow, access, share, security, creation,
                             attributes, template_file);
-}
-
-static u64 __attribute__((ms_abi))
-impl_CreateFileMappingW(u64 file, void *security, u32 protection,
-                        u32 maximum_high, u32 maximum_low, const u16 *name)
-{
-    (void)security;
-    (void)name; /* Named section objects are not implemented yet. */
-    int fd = -1;
-    if (file != INVALID_HANDLE_VALUE64) {
-        fd = fh_get(file);
-        if (fd < 0) { g_last_error = 6; return 0; }
-    }
-    u64 maximum = ((u64)maximum_high << 32) | maximum_low;
-    if (maximum > INT64_MAX) { g_last_error = 87; return 0; }
-    u64 section = 0;
-    u32 status = beer_nt_section_create(&section, fd, (s64)maximum,
-                                         protection & 0xffu, 0x08000000u);
-    if (status != BEER_STATUS_SUCCESS) {
-        g_last_error = status == BEER_STATUS_INVALID_HANDLE ? 6u :
-                       status == BEER_STATUS_INVALID_PARAMETER ? 87u : 8u;
-        return 0;
-    }
-    g_last_error = 0;
-    return section;
-}
-
-static u64 __attribute__((ms_abi))
-impl_MapViewOfFile(u64 mapping, u32 access, u32 offset_high,
-                   u32 offset_low, size_t bytes)
-{
-    s64 offset = (s64)(((u64)offset_high << 32) | offset_low);
-    size_t view_size = bytes;
-    void *base = NULL;
-    u32 protection = (access & 0x0002u) ? 0x04u : 0x02u; /* FILE_MAP_WRITE */
-    if (access & 0x0020u) protection = (protection == 0x04u) ? 0x40u : 0x20u;
-    u32 status = beer_nt_section_map(mapping, &base, 0, &offset, &view_size,
-                                     1, 0, protection);
-    if (status != BEER_STATUS_SUCCESS) {
-        g_last_error = status == BEER_STATUS_INVALID_HANDLE ? 6u :
-                       status == BEER_STATUS_INVALID_PARAMETER ? 87u : 8u;
-        return 0;
-    }
-    g_last_error = 0;
-    return (u64)(uintptr_t)base;
-}
-
-static u64 __attribute__((ms_abi))
-impl_UnmapViewOfFile(void *base)
-{
-    u32 status = beer_nt_section_unmap(base);
-    if (status != BEER_STATUS_SUCCESS) { g_last_error = 87; return 0; }
-    g_last_error = 0;
-    return 1;
 }
 
 /* ---- One-time initialisation (INIT_ONCE, 8 bytes): 0 = not started, 1 = being initialised (synchronous),
@@ -12236,17 +12664,6 @@ static u64 __attribute__((ms_abi)) impl_SetFileCompletionNotificationModes(u64 f
     g_last_error = 0;
     return 1;
 }
-static u64 __attribute__((ms_abi)) impl_CancelIoEx(u64 file, u64 overlapped)
-    { (void)file; (void)overlapped; g_last_error = 1168; return 0; }          /* ERROR_NOT_FOUND: nothing pending */
-static u64 __attribute__((ms_abi)) impl_GetOverlappedResult(u64 file, const u64 *overlapped, u32 *bytes, u32 wait)
-{
-    (void)file; (void)wait;
-    if (!overlapped) { g_last_error = 87; return 0; }
-    if (bytes) *bytes = (u32)overlapped[1];
-    if (overlapped[0] != 0) { g_last_error = (u32)overlapped[0]; return 0; }
-    g_last_error = 0;
-    return 1;
-}
 
 static void iocp_close(int idx)
 {
@@ -12388,15 +12805,6 @@ impl_CloseHandle(u64 h)
         return 1;
     }
 
-    int snapshot_id = thread_snapshot_id(h);
-    if (snapshot_id >= 0) {
-        pthread_mutex_lock(&g_thread_snapshot_mutex);
-        memset(&g_thread_snapshots[snapshot_id], 0,
-               sizeof(g_thread_snapshots[snapshot_id]));
-        pthread_mutex_unlock(&g_thread_snapshot_mutex);
-        g_last_error = 0;
-        return 1;
-    }
 
     int iocp_id = iocp_from_handle(h);
     if (iocp_id >= 0) { iocp_close(iocp_id); return 1; }
@@ -12414,11 +12822,12 @@ impl_CloseHandle(u64 h)
 
     int eid = event_id_from_handle(h);
     if (eid >= 0) {
+        if (g_timer_thread_started) beer_timer_forget(h);
         pthread_mutex_lock(&g_event_table_mtx);
         WinEvent *ev = &g_events[eid];
         pthread_mutex_destroy(&ev->mtx);
         pthread_cond_destroy(&ev->cv);
-        ev->used = 0;
+        event_release_id_locked(eid);
         pthread_mutex_unlock(&g_event_table_mtx);
         return 1;
     }
@@ -12431,6 +12840,11 @@ impl_CloseHandle(u64 h)
         g_sem_free_hint = sid;
         g_sem_val[sid] = 0;
         g_sem_max[sid] = 0;
+        return 1;
+    }
+
+    if (beer_proc_close(h)) {
+        g_last_error = 0;
         return 1;
     }
 
@@ -12456,6 +12870,100 @@ typedef struct {
     u64 hEvent;
 } WIN_OVERLAPPED;
 
+/* ---- Overlapped I/O on named pipes ----
+ * A pipe read issued with an OVERLAPPED that finds no data is left pending (ERROR_IO_PENDING) instead of blocking the
+ * thread; GetOverlappedResult(Ex) completes it once data arrives, reports ERROR_IO_INCOMPLETE until then, and
+ * CancelIo(Ex) abandons it. Games that handshake with a launcher poll this in a loop and carry on after a timeout. */
+typedef struct { WIN_OVERLAPPED *overlapped; u64 handle; void *buffer; u32 length; } BeerPendingRead;
+static BeerPendingRead g_pending_reads[64];
+static pthread_mutex_t g_pending_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void beer_pending_add(WIN_OVERLAPPED *ov, u64 h, void *buf, u32 n)
+{
+    pthread_mutex_lock(&g_pending_mtx);
+    for (size_t i = 0; i < 64; ++i)
+        if (!g_pending_reads[i].overlapped) { g_pending_reads[i] = (BeerPendingRead){ ov, h, buf, n }; break; }
+    pthread_mutex_unlock(&g_pending_mtx);
+}
+/* Tries to finish the pending read of <ov>; returns 1 done (result stored in the OVERLAPPED), 0 still pending, -1 not pending. */
+static int beer_pending_poll(WIN_OVERLAPPED *ov, int wait_ms)
+{
+    BeerPendingRead entry = {0};
+    size_t slot = 64;
+    pthread_mutex_lock(&g_pending_mtx);
+    for (size_t i = 0; i < 64; ++i)
+        if (g_pending_reads[i].overlapped == ov) { entry = g_pending_reads[i]; slot = i; break; }
+    pthread_mutex_unlock(&g_pending_mtx);
+    if (slot == 64) return -1;
+    int fd = fh_get(entry.handle);
+    ssize_t got = -1;
+    if (fd >= 0) {
+        if (wait_ms != 0) {
+            struct pollfd pfd = { fd, POLLIN, 0 };
+            poll(&pfd, 1, wait_ms);
+        }
+        got = recv(fd, entry.buffer, entry.length, MSG_DONTWAIT);
+    }
+    if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && fd >= 0) return 0;
+    pthread_mutex_lock(&g_pending_mtx);
+    if (g_pending_reads[slot].overlapped == ov) g_pending_reads[slot].overlapped = NULL;
+    pthread_mutex_unlock(&g_pending_mtx);
+    if (got > 0) { ov->Internal = 0; ov->InternalHigh = (u64)got; }
+    else { ov->Internal = 0xC000014Bu; ov->InternalHigh = 0; }       /* STATUS_PIPE_BROKEN */
+    if (ov->hEvent) impl_SetEvent(ov->hEvent);
+    return 1;
+}
+static u64 __attribute__((ms_abi))
+impl_GetOverlappedResultEx(u64 h, WIN_OVERLAPPED *ov, u32 *transferred, u32 timeout_ms, u32 alertable)
+{
+    (void)h; (void)alertable;
+    if (!ov) { g_last_error = 87; return 0; }
+    int state = beer_pending_poll(ov, timeout_ms == 0xFFFFFFFFu ? -1 : (int)timeout_ms);
+    if (state == 0 && timeout_ms == 0xFFFFFFFFu) {
+        while ((state = beer_pending_poll(ov, 1000)) == 0) { }
+    }
+    if (state == 0) { if (transferred) *transferred = 0; g_last_error = timeout_ms ? 258u : 996u; return 0; }   /* WAIT_TIMEOUT / ERROR_IO_INCOMPLETE */
+    if (ov->Internal == 0x103u) { if (transferred) *transferred = 0; g_last_error = 996u; return 0; }
+    if (transferred) *transferred = (u32)ov->InternalHigh;
+    if (ov->Internal != 0) {
+        /* NTSTATUS from a pipe read, or the Win32 error an I/O completion stored. */
+        g_last_error = ov->Internal == 0xC000014Bu ? 109u : ov->Internal < 0x10000u ? (u32)ov->Internal : 1117u;
+        return 0;
+    }
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi))
+impl_GetOverlappedResult(u64 h, WIN_OVERLAPPED *ov, u32 *transferred, u32 wait)
+    { return impl_GetOverlappedResultEx(h, ov, transferred, wait ? 0xFFFFFFFFu : 0u, 0); }
+static u64 __attribute__((ms_abi))
+impl_CancelIoEx(u64 h, WIN_OVERLAPPED *ov)
+{
+    int any = 0;
+    pthread_mutex_lock(&g_pending_mtx);
+    for (size_t i = 0; i < 64; ++i)
+        if (g_pending_reads[i].overlapped && g_pending_reads[i].handle == h && (!ov || g_pending_reads[i].overlapped == ov)) {
+            g_pending_reads[i].overlapped->Internal = 0xC0000120u;        /* STATUS_CANCELLED */
+            g_pending_reads[i].overlapped = NULL; any = 1;
+        }
+    pthread_mutex_unlock(&g_pending_mtx);
+    if (!any) { g_last_error = 1168; return 0; }                          /* ERROR_NOT_FOUND */
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_CancelIo(u64 h) { return impl_CancelIoEx(h, NULL); }
+
+/* BEER_PIPE_DIAGNOSTICS=1: hex-dumps the first bytes of every named-pipe transfer. */
+static void beer_pipe_dump(const char *dir, u64 h, const void *buf, ssize_t n)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("BEER_PIPE_DIAGNOSTICS") != NULL;
+    if (!enabled) return;
+    fprintf(stderr, "[PIPE] %s h=0x%llx %zd bytes:", dir, (unsigned long long)h, n);
+    for (ssize_t i = 0; i < n && i < 96; ++i) fprintf(stderr, " %02x", ((const u8 *)buf)[i]);
+    fputc('\n', stderr);
+}
+
 static u64 __attribute__((ms_abi))
 impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
 {
@@ -12467,6 +12975,43 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
     }
 
     ssize_t received;
+    const int pipe_handle = beer_pipe_is_pipe(h);
+    if (pipe_handle) {
+        if (!beer_pipe_ensure_connected(h)) { if (done) *done = 0; return 0; }
+        fd = fh_get(h);     /* adopting a client replaces the descriptor */
+        if (overlapped) {
+            /* Overlapped read: take what is there; with nothing yet the request stays pending. */
+            overlapped->Internal = 0x103u; overlapped->InternalHigh = 0;
+            do { received = recv(fd, buf, n, MSG_DONTWAIT); } while (received < 0 && errno == EINTR);
+            if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                beer_pending_add(overlapped, h, buf, n);
+                if (done) *done = 0;
+                g_last_error = 997;                                      /* ERROR_IO_PENDING */
+                return 0;
+            }
+            beer_pipe_dump("read", h, buf, received);
+            overlapped->Internal = received > 0 ? 0 : 0xC000014Bu;
+            overlapped->InternalHigh = received > 0 ? (u64)received : 0;
+            if (overlapped->hEvent) impl_SetEvent(overlapped->hEvent);
+            if (done) *done = (u32)(received > 0 ? received : 0);
+            if (received > 0) { g_last_error = 0; return 1; }
+            g_last_error = 109;
+            return 0;
+        }
+        /* Synchronous pipe read: blocks until data or EOF. */
+        do { received = read(fd, buf, n); } while (received < 0 && errno == EINTR);
+        beer_pipe_dump("read", h, buf, received);
+        if (overlapped) {
+            overlapped->Internal = received < 0 ? (u64)(u32)errno : 0;
+            overlapped->InternalHigh = received < 0 ? 0 : (u64)received;
+            if (received >= 0 && overlapped->hEvent) impl_SetEvent(overlapped->hEvent);
+        }
+        if (done) *done = (u32)(received < 0 ? 0 : received);
+        if (received == 0 && n) { g_last_error = 109; return 0; }   /* ERROR_BROKEN_PIPE: peer closed */
+        if (received < 0) { g_last_error = 109; return 0; }
+        g_last_error = 0;
+        return 1;
+    }
     if (overlapped) {
         /* An OVERLAPPED read has its own absolute file position. RE8 issues
          * archive reads concurrently against shared handles; treating these as
@@ -12504,6 +13049,10 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
         }
     } else {
         received = read(fd, buf, n);
+        if (received == 0 && n) {                       /* end of an anonymous pipe: the write end is closed */
+            struct stat pipe_st;
+            if (fstat(fd, &pipe_st) == 0 && S_ISFIFO(pipe_st.st_mode)) { if (done) *done = 0; g_last_error = 109; return 0; }
+        }
     }
 
     if (done) *done = (u32)(received < 0 ? 0 : received);
@@ -12925,9 +13474,17 @@ impl_GetFileAttributesA(const char *path)
 
     char host_path[PATH_MAX];
     struct stat st;
+    if (path && getenv("BEER_CALLER_DIAGNOSTICS") && strcasestr(path, getenv("BEER_CALLER_DIAGNOSTICS")))
+        dbg_dump_guest_callchain("GetFileAttributes");
     if (!path || !resolve_windows_host_path(path, host_path, sizeof(host_path)) ||
         stat(host_path, &st) < 0) {
+        /* Windows distinguishes a missing file (2) from a missing directory on the way to it (3). */
         g_last_error = 2;
+        char *slash = path ? strrchr(host_path, '/') : NULL;
+        if (slash && slash != host_path) {
+            *slash = 0;
+            if (stat(host_path, &st) < 0) g_last_error = 3;
+        }
         return 0xFFFFFFFF;
     }
     u32 attr = S_ISDIR(st.st_mode) ? 0x10u : 0x20u;
@@ -12962,6 +13519,23 @@ impl_GetFileVersionInfoSizeW(const u16 *path, u32 *handle)
     u32 size = 0;
     if (handle) *handle = 0;
     if (!wide_to_host_path(path, host, sizeof(host))) { g_last_error = 2; fprintf(stderr, "[VERSION] cannot resolve path\n"); return 0; }
+    if (access(host, F_OK) != 0) {
+        if (getenv("BEER_HOOK_PROBE")) {
+            /* Experiment: what does the (possibly hooked) guest-visible CreateFileW say about this path? */
+            u64 (__attribute__((ms_abi)) *guest_create_file)(const u16 *, u32, u32, void *, u32, u32, u64) = NULL;
+            for (int i = 0; i < g_nstubs; ++i) {
+                const char *bang = g_snames[i] ? strchr(g_snames[i], '!') : NULL;
+                const char *name = g_snames[i] ? (bang ? bang + 1 : g_snames[i]) : NULL;
+                if (name && !strcmp(name, "CreateFileW") && g_impl_real[i]) { guest_create_file = (void *)(g_tramp + i * THUNK_SZ); break; }
+            }
+            if (guest_create_file) {
+                u64 handle = guest_create_file(path, 0x80000000u, 1u, NULL, 3u, 0x80u, 0);
+                fprintf(stderr, "[HOOKPROBE] CreateFileW(socialclub-ish) via guest thunk %p -> 0x%lx (err %u)\n",
+                        (void *)guest_create_file, handle, g_last_error);
+            }
+        }
+        g_last_error = 2; return 0;                                                  /* ERROR_FILE_NOT_FOUND, as the real API */
+    }
     if (!beer_pe_version_resource(host, &data, &size)) { g_last_error = 1813; fprintf(stderr, "[VERSION] no version resource in %s\n", host); return 0; }   /* ERROR_RESOURCE_TYPE_NOT_FOUND */
     free(data);
     return size;
@@ -12984,7 +13558,7 @@ impl_GetFileVersionInfoW(const u16 *path, u32 handle, u32 length, u8 *buffer)
     char host[1024];
     u8 *data = NULL;
     u32 size = 0;
-    if (!buffer || !wide_to_host_path(path, host, sizeof(host))) { g_last_error = 2; return 0; }
+    if (!buffer || !wide_to_host_path(path, host, sizeof(host)) || access(host, F_OK) != 0) { g_last_error = 2; return 0; }
     if (!beer_pe_version_resource(host, &data, &size)) { g_last_error = 1813; return 0; }
     memcpy(buffer, data, size < length ? size : length);
     free(data);
@@ -13181,6 +13755,89 @@ impl_AdjustWindowRect(WIN_RECT *rect, u32 style, u32 menu) {
 static u64 __attribute__((ms_abi))
 impl_AdjustWindowRectEx(WIN_RECT *rect, u32 style, u32 menu, u32 exstyle)
     { (void)exstyle; return impl_AdjustWindowRect(rect,style,menu); }
+/* ---- RECT helpers (user32).  RECT = { left, top, right, bottom } of 32-bit ints; POINT is passed packed in a u64. ---- */
+static u64 __attribute__((ms_abi)) impl_SetRect(s32 *r, s32 l, s32 t, s32 rt, s32 b)
+{ if (!r) return 0; r[0] = l; r[1] = t; r[2] = rt; r[3] = b; return 1; }
+static u64 __attribute__((ms_abi)) impl_SetRectEmpty(s32 *r)
+{ if (!r) return 0; r[0] = r[1] = r[2] = r[3] = 0; return 1; }
+static u64 __attribute__((ms_abi)) impl_CopyRect(s32 *dst, const s32 *src)
+{ if (!dst || !src) return 0; memcpy(dst, src, 16); return 1; }
+static u64 __attribute__((ms_abi)) impl_OffsetRect(s32 *r, s32 dx, s32 dy)
+{ if (!r) return 0; r[0] += dx; r[2] += dx; r[1] += dy; r[3] += dy; return 1; }
+static u64 __attribute__((ms_abi)) impl_InflateRect(s32 *r, s32 dx, s32 dy)
+{ if (!r) return 0; r[0] -= dx; r[2] += dx; r[1] -= dy; r[3] += dy; return 1; }
+static u64 __attribute__((ms_abi)) impl_IsRectEmpty(const s32 *r)
+{ return !r || r[0] >= r[2] || r[1] >= r[3]; }
+static u64 __attribute__((ms_abi)) impl_EqualRect(const s32 *a, const s32 *b)
+{ return a && b && !memcmp(a, b, 16); }
+static u64 __attribute__((ms_abi)) impl_PtInRect(const s32 *r, u64 point)
+{
+    const s32 x = (s32)(u32)point, y = (s32)(u32)(point >> 32);
+    return r && x >= r[0] && x < r[2] && y >= r[1] && y < r[3];
+}
+static u64 __attribute__((ms_abi)) impl_IntersectRect(s32 *out, const s32 *a, const s32 *b)
+{
+    if (!out || !a || !b) return 0;
+    s32 l = a[0] > b[0] ? a[0] : b[0], t = a[1] > b[1] ? a[1] : b[1];
+    s32 r = a[2] < b[2] ? a[2] : b[2], bt = a[3] < b[3] ? a[3] : b[3];
+    if (l >= r || t >= bt) { out[0] = out[1] = out[2] = out[3] = 0; return 0; }
+    out[0] = l; out[1] = t; out[2] = r; out[3] = bt;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_UnionRect(s32 *out, const s32 *a, const s32 *b)
+{
+    if (!out || !a || !b) return 0;
+    const int ea = a[0] >= a[2] || a[1] >= a[3], eb = b[0] >= b[2] || b[1] >= b[3];
+    if (ea && eb) { out[0] = out[1] = out[2] = out[3] = 0; return 0; }
+    if (ea) { memcpy(out, b, 16); return 1; }
+    if (eb) { memcpy(out, a, 16); return 1; }
+    out[0] = a[0] < b[0] ? a[0] : b[0]; out[1] = a[1] < b[1] ? a[1] : b[1];
+    out[2] = a[2] > b[2] ? a[2] : b[2]; out[3] = a[3] > b[3] ? a[3] : b[3];
+    return 1;
+}
+
+/* ---- Small system services that protection and telemetry code calls and then trusts the outputs of.  A zero-returning
+ * stub left their output buffers uninitialised (UUID, locale name, token privileges, cursor info). ---- */
+static u64 __attribute__((ms_abi)) impl_UuidCreate(u8 *uuid)
+{
+    if (!uuid) return 87;
+    static _Atomic(u64) counter;
+    u64 a = (u64)time(NULL) * 1000003ull + atomic_fetch_add(&counter, 1) * 7919ull + (u64)getpid();
+    u64 b = a * 6364136223846793005ull + 1442695040888963407ull;
+    memcpy(uuid, &a, 8); memcpy(uuid + 8, &b, 8);
+    uuid[7] = (uuid[7] & 0x0f) | 0x40;          /* version 4 */
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;          /* RFC 4122 variant */
+    return 0;                                   /* RPC_S_OK */
+}
+static u64 __attribute__((ms_abi)) impl_GetSystemDefaultLocaleName(u16 *buf, int size)
+{
+    static const u16 name[] = {'e','n','-','U','S',0};
+    if (!buf || size < 6) { g_last_error = 122; return 0; }
+    memcpy(buf, name, sizeof(name));
+    return 6;
+}
+static u64 __attribute__((ms_abi)) impl_GetSystemDefaultUILanguage(void) { return 0x0409; }
+static u64 __attribute__((ms_abi)) impl_OpenProcessToken(u64 process, u32 access, u64 *token)
+{ (void)process; (void)access; if (!token) { g_last_error = 87; return 0; } *token = 0x7E0C0001ull; return 1; }
+static u64 __attribute__((ms_abi)) impl_LookupPrivilegeValue(const void *system, const void *name, u32 *luid)
+{ (void)system; (void)name; if (!luid) { g_last_error = 87; return 0; } luid[0] = 20; luid[1] = 0; return 1; }
+static u64 __attribute__((ms_abi)) impl_AdjustTokenPrivileges(u64 token, u32 disable_all, void *new_state, u32 len, void *old, u32 *ret)
+{ (void)token; (void)disable_all; (void)new_state; (void)len; (void)old; if (ret) *ret = 0; g_last_error = 0; return 1; }
+static u64 __attribute__((ms_abi)) impl_EventRegister(const void *provider, void *callback, void *context, u64 *handle)
+{ (void)provider; (void)callback; (void)context; if (handle) *handle = 0x7E0E0001ull; return 0; }
+#include "platform/win32_advapi_misc.inc"
+
+/* Per-monitor DPI APIs (Windows 10): the desktop runs at 96 dpi, so scaling is the identity. */
+static u64 __attribute__((ms_abi))
+impl_AdjustWindowRectExForDpi(WIN_RECT *rect, u32 style, u32 menu, u32 exstyle, u32 dpi)
+    { (void)dpi; return impl_AdjustWindowRectEx(rect, style, menu, exstyle); }
+static u64 __attribute__((ms_abi)) impl_GetDpiForSystem(void) { return 96; }
+static u64 __attribute__((ms_abi)) impl_GetDpiForWindow(u64 hwnd) { (void)hwnd; return 96; }
+static u64 __attribute__((ms_abi)) impl_DpiSuccess(void) { return 1; }                       /* EnableNonClientDpiScaling, SetDialog*DpiChangeBehavior */
+static u64 __attribute__((ms_abi)) impl_DpiHresultOk(void) { return 0; }                      /* S_OK */
+static u64 __attribute__((ms_abi)) impl_GetThreadDpiAwarenessContext(void) { return (u64)-4; }  /* PER_MONITOR_AWARE_V2 */
+static u64 __attribute__((ms_abi)) impl_AreDpiAwarenessContextsEqual(u64 a, u64 b) { return a == b; }
+
 static void window_title_from_wide(const u16 *wide, char *out, size_t capacity)
 {
     if (!out || !capacity) return;
@@ -13271,7 +13928,14 @@ static u64 call_guest_wndproc(u32 message, u64 wparam, u64 lparam)
         fprintf(stderr, "[INPUT] wndproc mouse message 0x%04x wparam=0x%llx\n",
                 message, (unsigned long long)wparam);
     if (!g_window_proc) return message == 0x0081 ? 1 : 0;
-    return ((GuestWndProc)(uintptr_t)g_window_proc)(FAKE_HWND, message, wparam, lparam);
+    u64 result = ((GuestWndProc)(uintptr_t)g_window_proc)(FAKE_HWND, message, wparam, lparam);
+    if (getenv("BEER_WNDPROC_DIAGNOSTICS")) {     /* every message Beer itself sends to the guest window procedure */
+        static _Atomic(u32) logs;
+        if (atomic_fetch_add(&logs, 1) < 400)
+            fprintf(stderr, "[WNDPROC] msg=0x%04x wparam=0x%llx lparam=0x%llx -> 0x%llx\n", message,
+                    (unsigned long long)wparam, (unsigned long long)lparam, (unsigned long long)result);
+    }
+    return result;
 }
 
 static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
@@ -13301,6 +13965,21 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
                 "[THREAD] window owner thread=%u creator=0x%llx\n",
                 g_window_thread_id,
                 (unsigned long long)g_dispatch_incoming_return);
+    /* CW_USEDEFAULT size, or a zero-sized window (engines create hidden 0x0 windows for adapter probing): the
+     * native window needs a positive client area, so give it the default size or one pixel. */
+    if ((u32)w == 0x80000000u) w = 1280;
+    if ((u32)h == 0x80000000u) h = 720;
+    {
+        int fl = 0, ft = 0, fw = 0, fh = 0;
+        if (beer_window_style_is_decorated(style) &&
+            beer_window_client_from_outer(1000, 1000, 1, &fl, &ft, &fw, &fh)) {
+            fw = 1000 - fw; fh = 1000 - fh;       /* total frame thickness */
+        } else {
+            fw = fh = 0;
+        }
+        if (w < fw + 1) w = fw + 1;
+        if (h < fh + 1) h = fh + 1;
+    }
     g_window_outer_x = (u32)x == 0x80000000u ? 0 : x;
     g_window_outer_y = (u32)y == 0x80000000u ? 0 : y;
     g_window_outer_width = w;
@@ -13409,6 +14088,7 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
         }
 
         /* WM_ACTIVATEAPP (0x001c): wParam=1 (activated), lParam=0 (no other TID) */
+        g_window_activated = 1;
         call_guest_wndproc(0x001c, 1, 0);
 
         /* WM_NCACTIVATE (0x0086): wParam=1 (title bar active), lParam=0 */
@@ -13462,6 +14142,10 @@ impl_CreateWindowExW(u32 exstyle, u64 classname, u64 title, u32 style,
     window_title_from_wide((const u16 *)(uintptr_t)title, utf8_title, sizeof(utf8_title));
     fprintf(stderr, "[WIN] CreateWindowExW(%dx%d, title=%s)\n", w, h,
             utf8_title[0] ? utf8_title : "(untitled)");
+    if (getenv("BEER_WINDOW_DIAGNOSTICS"))
+        fprintf(stderr, "[WIN]   exstyle=0x%x style=0x%x pos=%d,%d parent=0x%lx menu=0x%lx inst=0x%lx param=0x%lx caller=%p\n",
+                exstyle, style, x, y, (unsigned long)parent, (unsigned long)menu, (unsigned long)inst,
+                (unsigned long)param, (void *)g_dispatch_incoming_return);
     return create_guest_window(exstyle, classname, title, style, x, y, w, h,
                                parent, menu, inst, param, utf8_title);
 }
@@ -13482,6 +14166,7 @@ impl_DestroyWindow(u64 hw) {
     call_guest_wndproc(0x0082, 0, 0);
     xwayland_window_destroy();
     g_window_focused = 0;
+    g_window_activated = 0;
     return 1;
 }
 static u64 __attribute__((ms_abi))
@@ -13669,10 +14354,13 @@ typedef struct {
     s32 delta_x, delta_y, wheel;
     u8 mouse_buttons[8];
     /* A press that began and ended between two DirectInput polls must still be
-     * visible to one GetDeviceState call, as on Windows where device state is
-     * latched until read. The latch is only OR-ed into polled state. */
-    u8 mouse_latch[8];
-    u8 dik_latch[256];
+     * visible to the next GetDeviceState call of every device, as on Windows
+     * where each device's state is latched until it is read. Presses are
+     * counted here; each device remembers the counts it has reported (games
+     * open several keyboards and mice: Sekiro four of each, and a shared
+     * latch cleared by the first poll hid quick taps from the others). */
+    u32 mouse_presses[8];
+    u32 dik_presses[256];
     u8 pointer_position_valid;
     /* Virtual cursor: after SetCursorPos the guest's idea of the position is the warp target, and later motion is
      * applied to it as host-relative deltas, whether or not the compositor honours the warp (XWayland often does not). */
@@ -14088,12 +14776,13 @@ impl_RegisterRawInputDevices(const BEER_RAW_INPUT_DEVICE *devices,
     pthread_mutex_lock(&g_raw_input_mutex);
     for (u32 i = 0; i < count; ++i) {
         const BEER_RAW_INPUT_DEVICE *device = &devices[i];
-        if (device->usage_page != 1 ||
-            (device->usage != 2 && device->usage != 6)) {
-            pthread_mutex_unlock(&g_raw_input_mutex);
-            g_last_error = 87;
-            return 0;
-        }
+        if (getenv("BEER_INPUT_DIAGNOSTICS"))
+            fprintf(stderr, "[INPUT] RegisterRawInputDevices[%u/%u] usage=%u:%u flags=0x%x target=0x%llx\n", i, count,
+                    device->usage_page, device->usage, device->flags, (unsigned long long)device->target);
+        /* Windows accepts any HID top-level collection (gamepads, consumer control, ...). Beer only produces mouse
+         * and keyboard reports, so other usages are accepted and simply never deliver data; rejecting the whole
+         * array used to drop the keyboard registration that came with them. */
+        if (device->usage_page != 1 || (device->usage != 2 && device->usage != 6)) continue;
         BEER_RAW_INPUT_DEVICE *registration = device->usage == 2
             ? &g_raw_mouse_registration : &g_raw_keyboard_registration;
         int *registered = device->usage == 2
@@ -14345,8 +15034,10 @@ impl_SendInput(u32 count, const WIN_INPUT *inputs, s32 size)
 static u64 __attribute__((ms_abi))
 impl_XInputGetStateDisconnected(u32 user_index, void *state)
 {
+    /* Real XInput leaves the caller's XINPUT_STATE untouched on failure.  This function is also the entry for
+     * XInputSetState, whose XINPUT_VIBRATION is only 4 bytes: clearing 16 bytes overran the game's stack frame. */
     (void)user_index;
-    if (state) memset(state, 0, 16); /* XINPUT_STATE */
+    (void)state;
     return 1167; /* ERROR_DEVICE_NOT_CONNECTED */
 }
 
@@ -14693,6 +15384,65 @@ static void post_wm_setcursor(u32 mouse_message)
     queue_window_message(0x0020, FAKE_HWND, 1u | ((u64)mouse_message << 16)); /* HTCLIENT */
 }
 
+/* One key transition into every guest-visible keyboard source: GetKeyState/GetAsyncKeyState, DirectInput,
+ * WM_KEYDOWN/WM_KEYUP and raw input. Used by the X event loop and by the control socket's "key" command. */
+static void beer_deliver_key(u32 vk, u8 dik, int extended, int down, int top_level)
+{
+    /* Win32 keyboard messages carry the generic modifier VKs;
+     * the left/right VKs only exist in GetKeyState/raw input. */
+    u32 message_vk = vk;
+    u32 generic_vk = 0;
+    if (vk == 0xa0 || vk == 0xa1) generic_vk = 0x10;
+    else if (vk == 0xa2 || vk == 0xa3) generic_vk = 0x11;
+    else if (vk == 0xa4 || vk == 0xa5) generic_vk = 0x12;
+    if (generic_vk) message_vk = generic_vk;
+    pthread_mutex_lock(&g_input_mutex);
+    /* With detectable auto-repeat a held key sends further presses
+     * and no releases; Windows reports those as WM_KEYDOWN with the
+     * previous-state bit and DirectInput not at all. */
+    const int repeat = down &&
+        ((vk && vk < 256 && (g_input.keys[vk] & 0x80)) ||
+         (dik && (g_input.dik[dik] & 0x80)));
+    if (vk && vk < 256) {
+        if (down && !(g_input.keys[vk] & 0x80)) g_input.pressed[vk] = 1;
+        g_input.keys[vk] = down ? 0x80 : 0;
+        if (generic_vk) {
+            const u32 pair = vk & ~1u;      /* left/right VK pair */
+            const int either = (g_input.keys[pair] | g_input.keys[pair + 1]) & 0x80;
+            g_input.keys[generic_vk] = either ? 0x80 : 0;
+        }
+    }
+    if (dik) {
+        g_input.dik[dik] = down ? 0x80 : 0;
+        if (down) g_input.dik_presses[dik]++;
+        if (top_level && !repeat)
+            queue_dinput_event_locked(2, dik, down ? 0x80u : 0u);
+    }
+    pthread_mutex_unlock(&g_input_mutex);
+    if (top_level && vk) {
+        u64 lparam = 1 | ((u64)(dik & 0x7f) << 16);
+        if (extended) lparam |= 1ULL << 24;
+        if (!down) lparam |= 0xc0000000ULL;
+        else if (repeat) lparam |= 0x40000000ULL;
+        queue_window_message(down ? 0x0100 : 0x0101, message_vk, lparam);
+        BeerRawInput raw = beer_raw_keyboard_input(vk, dik & 0x7f, down);
+        if (extended) raw.data.keyboard.flags |= 2; /* RI_KEY_E0 */
+        queue_raw_input(&raw, 1);
+        if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+            u32 log = atomic_fetch_add(&g_input_event_logs, 1);
+            if (log < 32)
+                fprintf(stderr,
+                        "[INPUT] key %s vk=0x%02x dik=0x%02x%s\n",
+                        repeat ? "repeat" : down ? "down" : "up", vk, dik,
+                        extended ? " ext" : "");
+        }
+    }
+}
+void beer_control_inject_key(unsigned vk, unsigned dik, int extended, int down)
+{
+    beer_deliver_key(vk, (u8)dik, extended, down, 1);
+}
+
 static void collect_native_window_events(void)
 {
     pthread_mutex_lock(&g_event_collect_mutex);
@@ -14713,55 +15463,7 @@ static void collect_native_window_events(void)
                 if (!vk) vk = x11_keysym_to_vk(event.keysym);
                 u8 dik = x11_keycode_to_dik(event.keycode);
                 const int extended = x11_keycode_is_extended(event.keycode);
-                /* Win32 keyboard messages carry the generic modifier VKs;
-                 * the left/right VKs only exist in GetKeyState/raw input. */
-                u32 message_vk = vk;
-                u32 generic_vk = 0;
-                if (vk == 0xa0 || vk == 0xa1) generic_vk = 0x10;
-                else if (vk == 0xa2 || vk == 0xa3) generic_vk = 0x11;
-                else if (vk == 0xa4 || vk == 0xa5) generic_vk = 0x12;
-                if (generic_vk) message_vk = generic_vk;
-                pthread_mutex_lock(&g_input_mutex);
-                /* With detectable auto-repeat a held key sends further presses
-                 * and no releases; Windows reports those as WM_KEYDOWN with the
-                 * previous-state bit and DirectInput not at all. */
-                const int repeat = down &&
-                    ((vk && vk < 256 && (g_input.keys[vk] & 0x80)) ||
-                     (dik && (g_input.dik[dik] & 0x80)));
-                if (vk && vk < 256) {
-                    if (down && !(g_input.keys[vk] & 0x80)) g_input.pressed[vk] = 1;
-                    g_input.keys[vk] = down ? 0x80 : 0;
-                    if (generic_vk) {
-                        const u32 pair = vk & ~1u;      /* left/right VK pair */
-                        const int either = (g_input.keys[pair] | g_input.keys[pair + 1]) & 0x80;
-                        g_input.keys[generic_vk] = either ? 0x80 : 0;
-                    }
-                }
-                if (dik) {
-                    g_input.dik[dik] = down ? 0x80 : 0;
-                    if (down) g_input.dik_latch[dik] = 1;
-                    if (top_level && !repeat)
-                        queue_dinput_event_locked(2, dik, down ? 0x80u : 0u);
-                }
-                pthread_mutex_unlock(&g_input_mutex);
-                if (top_level && vk) {
-                    u64 lparam = 1 | ((u64)(dik & 0x7f) << 16);
-                    if (extended) lparam |= 1ULL << 24;
-                    if (!down) lparam |= 0xc0000000ULL;
-                    else if (repeat) lparam |= 0x40000000ULL;
-                    queue_window_message(down ? 0x0100 : 0x0101, message_vk, lparam);
-                    BeerRawInput raw = beer_raw_keyboard_input(vk, dik & 0x7f, down);
-                    if (extended) raw.data.keyboard.flags |= 2; /* RI_KEY_E0 */
-                    queue_raw_input(&raw, 1);
-                    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
-                        u32 log = atomic_fetch_add(&g_input_event_logs, 1);
-                        if (log < 32)
-                            fprintf(stderr,
-                                    "[INPUT] key %s vk=0x%02x dik=0x%02x%s\n",
-                                    repeat ? "repeat" : down ? "down" : "up", vk, dik,
-                                    extended ? " ext" : "");
-                    }
-                }
+                beer_deliver_key(vk, dik, extended, down, top_level);
                 break;
             }
             case XWAYLAND_EVENT_BUTTON_DOWN:
@@ -14796,7 +15498,7 @@ static void collect_native_window_events(void)
                     if (down && !(g_input.keys[vk] & 0x80))
                         g_input.pressed[vk] = 1;
                     g_input.mouse_buttons[di_button] = down ? 0x80 : 0;
-                    if (down) g_input.mouse_latch[di_button] = 1;
+                    if (down) g_input.mouse_presses[di_button]++;
                     g_input.keys[vk] = down ? 0x80 : 0;
                     if (top_level)
                         queue_dinput_event_locked(1, 12u + di_button,
@@ -14844,7 +15546,7 @@ static void collect_native_window_events(void)
                     pthread_mutex_lock(&g_input_mutex);
                     if (down && !(g_input.keys[vk] & 0x80)) g_input.pressed[vk] = 1;
                     g_input.mouse_buttons[2 + xb] = down ? 0x80 : 0;
-                    if (down) g_input.mouse_latch[2 + xb] = 1;
+                    if (down) g_input.mouse_presses[2 + xb]++;
                     g_input.keys[vk] = down ? 0x80 : 0;
                     if (top_level)
                         queue_dinput_event_locked(1, 12u + 2u + xb,
@@ -15003,8 +15705,9 @@ static void collect_native_window_events(void)
                 /* If focus was already granted synchronously during
                  * create_guest_window (WS_VISIBLE path), do not re-deliver
                  * WM_ACTIVATEAPP/WM_ACTIVATE/WM_SETFOCUS; just record state. */
-                if (!g_window_focused) {
+                if (!g_window_activated) {
                     g_window_focused = 1;
+                    g_window_activated = 1;
                     if (top_level) {
                         queue_window_message(0x001c, 1, 0);
                         queue_window_message(0x0086, 1, 0);
@@ -15020,6 +15723,7 @@ static void collect_native_window_events(void)
                 if (getenv("BEER_INPUT_DIAGNOSTICS"))
                     fprintf(stderr, "[INPUT] native focus out (was %d)\n", g_window_focused);
                 g_window_focused = 0;
+                g_window_activated = 0;
                 pthread_mutex_lock(&g_input_mutex);
                 memset(g_input.keys, 0, sizeof(g_input.keys));
                 memset(g_input.dik, 0, sizeof(g_input.dik));
@@ -15751,12 +16455,13 @@ impl_EnumDisplayMonitors(u64 hdc, void *clip, MonitorEnumProc proc, u64 data)
 }
 
 /* EnumDisplaySettingsW — reports a single fullscreen mode matching the screen */
-static u64 __attribute__((ms_abi))
-impl_EnumDisplaySettingsW(const u16 *device, u32 mode_num, u8 *devmode)
+/* DEVMODEA and DEVMODEW differ in the width of dmDeviceName/dmFormName, which shifts every later field:
+ *   A: dmSize@36 dmFields@40 dmPosition@44 dmBitsPerPel@104 dmPelsWidth@108 dmPelsHeight@112 dmDisplayFrequency@120 (156 bytes)
+ *   W: dmSize@68 dmFields@72 dmPosition@76 dmBitsPerPel@168 dmPelsWidth@172 dmPelsHeight@176 dmDisplayFrequency@184 (220 bytes)
+ * Mode numbers walk the same list DXGI exposes; ENUM_CURRENT_SETTINGS (-1) and ENUM_REGISTRY_SETTINGS (-2) report the
+ * desktop mode. */
+static u64 enum_display_settings(u32 mode_num, u8 *devmode, int wide)
 {
-    (void)device;
-    /* Mode numbers walk the same list DXGI exposes; ENUM_CURRENT_SETTINGS
-     * (-1) and ENUM_REGISTRY_SETTINGS (-2) report the desktop mode. */
     DxgiHostMode modes[64];
     const u32 mode_total = dxgi_host_modes(modes, 64);
     int sw = 1920, sh = 1080;
@@ -15772,22 +16477,33 @@ impl_EnumDisplaySettingsW(const u16 *device, u32 mode_num, u8 *devmode)
         return 0;
     }
     if (!devmode) return 0;
-    /* DEVMODEW is 220 bytes on Win64.  Zero it, fill key fields. */
-    memset(devmode, 0, 220);
-    /* dmSize at offset 36 (after dmDeviceName[32] + dmSpecVersion[2] +
-     * dmDriverVersion[2]); dmDriverExtra at offset 38 */
-    *(u16*)(devmode + 36) = 220; /* dmSize */
-    *(u16*)(devmode + 38) = 0;   /* dmDriverExtra */
-    /* dmFields at offset 40 */
-    *(u32*)(devmode + 40) = (1<<18)|(1<<19)|(1<<20)|(1<<22); /* DM_BITSPERPEL|PELSWIDTH|PELSHEIGHT|DISPLAYFREQUENCY */
-    /* dmBitsPerPel at offset 104, dmPelsWidth at 108, dmPelsHeight at 112,
-     * dmDisplayFrequency at 120 */
-    *(u32*)(devmode + 104) = 32;
-    *(u32*)(devmode + 108) = (u32)sw;
-    *(u32*)(devmode + 112) = (u32)sh;
-    *(u32*)(devmode + 120) = hz;
+    const char *device_name = "\\\\.\\DISPLAY1";
+    const u32 fields = (1u << 5) | (1u << 18) | (1u << 19) | (1u << 20) | (1u << 22);   /* POSITION|BITSPERPEL|PELSWIDTH|PELSHEIGHT|DISPLAYFREQUENCY */
+    if (wide) {
+        memset(devmode, 0, 220);
+        u16 *name = (u16 *)devmode;
+        for (int i = 0; device_name[i] && i < 31; ++i) name[i] = (u8)device_name[i];
+        *(u16 *)(devmode + 68) = 220;                 /* dmSize */
+        *(u32 *)(devmode + 72) = fields;
+        *(u32 *)(devmode + 168) = 32;
+        *(u32 *)(devmode + 172) = (u32)sw;
+        *(u32 *)(devmode + 176) = (u32)sh;
+        *(u32 *)(devmode + 184) = hz;
+    } else {
+        memset(devmode, 0, 156);
+        for (int i = 0; device_name[i] && i < 31; ++i) devmode[i] = (u8)device_name[i];
+        *(u16 *)(devmode + 36) = 156;                 /* dmSize */
+        *(u32 *)(devmode + 40) = fields;
+        *(u32 *)(devmode + 104) = 32;
+        *(u32 *)(devmode + 108) = (u32)sw;
+        *(u32 *)(devmode + 112) = (u32)sh;
+        *(u32 *)(devmode + 120) = hz;
+    }
     return 1;
 }
+static u64 __attribute__((ms_abi))
+impl_EnumDisplaySettingsW(const u16 *device, u32 mode_num, u8 *devmode)
+    { (void)device; return enum_display_settings(mode_num, devmode, 1); }
 /* DISPLAY_DEVICEW: one adapter (\\.\DISPLAY1, the host GPU) with one monitor. */
 static void display_device_text(u16 *dest, size_t capacity, const char *text)
 {
@@ -15856,7 +16572,7 @@ impl_EnumDisplayDevicesA(const char *device, u32 index, u8 *info, u32 flags)
 
 static u64 __attribute__((ms_abi))
 impl_EnumDisplaySettingsA(u64 device, u32 mode_num, u8 *devmode)
-    { return impl_EnumDisplaySettingsW((const u16*)(uintptr_t)device, mode_num, devmode); }
+    { (void)device; return enum_display_settings(mode_num, devmode, 0); }
 
 static u64 __attribute__((ms_abi))
 impl_SetWindowsHookExW(s32 type, u64 fn, u64 mod, u32 tid)
@@ -16022,6 +16738,7 @@ impl_ReleaseSemaphore(u64 h, u32 n, u32 *prev)
     g_sem_val[sid] = (u32)nv;
     if (n) pthread_cond_broadcast(&g_sem_cv[sid]);
     pthread_mutex_unlock(&g_sem_mtx[sid]);
+    if (n) wait_multi_notify();
     return 1;
 }
 
@@ -16514,7 +17231,7 @@ static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
     _exit((int)code);
 }
 static u64 __attribute__((ms_abi)) impl_TerminateProcess(u64 h, u32 code)
-    { (void)h; fprintf(stderr, "[IMPL] TerminateProcess(%u) -> terminating loader\n", code); dbg_dump_guest_callchain("TerminateProcess"); fflush(stderr); _exit((int)code); }
+    { if (beer_proc_terminate(h, code)) return 1; fprintf(stderr, "[IMPL] TerminateProcess(%u) -> terminating loader\n", code); dbg_dump_guest_callchain("TerminateProcess"); fflush(stderr); _exit((int)code); }
 /* Anti-debug probes that protection stubs run: a normal, undebugged Windows machine answers these
  * with "no debugger", success and zero. */
 static u64 __attribute__((ms_abi)) impl_CheckRemoteDebuggerPresent(u64 process, u32 *present)
@@ -16582,7 +17299,13 @@ impl_WriteFile(u64 h, const void *buf, u32 n, u32 *written, u64 ov)
     else if (h == (u64)(int64_t)-12 || h == (u64)(int64_t)-0xC) fd = STDERR_FILENO;
     else { fd = fh_get(h); }
     if (fd < 0) { if (written) *written = 0; return 0; }
+    if (beer_pipe_is_pipe(h)) {
+        if (!beer_pipe_ensure_connected(h)) { if (written) *written = 0; return 0; }
+        fd = fh_get(h);
+    }
     ssize_t r = write(fd, buf, n);
+    if (beer_pipe_is_pipe(h)) beer_pipe_dump("write", h, buf, r);
+    if (r < 0 && beer_pipe_is_pipe(h)) g_last_error = 232;      /* ERROR_NO_DATA: the other end is closing */
     if (written) *written = (u32)(r < 0 ? 0 : r);
     return r >= 0 ? 1 : 0;
 }
@@ -18302,6 +19025,7 @@ struct BeerDirectInputDevice {
     u32 key_offsets[256];
     int axis_absolute;     /* DIPROP_AXISMODE == DIPROPAXISMODE_ABS */
     s64 mouse_read[3];     /* g_input.mouse_total at this device's last poll */
+    u32 presses_seen[256]; /* g_input.dik_presses / mouse_presses at the last poll */
 };
 
 typedef struct {
@@ -18659,16 +19383,21 @@ static u64 __attribute__((ms_abi))
 beer_dinput_device_Acquire(BeerDirectInputDevice *self)
 {
     if (!self) return DIERR_INVALIDPARAM;
-    if (!beer_dinput_can_acquire(g_window_focused, self->cooperative_flags))
+    if (!beer_dinput_can_acquire(g_window_focused, self->cooperative_flags)) {
+        if (getenv("BEER_INPUT_DIAGNOSTICS"))
+            fprintf(stderr, "[DINPUT] Acquire kind=%d refused (window not focused, flags=0x%x)\n", self->kind, self->cooperative_flags);
         return DIERR_NOTACQUIRED;
+    }
     if (!self->acquired && self->kind == 1) {
         pthread_mutex_lock(&g_input_mutex);
         beer_dinput_mouse_baseline_locked(self);
         pthread_mutex_unlock(&g_input_mutex);
     }
     self->acquired = 1;
-    if (getenv("BEER_INPUT_DIAGNOSTICS"))
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
         fprintf(stderr, "[DINPUT] Acquire kind=%d\n", self->kind);
+        fprintf(stderr, "[DINPUT]   Acquire caller=%p\n", __builtin_return_address(0));
+    }
     return DI_OK;
 }
 
@@ -18713,9 +19442,10 @@ beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
     u8 polled_buttons[8], polled_keys[256];
     for (int b = 0; b < 8; ++b)
         polled_buttons[b] = g_input.mouse_buttons[b] |
-                            (g_input.mouse_latch[b] ? 0x80 : 0);
+                            (self->kind == 1 && g_input.mouse_presses[b] != self->presses_seen[b] ? 0x80 : 0);
     for (int k = 0; k < 256; ++k)
-        polled_keys[k] = g_input.dik[k] | (g_input.dik_latch[k] ? 0x80 : 0);
+        polled_keys[k] = g_input.dik[k] |
+                         (self->kind == 2 && g_input.dik_presses[k] != self->presses_seen[k] ? 0x80 : 0);
     if (self->kind == 1) {
         /* Every device of the same kind sees all motion since its own last
          * poll, as with real DirectInput (Sekiro opens four mice). */
@@ -18756,7 +19486,7 @@ beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
         g_input.delta_x = 0;
         g_input.delta_y = 0;
         g_input.wheel = 0;
-        memset(g_input.mouse_latch, 0, sizeof(g_input.mouse_latch));
+        memcpy(self->presses_seen, g_input.mouse_presses, sizeof(g_input.mouse_presses));
     } else if (self->kind == 2) {
         if (self->data_size)
             beer_dinput_write_keyboard_state(state, size, polled_keys,
@@ -18765,7 +19495,7 @@ beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
             u32 keys = size < sizeof(polled_keys) ? size : sizeof(polled_keys);
             memcpy(state, polled_keys, keys);
         }
-        memset(g_input.dik_latch, 0, sizeof(g_input.dik_latch));
+        memcpy(self->presses_seen, g_input.dik_presses, sizeof(g_input.dik_presses));
         if (getenv("BEER_INPUT_DIAGNOSTICS")) {
             char held[96] = {0};
             size_t used = 0;
@@ -18978,6 +19708,13 @@ beer_dinput_CreateDevice(BeerDirectInput *self, const void *guid,
     memcpy(&guid_data1, guid, sizeof(guid_data1));
     if (guid_data1 == 0x6f1d2b60u) device->kind = 1;
     else if (guid_data1 == 0x6f1d2b61u) device->kind = 2;
+    /* Presses made before the device existed are not reported to it. */
+    pthread_mutex_lock(&g_input_mutex);
+    if (device->kind == 1)
+        memcpy(device->presses_seen, g_input.mouse_presses, sizeof(g_input.mouse_presses));
+    else if (device->kind == 2)
+        memcpy(device->presses_seen, g_input.dik_presses, sizeof(g_input.dik_presses));
+    pthread_mutex_unlock(&g_input_mutex);
     *out = device;
     fprintf(stderr, "[DINPUT] CreateDevice -> %s device %p\n",
             device->kind == 1 ? "mouse" :
@@ -19771,11 +20508,60 @@ impl___acrt_iob_func(u32 index)
 }
 
 /* ---- Impl dispatch table ---- */
+#include "platform/win32_process.inc"
+#include "platform/win32_d3d9.inc"
+#include "platform/win32_display_config.inc"
+#include "platform/win32_nvapi.inc"
 #include "platform/win32_file_search.inc"
 #include "platform/win32_missing_exports.inc"
+static u64 __attribute__((ms_abi))
+impl_RegGetValueA(u64 key, const char *subkey, const char *value, u32 flags, u32 *type, void *data, u32 *size)
+{
+    return reg_get_value(key, subkey, value, flags, type, data, size, 0);
+}
+static u64 __attribute__((ms_abi))
+impl_RegGetValueW(u64 key, const u16 *subkey, const u16 *value, u32 flags, u32 *type, void *data, u32 *size)
+{
+    char sk[192], vn[96];
+    reg_narrow(subkey, sk, sizeof(sk));
+    reg_narrow(value, vn, sizeof(vn));
+    return reg_get_value(key, subkey ? sk : NULL, value ? vn : NULL, flags, type, data, size, 1);
+}
 #include "platform/win32_native_info.inc"
 #include "platform/win32_crypt32.inc"
 typedef struct { const char *name; ImplFn fn; } ImplEntry;
+
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004u
+#define STATUS_INVALID_INFO_CLASS 0xC0000003u
+#define STATUS_PORT_NOT_SET 0xC0000353u
+static u64 __attribute__((ms_abi)) impl_NtQueryInformationProcess(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned);
+static u64 __attribute__((ms_abi)) impl_NtQueryVirtualMemory(u64 process, void *base, u32 info_class, void *buffer, u64 length, u64 *returned);
+static u64 __attribute__((ms_abi)) impl_GetThreadGroupAffinity(u64 thread, u64 *affinity)
+{
+    (void)thread;
+    if (!affinity) return 0;
+    memset(affinity, 0, 16);                       /* GROUP_AFFINITY { KAFFINITY Mask; WORD Group; WORD Reserved[3]; } */
+    affinity[0] = win_processor_mask();
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_SetThreadGroupAffinity(u64 thread, const u64 *affinity, u64 *previous)
+{
+    (void)thread; (void)affinity;
+    if (previous) { memset(previous, 0, 16); previous[0] = win_processor_mask(); }
+    return 1;
+}
+/* NtOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID): the process itself yields the pseudo handle. */
+static u64 __attribute__((ms_abi)) impl_NtOpenProcess(u64 *handle, u32 access, void *attributes, const u64 *client_id)
+{
+    (void)access; (void)attributes;
+    if (!handle || !client_id) return 0xC000000Du;                   /* STATUS_INVALID_PARAMETER */
+    const u32 pid = (u32)client_id[0];
+    if (pid != (u32)getpid()) return 0xC0000022u;                    /* STATUS_ACCESS_DENIED */
+    *handle = (u64)-1;
+    return 0;
+}
+static u64 __attribute__((ms_abi)) impl_ReturnTrue(void) { return 1; }                        /* SetDefaultDllDirectories, SetThreadStackGuarantee */
+static u64 __attribute__((ms_abi)) impl_GetNativeSystemInfo(WIN_SYSTEM_INFO *info) { return impl_GetSystemInfo(info); }
 
 static ImplEntry g_impls[] = {
 #include "platform/win32_missing_exports_table.inc"
@@ -19829,6 +20615,7 @@ static ImplEntry g_impls[] = {
     {"VerifyVersionInfoW",                      (ImplFn)impl_VerifyVersionInfoW},
     {"RtlVerifyVersionInfo",                    (ImplFn)impl_RtlVerifyVersionInfo},
     {"RtlGetVersion",                           (ImplFn)impl_RtlGetVersion},
+    {"RtlGetNtVersionNumbers",                  (ImplFn)impl_RtlGetNtVersionNumbers},
     {"GetVersionExW",                           (ImplFn)impl_GetVersionExW},
     {"GetVersionExA",                           (ImplFn)impl_GetVersionExA},
     {"WinHttpCheckPlatform",                    (ImplFn)impl_WinHttpCheckPlatform},
@@ -19960,6 +20747,8 @@ static ImplEntry g_impls[] = {
     {"RegQueryValueExA",                       (ImplFn)impl_RegQueryValueExA},
     {"RegQueryValueExW",                       (ImplFn)impl_RegQueryValueExW},
     {"RegCloseKey",                            (ImplFn)impl_RegCloseKey},
+    {"RegGetValueA",                           (ImplFn)impl_RegGetValueA},
+    {"RegGetValueW",                           (ImplFn)impl_RegGetValueW},
     /* Security */
     {"InitializeSecurityDescriptor",          (ImplFn)impl_InitializeSecurityDescriptor},
     {"SetSecurityDescriptorDacl",             (ImplFn)impl_SetSecurityDescriptorDacl},
@@ -20020,6 +20809,10 @@ static ImplEntry g_impls[] = {
     {"CreateDXGIFactory2",                    (ImplFn)impl_CreateDXGIFactory2},
     /* WS2_32 */
     {"WSAStartup",                            (ImplFn)impl_WSAStartup},
+    {"getaddrinfo",                           (ImplFn)impl_getaddrinfo},
+    {"GetAddrInfoW",                          (ImplFn)impl_GetAddrInfoW},
+    {"freeaddrinfo",                          (ImplFn)impl_freeaddrinfo},
+    {"FreeAddrInfoW",                         (ImplFn)impl_freeaddrinfo},
     {"WSACleanup",                            (ImplFn)impl_WSACleanup},
     {"WSAGetLastError",                       (ImplFn)impl_WSAGetLastError},
     {"WSASetLastError",                       (ImplFn)impl_WSASetLastError},
@@ -20074,6 +20867,9 @@ static ImplEntry g_impls[] = {
     {"TaskDialogIndirect",                    (ImplFn)impl_TaskDialogIndirect},
     {"RoGetActivationFactory",                (ImplFn)impl_RoGetActivationFactory},
     {"ReadConsoleW",                          (ImplFn)impl_ReadConsoleW},
+    {"SwitchToThread",                        (ImplFn)impl_SwitchToThread},
+    {"PropVariantClear",                      (ImplFn)impl_PropVariantClear},
+    {"PropVariantToStringAlloc",              (ImplFn)impl_PropVariantToStringAlloc},
     {"ReadConsoleA",                          (ImplFn)impl_ReadConsoleA},
     {"WindowsCreateString",                   (ImplFn)impl_WindowsCreateString},
     {"WindowsCreateStringReference",          (ImplFn)impl_WindowsCreateStringReference},
@@ -20117,6 +20913,45 @@ static ImplEntry g_impls[] = {
     {"SetupDiGetDeviceRegistryPropertyW",     (ImplFn)impl_SetupDiGetDeviceRegistryPropertyW},
     {"SetupDiDestroyDeviceInfoList",          (ImplFn)impl_SetupDiDestroyDeviceInfoList},
     {"GlobalMemoryStatusEx",                  (ImplFn)impl_GlobalMemoryStatusEx},
+    {"Direct3DCreate9",                       (ImplFn)impl_Direct3DCreate9},
+    {"Direct3DCreate9Ex",                     (ImplFn)impl_Direct3DCreate9Ex},
+    {"CreateProcessA",                        (ImplFn)beer_CreateProcessA},
+    {"K32EnumProcessModules", (ImplFn)beer_K32EnumProcessModules},
+    {"EnumProcessModules", (ImplFn)beer_K32EnumProcessModules},
+    {"K32EnumProcessModulesEx", (ImplFn)beer_K32EnumProcessModulesEx},
+    {"EnumProcessModulesEx", (ImplFn)beer_K32EnumProcessModulesEx},
+    {"K32GetModuleFileNameExA", (ImplFn)beer_K32GetModuleFileNameExA},
+    {"GetModuleFileNameExA", (ImplFn)beer_K32GetModuleFileNameExA},
+    {"K32GetModuleFileNameExW", (ImplFn)beer_K32GetModuleFileNameExW},
+    {"GetModuleFileNameExW", (ImplFn)beer_K32GetModuleFileNameExW},
+    {"K32GetModuleBaseNameA", (ImplFn)beer_K32GetModuleBaseNameA},
+    {"GetModuleBaseNameA", (ImplFn)beer_K32GetModuleBaseNameA},
+    {"K32GetModuleBaseNameW", (ImplFn)beer_K32GetModuleBaseNameW},
+    {"GetModuleBaseNameW", (ImplFn)beer_K32GetModuleBaseNameW},
+    {"QueryFullProcessImageNameA", (ImplFn)beer_QueryFullProcessImageNameA},
+    {"QueryFullProcessImageNameW", (ImplFn)beer_QueryFullProcessImageNameW},
+    {"K32GetProcessImageFileNameA", (ImplFn)beer_K32GetProcessImageFileNameA},
+    {"GetProcessImageFileNameA", (ImplFn)beer_K32GetProcessImageFileNameA},
+    {"K32GetProcessImageFileNameW", (ImplFn)beer_K32GetProcessImageFileNameW},
+    {"GetProcessImageFileNameW", (ImplFn)beer_K32GetProcessImageFileNameW},
+    {"CreateProcessW",                        (ImplFn)beer_CreateProcessW},
+    {"GetProcessId",                          (ImplFn)beer_GetProcessId},
+    {"CreateToolhelp32Snapshot",              (ImplFn)beer_CreateToolhelp32Snapshot},
+    {"Thread32First",                         (ImplFn)beer_Thread32First},
+    {"Thread32Next",                          (ImplFn)beer_Thread32Next},
+    {"Process32First",                        (ImplFn)beer_Process32First},
+    {"Process32Next",                         (ImplFn)beer_Process32Next},
+    {"Process32FirstW",                       (ImplFn)beer_Process32FirstW},
+    {"Process32NextW",                        (ImplFn)beer_Process32NextW},
+    {"CreateNamedPipeA",                      (ImplFn)beer_CreateNamedPipeA},
+    {"CreateNamedPipeW",                      (ImplFn)beer_CreateNamedPipeW},
+    {"ConnectNamedPipe",                      (ImplFn)beer_ConnectNamedPipe},
+    {"DisconnectNamedPipe",                   (ImplFn)beer_DisconnectNamedPipe},
+    {"WaitNamedPipeA",                        (ImplFn)beer_WaitNamedPipeA},
+    {"WaitNamedPipeW",                        (ImplFn)beer_WaitNamedPipeW},
+    {"PeekNamedPipe",                         (ImplFn)beer_PeekNamedPipe},
+    {"SetNamedPipeHandleState",               (ImplFn)beer_SetNamedPipeHandleState},
+    {"GetPhysicallyInstalledSystemMemory",    (ImplFn)impl_GetPhysicallyInstalledSystemMemory},
     {"GetTimeZoneInformation",               (ImplFn)impl_GetTimeZoneInformation},
     /* Time */
     {"GetLocalTime",                          (ImplFn)impl_GetLocalTime},
@@ -20137,7 +20972,13 @@ static ImplEntry g_impls[] = {
     /* Shell */
     {"SHGetFolderPathW",                      (ImplFn)impl_SHGetFolderPathW},
     {"SHGetFolderPathA",                      (ImplFn)impl_SHGetFolderPathA},
+    {"SHGetSpecialFolderPathW",               (ImplFn)impl_SHGetSpecialFolderPathW},
+    {"SHGetSpecialFolderPathA",               (ImplFn)impl_SHGetSpecialFolderPathA},
     {"SHGetKnownFolderPath",                  (ImplFn)impl_SHGetKnownFolderPath},
+    {"WinVerifyTrust",                        (ImplFn)impl_WinVerifyTrust},
+    {"ShellExecuteA",                             (ImplFn)impl_ShellExecuteA},
+    {"ShellExecuteW",                             (ImplFn)impl_ShellExecuteW},
+    {"ShellExecuteExA",                           (ImplFn)impl_ShellExecuteExA},
     {"CoTaskMemFree",                         (ImplFn)impl_CoTaskMemFree},
     /* COM */
     {"CoInitialize",                          (ImplFn)impl_CoInitialize},
@@ -20146,6 +20987,7 @@ static ImplEntry g_impls[] = {
     {"CoUninitialize",                        (ImplFn)impl_CoUninitialize},
     {"CoCreateGuid",                          (ImplFn)impl_CoCreateGuid},
     {"CoCreateInstance",                      (ImplFn)impl_CoCreateInstance},
+    {"CoSetProxyBlanket",                         (ImplFn)impl_CoSetProxyBlanket},
     /* Media Foundation: typed, output-clearing boundaries. */
     {"MFStartup",                             (ImplFn)beer_mf_startup},
     {"MFShutdown",                            (ImplFn)beer_mf_shutdown},
@@ -20237,7 +21079,15 @@ static ImplEntry g_impls[] = {
     {"TerminateProcess",                      (ImplFn)impl_TerminateProcess},
     {"FatalAppExitW",                          (ImplFn)impl_FatalAppExitW},
     {"GetSystemInfo",                         (ImplFn)impl_GetSystemInfo},
-    {"GetNativeSystemInfo",                   (ImplFn)impl_GetSystemInfo},
+    {"GetNativeSystemInfo",                   (ImplFn)impl_GetNativeSystemInfo},
+    {"GetThreadGroupAffinity",                (ImplFn)impl_GetThreadGroupAffinity},
+    {"SetThreadGroupAffinity",                (ImplFn)impl_SetThreadGroupAffinity},
+    {"NtOpenProcess",                         (ImplFn)impl_NtOpenProcess},
+    {"ZwOpenProcess",                         (ImplFn)impl_NtOpenProcess},
+    {"SetDefaultDllDirectories",              (ImplFn)impl_ReturnTrue},
+    {"SetThreadStackGuarantee",               (ImplFn)impl_ReturnTrue},
+    {"ZwQueryVirtualMemory",                  (ImplFn)impl_NtQueryVirtualMemory},
+    {"ZwQueryInformationProcess",             (ImplFn)impl_NtQueryInformationProcess},
     {"GetVersion",                            (ImplFn)impl_GetVersion},
     {"GetCommandLineA",                       (ImplFn)impl_GetCommandLineA},
     {"GetVolumePathNameW",                    (ImplFn)impl_GetVolumePathNameW},
@@ -20320,6 +21170,8 @@ static ImplEntry g_impls[] = {
     {"FormatMessageW",                        (ImplFn)impl_FormatMessageW},
     /* Window placeholders */
     {"RegisterClassExA",                      (ImplFn)impl_RegisterClassExA},
+    {"RegisterClassA",                        (ImplFn)impl_RegisterClassA},
+    {"RegisterClassW",                        (ImplFn)impl_RegisterClassW},
     {"RegisterClassExW",                      (ImplFn)impl_RegisterClassExW},
     {"RegisterDeviceNotificationA",           (ImplFn)impl_RegisterDeviceNotificationA},
     {"RegisterDeviceNotificationW",           (ImplFn)impl_RegisterDeviceNotificationW},
@@ -20363,9 +21215,6 @@ static ImplEntry g_impls[] = {
     {"GetCurrentThread",                      (ImplFn)impl_GetCurrentThread},
     {"GetExitCodeThread",                     (ImplFn)impl_GetExitCodeThread},
     {"DuplicateHandle",                       (ImplFn)impl_DuplicateHandle},
-    {"CreateToolhelp32Snapshot",               (ImplFn)impl_CreateToolhelp32Snapshot},
-    {"Thread32First",                          (ImplFn)impl_Thread32First},
-    {"Thread32Next",                           (ImplFn)impl_Thread32Next},
     {"SuspendThread",                         (ImplFn)impl_SuspendThread},
     {"ResumeThread",                          (ImplFn)impl_ResumeThread},
     {"SetThreadPriority",                     (ImplFn)impl_SetThreadPriority},
@@ -20440,12 +21289,39 @@ static ImplEntry g_impls[] = {
     {"RtlFreeUnicodeString",                  (ImplFn)impl_RtlFreeUnicodeString},
     {"WriteFile",                             (ImplFn)impl_WriteFile},
     {"FlushFileBuffers",                      (ImplFn)impl_FlushFileBuffers},
-    {"FlushViewOfFile",                       (ImplFn)impl_FlushViewOfFile},
     {"GetFileInformationByHandle",            (ImplFn)impl_GetFileInformationByHandle},
     {"GetFileTime",                           (ImplFn)impl_GetFileTime},
     {"CompareFileTime",                       (ImplFn)impl_CompareFileTime},
     {"GetFileSize",                           (ImplFn)impl_GetFileSize},
     {"GetFileSizeEx",                         (ImplFn)impl_GetFileSizeEx},
+    {"CreateFileMappingA",                        (ImplFn)impl_CreateFileMappingA},
+    {"CreateFileMappingW",                        (ImplFn)impl_CreateFileMappingW},
+    {"OpenFileMappingA",                          (ImplFn)impl_OpenFileMappingA},
+    {"OpenFileMappingW",                          (ImplFn)impl_OpenFileMappingW},
+    {"MapViewOfFile",                             (ImplFn)impl_MapViewOfFile},
+    {"MapViewOfFileEx",                           (ImplFn)impl_MapViewOfFileEx},
+    {"UnmapViewOfFile",                           (ImplFn)impl_UnmapViewOfFile},
+    {"FlushViewOfFile",                           (ImplFn)impl_FlushViewOfFile},
+    {"DuplicateToken",                            (ImplFn)impl_DuplicateToken},
+    {"DuplicateTokenEx",                          (ImplFn)impl_DuplicateTokenEx},
+    {"GetFileSecurityW",                          (ImplFn)impl_GetFileSecurityW},
+    {"GetFileSecurityA",                          (ImplFn)impl_GetFileSecurityA},
+    {"AccessCheck",                               (ImplFn)impl_AccessCheck},
+    {"MapGenericMask",                            (ImplFn)impl_MapGenericMask},
+    {"CreatePipe",                                (ImplFn)impl_CreatePipe},
+    {"SetHandleInformation",                      (ImplFn)impl_SetHandleInformation},
+    {"CreateTimerQueue",                          (ImplFn)impl_CreateTimerQueue},
+    {"CreateTimerQueueTimer",                     (ImplFn)impl_CreateTimerQueueTimer},
+    {"DeleteTimerQueueTimer",                     (ImplFn)impl_DeleteTimerQueueTimer},
+    {"DeleteTimerQueueEx",                        (ImplFn)impl_DeleteTimerQueueEx},
+    {"GetOverlappedResult",                       (ImplFn)impl_GetOverlappedResult},
+    {"GetOverlappedResultEx",                     (ImplFn)impl_GetOverlappedResultEx},
+    {"CancelIo",                                  (ImplFn)impl_CancelIo},
+    {"CancelIoEx",                                (ImplFn)impl_CancelIoEx},
+    {"GetFileInformationByHandleExW",             (ImplFn)impl_GetFileInformationByHandleEx},
+    {"SetFileInformationByHandleW",               (ImplFn)impl_SetFileInformationByHandle},
+    {"WakeByAddressSingle",                       (ImplFn)impl_WakeByAddressSingle},
+    {"WakeByAddressAll",                          (ImplFn)impl_WakeByAddressAll},
     {"SetFilePointer",                        (ImplFn)impl_SetFilePointer},
     {"SetFilePointerEx",                      (ImplFn)impl_SetFilePointerEx},
     {"SetEndOfFile",                          (ImplFn)impl_SetEndOfFile},
@@ -20492,6 +21368,39 @@ static ImplEntry g_impls[] = {
     {"LoadCursorA",                           (ImplFn)impl_LoadCursorA},
     {"AdjustWindowRect",                      (ImplFn)impl_AdjustWindowRect},
     {"AdjustWindowRectEx",                    (ImplFn)impl_AdjustWindowRectEx},
+    {"AdjustWindowRectExForDpi",              (ImplFn)impl_AdjustWindowRectExForDpi},
+    {"UuidCreate",                            (ImplFn)impl_UuidCreate},
+    {"UuidCreateSequential",                  (ImplFn)impl_UuidCreate},
+    {"GetSystemDefaultLocaleName",            (ImplFn)impl_GetSystemDefaultLocaleName},
+    {"GetSystemDefaultUILanguage",            (ImplFn)impl_GetSystemDefaultUILanguage},
+    {"OpenProcessToken",                      (ImplFn)impl_OpenProcessToken},
+    {"LookupPrivilegeValueA",                 (ImplFn)impl_LookupPrivilegeValue},
+    {"LookupPrivilegeValueW",                 (ImplFn)impl_LookupPrivilegeValue},
+    {"AdjustTokenPrivileges",                 (ImplFn)impl_AdjustTokenPrivileges},
+    {"GetCursorInfo",                         (ImplFn)impl_GetCursorInfo},
+    {"EventRegister",                         (ImplFn)impl_EventRegister},
+    {"HeapSetInformation",                    (ImplFn)impl_ReturnTrue},
+    {"SetHandleCount",                        (ImplFn)impl_ReturnTrue},
+    {"SetRect",                               (ImplFn)impl_SetRect},
+    {"SetRectEmpty",                          (ImplFn)impl_SetRectEmpty},
+    {"CopyRect",                              (ImplFn)impl_CopyRect},
+    {"OffsetRect",                            (ImplFn)impl_OffsetRect},
+    {"InflateRect",                           (ImplFn)impl_InflateRect},
+    {"IsRectEmpty",                           (ImplFn)impl_IsRectEmpty},
+    {"EqualRect",                             (ImplFn)impl_EqualRect},
+    {"PtInRect",                              (ImplFn)impl_PtInRect},
+    {"IntersectRect",                         (ImplFn)impl_IntersectRect},
+    {"UnionRect",                             (ImplFn)impl_UnionRect},
+    {"GetDpiForSystem",                       (ImplFn)impl_GetDpiForSystem},
+    {"GetDpiForWindow",                       (ImplFn)impl_GetDpiForWindow},
+    {"EnableNonClientDpiScaling",             (ImplFn)impl_DpiSuccess},
+    {"SetProcessDPIAware",                    (ImplFn)impl_DpiSuccess},
+    {"SetProcessDpiAwarenessContext",         (ImplFn)impl_DpiSuccess},
+    {"SetProcessDpiAwareness",                (ImplFn)impl_DpiHresultOk},
+    {"SetDialogControlDpiChangeBehavior",     (ImplFn)impl_DpiSuccess},
+    {"SetDialogDpiChangeBehavior",            (ImplFn)impl_DpiSuccess},
+    {"GetThreadDpiAwarenessContext",          (ImplFn)impl_GetThreadDpiAwarenessContext},
+    {"AreDpiAwarenessContextsEqual",          (ImplFn)impl_AreDpiAwarenessContextsEqual},
     {"CreateWindowExW",                       (ImplFn)impl_CreateWindowExW},
     {"CreateWindowExA",                       (ImplFn)impl_CreateWindowExA},
     {"DestroyWindow",                         (ImplFn)impl_DestroyWindow},
@@ -20642,6 +21551,11 @@ static ImplEntry g_impls[] = {
     {"GetWindowDisplayAffinity",              (ImplFn)impl_GetWindowDisplayAffinity},
     {"EnumDisplayMonitors",                   (ImplFn)impl_EnumDisplayMonitors},
     {"EnumDisplayDevicesW",                   (ImplFn)impl_EnumDisplayDevicesW},
+    {"GetDisplayConfigBufferSizes",           (ImplFn)impl_GetDisplayConfigBufferSizes},
+    {"QueryDisplayConfig",                    (ImplFn)impl_QueryDisplayConfig},
+    {"DisplayConfigGetDeviceInfo",            (ImplFn)impl_DisplayConfigGetDeviceInfo},
+    {"DisplayConfigSetDeviceInfo",            (ImplFn)impl_DisplayConfigSetDeviceInfo},
+    {"GetDpiForMonitor",                      (ImplFn)impl_GetDpiForMonitor},
     {"nvapi_QueryInterface",                  (ImplFn)impl_nvapi_QueryInterface},
     {"EnumDisplayDevicesA",                   (ImplFn)impl_EnumDisplayDevicesA},
     {"EnumDisplaySettingsW",                  (ImplFn)impl_EnumDisplaySettingsW},
@@ -20717,6 +21631,13 @@ static ImplEntry g_impls[] = {
     {"FreeLibraryWhenCallbackReturns",        (ImplFn)impl_FreeLibraryWhenCallbackReturns},
     /* Events (extended) */
     {"CreateEventExW",                        (ImplFn)impl_CreateEventExW},
+    {"CreateWaitableTimerA",                  (ImplFn)impl_CreateWaitableTimerW},
+    {"CreateWaitableTimerW",                  (ImplFn)impl_CreateWaitableTimerW},
+    {"CreateWaitableTimerExA",                (ImplFn)impl_CreateWaitableTimerExW},
+    {"CreateWaitableTimerExW",                (ImplFn)impl_CreateWaitableTimerExW},
+    {"SetWaitableTimer",                      (ImplFn)impl_SetWaitableTimer},
+    {"SetWaitableTimerEx",                    (ImplFn)impl_SetWaitableTimerEx},
+    {"CancelWaitableTimer",                   (ImplFn)impl_CancelWaitableTimer},
     /* Package identity */
     {"GetCurrentPackageId",                   (ImplFn)impl_GetCurrentPackageId},
     /* Stack trace */
@@ -21040,6 +21961,17 @@ static void fake_pe_exports_build(void)
         if (find_impl(name)) fake_pe_add_export(kernel32, name, capacity);
     }
 
+    /* Code that resolves Kernel32/KernelBase functions itself (export walks, by-hash lookups in protected games)
+     * finds every routine Beer implements under the names the real modules export, not only the ones this
+     * executable happens to import statically. */
+    FakePeModule *kernelbase_module = fake_pe_module_from_base(HMOD_KBASE);
+    for (size_t i = 0; i < sizeof(g_kernel32_export_names) / sizeof(*g_kernel32_export_names); ++i) {
+        const char *name = g_kernel32_export_names[i];
+        if (!name || !find_impl(name)) continue;
+        fake_pe_add_export(kernel32, name, capacity);
+        if (!fake_pe_native_export_name(name)) fake_pe_add_export(kernelbase_module, name, capacity);
+    }
+
     for (size_t m = 0; m < sizeof(g_fake_pe_modules) / sizeof(*g_fake_pe_modules); ++m) {
         FakePeModule *module = &g_fake_pe_modules[m];
         qsort(module->exports, module->export_count, sizeof(*module->exports), fake_pe_name_cmp);
@@ -21091,27 +22023,30 @@ static void fake_pe_exports_build(void)
 
             u8 *stub = p + stubs + emitted * FAKE_PE_STUB_SLOT;
             memset(stub, 0xCC, FAKE_PE_STUB_SLOT);
-            /* ntdll's Nt and Zw exports are native system-call stubs, as on Windows. Protected
-             * executables read the service number from these bytes, in this image or a file view
-             * of it, and execute SYSCALL themselves. platform/win32_syscall.c routes both paths to
-             * the same Beer implementation. */
-            if (module->base == HMOD_NTDLL && g_win32_syscalls &&
-                beer_win32_syscall_is_service_name(name)) {
-                int number = beer_win32_syscall_register(name, (BeerWin32SyscallFn)find_impl(name));
-                if (number >= 0 &&
-                    beer_win32_syscall_write_stub(stub, FAKE_PE_STUB_SLOT, (u32)number)) {
-                    *(u32 *)(p + funcs + emitted * 4) = stubs + (u32)(emitted * FAKE_PE_STUB_SLOT);
-                    continue;
-                }
-            }
             /* Calls from guest code must cross the normal dispatcher thunk; jumping directly to
              * a host C implementation would run it on the guest stack and bypass trace/context
              * setup. fake_pe_ready remains false during construction, so this lookup cannot
              * recurse back into the export image being built. */
             u64 target = impl_GetProcAddress(module->base, name);
             if (!target) target = (u64)win_export_stub_zero;
-            stub[0] = 0x48; stub[1] = 0xB8; *(u64 *)(stub + 2) = target;
-            stub[10] = 0xFF; stub[11] = 0xE0;
+            int service = module->base == HMOD_NTDLL && beer_win32_syscall_is_service_name(name)
+                        ? beer_win32_syscall_register(name, (BeerWin32SyscallFn)find_impl(name)) : -1;
+            if (service >= 0) {
+                /* Windows syscall stub prefix: code that bypasses hooks reads the service number at +4 and
+                 * issues `syscall` itself (served by win32_syscall.c). Known services carry the number of
+                 * the Windows build Beer reports, so tables of hard-coded numbers agree with ntdll. */
+                stub[0] = 0x4C; stub[1] = 0x8B; stub[2] = 0xD1;                       /* mov r10, rcx */
+                stub[3] = 0xB8; *(u32 *)(stub + 4) = (u32)service;                     /* mov eax, service */
+                stub[8] = 0x48; stub[9] = 0xB8; *(u64 *)(stub + 10) = target;          /* mov rax, imm64 */
+                stub[18] = 0xFF; stub[19] = 0xE0;                                      /* jmp rax */
+            } else {
+                /* A bare "mov rax, imm64; jmp rax" at an export is what a detour hook looks like: protection code
+                 * that walks ntdll/kernel32 exports follows it, sees a target outside the module and reports
+                 * tampering. The leading two-byte nop keeps the stub from matching that pattern. */
+                stub[0] = 0x66; stub[1] = 0x90;                                        /* xchg ax, ax */
+                stub[2] = 0x48; stub[3] = 0xB8; *(u64 *)(stub + 4) = target;           /* mov rax, imm64 */
+                stub[12] = 0xFF; stub[13] = 0xE0;                                      /* jmp rax */
+            }
             *(u32 *)(p + funcs + emitted * 4) = stubs + (u32)(emitted * FAKE_PE_STUB_SLOT);
         }
         module->export_count = emitted;
@@ -21324,7 +22259,10 @@ static void pe_load(const char *path)
            preferred, imgsz, nt->opt.entry_rva, nt->file.nsections);
 
     /* ── map image memory ── */
-    g_img = mmap((void *)preferred, imgsz,
+    /* BEER_EXE_BASE=<hex> loads the executable at another address (relocated), like ASLR does on Windows. */
+    u64 wanted_base = preferred;
+    if (getenv("BEER_EXE_BASE")) wanted_base = strtoull(getenv("BEER_EXE_BASE"), NULL, 16) & ~0xffffull;
+    g_img = mmap((void *)wanted_base, imgsz,
                  PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                  -1, 0);
@@ -21335,7 +22273,7 @@ static void pe_load(const char *path)
         if (g_img == MAP_FAILED) die("mmap(image): %s", strerror(errno));
         printf("[PE]  Preferred base busy; loaded at 0x%lx (need relocs)\n", (u64)g_img);
     } else {
-        printf("[PE]  Mapped at preferred base 0x%lx\n", (u64)g_img);
+        printf("[PE]  Mapped at %s base 0x%lx\n", wanted_base == preferred ? "preferred" : "requested", (u64)g_img);
     }
     g_delta = (u64)g_img - preferred;
 
@@ -21390,6 +22328,7 @@ static void pe_load(const char *path)
                 p += blk->block_sz;
             }
             printf("[PE]  %u reloc entries patched (delta=+0x%lx)\n", npatched, g_delta);
+            nt2->opt.imagebase = (u64)g_img;       /* the Windows loader records the real base in the header */
         } else {
             fprintf(stderr, "[WARN] No reloc table — image may malfunction at non-preferred base\n");
         }
@@ -21431,23 +22370,17 @@ guest_oodle_decompress_trace(const void *compressed, s64 compressed_size,
     return result;
 }
 
-static u64 guest_dll_export_ordinal(GuestDll *dll, u16 requested_ordinal)
+static u64 guest_dll_export_by_ordinal(GuestDll *dll, u32 ordinal)
 {
     if (!dll || !dll->image) return 0;
     NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
     DataDir *dir = &nt->opt.dirs[0];
     if (!dir->size || !guest_dll_rva_valid(dll, dir->rva, sizeof(ExportDir))) return 0;
     ExportDir *exports = (ExportDir *)(dll->image + dir->rva);
-    if (requested_ordinal < exports->ordinal_base) return 0;
-    u32 index = (u32)requested_ordinal - exports->ordinal_base;
-    if (index >= exports->function_count ||
-        !guest_dll_rva_valid(dll, exports->functions_rva,
-                             (size_t)exports->function_count * sizeof(u32)))
-        return 0;
-    u32 rva = ((u32 *)(dll->image + exports->functions_rva))[index];
-    if (!rva || (rva >= dir->rva && rva < dir->rva + dir->size) ||
-        !guest_dll_rva_valid(dll, rva, 1))
-        return 0;
+    if (ordinal < exports->ordinal_base || ordinal - exports->ordinal_base >= exports->function_count) return 0;
+    if (!guest_dll_rva_valid(dll, exports->functions_rva, (size_t)exports->function_count * sizeof(u32))) return 0;
+    u32 rva = ((u32 *)(dll->image + exports->functions_rva))[ordinal - exports->ordinal_base];
+    if (!rva || (rva >= dir->rva && rva < dir->rva + dir->size) || !guest_dll_rva_valid(dll, rva, 1)) return 0;
     return (u64)(dll->image + rva);
 }
 
@@ -21483,6 +22416,60 @@ static u64 guest_dll_export(GuestDll *dll, const char *name)
         return (u64)(dll->image + rva);
     }
     return 0;
+}
+
+/* One function, one address: on Windows an import slot holds the exporting module's own export address, the
+ * same one GetProcAddress returns, and inline-hooking modules (cracks, anti-cheat) patch that address expecting
+ * every caller to pass through it.  Beer's fake system DLLs export stubs that jump to the dispatch thunks, so once
+ * those images exist, import slots that still hold a thunk are pointed at the matching export.  (RDR2's 1911.dll
+ * hooks kernel32 exports this way; with the slots left on the thunks its hooks never ran -> "Social Club error".) */
+static u64 fake_pe_base_for_import(const char *lower)
+{
+    if (!strcmp(lower, "kernel32.dll")) return HMOD_K32;
+    if (!strcmp(lower, "kernelbase.dll")) return HMOD_KBASE;
+    if (!strcmp(lower, "ntdll.dll")) return HMOD_NTDLL;
+    if (!strcmp(lower, "user32.dll")) return HMOD_USER32;
+    if (!strcmp(lower, "advapi32.dll")) return HMOD_ADVAPI;
+    if (!strcmp(lower, "win32u.dll")) return HMOD_WIN32U;
+    if (!strncmp(lower, "api-ms-win-core-", 16) || !strncmp(lower, "ext-ms-win-", 11)) return HMOD_KBASE;
+    return 0;
+}
+
+static void fake_pe_rebind_imports(u8 *image)
+{
+    if (!image || !g_tramp) return;
+    fake_pe_exports_build();                 /* the export images must exist; imports are resolved by now */
+    if (!g_fake_pe_ready) return;
+    NtHdrs64 *nt = (NtHdrs64 *)(image + ((DosHdr *)image)->lfanew);
+    DataDir *dir = &nt->opt.dirs[DIR_IMPORT];
+    if (!dir->rva || !dir->size) return;
+    int mem = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+    if (mem < 0) return;
+    unsigned rebound = 0;
+    for (ImportDesc *d = (ImportDesc *)(image + dir->rva); d->name_rva; ++d) {
+        char lower[64];
+        lowercase_dll_basename((const char *)(image + d->name_rva), lower, sizeof(lower));
+        const u64 module = fake_pe_base_for_import(lower);
+        if (!module || !d->iat_rva) continue;
+        u64 *iat = (u64 *)(image + d->iat_rva);
+        for (size_t i = 0; iat[i]; ++i) {
+            if (iat[i] < (u64)(uintptr_t)g_tramp || iat[i] >= (u64)(uintptr_t)g_tramp + g_trampsz) continue;
+            /* The slot holds a dispatcher thunk, whose index names the import ("dll!name"). The descriptor's
+             * name table cannot be used: without OriginalFirstThunk it is this IAT, already overwritten. */
+            const u64 index = (iat[i] - (u64)(uintptr_t)g_tramp) / THUNK_SZ;
+            const char *label = index < (u64)g_nstubs ? g_snames[index] : NULL;
+            const char *bang = label ? strchr(label, '!') : NULL;
+            if (!bang || bang[1] == '#') continue;                                  /* by ordinal */
+            const char *name = bang + 1;
+            u64 exported = fake_pe_export_address(module, name);
+            if (!exported && module == HMOD_KBASE) exported = fake_pe_export_address(HMOD_K32, name);
+            if (!exported) continue;
+            if (pwrite(mem, &exported, sizeof(exported), (off_t)(uintptr_t)&iat[i]) == (ssize_t)sizeof(exported)) ++rebound;
+        }
+    }
+    close(mem);
+    if (rebound && getenv("BEER_DLL_DIAGNOSTICS"))
+        fprintf(stderr, "[PE] %u import slots of image %p now hold the system DLLs' export addresses\n", rebound, (void *)image);
 }
 
 static void guest_dll_resolve_imports(GuestDll *dll)
@@ -21529,8 +22516,15 @@ static void guest_dll_resolve_imports(GuestDll *dll)
             GuestDll *dependency_dll = NULL;
             if (api_set_contract) {
                 if (!implementation && !strncmp(dependency_lower,
-                                                "api-ms-win-crt-", 15))
+                                                "api-ms-win-crt-", 15)) {
                     dependency_dll = guest_dll_find("ucrtbase.dll");
+                    /* A bundled C++ runtime pulled in by a game DLL (not by the exe) needs its UCRT too. */
+                    if (!dependency_dll && !g_loading_ucrtbase) {
+                        g_loading_ucrtbase = 1;
+                        dependency_dll = guest_dll_load("ucrtbase.dll");
+                        g_loading_ucrtbase = 0;
+                    }
+                }
             } else {
                 dependency_dll = guest_dll_find(dependency);
                 if (!dependency_dll)
@@ -21568,6 +22562,10 @@ static void guest_dll_resolve_imports(GuestDll *dll)
             ++g_nstubs;
         }
     }
+    /* DLLs loaded after start-up: same addresses as GetProcAddress. During start-up the export images do
+     * not exist yet (building them now would freeze them before the executable's imports are known); the
+     * start-up pass in setup_teb_peb rebinds the executable and every DLL loaded so far. */
+    if (g_fake_pe_ready) fake_pe_rebind_imports(dll->image);
 }
 
 static GuestDll *guest_dll_finish(GuestDll *dll);
@@ -21762,17 +22760,13 @@ static u64 call_guest_nested(GuestNtCall fn, u64 a0, u64 a1, u64 a2, u64 a3, u64
 static GuestNtCall hooked_ntdll(const char *name)
 {
     u64 address = fake_pe_export_address(HMOD_NTDLL, name);
-    if (!address) return NULL;
-    if (g_win32_syscalls && beer_win32_syscall_is_service_name(name)) {
-        /* An unmodified export is exactly the system-call stub Beer generated. */
-        u8 original[BEER_WIN32_SYSCALL_STUB_SIZE];
-        int number = beer_win32_syscall_register(name, NULL);
-        if (number >= 0 && beer_win32_syscall_write_stub(original, sizeof(original), (u32)number) &&
-            !memcmp((const void *)(uintptr_t)address, original, sizeof(original)))
-            return NULL;
-    } else if (*(const u8 *)address == 0x48) {
-        return NULL;   /* unmodified jump stub starts with mov rax,imm64 */
-    }
+    const u8 *stub = (const u8 *)address;
+    /* An unmodified stub is one fake_pe_exports_build wrote: "xchg ax,ax; mov rax,imm64; jmp rax", or for Nt/Zw
+     * exports "mov r10,rcx; mov eax,ssn; mov rax,imm64; jmp rax". */
+    if (!address || (stub[0] == 0x66 && stub[1] == 0x90 && stub[2] == 0x48 && stub[3] == 0xB8 && stub[12] == 0xFF && stub[13] == 0xE0) ||
+        (stub[0] == 0x4C && stub[1] == 0x8B && stub[2] == 0xD1 && stub[3] == 0xB8 && stub[8] == 0x48 && stub[9] == 0xB8 &&
+         stub[18] == 0xFF && stub[19] == 0xE0))
+        return NULL;
     return (GuestNtCall)(uintptr_t)address;
 }
 
@@ -22032,8 +23026,29 @@ static u64 virtual_fs_load_library(const char *name)
     return loaded ? (u64)(uintptr_t)loaded->image : 0;
 }
 
+static volatile int g_exe_tls_attached;   /* set once the process-attach pass over the executable's callbacks has finished */
+
+/* The Windows loader hands DLL_THREAD_ATTACH/DETACH to the executable's own TLS callbacks as well; packers (Arxan)
+ * run their per-thread anti-debug checks there.  Opt-in (BEER_EXE_THREAD_TLS=1) until they run faithfully: with
+ * process-attach callbacks on by default, RDR2's Arxan thread callback left a worker spinning in Sleep(0) and the
+ * game never presented a frame. */
+static void exe_tls_notify_thread(u32 reason)
+{
+    if (!g_exe_tls_attached || !g_img || !getenv("BEER_EXE_THREAD_TLS")) return;
+    NtHdrs64 *nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
+    DataDir *directory = &nt->opt.dirs[9];
+    if (directory->size < sizeof(TLS_DIR64)) return;
+    TLS_DIR64 *tls = (TLS_DIR64 *)(g_img + directory->rva);
+    if (!tls->AddrOfCallbacks) return;
+    typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
+    TlsCallback *callbacks = (TlsCallback *)(uintptr_t)tls->AddrOfCallbacks;
+    for (size_t n = 0; n < 64 && callbacks[n]; ++n)
+        callbacks[n](g_img, reason, NULL);
+}
+
 static void guest_dll_notify_thread(u32 reason)
 {
+    if (reason == 2) exe_tls_notify_thread(reason);
     for (int i = 0; i < g_guest_dll_count; ++i) {
         GuestDll *dll = &g_guest_dlls[i];
         if (!dll->entry_called || !dll->image) continue;
@@ -22049,51 +23064,70 @@ static void guest_dll_notify_thread(u32 reason)
             ((DllEntry)(dll->image + nt->opt.entry_rva))(dll->image, reason, NULL);
         }
     }
+    if (reason == 3) exe_tls_notify_thread(reason);
 }
 
-static void guest_dll_initialize_all(void)
+static void guest_dll_initialize_one(GuestDll *dll);
+
+/* DllMain runs dependencies first, as the Windows loader does: a game DLL whose static initialisers use the
+ * C++ runtime must not attach before that runtime has. */
+static void guest_dll_initialize_dependencies(GuestDll *dll)
 {
-    for (int i = 0; i < g_guest_dll_count; ++i) {
-        GuestDll *dll = &g_guest_dlls[i];
-        if (dll->entry_called || dll->initializing) continue;
-        NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
-        dll->initializing = 1;
-        if (!nt->opt.entry_rva) {
-            dll->entry_called = 1;
-            dll->initializing = 0;
-            continue;
+    NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
+    DataDir *dir = &nt->opt.dirs[DIR_IMPORT];
+    if (!dir->rva || !dir->size) return;
+    for (ImportDesc *d = (ImportDesc *)(dll->image + dir->rva); d->name_rva; ++d) {
+        char lower[64];
+        lowercase_dll_basename((const char *)(dll->image + d->name_rva), lower, sizeof(lower));
+        GuestDll *dependency = !strncmp(lower, "api-ms-win-crt-", 15) ? guest_dll_find("ucrtbase.dll")
+                                                                      : guest_dll_find(lower);
+        if (dependency && dependency != dll && !dependency->entry_called && !dependency->initializing)
+            guest_dll_initialize_one(dependency);
+    }
+}
+
+static void guest_dll_initialize_one(GuestDll *dll)
+{
+    if (dll->entry_called || dll->initializing) return;
+    NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
+    dll->initializing = 1;
+    guest_dll_initialize_dependencies(dll);
+    if (!nt->opt.entry_rva) {
+        dll->entry_called = 1;
+        dll->initializing = 0;
+        return;
+    }
+    sigjmp_buf init_guard;
+    sigjmp_buf *outer_guard = t_guest_dll_init_jmp;
+    GuestDll *outer_dll = t_guest_dll_init_dll;
+    volatile int result = 0;
+    t_guest_dll_init_jmp = &init_guard;
+    t_guest_dll_init_dll = dll;
+    /* A LoadLibrary-time DllMain runs on the host-call stack; the TEB stack bounds must describe the stack
+     * it is really on, or __chkstk probes from the guest stack's limit down into unmapped memory. */
+    WinTEB *init_teb = NULL;
+    u64 saved_stack_low = 0, saved_stack_high = 0;
+    {
+        u64 here;
+        __asm__ volatile("mov %%rsp, %0" : "=r"(here));
+        u64 gs_base = 0;
+        if (is_current_host_call_stack_rsp(here) && syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
+            init_teb = (WinTEB *)gs_base;
+            saved_stack_low = init_teb->StackLimit;
+            saved_stack_high = init_teb->StackBase;
+            if (getenv("BEER_DLL_DIAGNOSTICS"))
+                fprintf(stderr, "[PE DLL] %s DllMain on host stack: TEB bounds %#lx..%#lx -> %#lx..%#lx\n", dll->name,
+                        (unsigned long)saved_stack_low, (unsigned long)saved_stack_high,
+                        (unsigned long)g_host_call_stack_base, (unsigned long)(g_host_call_stack_top + 256));
+            init_teb->StackBase = g_host_call_stack_top + 256;
+            init_teb->StackLimit = g_host_call_stack_base;
         }
-        sigjmp_buf init_guard;
-        sigjmp_buf *outer_guard = t_guest_dll_init_jmp;
-        GuestDll *outer_dll = t_guest_dll_init_dll;
-        volatile int result = 0;
-        t_guest_dll_init_jmp = &init_guard;
-        t_guest_dll_init_dll = dll;
-        /* A LoadLibrary-time DllMain runs on the host-call stack; the TEB stack bounds must describe the stack
-         * it is really on, or __chkstk probes from the guest stack's limit down into unmapped memory. */
-        WinTEB *init_teb = NULL;
-        u64 saved_stack_low = 0, saved_stack_high = 0;
-        {
-            u64 here;
-            __asm__ volatile("mov %%rsp, %0" : "=r"(here));
-            u64 gs_base = 0;
-            if (is_current_host_call_stack_rsp(here) && syscall(SYS_arch_prctl, ARCH_GET_GS, &gs_base) == 0 && gs_base) {
-                init_teb = (WinTEB *)gs_base;
-                saved_stack_low = init_teb->StackLimit;
-                saved_stack_high = init_teb->StackBase;
-                if (getenv("BEER_DLL_DIAGNOSTICS"))
-                    fprintf(stderr, "[PE DLL] %s DllMain on host stack: TEB bounds %#lx..%#lx -> %#lx..%#lx\n", dll->name,
-                            (unsigned long)saved_stack_low, (unsigned long)saved_stack_high,
-                            (unsigned long)g_host_call_stack_base, (unsigned long)(g_host_call_stack_top + 256));
-                init_teb->StackBase = g_host_call_stack_top + 256;
-                init_teb->StackLimit = g_host_call_stack_base;
-            }
-        }
-        if (sigsetjmp(init_guard, 1) == 0) {
+    }
+    if (sigsetjmp(init_guard, 1) == 0) {
         const int tls_after = getenv("BEER_DLL_TLS_AFTER_ENTRY") != NULL;   /* experiment */
-        if (dll->tls_callbacks && !tls_after) {
-            typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
-            TlsCallback *callbacks = (TlsCallback *)dll->tls_callbacks;
+        typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
+        TlsCallback *callbacks = (TlsCallback *)dll->tls_callbacks;
+        if (callbacks && !tls_after) {
             for (size_t n = 0; n < 64 && callbacks[n]; ++n) {
                 if (getenv("BEER_DLL_DIAGNOSTICS"))
                     fprintf(stderr, "[PE DLL] %s TLS callback[%zu]=%p (image %p)\n", dll->name, n,
@@ -22106,31 +23140,33 @@ static void guest_dll_initialize_all(void)
         if (getenv("BEER_DLL_DIAGNOSTICS"))
             fprintf(stderr, "[PE DLL] %s calling DllMain %p\n", dll->name, (void *)entry);
         result = entry(dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
-        if (dll->tls_callbacks && tls_after) {
-            typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
-            TlsCallback *callbacks = (TlsCallback *)dll->tls_callbacks;
+        if (callbacks && tls_after)
             for (size_t n = 0; n < 64 && callbacks[n]; ++n)
                 callbacks[n](dll->image, 1 /* DLL_PROCESS_ATTACH */, NULL);
-        }
-        } else {
-            result = 0;
-            dll->init_failed = 1;
-        }
-        t_guest_dll_init_jmp = outer_guard;
-        t_guest_dll_init_dll = outer_dll;
-        if (init_teb) {
-            init_teb->StackLimit = saved_stack_low; init_teb->StackBase = saved_stack_high;
-            if (getenv("BEER_DLL_DIAGNOSTICS"))
-                fprintf(stderr, "[PE DLL] %s TEB stack bounds restored to %#lx..%#lx\n", dll->name,
-                        (unsigned long)saved_stack_low, (unsigned long)saved_stack_high);
-        }
-        dll->entry_called = 1;
-        dll->initializing = 0;
-        fprintf(stderr, "[PE DLL] %s process attach -> %d\n", dll->name, result);
-        if (!result)
-            fprintf(stderr, "[PE DLL] warning: %s rejected DLL_PROCESS_ATTACH; exports may be unavailable\n",
-                    dll->name);
+    } else {
+        result = 0;
+        dll->init_failed = 1;
     }
+    t_guest_dll_init_jmp = outer_guard;
+    t_guest_dll_init_dll = outer_dll;
+    if (init_teb) {
+        init_teb->StackLimit = saved_stack_low; init_teb->StackBase = saved_stack_high;
+        if (getenv("BEER_DLL_DIAGNOSTICS"))
+            fprintf(stderr, "[PE DLL] %s TEB stack bounds restored to %#lx..%#lx\n", dll->name,
+                    (unsigned long)saved_stack_low, (unsigned long)saved_stack_high);
+    }
+    dll->entry_called = 1;
+    dll->initializing = 0;
+    fprintf(stderr, "[PE DLL] %s process attach -> %d\n", dll->name, result);
+    if (!result)
+        fprintf(stderr, "[PE DLL] warning: %s rejected DLL_PROCESS_ATTACH; exports may be unavailable\n",
+                dll->name);
+}
+
+static void guest_dll_initialize_all(void)
+{
+    for (int i = 0; i < g_guest_dll_count; ++i)
+        guest_dll_initialize_one(&g_guest_dlls[i]);
 }
 
 /* ── Import resolution ──────────────────────────────────────────── */
@@ -22196,7 +23232,9 @@ static void pe_imports(void)
         if (!strcmp(lower, "steam_api64.dll")) g_steam_api_imported = 1;
         int guest_steam_api = g_steam_api_guest_mode &&
                               !strcmp(lower, "steam_api64.dll");
-        int required = !strcmp(lower, "oo2core_6_win64.dll");
+        /* Oodle (any 2.x build: oo2core_5/6/7/8/9_win64.dll) carries the games' data decompression. */
+        int required = !strncmp(lower, "oo2core_", 8) && strlen(lower) > 18 &&
+                       !strcmp(lower + strlen(lower) - 10, "_win64.dll");
         int real_bink = !strcmp(lower, "bink2w64.dll");
         /* DirectStorage redistributables use an application-local bootstrap
          * DLL whose DllMain selects and loads the adjacent versioned runtime.
@@ -22349,18 +23387,20 @@ static void pe_imports(void)
             if (!guest && crt_api_set)
                 guest = guest_dll_find("ucrtbase.dll");
             u64 guest_export = (guest && fn_only) ? guest_dll_export(guest, fn_only) : 0;
+            if (!guest && fn_only && beer_is_vulkan_module(import_lower) && !getenv("BEER_ALLOW_GUEST_VULKAN"))
+                guest_export = (u64)beer_vkbridge_get_proc(fn_only);   /* statically linked vulkan-1.lib */
             /* Prefer the bundled UCRT for its API-set surface even when Beer
              * has a same-named fallback. This keeps CRT callback execution on
              * the guest stack and gives one coherent CRT heap/locale/runtime
              * state to RE8 and its private MSVC redistributables. */
             if (crt_api_set && guest_export)
                 real = NULL;
-            if (guest_export && fn_only && !strcmp(guest->name, "oo2core_6_win64.dll") &&
+            if (guest_export && fn_only && guest && !strncmp(guest->name, "oo2core_", 8) &&
                 !strcmp(fn_only, "OodleLZ_Decompress")) {
                 g_oodle_decompress = (void *)guest_export;
                 guest_export = (u64)guest_oodle_decompress_trace;
             }
-            if (guest_export && fn_only && !strcmp(guest->name, "bink2w64.dll")) {
+            if (guest_export && fn_only && guest && !strcmp(guest->name, "bink2w64.dll")) {
                 if (!strcmp(fn_only, "BinkOpen"))
                     guest_export = (u64)impl_BinkOpen_dispatch;
                 else if (!strcmp(fn_only, "BinkClose"))
@@ -22371,15 +23411,18 @@ static void pe_imports(void)
                     guest_export = (u64)impl_BinkWait_dispatch;
                 else if (!strcmp(fn_only, "BinkNextFrame"))
                     guest_export = (u64)impl_BinkNextFrame_dispatch;
-                else if (!strcmp(fn_only, "BinkDoFrameAsyncMulti"))
+                /* BEER_BINK_SYNC=1: decode on the caller instead of Bink's own worker threads.  Native workers are
+                 * the default: the synchronous fallback put whole-frame decodes on the game's movie/render thread
+                 * (RDR2's intro cards played at ~1 fps). */
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkDoFrameAsyncMulti"))
                     guest_export = (u64)impl_BinkDoFrameAsyncMulti_dispatch;
-                else if (!strcmp(fn_only, "BinkDoFrameAsyncWait"))
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkDoFrameAsyncWait"))
                     guest_export = (u64)impl_BinkDoFrameAsyncWait_dispatch;
-                else if (!strcmp(fn_only, "BinkStartAsyncThread"))
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkStartAsyncThread"))
                     guest_export = (u64)impl_BinkStartAsyncThread_dispatch;
-                else if (!strcmp(fn_only, "BinkRequestStopAsyncThread"))
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkRequestStopAsyncThread"))
                     guest_export = (u64)impl_BinkRequestStopAsyncThread_dispatch;
-                else if (!strcmp(fn_only, "BinkWaitStopAsyncThread"))
+                else if (getenv("BEER_BINK_SYNC") && !strcmp(fn_only, "BinkWaitStopAsyncThread"))
                     guest_export = (u64)impl_BinkWaitStopAsyncThread_dispatch;
             }
             g_snames[g_nstubs] = strdup(buf);
@@ -22455,9 +23498,25 @@ static void pe_imports(void)
                 iat[i] = guest_export;
                 printf("  [DLL ] %s -> 0x%lx\n", buf, guest_export);
             } else if (real) {
-                emit_impl_thunk(g_nstubs, (u64)real);
-                iat[i] = (u64)(g_tramp + g_nstubs * THUNK_SZ);
-                printf("  [REAL] %s\n", buf);
+                /* One function, one address: Windows hands every importer and GetProcAddress the same export
+                 * address, and inline-hooking modules (anti-cheat, cracks) patch that address expecting every
+                 * caller to see it. Reuse the thunk an earlier import or GetProcAddress already created. */
+                int shared = -1;
+                for (int k = 0; fn_only && k < g_nstubs && shared < 0; ++k) {   /* named imports only */
+                    const char *bang = g_snames[k] ? strchr(g_snames[k], '!') : NULL;
+                    const char *kn = g_snames[k] ? (bang ? bang + 1 : g_snames[k]) : NULL;
+                    if (kn && g_impl_real[k] == (u64)real && !strcmp(kn, fn_only)) shared = k;
+                }
+                if (shared >= 0) {
+                    iat[i] = (u64)(g_tramp + shared * THUNK_SZ);
+                    free(g_snames[g_nstubs]);
+                    g_snames[g_nstubs] = strdup(buf);
+                    printf("  [REAL] %s (shared)\n", buf);
+                } else {
+                    emit_impl_thunk(g_nstubs, (u64)real);
+                    iat[i] = (u64)(g_tramp + g_nstubs * THUNK_SZ);
+                    printf("  [REAL] %s\n", buf);
+                }
             } else if (guest_export) {
                 iat[i] = guest_export;
                 printf("  [DLL ] %s -> 0x%lx\n", buf, guest_export);
@@ -22470,43 +23529,6 @@ static void pe_imports(void)
             g_nstubs++;
         }
     }
-    /* Windows binds an import to an address inside the exporting module's image, and protected
-     * code relies on that: it walks down from an imported function in allocation-granularity steps
-     * to the owning module's MZ header. Beer's dispatcher thunks live in a separate low mapping, so
-     * rebind imports from Beer-owned system modules to their export entries in the synthetic module
-     * image. Those entries jump to the same thunk, so behaviour is unchanged. */
-    fake_pe_exports_build();
-    int rebound = 0;
-    for (ImportDesc *d = rva_ptr(dir->rva); d->name_rva; d++) {
-        const char *dll = rva_ptr(d->name_rva);
-        if (!dll || !dll[0]) break;
-        FakePeModule *owner = fake_pe_module_for_import(dll);
-        /* OriginalFirstThunk is the executable's immutable import-name table.
-         * When it is absent the IAT is also the lookup table, but binding has
-         * already overwritten it with function addresses. Do not infer names
-         * from global diagnostic indices: dependency DLL imports are allocated
-         * before main-image imports and therefore do not share that ordering. */
-        if (!owner || !d->orig_ilt) continue;
-        u64 *ilt = rva_ptr(d->orig_ilt);
-        u64 *iat = rva_ptr(d->iat_rva);
-        for (int i = 0; ilt[i]; i++) {
-            if (ilt[i] & (1ull << 63)) continue; /* ordinal */
-            if (iat[i] < (u64)(uintptr_t)g_tramp || iat[i] >= (u64)(uintptr_t)g_tramp + g_trampsz)
-                continue;
-            const char *fn = (const char *)rva_ptr((u32)ilt[i] + 2);
-            if (!fn || !fn[0]) continue;
-            u64 address = fake_pe_export_address(owner->base, fn);
-            for (size_t m = 0; address && m < sizeof(g_fake_pe_modules) / sizeof(*g_fake_pe_modules); ++m) {
-                u64 base = g_fake_pe_modules[m].base;
-                if (address >= base + FAKE_PE_TEXT_RVA && address < base + FAKE_PE_SIZE) {
-                    iat[i] = address;
-                    ++rebound;
-                    break;
-                }
-            }
-        }
-    }
-    printf("[IMP] %d system-module imports bound to their module images\n", rebound);
 
     int nreal = 0;
     for (int i = 0; i < g_nstubs; i++) {
@@ -22533,7 +23555,11 @@ typedef struct {
     WinListEntry InLoadOrderModuleList;          /* +0x010 */
     WinListEntry InMemoryOrderModuleList;        /* +0x020 */
     WinListEntry InInitializationOrderModuleList;/* +0x030 */
-} WinPebLdrData;
+    u64 EntryInProgress;                         /* +0x040 */
+    u8  ShutdownInProgress;                      /* +0x048 */
+    u8  _pad1[7];
+    u64 ShutdownThreadId;                        /* +0x050 */
+} WinPebLdrData;                                 /* 0x58: protection code checks Length == 0x58 */
 
 /* Windows code routinely walks PEB->Ldr directly before calling a loader API.
  * Empty list heads are not a harmless approximation: module discovery then
@@ -22549,6 +23575,12 @@ typedef struct {
     u32 _pad0;
     WinUnicodeString FullDllName;            /* +0x048 */
     WinUnicodeString BaseDllName;            /* +0x058 */
+    u32 Flags;                               /* +0x068 */
+    u16 ObsoleteLoadCount;                   /* +0x06c */
+    u16 TlsIndex;                            /* +0x06e */
+    WinListEntry HashLinks;                  /* +0x070 */
+    u32 TimeDateStamp;                       /* +0x080 */
+    u8  _rest[0x120 - 0x84];                 /* remaining Win10 fields, zero */
 } WinLdrDataTableEntry;
 
 _Static_assert(offsetof(WinPebLdrData, InLoadOrderModuleList) == 0x10,
@@ -22557,6 +23589,8 @@ _Static_assert(offsetof(WinLdrDataTableEntry, DllBase) == 0x30,
                "LDR module base offset");
 _Static_assert(offsetof(WinLdrDataTableEntry, FullDllName) == 0x48,
                "LDR full name offset");
+_Static_assert(sizeof(WinPebLdrData) == 0x58, "PEB_LDR_DATA size");
+_Static_assert(offsetof(WinLdrDataTableEntry, HashLinks) == 0x70, "LDR hash links offset");
 
 typedef BeerProcessParameters WinProcessParameters;
 
@@ -22595,6 +23629,102 @@ _Static_assert(offsetof(WinProcessParameters, CommandLine) == 0x70,
  * those threads to observe an invalid process environment. */
 static WinPEB *g_process_peb;
 
+/* NtQueryVirtualMemory for the current process: MemoryBasicInformation (class 0) is VirtualQuery; the other classes
+ * (mapped file names, working set) report that no information exists. */
+static u64 __attribute__((ms_abi))
+impl_NtQueryVirtualMemory(u64 process, void *base, u32 info_class, void *buffer, u64 length, u64 *returned)
+{
+    if (!native_is_current_process(process)) return 0xC0000008u;    /* STATUS_INVALID_HANDLE */
+    if (info_class != 0) return STATUS_INVALID_INFO_CLASS;
+    if (length < sizeof(BeerMemoryBasicInformation)) return STATUS_INFO_LENGTH_MISMATCH;
+    const u64 got = impl_VirtualQuery(base, buffer, length);
+    if (!got) return 0xC000000Du;                  /* STATUS_INVALID_PARAMETER (address outside user space) */
+    if (returned) *returned = got;
+    return 0;
+}
+
+/* NtQueryInformationProcess for the current process.  Protection code probes the debug classes (a real process has
+ * no debug port or object, debug flags are "inherit"); an unimplemented export that fails or leaves the buffer
+ * uninitialised reads as "being debugged / hooked". */
+static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned);
+static u64 __attribute__((ms_abi))
+impl_NtQueryInformationProcess(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned)
+{
+    u64 status = beer_nt_query_information_process(process, info_class, buffer, length, returned);
+    if (getenv("BEER_NT_DIAGNOSTICS")) {
+        static _Atomic(u32) logged;
+        if (atomic_fetch_add(&logged, 1) < 400)
+            fprintf(stderr, "[NT] NtQueryInformationProcess(class=%u len=%u) t%ld -> 0x%x\n", info_class, length, (long)syscall(SYS_gettid), (u32)status);
+    }
+    return status;
+}
+static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned)
+{
+    if (!native_is_current_process(process)) return 0xC0000008u;    /* STATUS_INVALID_HANDLE */
+    u32 needed = 0;
+    switch (info_class) {
+    case 29: needed = 4;  break;                 /* ProcessBreakOnTermination */
+    case 36: needed = 4;  break;                 /* ProcessCookie */
+    case 0:  needed = 48; break;                 /* ProcessBasicInformation */
+    case 7:  needed = 8;  break;                 /* ProcessDebugPort */
+    case 26: needed = 8;  break;                 /* ProcessWow64Information */
+    case 30: needed = 8;  break;                 /* ProcessDebugObjectHandle */
+    case 31: needed = 4;  break;                 /* ProcessDebugFlags */
+    case 3:  needed = 112; break;                /* ProcessVmCounters (VM_COUNTERS) */
+    case 12: needed = 4;  break;                 /* ProcessDefaultHardErrorMode */
+    case 21: needed = 8;  break;                 /* ProcessAffinityMask */
+    case 37: needed = 64; break;                 /* ProcessImageInformation (SECTION_IMAGE_INFORMATION) */
+    case 43: needed = 4;  break;                 /* ProcessTokenVirtualizationEnabled */
+    default: return STATUS_INVALID_INFO_CLASS;
+    }
+    if (returned) *returned = needed;
+    if (length < needed || !buffer) return STATUS_INFO_LENGTH_MISMATCH;
+    memset(buffer, 0, needed);
+    switch (info_class) {
+    case 0: {
+        u64 *pbi = buffer;
+        pbi[0] = 259;                             /* ExitStatus: STILL_ACTIVE */
+        pbi[1] = (u64)(uintptr_t)g_process_peb;
+        pbi[2] = win_processor_mask();            /* AffinityMask */
+        pbi[3] = 8;                               /* BasePriority */
+        pbi[4] = (u64)getpid();
+        pbi[5] = (u64)getppid();
+        break;
+    }
+    case 3: {   /* VM_COUNTERS from the process's real figures (/proc/self/status, kB) */
+        u64 *vm = buffer;
+        FILE *status = fopen("/proc/self/status", "r");
+        char line[128];
+        unsigned long long kb;
+        while (status && fgets(line, sizeof(line), status)) {
+            if (sscanf(line, "VmPeak: %llu", &kb) == 1) vm[0] = kb * 1024;     /* PeakVirtualSize */
+            else if (sscanf(line, "VmSize: %llu", &kb) == 1) vm[1] = kb * 1024; /* VirtualSize */
+            else if (sscanf(line, "VmHWM: %llu", &kb) == 1) vm[3] = kb * 1024;  /* PeakWorkingSetSize */
+            else if (sscanf(line, "VmRSS: %llu", &kb) == 1) vm[4] = kb * 1024;  /* WorkingSetSize */
+        }
+        if (status) fclose(status);
+        break;
+    }
+    case 12: *(u32 *)buffer = atomic_load(&g_process_hard_error_mode); break;
+    case 36: {                                    /* a per-process random value, stable for its lifetime */
+        static u32 cookie;
+        if (!cookie) {
+            u32 value = 0;
+            if (getrandom(&value, sizeof(value), 0) != (ssize_t)sizeof(value)) value = (u32)getpid() * 2654435761u;
+            cookie = value ? value : 1;
+        }
+        *(u32 *)buffer = cookie;
+        break;
+    }
+    case 21: *(u64 *)buffer = win_processor_mask(); break;
+    case 37: *(u16 *)((u8 *)buffer + 20) = 0x8664; break;   /* Machine */
+    case 30: return STATUS_PORT_NOT_SET;
+    case 31: *(u32 *)buffer = 1; break;           /* NoDebugInherit clear => 1 */
+    default: break;
+    }
+    return 0;
+}
+
 /*
  * alloc_teb_for_thread — allocate a private WinTEB with its own TLS array
  * and implicit-TLS data block for any thread (main or worker).
@@ -22612,6 +23742,18 @@ static void *alloc_teb_for_thread(void)
     if (host_stack == MAP_FAILED) { perror("mmap(host_call_stack)"); _exit(2); }
     u64 host_stack_base = (u64)host_stack;
     u64 host_stack_top = ((u64)host_stack + HOST_CALL_STACK_SIZE - 256) & ~0xFULL;
+
+    /* Signal handlers (guest faults, emulated syscalls) must not run on a guest thread's stack, which can be 16 KiB. */
+    {
+        stack_t current;
+        if (sigaltstack(NULL, &current) == 0 && (current.ss_flags & SS_DISABLE)) {
+            void *alt = mmap(NULL, 256 << 10, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (alt != MAP_FAILED) {
+                stack_t ss = { .ss_sp = alt, .ss_size = 256 << 10, .ss_flags = 0 };
+                sigaltstack(&ss, NULL);
+            }
+        }
+    }
 
     WinTEB *teb = mmap(NULL, sizeof(WinTEB), PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -22824,6 +23966,13 @@ static void init_peb_loader_data(WinPebLdrData *ldr)
 
         entry->DllBase = image_base;
         entry->EntryPoint = entry_point;
+        entry->Flags = index ? 0x000CC004u : 0x00004000u;   /* DLLs: IMAGE_DLL|ENTRY_PROCESSED|PROCESS_ATTACH_CALLED|...; exe: ENTRY_PROCESSED */
+        entry->ObsoleteLoadCount = 0xFFFF;
+        entry->HashLinks.Flink = entry->HashLinks.Blink = (u64)(uintptr_t)&entry->HashLinks;
+        if (image_base) {
+            const DosHdr *dh = (const DosHdr *)(uintptr_t)image_base;
+            if (dh->magic == MZ_MAGIC) entry->TimeDateStamp = ((const NtHdrs64 *)(uintptr_t)(image_base + dh->lfanew))->file.timestamp;
+        }
         entry->SizeOfImage = image_size > UINT32_MAX ? UINT32_MAX : (u32)image_size;
         entry->FullDllName.Buffer = (u64)(uintptr_t)
             win16_dup_ascii(full_name, &entry->FullDllName.Length);
@@ -22877,6 +24026,8 @@ static void setup_teb_peb(void)
     ldr->Length = sizeof(*ldr);
     ldr->Initialized = 1;
     init_peb_loader_data(ldr);
+    fake_pe_rebind_imports(g_img);
+    for (int i = 0; i < g_guest_dll_count; ++i) fake_pe_rebind_imports(g_guest_dlls[i].image);
 
     size_t path_chars = 0;
     while (g_exe_path_w[path_chars]) ++path_chars;
@@ -23048,6 +24199,7 @@ static void executable_tls_arm_timeout(u32 milliseconds)
 
 static void __attribute__((ms_abi)) executable_tls_process_attach(void)
 {
+    if (getenv("BEER_NO_EXECUTABLE_TLS")) return;   /* neither process- nor thread-attach callbacks run */
     NtHdrs64 *nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
     DataDir *directory = &nt->opt.dirs[9]; /* IMAGE_DIRECTORY_ENTRY_TLS */
     if (directory->size < sizeof(TLS_DIR64)) return;
@@ -23156,13 +24308,26 @@ static void __attribute__((ms_abi)) executable_tls_process_attach(void)
                         image_addr_is_exec(value) ? " [exec]" : "");
             }
             g_executable_tls_callback_index = -1;
+            if (getenv("BEER_EXECUTABLE_TLS_STRICT")) {
+                sigaction(SIGALRM, &previous_timeout_action, NULL);
+                _exit(2);
+            }
+            /* A faulting callback (copy protection probing the loader, e.g. RDR2's Arxan callback) must not stop
+             * an otherwise compatible executable from reaching its entry point, as long as Beer cannot run it
+             * faithfully: release the loader lock it may still hold and go on without the remaining callbacks.
+             * BEER_EXECUTABLE_TLS_STRICT=1 keeps the failure fatal. */
+            while (pthread_mutex_unlock(&g_loader_lock) == 0) {}
+            fprintf(stderr, "[TLS] continuing to the entry point without callback[%zu] and later ones; thread "
+                            "attach callbacks stay off\n", index);
+            executable_tls_arm_timeout(0);
             sigaction(SIGALRM, &previous_timeout_action, NULL);
-            _exit(2);
+            return;                                    /* g_exe_tls_attached stays 0 */
         }
         g_executable_tls_callback_index = -1;
     }
     executable_tls_arm_timeout(0);
     sigaction(SIGALRM, &previous_timeout_action, NULL);
+    g_exe_tls_attached = 1;
 }
 
 /* ── Section permissions ────────────────────────────────────────── */
@@ -24851,6 +26016,20 @@ static void beer_context_to_ucontext(ucontext_t *uc, const u8 *context)
     uc->uc_mcontext.gregs[REG_RIP] = (greg_t)*(const u64 *)(context + 0xf8);
 }
 
+/* "int 2dh" (debugger service, used by protection code to see whether an exception handler turns it into a breakpoint)
+ * and "int 2ch" (assertion failure) fault as general-protection SIGSEGVs on Linux.  Windows reports them as
+ * EXCEPTION_BREAKPOINT / STATUS_ASSERTION_FAILURE with the context already past the two-byte instruction.  Returns 1
+ * and sets *code when the faulting instruction is one of them. */
+static int beer_decode_int_trap(const ucontext_t *uc, const siginfo_t *si, u32 *code)
+{
+    if (!si || si->si_code <= 0) return 0;                 /* a real memory fault, not a trap instruction */
+    const u8 *ip = (const u8 *)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    if (!is_valid_resume_target((u64)(uintptr_t)ip) || ip[0] != 0xCD) return 0;
+    if (ip[1] == 0x2d) { *code = 0x80000003u; return 1; }
+    if (ip[1] == 0x2c) { *code = 0xC0000420u; return 1; }
+    return 0;
+}
+
 static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, ucontext_t *uc)
 {
     if (g_delivering_vectored_exception) return 0;
@@ -24858,8 +26037,15 @@ static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, ucontext_t *uc)
     BeerExceptionRecord64 record;
     memset(&record, 0, sizeof(record));
     record.code = beer_signal_exception_code(sig);
+    const greg_t original_rip = uc->uc_mcontext.gregs[REG_RIP];
+    u32 trap_code = 0;
+    const int is_int_trap = sig == SIGSEGV && beer_decode_int_trap(uc, si, &trap_code);
+    if (is_int_trap) {
+        record.code = trap_code;
+        uc->uc_mcontext.gregs[REG_RIP] += 2;               /* the context points past "int 2dh" */
+    }
     record.address = (u64)uc->uc_mcontext.gregs[REG_RIP];
-    if (sig == SIGSEGV || sig == SIGBUS) {
+    if (!is_int_trap && (sig == SIGSEGV || sig == SIGBUS)) {
         u64 fault = (u64)si->si_addr;
         u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
         record.parameter_count = 2;
@@ -24873,7 +26059,7 @@ static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, ucontext_t *uc)
     g_delivering_vectored_exception = 1;
     int handled = beer_veh_dispatch(&pointers);
     g_delivering_vectored_exception = 0;
-    if (!handled) return 0;
+    if (!handled) { uc->uc_mcontext.gregs[REG_RIP] = original_rip; return 0; }
 
     beer_context_to_ucontext(uc, context);
     g_cycle_hist_n = 0;
@@ -24899,10 +26085,17 @@ static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
     if (g_delivering_vectored_exception) return 0;
 
     BeerExceptionRecord64 *record_ptr = beer_exception_record_alloc();
-    memset(&(*record_ptr), 0, sizeof((*record_ptr)));
+    memset(record_ptr, 0, sizeof(*record_ptr));
     (*record_ptr).code = beer_signal_exception_code(sig);
+    const greg_t original_rip = uc->uc_mcontext.gregs[REG_RIP];
+    u32 trap_code = 0;
+    const int is_int_trap = sig == SIGSEGV && beer_decode_int_trap(uc, si, &trap_code);
+    if (is_int_trap) {
+        (*record_ptr).code = trap_code;
+        uc->uc_mcontext.gregs[REG_RIP] += 2;               /* the context points past "int 2dh" */
+    }
     (*record_ptr).address = (u64)uc->uc_mcontext.gregs[REG_RIP];
-    if (sig == SIGSEGV || sig == SIGBUS) {
+    if (!is_int_trap && (sig == SIGSEGV || sig == SIGBUS)) {
         u64 fault = (u64)si->si_addr;
         u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
         (*record_ptr).parameter_count = 2;
@@ -24934,7 +26127,7 @@ static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
         }
         fputc('\n', stderr);
     }
-    if (!handled) return 0;
+    if (!handled) { uc->uc_mcontext.gregs[REG_RIP] = original_rip; return 0; }
 
     beer_context_to_ucontext(uc, context);
     g_cycle_hist_n = 0;
@@ -25211,6 +26404,214 @@ static int touch_trace_signal(int sig, siginfo_t *si, ucontext_t *uc)
     return 1;
 }
 
+/* BEER_BP="0xaddr,0xaddr" (+ BEER_BP_DELAY seconds, default 30): one-shot guest breakpoints for reverse engineering. After the delay an int3 is
+ * written at each address; the first hit restores the byte, logs the thread and the code-looking return addresses on
+ * the stack, and resumes. Lets a running game be asked "does this function ever run, and who calls it?" without a debugger. */
+static struct { u64 address; u8 original; int armed; int expect; char module[48]; u64 offset; } g_breakpoints[16];
+static int g_breakpoint_count;
+static int g_breakpoint_memfd = -1;     /* /proc/self/mem: restores bytes in read-only (DLL text) pages */
+static int beer_breakpoint_hit(ucontext_t *uc)
+{
+    u64 at = (u64)uc->uc_mcontext.gregs[REG_RIP] - 1;
+    for (int i = 0; i < g_breakpoint_count; ++i) {
+        if (!g_breakpoints[i].armed || g_breakpoints[i].address != at) continue;
+        if (g_breakpoint_memfd < 0 || pwrite(g_breakpoint_memfd, &g_breakpoints[i].original, 1, (off_t)at) != 1)
+            *(volatile u8 *)(uintptr_t)at = g_breakpoints[i].original;
+        g_breakpoints[i].armed = 0;
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)at;
+        const u64 *stack = (const u64 *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+        fprintf(stderr, "[BP] hit 0x%llx tid %ld rax=%llx rcx=%llx rdx=%llx r8=%llx r9=%llx\n", (unsigned long long)at, (long)syscall(SYS_gettid),
+                (unsigned long long)uc->uc_mcontext.gregs[REG_RAX],
+                (unsigned long long)uc->uc_mcontext.gregs[REG_RCX], (unsigned long long)uc->uc_mcontext.gregs[REG_RDX],
+                (unsigned long long)uc->uc_mcontext.gregs[REG_R8], (unsigned long long)uc->uc_mcontext.gregs[REG_R9]);
+        int shown = 0;
+        for (int k = 0; k < 400 && shown < 24; ++k) {
+            u64 v = stack[k];
+            if ((v >= 0x140000000ull && v < 0x148000000ull) || (v >= 0x7ffff5000000ull && v < 0x7ffff9000000ull)) {
+                fprintf(stderr, "[BP]   [%3d] 0x%llx\n", k, (unsigned long long)v);
+                ++shown;
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+static void *beer_breakpoint_thread(void *unused)
+{
+    (void)unused;
+    const char *delay = getenv("BEER_BP_DELAY");
+    sleep(delay ? (unsigned)atoi(delay) : 30u);
+    int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    g_breakpoint_memfd = fd;
+    /* "addr:XX" arms only once the first byte of the (possibly still encrypted) code is the expected one; retries for 3 minutes. */
+    const char *poll = getenv("BEER_BP_POLL_US");     /* faster polling catches code decrypted only while it runs */
+    useconds_t interval = poll ? (useconds_t)atoi(poll) : 500000;
+    if (!interval) interval = 1;
+    u64 rounds = 180000000ull / interval;
+    for (u64 round = 0; round < rounds; ++round) {
+        int pending = 0;
+        for (int i = 0; i < g_breakpoint_count; ++i) {
+            if (g_breakpoints[i].armed || g_breakpoints[i].original == 0xFF) continue;
+            if (g_breakpoints[i].module[0]) {                 /* "module.dll+0xoffset": resolve once the DLL is mapped */
+                GuestDll *dll = guest_dll_find(g_breakpoints[i].module);
+                if (!dll || !dll->image) { ++pending; continue; }
+                g_breakpoints[i].address = (u64)(uintptr_t)dll->image + g_breakpoints[i].offset;
+            }
+            u8 now;
+            if (pread(fd, &now, 1, (off_t)g_breakpoints[i].address) != 1) { ++pending; continue; }
+            if (g_breakpoints[i].expect >= 0 && now != (u8)g_breakpoints[i].expect) { ++pending; continue; }
+            g_breakpoints[i].original = now;
+            u8 trap = 0xCC;
+            if (pwrite(fd, &trap, 1, (off_t)g_breakpoints[i].address) == 1) {
+                g_breakpoints[i].armed = 1;
+                fprintf(stderr, "[BP] armed 0x%llx (was %02x)\n", (unsigned long long)g_breakpoints[i].address, now);
+            }
+        }
+        if (!pending) break;
+        usleep(interval);
+    }
+    return NULL;
+}
+static void beer_breakpoints_start(void)
+{
+    const char *list = getenv("BEER_BP");
+    if (!list || !*list) return;
+    char copy[512]; snprintf(copy, sizeof(copy), "%s", list);
+    for (char *tok = strtok(copy, ","); tok && g_breakpoint_count < 16; tok = strtok(NULL, ","))
+    {
+        char *colon = strchr(tok, ':');
+        g_breakpoints[g_breakpoint_count].expect = colon ? (int)strtoul(colon + 1, NULL, 16) : -1;
+        char *plus = strchr(tok, '+');
+        if (plus && strncmp(tok, "0x", 2)) {
+            *plus = 0;
+            snprintf(g_breakpoints[g_breakpoint_count].module, sizeof(g_breakpoints[g_breakpoint_count].module), "%s", tok);
+            g_breakpoints[g_breakpoint_count].offset = strtoull(plus + 1, NULL, 0);
+        } else g_breakpoints[g_breakpoint_count].address = strtoull(tok, NULL, 0);
+        g_breakpoint_count++;
+    }
+    pthread_t thread;
+    if (g_breakpoint_count && pthread_create(&thread, NULL, beer_breakpoint_thread, NULL) == 0) pthread_detach(thread);
+}
+
+/* BEER_HWBP="0xaddr,0xaddr" (up to 4): hardware execute breakpoints through perf_event_open. Unlike BEER_BP they do
+ * not touch code bytes, so they work on code that a packer decrypts, runs and re-encrypts. Installed on the main
+ * thread before any guest thread exists and inherited by every thread created later; each hit logs the registers and
+ * the code-looking stack values (first 8 hits per address). */
+static u64 g_hw_breakpoints[4];
+static _Atomic(u32) g_hw_breakpoint_hits[4];
+static int g_hw_breakpoint_count;
+static int beer_hw_breakpoint_hit(siginfo_t *si, ucontext_t *uc)
+{
+    if (si->si_code != TRAP_PERF) return 0;
+    u64 at = (u64)uc->uc_mcontext.gregs[REG_RIP];
+    for (int i = 0; i < g_hw_breakpoint_count; ++i) {
+        if (g_hw_breakpoints[i] != at) continue;
+        if (atomic_fetch_add(&g_hw_breakpoint_hits[i], 1) >= 8) return 1;
+        greg_t *r = uc->uc_mcontext.gregs;
+        fprintf(stderr, "[HWBP] hit 0x%llx tid %ld rax=%llx rcx=%llx rdx=%llx r8=%llx r9=%llx rbx=%llx rsi=%llx rdi=%llx\n",
+                (unsigned long long)at, (long)syscall(SYS_gettid), (unsigned long long)r[REG_RAX],
+                (unsigned long long)r[REG_RCX], (unsigned long long)r[REG_RDX], (unsigned long long)r[REG_R8],
+                (unsigned long long)r[REG_R9], (unsigned long long)r[REG_RBX], (unsigned long long)r[REG_RSI],
+                (unsigned long long)r[REG_RDI]);
+        const u64 *stack = (const u64 *)(uintptr_t)r[REG_RSP];
+        int shown = 0;
+        for (int k = 0; k < 300 && shown < 12; ++k) {
+            u64 v = stack[k];
+            if ((v >= 0x140000000ull && v < 0x148000000ull) || (v >= 0x7ffff5000000ull && v < 0x7ffff9000000ull)) {
+                fprintf(stderr, "[HWBP]   [%3d] 0x%llx\n", k, (unsigned long long)v);
+                ++shown;
+            }
+        }
+        return 1;
+    }
+    return 1;      /* a perf trap for an address no longer listed: nothing to do */
+}
+static void beer_hw_breakpoints_start(void)
+{
+    const char *list = getenv("BEER_HWBP");
+    if (!list || !*list) return;
+    char copy[256]; snprintf(copy, sizeof(copy), "%s", list);
+    for (char *tok = strtok(copy, ","); tok && g_hw_breakpoint_count < 4; tok = strtok(NULL, ",")) {
+        u64 address = strtoull(tok, NULL, 0);
+        struct perf_event_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.type = PERF_TYPE_BREAKPOINT;
+        attr.size = sizeof(attr);
+        attr.bp_type = HW_BREAKPOINT_X;
+        attr.bp_addr = address;
+        attr.bp_len = sizeof(long);
+        attr.sample_period = 1;
+        attr.inherit = 1;
+        attr.remove_on_exec = 1;
+        attr.sigtrap = 1;
+        attr.sig_data = (u64)g_hw_breakpoint_count;
+        attr.exclude_kernel = 1;
+        attr.exclude_hv = 1;
+        int fd = (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, PERF_FLAG_FD_CLOEXEC);
+        if (fd < 0) { fprintf(stderr, "[HWBP] 0x%llx: perf_event_open failed: %s\n", (unsigned long long)address, strerror(errno)); continue; }
+        g_hw_breakpoints[g_hw_breakpoint_count++] = address;
+        fprintf(stderr, "[HWBP] armed 0x%llx\n", (unsigned long long)address);
+    }
+}
+
+/* BEER_THREAD_DUMP_AT=<seconds>: once, signal every thread of the process and have each print where it is (code-looking
+ * addresses on its stack and on its saved guest stack). Shows which guest thread is blocked in which function. */
+static void beer_thread_dump_handler(int sig, siginfo_t *si, void *uctx)
+{
+    (void)sig; (void)si;
+    ucontext_t *uc = uctx;
+    extern __thread u64 g_saved_guest_rsp;
+    char text[4096];
+    size_t n = (size_t)snprintf(text, sizeof(text), "[TDUMP] tid %ld rip=0x%llx saved_guest_rsp=0x%llx", (long)syscall(SYS_gettid),
+                                (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)g_saved_guest_rsp);
+    const u64 *stacks[2] = { (const u64 *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP], (const u64 *)(uintptr_t)g_saved_guest_rsp };
+    for (int which = 0; which < 2; ++which) {
+        if (!stacks[which]) continue;
+        n += (size_t)snprintf(text + n, sizeof(text) - n, which ? " guest:" : " stack:");
+        int shown = 0;
+        u64 copy[600];
+        size_t got = 0;                                   /* read what is mapped; the stack top may be close */
+        for (size_t want = sizeof(copy); want >= 64 && !got; want /= 2) {
+            struct iovec local = { copy, want }, remote = { (void *)stacks[which], want };
+            ssize_t r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+            if (r > 0) got = (size_t)r;
+        }
+        for (size_t k = 0; k < got / 8 && shown < 24 && n + 24 < sizeof(text); ++k) {
+            u64 v = copy[k];
+            if ((v >= 0x140000000ull && v < 0x148000000ull) || (v >= 0x7ffff5000000ull && v < 0x7ffff9000000ull)) {
+                n += (size_t)snprintf(text + n, sizeof(text) - n, " %llx", (unsigned long long)v);
+                ++shown;
+            }
+        }
+    }
+    text[n++] = '\n';
+    if (write(2, text, n) < 0) { }
+}
+static void *beer_thread_dump_thread(void *arg)
+{
+    sleep((unsigned)(uintptr_t)arg);
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = beer_thread_dump_handler; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGUSR2, &sa, NULL);
+    DIR *dir = opendir("/proc/self/task");
+    struct dirent *entry;
+    while (dir && (entry = readdir(dir))) {
+        long tid = atol(entry->d_name);
+        if (tid <= 0 || tid == syscall(SYS_gettid)) continue;
+        syscall(SYS_tgkill, getpid(), tid, SIGUSR2);
+        usleep(40000);
+    }
+    if (dir) closedir(dir);
+    return NULL;
+}
+static void beer_thread_dump_start(void)
+{
+    const char *at = getenv("BEER_THREAD_DUMP_AT");
+    if (!at || !*at) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, beer_thread_dump_thread, (void *)(uintptr_t)atoi(at)) == 0) pthread_detach(thread);
+}
 /* A guest DLL's initialisation (TLS callbacks + DllMain) runs under this guard: an execute-fault inside it
  * (a jump to a non-executable address) abandons the initialisation and makes LoadLibrary fail, the way the
  * Windows loader reports STATUS_DLL_INIT_FAILED, instead of killing the process. */
@@ -25228,6 +26629,8 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
     /* Windows calls vectored handlers before frame-based/unhandled exception
      * processing. Give registered guest handlers the original machine context;
      * only use Beer's compatibility recovery when every handler searches on. */
+    if (sig == SIGTRAP && beer_hw_breakpoint_hit(si, uc)) return;
+    if (sig == SIGTRAP && beer_breakpoint_hit(uc)) return;
     if (beer_dispatch_signal_to_veh(sig, si, uc)) return;
     if (beer_dispatch_signal_to_seh(sig, si, uc)) return;
     if (beer_dispatch_signal_to_top_level_filter(sig, si, uc)) return;
@@ -25278,8 +26681,29 @@ static void on_crash_impl(int sig, siginfo_t *si, void *uctx)
      * code while the fallback RVAs keep changing, defeating cycle detection. */
     if (sig == SIGSEGV) {
         g_total_sigsegv_count++;
-        fprintf(stderr, "[CRASH] SIGSEGV #%u at RIP=0x%lx FA=0x%lx\n",
-                g_total_sigsegv_count, rip, faultaddr);
+        fprintf(stderr, "[CRASH] SIGSEGV #%u at RIP=0x%lx FA=0x%lx (thread %ld)\n",
+                g_total_sigsegv_count, rip, faultaddr, (long)syscall(SYS_gettid));
+        if (g_total_sigsegv_count == 1 && getenv("BEER_CRASH_CODE") && g_img &&
+            rip >= (u64)g_img && rip < (u64)g_img + 0x8000000) {
+            /* Code around the first guest fault, as hex: feed to `xxd -r -p` + objdump -D -b binary -mi386:x86-64
+             * --adjust-vma=<start> to read packed images that only exist decrypted in memory. */
+            const u8 *start = (const u8 *)(rip - 0x200);
+            fprintf(stderr, "[CRASHCODE] start=0x%lx\n[CRASHCODE] ", (unsigned long)(rip - 0x200));
+            for (int i = 0; i < 0x400; ++i) fprintf(stderr, "%02x", start[i]);
+            fputs("\n", stderr);
+        }
+        if (g_total_sigsegv_count == 1 && getenv("BEER_CRASH_RANGES")) {
+            /* "START:LEN,START:LEN" (hex): dump guest memory at the first fault, e.g. the callers of the faulting code. */
+            char list[512];
+            snprintf(list, sizeof(list), "%s", getenv("BEER_CRASH_RANGES"));
+            for (char *item = strtok(list, ","); item; item = strtok(NULL, ",")) {
+                unsigned long start = 0, length = 0;
+                if (sscanf(item, "%lx:%lx", &start, &length) != 2 || length > 0x20000) continue;
+                fprintf(stderr, "[CRASHRANGE] start=0x%lx\n[CRASHRANGE] ", start);
+                for (unsigned long i = 0; i < length; ++i) fprintf(stderr, "%02x", ((const u8 *)start)[i]);
+                fputs("\n", stderr);
+            }
+        }
         if (g_total_sigsegv_count <= 4) {
             /* Diagnostic only (a fault is already being reported): name the
              * host module/symbol and the call chain when RIP is host code. */
@@ -25860,6 +27284,18 @@ generic_alloc_skip:
                             dli.dli_fname ? dli.dli_fname : "?",
                             (u64)dli.dli_fbase, sp0[k] - (u64)dli.dli_fbase);
                 fprintf(stderr, "\n");
+            }
+            /* Poor man's backtrace: every stack word inside the main image is a
+             * candidate return address (self-protected/packed games have no usable
+             * unwind data until their code is decrypted at run time). */
+            if (g_img) {
+                int shown = 0;
+                for (int k = 8; k < 1024 && shown < 40; k++) {
+                    if (sp0[k] >= (u64)g_img && sp0[k] < (u64)g_img + g_img_size) {
+                        fprintf(stderr, "[DBG]   stack+0x%x -> image RVA 0x%lx\n", k * 8, sp0[k] - (u64)g_img);
+                        shown++;
+                    }
+                }
             }
         }
     }
@@ -27736,7 +29172,7 @@ static uint64_t beer_monotonic_nanoseconds(void)
 
 /* Opt-in sampling profiler (BEER_PROF_SAMPLE=1). ITIMER_PROF fires every ~1 ms
  * of process CPU time and records the interrupted RIP and thread id; SIGUSR2
- * dumps /tmp/beer-prof.txt (maps, image base, raw samples). perf/gdb are
+ * dumps /tmp/beer-prof.txt (maps, image base, raw samples) and starts a new interval. perf/gdb are
  * unavailable here, so this is the only CPU profiler. */
 #define BEER_PROF_MAX 400000
 static volatile unsigned long long g_prof_rip[BEER_PROF_MAX];
@@ -27812,6 +29248,7 @@ static void prof_dump(int sig)
                 g_prof_r12[i], g_prof_r13[i], g_prof_r14[i], g_prof_r15[i]);
     fclose(out);
     fprintf(stderr, "[PROF] wrote %u samples\n", g_prof_count);
+    g_prof_count = 0;   /* each dump covers the interval since the previous one */
 }
 
 static void prof_start(void)
@@ -27830,6 +29267,38 @@ static void prof_start(void)
 
 int main(int argc, char **argv)
 {
+    /* Graphics drivers back device memory allocations with file descriptors (NVIDIA: one or more per
+     * vkAllocateMemory), and Windows has no comparable per-process handle limit.  Desktop sessions usually start
+     * programs with a soft limit of 1024, which RDR2 exhausts during start-up: vkAllocateMemory then reports
+     * VK_ERROR_OUT_OF_DEVICE_MEMORY and the game crashes.  Raise the soft limit to the hard limit, as Wine does. */
+    struct rlimit files;
+    if (getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur < files.rlim_max) {
+        files.rlim_cur = files.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &files);
+    }
+    /* Guest code is sensitive to the process layout: RDR2 takes different graphics start-up paths depending on where
+     * the host places its heaps and stacks, and fails most runs with address randomisation on.  Re-exec once with
+     * randomisation off (BEER_ASLR=1 keeps it) so every run lays memory out the same way, like gdb does. */
+    /* glibc's per-thread malloc cache keeps 7 chunks per size class. Games record D3D11 deferred contexts and other
+     * work on many threads at once, and with that tiny cache most allocations and frees went through contended arena
+     * locks (the worker threads spent a third of their time there). A larger tcache keeps them thread-local; the
+     * tunable is only read at exec, so it rides on the re-exec below. BEER_MALLOC_TUNE=0 leaves malloc alone. */
+    int reexec = 0;
+    {
+        const char *tune = getenv("BEER_MALLOC_TUNE");
+        const char *tunables = getenv("GLIBC_TUNABLES");
+        if (!(tune && !strcmp(tune, "0")) && !(tunables && strstr(tunables, "glibc.malloc.tcache_count"))) {
+            char value[1024];
+            snprintf(value, sizeof(value), "%s%sglibc.malloc.tcache_count=1024",
+                     tunables ? tunables : "", tunables && *tunables ? ":" : "");
+            setenv("GLIBC_TUNABLES", value, 1);
+            reexec = 1;
+        }
+    }
+    if (!getenv("BEER_ASLR") && !(personality(0xffffffffu) & ADDR_NO_RANDOMIZE)) {
+        if (personality(ADDR_NO_RANDOMIZE) != -1) reexec = 1;
+    }
+    if (reexec) execv("/proc/self/exe", argv);
     const char *recovery_limit = getenv("BEER_CRASH_RECOVERY_LIMIT");
     if (recovery_limit && *recovery_limit) {
         char *end = NULL;
@@ -27868,6 +29337,10 @@ int main(int argc, char **argv)
     XwaylandPresenter presenter = XWAYLAND_PRESENTER_AUTO;
     BeerD3D11Renderer renderer = BEER_D3D11_RENDERER_VULKAN;
     const char *exe_arg = NULL;
+    const char *cmdline_arg = NULL;
+    beer_proc_save_args(argc, argv);
+    beer_breakpoints_start();
+    beer_thread_dump_start();
     const char *prefix_arg = NULL;
     int guest_arg_count = 0;
     char **guest_args = NULL;
@@ -27907,6 +29380,8 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--prefix requires a non-empty path\n");
                 return 2;
             }
+        } else if (strncmp(arg, "--cmdline=", 10) == 0) {
+            cmdline_arg = arg + 10;       /* full guest command line (set by CreateProcess for child loaders) */
         } else if (strncmp(arg, "--audio=", 8) == 0) {
             const char *value = arg + 8;
             if (!strcmp(value, "compat")) g_use_guest_fmod = 0;
@@ -27947,6 +29422,7 @@ int main(int argc, char **argv)
     if (!exe)
         die("cannot configure guest process path '%s': %s", exe_arg, strerror(errno));
     beer_set_guest_arguments(guest_arg_count, guest_args);
+    if (cmdline_arg && *cmdline_arg) beer_set_command_line(cmdline_arg);   /* child loaders: the parent's full line */
     {
         /* Steam's native bootstrap reads these process-environment values when
          * no client launcher supplied them. Populate them from standard
@@ -28011,7 +29487,8 @@ int main(int argc, char **argv)
     printf("=== Beer Loader ===\n");
     if (!beer_win32_shared_data_map())
         return 2;
-    if (getenv("BEER_WIN32_SYSCALLS") && !strcmp(getenv("BEER_WIN32_SYSCALLS"), "0"))
+    if ((getenv("BEER_WIN32_SYSCALLS") && !strcmp(getenv("BEER_WIN32_SYSCALLS"), "0")) ||
+        getenv("BEER_NO_SYSCALL_EMULATION"))
         g_win32_syscalls = 0;
     if (g_win32_syscalls && !beer_win32_syscall_install()) {
         fprintf(stderr, "[SYSCALL] Syscall User Dispatch unavailable (%s); "
@@ -28019,6 +29496,7 @@ int main(int argc, char **argv)
         g_win32_syscalls = 0;
     }
     pe_load(exe);
+    beer_proc_register();
     beer_overlay_init();
     beer_post_init(exe_arg);
     beer_control_start(exe_arg);
@@ -28036,6 +29514,7 @@ int main(int argc, char **argv)
     sigaction(SIGILL,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);  /* int3 / abort() in Windows CRT */
+    beer_hw_breakpoints_start();
     
     pe_imports();
     setup_teb_peb();

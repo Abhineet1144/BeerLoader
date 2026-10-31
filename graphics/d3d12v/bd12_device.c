@@ -93,6 +93,8 @@ BD12Device *bd12_device_create(void)
     PFN_vkGetPhysicalDeviceProperties get_properties =
         (PFN_vkGetPhysicalDeviceProperties)get_instance(
             device->instance, "vkGetPhysicalDeviceProperties");
+    device->get_format_properties = (PFN_vkGetPhysicalDeviceFormatProperties)get_instance(
+        device->instance, "vkGetPhysicalDeviceFormatProperties");
     get_memory(device->physical_device, &device->memory);
     VkPhysicalDeviceProperties properties;
     get_properties(device->physical_device, &properties);
@@ -967,6 +969,8 @@ static void bd12_report_drops(void)
 
 uint64_t g_bd12_prof_ns[BD12_PROF_COUNT];
 uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
+
+uint64_t g_bd12_cmd_counts[4];
 
 void bd12_prof_report(void)
 {

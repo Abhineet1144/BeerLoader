@@ -27,6 +27,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import storage  # noqa: E402
 from memory_window import MemoryWindow  # noqa: E402
+from objects_window import ObjectsWindow  # noqa: E402
 from overlay_page import OverlayPage, flat_message, load_config as load_overlay_config  # noqa: E402
 from display_page import DisplayPage, post_message, load_config as load_display_config  # noqa: E402
 from graphics_window import GraphicsWindow, apply_saved as apply_saved_tweaks  # noqa: E402
@@ -293,6 +294,14 @@ def pid_alive(pid):
         return True
 
 
+def parent_pid(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
 # ---------------------------------------------------------------- running game card
 
 SCALE_MIN, SCALE_MAX = 0.05, 10.0
@@ -381,6 +390,10 @@ class RunningCard(Adw.PreferencesGroup):
         memory = Gtk.Button(label="Memory…", valign=Gtk.Align.CENTER)
         memory.connect("clicked", lambda _b: MemoryWindow(app, self.path, self.name, self.pid).present())
         actions.add_suffix(memory)
+        objects = Gtk.Button(label="Objects…", valign=Gtk.Align.CENTER,
+                             tooltip_text="Find the player and the objects around it; edit position, rotation, scale and fields")
+        objects.connect("clicked", lambda _b: ObjectsWindow(app, self.path, self.name, self.pid, self.exe).present())
+        actions.add_suffix(objects)
         stop = Gtk.Button(label="Stop", valign=Gtk.Align.CENTER)
         stop.add_css_class("destructive-action")
         stop.connect("clicked", lambda _b: app.stop_game(self.pid))
@@ -1033,7 +1046,13 @@ class Manager(Adw.Application):
                 pass
 
     def stop_game(self, pid):
+        # Launchers start the real game as a child loader (RDR2: Launcher.exe -> RDR2.exe), which outlives its parent.
+        # Games started here run in their own session, so stop the whole process group.
         try:
+            group = os.getpgid(pid)
+            if group != os.getpgid(0):
+                os.killpg(group, signal.SIGTERM)
+                return
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
@@ -1048,7 +1067,7 @@ class Manager(Adw.Application):
         for pid, (proc, _log, _name) in list(self.children.items()):
             if proc.poll() is not None:
                 del self.children[pid]
-        seen = set()
+        sockets = {}
         for path in glob.glob(os.path.join(SOCKET_DIR, "*.sock")):
             try:
                 pid = int(os.path.basename(path)[:-5])
@@ -1060,6 +1079,15 @@ class Manager(Adw.Application):
                 except OSError:
                     pass
                 continue
+            sockets[pid] = path
+        # A launcher exe (RDR2's Launcher.exe) runs the real game as a child loader and then only waits for it:
+        # show the game, under the launcher's library name and log, instead of two cards.
+        launcher_of = {pid: parent_pid(pid) for pid in sockets}
+        launcher_of = {pid: parent for pid, parent in launcher_of.items() if parent in sockets}
+        seen = set()
+        for pid, path in sockets.items():
+            if pid in launcher_of.values():
+                continue
             seen.add(pid)
             if pid not in self.cards:
                 control = Control(path)
@@ -1068,9 +1096,11 @@ class Manager(Adw.Application):
                 if not hello or not hello.get("ok"):
                     continue
                 exe = hello.get("exe", "")
-                name = next((g["name"] for g in self.lib.games if g["exe"] == exe),
-                            os.path.splitext(os.path.basename(exe))[0] or "game")
-                log = self.children.get(pid, (None, "", ""))[1]
+                launcher = launcher_of.get(pid)
+                started = self.children.get(pid) or self.children.get(launcher) or (None, "", "")
+                name = next((g["name"] for g in self.lib.games if g["exe"] == exe), started[2]
+                            or os.path.splitext(os.path.basename(exe))[0] or "game")
+                log = started[1]
                 card = RunningCard(self, pid, path, name, log, exe)
                 apply_saved_tweaks(card.control, exe)
                 self.cards[pid] = card

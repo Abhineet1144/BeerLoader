@@ -2,6 +2,7 @@
 /* BD11 part 2: device creation, command-list rotation and submission. */
 
 #include "bd11.h"
+#include <time.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +27,7 @@ B11Device *b11_device_create(void)
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&dev->lock, &attr);
     pthread_mutex_init(&dev->grave_lock, NULL);
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < B11_ALLOCATORS; ++i) {
         dev->allocators[i] = bd12_cmd_allocator_create(dev->bd);
         if (dev->allocators[i]) dev->lists[i] = bd12_cmd_list_create(dev->allocators[i]);
     }
@@ -48,10 +49,28 @@ B11Device *b11_device_create(void)
     return dev;
 }
 
+uint64_t g_b11_wait_ns;              /* time spent blocked on the GPU, reported by BEER_BD11_FPS */
+
 int b11_wait_serial(B11Device *dev, uint64_t serial)
 {
-    if (!serial) return 1;
-    return bd12_fence_wait(dev->retire, serial, 10ull * 1000000000ull);
+    if (!serial || serial <= bd12_fence_completed(dev->retire)) return 1;
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    const int ok = bd12_fence_wait(dev->retire, serial, 10ull * 1000000000ull);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    __atomic_fetch_add(&g_b11_wait_ns, (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)),
+                       __ATOMIC_RELAXED);
+    return ok;
+}
+
+void b11_wait_gpu_use(B11Device *dev, uint64_t serial)
+{
+    if (!serial || serial <= bd12_fence_completed(dev->retire)) return;
+    pthread_mutex_lock(&dev->lock);
+    const int open = serial > dev->serial;
+    pthread_mutex_unlock(&dev->lock);
+    if (open) b11_flush(dev, 0);
+    b11_wait_serial(dev, serial);
 }
 
 BD12CmdList *b11_cmd(B11Device *dev)
@@ -87,7 +106,7 @@ void b11_flush(B11Device *dev, int wait)
         if (r != VK_SUCCESS) fprintf(stderr, "[BD11] queue submit failed: %d\n", (int)r);
         dev->serial = serial;
         dev->allocator_serial[dev->allocator_current] = serial;
-        dev->allocator_current = (dev->allocator_current + 1) % 3;
+        dev->allocator_current = (dev->allocator_current + 1) % B11_ALLOCATORS;
         dev->recording = 0;
         dev->cmd = NULL;
     }
@@ -109,4 +128,104 @@ B11HR b11_device_create_for_loader(void **device, void **context)
     if (device) { b11_add_ref(&dev->obj); *device = dev; }
     if (context) { b11_add_ref(&dev->immediate->obj); *context = dev->immediate; }
     return B11_S_OK;
+}
+
+/* Upload slices ------------------------------------------------------------------------------- */
+#define SLICE_CLASSES 18                   /* 256 B .. 32 MiB */
+#define SLICE_CHUNK (4u << 20)
+
+typedef struct { BD12Buffer *slice; uint64_t serial; } SliceWait;
+
+struct B11SlicePool {
+    pthread_mutex_t lock;
+    BD12Buffer **free_list[SLICE_CLASSES];
+    uint32_t free_count[SLICE_CLASSES], free_capacity[SLICE_CLASSES];
+    SliceWait *wait[SLICE_CLASSES];        /* FIFO in retire order */
+    uint32_t wait_head[SLICE_CLASSES], wait_tail[SLICE_CLASSES], wait_capacity[SLICE_CLASSES];
+    BD12Heap *chunk;
+    VkDeviceSize chunk_used, chunk_size;
+};
+
+static int slice_class(size_t size)
+{
+    int c = 0;
+    while (c < SLICE_CLASSES - 1 && ((size_t)256 << c) < size) ++c;
+    return ((size_t)256 << c) >= size ? c : -1;
+}
+
+static int push_free(struct B11SlicePool *p, int c, BD12Buffer *slice)
+{
+    if (p->free_count[c] == p->free_capacity[c]) {
+        const uint32_t cap = p->free_capacity[c] ? p->free_capacity[c] * 2 : 64;
+        BD12Buffer **grown = realloc(p->free_list[c], cap * sizeof(*grown));
+        if (!grown) return 0;
+        p->free_list[c] = grown;
+        p->free_capacity[c] = cap;
+    }
+    p->free_list[c][p->free_count[c]++] = slice;
+    return 1;
+}
+
+BD12Buffer *b11_slice_get(B11Device *dev, size_t size)
+{
+    const int c = slice_class(size);
+    if (c < 0) return NULL;
+    struct B11SlicePool *p = dev->slices;
+    if (!p) {
+        pthread_mutex_lock(&dev->lock);
+        if (!dev->slices && (p = calloc(1, sizeof(*p)))) {
+            pthread_mutex_init(&p->lock, NULL);
+            dev->slices = p;
+        }
+        p = dev->slices;
+        pthread_mutex_unlock(&dev->lock);
+        if (!p) return NULL;
+    }
+    const uint64_t done = bd12_fence_completed(dev->retire);
+    pthread_mutex_lock(&p->lock);
+    while (p->wait_head[c] != p->wait_tail[c]) {
+        SliceWait *w = &p->wait[c][p->wait_head[c] % p->wait_capacity[c]];
+        if (w->serial > done || !push_free(p, c, w->slice)) break;
+        p->wait_head[c]++;
+    }
+    BD12Buffer *slice = p->free_count[c] ? p->free_list[c][--p->free_count[c]] : NULL;
+    if (!slice) {
+        const VkDeviceSize bytes = (VkDeviceSize)256 << c;
+        if (!p->chunk || p->chunk_used + bytes > p->chunk_size) {
+            p->chunk_size = bytes > SLICE_CHUNK ? bytes : SLICE_CHUNK;
+            p->chunk = bd12_heap_create_unzeroed(dev->bd, BD12_HEAP_UPLOAD, p->chunk_size);
+            p->chunk_used = 0;
+        }
+        if (p->chunk) {
+            slice = bd12_buffer_create_placed(p->chunk, p->chunk_used, bytes);
+            if (slice) p->chunk_used += bytes;       /* power-of-two sizes keep every slice aligned */
+        }
+    }
+    pthread_mutex_unlock(&p->lock);
+    return slice;
+}
+
+void b11_slice_retire(B11Device *dev, BD12Buffer *slice)
+{
+    struct B11SlicePool *p = dev->slices;
+    const int c = slice ? slice_class(slice->size) : -1;
+    if (!p || c < 0) return;
+    pthread_mutex_lock(&dev->lock);
+    const uint64_t serial = dev->serial + 1;           /* the open list may still use it */
+    pthread_mutex_unlock(&dev->lock);
+    pthread_mutex_lock(&p->lock);
+    if (p->wait_tail[c] - p->wait_head[c] == p->wait_capacity[c]) {
+        const uint32_t cap = p->wait_capacity[c] ? p->wait_capacity[c] * 2 : 256;
+        SliceWait *grown = malloc(cap * sizeof(*grown));
+        if (!grown) { pthread_mutex_unlock(&p->lock); return; }     /* leaks one slice; never reused */
+        for (uint32_t i = 0; i < p->wait_tail[c] - p->wait_head[c]; ++i)
+            grown[i] = p->wait[c][(p->wait_head[c] + i) % p->wait_capacity[c]];
+        p->wait_tail[c] -= p->wait_head[c];
+        p->wait_head[c] = 0;
+        free(p->wait[c]);
+        p->wait[c] = grown;
+        p->wait_capacity[c] = cap;
+    }
+    p->wait[c][p->wait_tail[c]++ % p->wait_capacity[c]] = (SliceWait){ slice, serial };
+    pthread_mutex_unlock(&p->lock);
 }
