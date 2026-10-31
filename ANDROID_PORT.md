@@ -412,8 +412,9 @@ RE8 now renders its title scene, menus, popups and logo in the APK, without the 
 
 RE8 now reaches gameplay in the APK: videos play, the 3D world renders, ~30 fps at 1080p and 50-60 fps at the lowest
 Image Quality, GPU-bound (kgsl gpubusy ~95%).
-- Loading hang: the game's audio mixer, slow under emulation, held its audio engine's lock almost permanently and starved
-  the sound-bank requests loading waits for. Workaround until audio is done: `env:BEER_WASAPI_NO_DEVICE=1` (no endpoint).
+- Loading hang: with the silent sink, the game's audio mixer held its audio engine's lock almost permanently and starved
+  the sound-bank requests loading waits for (`env:BEER_WASAPI_NO_DEVICE=1` hid the device as a workaround). With real
+  output through AAudio (`audio/audio_backend.c`, Android only) sound plays and the hang does not occur.
 - Videos: ffmpeg/ffprobe built for Android (`../android-deps/ffmpeg-build`, minimal LGPL build) ship as
   `libffmpeg.so`/`libffprobe.so`; `BEER_FFMPEG`/`BEER_FFPROBE` point media_foundation.c at them.
 - Speed: guest calls into Beer's COM objects patch their vtable slot to a `syscall` thunk on first use (no signal per call);

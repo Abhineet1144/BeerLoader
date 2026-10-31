@@ -4,6 +4,9 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#ifdef __ANDROID__
+#include <aaudio/AAudio.h>
+#endif
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -73,6 +76,10 @@ static struct {
     int failed;
     int null_sink;                 /* no sound server: accept PCM and discard it at real-time pace */
     uint64_t bytes_per_second;
+#ifdef __ANDROID__
+    AAudioStream *aaudio;          /* Android output; NULL = silent pacing (null_sink) */
+    uint32_t frame_bytes;
+#endif
 } g_audio;
 
 static void audio_finish_packet(AudioPacket *packet)
@@ -159,6 +166,22 @@ static void *audio_thread_main(void *unused)
         for (size_t done = 0; write_ok && done < packet->size; ) {
             size_t n = packet->size - done < piece ? packet->size - done : piece;
             const uint64_t t_before = audio_now_ms();
+#ifdef __ANDROID__
+            if (g_audio.aaudio) {
+                /* The blocking write paces the producer at the device's real rate. */
+                const aaudio_result_t written = AAudioStream_write(g_audio.aaudio, (const uint8_t *)packet->data + done,
+                                                                   (int32_t)(n / g_audio.frame_bytes), 1000000000ll);
+                if (written < 0) {
+                    fprintf(stderr, "[AUDIO] AAudio write failed (%s); continuing silently\n",
+                            AAudio_convertResultToText(written));
+                    AAudioStream_close(g_audio.aaudio);
+                    g_audio.aaudio = NULL;
+                }
+                done += n;
+                atomic_store(&g_audio.write_started_ms, audio_now_ms());
+                continue;
+            }
+#endif
             if (g_audio.null_sink) {
                 /* A real device consumes PCM at its sample rate; pace the producer the same way so the game's audio
                  * threads see normal timing (and callbacks complete) instead of an instant, endless drain. */
@@ -193,10 +216,33 @@ int beer_audio_init(unsigned rate, unsigned channels)
     if (!(force_null && *force_null && strcmp(force_null, "0")))
         g_audio.library = dlopen("libpulse-simple.so.0", RTLD_NOW | RTLD_LOCAL);
     if (!g_audio.library) {
-        /* No sound server (Android has no PulseAudio): keep the game's audio path working with a silent sink. */
-        fprintf(stderr, "[AUDIO] no Pulse/PipeWire library (%s): using a silent timed sink\n",
-                force_null && *force_null ? "BEER_AUDIO_NULL" : dlerror());
+        /* No sound server: on Android play through AAudio, else keep the game's audio path working with a silent sink. */
+        const char *why = force_null && *force_null ? "BEER_AUDIO_NULL" : dlerror();
         g_audio.null_sink = 1;
+#ifdef __ANDROID__
+        AAudioStreamBuilder *builder = NULL;
+        if (!(force_null && *force_null && strcmp(force_null, "0")) && AAudio_createStreamBuilder(&builder) == AAUDIO_OK) {
+            AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
+            AAudioStreamBuilder_setChannelCount(builder, (int32_t)channels);
+            AAudioStreamBuilder_setSampleRate(builder, (int32_t)rate);
+            AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_NONE);
+            AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
+            AAudioStream *stream = NULL;
+            if (AAudioStreamBuilder_openStream(builder, &stream) == AAUDIO_OK) {
+                if (AAudioStream_requestStart(stream) == AAUDIO_OK) {
+                    g_audio.aaudio = stream;
+                    g_audio.frame_bytes = channels * (uint32_t)sizeof(int16_t);
+                } else {
+                    AAudioStream_close(stream);
+                }
+            }
+            AAudioStreamBuilder_delete(builder);
+        }
+        if (g_audio.aaudio)
+            fprintf(stderr, "[AUDIO] AAudio output initialized: %u Hz, %u channels, S16LE\n", rate, channels);
+        else
+#endif
+        fprintf(stderr, "[AUDIO] no Pulse/PipeWire library (%s): using a silent timed sink\n", why);
         g_audio.bytes_per_second = (uint64_t)rate * channels * sizeof(int16_t);
         pthread_mutex_init(&g_audio.mutex, NULL);
         pthread_cond_init(&g_audio.condition, NULL);

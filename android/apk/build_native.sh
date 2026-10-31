@@ -59,4 +59,4 @@ $CXX -shared -o "$OUT/lib/arm64-v8a/libbeer.so" $OBJ/*.o \
   $FB/FEXCore/Source/libFEXCore.a $FB/FEXCore/Source/libFEXCore_Base.a $FB/FEXCore/Source/libJemallocDummy.a \
   $FB/External/fmt/libfmt.a $FB/External/xxhash/cmake_unofficial/libxxhash.a \
   $FB/External/SoftFloat-3e/libsoftfloat_3e.a $FB/External/cephes/libcephes_128bit.a \
-  -static-libstdc++ -landroid -llog -ldl -lm -lz -Wl,-z,max-page-size=16384 -Wl,--no-undefined 2> "$OUT/link.err" && echo "libbeer.so built" || { echo "LINK FAILED"; grep -oE "undefined symbol: [A-Za-z0-9_:]+" "$OUT/link.err" | sort | uniq -c | sort -rn | head -30; exit 1; }
+  -static-libstdc++ -landroid -llog -laaudio -ldl -lm -lz -Wl,-z,max-page-size=16384 -Wl,--no-undefined 2> "$OUT/link.err" && echo "libbeer.so built" || { echo "LINK FAILED"; grep -oE "undefined symbol: [A-Za-z0-9_:]+" "$OUT/link.err" | sort | uniq -c | sort -rn | head -30; exit 1; }
