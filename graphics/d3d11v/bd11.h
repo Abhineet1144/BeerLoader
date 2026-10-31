@@ -95,6 +95,10 @@ typedef struct {
     uint32_t usage, bind, cpu, misc;
 } B11TextureDesc;
 
+/* Command lists in flight. Presents no longer wait for the GPU and games Flush() several times a frame,
+ * so the ring must outlast a few frames of submissions or recording would stall on the oldest one. */
+#define B11_ALLOCATORS 16
+
 typedef struct B11Buffer {
     B11Obj obj;
     B11BufferDesc desc;
@@ -104,6 +108,8 @@ typedef struct B11Buffer {
     uint64_t *backing_serial;     /* last submission serial that used each backing */
     uint32_t backing_count, backing_capacity, current;
     int host_visible;
+    int renamed;                  /* backing[0] is an upload slice replaced on every UpdateSubresource */
+    int gpu_written;              /* a GPU copy wrote it: CPU-side renames would lose that data */
     uint8_t *shadow;              /* CPU copy for STAGING reads/writes via Map */
 } B11Buffer;
 
@@ -177,7 +183,8 @@ typedef enum {
     B11_OP_COPY_RESOURCE, B11_OP_COPY_REGION, B11_OP_UPDATE, B11_OP_BUFFER_WRITE,
     B11_OP_GENERATE_MIPS, B11_OP_RESOLVE, B11_OP_BEGIN_QUERY, B11_OP_END_QUERY,
     B11_OP_SET_PREDICATION, B11_OP_CLEAR_STATE,
-    B11_OP_DRAW_INDEXED_INDIRECT, B11_OP_DRAW_INSTANCED_INDIRECT, B11_OP_DISPATCH_INDIRECT
+    B11_OP_DRAW_INDEXED_INDIRECT, B11_OP_DRAW_INSTANCED_INDIRECT, B11_OP_DISPATCH_INDIRECT,
+    B11_OP_BUFFER_RENAME
 } B11OpType;
 
 typedef struct {
@@ -239,7 +246,12 @@ struct B11Context {
         void *data;
         size_t size;
         int lazy_slot;            /* lazy scratch registry slot + 1, 0 when data is plain heap memory */
+        BD12Buffer *slice;        /* deferred DISCARD: the new version, renamed in when the list executes */
+        int direct;               /* deferred NO_OVERWRITE into this context's discarded slice: nothing to emit */
     } mapped[64];
+    /* deferred: the slice each buffer was last discarded into while recording the current list */
+    struct { B11Obj *buffer; BD12Buffer *slice; } discards[64];
+    uint32_t discard_count;
     /* immediate execution state */
     uint32_t dirty;
     uint64_t generation;          /* dev->cmd_generation the dirty bits were computed for */
@@ -284,11 +296,11 @@ struct B11Device {
     pthread_mutex_t lock;
     pthread_mutex_t grave_lock;
     B11Grave *grave_head, *grave_tail;
-    BD12CmdAllocator *allocators[3];
-    uint64_t allocator_serial[3];
+    BD12CmdAllocator *allocators[B11_ALLOCATORS];
+    uint64_t allocator_serial[B11_ALLOCATORS];
     uint32_t allocator_current;
     BD12CmdList *cmd;             /* the immediate context's open list */
-    BD12CmdList *lists[3];        /* one list per allocator */
+    BD12CmdList *lists[B11_ALLOCATORS];  /* one list per allocator */
     uint64_t cmd_generation;      /* bumped whenever a fresh command list begins */
     int recording;
     B11Context *immediate;
@@ -304,6 +316,7 @@ struct B11Device {
     uint64_t frame;
     BD12Buffer *null_buffer;       /* bound for NULL constant buffers */
     uint32_t flags;
+    struct B11SlicePool *slices;   /* recycled host-visible upload slices */
 };
 
 /* ---- API -------------------------------------------------------------------------------- */
@@ -324,6 +337,16 @@ B11Context *b11_context_create(B11Device *dev, uint32_t type, uint32_t flags);
 void b11_flush(B11Device *dev, int wait);
 BD12CmdList *b11_cmd(B11Device *dev);        /* the open immediate list, creating it on demand */
 int b11_wait_serial(B11Device *dev, uint64_t serial);
+/* Host-visible upload slices of up to 32 MiB, carved from shared heaps and recycled once the GPU is done with
+ * them: CPU-written buffer versions and staging copies without one vkAllocateMemory per update. */
+#define B11_SLICE_MAX (32u << 20)
+BD12Buffer *b11_slice_get(B11Device *dev, size_t size);
+/* Returns a slice; it is reused after the work recorded so far has retired. */
+void b11_slice_retire(B11Device *dev, BD12Buffer *slice);
+/* Makes `slice` the buffer's contents (the previous version retires once the GPU is done with it). */
+void b11_buffer_rename(B11Buffer *b, BD12Buffer *slice);
+/* Waits until GPU work recorded up to `serial` (possibly still in the open list) has finished. */
+void b11_wait_gpu_use(B11Device *dev, uint64_t serial);
 VkDescriptorSet b11_resolve_hook(BD12CmdList *list, void *user, const BD12ShaderBinding *bindings,
                                  const VkDescriptorType *types, uint32_t binding_count,
                                  VkDescriptorSetLayout set_layout, int compute);

@@ -956,6 +956,8 @@ static void bd12_report_drops(void)
 uint64_t g_bd12_prof_ns[BD12_PROF_COUNT];
 uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
 
+uint64_t g_bd12_cmd_counts[4];
+
 void bd12_prof_report(void)
 {
     bd12_report_drops();

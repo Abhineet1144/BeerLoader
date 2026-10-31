@@ -102,12 +102,9 @@ void bd12_pso_parse_graphics(const uint8_t *desc, BD12PsoDesc *pso)
     memcpy(&pso->root_signature, desc, sizeof(void *));
     shader_at(desc, 8, &pso->vs, &pso->vs_size);
     shader_at(desc, 24, &pso->ps, &pso->ps_size);
-    const uint8_t *unused_code = NULL;
-    size_t unused_size = 0;
-    for (size_t off = 40; off <= 72; off += 16) {   /* DS, HS, GS */
-        shader_at(desc, off, &unused_code, &unused_size);
-        if (unused_code) pso->has_tessellation_or_geometry = 1;
-    }
+    shader_at(desc, 40, &pso->ds, &pso->ds_size);
+    shader_at(desc, 56, &pso->hs, &pso->hs_size);
+    shader_at(desc, 72, &pso->gs, &pso->gs_size);
     parse_blend(pso, desc + 120);
     pso->sample_mask = rd32(desc + 448);
     parse_rasterizer(pso, desc + 452);
@@ -153,13 +150,9 @@ void bd12_pso_parse_stream(const uint8_t *stream, size_t size, BD12PsoDesc *pso)
         case 0: memcpy(&pso->root_signature, d, sizeof(void *)); break;
         case 1: shader_at(d, 0, &pso->vs, &pso->vs_size); break;
         case 2: shader_at(d, 0, &pso->ps, &pso->ps_size); break;
-        case 3: case 4: case 5: {
-            const uint8_t *c = NULL;
-            size_t n = 0;
-            shader_at(d, 0, &c, &n);
-            if (c) pso->has_tessellation_or_geometry = 1;
-            break;
-        }
+        case 3: shader_at(d, 0, &pso->ds, &pso->ds_size); break;
+        case 4: shader_at(d, 0, &pso->hs, &pso->hs_size); break;
+        case 5: shader_at(d, 0, &pso->gs, &pso->gs_size); break;
         case 6: shader_at(d, 0, &pso->cs, &pso->cs_size); break;
         case 8: parse_blend(pso, d); break;
         case 9: pso->sample_mask = rd32(d); break;
@@ -348,8 +341,63 @@ static uint32_t to_bindings(const BeerD3D12TranslatedShader *shader,
     return shader->descriptor_count;
 }
 
+/* Input patch size a hull shader declares (dcl_input_control_point_count),
+ * 0 when absent. */
+static uint32_t hull_input_control_points(const uint8_t *dxbc, size_t size)
+{
+    if (!dxbc || size < 32 || memcmp(dxbc, "DXBC", 4) != 0) return 0;
+    const uint32_t chunks = rd32(dxbc + 28);
+    for (uint32_t c = 0; c < chunks && 32 + (size_t)c * 4 + 4 <= size; ++c) {
+        const uint32_t offset = rd32(dxbc + 32 + c * 4);
+        if ((size_t)offset + 8 > size) continue;
+        if (memcmp(dxbc + offset, "SHEX", 4) && memcmp(dxbc + offset, "SHDR", 4)) continue;
+        const size_t end = offset + 8 + (size_t)rd32(dxbc + offset + 4);
+        size_t at = offset + 16;                /* skip version and length tokens */
+        while (at + 4 <= end && end <= size) {
+            const uint32_t token = rd32(dxbc + at);
+            const uint32_t opcode = token & 0x7ff;
+            if (opcode == 147) return (token >> 11) & 0x3f;
+            uint32_t length = (token >> 24) & 0x7f;
+            if (opcode == 0x35) {               /* customdata: length in the next token */
+                if (at + 8 > end) break;
+                length = rd32(dxbc + at + 4);
+            }
+            if (!length) break;
+            at += (size_t)length * 4;
+        }
+    }
+    return 0;
+}
+
+static const BeerD3D12TranslatedShader *translate_stage(const char *name,
+                                                         const uint8_t *code,
+                                                         size_t size)
+{
+    if (!code) return NULL;
+    const BeerD3D12TranslatedShader *shader =
+        beer_d3d12_translate_shader(code, size, fnv(code, size));
+    if (!shader)
+        fprintf(stderr, "[BD12] %s translation failed: %s\n", name,
+                beer_d3d12_shader_translation_error());
+    return shader;
+}
+
+static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDesc *pso,
+                                             int no_extra_stages);
+
 BD12GraphicsPipeline *bd12_pso_create_graphics(BD12Device *device,
                                                const BD12PsoDesc *pso)
+{
+    BD12GraphicsPipeline *pipeline = create_graphics(device, pso, 0);
+    if (!pipeline && (pso->hs || pso->gs)) {
+        fprintf(stderr, "[BD12] pipeline with hull/domain/geometry stages failed: retrying with VS/PS only\n");
+        pipeline = create_graphics(device, pso, 1);
+    }
+    return pipeline;
+}
+
+static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDesc *pso,
+                                             int no_extra_stages)
 {
     if (!pso->vs) return NULL;
     const BeerD3D12TranslatedShader *vs =
@@ -384,6 +432,19 @@ BD12GraphicsPipeline *bd12_pso_create_graphics(BD12Device *device,
         }
     }
 
+    /* Hull and domain shaders only work as a pair. A stage that does not translate is left out, so the draw
+     * still renders untessellated / without its geometry shader as it did before BD12 had these stages. */
+    const BeerD3D12TranslatedShader *hs = NULL, *ds = NULL, *gs = NULL;
+    if (pso->hs && pso->ds && !no_extra_stages &&
+        (!(hs = translate_stage("HS", pso->hs, pso->hs_size)) ||
+         !(ds = translate_stage("DS", pso->ds, pso->ds_size))))
+        hs = ds = NULL;
+    if (pso->gs && !no_extra_stages) gs = translate_stage("GS", pso->gs, pso->gs_size);
+    const int tessellated = hs != NULL;
+
+    BD12ShaderBinding hs_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
+    BD12ShaderBinding ds_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
+    BD12ShaderBinding gs_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
     BD12ShaderBinding vs_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
     BD12ShaderBinding ps_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
     BD12GraphicsPipelineDesc desc;
@@ -393,6 +454,16 @@ BD12GraphicsPipeline *bd12_pso_create_graphics(BD12Device *device,
     if (ps)
         desc.ps = (BD12ShaderCode){ (const uint32_t *)ps->spirv, ps->spirv_size,
                                     ps_bindings, to_bindings(ps, ps_bindings) };
+    if (hs) {
+        desc.hs = (BD12ShaderCode){ (const uint32_t *)hs->spirv, hs->spirv_size,
+                                    hs_bindings, to_bindings(hs, hs_bindings) };
+        desc.ds = (BD12ShaderCode){ (const uint32_t *)ds->spirv, ds->spirv_size,
+                                    ds_bindings, to_bindings(ds, ds_bindings) };
+        desc.patch_control_points = hull_input_control_points(pso->hs, pso->hs_size);
+    }
+    if (gs)
+        desc.gs = (BD12ShaderCode){ (const uint32_t *)gs->spirv, gs->spirv_size,
+                                    gs_bindings, to_bindings(gs, gs_bindings) };
 
     /* Vertex attributes: match each input element to the vertex shader's
      * input signature by semantic; the shader location is the register. */
@@ -434,11 +505,10 @@ BD12GraphicsPipeline *bd12_pso_create_graphics(BD12Device *device,
     desc.attributes = attributes;
     desc.attribute_count = attribute_count;
 
-    uint32_t patch_points;
-    desc.topology = pso->topology_type == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
+    desc.topology = tessellated ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST :
+                    pso->topology_type == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
                     pso->topology_type == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST :
                     VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    (void)patch_points;
     desc.fill_mode = pso->fill_mode == 2 ? VK_POLYGON_MODE_LINE :
                                            VK_POLYGON_MODE_FILL;
     desc.cull_mode = pso->cull_mode == 1 ? VK_CULL_MODE_NONE :
@@ -499,6 +569,7 @@ int bd12_pso_clone(const BD12PsoDesc *src, BD12PsoDesc *dst)
 {
     *dst = *src;
     size_t total = src->vs_size + src->ps_size + src->cs_size +
+                   src->hs_size + src->ds_size + src->gs_size +
                    (size_t)src->input_count * 32;
     for (uint32_t i = 0; i < src->input_count; ++i) {
         const char *name = NULL;
@@ -519,6 +590,18 @@ int bd12_pso_clone(const BD12PsoDesc *src, BD12PsoDesc *dst)
     if (src->cs_size) {
         memcpy(cursor, src->cs, src->cs_size);
         dst->cs = cursor; cursor += src->cs_size;
+    }
+    if (src->hs_size) {
+        memcpy(cursor, src->hs, src->hs_size);
+        dst->hs = cursor; cursor += src->hs_size;
+    }
+    if (src->ds_size) {
+        memcpy(cursor, src->ds, src->ds_size);
+        dst->ds = cursor; cursor += src->ds_size;
+    }
+    if (src->gs_size) {
+        memcpy(cursor, src->gs, src->gs_size);
+        dst->gs = cursor; cursor += src->gs_size;
     }
     if (src->input_count) {
         uint8_t *elements = cursor;

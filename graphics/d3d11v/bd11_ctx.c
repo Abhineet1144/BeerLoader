@@ -166,6 +166,9 @@ static void apply_state(B11Context *ctx, const B11Op *op)
     }
 }
 
+/* Payload of B11_OP_BUFFER_RENAME: the slice a deferred DISCARD map wrote, owned by the op until it executes. */
+typedef struct { BD12Buffer *slice; int consumed; } B11RenameOp;
+
 /* ---- texture state ------------------------------------------------------------------------- */
 
 static int bd12_format_has_stencil(uint32_t dxgi)
@@ -183,7 +186,7 @@ void b11_texture_use(B11Context *ctx, B11Texture *t, uint32_t state)
 
 static void buffer_mark_used(B11Buffer *b)
 {
-    if (b->desc.usage != B11_USAGE_DYNAMIC) return;
+    if (b->desc.usage != B11_USAGE_DYNAMIC && b->desc.usage != B11_USAGE_STAGING) return;
     b->backing_serial[b->current] = b->obj.dev->serial + 1;
 }
 
@@ -201,12 +204,10 @@ static BD12GraphicsPipeline *get_pso(B11Context *ctx)
     B11Device *dev = ctx->obj.dev;
     B11PipelineState *s = &ctx->st;
     B11Shader *vs = (B11Shader *)s->shader[B11_STAGE_VS], *ps = (B11Shader *)s->shader[B11_STAGE_PS];
+    B11Shader *hs = (B11Shader *)s->shader[B11_STAGE_HS], *ds = (B11Shader *)s->shader[B11_STAGE_DS],
+              *gs = (B11Shader *)s->shader[B11_STAGE_GS];
     if (!vs) return NULL;
-    if (s->shader[B11_STAGE_HS] || s->shader[B11_STAGE_DS]) {
-        static int warned;
-        if (!warned++) fprintf(stderr, "[BD11] tessellation shaders bound: draw skipped (not implemented yet)\n");
-        return NULL;
-    }
+    if (!hs || !ds) hs = ds = NULL;        /* a lone hull or domain shader is inactive */
     uint32_t topo_type = 3;
     switch (s->topology) {
     case 1: topo_type = 1; break;
@@ -228,6 +229,7 @@ static BD12GraphicsPipeline *get_pso(B11Context *ctx)
     uint64_t key = 1469598103934665603ull;
 #define MIX(v) do { key = (key ^ (uint64_t)(v)) * 1099511628211ull; } while (0)
     MIX(vs->hash); MIX(ps ? ps->hash : 0); MIX(layout ? layout->hash : 0);
+    MIX(hs ? hs->hash : 4); MIX(ds ? ds->hash : 5); MIX(gs ? gs->hash : 6);
     MIX(blend ? blend->hash : 1); MIX(depth ? depth->hash : 2); MIX(raster ? raster->hash : 3);
     MIX(topo_type); MIX(s->rtv_count); MIX(ds_format); MIX(samples);
     for (uint32_t i = 0; i < s->rtv_count; ++i) MIX(rt_formats[i]);
@@ -240,6 +242,9 @@ static BD12GraphicsPipeline *get_pso(B11Context *ctx)
     size_t vs_size = 0, ps_size = 0;
     pso.vs = shader_code(&vs->obj, &vs_size); pso.vs_size = vs_size;
     pso.ps = shader_code(ps ? &ps->obj : NULL, &ps_size); pso.ps_size = ps_size;
+    pso.hs = shader_code(hs ? &hs->obj : NULL, &pso.hs_size);
+    pso.ds = shader_code(ds ? &ds->obj : NULL, &pso.ds_size);
+    pso.gs = shader_code(gs ? &gs->obj : NULL, &pso.gs_size);
     if (layout) { pso.input_elements = layout->elements; pso.input_count = layout->count; }
     if (blend) {
         const uint32_t *w = (const uint32_t *)blend->desc;
@@ -307,9 +312,9 @@ VkDescriptorSet b11_resolve_hook(BD12CmdList *list, void *user, const BD12Shader
     B11Context *ctx = user;
     B11Device *dev = ctx->obj.dev;
     BD12Device *bd = list->device;
-    VkDescriptorSet set = bd12_allocate_descriptor_set(list->allocator, layout);
-    if (!set) return VK_NULL_HANDLE;
-    enum { MAX = 64 };
+    /* Allocated here only if the writes overflow the arrays; otherwise BD12's set cache reuses an identical set. */
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    enum { MAX = 128 };
     VkWriteDescriptorSet writes[MAX];
     VkDescriptorBufferInfo buffer_infos[MAX];
     VkDescriptorImageInfo image_infos[MAX];
@@ -319,6 +324,8 @@ VkDescriptorSet b11_resolve_hook(BD12CmdList *list, void *user, const BD12Shader
         const BD12ShaderBinding *b = &bindings[i];
         const uint32_t stage = translator_stage_to_b11(b->stage);
         if (wn == MAX) {
+            if (!set && !(set = bd12_allocate_descriptor_set(list->allocator, layout))) return VK_NULL_HANDLE;
+            for (uint32_t k = 0; k < wn; ++k) writes[k].dstSet = set;
             bd->vk.UpdateDescriptorSets(bd->device, wn, writes, 0, NULL);
             wn = 0;
         }
@@ -385,8 +392,15 @@ VkDescriptorSet b11_resolve_hook(BD12CmdList *list, void *user, const BD12Shader
             VkBufferView bv = VK_NULL_HANDLE;
             if (v && v->desc) {
                 bv = v->desc->buffer_view;
-                if (!bv && v->desc->source_buffer)
-                    bv = bd12_buffer_view(v->desc->source_buffer, v->desc->format, v->desc->offset, v->desc->range,
+                /* A renamed buffer (dynamic Map DISCARD, CPU-written versions) lives in a different VkBuffer than
+                 * the one the view was created on: view its current version. */
+                BD12Buffer *src = v->desc->source_buffer;
+                if (v->resource && v->resource->kind == B11_BUFFER && ((B11Buffer *)v->resource)->backing_count) {
+                    BD12Buffer *cur = b11_buffer_current((B11Buffer *)v->resource);
+                    if (cur && cur != src) { src = cur; bv = VK_NULL_HANDLE; }
+                }
+                if (!bv && src)
+                    bv = bd12_buffer_view(src, v->desc->format, v->desc->offset, v->desc->range,
                                           types[i] == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
                 if (v->resource && v->resource->kind == B11_BUFFER) buffer_mark_used((B11Buffer *)v->resource);
             }
@@ -397,6 +411,8 @@ VkDescriptorSet b11_resolve_hook(BD12CmdList *list, void *user, const BD12Shader
         }
         ++wn;
     }
+    if (!set) return bd12_descriptor_set_for_writes(list->allocator, layout, writes, wn);
+    for (uint32_t k = 0; k < wn; ++k) writes[k].dstSet = set;
     if (wn) bd->vk.UpdateDescriptorSets(bd->device, wn, writes, 0, NULL);
     return set;
 }
@@ -423,6 +439,7 @@ static void use_srvs(B11Context *ctx, int compute)
 }
 
 uint64_t g_b11_stats[16];
+uint64_t g_b11_map_stats[8][3];
 enum { ST_DRAW, ST_DRAW_SKIPPED, ST_CLEAR_RTV, ST_CLEAR_DSV, ST_COPY, ST_UPDATE, ST_BUFWRITE, ST_REPLAY_OPS, ST_LISTS,
        ST_INDIRECT };
 
@@ -827,6 +844,17 @@ static void do_copy(B11Context *ctx, B11Obj *dst_o, uint32_t dst_sub, uint32_t d
                 (void *)src_o, ((B11Texture *)src_o)->desc.format, ((B11Texture *)src_o)->desc.width, ((B11Texture *)src_o)->desc.height, src_sub, whole, box != NULL);
     if (dst_o->kind == B11_BUFFER && src_o->kind == B11_BUFFER) {
         B11Buffer *d = (B11Buffer *)dst_o, *s = (B11Buffer *)src_o;
+        if (d->renamed) {                               /* back to a GPU-written buffer: CPU renames would drop this copy */
+            d->renamed = 0;
+            BD12Buffer *own = bd12_buffer_create_committed(dev->bd, BD12_HEAP_DEFAULT, (d->desc.byte_width + 255u) & ~255u);
+            if (own) {
+                bd12_cmd_global_barrier(cmd);
+                bd12_cmd_copy_buffer(cmd, own, 0, d->backing[0], 0, d->desc.byte_width);
+                b11_slice_retire(dev, d->backing[0]);
+                d->backing[0] = own;
+            } else d->renamed = 1;
+        }
+        d->gpu_written = 1;
         BD12Buffer *db = b11_buffer_write_backing(d, 0), *sb = b11_buffer_current(s);
         uint64_t sz = s->desc.byte_width, off = 0;
         if (!whole && box) { off = box[0]; sz = box[3] - box[0]; }
@@ -866,6 +894,7 @@ static void do_copy(B11Context *ctx, B11Obj *dst_o, uint32_t dst_sub, uint32_t d
         b11_texture_use(ctx, d, BD12_STATE_COPY_DEST);
         bd12_cmd_copy_buffer_to_image(cmd, d->image, (BD12ImagePoint){ dst_sub, (int32_t)dx, (int32_t)dy, (int32_t)dz },
                                       s->staging, s->sub_offset[src_sub], s->sub_pitch[src_sub], w, h, depth);
+        s->last_use_serial = dev->serial + 1;      /* a later Map must not overwrite what this copy reads */
     }
 }
 
@@ -894,17 +923,43 @@ static void do_update(B11Context *ctx, const B11Op *op)
                 fprintf(stderr, "[BD11 UPD] buffer %p bind=%u usage=%u size=%u offset=%u box=%d nonzero4K=%u\n", (void *)b, b->desc.bind, b->desc.usage, size, off, box != NULL, nz);
             }
         }
-        BD12Buffer *bk = b11_buffer_write_backing(b, 0);
-        if (b->host_visible && bk->cpu) { memcpy((uint8_t *)bk->cpu + off, src, size); buffer_mark_used(b); return; }
-        if (size <= 65536 && (off & 3) == 0 && (size & 3) == 0) bd12_cmd_update_buffer(cmd, bk, off, size, src);
-        else {
-            BD12Buffer *stage = bd12_buffer_create_committed(dev->bd, BD12_HEAP_UPLOAD, (size + 255u) & ~255u);
-            if (!stage || !stage->cpu) return;
-            memcpy(stage->cpu, src, size);
-            bd12_cmd_global_barrier(cmd);                 /* earlier draws may still read this buffer */
-            bd12_cmd_copy_buffer(cmd, bk, off, stage, 0, size);
-            b11_defer(dev, b11_free_buffer_fn, stage);
+        if (off > b->desc.byte_width || size > b->desc.byte_width - off) return;
+        /* Small constant/vertex/index buffers are renamed: every update writes a fresh upload slice on the CPU
+         * (copying the rest of the previous version), so the update costs no GPU copy and, above all, no
+         * pipeline barrier. Games update such buffers between most draws; a barrier-bracketed GPU copy each
+         * time serialised the GPU (thousands of full barriers per frame). Buffers with views (SRV/UAV/stream
+         * out) keep their VkBuffer; so do buffers a GPU copy has written. The switch happens on a whole-buffer
+         * update, when the old device-local contents no longer matter. */
+        const int renamable = b->desc.usage == 0 && !(b->desc.bind & ~7u) && !b->gpu_written &&
+                              b->desc.byte_width <= 65536 && !getenv("BEER_BD11_NO_RENAME");
+        if (renamable && (b->renamed || (off == 0 && size == b->desc.byte_width))) {
+            BD12Buffer *slice = b11_slice_get(dev, b->desc.byte_width);
+            if (slice && slice->cpu) {
+                BD12Buffer *old = b->backing[0];
+                if (b->renamed && (off || size != b->desc.byte_width)) memcpy(slice->cpu, old->cpu, b->desc.byte_width);
+                memcpy((uint8_t *)slice->cpu + off, src, size);
+                if (b->renamed) b11_slice_retire(dev, old);
+                else b11_defer(dev, b11_free_buffer_fn, old);
+                b->backing[0] = slice;
+                b->current = 0;
+                b->renamed = 1;
+                return;
+            }
         }
+        BD12Buffer *bk = b11_buffer_write_backing(b, 0);
+        if (b->host_visible && !b->renamed && bk->cpu) { memcpy((uint8_t *)bk->cpu + off, src, size); buffer_mark_used(b); return; }
+        if (size <= 65536 && (off & 3) == 0 && (size & 3) == 0) {
+            bd12_cmd_update_buffer(cmd, bk, off, size, src);   /* brackets itself with barriers */
+            return;
+        }
+        BD12Buffer *stage = size <= B11_SLICE_MAX ? b11_slice_get(dev, size) : NULL;
+        const int pooled = stage != NULL;
+        if (!stage) stage = bd12_buffer_create_committed(dev->bd, BD12_HEAP_UPLOAD, (size + 255u) & ~255u);
+        if (!stage || !stage->cpu) return;
+        memcpy(stage->cpu, src, size);
+        bd12_cmd_global_barrier(cmd);                 /* earlier draws may still read this buffer */
+        bd12_cmd_copy_buffer(cmd, bk, off, stage, 0, size);
+        if (pooled) b11_slice_retire(dev, stage); else b11_defer(dev, b11_free_buffer_fn, stage);
         bd12_cmd_global_barrier(cmd);
         return;
     }
@@ -920,7 +975,10 @@ static void do_update(B11Context *ctx, const B11Op *op)
     uint32_t bw = 1, bh = 1, bytes = bd12_dxgi_bytes(t->desc.format);
     if (f != VK_FORMAT_UNDEFINED) bd12_format_block(f, VK_IMAGE_ASPECT_COLOR_BIT, &bw, &bh, &bytes);
     const uint32_t row_bytes = ((w + bw - 1) / bw) * bytes, rows = (h + bh - 1) / bh;
-    BD12Buffer *stage = bd12_buffer_create_committed(dev->bd, BD12_HEAP_UPLOAD, ((uint64_t)row_bytes * rows * d + 255u) & ~255ull);
+    const uint64_t stage_bytes = (uint64_t)row_bytes * rows * d;
+    BD12Buffer *stage = stage_bytes <= B11_SLICE_MAX ? b11_slice_get(dev, stage_bytes) : NULL;
+    const int pooled = stage != NULL;
+    if (!stage) stage = bd12_buffer_create_committed(dev->bd, BD12_HEAP_UPLOAD, (stage_bytes + 255u) & ~255ull);
     if (!stage || !stage->cpu) return;
     for (uint32_t z = 0; z < d; ++z)
         for (uint32_t r = 0; r < rows; ++r)
@@ -934,7 +992,7 @@ static void do_update(B11Context *ctx, const B11Op *op)
     b11_texture_use(ctx, t, BD12_STATE_COPY_DEST);
     bd12_cmd_copy_buffer_to_image(cmd, t->image, (BD12ImagePoint){ sub, (int32_t)x0, (int32_t)y0, (int32_t)z0 },
                                   stage, 0, row_bytes, w, h, d);
-    b11_defer(dev, b11_free_buffer_fn, stage);
+    if (pooled) b11_slice_retire(dev, stage); else b11_defer(dev, b11_free_buffer_fn, stage);
 }
 
 static void do_buffer_write(B11Context *ctx, const B11Op *op)
@@ -1233,6 +1291,17 @@ static void execute(B11Context *ctx, const B11Op *op)
         break;
     case B11_OP_UPDATE: g_b11_stats[ST_UPDATE]++; do_update(ctx, op); break;
     case B11_OP_BUFFER_WRITE: g_b11_stats[ST_BUFWRITE]++; do_buffer_write(ctx, op); break;
+    case B11_OP_BUFFER_RENAME: {
+        B11RenameOp *r = op->data;
+        if (r && !r->consumed && op->obj[0]) {
+            b11_buffer_rename((B11Buffer *)op->obj[0], r->slice);
+            r->consumed = 1;
+        } else if (r && r->consumed) {
+            static int warned;
+            if (!warned++) fprintf(stderr, "[BD11] command list with a discarded Map executed twice: later runs keep the first contents\n");
+        }
+        break;
+    }
     default: break;
     }
 }
@@ -1241,6 +1310,10 @@ static void execute(B11Context *ctx, const B11Op *op)
 
 static void op_release(B11Op *op)
 {
+    if (op->type == B11_OP_BUFFER_RENAME && op->data && op->obj[0]) {     /* never executed: give the slice back */
+        B11RenameOp *r = op->data;
+        if (!r->consumed) b11_slice_retire(op->obj[0]->dev, r->slice);
+    }
     for (int i = 0; i < 3; ++i) if (op->obj[i]) b11_release(op->obj[i]);
     if (op->data) {
         if (op->type == B11_OP_SET_IA_VB) { VbEnt *e = op->data; for (uint32_t i = 0; i < op->b; ++i) if (e[i].obj) b11_release(e[i].obj); }
@@ -1765,13 +1838,38 @@ static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t t
     void *data = NULL;
     uint32_t row_pitch = 0, depth_pitch = 0;
     size_t map_size = 0;
-    int lazy_slot = 0;
+    int lazy_slot = 0, direct = 0;
+    BD12Buffer *slice = NULL;
     if (res->kind == B11_BUFFER) {
         B11Buffer *b = (B11Buffer *)res;
         map_size = b->desc.byte_width;
         if (c->type == 1) {                        /* deferred: scratch the unmap turns into an op */
+            {   /* BEER_BD11_STATS: deferred maps by type (1 READ 2 WRITE 4 DISCARD 5 NO_OVERWRITE) and size */
+                extern uint64_t g_b11_map_stats[8][3];
+                __atomic_fetch_add(&g_b11_map_stats[type & 7][map_size <= 65536 ? 0 : map_size <= (1u << 20) ? 1 : 2], 1, __ATOMIC_RELAXED);
+            }
             BD12Buffer *bk = b11_buffer_current(b);
-            if (type == B11_MAP_WRITE_DISCARD || ((type == B11_MAP_WRITE_NO_OVERWRITE || type == B11_MAP_WRITE) && bk && bk->cpu)) {
+            /* DISCARD: the game writes straight into a fresh upload slice that replaces the buffer's contents when
+             * the list executes, and later NO_OVERWRITE maps in this list reuse that slice. No scratch copy, page
+             * faults or diffs (the lazy scratch below stays for maps without a discard in this list). */
+            if (b->desc.usage == B11_USAGE_DYNAMIC && map_size <= B11_SLICE_MAX && !getenv("BEER_BD11_LAZY_MAPS")) {
+                if (type == B11_MAP_WRITE_DISCARD && (slice = b11_slice_get(dev, map_size)) && slice->cpu) {
+                    data = slice->cpu;
+                    uint32_t d = 0;
+                    while (d < c->discard_count && c->discards[d].buffer != res) ++d;
+                    if (d == c->discard_count) {
+                        if (c->discard_count < 64) c->discard_count++;
+                        else d = (uint32_t)(dev->frame % 64);
+                    }
+                    c->discards[d].buffer = res;
+                    c->discards[d].slice = slice;
+                } else if (type == B11_MAP_WRITE_NO_OVERWRITE) {
+                    for (uint32_t d = 0; d < c->discard_count; ++d)
+                        if (c->discards[d].buffer == res) { data = c->discards[d].slice->cpu; direct = 1; break; }
+                }
+                if (slice && !data) { b11_slice_retire(dev, slice); slice = NULL; }
+            }
+            if (!data && (type == B11_MAP_WRITE_DISCARD || ((type == B11_MAP_WRITE_NO_OVERWRITE || type == B11_MAP_WRITE) && bk && bk->cpu))) {
                 data = b11_lazy_alloc(map_size, type == B11_MAP_WRITE_DISCARD ? NULL : bk->cpu, &lazy_slot);
             }
             if (!data) {
@@ -1782,7 +1880,9 @@ static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t t
         } else {
             pthread_mutex_lock(&dev->lock);
             if (b->desc.usage == B11_USAGE_STAGING) {
-                if (type & B11_MAP_READ) { b11_flush(dev, 1); }
+                /* D3D11 Map waits for the GPU's pending use of a staging resource (reads need its copies done,
+                 * writes must not overwrite data a queued copy still reads); other work keeps running. */
+                b11_wait_gpu_use(dev, b->backing_serial[b->current]);
                 data = b11_buffer_current(b)->cpu;
             } else {
                 BD12Buffer *bk = b11_buffer_write_backing(b, type == B11_MAP_WRITE_DISCARD);
@@ -1797,7 +1897,7 @@ static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t t
         if (t->staging) {
             if (c->type == 0) {
                 pthread_mutex_lock(&dev->lock);
-                if ((type & B11_MAP_READ) && t->last_use_serial) { b11_flush(dev, 0); b11_wait_serial(dev, t->last_use_serial); }
+                b11_wait_gpu_use(dev, t->last_use_serial);
                 pthread_mutex_unlock(&dev->lock);
             }
             data = (uint8_t *)t->staging->cpu + t->sub_offset[sub];
@@ -1811,13 +1911,22 @@ static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t t
     } else return B11_E_INVALIDARG;
     int slot = -1;
     for (int i = 0; i < 64; ++i) if (!c->mapped[i].resource) { slot = i; break; }
-    if (slot < 0) { if (c->type == 1 && res->kind == B11_BUFFER) free(data); return B11_E_FAIL; }
+    if (slot < 0) {
+        if (c->type == 1 && res->kind == B11_BUFFER) {
+            if (slice) b11_slice_retire(dev, slice);
+            else if (lazy_slot) b11_lazy_free(lazy_slot);
+            else if (!direct) free(data);
+        }
+        return B11_E_FAIL;
+    }
     c->mapped[slot].resource = res;
     c->mapped[slot].subresource = sub;
     c->mapped[slot].map_type = type;
     c->mapped[slot].data = data;
     c->mapped[slot].size = map_size;
     c->mapped[slot].lazy_slot = lazy_slot;
+    c->mapped[slot].slice = slice;
+    c->mapped[slot].direct = direct;
     memcpy(mapped, &data, 8);
     memcpy(mapped + 8, &row_pitch, 4);
     memcpy(mapped + 12, &depth_pitch, 4);
@@ -1832,6 +1941,22 @@ static void B11_MS ctx_unmap(B11Context *c, B11Obj *res, uint32_t sub)
             B11Buffer *b = (B11Buffer *)res;
             uint8_t *data = c->mapped[i].data;
             size_t first = 0, last = b->desc.byte_width;
+            if (c->mapped[i].slice || c->mapped[i].direct) {
+                if (c->mapped[i].slice) {
+                    B11RenameOp *r = calloc(1, sizeof(*r));
+                    if (r) {
+                        r->slice = c->mapped[i].slice;
+                        B11Op op = op_new(B11_OP_BUFFER_RENAME);
+                        op.obj[0] = res;
+                        op.data = r;
+                        ctx_emit(c, &op);
+                    } else {
+                        b11_slice_retire(c->obj.dev, c->mapped[i].slice);
+                    }
+                }
+                memset(&c->mapped[i], 0, sizeof(c->mapped[i]));
+                return;
+            }
             if (c->mapped[i].lazy_slot) {
                 b11_lazy_emit(c, res, c->mapped[i].lazy_slot, c->mapped[i].map_type == B11_MAP_WRITE_DISCARD, b->desc.byte_width);
                 b11_lazy_free(c->mapped[i].lazy_slot);
@@ -1948,10 +2073,13 @@ static B11HR B11_MS ctx_finish_list(B11Context *c, uint32_t restore, void **out)
     if (!restore) b11_state_clear(c);
     for (int i = 0; i < 64; ++i) {                       /* unmatched deferred maps are dropped */
         if (c->mapped[i].resource && c->mapped[i].resource->kind == B11_BUFFER && c->type == 1) {
-            if (c->mapped[i].lazy_slot) b11_lazy_free(c->mapped[i].lazy_slot); else free(c->mapped[i].data);
+            if (c->mapped[i].slice) b11_slice_retire(c->obj.dev, c->mapped[i].slice);
+            else if (c->mapped[i].direct) {}
+            else if (c->mapped[i].lazy_slot) b11_lazy_free(c->mapped[i].lazy_slot); else free(c->mapped[i].data);
         }
         memset(&c->mapped[i], 0, sizeof(c->mapped[i]));
     }
+    c->discard_count = 0;                                /* the discarded slices now belong to the list's ops */
     if (out) *out = l; else b11_release(&l->obj);
     return B11_S_OK;
 }

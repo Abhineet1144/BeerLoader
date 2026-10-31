@@ -43,6 +43,9 @@ static const uint8_t iid_render_client[16] = {
 static const uint8_t iid_session_control[16] = {   /* IAudioSessionControl */
     0x99,0xa5,0xb1,0xf4,0x66,0x72,0x19,0x43,0xa8,0xca,0xe7,0x0a,0xcb,0x11,0xe8,0xcd
 };
+static const uint8_t iid_endpoint[16] = {           /* IMMEndpoint */
+    0x88,0x97,0xe0,0x1b,0x94,0x68,0x89,0x40,0x85,0x86,0x9a,0x2a,0x6c,0x26,0x5a,0xc5
+};
 static const uint8_t iid_audio_clock[16] = {
     0x4f,0x31,0x63,0xcd,0xba,0x3f,0x1b,0x4a,0x81,0x2c,0xef,0x96,0x35,0x87,0x28,0xe7
 };
@@ -73,6 +76,7 @@ struct BeerWasapi {
     BeerWasapiInterface audio_clock;
     BeerWasapiInterface session;          /* IAudioSessionControl */
     BeerWasapiInterface property_store;   /* IPropertyStore of the endpoint */
+    BeerWasapiInterface endpoint;         /* IMMEndpoint of the device */
     WaveFormat format;
     uint32_t buffer_frames;
     uint32_t acquired_frames;
@@ -128,6 +132,7 @@ static void *select_interface(BeerWasapi *owner, const void *iid)
     if (guid_equal(iid, iid_render_client)) return &owner->render_client;
     if (guid_equal(iid, iid_audio_clock)) return &owner->audio_clock;
     if (guid_equal(iid, iid_session_control)) return &owner->session;
+    if (guid_equal(iid, iid_endpoint)) return &owner->endpoint;
     return NULL;
 }
 
@@ -765,6 +770,12 @@ static void *device_vtable[7] = {
 static void *property_store_vtable[8] = {
     wasapi_query, wasapi_add_ref, wasapi_release, store_get_count, store_get_at, store_get_value, store_ok, store_ok
 };
+/* The only endpoint is the render device: eRender (0). */
+static uint64_t __attribute__((ms_abi)) endpoint_get_data_flow(void *self, uint32_t *flow)
+{ (void)self; if (!flow) return E_POINTER; *flow = 0; return S_OK; }
+static void *endpoint_vtable[4] = {
+    wasapi_query, wasapi_add_ref, wasapi_release, endpoint_get_data_flow
+};
 static void *session_vtable[12] = {
     wasapi_query, wasapi_add_ref, wasapi_release, session_get_state, session_get_string, session_ok,
     session_get_string, session_ok, session_get_grouping, session_ok, session_ok, session_ok
@@ -804,6 +815,7 @@ uint64_t beer_wasapi_create_instance(const void *class_id, const void *interface
     owner->audio_clock = (BeerWasapiInterface){audio_clock_vtable, owner};
     owner->session = (BeerWasapiInterface){session_vtable, owner};
     owner->property_store = (BeerWasapiInterface){property_store_vtable, owner};
+    owner->endpoint = (BeerWasapiInterface){endpoint_vtable, owner};
     atomic_init(&owner->event_handle, 0);
     atomic_init(&owner->clock_frames, 0);
     atomic_init(&owner->started, 0);

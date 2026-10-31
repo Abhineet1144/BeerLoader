@@ -1896,6 +1896,11 @@ static pthread_mutex_t *cs_get_or_create_mutex(WIN_CS *cs)
 {
     if (!cs_ptr_is_valid(cs))
         return &g_fallback_cs_mutex;
+    /* Initialised already (every Enter/Leave after the first): plain loads, no locked compare-and-swap bouncing
+     * the line between threads that contend for the same section. */
+    pthread_mutex_t *ready = __atomic_load_n(&cs->Mutex, __ATOMIC_ACQUIRE);
+    if (ready && __atomic_load_n(&cs->Magic, __ATOMIC_RELAXED) == WIN_CS_MAGIC)
+        return ready;
 
     /* Double-checked init using __sync builtins to be safe against races
      * on InitializeCriticalSection itself being called concurrently. */
@@ -8162,6 +8167,17 @@ typedef struct {
 
 static WinEvent g_events[MAX_EVENTS];
 static int g_event_cnt = 1;
+/* Closed event ids, reused oldest first (a FIFO keeps a just-closed handle value unused for a while). CreateEvent
+ * used to scan the table from slot 1; games that create and close events every frame made that scan hot. */
+static int g_event_free[MAX_EVENTS];
+static unsigned g_event_free_head, g_event_free_tail;
+
+static void event_release_id_locked(int id)
+{
+    if (!g_events[id].used) return;
+    g_events[id].used = 0;
+    g_event_free[g_event_free_tail++ % MAX_EVENTS] = id;
+}
 static pthread_mutex_t g_event_table_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static u32 g_sem_val[MAX_SEMS];
@@ -8207,11 +8223,9 @@ static u64 event_alloc(int manual, int initial)
 {
     pthread_mutex_lock(&g_event_table_mtx);
     int id = 0;
-    for (int candidate = 1; candidate < g_event_cnt; ++candidate) {
-        if (!g_events[candidate].used) {
-            id = candidate;
-            break;
-        }
+    while (!id && g_event_free_head != g_event_free_tail) {
+        const int candidate = g_event_free[g_event_free_head++ % MAX_EVENTS];
+        if (!g_events[candidate].used) id = candidate;
     }
     if (!id) {
         if (g_event_cnt >= MAX_EVENTS) {
@@ -8267,6 +8281,20 @@ static u64 __attribute__((ms_abi))
 impl_CreateEventW(u64 sa, u32 manual, u32 initial, u64 name)
     { (void)sa;(void)name; return event_alloc((int)manual, (int)initial); }
 
+/* Multiple-object waits poll their handles. Instead of sleeping a fixed 1 ms between polls (which added up to a
+ * millisecond to every hand-off between a game's job threads, several times a frame), they sleep on this counter,
+ * which every event set, semaphore release and mutex release bumps. Handle kinds that do not bump it (threads,
+ * processes, timers) are still caught by the 1 ms poll. */
+static _Atomic u32 g_wait_wake_seq;
+static _Atomic u32 g_wait_multi_waiters;
+
+static void wait_multi_notify(void)
+{
+    atomic_fetch_add(&g_wait_wake_seq, 1);
+    if (atomic_load(&g_wait_multi_waiters))
+        syscall(SYS_futex, (u32 *)&g_wait_wake_seq, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
+}
+
 static u64 __attribute__((ms_abi))
 impl_SetEvent(u64 h)
 {
@@ -8285,6 +8313,7 @@ impl_SetEvent(u64 h)
     if (ev->manual_reset) pthread_cond_broadcast(&ev->cv);
     else pthread_cond_signal(&ev->cv);
     pthread_mutex_unlock(&ev->mtx);
+    wait_multi_notify();
     return 1;
 }
 
@@ -8360,6 +8389,7 @@ impl_PulseEvent(u64 h)
     else pthread_cond_signal(&ev->cv);
     ev->signaled = 0;
     pthread_mutex_unlock(&ev->mtx);
+    wait_multi_notify();
     return 1;
 }
 
@@ -8594,7 +8624,7 @@ impl_WSACloseEvent(u64 handle)
     WinEvent *event = &g_events[eid];
     pthread_mutex_destroy(&event->mtx);
     pthread_cond_destroy(&event->cv);
-    event->used = 0;
+    event_release_id_locked(eid);
     pthread_mutex_unlock(&g_event_table_mtx);
     return 1;
 }
@@ -8690,12 +8720,16 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
     struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
     int traced = 0;
+    atomic_fetch_add(&g_wait_multi_waiters, 1);
+    u64 result;
     for (;;) {
+        /* Read the wake counter before polling: a signal after the poll changes it and ends the futex wait. */
+        const u32 seq = atomic_load(&g_wait_wake_seq);
         if (all) {
             int ready = 1;
             for (u32 i = 0; i < n; ++i) {
                 int state = wait_handle_poll(handles[i], 0);
-                if (state < 0) return 0xFFFFFFFFu;
+                if (state < 0) { result = 0xFFFFFFFFu; goto done; }
                 if (!state) { ready = 0; break; }
             }
             if (ready) {
@@ -8703,13 +8737,13 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
                  * pass safely performs auto-reset/semaphore consumption. */
                 for (u32 i = 0; i < n; ++i)
                     (void)wait_handle_poll(handles[i], 1);
-                return 0; /* WAIT_OBJECT_0 */
+                { result = 0; goto done; } /* WAIT_OBJECT_0 */
             }
         } else {
             for (u32 i = 0; i < n; ++i) {
                 int state = wait_handle_poll(handles[i], 1);
-                if (state < 0) return 0xFFFFFFFFu;
-                if (state) return i; /* WAIT_OBJECT_0 + index */
+                if (state < 0) { result = 0xFFFFFFFFu; goto done; }
+                if (state) { result = i; goto done; } /* WAIT_OBJECT_0 + index */
             }
         }
 
@@ -8721,7 +8755,7 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
         else
             elapsed_ms -= (u64)(started.tv_nsec - now.tv_nsec) / 1000000u;
         if (ms == 0 || (ms != 0xFFFFFFFFu && elapsed_ms >= ms))
-            return 0x102u; /* WAIT_TIMEOUT */
+            { result = 0x102u; goto done; } /* WAIT_TIMEOUT */
 
         if (!traced && getenv("BEER_SYNC_DIAGNOSTICS")) {
             traced = 1;
@@ -8733,8 +8767,11 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
                     (unsigned)impl_GetCurrentThreadId());
         }
         struct timespec delay = {0, 1000000L};
-        nanosleep(&delay, NULL);
+        syscall(SYS_futex, (u32 *)&g_wait_wake_seq, FUTEX_WAIT_PRIVATE, seq, &delay, NULL, 0);
     }
+done:
+    atomic_fetch_sub(&g_wait_multi_waiters, 1);
+    return result;
 }
 
 static u64 __attribute__((ms_abi))
@@ -8792,6 +8829,7 @@ static u64 __attribute__((ms_abi)) impl_ReleaseMutex(u64 h)
         if (--m->count == 0) { m->owner = 0; pthread_cond_signal(&m->cv); }
     } else g_last_error = 288;   /* ERROR_NOT_OWNER */
     pthread_mutex_unlock(&m->mtx);
+    if (ok && !m->count) wait_multi_notify();
     return ok;
 }
 static u64 __attribute__((ms_abi)) impl_OpenMutexA(u32 a, u32 b, const char *n)
@@ -11849,7 +11887,7 @@ impl_CloseHandle(u64 h)
         WinEvent *ev = &g_events[eid];
         pthread_mutex_destroy(&ev->mtx);
         pthread_cond_destroy(&ev->cv);
-        ev->used = 0;
+        event_release_id_locked(eid);
         pthread_mutex_unlock(&g_event_table_mtx);
         return 1;
     }
@@ -15785,6 +15823,7 @@ impl_ReleaseSemaphore(u64 h, u32 n, u32 *prev)
     g_sem_val[sid] = (u32)nv;
     if (n) pthread_cond_broadcast(&g_sem_cv[sid]);
     pthread_mutex_unlock(&g_sem_mtx[sid]);
+    if (n) wait_multi_notify();
     return 1;
 }
 
@@ -27572,11 +27611,26 @@ int main(int argc, char **argv)
     /* Guest code is sensitive to the process layout: RDR2 takes different graphics start-up paths depending on where
      * the host places its heaps and stacks, and fails most runs with address randomisation on.  Re-exec once with
      * randomisation off (BEER_ASLR=1 keeps it) so every run lays memory out the same way, like gdb does. */
-    if (!getenv("BEER_ASLR") && !(personality(0xffffffffu) & ADDR_NO_RANDOMIZE)) {
-        if (personality(ADDR_NO_RANDOMIZE) != -1) {
-            execv("/proc/self/exe", argv);
+    /* glibc's per-thread malloc cache keeps 7 chunks per size class. Games record D3D11 deferred contexts and other
+     * work on many threads at once, and with that tiny cache most allocations and frees went through contended arena
+     * locks (the worker threads spent a third of their time there). A larger tcache keeps them thread-local; the
+     * tunable is only read at exec, so it rides on the re-exec below. BEER_MALLOC_TUNE=0 leaves malloc alone. */
+    int reexec = 0;
+    {
+        const char *tune = getenv("BEER_MALLOC_TUNE");
+        const char *tunables = getenv("GLIBC_TUNABLES");
+        if (!(tune && !strcmp(tune, "0")) && !(tunables && strstr(tunables, "glibc.malloc.tcache_count"))) {
+            char value[1024];
+            snprintf(value, sizeof(value), "%s%sglibc.malloc.tcache_count=1024",
+                     tunables ? tunables : "", tunables && *tunables ? ":" : "");
+            setenv("GLIBC_TUNABLES", value, 1);
+            reexec = 1;
         }
     }
+    if (!getenv("BEER_ASLR") && !(personality(0xffffffffu) & ADDR_NO_RANDOMIZE)) {
+        if (personality(ADDR_NO_RANDOMIZE) != -1) reexec = 1;
+    }
+    if (reexec) execv("/proc/self/exe", argv);
     const char *recovery_limit = getenv("BEER_CRASH_RECOVERY_LIMIT");
     if (recovery_limit && *recovery_limit) {
         char *end = NULL;

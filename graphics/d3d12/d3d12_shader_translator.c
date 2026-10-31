@@ -171,6 +171,15 @@ static int load_api(void)
     static const char *const runtime_patterns[] = {
         "%s/.local/share/Steam/steamapps/common/SteamLinuxRuntime_*/"
         "*_platform_*/files/lib/x86_64-linux-gnu/libvkd3d-shader.so.1*",
+        /* Debian/Ubuntu package installs and their ~/.steam links */
+        "%s/.steam/steam/steamapps/common/SteamLinuxRuntime_*/"
+        "*_platform_*/files/lib/x86_64-linux-gnu/libvkd3d-shader.so.1*",
+        "%s/.steam/debian-installation/steamapps/common/SteamLinuxRuntime_*/"
+        "*_platform_*/files/lib/x86_64-linux-gnu/libvkd3d-shader.so.1*",
+        "%s/snap/steam/common/.local/share/Steam/steamapps/common/SteamLinuxRuntime_*/"
+        "*_platform_*/files/lib/x86_64-linux-gnu/libvkd3d-shader.so.1*",
+        "%s/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/"
+        "SteamLinuxRuntime_*/*_platform_*/files/lib/x86_64-linux-gnu/libvkd3d-shader.so.1*",
         "%s/.local/share/umu/steamrt*/steamrt*_platform_*/files/lib/"
         "x86_64-linux-gnu/libvkd3d-shader.so.1*",
     };

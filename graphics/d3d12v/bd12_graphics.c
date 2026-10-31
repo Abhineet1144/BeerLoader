@@ -26,13 +26,22 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     BD12Device *device, const BD12GraphicsPipelineDesc *desc)
 {
     if (!desc->vs.spirv || desc->rt_count > BD12_MAX_RENDER_TARGETS) return NULL;
+    if (!desc->hs.spirv != !desc->ds.spirv) return NULL;
     BD12GraphicsPipeline *gp = calloc(1, sizeof(*gp));
     if (!gp) return NULL;
     gp->device = device;
     /* Stable diagnostic identity; no shader-specific behavior depends on it. */
     uint64_t hash = UINT64_C(1469598103934665603);
-    const BD12ShaderCode *hash_stages[2] = { &desc->vs, &desc->ps };
-    for (int s = 0; s < 2; ++s) {
+    /* Pipeline stages in Vulkan order; absent ones have no SPIR-V. */
+    enum { STAGES = 5 };
+    const BD12ShaderCode *stages[STAGES] = { &desc->vs, &desc->hs, &desc->ds, &desc->gs, &desc->ps };
+    static const VkShaderStageFlagBits stage_bits[STAGES] = {
+        VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+        VK_SHADER_STAGE_FRAGMENT_BIT
+    };
+    const BD12ShaderCode *const *hash_stages = stages;
+    for (int s = 0; s < STAGES; ++s) {
         const uint8_t *bytes = (const uint8_t *)hash_stages[s]->spirv;
         for (size_t i = 0; bytes && i < hash_stages[s]->spirv_bytes; ++i) {
             hash ^= bytes[i];
@@ -50,22 +59,27 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
                 desc->blend[0].blend_enable, desc->blend[0].write_mask,
                 (int)desc->ds_format, desc->samples);
 
-    /* Merge both stages' reflected bindings into one set-0 layout. */
-    const BD12ShaderCode *stages[2] = { &desc->vs, &desc->ps };
-    const uint32_t total = desc->vs.binding_count + desc->ps.binding_count;
+    /* Merge every stage's reflected bindings into one set-0 layout. */
+    uint32_t total = 0;
+    for (int s = 0; s < STAGES; ++s)
+        if (stages[s]->spirv) {
+            total += stages[s]->binding_count;
+            gp->stages |= stage_bits[s];
+        }
+    gp->tessellated = desc->hs.spirv != NULL;
     VkDescriptorSetLayoutBinding *layout_bindings =
         calloc(total ? total : 1, sizeof(*layout_bindings));
     gp->bindings = calloc(total ? total : 1, sizeof(*gp->bindings));
     gp->binding_types = calloc(total ? total : 1, sizeof(*gp->binding_types));
-    VkShaderModule modules[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    BD12ShaderBinding *stage_binds[2] = { NULL, NULL };
-    uint32_t stage_kept[2] = { 0, 0 };
+    VkShaderModule modules[STAGES] = { VK_NULL_HANDLE };
+    BD12ShaderBinding *stage_binds[STAGES] = { NULL };
+    uint32_t stage_kept[STAGES] = { 0 };
     gp->bindless = calloc(total ? total : 1, sizeof(*gp->bindless));
     if (!gp->bindless) goto fail;
-    uint32_t *dense_spirv[2] = { NULL, NULL };
+    uint32_t *dense_spirv[STAGES] = { NULL };
     uint32_t next_binding = 0;
     if (!layout_bindings || !gp->bindings || !gp->binding_types) goto fail;
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < STAGES; ++s) {
         if (!stages[s]->spirv) continue;
         const uint32_t n = stages[s]->binding_count;
         stage_binds[s] = calloc(n ? n : 1, sizeof(*stage_binds[s]));
@@ -86,7 +100,7 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
                                                &next_binding);
         if (!dense_spirv[s]) goto fail;
     }
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < STAGES; ++s) {
         for (uint32_t i = 0; stages[s]->spirv && i < stage_kept[s]; ++i) {
             BD12ShaderBinding b = stage_binds[s][i];
             VkDescriptorType type;
@@ -96,8 +110,7 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
                 .binding = b.binding,
                 .descriptorType = type,
                 .descriptorCount = b.count,
-                .stageFlags = s == 0 ? VK_SHADER_STAGE_VERTEX_BIT :
-                              VK_SHADER_STAGE_FRAGMENT_BIT
+                .stageFlags = stage_bits[s]
             };
             gp->bindings[gp->binding_count] = b;
             gp->binding_types[gp->binding_count] = type;
@@ -114,7 +127,7 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
         goto fail;
     VkDescriptorSetLayout set_layouts[2] = { gp->set_layout, VK_NULL_HANDLE };
     VkPushConstantRange push_range = {
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .stageFlags = gp->stages,
         .size = gp->bindless_words * 4
     };
     if (gp->bindless_words) {
@@ -132,30 +145,22 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
                                         &gp->layout) != VK_SUCCESS)
         goto fail;
 
-    VkPipelineShaderStageCreateInfo shader_stages[2];
+    VkPipelineShaderStageCreateInfo shader_stages[STAGES];
     uint32_t stage_count = 0;
-    BD12ShaderCode dense_vs = desc->vs, dense_ps = desc->ps;
-    dense_vs.spirv = dense_spirv[0];
-    dense_ps.spirv = dense_spirv[1];
-    modules[0] = make_module(device, &dense_vs);
-    if (!modules[0]) goto fail;
-    shader_stages[stage_count++] = (VkPipelineShaderStageCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .stage = VK_SHADER_STAGE_VERTEX_BIT,
-        .module = modules[0],
-        .pName = "main"
-    };
-    if (desc->ps.spirv) {
-        modules[1] = make_module(device, &dense_ps);
-        if (!modules[1]) goto fail;
+    for (int s = 0; s < STAGES; ++s) {
+        if (!stages[s]->spirv) continue;
+        BD12ShaderCode dense = *stages[s];
+        dense.spirv = dense_spirv[s];
+        modules[s] = make_module(device, &dense);
+        if (!modules[s]) goto fail;
         shader_stages[stage_count++] = (VkPipelineShaderStageCreateInfo){
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = modules[1],
+            .stage = stage_bits[s],
+            .module = modules[s],
             .pName = "main"
         };
     }
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < STAGES; ++i) {
         free(dense_spirv[i]); dense_spirv[i] = NULL;
         free(stage_binds[i]); stage_binds[i] = NULL;
     }
@@ -195,6 +200,10 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = desc->topology,
         .primitiveRestartEnable = desc->primitive_restart
+    };
+    VkPipelineTessellationStateCreateInfo tessellation = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+        .patchControlPoints = desc->patch_control_points ? desc->patch_control_points : 3
     };
     VkPipelineViewportStateCreateInfo viewport = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
@@ -288,6 +297,7 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
         .pStages = shader_stages,
         .pVertexInputState = &vertex_input,
         .pInputAssemblyState = &input_assembly,
+        .pTessellationState = gp->tessellated ? &tessellation : NULL,
         .pViewportState = &viewport,
         .pRasterizationState = &raster,
         .pMultisampleState = &multisample,
@@ -301,18 +311,18 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     if (result == VK_SUCCESS) bd12_pipeline_cache_note_new(device);
     beer_vulkan_record_result(result, "BD12 graphics pipeline");
     if (result != VK_SUCCESS) goto fail;
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < STAGES; ++i)
         if (modules[i])
             device->vk.DestroyShaderModule(device->device, modules[i], NULL);
     free(layout_bindings);
     return gp;
 
 fail:
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < STAGES; ++i) {
         free(dense_spirv[i]);
         free(stage_binds[i]);
     }
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < STAGES; ++i)
         if (modules[i])
             device->vk.DestroyShaderModule(device->device, modules[i], NULL);
     free(layout_bindings);
@@ -424,29 +434,15 @@ void bd12_cmd_set_scissors(BD12CmdList *list, const VkRect2D *rects,
 void bd12_cmd_set_topology(BD12CmdList *list, VkPrimitiveTopology topology)
 {
     list->gfx.topology = topology;
-    list->gfx.topology_unsupported = 0;
-    list->gfx.dirty |= BD12_DIRTY_TOPOLOGY;
+    list->gfx.patch_points = 0;
 }
 
 void bd12_cmd_set_d3d_topology(BD12CmdList *list, uint32_t d3d_topology)
 {
     uint32_t patch = 0;
     VkPrimitiveTopology vk = bd12_topology_to_vk(d3d_topology, &patch);
-    /* BD12 pipelines carry no hull/domain stages, and a patch list without
-     * them is invalid Vulkan (Mesa ANV crashes in vkCmdDraw; NVIDIA tolerates
-     * it). Three-point patches still draw as their untessellated triangles;
-     * other patch sizes have no equivalent and their draws are dropped. */
-    if (vk == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
-        bd12_cmd_set_topology(list, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-        if (patch != 3) {
-            list->gfx.topology_unsupported = 1;
-            static uint64_t logged;
-            if (!(__atomic_fetch_or(&logged, 1ull << patch, __ATOMIC_RELAXED) & (1ull << patch)))
-                fprintf(stderr, "[BD12] %u-control-point patch list without tessellation: draws dropped\n", patch);
-        }
-        return;
-    }
     bd12_cmd_set_topology(list, vk);
+    list->gfx.patch_points = patch;
 }
 
 void bd12_cmd_set_vertex_buffers(BD12CmdList *list, uint32_t start,
@@ -591,6 +587,7 @@ static void begin_rendering_for(BD12CmdList *list,
         if (dsv) list->gfx.cap_dsv = *dsv;
         list->gfx.cap_hash = list->gfx.pipeline ? list->gfx.pipeline->shader_hash : 0;
     }
+    g_bd12_cmd_counts[BD12_COUNT_RENDER_PASS]++;
     device->vk.CmdBeginRendering(list->command_buffer, &info);
 }
 
@@ -618,9 +615,28 @@ static int prepare_draw(BD12CmdList *list)
         { static unsigned logged; if (logged++ < 5) fprintf(stderr, "[BD12] draw dropped: pipeline=%p root_signature=%p resolve_hook=%p\n", (void *)gp, (void *)list->graphics.root_signature, (void *)(uintptr_t)list->resolve_hook); }
         return 0;
     }
-    if (g->topology_unsupported) {
+    /* A patch list needs the pipeline's hull/domain stages, and those
+     * stages need a patch list. A patch list reaching a pipeline without
+     * tessellation is invalid Vulkan (Mesa ANV crashes in vkCmdDraw):
+     * three-point patches still draw as their untessellated triangles,
+     * other patch sizes have no equivalent and their draws are dropped. */
+    const int patches = g->topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    if (patches != gp->tessellated && (gp->tessellated || g->patch_points != 3)) {
+        static uint64_t logged;
+        const uint32_t bit = gp->tessellated ? 0 : g->patch_points & 63;
+        if (!(__atomic_fetch_or(&logged, 1ull << bit, __ATOMIC_RELAXED) & (1ull << bit)))
+            fprintf(stderr, gp->tessellated ?
+                    "[BD12] tessellation pipeline drawn without a patch list: draws dropped\n" :
+                    "[BD12] %u-control-point patch list without tessellation: draws dropped\n",
+                    g->patch_points);
         BD12_DROP(BD12_DROP_DRAW_PATCH_LIST);
         return 0;
+    }
+    const VkPrimitiveTopology topology = patches && !gp->tessellated ?
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : g->topology;
+    if (topology != g->bound_topology) {
+        g->bound_topology = topology;
+        g->dirty |= BD12_DIRTY_TOPOLOGY;
     }
     if (bd12_debug_sync_all()) bd12_cmd_global_barrier(list);
     /* Resolve first: it can emit first-use layout barriers, which must not
@@ -641,19 +657,23 @@ static int prepare_draw(BD12CmdList *list)
     if (g->dirty & BD12_DIRTY_PIPELINE)
         device->vk.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                    gp->pipeline);
-    device->vk.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                     gp->layout, 0, 1, &set, 0, NULL);
+    /* Cached descriptor sets repeat across draws: rebind only when the set or the pipeline changed. */
+    if (set != g->bound_set || (g->dirty & BD12_DIRTY_PIPELINE)) {
+        device->vk.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                         gp->layout, 0, 1, &set, 0, NULL);
+        g->bound_set = set;
+    }
     if (gp->bindless_words)
         bd12_cmd_bind_bindless(list, &list->graphics, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                gp->layout,
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               gp->stages,
                                gp->bindless, gp->bindless_count, gp->bindless_words);
     if ((g->dirty & BD12_DIRTY_VIEWPORT) && g->viewport_count)
         device->vk.CmdSetViewportWithCount(cb, g->viewport_count, g->viewports);
     if ((g->dirty & BD12_DIRTY_SCISSOR) && g->scissor_count)
         device->vk.CmdSetScissorWithCount(cb, g->scissor_count, g->scissors);
     if (g->dirty & BD12_DIRTY_TOPOLOGY)
-        device->vk.CmdSetPrimitiveTopology(cb, g->topology);
+        device->vk.CmdSetPrimitiveTopology(cb, g->bound_topology);
     if (g->dirty & (BD12_DIRTY_VERTEX | BD12_DIRTY_PIPELINE)) {
         VkBuffer buffers[BD12_MAX_VERTEX_BUFFERS];
         VkDeviceSize offsets[BD12_MAX_VERTEX_BUFFERS];

@@ -1801,3 +1801,57 @@ and not the executable TLS callbacks (unchanged with BEER_NO_EXECUTABLE_TLS=1). 
 - RDR2 still needs `BEER_NO_EXECUTABLE_TLS=1` (main runs exe TLS callbacks by default; RDR2's Arxan callback then
   leaves a worker spinning in Sleep(0) with no frames).
 - VariantInit/VariantClear stubs from main, dropped while resolving the missing-exports conflict, are restored.
+
+### Sekiro after the merge: invisible objects and 10 fps fixed (2026-10-31)
+
+Gameplay went from ~9 fps to ~40-45 fps in the same scenes (60 fps cap reached on the title and menus), and loading
+screens from ~10 fps to ~40-60 fps; tessellated objects render again. Everything below is generic (BD11 = every D3D11
+game, BD12/loader = every game). Measure with `BEER_BD11_FPS=1` (fps, worst frame, `gpu-wait` and `present` ms per
+second) and `BEER_BD11_STATS=1` (now also barriers/render passes per frame and deferred Map types/sizes).
+
+- **Invisible objects = tessellation.** BD12 pipelines only had VS/PS and BD11 skipped every draw with HS/DS bound
+  (Sekiro: 73 HS / 88 DS / 28 GS). `BD12GraphicsPipelineDesc` now carries hs/ds/gs (five stages, per-stage descriptor
+  bindings, `VkPipelineTessellationStateCreateInfo` with the patch size read from the hull shader's
+  `dcl_input_control_point_count`, push constants for all stages). The D3D12 PSO parser keeps DS/HS/GS bytecode
+  (graphics desc and pipeline streams). Patch-list topology is resolved per draw against the bound pipeline (a
+  pipeline without tessellation still draws 3-point patches as triangles). If an extra stage fails to translate or
+  the pipeline fails, BD12 retries with VS/PS only (the old behaviour) instead of losing the draw.
+- **Present waited for the GPU every frame** (`b11_flush(dev, 1)`), so CPU recording and GPU rendering never
+  overlapped. Present now submits and only blocks when the GPU is `BEER_BD11_FRAME_LATENCY` frames behind (default
+  2, 1 = old behaviour). The command-allocator ring grew from 3 to 16. STAGING Map now waits only for GPU work that
+  really uses that resource (staging->GPU copies record a use serial). 9 -> 21 fps.
+- **~25,000 pipeline barriers per frame** (counted per call site): every buffer UpdateSubresource was a
+  barrier + vkCmdUpdateBuffer + barrier, plus a redundant third barrier in BD11, and each barrier also ended the
+  render pass. Small (<= 64 KiB) DEFAULT constant/vertex/index buffers (no SRV/UAV/stream-out views) are now
+  *renamed*: the update writes a fresh host-visible slice on the CPU (copying the rest of the previous version) and
+  the buffer points at it; no GPU copy, no barrier. A GPU copy into such a buffer moves it back to device memory.
+  `BEER_BD11_NO_RENAME=1` disables it. Barriers 25k -> ~550 per frame, 21 -> 33 fps.
+- **Upload slice pool** (`b11_slice_get/retire`, bd11_dev.c): power-of-two slices 256 B .. 32 MiB placed in shared
+  4 MiB+ UPLOAD heaps, recycled when the retire fence passes. Also replaces the committed buffer (vkAllocateMemory +
+  heap zero fill) every texture/large-buffer UpdateSubresource created.
+- **Deferred-context Map**: DISCARD now hands the game a fresh slice (no PROT_NONE scratch, SIGSEGV per page,
+  mmap/munmap or page diff) and records `B11_OP_BUFFER_RENAME`, which makes the slice the buffer's contents when the
+  list executes; later NO_OVERWRITE maps of that buffer in the same list write into the same slice. The lazy scratch
+  remains for maps without an earlier discard in the list (`BEER_BD11_LAZY_MAPS=1` forces it everywhere). Buffer
+  SRV/UAV views resolve against the buffer's current version, so renamed dynamic buffers no longer read a stale
+  VkBuffer (this was already wrong for the old DISCARD ring). 33 -> ~40 fps.
+- **Descriptor set reuse (BD12, all games)**: `bd12_descriptor_set_for_writes` keys sets by their exact contents
+  (handles, offsets, ranges, layouts) per command allocator and device epoch, so draws with the same bindings reuse a
+  set instead of vkAllocateDescriptorSets + vkUpdateDescriptorSets; unchanged sets are not re-bound
+  (`BEER_BD12_NO_SET_CACHE=1` disables). BD12's per-draw timing clock now only runs with `BEER_BD12_PROF`.
+- **Loader**: glibc's per-thread malloc cache is raised to 1024 chunks per size via `GLIBC_TUNABLES` on the existing
+  re-exec (D3D11 deferred-context workers spent a third of their time on contended malloc arena locks;
+  `BEER_MALLOC_TUNE=0` opts out). CreateEvent reuses closed ids from a FIFO instead of scanning the table.
+  EnterCriticalSection skips the two locked compare-and-swaps once the section is initialised.
+  WaitForMultipleObjects sleeps on a futex that SetEvent/PulseEvent/ReleaseSemaphore/ReleaseMutex bump instead of a
+  fixed 1 ms nanosleep (still a 1 ms poll for thread/process/timer handles).
+- Merge fallout fixed on the way: FMOD queried IMMEndpoint on Beer's WASAPI device, got E_NOINTERFACE and crashed;
+  the device now implements IMMEndpoint (GetDataFlow = eRender). libvkd3d-shader (DXBC translation) is also found in
+  Debian/Ubuntu Steam installs (`~/.steam/debian-installation`, `~/.steam/steam`), snap and flatpak Steam; without it
+  no Sekiro shader translated.
+- Where the time goes now (Sekiro gameplay, ~42 fps): the D3D11 render thread that replays command lists runs ~67% of
+  wall time (23% inside the NVIDIA driver recording Vulkan, the rest BD11 op replay: `apply_state`, `execute`,
+  `use_srvs`, cache misses on objects recorded by other threads) and the game's main thread waits for it; GPU ~50%,
+  no GPU waits. Next steps: cheaper op replay (fewer refcount atomics, tracking the highest bound SRV slot, avoiding
+  per-op payload mallocs) or recording replay into several command buffers in parallel.
+- RDR2 (Vulkan renderer, not BD12) re-checked with these changes: reaches the main menu at ~52 fps.

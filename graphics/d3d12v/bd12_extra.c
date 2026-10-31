@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #include "bd12.h"
 
+
 #include <string.h>
 
 /* Clears, resolves and small updates that D3D12 treats as ordinary commands.
@@ -28,6 +29,7 @@ static void global_barrier(BD12CmdList *list, VkPipelineStageFlags2 src_stage,
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier
     };
+    g_bd12_cmd_counts[BD12_COUNT_BARRIER]++;
     list->device->vk.CmdPipelineBarrier2(list->command_buffer, &dependency);
 }
 
