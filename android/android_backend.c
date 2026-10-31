@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #include "xwayland_backend.h"
 #include "vulkan_context.h"
+#include "beer_overlay.h"
 
 #include <android/input.h>
 #include <android/log.h>
@@ -346,6 +347,32 @@ static void request_all_files_access(ANativeActivity *activity)
     LOGI("asked for all-files access");
 }
 
+/* The start screen (android/apk/java/.../Launcher.java) opens this activity with the path of a session file in the
+ * launch.txt format; started any other way (adb, tests), launch.txt is read as before. */
+static char g_session_path[1024];
+
+static void read_session_extra(ANativeActivity *activity)
+{
+    JNIEnv *env = activity->env;
+    jclass activity_class = (*env)->GetObjectClass(env, activity->clazz);
+    jmethodID get_intent = (*env)->GetMethodID(env, activity_class, "getIntent", "()Landroid/content/Intent;");
+    jobject intent = get_intent ? (*env)->CallObjectMethod(env, activity->clazz, get_intent) : NULL;
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (!intent) return;
+    jclass intent_class = (*env)->GetObjectClass(env, intent);
+    jmethodID get_extra = (*env)->GetMethodID(env, intent_class, "getStringExtra", "(Ljava/lang/String;)Ljava/lang/String;");
+    jstring value = get_extra ? (jstring)(*env)->CallObjectMethod(env, intent, get_extra,
+                                                                   (*env)->NewStringUTF(env, "beer.session")) : NULL;
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (!value) return;
+    const char *text = (*env)->GetStringUTFChars(env, value, NULL);
+    if (text) {
+        snprintf(g_session_path, sizeof(g_session_path), "%s", text);
+        (*env)->ReleaseStringUTFChars(env, value, text);
+        LOGI("session from the start screen: %s", g_session_path);
+    }
+}
+
 /* The loader logs to stderr; send it (and stdout) to logcat under the tag "Beer" so `adb logcat -s Beer` shows it. */
 static void *log_pump(void *fd_ptr)
 {
@@ -407,6 +434,10 @@ static void *loader_thread(void *unused)
     /* launch.txt: the app's own folder first, then shared storage (writable from Termux or a file manager). The
      * permission page may still be open, so keep looking for a while. */
     FILE *f = NULL;
+    if (g_session_path[0]) {
+        snprintf(path, sizeof(path), "%s", g_session_path);
+        f = fopen(path, "r");
+    }
     for (int attempt = 0; attempt < 300 && !f; ++attempt) {
         snprintf(path, sizeof(path), "%s/launch.txt", external);
         f = fopen(path, "r");
@@ -487,6 +518,7 @@ void ANativeActivity_onCreate(ANativeActivity *activity, void *saved_state, size
     (void)saved_state; (void)saved_state_size;
     A.activity = activity;
     redirect_output_to_logcat();
+    read_session_extra(activity);
     request_all_files_access(activity);
     activity->callbacks->onNativeWindowCreated = on_window_created;
     activity->callbacks->onNativeWindowDestroyed = on_window_destroyed;
@@ -625,6 +657,10 @@ static struct {
     VkDeviceMemory stage_memory;
     uint8_t *stage_map;
     VkDeviceSize stage_size;
+    VkBuffer overlay;                 /* host-visible: the overlay boxes, one region per box */
+    VkDeviceMemory overlay_memory;
+    uint8_t *overlay_map;
+    uint64_t overlay_serial[2];
     PFN_vkGetInstanceProcAddr gipa;
     PFN_vkGetDeviceProcAddr gdpa;
 #define F(name) PFN_vk##name name;
@@ -829,6 +865,63 @@ static void barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkIma
     P.CmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
+/* Performance overlay (platform/beer_overlay.c): the CPU-rendered boxes are copied onto the swapchain image after the
+ * frame was blitted into it (image in TRANSFER_DST). The previous present's fence was waited for, so the buffer is
+ * free to rewrite; a box is re-uploaded only when its pixels changed. */
+#define OVERLAY_REGION_BYTES (4u * 1024u * 1024u)
+static void record_overlay(VkCommandBuffer cb, VkImage image)
+{
+    BeerOverlayRect rects[2];
+    const int count = beer_overlay_frame((int)P.extent.width, (int)P.extent.height, rects);
+    if (count <= 0) return;
+    if (!P.overlay) {
+        VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 2u * OVERLAY_REGION_BYTES,
+            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+        if (P.CreateBuffer(P.device, &bi, NULL, &P.overlay) != VK_SUCCESS) { P.overlay = VK_NULL_HANDLE; return; }
+        VkMemoryRequirements req;
+        P.GetBufferMemoryRequirements(P.device, P.overlay, &req);
+        const int type = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+            .memoryTypeIndex = (uint32_t)type };
+        void *map = NULL;
+        if (type < 0 || P.AllocateMemory(P.device, &ai, NULL, &P.overlay_memory) != VK_SUCCESS ||
+            P.BindBufferMemory(P.device, P.overlay, P.overlay_memory, 0) != VK_SUCCESS ||
+            P.MapMemory(P.device, P.overlay_memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+            P.DestroyBuffer(P.device, P.overlay, NULL);
+            P.overlay = VK_NULL_HANDLE;
+            return;
+        }
+        P.overlay_map = map;
+        P.overlay_serial[0] = P.overlay_serial[1] = 0;
+    }
+    const int swap_rb = P.format == VK_FORMAT_R8G8B8A8_UNORM;   /* the boxes are B G R A */
+    for (int i = 0; i < count; ++i) {
+        const BeerOverlayRect *r = &rects[i];
+        if (r->w <= 0 || r->h <= 0 || r->x < 0 || r->y < 0 || (uint32_t)(r->x + r->w) > P.extent.width ||
+            (uint32_t)(r->y + r->h) > P.extent.height)
+            continue;
+        const size_t bytes = (size_t)r->w * (size_t)r->h * 4u;
+        if (bytes > OVERLAY_REGION_BYTES) continue;
+        const int slot = (int)(r->serial & 1u);   /* the box index is the serial's low bit */
+        uint8_t *region = P.overlay_map + (size_t)slot * OVERLAY_REGION_BYTES;
+        if (P.overlay_serial[slot] != r->serial) {
+            if (swap_rb) {
+                for (size_t k = 0; k < bytes; k += 4) {
+                    region[k] = r->bgra[k + 2]; region[k + 1] = r->bgra[k + 1];
+                    region[k + 2] = r->bgra[k]; region[k + 3] = r->bgra[k + 3];
+                }
+            } else {
+                memcpy(region, r->bgra, bytes);
+            }
+            P.overlay_serial[slot] = r->serial;
+        }
+        VkBufferImageCopy copy = { .bufferOffset = (VkDeviceSize)slot * OVERLAY_REGION_BYTES, .bufferRowLength = (uint32_t)r->w,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageOffset = { r->x, r->y, 0 },
+            .imageExtent = { (uint32_t)r->w, (uint32_t)r->h, 1 } };
+        P.CmdCopyBufferToImage(cb, P.overlay, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
+}
+
 /* kind: 0 = blit `source` as-is, 1 = raw-copy `source` into the RGBA8 intermediate first, 2 = upload the staging
  * buffer into the intermediate. The result is blitted (scaled) to the swapchain image and presented. */
 static int present_common(VkImage source, VkImageLayout layout, uint32_t w, uint32_t h, int kind)
@@ -886,6 +979,12 @@ static int present_common(VkImage source, VkImageLayout layout, uint32_t w, uint
         .dstOffsets = { { 0, 0, 0 }, { (int32_t)P.extent.width, (int32_t)P.extent.height, 1 } } };
     P.CmdBlitImage(P.cb, blit_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, P.images[index],
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    {   /* the overlay copies write the same image: order them after the blit */
+        VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
+        P.CmdPipelineBarrier(P.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    record_overlay(P.cb, P.images[index]);
     barrier(P.cb, P.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     if (kind == 0 || kind == 1)

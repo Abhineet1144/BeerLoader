@@ -16,12 +16,26 @@
     <!-- Guest pointers must stay untagged: the emulated x86-64 code cannot carry scudo's top-byte heap tags. -->
     <application
         android:label="Beer"
-        android:hasCode="false"
+        android:hasCode="true"
         android:allowNativeHeapPointerTagging="false"
         android:debuggable="true"
         android:extractNativeLibs="true"
         android:largeHeap="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+        <!-- Start screen: games, overlay and controller settings (android/apk/java). -->
+        <activity
+            android:name="com.beer.loader.Launcher"
+            android:exported="true"
+            android:label="Beer"
+            android:theme="@android:style/Theme.DeviceDefault"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <!-- The game. Exported so tests can start it directly: `am start -n com.beer.loader/android.app.NativeActivity`
+             reads Download/Beer/launch.txt; the start screen passes its session file instead. -->
         <activity
             android:name="android.app.NativeActivity"
             android:exported="true"
@@ -30,10 +44,6 @@
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|uiMode|density|navigation"
             android:launchMode="singleTask">
             <meta-data android:name="android.app.lib_name" android:value="beer" />
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
         </activity>
     </application>
 </manifest>

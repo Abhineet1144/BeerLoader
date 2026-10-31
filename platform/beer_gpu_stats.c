@@ -28,6 +28,33 @@ static long read_long(const char *path)
     return v;
 }
 
+#ifdef __ANDROID__
+/* Adreno (kgsl): "busy total" GPU cycles of the last sampling window. Phones share memory between CPU and GPU, so the
+ * memory line reports the device's RAM in use (MemTotal - MemAvailable). */
+static int adreno_sample(int *util, uint64_t *used_mb, uint64_t *total_mb)
+{
+    FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpubusy", "r");
+    if (!f) return 0;
+    long long busy = 0, total = 0;
+    const int ok = fscanf(f, "%lld %lld", &busy, &total) == 2;
+    fclose(f);
+    if (!ok) return 0;
+    *util = total > 0 ? (int)(busy * 100 / total) : 0;
+    unsigned long long mem_total = 0, mem_available = 0, value;
+    char key[64];
+    if ((f = fopen("/proc/meminfo", "r"))) {
+        while (fscanf(f, "%63s %llu kB", key, &value) == 2) {
+            if (!strcmp(key, "MemTotal:")) mem_total = value;
+            else if (!strcmp(key, "MemAvailable:")) mem_available = value;
+        }
+        fclose(f);
+    }
+    *total_mb = mem_total / 1024;
+    *used_mb = mem_total > mem_available ? (mem_total - mem_available) / 1024 : 0;
+    return 1;
+}
+#endif
+
 static void *poll_thread(void *opaque)
 {
     (void)opaque;
@@ -77,7 +104,20 @@ static void *poll_thread(void *opaque)
                         if (list[i].pid == (unsigned)getpid()) mine += list[i].used >> 20;
                 atomic_store(&g_process, mine);
             }
-        } else if (amd_busy[0]) {
+        }
+#ifdef __ANDROID__
+        else if (!amd_busy[0]) {
+            int util = 0;
+            uint64_t used = 0, total = 0;
+            if (adreno_sample(&util, &used, &total)) {
+                atomic_store(&g_util, util);
+                atomic_store(&g_used, used);
+                atomic_store(&g_total, total);
+                atomic_store(&g_ok, 1);
+            }
+        }
+#endif
+        else if (amd_busy[0]) {
             const long busy = read_long(amd_busy), used = read_long(amd_used), total = read_long(amd_total);
             if (busy >= 0) {
                 atomic_store(&g_util, (int)busy);

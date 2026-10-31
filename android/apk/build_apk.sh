@@ -26,6 +26,12 @@ cp "$FFMPEG/ffprobe" "$STAGE/lib/arm64-v8a/libffprobe.so"
 
 "$BT/aapt2" link -o "$OUT/beer-unsigned.apk" --manifest android/apk/AndroidManifest.xml -I "$JAR" \
     --min-sdk-version 30 --target-sdk-version 35 --version-code 1 --version-name 0.1
+# The start screen (Java, no resources): javac against android.jar, then d8 to classes.dex at the APK root.
+rm -rf "$OUT/classes" && mkdir -p "$OUT/classes" "$OUT/dex"
+javac -nowarn -source 11 -target 11 -cp "$JAR" -d "$OUT/classes" $(find android/apk/java -name '*.java') 2> "$OUT/javac.log" ||
+    { cat "$OUT/javac.log"; exit 1; }
+"$BT/d8" --min-api 30 --lib "$JAR" --output "$OUT/dex" $(find "$OUT/classes" -name '*.class')
+(cd "$OUT/dex" && zip -q -D -X "../beer-unsigned.apk" classes.dex)
 (cd "$STAGE" && zip -q -r -D -X "../beer-unsigned.apk" lib)
 "$BT/zipalign" -f -p 4 "$OUT/beer-unsigned.apk" "$OUT/beer-aligned.apk"
 if [ ! -f "$KEY" ]; then
