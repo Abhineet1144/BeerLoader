@@ -1855,3 +1855,20 @@ second) and `BEER_BD11_STATS=1` (now also barriers/render passes per frame and d
   no GPU waits. Next steps: cheaper op replay (fewer refcount atomics, tracking the highest bound SRV slot, avoiding
   per-op payload mallocs) or recording replay into several command buffers in parallel.
 - RDR2 (Vulkan renderer, not BD12) re-checked with these changes: reaches the main menu at ~52 fps.
+
+### Sekiro: sound, E key, stack probes (2026-10-31)
+- **No sound** had four causes, all generic:
+  1. `IMMDeviceEnumerator::GetDevice` was unimplemented. FMOD gave up on WASAPI and the game never called `EventSystem::init`.
+  2. WASAPI accepted only `WAVE_FORMAT_PCM`. FMOD Ex uses `WAVE_FORMAT_EXTENSIBLE` (16-bit PCM for the first system, 32-bit float for later ones). Both are accepted now; float clients are always converted to PCM16 on `ReleaseBuffer`.
+  3. `CreateWaitableTimer*` were stubs returning NULL, and FMOD's mixer needs one. Timers are now events signalled by one host thread: `SetWaitableTimer(Ex)`, `CancelWaitableTimer`, periodic and absolute or relative due times. Completion routines (APCs) are not run.
+  4. `GetBuffer(0)` failed. Windows allows it when the buffer is full. FMOD took the failure as a lost device (`FMOD_ERR_OUTPUT_DRIVERCALL`) and closed and reopened its output about once a second, so almost nothing played.
+  - Checked by recording Beer's PipeWire stream: one stable stream with real signal.
+- **Crash once audio worked: TEB stack bounds during API calls.** Implementations run on the 1 MiB host call stack, but `gs:0x8`/`gs:0x10` still described the guest stack. FMOD's `EventSystem::load`, called from Beer's FMOD hook, probes with `__chkstk` against `StackLimit` and hit the guest stack's guard page. The dispatch trampoline now switches the TEB bounds to the host stack on the outermost entry and restores them on return.
+- **E key "works only sometimes".** The DirectInput press latch was shared: the first of Sekiro's four keyboard (and mouse) devices to poll cleared it, so a tap between two polls was lost on the other three. Presses are now counted, and each device remembers the counts it has reported.
+- **Render-thread replay (untested in gameplay at commit time).**
+  - Renamed buffers keep a cached CPU copy, so partial `UpdateSubresource` calls no longer read the old upload slice (write-combined memory, very slow to read).
+  - SRV binding keeps each bound view's resource plus a per-stage high-water mark, so `unbind_hazards`, `use_srvs` and state clears scan only used slots without dereferencing views. Rebinding the same view is skipped.
+- `BEER_THREAD_DIAGNOSTICS` now prints the requested stack size.
+- **Open:**
+  - In the last two runs the game called `ExitProcess(0)` after a few Enter presses on the title menu, probably a menu "Quit" selection. Not yet confirmed to be unrelated to the replay changes.
+  - Gameplay frame rate is about 30–40 fps in combat.

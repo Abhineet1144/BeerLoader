@@ -1120,6 +1120,12 @@ _Static_assert(HOST_CALL_STACK_SIZE == 1048576,
 __thread u64 g_host_call_stack_base;
 __thread u64 g_host_call_stack_top;
 __thread u64 g_saved_guest_rsp;
+/* The TEB stack bounds (gs:0x8 StackBase, gs:0x10 StackLimit) of the guest stack, kept while an outermost API call
+ * runs on the host call stack. During that call the TEB describes the host call stack instead: Windows code that an
+ * implementation calls back into (FMOD's EventSystem::load from Beer's FMOD hook) probes its frames with __chkstk
+ * against StackLimit, and with the guest stack's limit above the host stack it probed the guest stack's guard page. */
+__thread u64 g_teb_guest_stack_base;
+__thread u64 g_teb_guest_stack_limit;
 /* Import-dispatch provenance used to diagnose nested guest/host transitions.
  * The trampoline records these before changing RSP or consuming r10. */
 __thread u64 g_dispatch_import_index;
@@ -1233,6 +1239,20 @@ __asm__(
     "    cmp $" HOST_CALL_STACK_SIZE_STR ", %rax\n"
     "    jb 1f\n"                           /* (rsp - base) < SIZE => already on it */
     "    mov %rsp, %fs:g_saved_guest_rsp@tpoff\n"              /* Save to TEB SavedGuestRsp @ 0xA0 */
+    /* TEB stack bounds -> host call stack (kept as they are if they already describe it: a guest context resumed
+     * without returning through here left them switched, and the guest values saved then are still current). */
+    "    mov %gs:0x10, %rax\n"
+    "    cmp %fs:g_host_call_stack_base@tpoff, %rax\n"
+    "    je 5f\n"
+    "    mov %rax, %fs:g_teb_guest_stack_limit@tpoff\n"
+    "    mov %gs:0x8, %rax\n"
+    "    mov %rax, %fs:g_teb_guest_stack_base@tpoff\n"
+    "    mov %fs:g_host_call_stack_base@tpoff, %rax\n"
+    "    mov %rax, %gs:0x10\n"
+    "    mov %fs:g_host_call_stack_top@tpoff, %rax\n"
+    "    add $256, %rax\n"
+    "    mov %rax, %gs:0x8\n"
+    "5:\n"
     "    mov %fs:g_host_call_stack_top@tpoff, %rsp\n"              /* Switch to HostCallStackTop from TEB @ 0xB0 */
     "    and $-16, %rsp\n"                  /* Guarantee Windows ABI pre-call alignment */
     "    lea g_impl_targets(%rip), %r11\n"
@@ -1345,6 +1365,10 @@ __asm__(
      * any observable nonvolatile state. The old helper returned guest RSP in
      * RAX and the subsequent `pop %rax` replaced every API result with the
      * caller's continuation address. */
+    "    mov %fs:g_teb_guest_stack_limit@tpoff, %r11\n"
+    "    mov %r11, %gs:0x10\n"
+    "    mov %fs:g_teb_guest_stack_base@tpoff, %r11\n"
+    "    mov %r11, %gs:0x8\n"
     "    mov %fs:g_saved_guest_rsp@tpoff, %rsp\n"
     "    movq $0, %fs:g_saved_guest_rsp@tpoff\n"              /* No outer dispatch remains active after restore */
     "    pop %r11\n"
@@ -8393,6 +8417,161 @@ impl_PulseEvent(u64 h)
     return 1;
 }
 
+/* Waitable timers are events (same handle space, so every wait path takes them) that one host thread sets when
+ * they come due, and again every period for periodic timers. FMOD's WASAPI output paces its mixer with one and
+ * fails to initialise (no sound) without it. Completion routines (APCs) are not run. */
+#define BEER_MAX_TIMERS 256
+static struct {
+    u64 handle;          /* 0 = free slot */
+    u64 due_ns;          /* CLOCK_MONOTONIC; 0 = not armed */
+    u64 period_ns;
+} g_timers[BEER_MAX_TIMERS];
+static pthread_mutex_t g_timer_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_timer_cv;
+static int g_timer_thread_started;
+
+static u64 timer_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+
+static void *timer_thread_main(void *unused)
+{
+    (void)unused;
+    pthread_mutex_lock(&g_timer_mtx);
+    for (;;) {
+        u64 now = timer_now_ns(), next = 0;
+        for (int i = 0; i < BEER_MAX_TIMERS; ++i) {
+            if (!g_timers[i].handle || !g_timers[i].due_ns) continue;
+            if (g_timers[i].due_ns <= now) {
+                /* Under g_timer_mtx, so CloseHandle (which forgets the timer first) never races a late signal. */
+                impl_SetEvent(g_timers[i].handle);
+                if (g_timers[i].period_ns) {
+                    g_timers[i].due_ns += g_timers[i].period_ns;
+                    if (g_timers[i].due_ns <= now) g_timers[i].due_ns = now + g_timers[i].period_ns;
+                } else {
+                    g_timers[i].due_ns = 0;
+                }
+            }
+            if (g_timers[i].due_ns && (!next || g_timers[i].due_ns < next)) next = g_timers[i].due_ns;
+        }
+        if (!next) {
+            pthread_cond_wait(&g_timer_cv, &g_timer_mtx);
+        } else {
+            struct timespec ts = { (time_t)(next / 1000000000ull), (long)(next % 1000000000ull) };
+            pthread_cond_timedwait(&g_timer_cv, &g_timer_mtx, &ts);
+        }
+    }
+    return NULL;
+}
+
+static int timer_slot_locked(u64 h)
+{
+    for (int i = 0; i < BEER_MAX_TIMERS; ++i)
+        if (g_timers[i].handle == h) return i;
+    return -1;
+}
+
+static u64 beer_timer_create(int manual)
+{
+    u64 h = event_alloc(manual, 0);
+    if (!h) return 0;
+    pthread_mutex_lock(&g_timer_mtx);
+    if (!g_timer_thread_started) {
+        pthread_condattr_t attr;
+        pthread_condattr_init(&attr);
+        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        pthread_cond_init(&g_timer_cv, &attr);
+        pthread_condattr_destroy(&attr);
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, timer_thread_main, NULL) == 0) {
+            pthread_detach(thread);
+            g_timer_thread_started = 1;
+        }
+    }
+    int slot = timer_slot_locked(0);
+    if (slot >= 0) g_timers[slot] = (typeof(g_timers[0])){ h, 0, 0 };
+    pthread_mutex_unlock(&g_timer_mtx);
+    if (slot < 0 || !g_timer_thread_started) {
+        fprintf(stderr, "[SYNC] waitable timer table exhausted (%d)\n", BEER_MAX_TIMERS);
+        g_last_error = 4;
+        return 0;
+    }
+    return h;
+}
+
+/* CloseHandle: the timer stops before its event is released. */
+static void beer_timer_forget(u64 h)
+{
+    pthread_mutex_lock(&g_timer_mtx);
+    int slot = timer_slot_locked(h);
+    if (slot >= 0) g_timers[slot].handle = 0;
+    pthread_mutex_unlock(&g_timer_mtx);
+}
+
+static u64 __attribute__((ms_abi))
+impl_CreateWaitableTimerW(u64 sa, u32 manual, u64 name)
+    { (void)sa; (void)name; return beer_timer_create(manual != 0); }
+
+static u64 __attribute__((ms_abi))
+impl_CreateWaitableTimerExW(u64 sa, u64 name, u32 flags, u32 access)
+{
+    (void)sa; (void)name; (void)access;
+    /* CREATE_WAITABLE_TIMER_MANUAL_RESET=1, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION=2. */
+    return beer_timer_create((flags & 1u) != 0);
+}
+
+/* due: negative = relative, in 100 ns units; positive = absolute FILETIME (UTC). period in ms, 0 = one-shot. */
+static u64 __attribute__((ms_abi))
+impl_SetWaitableTimer(u64 h, const s64 *due, s32 period, u64 routine, u64 arg, u32 resume)
+{
+    (void)arg; (void)resume;
+    if (!due || period < 0) { g_last_error = 87; return 0; }
+    if (routine) {
+        static int warned;
+        if (!warned++) fprintf(stderr, "[SYNC] SetWaitableTimer completion routine not supported (timer still signals)\n");
+    }
+    u64 now = timer_now_ns(), when;
+    if (*due <= 0) {
+        when = now + (u64)(-*due) * 100u;
+    } else {
+        struct timespec rt;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        const s64 unix_100ns = *due - 116444736000000000ll;
+        const s64 now_100ns = (s64)rt.tv_sec * 10000000ll + rt.tv_nsec / 100;
+        when = unix_100ns > now_100ns ? now + (u64)(unix_100ns - now_100ns) * 100u : now;
+    }
+    pthread_mutex_lock(&g_timer_mtx);
+    int slot = timer_slot_locked(h);
+    if (slot < 0) { pthread_mutex_unlock(&g_timer_mtx); g_last_error = 6; return 0; }
+    impl_ResetEvent(h);                    /* setting a timer makes it non-signaled */
+    g_timers[slot].due_ns = when ? when : 1;
+    g_timers[slot].period_ns = (u64)period * 1000000u;
+    pthread_cond_signal(&g_timer_cv);
+    pthread_mutex_unlock(&g_timer_mtx);
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_SetWaitableTimerEx(u64 h, const s64 *due, s32 period, u64 routine, u64 arg, u64 wake_context, u32 tolerable)
+{
+    (void)wake_context; (void)tolerable;
+    return impl_SetWaitableTimer(h, due, period, routine, arg, 0);
+}
+
+static u64 __attribute__((ms_abi))
+impl_CancelWaitableTimer(u64 h)
+{
+    pthread_mutex_lock(&g_timer_mtx);
+    int slot = timer_slot_locked(h);
+    if (slot >= 0) g_timers[slot].due_ns = 0;
+    pthread_mutex_unlock(&g_timer_mtx);
+    if (slot < 0) { g_last_error = 6; return 0; }
+    return 1;
+}
+
 /* Win32 mutexes: recursive, owned by the acquiring guest thread. */
 #define MAX_WIN_MUTEXES 65536
 typedef struct { int used; u32 owner; u32 count; pthread_mutex_t mtx; pthread_cond_t cv; } WinMutex;
@@ -10397,10 +10576,10 @@ impl_CreateThread(u64 attr, u64 stack, u64 fn, u64 arg, u32 flags, u32 *tid)
     t->suspended = (flags & 0x4) ? 1 : 0; /* CREATE_SUSPENDED */
     if (getenv("BEER_THREAD_DIAGNOSTICS"))
         fprintf(stderr,
-                "[THREAD] create id=%u fn=0x%llx arg=0x%llx flags=0x%x "
+                "[THREAD] create id=%u fn=0x%llx arg=0x%llx flags=0x%x stack=0x%llx "
                 "creator=0x%llx\n",
                 t->tid, (unsigned long long)t->fn,
-                (unsigned long long)t->arg, flags,
+                (unsigned long long)t->arg, flags, (unsigned long long)stack,
                 (unsigned long long)t->creator_rip);
     if (getenv("BEER_THREAD_DIAGNOSTICS")) diag_dump_thread_arg("create", arg);
     pthread_mutex_init(&t->mtx, NULL);
@@ -11883,6 +12062,7 @@ impl_CloseHandle(u64 h)
 
     int eid = event_id_from_handle(h);
     if (eid >= 0) {
+        if (g_timer_thread_started) beer_timer_forget(h);
         pthread_mutex_lock(&g_event_table_mtx);
         WinEvent *ev = &g_events[eid];
         pthread_mutex_destroy(&ev->mtx);
@@ -13442,10 +13622,13 @@ typedef struct {
     s32 delta_x, delta_y, wheel;
     u8 mouse_buttons[8];
     /* A press that began and ended between two DirectInput polls must still be
-     * visible to one GetDeviceState call, as on Windows where device state is
-     * latched until read. The latch is only OR-ed into polled state. */
-    u8 mouse_latch[8];
-    u8 dik_latch[256];
+     * visible to the next GetDeviceState call of every device, as on Windows
+     * where each device's state is latched until it is read. Presses are
+     * counted here; each device remembers the counts it has reported (games
+     * open several keyboards and mice: Sekiro four of each, and a shared
+     * latch cleared by the first poll hid quick taps from the others). */
+    u32 mouse_presses[8];
+    u32 dik_presses[256];
     u8 pointer_position_valid;
     /* Virtual cursor: after SetCursorPos the guest's idea of the position is the warp target, and later motion is
      * applied to it as host-relative deltas, whether or not the compositor honours the warp (XWayland often does not). */
@@ -14499,7 +14682,7 @@ static void beer_deliver_key(u32 vk, u8 dik, int extended, int down, int top_lev
     }
     if (dik) {
         g_input.dik[dik] = down ? 0x80 : 0;
-        if (down) g_input.dik_latch[dik] = 1;
+        if (down) g_input.dik_presses[dik]++;
         if (top_level && !repeat)
             queue_dinput_event_locked(2, dik, down ? 0x80u : 0u);
     }
@@ -14583,7 +14766,7 @@ static void collect_native_window_events(void)
                     if (down && !(g_input.keys[vk] & 0x80))
                         g_input.pressed[vk] = 1;
                     g_input.mouse_buttons[di_button] = down ? 0x80 : 0;
-                    if (down) g_input.mouse_latch[di_button] = 1;
+                    if (down) g_input.mouse_presses[di_button]++;
                     g_input.keys[vk] = down ? 0x80 : 0;
                     if (top_level)
                         queue_dinput_event_locked(1, 12u + di_button,
@@ -14631,7 +14814,7 @@ static void collect_native_window_events(void)
                     pthread_mutex_lock(&g_input_mutex);
                     if (down && !(g_input.keys[vk] & 0x80)) g_input.pressed[vk] = 1;
                     g_input.mouse_buttons[2 + xb] = down ? 0x80 : 0;
-                    if (down) g_input.mouse_latch[2 + xb] = 1;
+                    if (down) g_input.mouse_presses[2 + xb]++;
                     g_input.keys[vk] = down ? 0x80 : 0;
                     if (top_level)
                         queue_dinput_event_locked(1, 12u + 2u + xb,
@@ -18094,6 +18277,7 @@ struct BeerDirectInputDevice {
     u32 key_offsets[256];
     int axis_absolute;     /* DIPROP_AXISMODE == DIPROPAXISMODE_ABS */
     s64 mouse_read[3];     /* g_input.mouse_total at this device's last poll */
+    u32 presses_seen[256]; /* g_input.dik_presses / mouse_presses at the last poll */
 };
 
 typedef struct {
@@ -18510,9 +18694,10 @@ beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
     u8 polled_buttons[8], polled_keys[256];
     for (int b = 0; b < 8; ++b)
         polled_buttons[b] = g_input.mouse_buttons[b] |
-                            (g_input.mouse_latch[b] ? 0x80 : 0);
+                            (self->kind == 1 && g_input.mouse_presses[b] != self->presses_seen[b] ? 0x80 : 0);
     for (int k = 0; k < 256; ++k)
-        polled_keys[k] = g_input.dik[k] | (g_input.dik_latch[k] ? 0x80 : 0);
+        polled_keys[k] = g_input.dik[k] |
+                         (self->kind == 2 && g_input.dik_presses[k] != self->presses_seen[k] ? 0x80 : 0);
     if (self->kind == 1) {
         /* Every device of the same kind sees all motion since its own last
          * poll, as with real DirectInput (Sekiro opens four mice). */
@@ -18553,7 +18738,7 @@ beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
         g_input.delta_x = 0;
         g_input.delta_y = 0;
         g_input.wheel = 0;
-        memset(g_input.mouse_latch, 0, sizeof(g_input.mouse_latch));
+        memcpy(self->presses_seen, g_input.mouse_presses, sizeof(g_input.mouse_presses));
     } else if (self->kind == 2) {
         if (self->data_size)
             beer_dinput_write_keyboard_state(state, size, polled_keys,
@@ -18562,7 +18747,7 @@ beer_dinput_device_GetDeviceState(BeerDirectInputDevice *self, u32 size,
             u32 keys = size < sizeof(polled_keys) ? size : sizeof(polled_keys);
             memcpy(state, polled_keys, keys);
         }
-        memset(g_input.dik_latch, 0, sizeof(g_input.dik_latch));
+        memcpy(self->presses_seen, g_input.dik_presses, sizeof(g_input.dik_presses));
         if (getenv("BEER_INPUT_DIAGNOSTICS")) {
             char held[96] = {0};
             size_t used = 0;
@@ -18775,6 +18960,13 @@ beer_dinput_CreateDevice(BeerDirectInput *self, const void *guid,
     memcpy(&guid_data1, guid, sizeof(guid_data1));
     if (guid_data1 == 0x6f1d2b60u) device->kind = 1;
     else if (guid_data1 == 0x6f1d2b61u) device->kind = 2;
+    /* Presses made before the device existed are not reported to it. */
+    pthread_mutex_lock(&g_input_mutex);
+    if (device->kind == 1)
+        memcpy(device->presses_seen, g_input.mouse_presses, sizeof(g_input.mouse_presses));
+    else if (device->kind == 2)
+        memcpy(device->presses_seen, g_input.dik_presses, sizeof(g_input.dik_presses));
+    pthread_mutex_unlock(&g_input_mutex);
     *out = device;
     fprintf(stderr, "[DINPUT] CreateDevice -> %s device %p\n",
             device->kind == 1 ? "mouse" :
@@ -20615,6 +20807,13 @@ static ImplEntry g_impls[] = {
     {"FreeLibraryWhenCallbackReturns",        (ImplFn)impl_FreeLibraryWhenCallbackReturns},
     /* Events (extended) */
     {"CreateEventExW",                        (ImplFn)impl_CreateEventExW},
+    {"CreateWaitableTimerA",                  (ImplFn)impl_CreateWaitableTimerW},
+    {"CreateWaitableTimerW",                  (ImplFn)impl_CreateWaitableTimerW},
+    {"CreateWaitableTimerExA",                (ImplFn)impl_CreateWaitableTimerExW},
+    {"CreateWaitableTimerExW",                (ImplFn)impl_CreateWaitableTimerExW},
+    {"SetWaitableTimer",                      (ImplFn)impl_SetWaitableTimer},
+    {"SetWaitableTimerEx",                    (ImplFn)impl_SetWaitableTimerEx},
+    {"CancelWaitableTimer",                   (ImplFn)impl_CancelWaitableTimer},
     /* Package identity */
     {"GetCurrentPackageId",                   (ImplFn)impl_GetCurrentPackageId},
     /* Stack trace */

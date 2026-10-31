@@ -214,6 +214,7 @@ static void buffer_destroy(B11Obj *o)
     free(b->backing);
     free(b->backing_serial);
     free(b->shadow);
+    free(b->versions_copy);
     free(b);
 }
 
@@ -265,6 +266,7 @@ void b11_buffer_rename(B11Buffer *b, BD12Buffer *slice)
     b->backing_serial[0] = 0;
     b->backing_count = 1;
     b->current = 0;
+    b->versions_copy_valid = 0;   /* the new version was written elsewhere (a deferred Map) */
 }
 
 BD12Buffer *b11_buffer_write_backing(B11Buffer *b, int discard)

@@ -38,7 +38,7 @@ void b11_state_clear(B11Context *ctx)
     for (int st = 0; st < B11_STAGE_COUNT; ++st) {
         set_obj(&s->shader[st], NULL);
         for (int i = 0; i < B11_MAX_CBV; ++i) set_obj(&s->cb[st][i], NULL);
-        for (int i = 0; i < B11_MAX_SRV; ++i) set_obj(&s->srv[st][i], NULL);
+        for (uint32_t i = 0; i < s->srv_end[st]; ++i) set_obj(&s->srv[st][i], NULL);
         for (int i = 0; i < B11_MAX_SAMPLER; ++i) set_obj(&s->sampler[st][i], NULL);
         for (int i = 0; i < B11_MAX_UAV; ++i) set_obj(&s->uav[st][i], NULL);
     }
@@ -59,14 +59,21 @@ void b11_state_clear(B11Context *ctx)
 
 static B11Obj *view_resource(B11Obj *view) { return view ? ((B11View *)view)->resource : NULL; }
 
+static void set_srv(B11PipelineState *s, uint32_t stage, uint32_t slot, B11Obj *view)
+{
+    set_obj(&s->srv[stage][slot], view);
+    s->srv_res[stage][slot] = view_resource(view);
+    if (view && slot >= s->srv_end[stage]) s->srv_end[stage] = slot + 1;
+}
+
 /* D3D11 unbinds shader-resource/UAV bindings of a resource that becomes a render target. */
 static void unbind_hazards(B11Context *ctx, B11Obj *resource)
 {
     if (!resource) return;
     B11PipelineState *s = &ctx->st;
     for (int st = 0; st < B11_STAGE_COUNT; ++st) {
-        for (int i = 0; i < B11_MAX_SRV; ++i)
-            if (s->srv[st][i] && view_resource(s->srv[st][i]) == resource) set_obj(&s->srv[st][i], NULL);
+        for (uint32_t i = 0; i < s->srv_end[st]; ++i)
+            if (s->srv_res[st][i] == resource) set_srv(s, (uint32_t)st, i, NULL);
         for (int i = 0; i < B11_MAX_UAV; ++i)
             if (s->uav[st][i] && view_resource(s->uav[st][i]) == resource) set_obj(&s->uav[st][i], NULL);
     }
@@ -100,6 +107,9 @@ static void apply_state(B11Context *ctx, const B11Op *op)
     case B11_OP_SET_SRV: {
         B11Obj *const *e = op->data;
         for (uint32_t i = 0; i < op->c && op->b + i < B11_MAX_SRV; ++i) {
+            /* Rebinding the bound view: it was checked against the targets when bound, and binding a target
+             * since then would have unbound it. */
+            if (e[i] && s->srv[op->a][op->b + i] == e[i]) continue;
             B11Obj *res = view_resource(e[i]);
             /* A resource bound for writing cannot also be read. */
             if (res) {
@@ -108,7 +118,7 @@ static void apply_state(B11Context *ctx, const B11Op *op)
                 if (res && s->dsv && view_resource(s->dsv) == res &&
                     !(((B11View *)s->dsv)->flags & 1)) res = NULL;
             }
-            set_obj(&s->srv[op->a][op->b + i], res || !e[i] ? e[i] : NULL);
+            set_srv(s, op->a, op->b + i, res || !e[i] ? e[i] : NULL);
         }
         break;
     }
@@ -425,10 +435,10 @@ static void use_srvs(B11Context *ctx, int compute)
     const int first = compute ? B11_STAGE_CS : 0, last = compute ? B11_STAGE_CS : B11_STAGE_PS;
     for (int st = first; st <= last; ++st) {
         if (!s->shader[st]) continue;
-        for (int i = 0; i < B11_MAX_SRV; ++i) {
-            B11View *v = (B11View *)s->srv[st][i];
-            if (v && v->resource && v->resource->kind == B11_TEXTURE)
-                b11_texture_use(ctx, (B11Texture *)v->resource, BD12_STATE_PIXEL_SHADER_RESOURCE | BD12_STATE_NON_PIXEL_SHADER_RESOURCE);
+        for (uint32_t i = 0; i < s->srv_end[st]; ++i) {
+            B11Obj *r = s->srv_res[st][i];
+            if (r && r->kind == B11_TEXTURE)
+                b11_texture_use(ctx, (B11Texture *)r, BD12_STATE_PIXEL_SHADER_RESOURCE | BD12_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
         for (int i = 0; i < B11_MAX_UAV; ++i) {
             B11View *v = (B11View *)s->uav[st][i];
@@ -846,6 +856,7 @@ static void do_copy(B11Context *ctx, B11Obj *dst_o, uint32_t dst_sub, uint32_t d
         B11Buffer *d = (B11Buffer *)dst_o, *s = (B11Buffer *)src_o;
         if (d->renamed) {                               /* back to a GPU-written buffer: CPU renames would drop this copy */
             d->renamed = 0;
+            d->versions_copy_valid = 0;
             BD12Buffer *own = bd12_buffer_create_committed(dev->bd, BD12_HEAP_DEFAULT, (d->desc.byte_width + 255u) & ~255u);
             if (own) {
                 bd12_cmd_global_barrier(cmd);
@@ -936,8 +947,21 @@ static void do_update(B11Context *ctx, const B11Op *op)
             BD12Buffer *slice = b11_slice_get(dev, b->desc.byte_width);
             if (slice && slice->cpu) {
                 BD12Buffer *old = b->backing[0];
-                if (b->renamed && (off || size != b->desc.byte_width)) memcpy(slice->cpu, old->cpu, b->desc.byte_width);
-                memcpy((uint8_t *)slice->cpu + off, src, size);
+                const int whole = off == 0 && size == b->desc.byte_width;
+                if (!b->versions_copy) b->versions_copy = malloc(b->desc.byte_width);
+                if (b->versions_copy && (whole || b->versions_copy_valid)) {
+                    /* The next version is built in cached memory, then written to the slice in one sequential pass. */
+                    memcpy(b->versions_copy + off, src, size);
+                    memcpy(slice->cpu, b->versions_copy, b->desc.byte_width);
+                    b->versions_copy_valid = 1;
+                } else {                                  /* no current copy (a deferred Map wrote this version) */
+                    if (b->renamed && !whole) memcpy(slice->cpu, old->cpu, b->desc.byte_width);
+                    memcpy((uint8_t *)slice->cpu + off, src, size);
+                    if (b->versions_copy) {               /* one slow read to resume the fast path */
+                        memcpy(b->versions_copy, slice->cpu, b->desc.byte_width);
+                        b->versions_copy_valid = 1;
+                    }
+                }
                 if (b->renamed) b11_slice_retire(dev, old);
                 else b11_defer(dev, b11_free_buffer_fn, old);
                 b->backing[0] = slice;

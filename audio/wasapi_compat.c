@@ -82,6 +82,7 @@ struct BeerWasapi {
     uint32_t acquired_frames;
     size_t acquired_capacity;
     int float_staging;            /* the engine mixes floats in place: sticky once seen (a packet's tail can be silent) */
+    int float_client;             /* initialised with a 32-bit float format: every packet is converted to PCM16 */
     uint8_t *acquired_buffer;
     atomic_uint_fast64_t submitted_frames;
     BeerAudioStream *stream;      /* this client's own sound-server stream */
@@ -173,6 +174,21 @@ static uint64_t __attribute__((ms_abi)) enumerator_get_default(void *self,
     return S_OK;
 }
 
+/* GetDevice(id): there is one render endpoint, so every id names it. FMOD looks the default device up again by
+ * the id GetId returned and gives up on WASAPI (silence) when this fails. */
+static uint64_t __attribute__((ms_abi)) enumerator_get_device(void *self,
+                                                              const uint16_t *id,
+                                                              void **device)
+{
+    if (!device) return E_POINTER;
+    *device = NULL;
+    if (!id) return E_POINTER;
+    BeerWasapi *owner = wasapi_interface(self)->owner;
+    wasapi_add_ref(&owner->device);
+    *device = &owner->device;
+    return S_OK;
+}
+
 static uint64_t __attribute__((ms_abi)) collection_get_count(void *self,
                                                              uint32_t *count)
 {
@@ -206,8 +222,6 @@ static uint64_t __attribute__((ms_abi)) enumerator_enum_endpoints(
     return S_OK;
 }
 
-static uint64_t __attribute__((ms_abi)) enumerator_notimpl(void *self, ...)
-{ (void)self; wasapi_log_unsupported("IMMDeviceEnumerator method not implemented", NULL); return E_FAIL; }
 static uint64_t __attribute__((ms_abi)) enumerator_notify(void *self, void *callback)
 { (void)self; (void)callback; return S_OK; }
 
@@ -297,11 +311,25 @@ static uint64_t __attribute__((ms_abi)) session_get_grouping(void *self, uint8_t
 static uint64_t __attribute__((ms_abi)) session_ok(void *self, ...)
 { (void)self; return S_OK; }
 
+/* Mono or stereo 16-bit PCM (returns 1) or 32-bit float (returns 2): WAVE_FORMAT_PCM / WAVE_FORMAT_IEEE_FLOAT, or
+ * WAVE_FORMAT_EXTENSIBLE with the matching KSDATAFORMAT_SUBTYPE (FMOD Ex always uses the extensible form, and asks
+ * for float in the systems it opens after the first). Float packets are converted to PCM16 in ReleaseBuffer. */
 static int supported_format(const WaveFormat *format)
 {
-    return format && format->tag == 1 && format->channels >= 1 &&
-           format->channels <= 2 && format->rate && format->bits == 16 &&
-           format->block_align == format->channels * 2u;
+    if (!format || format->channels < 1 || format->channels > 2 || !format->rate ||
+        (format->bits != 16 && format->bits != 32) ||
+        format->block_align != format->channels * (format->bits / 8u))
+        return 0;
+    const int kind = format->bits == 16 ? 1 : 2;
+    if (format->tag == (kind == 1 ? 1 : 3)) return kind;
+    if (format->tag != 0xfffe || format->extra < 22) return 0;
+    static const uint8_t subtype_tail[14] = {0x00,0x00, 0x00,0x00, 0x10,0x00,
+                                             0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71};
+    const uint8_t *extensible = (const uint8_t *)format + sizeof(*format);
+    uint16_t valid_bits;
+    memcpy(&valid_bits, extensible, sizeof(valid_bits));
+    return (valid_bits == 0 || valid_bits == format->bits) &&
+           extensible[6] == (kind == 1 ? 1 : 3) && !memcmp(extensible + 8, subtype_tail, 14) ? kind : 0;
 }
 
 static uint64_t __attribute__((ms_abi)) audio_client_initialize(
@@ -319,8 +347,17 @@ static uint64_t __attribute__((ms_abi)) audio_client_initialize(
             format ? format->channels : 0, format ? format->rate : 0,
             format ? format->bits : 0);
     if (owner->initialized) return AUDCLNT_E_ALREADY_INITIALIZED;
-    if (!supported_format(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    const int kind = supported_format(format);
+    if (!kind) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    /* The stream is always PCM16; a float client's packets are converted on release. */
     owner->format = *format;
+    owner->format.tag = 1;
+    owner->format.extra = 0;
+    owner->format.bits = 16;
+    owner->format.block_align = (uint16_t)(format->channels * 2u);
+    owner->format.average_bytes = format->rate * owner->format.block_align;
+    owner->float_client = kind == 2;
+    owner->float_staging = kind == 2;
     uint64_t duration = buffer_duration > 0 ? (uint64_t)buffer_duration : UINT64_C(1000000);
     /* Shared mode never hands out less than a few device periods (Wine's drivers use three): RDR2 asks for one 10 ms
      * period, and with exactly 10 ms any scheduling hiccup leaves its mixer no room to write ahead. */
@@ -531,7 +568,9 @@ static uint64_t __attribute__((ms_abi)) render_get_buffer(void *self, uint32_t f
     BeerWasapi *owner = wasapi_interface(self)->owner;
     if (!owner->initialized) return AUDCLNT_E_NOT_INITIALIZED;
     if (owner->acquired_buffer) return AUDCLNT_E_OUT_OF_ORDER;
-    if (!frames || frames > owner->buffer_frames) return AUDCLNT_E_BUFFER_SIZE_ERROR;
+    /* Zero frames is a valid request (the buffer is full): FMOD makes it every time it has filled the whole buffer
+     * and treats a failure as a lost device, closing and reopening its output about once a second. */
+    if (frames > owner->buffer_frames) return AUDCLNT_E_BUFFER_SIZE_ERROR;
     /* Reserve engine-mix staging capacity in addition to the endpoint's
      * declared PCM payload. Some clients perform an in-place float-to-PCM
      * conversion in the render packet; ReleaseBuffer still submits only the
@@ -539,7 +578,7 @@ static uint64_t __attribute__((ms_abi)) render_get_buffer(void *self, uint32_t f
     size_t staging_align = (size_t)owner->format.channels * sizeof(float);
     if (staging_align < owner->format.block_align)
         staging_align = owner->format.block_align;
-    size_t capacity = (size_t)frames * staging_align;
+    size_t capacity = (size_t)(frames ? frames : 1) * staging_align;
     owner->acquired_buffer = calloc(1, capacity);
     if (!owner->acquired_buffer) return E_FAIL;
     owner->acquired_frames = frames;
@@ -590,6 +629,7 @@ static int convert_float_staging_packet(BeerWasapi *owner, uint32_t frames)
     size_t pcm_bytes = samples * sizeof(int16_t);
     if (owner->acquired_capacity < float_bytes || pcm_bytes >= float_bytes)
         return 0;
+    if (owner->float_client) goto convert;
 
     /* A PCM16 client normally writes only the declared packet bytes. Some
      * engine mixers use the extra endpoint buffer capacity as an in-place
@@ -615,6 +655,7 @@ static int convert_float_staging_packet(BeerWasapi *owner, uint32_t frames)
     if (finite_unit_samples < samples * 7u / 8u) return 0;
 
     owner->float_staging = 1;
+convert:
     for (size_t sample = 0; sample < samples; ++sample) {
         uint32_t bits;
         int16_t pcm;
@@ -757,7 +798,7 @@ static uint64_t __attribute__((ms_abi)) clock_get_characteristics(void *self,
 
 static void *enumerator_vtable[8] = {
     wasapi_query, wasapi_add_ref, wasapi_release, enumerator_enum_endpoints,
-    enumerator_get_default, enumerator_notimpl, enumerator_notify, enumerator_notify
+    enumerator_get_default, enumerator_get_device, enumerator_notify, enumerator_notify
 };
 static void *collection_vtable[5] = {
     wasapi_query, wasapi_add_ref, wasapi_release,

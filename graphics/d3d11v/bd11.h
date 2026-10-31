@@ -111,6 +111,10 @@ typedef struct B11Buffer {
     int renamed;                  /* backing[0] is an upload slice replaced on every UpdateSubresource */
     int gpu_written;              /* a GPU copy wrote it: CPU-side renames would lose that data */
     uint8_t *shadow;              /* CPU copy for STAGING reads/writes via Map */
+    /* Renamed buffers: cached CPU copy of the current version, so a partial UpdateSubresource builds the next
+     * version without reading the old slice (upload memory is write-combined: reads are uncached and slow). */
+    uint8_t *versions_copy;
+    int versions_copy_valid;
 } B11Buffer;
 
 typedef struct B11Texture {
@@ -209,6 +213,10 @@ typedef struct {
     uint32_t cb_first[B11_STAGE_COUNT][B11_MAX_CBV];
     uint32_t cb_count[B11_STAGE_COUNT][B11_MAX_CBV];
     B11Obj *srv[B11_STAGE_COUNT][B11_MAX_SRV];
+    /* The resource of each bound SRV and one past the highest slot ever bound since the last clear, so the
+     * per-draw and per-render-target scans touch only used slots and never chase view pointers. */
+    B11Obj *srv_res[B11_STAGE_COUNT][B11_MAX_SRV];
+    uint32_t srv_end[B11_STAGE_COUNT];
     B11Obj *sampler[B11_STAGE_COUNT][B11_MAX_SAMPLER];
     B11Obj *uav[B11_STAGE_COUNT][B11_MAX_UAV];       /* PS slots follow the RTV count; CS slots 0..7 */
     uint32_t uav_initial[B11_STAGE_COUNT][B11_MAX_UAV];
