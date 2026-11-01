@@ -1,5 +1,6 @@
 #include "directinput_format.h"
 #include "win32_input.h"
+#include "win32_keyboard_text.h"
 
 #include <assert.h>
 #include <stddef.h>
@@ -108,6 +109,19 @@ int main(void)
     assert(beer_win32_key_message_character(0x0100, 'E', 1, 0) == 'E');
     assert(beer_win32_key_message_character(0x0100, 'E', 0, 1) == 'E');
     assert(beer_win32_key_message_character(0x0101, 'E', 0, 0) == 0);
+    assert(beer_win32_us_key_character('1', 0, 0) == '1');
+    assert(beer_win32_us_key_character('1', 1, 0) == '!');
+    assert(beer_win32_us_key_character(0xba, 0, 0) == ';');
+    assert(beer_win32_us_key_character(0xba, 1, 0) == ':');
+    uint8_t unicode_keys[256] = {0};
+    uint16_t unicode_output[2] = {0};
+    assert(beer_win32_to_unicode_us('E', unicode_keys, unicode_output, 2) == 1);
+    assert(unicode_output[0] == 'e');
+    unicode_keys[0x10] = 0x80;
+    assert(beer_win32_to_unicode_us('E', unicode_keys, unicode_output, 2) == 1);
+    assert(unicode_output[0] == 'E');
+    unicode_keys[0x10] = 0;
+    assert(beer_win32_to_unicode_us(0x70, unicode_keys, unicode_output, 2) == 0);
 
     assert(beer_win32_message_is_coalescible_motion(0x0200));
     assert(!beer_win32_message_is_coalescible_motion(0x0201));

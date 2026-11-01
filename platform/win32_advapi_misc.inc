@@ -40,6 +40,19 @@ static u64 __attribute__((ms_abi)) impl_AccessCheck(const void *descriptor, u64 
     g_last_error = 0;
     return 1;
 }
+/* PRIVILEGE_SET begins with PrivilegeCount, Control, followed by LUID_AND_ATTRIBUTES.
+ * Beer's single-user token has the privileges it exposes enabled. */
+static u64 __attribute__((ms_abi))
+impl_PrivilegeCheck(u64 token, const u32 *required_privileges, u32 *result)
+{
+    if (!token || !required_privileges || !result) {
+        g_last_error = 87;
+        return 0;
+    }
+    *result = 1;
+    g_last_error = 0;
+    return 1;
+}
 /* GENERIC_MAPPING { GenericRead, GenericWrite, GenericExecute, GenericAll } */
 static u64 __attribute__((ms_abi)) impl_MapGenericMask(u32 *access, const u32 *mapping)
 {

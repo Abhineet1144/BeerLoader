@@ -12,7 +12,10 @@
 #define NVAPI_NVIDIA_DEVICE_NOT_FOUND (-6)
 #define NVAPI_END_ENUMERATION (-7)
 #define NVAPI_INVALID_HANDLE (-8)
+#define NVAPI_INCOMPATIBLE_STRUCT_VERSION (-9)
+#define NVAPI_NOT_SUPPORTED (-104)
 #define NVAPI_GPU_HANDLE 0x4E564750u        /* "NVGP" */
+#define NVAPI_LOGICAL_GPU_HANDLE 0x4E56474Cu /* "NVGL" */
 
 static _Atomic(int) g_nvapi_initialized;
 
@@ -170,6 +173,119 @@ static int __attribute__((ms_abi)) nvapi_EnumNvidiaDisplayHandle(u32 index, u64 
     return NVAPI_OK;
 }
 
+/* A single physical adapter also forms one logical GPU.  Streamline uses this
+ * documented relationship to associate NVAPI capabilities with its DXGI
+ * adapter; returning NO_IMPLEMENTATION discards otherwise valid GPU data. */
+static int __attribute__((ms_abi))
+nvapi_GetLogicalGPUFromPhysicalGPU(u64 physical, u64 *logical)
+{
+    if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
+    if (physical != NVAPI_GPU_HANDLE) return NVAPI_INVALID_HANDLE;
+    if (!logical) return NVAPI_INVALID_ARGUMENT;
+    *logical = NVAPI_LOGICAL_GPU_HANDLE;
+    return NVAPI_OK;
+}
+
+static int __attribute__((ms_abi))
+nvapi_GetPhysicalGPUsFromLogicalGPU(u64 logical, u64 *physical, u32 *count)
+{
+    if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
+    if (logical != NVAPI_LOGICAL_GPU_HANDLE) return NVAPI_INVALID_HANDLE;
+    if (!physical || !count) return NVAPI_INVALID_ARGUMENT;
+    physical[0] = NVAPI_GPU_HANDLE;
+    *count = 1;
+    return NVAPI_OK;
+}
+
+/* NV_GPU_LOGICAL_GPU_INFO is versioned and larger in newer NVAPI releases.
+ * The stable prefix is: version, physicalGpuCount, physicalGpuHandles[64].
+ * Fill only that documented prefix and preserve extension bytes owned by the
+ * caller. */
+static int __attribute__((ms_abi))
+nvapi_GPU_GetLogicalGpuInfo(u64 logical, u8 *info)
+{
+    if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
+    if (logical != NVAPI_LOGICAL_GPU_HANDLE) return NVAPI_INVALID_HANDLE;
+    if (!info) return NVAPI_INVALID_ARGUMENT;
+    u32 version = *(u32 *)info;
+    u32 size = version & 0xffffu;
+    if (size < 16u + 64u * sizeof(u64))
+        return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    *(u32 *)(info + 4) = 1;
+    *(u64 *)(info + 8) = NVAPI_GPU_HANDLE;
+    for (u32 index = 1; index < 64; ++index)
+        *(u64 *)(info + 8 + index * sizeof(u64)) = 0;
+    return NVAPI_OK;
+}
+
+/* NVIDIA's resource-creation extension is mostly a thin wrapper around
+ * ID3D12Device::CreateCommittedResource.  Beer can truthfully support the
+ * ordinary path because BD12 already implements that COM method.  NVIDIA-only
+ * HTEX and CPU-visible-VRAM hints have no Vulkan equivalent in BD12 yet, so
+ * report those flags as unsupported instead of silently changing semantics. */
+static int __attribute__((ms_abi))
+nvapi_D3D12_CreateCommittedResource(void *device, const void *heap_properties,
+                                    u32 heap_flags, const void *resource_desc,
+                                    u32 initial_state, const void *clear_value,
+                                    const u32 *nv_params, const u8 *riid,
+                                    void **resource, u8 *supported)
+{
+    if (resource) *resource = NULL;
+    if (supported) *supported = 0;
+    if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
+    if (!device || !heap_properties || !resource_desc || !riid)
+        return NVAPI_INVALID_ARGUMENT;
+    if (nv_params) {
+        const u32 version = nv_params[0];
+        if ((version & 0xffffu) < 8u || (version >> 16) != 1u)
+            return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+        if (nv_params[1] != 0)
+            return NVAPI_NOT_SUPPORTED;
+    }
+    /* ID3D12Device::CreateCommittedResource is vtable slot 27. */
+    void **vtable = *(void ***)device;
+    if (!vtable || !vtable[27]) return NVAPI_INVALID_HANDLE;
+    typedef u32 (__attribute__((ms_abi)) *CreateFn)(
+        void *, const void *, u32, const void *, u32, const void *,
+        const u8 *, void **);
+    void *created = NULL;
+    u32 hr = ((CreateFn)vtable[27])(device, heap_properties, heap_flags,
+                                   resource_desc, initial_state, clear_value,
+                                   riid, resource ? &created : NULL);
+    if (hr != 0) return NVAPI_ERROR;
+    if (resource) *resource = created;
+    if (supported) *supported = 1;
+    return NVAPI_OK;
+}
+
+static int nvapi_logical_gpu_self_test(void)
+{
+    u64 logical = 0, physical[64] = {0};
+    u32 count = 0;
+    g_nvapi_initialized = 1;
+    if (nvapi_GetLogicalGPUFromPhysicalGPU(NVAPI_GPU_HANDLE, &logical) != NVAPI_OK ||
+        logical != NVAPI_LOGICAL_GPU_HANDLE)
+        return 0;
+    if (nvapi_GetPhysicalGPUsFromLogicalGPU(logical, physical, &count) != NVAPI_OK ||
+        count != 1 || physical[0] != NVAPI_GPU_HANDLE)
+        return 0;
+    u8 info[16 + 64 * sizeof(u64)];
+    memset(info, 0xa5, sizeof(info));
+    *(u32 *)info = (u32)sizeof(info) | (1u << 16);
+    if (nvapi_GPU_GetLogicalGpuInfo(logical, info) != NVAPI_OK ||
+        *(u32 *)(info + 4) != 1 || *(u64 *)(info + 8) != NVAPI_GPU_HANDLE ||
+        *(u64 *)(info + 16) != 0)
+        return 0;
+    if (nvapi_GetLogicalGPUFromPhysicalGPU(0, &logical) != NVAPI_INVALID_HANDLE ||
+        nvapi_GetLogicalGPUFromPhysicalGPU(NVAPI_GPU_HANDLE, NULL) != NVAPI_INVALID_ARGUMENT)
+        return 0;
+    u32 params[2] = { 8u | (1u << 16), 1u };
+    u8 supported = 1;
+    return nvapi_D3D12_CreateCommittedResource((void *)1, (void *)1, 0,
+        (void *)1, 0, NULL, params, (const u8 *)1, NULL, &supported) == NVAPI_NOT_SUPPORTED &&
+        supported == 0;
+}
+
 static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
 {
     static const struct { u32 id; void *fn; } table[] = {
@@ -187,6 +303,10 @@ static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
         { 0xBAAABFCCu, nvapi_GPU_GetSystemType },
         { 0x1BE0B8E5u, nvapi_GPU_GetBusId },
         { 0x9ABDD40Du, nvapi_EnumNvidiaDisplayHandle },
+        { 0xADD604D1u, nvapi_GetLogicalGPUFromPhysicalGPU },
+        { 0xAEA3FA32u, nvapi_GetPhysicalGPUsFromLogicalGPU },
+        { 0x842B066Eu, nvapi_GPU_GetLogicalGpuInfo },
+        { 0x027E98AEu, nvapi_D3D12_CreateCommittedResource },
         { 0xD8265D24u, nvapi_GPU_GetArchInfo },
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(*table); ++i)

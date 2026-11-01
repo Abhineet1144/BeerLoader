@@ -7,7 +7,7 @@ TARGET = loader
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
 MEDIA_SRCS = media/media_foundation.c
-PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
+PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
                 platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c
@@ -161,6 +161,10 @@ test-input:
 	/tmp/beer-win32-environment-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_apiset_test.c platform/win32_apiset.c -o /tmp/beer-win32-apiset-test
 	/tmp/beer-win32-apiset-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_tsf_test.c platform/win32_tsf.c -o /tmp/beer-win32-tsf-test
+	/tmp/beer-win32-tsf-test
+	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_registered_message_test.c platform/win32_registered_message.c -o /tmp/beer-win32-registered-message-test
+	/tmp/beer-win32-registered-message-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_kernel32_contract_test.c -o /tmp/beer-win32-kernel32-contract-test
 	/tmp/beer-win32-kernel32-contract-test
 	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_address_wait_test.c platform/win32_address_wait.c -o /tmp/beer-win32-address-wait-test

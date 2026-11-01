@@ -831,6 +831,63 @@ static u64 __attribute__((ms_abi)) beer_K32EnumProcessModules(u64 process, u64 *
 static u64 __attribute__((ms_abi)) beer_K32EnumProcessModulesEx(u64 process, u64 *modules, u32 cb, u32 *needed, u32 filter)
 { (void)filter; return beer_enum_process_modules(process, modules, cb, needed); }
 
+/* MODULEINFO { lpBaseOfDll, SizeOfImage, EntryPoint }.  Beer can inspect the
+ * current guest process directly; remote Beer processes expose only their main
+ * image metadata through the process registry and therefore have no entry RVA. */
+typedef struct {
+    u64 base;
+    u32 size;
+    u32 padding;
+    u64 entry;
+} BeerModuleInfo;
+
+static u64 __attribute__((ms_abi))
+beer_K32GetModuleInformation(u64 process, u64 module, BeerModuleInfo *output,
+                             u32 output_size)
+{
+    if (!output || output_size < sizeof(*output)) {
+        g_last_error = 122; /* ERROR_INSUFFICIENT_BUFFER */
+        return 0;
+    }
+    BeerProcInfo process_info;
+    if (!beer_handle_info(process, &process_info)) return 0;
+
+    u64 base = module ? module : process_info.base;
+    u64 size = 0, entry = 0;
+    if (beer_handle_pid(process) == getpid()) {
+        if (base == (u64)(uintptr_t)g_img) {
+            const NtHdrs64 *nt = (const NtHdrs64 *)(g_img + ((const DosHdr *)g_img)->lfanew);
+            size = nt->opt.sz_image;
+            entry = base + nt->opt.entry_rva;
+        } else {
+            GuestDll *dll = guest_dll_from_handle(base);
+            if (dll && dll->image) {
+                const NtHdrs64 *nt = (const NtHdrs64 *)(dll->image + ((const DosHdr *)dll->image)->lfanew);
+                size = nt->opt.sz_image;
+                entry = nt->opt.entry_rva ? base + nt->opt.entry_rva : 0;
+            } else if (fake_pe_module_from_base(base)) {
+                size = FAKE_PE_SIZE;
+            } else {
+                for (int index = 0; index < g_fake_dll_count; ++index)
+                    if (g_fake_dll_cache[index].handle == base) {
+                        size = FAKE_PE_SIZE;
+                        break;
+                    }
+            }
+        }
+    } else if (base == process_info.base) {
+        size = 0; /* Remote image size is not stored in the process registry. */
+    }
+
+    if (!base || !size) {
+        g_last_error = 126; /* ERROR_MOD_NOT_FOUND */
+        return 0;
+    }
+    *output = (BeerModuleInfo){ base, (u32)size, 0, entry };
+    g_last_error = 0;
+    return 1;
+}
+
 static u32 beer_copy_text_out(const char *text, void *out, u32 size, int wide)
 {
     u32 n = (u32)strlen(text);

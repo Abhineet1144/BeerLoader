@@ -2356,3 +2356,85 @@ Oracle logs on the remote host: `/tmp/re9-wine-oracle.log`, `/tmp/re9-wine-relay
   BD12, input setup, WMI, and Media Foundation startup. The next failure is a later unhandled exception in dynamically
   generated/manual-mapped code at `0x23626264` (near-null read at `0x100`), followed by the game's crash reporter. No
   further runtime contract was started in this pass. Log: `/tmp/beer-re9-reserved.log`.
+
+### RE9 AppUserModelID and address-change contracts (2026-11-01)
+
+- The generated-code fault after Media Foundation startup remains at the same relative runtime location and still
+  dereferences the state pointer value `0x100`. Dynamic callback unwind lookup and language-handler dispatch are valid;
+  the handler declines the access violation.
+- Two pre-fault false-success stubs were replaced with documented Windows behavior:
+  - `GetCurrentProcessExplicitAppUserModelID` now clears the output and returns
+    `HRESULT_FROM_WIN32(APPMODEL_ERROR_NO_APPLICATION)` (`0x80073D57`) until an ID is set. The setter stores process-wide
+    state, and successful getters return independent `CoTaskMemFree`-compatible copies.
+  - `NotifyAddrChange` now starts a pending asynchronous request instead of returning success with untouched outputs. It
+    supplies a closeable notification handle, sets `OVERLAPPED.Internal=STATUS_PENDING`, returns `ERROR_IO_PENDING`, and
+    supports `CancelIPChangeNotify` with cancelled completion state. Closing the handle removes the pending request.
+- Both contracts have opt-in self-tests (`BEER_SELF_TEST_APP_USER_MODEL_ID=1` and
+  `BEER_SELF_TEST_NOTIFY_ADDR_CHANGE=1`), which pass locally. The serial loader build, source diagnostics, and
+  `git diff --check` pass under the 6 GiB RAM / 1 GiB swap cap.
+- Only the rebuilt `loader` was uploaded remotely. The previous remote loader was backed up before upload.
+- Remote A/B result: both APIs resolve as real implementations and execute with valid outputs, but RE9 still reaches the
+  same generated-code fault after `MFStartup`. Therefore these are valid generic compatibility fixes, not the remaining
+  root cause. Log: `/tmp/beer-re9-notify.log`.
+- The next observable pre-fault difference was a failed `CoCreateInstance` for CLSID
+  `529a9e6b-6587-4f23-ab9e-9c7d683e3c50`, IID `aa80e801-2021-11d2-93e0-0060b067b86e`. Wine registry metadata identifies
+  these as `CLSID_TF_ThreadMgr` and `IID_ITfThreadMgr`; no Wine implementation or export inventory was copied.
+
+### RE9 Text Services and module-information contracts (2026-11-01)
+
+- Added a process-local, 14-slot `ITfThreadMgr` implementation for the documented Text Services Framework COM class.
+  It supports COM identity/refcounts, activation/deactivation, focus state, and conservative null/failure results for
+  unsupported document/function-provider services. `CoCreateInstance` now returns this typed object only for
+  `CLSID_TF_ThreadMgr`; unsupported interfaces still receive `E_NOINTERFACE` rather than a generic success object.
+- Added a standalone TSF ABI/slot/lifetime test and integrated it into `make test-input`.
+- The remote run also exposed repeated `K32GetModuleInformation` zero stubs immediately before the generated-code fault.
+  Implemented the documented current-process `MODULEINFO` contract for the executable, loaded guest DLLs, and Beer-owned
+  compatibility modules; invalid modules fail instead of returning success with untouched output.
+- Only the rebuilt `loader` was uploaded remotely, with the previous binary backed up. Remote A/B result:
+  `CoCreateInstance(TF_ThreadMgr)` now succeeds and both `K32GetModuleInformation` calls resolve as real functions, but
+  RE9 still faults at the same relative generated-code location (the mapped base shifted from `0x2361f000` to
+  `0x2361c000`, so RIP shifted from `0x2362f264` to `0x2362c264`; fault address remains `0x100`). These are valid generic
+  Windows compatibility fixes, but neither is the remaining root cause. Log: `/tmp/beer-re9-tsf-moduleinfo.log`.
+
+### RE9 OLEAUT32 ordinal consistency (2026-11-01)
+
+- The pre-fault API trace exposed `OLEAUT32.dll!#2` being routed to a zero stub even though Beer already implemented the corresponding BSTR function, `SysAllocString`, by name. `GetProcAddress` had a private ordinal mapping, but static executable and guest-DLL import binding did not share it.
+- Added one canonical OLEAUT32 ordinal mapping for the implemented BSTR surface (ordinals 2–7) and reused it from `GetProcAddress`, executable import binding, and guest-DLL import binding. Added `BEER_SELF_TEST_OLEAUT32_ORDINALS=1`; the capped serial build and self-test pass.
+- Only the rebuilt `loader` was uploaded remotely; the previous remote loader was backed up. The RE9 trace now reports `[REAL] OLEAUT32.dll!#2` instead of `[STUB]`.
+- In the observed call, ordinal 2 receives `SysAllocString(NULL)`. Returning NULL is the documented result, so the generated/manual-mapped fault remains at the same relative generated-code location (mapped base shifted; RIP `0x23625264`, fault address `0x100`). This is a real generic import-consistency correction but not the remaining root cause.
+- Remote log: `/tmp/beer-re9-oleaut32.log`.
+
+### RE9 provider metadata, registered messages, and keyboard-text contracts (2026-11-01)
+
+- `CryptGetProvParam` now implements documented metadata queries for Beer's existing CryptoAPI provider. In particular,
+  `PP_UNIQUE_CONTAINER` supports the normal two-pass size/data query and returns a stable process container name instead
+  of leaving the caller's size/output untouched. The focused `BEER_SELF_TEST_CRYPT_PROV_PARAM=1` contract passes.
+  The remote trace confirmed both query passes, but the callback-registered generated-code fault remained unchanged.
+- `RegisterWindowMessageA/W` now uses a process-wide, case-sensitive A/W-shared namespace and returns stable IDs in
+  Windows' `0xC000..0xFFFF` range. RE9/Streamline now receives nonzero IDs (`0xC000`, `0xC001`), but the generated-code
+  fault remained at the same relative instruction with fault address `0x100`.
+- The callback-backed function table is self-registered from inside the same anonymous generated mapping
+  (`caller = generated base + 0x8944`, empty module name). The first fault therefore has not moved into ordinary RE9,
+  BD12, or loader code; it remains within the package-generated runtime path.
+- A later full A/B trace exposed two high-volume USER32 zero stubs before `MFStartup`: `ToUnicodeEx` and
+  `GetKeyNameTextW`. Beer now implements conservative US-layout keyboard translation and common key-name lookup, with
+  focused input tests. This is a generic USER32 correction and not a title-specific patch.
+- The first remote run with those keyboard contracts did not reach the old generated fault. It progressed through BD12
+  and display/input setup, then deliberately aborted with `Fatal D3D error (6, E_OUTOFMEMORY, 0x8007000e)` before
+  `MFStartup`. This is a different, earlier failure boundary and needs a repeat run before causality is claimed. Remote
+  logs: `/tmp/beer-re9-cryptprov2.log`, `/tmp/beer-re9-registermsg.log`, and `/tmp/beer-re9-keyboard.log`.
+
+### RE9 VRAM-pressure retry (2026-11-01)
+
+- Repeated the exact current remote loader after the other VRAM-heavy application was closed. The RTX 2070 SUPER had
+  approximately 6.5 GiB free after the run (`1315 / 8192 MiB` used), and the launch remained inside the 6 GiB RAM /
+  1 GiB swap scope.
+- The earlier deliberate `Fatal D3D error (6, E_OUTOFMEMORY, 0x8007000e)` did not recur. RE9 completed Streamline,
+  XeSS, BD12 feature setup, reserved-resource/command-signature creation, display enumeration, DirectInput, WMI, TSF,
+  and `MFStartup`.
+- The first failure returned to the established callback-registered package-generated region:
+  `RIP=0x2362c264`, `FaultAddr=0x100`. This confirms the earlier E_OUTOFMEMORY boundary was caused by external VRAM
+  pressure rather than the keyboard-text contract or a persistent Beer allocation regression.
+- The failure has therefore not moved permanently into ordinary RE9/BD12 code; it remains at the package-generated
+  runtime boundary. No runtime source or remote binary was changed for this retry.
+- Remote log: `/tmp/beer-re9-vram-retry.log`.

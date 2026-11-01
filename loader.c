@@ -80,6 +80,7 @@
 #include "win32_resource.h"
 #include "win32_string_ordinal.h"
 #include "win32_address_wait.h"
+#include "win32_registered_message.h"
 #include "beer_time.h"
 #include "beer_control.h"
 #include "beer_overlay.h"
@@ -107,6 +108,7 @@
 #include "platform/steam_offline_policy.h"
 #include "platform/steam_interface_contract.h"
 #include "platform/win32_input.h"
+#include "platform/win32_keyboard_text.h"
 #include "platform/win32_filesystem_policy.h"
 #include "platform/window_style_policy.h"
 #include "platform/window_icon_policy.h"
@@ -2143,12 +2145,23 @@ impl_RtlInstallFunctionTableCallback(u64 identifier, u64 base, u32 length,
                                      BeerFunctionTableCallback callback,
                                      void *context, const u16 *dll_name)
 {
-    (void)dll_name;
     u64 result = (u64)beer_install_function_table_callback(identifier, base, length,
                                                             callback, context);
-    if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
-        fprintf(stderr, "[UNWIND] RtlInstallFunctionTableCallback(0x%lx, 0x%lx, 0x%x, %p) -> %lu\n",
-                identifier, base, length, (void *)(uintptr_t)callback, result);
+    if (getenv("BEER_EXCEPTION_DIAGNOSTICS")) {
+        char module_name[256];
+        size_t module_length = 0;
+        if (dll_name) {
+            while (module_length + 1 < sizeof(module_name) && dll_name[module_length]) {
+                u16 character = dll_name[module_length];
+                module_name[module_length++] = character < 0x80 ? (char)character : '?';
+            }
+        }
+        module_name[module_length] = 0;
+        fprintf(stderr,
+                "[UNWIND] RtlInstallFunctionTableCallback(0x%lx, 0x%lx, 0x%x, %p, name=\"%s\") -> %lu\n",
+                identifier, base, length, (void *)(uintptr_t)callback,
+                module_name, result);
+    }
     return result;
 }
 
@@ -3154,6 +3167,27 @@ impl_GetModuleFileNameA(u64 hmod, char *buf, u32 sz)
 
 /* Forward declarations needed by GetProcAddress */
 static ImplFn find_impl(const char *name);  /* defined later */
+
+/* OLE Automation's BSTR entry points have stable public ordinals which are
+ * still used by import libraries and dynamically loaded runtimes. Keep one
+ * canonical mapping for static imports, guest-DLL imports, and GetProcAddress
+ * so all three paths expose the same implemented contract. */
+static const char *oleaut32_ordinal_name(u16 ordinal)
+{
+    static const char *const names[] = {
+        [2] = "SysAllocString", [3] = "SysReAllocString",
+        [4] = "SysAllocStringLen", [5] = "SysReAllocStringLen",
+        [6] = "SysFreeString", [7] = "SysStringLen"
+    };
+    return ordinal < sizeof(names) / sizeof(*names) ? names[ordinal] : NULL;
+}
+
+static ImplFn oleaut32_ordinal_impl(u16 ordinal)
+{
+    const char *name = oleaut32_ordinal_name(ordinal);
+    return name ? find_impl(name) : NULL;
+}
+
 static __thread u32 g_last_error;
 
 /* GetProcAddress – look up in our stub name table, then impl table */
@@ -3234,13 +3268,7 @@ impl_GetProcAddress(u64 hmod, const char *procname)
         for (int i = 0; !address && i < g_fake_dll_count; ++i)
             if (g_fake_dll_cache[i].handle == hmod &&
                 !strcmp(g_fake_dll_cache[i].name, "oleaut32.dll")) {
-                static const char *const bstr_ordinals[] = {
-                    [2] = "SysAllocString", [3] = "SysReAllocString",
-                    [4] = "SysAllocStringLen", [5] = "SysReAllocStringLen",
-                    [6] = "SysFreeString", [7] = "SysStringLen"
-                };
-                if (ordinal < sizeof(bstr_ordinals) / sizeof(*bstr_ordinals))
-                    compat_name = bstr_ordinals[ordinal];
+                compat_name = oleaut32_ordinal_name(ordinal);
                 break;
             }
         if (!address && compat_name) {
@@ -7855,6 +7883,83 @@ impl_SHGetKnownFolderPath(const void *rfid, u32 flags, u64 tok, u64 *out)
 static u64 __attribute__((ms_abi))
 impl_CoTaskMemFree(void *p) { free(p); return 0; }
 
+/* Windows exposes the current explicit AppUserModelID as caller-owned COM
+ * memory. Unpackaged desktop processes have no ID until one is explicitly set.
+ * Keep this process contract separate from the executable path. Returned copies
+ * use the same COM allocator convention as Beer's other Shell/COM strings. */
+static pthread_mutex_t g_app_user_model_id_mutex = PTHREAD_MUTEX_INITIALIZER;
+static u16 *g_app_user_model_id;
+
+static u64 __attribute__((ms_abi))
+impl_SetCurrentProcessExplicitAppUserModelID(const u16 *app_id)
+{
+    enum { E_INVALIDARG = 0x80070057u, E_OUTOFMEMORY = 0x8007000eu };
+    if (!app_id || !app_id[0]) return E_INVALIDARG;
+    size_t length = 0;
+    while (app_id[length]) ++length;
+    if (length > 127) return E_INVALIDARG;
+    u16 *copy = malloc((length + 1) * sizeof(*copy));
+    if (!copy) return E_OUTOFMEMORY;
+    memcpy(copy, app_id, (length + 1) * sizeof(*copy));
+    pthread_mutex_lock(&g_app_user_model_id_mutex);
+    u16 *old = g_app_user_model_id;
+    g_app_user_model_id = copy;
+    pthread_mutex_unlock(&g_app_user_model_id_mutex);
+    free(old);
+    return S_OK;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetCurrentProcessExplicitAppUserModelID(u16 **app_id)
+{
+    enum { E_INVALIDARG = 0x80070057u, E_OUTOFMEMORY = 0x8007000eu,
+           HRESULT_NO_APPLICATION = 0x80073d57u };
+    if (!app_id) return E_INVALIDARG;
+    *app_id = NULL;
+    pthread_mutex_lock(&g_app_user_model_id_mutex);
+    const u16 *current = g_app_user_model_id;
+    size_t length = 0;
+    while (current && current[length]) ++length;
+    u16 *copy = current ? malloc((length + 1) * sizeof(*copy)) : NULL;
+    if (copy) memcpy(copy, current, (length + 1) * sizeof(*copy));
+    pthread_mutex_unlock(&g_app_user_model_id_mutex);
+    if (!current) return HRESULT_NO_APPLICATION;
+    if (!copy) return E_OUTOFMEMORY;
+    *app_id = copy;
+    return S_OK;
+}
+
+/* Get/SetCurrentProcessExplicitAppUserModelID contract checks.  Keep these
+ * beside the implementation so the normal loader build verifies output
+ * clearing, state replacement, copy ownership, and the no-ID HRESULT. */
+static int beer_app_user_model_id_self_test(void)
+{
+    static const u16 first[] = { 'B','e','e','r','.','T','e','s','t',0 };
+    static const u16 second[] = { 'B','e','e','r','.','T','e','s','t','2',0 };
+    u16 *copy = (u16 *)(uintptr_t)1;
+    pthread_mutex_lock(&g_app_user_model_id_mutex);
+    free(g_app_user_model_id);
+    g_app_user_model_id = NULL;
+    pthread_mutex_unlock(&g_app_user_model_id_mutex);
+    if ((u32)impl_GetCurrentProcessExplicitAppUserModelID(&copy) != 0x80073d57u || copy)
+        return 0;
+    if ((u32)impl_GetCurrentProcessExplicitAppUserModelID(NULL) != 0x80070057u)
+        return 0;
+    if (impl_SetCurrentProcessExplicitAppUserModelID(first) != S_OK ||
+        impl_GetCurrentProcessExplicitAppUserModelID(&copy) != S_OK || !copy)
+        return 0;
+    int ok = memcmp(copy, first, sizeof(first)) == 0;
+    copy[0] = 'X';
+    impl_CoTaskMemFree(copy);
+    copy = NULL;
+    if (!ok || impl_SetCurrentProcessExplicitAppUserModelID(second) != S_OK ||
+        impl_GetCurrentProcessExplicitAppUserModelID(&copy) != S_OK || !copy)
+        return 0;
+    ok = memcmp(copy, second, sizeof(second)) == 0;
+    impl_CoTaskMemFree(copy);
+    return ok;
+}
+
 /* ---- COM CoInitialize ---- */
 static u64 __attribute__((ms_abi))
 impl_CoInitialize(u64 reserved) { (void)reserved; return 0; /* S_OK */ }
@@ -7904,12 +8009,19 @@ impl_CoInitializeSecurity(void *security_descriptor, s32 authentication_services
     return atomic_exchange(&initialized, 1) ? UINT64_C(0x80010119) : 0;
 }
 #include "platform/win32_wmi.inc"
+#include "platform/win32_tsf.h"
 static u64 __attribute__((ms_abi))
 impl_CoCreateInstance(const u8 *rclsid, u64 outer, u32 ctx,
                       const u8 *riid, void **ppv)
 {
-    (void)outer;
     if (ppv) *ppv = NULL;
+    u64 tsf_result = E_FAIL;
+    if (beer_tsf_create_instance(rclsid, riid, (void *)(uintptr_t)outer,
+                                 ppv, &tsf_result)) {
+        fprintf(stderr, "[COM] CoCreateInstance TF_ThreadMgr -> %p hr=0x%llx\n",
+                ppv ? *ppv : NULL, (unsigned long long)tsf_result);
+        return tsf_result;
+    }
     if (ppv && beer_wmi_create_instance(rclsid, riid, ppv)) {
         fprintf(stderr, "[COM] CoCreateInstance WbemLocator -> %p\n", *ppv);
         return 0;
@@ -8830,6 +8942,34 @@ typedef struct {
     u64 total_page_file, available_page_file;
     u64 total_virtual, available_virtual, available_extended_virtual;
 } WIN_MEMORYSTATUSEX;
+typedef struct {
+    u8 ac_line_status;
+    u8 battery_flag;
+    u8 battery_life_percent;
+    u8 system_status_flag;
+    u32 battery_life_time;
+    u32 battery_full_life_time;
+} WIN_SYSTEM_POWER_STATUS;
+
+_Static_assert(sizeof(WIN_SYSTEM_POWER_STATUS) == 12,
+               "Win64 SYSTEM_POWER_STATUS layout must be 12 bytes");
+
+static u64 __attribute__((ms_abi))
+impl_GetSystemPowerStatus(WIN_SYSTEM_POWER_STATUS *status)
+{
+    if (!status) { g_last_error = 87; return 0; }
+    /* A desktop with no battery is on AC. Unknown battery fields use the
+     * documented 0xff/0xffffffff sentinels rather than uninitialized bytes. */
+    memset(status, 0, sizeof(*status));
+    status->ac_line_status = 1;
+    status->battery_flag = 0x80; /* BATTERY_FLAG_NO_BATTERY */
+    status->battery_life_percent = 0xff;
+    status->battery_life_time = 0xffffffffu;
+    status->battery_full_life_time = 0xffffffffu;
+    g_last_error = 0;
+    return 1;
+}
+
 static u64 __attribute__((ms_abi)) impl_GlobalMemoryStatusEx(WIN_MEMORYSTATUSEX *status)
 {
     if (!status || status->length != sizeof(*status)) { g_last_error = 87; return 0; }
@@ -10176,6 +10316,65 @@ impl_MapVirtualKeyExW(u32 code, u32 map_type, u64 keyboard_layout)
     return impl_MapVirtualKeyW(code, map_type);
 }
 
+static u64 __attribute__((ms_abi))
+impl_ToUnicodeEx(u32 virtual_key, u32 scan_code, const u8 *keyboard_state,
+                 u16 *buffer, s32 buffer_length, u32 flags,
+                 u64 keyboard_layout)
+{
+    (void)scan_code;
+    (void)flags;
+    (void)keyboard_layout;
+    return (u64)(s64)beer_win32_to_unicode_us(virtual_key, keyboard_state,
+                                               buffer, buffer_length);
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetKeyNameTextW(s32 key_data, u16 *buffer, s32 buffer_length)
+{
+    if (!buffer || buffer_length <= 0) return 0;
+    const u32 scan = ((u32)key_data >> 16) & 0xffu;
+    const u32 extended = ((u32)key_data & 0x01000000u) ? 0xe000u : 0;
+    const u32 virtual_key = scan_code_to_virtual_key(extended | scan);
+    const char *name = NULL;
+    char generated[2] = {0, 0};
+    switch (virtual_key) {
+        case 0x08: name = "Backspace"; break;
+        case 0x09: name = "Tab"; break;
+        case 0x0d: name = "Enter"; break;
+        case 0x10: name = "Shift"; break;
+        case 0x11: case 0xa2: case 0xa3: name = "Ctrl"; break;
+        case 0x12: case 0xa4: case 0xa5: name = "Alt"; break;
+        case 0x14: name = "Caps Lock"; break;
+        case 0x1b: name = "Esc"; break;
+        case 0x20: name = "Space"; break;
+        case 0x21: name = "Page Up"; break;
+        case 0x22: name = "Page Down"; break;
+        case 0x23: name = "End"; break;
+        case 0x24: name = "Home"; break;
+        case 0x25: name = "Left"; break;
+        case 0x26: name = "Up"; break;
+        case 0x27: name = "Right"; break;
+        case 0x28: name = "Down"; break;
+        case 0x2d: name = "Insert"; break;
+        case 0x2e: name = "Delete"; break;
+        default:
+            if ((virtual_key >= 'A' && virtual_key <= 'Z') ||
+                (virtual_key >= '0' && virtual_key <= '9')) {
+                generated[0] = (char)virtual_key;
+                name = generated;
+            }
+            break;
+    }
+    if (!name) return 0;
+    s32 written = 0;
+    while (name[written] && written + 1 < buffer_length) {
+        buffer[written] = (u8)name[written];
+        ++written;
+    }
+    buffer[written] = 0;
+    return (u64)written;
+}
+
 /* ---- FormatMessage (minimal) ---- */
 static u64 __attribute__((ms_abi))
 impl_FormatMessageA(u32 flags, u64 src, u32 msgid, u32 langid,
@@ -10305,6 +10504,16 @@ static u64 __attribute__((ms_abi))
 impl_RegisterClassA(const u8 *window_class) { return register_plain_window_class(window_class, "RegisterClassA"); }
 static u64 __attribute__((ms_abi))
 impl_RegisterClassW(const u8 *window_class) { return register_plain_window_class(window_class, "RegisterClassW"); }
+static u64 __attribute__((ms_abi))
+impl_RegisterWindowMessageA(const char *name)
+{
+    return beer_register_window_message_a(name, &g_last_error);
+}
+static u64 __attribute__((ms_abi))
+impl_RegisterWindowMessageW(const u16 *name)
+{
+    return beer_register_window_message_w(name, &g_last_error);
+}
 static u64 __attribute__((ms_abi))
 impl_GetDesktopWindow(void) { return FAKE_DESKTOP_HWND; }
 static u64 __attribute__((ms_abi))
@@ -11680,22 +11889,44 @@ impl_ResumeThread(u64 h)
 }
 static u64 __attribute__((ms_abi)) impl_SetThreadPriority(u64 h, u32 p)   { (void)h;(void)p; return 1; }
 
+/* Publish a thread's requested Windows exit code before pthread_exit runs the
+ * cleanup handler that marks the object signalled.  Leaving the initial
+ * STILL_ACTIVE value in a completed object makes GetExitCodeThread report an
+ * impossible state and breaks runtimes that reap worker threads by polling. */
+static void thread_set_current_exit_code(u32 code)
+{
+    const u32 tid = (u32)current_windows_thread_id();
+    for (int id = 1; id < g_thread_cnt; ++id) {
+        WinThread *thread = &g_threads[id];
+        if (!thread->used || thread->tid != tid) continue;
+        pthread_mutex_lock(&thread->mtx);
+        thread->exit_code = code;
+        pthread_mutex_unlock(&thread->mtx);
+        return;
+    }
+}
+
 /* ---- Thread exit (must not return) ---- */
 static u64 __attribute__((ms_abi)) impl_ExitThread(u32 code) {
+    thread_set_current_exit_code(code);
     pthread_exit((void*)(uintptr_t)code);
 }
 static u64 __attribute__((ms_abi))
 impl_FreeLibraryAndExitThread(u64 hmod, u32 code)
-    { (void)hmod; pthread_exit((void*)(uintptr_t)code); }
+{
+    (void)hmod;
+    thread_set_current_exit_code(code);
+    pthread_exit((void*)(uintptr_t)code);
+}
 static u64 __attribute__((ms_abi))
 impl_TerminateThread(u64 h, u32 code)
 {
-    (void)code;
     int id = thread_id_from_handle(h);
     if (id < 0) return 0;
     WinThread *t = &g_threads[id];
     pthread_mutex_lock(&t->mtx);
     if (t->started && !t->done) {
+        t->exit_code = code;
         pthread_cancel(t->pt);
         t->done = 1;
         pthread_cond_broadcast(&t->cv);
@@ -13019,6 +13250,8 @@ static int dup_ref_release(u64 handle)
     return consumed;
 }
 
+static void beer_addr_change_forget_handle(u64 handle);
+
 static u64 __attribute__((ms_abi))
 impl_CloseHandle(u64 h)
 {
@@ -13061,6 +13294,7 @@ impl_CloseHandle(u64 h)
 
     int eid = event_id_from_handle(h);
     if (eid >= 0) {
+        beer_addr_change_forget_handle(h);
         if (g_timer_thread_started) beer_timer_forget(h);
         pthread_mutex_lock(&g_event_table_mtx);
         WinEvent *ev = &g_events[eid];
@@ -13108,6 +13342,104 @@ typedef struct {
     };
     u64 hEvent;
 } WIN_OVERLAPPED;
+
+/* ---- IP Helper address-change notifications ---------------------------------------------------------------
+ * NotifyAddrChange is asynchronous when both output parameters are supplied. Beer does not currently monitor host
+ * route changes, but it must not report immediate success with untouched outputs: callers then consume an indeterminate
+ * HANDLE/OVERLAPPED. Keep the request pending until it is cancelled or its handle is closed. */
+typedef struct {
+    WIN_OVERLAPPED *overlapped;
+    u64 handle;
+} BeerAddrChangeNotification;
+
+static BeerAddrChangeNotification g_addr_change_notifications[32];
+static pthread_mutex_t g_addr_change_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int beer_safe_write(void *destination, const void *source, size_t size)
+{
+    if (!destination || !source || !size) return 0;
+    struct iovec local = { (void *)source, size };
+    struct iovec remote = { destination, size };
+    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)size;
+}
+
+static void beer_addr_change_forget_handle(u64 handle)
+{
+    pthread_mutex_lock(&g_addr_change_mutex);
+    for (size_t i = 0; i < sizeof(g_addr_change_notifications) / sizeof(*g_addr_change_notifications); ++i)
+        if (g_addr_change_notifications[i].handle == handle)
+            g_addr_change_notifications[i] = (BeerAddrChangeNotification){0};
+    pthread_mutex_unlock(&g_addr_change_mutex);
+}
+
+static u64 __attribute__((ms_abi))
+impl_NotifyAddrChange(u64 *notification_handle, WIN_OVERLAPPED *overlapped)
+{
+    enum { ERROR_INVALID_PARAMETER = 87, ERROR_NOT_ENOUGH_MEMORY = 8,
+           ERROR_IO_PENDING = 997, STATUS_PENDING = 0x103 };
+    if (!notification_handle || !overlapped) return ERROR_INVALID_PARAMETER;
+
+    const u64 handle = event_alloc(1, 0);
+    if (!handle) return ERROR_NOT_ENOUGH_MEMORY;
+    const u64 pending = STATUS_PENDING, zero = 0;
+    if (!beer_safe_write(notification_handle, &handle, sizeof(handle)) ||
+        !beer_safe_write(&overlapped->Internal, &pending, sizeof(pending)) ||
+        !beer_safe_write(&overlapped->InternalHigh, &zero, sizeof(zero))) {
+        impl_CloseHandle(handle);
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    int stored = 0;
+    pthread_mutex_lock(&g_addr_change_mutex);
+    for (size_t i = 0; i < sizeof(g_addr_change_notifications) / sizeof(*g_addr_change_notifications); ++i) {
+        if (!g_addr_change_notifications[i].overlapped) {
+            g_addr_change_notifications[i] = (BeerAddrChangeNotification){ overlapped, handle };
+            stored = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_addr_change_mutex);
+    if (!stored) {
+        impl_CloseHandle(handle);
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+    return ERROR_IO_PENDING;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CancelIPChangeNotify(WIN_OVERLAPPED *overlapped)
+{
+    enum { ERROR_INVALID_PARAMETER = 87, ERROR_NOT_FOUND = 1168, STATUS_CANCELLED = 0xC0000120u };
+    if (!overlapped) return ERROR_INVALID_PARAMETER;
+    u64 handle = 0;
+    pthread_mutex_lock(&g_addr_change_mutex);
+    for (size_t i = 0; i < sizeof(g_addr_change_notifications) / sizeof(*g_addr_change_notifications); ++i) {
+        if (g_addr_change_notifications[i].overlapped == overlapped) {
+            handle = g_addr_change_notifications[i].handle;
+            g_addr_change_notifications[i] = (BeerAddrChangeNotification){0};
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_addr_change_mutex);
+    if (!handle) return ERROR_NOT_FOUND;
+    const u64 cancelled = STATUS_CANCELLED, zero = 0;
+    (void)beer_safe_write(&overlapped->Internal, &cancelled, sizeof(cancelled));
+    (void)beer_safe_write(&overlapped->InternalHigh, &zero, sizeof(zero));
+    if (overlapped->hEvent) impl_SetEvent(overlapped->hEvent);
+    return 0;
+}
+
+static int beer_notify_addr_change_self_test(void)
+{
+    WIN_OVERLAPPED overlapped = {0};
+    u64 handle = 0;
+    if (impl_NotifyAddrChange(&handle, &overlapped) != 997 || !handle ||
+        overlapped.Internal != 0x103 || overlapped.InternalHigh != 0)
+        return 0;
+    if (impl_CancelIPChangeNotify(&overlapped) != 0 || overlapped.Internal != 0xC0000120u)
+        return 0;
+    return impl_CloseHandle(handle) != 0;
+}
 
 /* ---- Overlapped I/O on named pipes ----
  * A pipe read issued with an OVERLAPPED that finds no data is left pending (ERROR_IO_PENDING) instead of blocking the
@@ -15346,6 +15678,19 @@ static _Atomic(u32) g_xinput_enabled = 1;
 static void __attribute__((ms_abi)) impl_XInputEnable(u32 enabled)
 {
     atomic_store(&g_xinput_enabled, enabled != 0);
+}
+
+/* XInput 1.3 and 1.4 retain the same public ordinals for the core API.
+ * Keep import-time resolution consistent across both module versions. */
+static ImplFn xinput_ordinal_impl(u16 ordinal)
+{
+    switch (ordinal) {
+    case 2: return (ImplFn)impl_XInputGetStateDisconnected;
+    case 3: return (ImplFn)impl_XInputDisconnected;       /* XInputSetState */
+    case 4: return (ImplFn)impl_XInputGetCapabilitiesDisconnected;
+    case 5: return (ImplFn)impl_XInputEnable;
+    default: return NULL;
+    }
 }
 
 static u64 __attribute__((ms_abi))
@@ -20259,6 +20604,15 @@ static u64 __attribute__((ms_abi)) impl_agsDeInit(void *context)
 #define BEER_CALG_SHA1      0x00008004u
 #define BEER_HP_HASHVAL     0x0002u
 #define BEER_HP_HASHSIZE    0x0004u
+#define BEER_PP_ENUMALGS    0x0001u
+#define BEER_PP_NAME        0x0004u
+#define BEER_PP_VERSION     0x0005u
+#define BEER_PP_CONTAINER   0x0006u
+#define BEER_PP_PROVTYPE    0x0010u
+#define BEER_PP_UNIQUE_CONTAINER 0x0024u
+#define BEER_PP_IMPTYPE     0x0003u
+#define BEER_CRYPT_FIRST    0x00000001u
+#define BEER_CRYPT_IMPL_SOFTWARE 0x00000001u
 
 typedef struct BeerCryptHash {
     u64 magic;
@@ -20311,6 +20665,73 @@ impl_CryptGenRandom(u64 provider, u32 length, u8 *buffer)
         if (got <= 0) { g_last_error = (u32)errno; return 0; }
         done += (size_t)got;
     }
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_CryptGetProvParam(u64 provider, u32 parameter, u8 *data,
+                       u32 *data_length, u32 flags)
+{
+    static const char provider_name[] = "Microsoft Enhanced Cryptographic Provider v1.0";
+    static const char container_name[] = "Beer Default Container";
+    if (provider != BEER_CRYPT_PROVIDER || !data_length) {
+        g_last_error = provider == BEER_CRYPT_PROVIDER ? 87u : 6u;
+        return 0;
+    }
+
+    const void *source = NULL;
+    u32 required = 0;
+    u32 scalar = 0;
+    switch (parameter) {
+    case BEER_PP_NAME:
+        source = provider_name;
+        required = (u32)sizeof(provider_name);
+        break;
+    case BEER_PP_CONTAINER:
+    case BEER_PP_UNIQUE_CONTAINER:
+        source = container_name;
+        required = (u32)sizeof(container_name);
+        break;
+    case BEER_PP_VERSION:
+        scalar = 0x0200u;
+        source = &scalar;
+        required = sizeof(scalar);
+        break;
+    case BEER_PP_PROVTYPE:
+        scalar = 1u; /* PROV_RSA_FULL */
+        source = &scalar;
+        required = sizeof(scalar);
+        break;
+    case BEER_PP_IMPTYPE:
+        scalar = BEER_CRYPT_IMPL_SOFTWARE;
+        source = &scalar;
+        required = sizeof(scalar);
+        break;
+    case BEER_PP_ENUMALGS:
+        /* Beer currently exposes hashing and randomness but not a complete
+         * CryptoAPI algorithm-enumeration record. Report an empty enumeration
+         * instead of returning success with untouched output storage. */
+        (void)flags;
+        *data_length = 0;
+        g_last_error = 259; /* ERROR_NO_MORE_ITEMS */
+        return 0;
+    default:
+        g_last_error = 87;
+        return 0;
+    }
+
+    (void)flags;
+    if (!data) {
+        *data_length = required;
+        return 1;
+    }
+    if (*data_length < required) {
+        *data_length = required;
+        g_last_error = 234; /* ERROR_MORE_DATA */
+        return 0;
+    }
+    memcpy(data, source, required);
+    *data_length = required;
     return 1;
 }
 
@@ -20958,6 +21379,8 @@ static ImplEntry g_impls[] = {
     {"WinHttpCheckPlatform",                    (ImplFn)impl_WinHttpCheckPlatform},
     {"GetAdaptersAddresses",                    (ImplFn)impl_GetAdaptersAddresses},
     {"GetAdaptersInfo",                         (ImplFn)impl_GetAdaptersInfo},
+    {"NotifyAddrChange",                        (ImplFn)impl_NotifyAddrChange},
+    {"CancelIPChangeNotify",                    (ImplFn)impl_CancelIPChangeNotify},
     {"D3DKMTOpenAdapterFromLuid",               (ImplFn)impl_D3DKMTOpenAdapterFromLuid},
     {"D3DKMTOpenAdapterFromHdc",                (ImplFn)impl_D3DKMTOpenAdapterFromHdc},
     {"D3DKMTCloseAdapter",                      (ImplFn)impl_D3DKMTCloseAdapter},
@@ -21005,6 +21428,7 @@ static ImplEntry g_impls[] = {
     {"VirtualAlloc",                          (ImplFn)impl_VirtualAlloc},
     {"VirtualAlloc2",                         (ImplFn)impl_VirtualAlloc2},
     {"GetPhysicallyInstalledSystemMemory",    (ImplFn)impl_GetPhysicallyInstalledSystemMemory},
+    {"GetSystemPowerStatus",                  (ImplFn)impl_GetSystemPowerStatus},
     {"VirtualAlloc2FromApp",                  (ImplFn)impl_VirtualAlloc2},
     {"NtAllocateVirtualMemoryEx",             (ImplFn)impl_NtAllocateVirtualMemoryEx},
     {"ZwAllocateVirtualMemoryEx",             (ImplFn)impl_NtAllocateVirtualMemoryEx},
@@ -21102,6 +21526,7 @@ static ImplEntry g_impls[] = {
     {"CryptAcquireContextW",                  (ImplFn)impl_CryptAcquireContextW},
     {"CryptReleaseContext",                   (ImplFn)impl_CryptReleaseContext},
     {"CryptGenRandom",                        (ImplFn)impl_CryptGenRandom},
+    {"CryptGetProvParam",                     (ImplFn)impl_CryptGetProvParam},
     {"CryptCreateHash",                       (ImplFn)impl_CryptCreateHash},
     {"CryptHashData",                         (ImplFn)impl_CryptHashData},
     {"CryptGetHashParam",                     (ImplFn)impl_CryptGetHashParam},
@@ -21266,6 +21691,8 @@ static ImplEntry g_impls[] = {
     {"EnumProcessModules", (ImplFn)beer_K32EnumProcessModules},
     {"K32EnumProcessModulesEx", (ImplFn)beer_K32EnumProcessModulesEx},
     {"EnumProcessModulesEx", (ImplFn)beer_K32EnumProcessModulesEx},
+    {"K32GetModuleInformation", (ImplFn)beer_K32GetModuleInformation},
+    {"GetModuleInformation", (ImplFn)beer_K32GetModuleInformation},
     {"K32GetModuleFileNameExA", (ImplFn)beer_K32GetModuleFileNameExA},
     {"GetModuleFileNameExA", (ImplFn)beer_K32GetModuleFileNameExA},
     {"K32GetModuleFileNameExW", (ImplFn)beer_K32GetModuleFileNameExW},
@@ -21325,7 +21752,9 @@ static ImplEntry g_impls[] = {
     {"ShellExecuteA",                             (ImplFn)impl_ShellExecuteA},
     {"ShellExecuteW",                             (ImplFn)impl_ShellExecuteW},
     {"ShellExecuteExA",                           (ImplFn)impl_ShellExecuteExA},
-    {"CoTaskMemFree",                         (ImplFn)impl_CoTaskMemFree},
+    {"GetCurrentProcessExplicitAppUserModelID",    (ImplFn)impl_GetCurrentProcessExplicitAppUserModelID},
+    {"SetCurrentProcessExplicitAppUserModelID",    (ImplFn)impl_SetCurrentProcessExplicitAppUserModelID},
+    {"CoTaskMemFree",                              (ImplFn)impl_CoTaskMemFree},
     /* COM */
     {"CoInitialize",                          (ImplFn)impl_CoInitialize},
     {"CoInitializeEx",                        (ImplFn)impl_CoInitializeEx},
@@ -21511,6 +21940,8 @@ static ImplEntry g_impls[] = {
     {"MapVirtualKeyW",                        (ImplFn)impl_MapVirtualKeyW},
     {"MapVirtualKeyExA",                      (ImplFn)impl_MapVirtualKeyExW},
     {"MapVirtualKeyExW",                      (ImplFn)impl_MapVirtualKeyExW},
+    {"ToUnicodeEx",                           (ImplFn)impl_ToUnicodeEx},
+    {"GetKeyNameTextW",                       (ImplFn)impl_GetKeyNameTextW},
     /* Format */
     {"FormatMessageA",                        (ImplFn)impl_FormatMessageA},
     {"FormatMessageW",                        (ImplFn)impl_FormatMessageW},
@@ -21519,6 +21950,8 @@ static ImplEntry g_impls[] = {
     {"RegisterClassA",                        (ImplFn)impl_RegisterClassA},
     {"RegisterClassW",                        (ImplFn)impl_RegisterClassW},
     {"RegisterClassExW",                      (ImplFn)impl_RegisterClassExW},
+    {"RegisterWindowMessageA",                (ImplFn)impl_RegisterWindowMessageA},
+    {"RegisterWindowMessageW",                (ImplFn)impl_RegisterWindowMessageW},
     {"RegisterDeviceNotificationA",           (ImplFn)impl_RegisterDeviceNotificationA},
     {"RegisterDeviceNotificationW",           (ImplFn)impl_RegisterDeviceNotificationW},
     {"UnregisterDeviceNotification",          (ImplFn)impl_UnregisterDeviceNotification},
@@ -21653,6 +22086,7 @@ static ImplEntry g_impls[] = {
     {"GetFileSecurityW",                          (ImplFn)impl_GetFileSecurityW},
     {"GetFileSecurityA",                          (ImplFn)impl_GetFileSecurityA},
     {"AccessCheck",                               (ImplFn)impl_AccessCheck},
+    {"PrivilegeCheck",                            (ImplFn)impl_PrivilegeCheck},
     {"MapGenericMask",                            (ImplFn)impl_MapGenericMask},
     {"CreatePipe",                                (ImplFn)impl_CreatePipe},
     {"SetHandleInformation",                      (ImplFn)impl_SetHandleInformation},
@@ -22040,6 +22474,23 @@ static ImplFn find_impl(const char *fn_name)
     return NULL;
 }
 
+static int beer_oleaut32_ordinal_self_test(void)
+{
+    static const struct { u16 ordinal; const char *name; } expected[] = {
+        { 2, "SysAllocString" }, { 3, "SysReAllocString" },
+        { 4, "SysAllocStringLen" }, { 5, "SysReAllocStringLen" },
+        { 6, "SysFreeString" }, { 7, "SysStringLen" }
+    };
+    for (size_t i = 0; i < sizeof(expected) / sizeof(*expected); ++i) {
+        if (!oleaut32_ordinal_name(expected[i].ordinal) ||
+            strcmp(oleaut32_ordinal_name(expected[i].ordinal), expected[i].name) ||
+            oleaut32_ordinal_impl(expected[i].ordinal) != find_impl(expected[i].name))
+            return 0;
+    }
+    return !oleaut32_ordinal_name(1) && !oleaut32_ordinal_name(8) &&
+           !oleaut32_ordinal_impl(1) && !oleaut32_ordinal_impl(8);
+}
+
 /* Build each synthetic module from exports assigned to that module by the guest's import
  * descriptors. Native NT aliases implemented by Beer are additionally owned by ntdll. This keeps
  * the catalog first-party and workload-derived without pretending that every DLL owns every API. */
@@ -22241,6 +22692,16 @@ static void fake_pe_exports_build(void)
         if (fake_pe_native_export_name(name))
             fake_pe_add_export(ntdll, name, capacity);
     }
+
+    /* Stable USER32 contracts must remain visible to direct export-table walkers
+     * even when the current executable did not import them statically. */
+    FakePeModule *user32 = fake_pe_module_from_base(HMOD_USER32);
+    static const char *const user32_stable_exports[] = {
+        "MessageBoxA", "MessageBoxW", "RegisterWindowMessageA", "RegisterWindowMessageW"
+    };
+    for (size_t i = 0; i < sizeof(user32_stable_exports) / sizeof(*user32_stable_exports); ++i)
+        if (find_impl(user32_stable_exports[i]))
+            fake_pe_add_export(user32, user32_stable_exports[i], capacity);
 
     /* The core registry API (api-ms-win-core-registry-l1) is exported by both
      * advapi32 and, since Windows 7, kernel32. Publish Beer's implemented Reg*
@@ -22863,8 +23324,15 @@ static void guest_dll_resolve_imports(GuestDll *dll)
             lowercase_dll_basename(dependency, dependency_lower,
                                    sizeof(dependency_lower));
             if (!implementation && !function &&
+                (!strcmp(dependency_lower, "xinput1_3.dll") ||
+                 !strcmp(dependency_lower, "xinput1_4.dll")))
+                implementation = xinput_ordinal_impl((u16)(ilt[i] & 0xffff));
+            if (!implementation && !function &&
                 !strcmp(dependency_lower, "ws2_32.dll"))
                 implementation = winsock_ordinal_impl((u16)(ilt[i] & 0xffff));
+            if (!implementation && !function &&
+                !strcmp(dependency_lower, "oleaut32.dll"))
+                implementation = oleaut32_ordinal_impl((u16)(ilt[i] & 0xffff));
             int api_set_contract = !strncmp(dependency_lower, "api-ms-", 7) ||
                                    !strncmp(dependency_lower, "ext-ms-", 7);
             /* API-set DLLs are contracts forwarded into the Windows runtime,
@@ -23723,23 +24191,16 @@ static void pe_imports(void)
             /* Use a Beer implementation first, then an export from a loaded
              * bundled PE DLL, otherwise retain the explicit logging stub. */
             ImplFn real = fn_only ? find_impl(fn_only) : NULL;
-            if (!real && import_by_ordinal && !strcasecmp(dll, "xinput1_3.dll")) {
-                u16 ordinal = (u16)(ilt[i] & 0xffff);
-                /* XInput 1.3 exposes state/capability helpers by ordinal.
-                 * Beer has no controller backend yet, so all observed probes
-                 * report ERROR_DEVICE_NOT_CONNECTED instead of false success
-                 * with untouched output structures. */
-                if (ordinal == 2)
-                    real = (ImplFn)impl_XInputGetStateDisconnected;
-                else if (ordinal == 4)
-                    real = (ImplFn)impl_XInputGetCapabilitiesDisconnected;
-                else if (ordinal == 5)
-                    real = (ImplFn)impl_XInputEnable;
-            }
+            if (!real && import_by_ordinal &&
+                (!strcasecmp(dll, "xinput1_3.dll") ||
+                 !strcasecmp(dll, "xinput1_4.dll")))
+                real = xinput_ordinal_impl((u16)(ilt[i] & 0xffff));
             if (!real && import_by_ordinal && !strcasecmp(dll, "comctl32.dll") && (u16)(ilt[i] & 0xffff) == 345)
                 real = (ImplFn)impl_TaskDialogIndirect;
             if (!real && import_by_ordinal && !strcasecmp(dll, "ws2_32.dll"))
                 real = winsock_ordinal_impl((u16)(ilt[i] & 0xffff));
+            if (!real && import_by_ordinal && !strcasecmp(dll, "oleaut32.dll"))
+                real = oleaut32_ordinal_impl((u16)(ilt[i] & 0xffff));
             GuestDll *guest = guest_dll_find(dll);
             char import_lower[64];
             lowercase_dll_basename(dll, import_lower, sizeof(import_lower));
@@ -29636,6 +30097,46 @@ static void prof_start(void)
 
 int main(int argc, char **argv)
 {
+    if (getenv("BEER_SELF_TEST_NVAPI_LOGICAL_GPU")) {
+        int passed = nvapi_logical_gpu_self_test();
+        fprintf(stderr, "NVAPI logical GPU contract: %s\n", passed ? "PASS" : "FAIL");
+        return passed ? 0 : 1;
+    }
+    if (getenv("BEER_SELF_TEST_CRYPT_PROV_PARAM")) {
+        u32 length = 0;
+        u32 value = 0;
+        int passed = impl_CryptGetProvParam(BEER_CRYPT_PROVIDER, BEER_PP_VERSION,
+                                             NULL, &length, 0) == 1 &&
+                     length == sizeof(u32);
+        length = sizeof(value);
+        passed = passed &&
+                 impl_CryptGetProvParam(BEER_CRYPT_PROVIDER, BEER_PP_VERSION,
+                                        (u8 *)&value, &length, 0) == 1 &&
+                 value == 0x0200u && length == sizeof(u32);
+        length = 0;
+        passed = passed &&
+                 impl_CryptGetProvParam(BEER_CRYPT_PROVIDER, BEER_PP_ENUMALGS,
+                                        NULL, &length, BEER_CRYPT_FIRST) == 0 &&
+                 length == 0 && g_last_error == 259u;
+        fprintf(stderr, "CryptGetProvParam contract: %s\n", passed ? "PASS" : "FAIL");
+        return passed ? 0 : 1;
+    }
+    if (getenv("BEER_SELF_TEST_APP_USER_MODEL_ID")) {
+        int passed = beer_app_user_model_id_self_test();
+        fprintf(stderr, "AppUserModelID contract: %s\n", passed ? "PASS" : "FAIL");
+        return passed ? 0 : 1;
+    }
+    if (getenv("BEER_SELF_TEST_NOTIFY_ADDR_CHANGE")) {
+        int passed = beer_notify_addr_change_self_test();
+        fprintf(stderr, "NotifyAddrChange contract: %s\n", passed ? "PASS" : "FAIL");
+        return passed ? 0 : 1;
+    }
+    if (getenv("BEER_SELF_TEST_OLEAUT32_ORDINALS")) {
+        int passed = beer_oleaut32_ordinal_self_test();
+        fprintf(stderr, "OLEAUT32 ordinal contract: %s\n", passed ? "PASS" : "FAIL");
+        return passed ? 0 : 1;
+    }
+
     /* Graphics drivers back device memory allocations with file descriptors (NVIDIA: one or more per
      * vkAllocateMemory), and Windows has no comparable per-process handle limit.  Desktop sessions usually start
      * programs with a soft limit of 1024, which RDR2 exhausts during start-up: vkAllocateMemory then reports
