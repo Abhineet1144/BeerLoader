@@ -136,6 +136,31 @@ static int __attribute__((ms_abi)) nvapi_GPU_GetBusId(u64 handle, u32 *bus)
     return NVAPI_OK;
 }
 
+/* NvAPI_GPU_GetArchInfo: NV_GPU_ARCH_INFO { version, architecture, implementation, revision } (16 bytes, v1/v2).
+ * Engines pick render paths, or refuse the GPU, by architecture; it follows from the PCI device id range of each
+ * generation. */
+static int __attribute__((ms_abi)) nvapi_GPU_GetArchInfo(u64 handle, u32 *info)
+{
+    if (handle != NVAPI_GPU_HANDLE) return NVAPI_INVALID_HANDLE;
+    if (!info) return NVAPI_INVALID_ARGUMENT;
+    if ((info[0] & 0xffff) != 16 || (info[0] >> 16) < 1 || (info[0] >> 16) > 2) return -9;   /* INCOMPATIBLE_STRUCT_VERSION */
+    BeerHostGpuInfo gpu;
+    if (!nvapi_gpu(&gpu)) return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+    const u32 id = gpu.device_id;
+    u32 arch, impl = 0;
+    if (id >= 0x2900) { arch = 0x1b0; impl = id >= 0x2f00 ? 7 : id >= 0x2d00 ? 6 : id >= 0x2c00 ? 5 : 2; }  /* Blackwell */
+    else if (id >= 0x2600) { arch = 0x190; impl = id >= 0x28a0 ? 7 : id >= 0x2800 ? 6 : id >= 0x2780 ? 4 : id >= 0x2700 ? 3 : 2; }  /* Ada */
+    else if (id >= 0x2200) { arch = 0x170; impl = id >= 0x25a0 ? 7 : id >= 0x2500 ? 6 : id >= 0x2400 ? 4 : id >= 0x2200 && id < 0x2300 ? 2 : 0; }  /* Ampere */
+    else if (id >= 0x1e00) { arch = 0x160; impl = id >= 0x2180 ? 8 : id >= 0x1f80 ? 7 : id >= 0x1f00 ? 6 : id >= 0x1e80 ? 4 : 2; }  /* Turing */
+    else if (id >= 0x1db0 && id < 0x1dc0) { arch = 0x140; }                                                           /* Volta */
+    else if (id >= 0x15f0) { arch = 0x130; impl = id >= 0x1d00 ? 8 : id >= 0x1c80 ? 7 : id >= 0x1c00 ? 6 : id >= 0x1b80 ? 4 : 2; }  /* Pascal */
+    else { arch = 0x120; }                                                                                             /* Maxwell */
+    info[1] = arch;
+    info[2] = impl;
+    info[3] = gpu.revision ? gpu.revision : 0xa1;
+    return NVAPI_OK;
+}
+
 static int __attribute__((ms_abi)) nvapi_EnumNvidiaDisplayHandle(u32 index, u64 *handle)
 {
     if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
@@ -162,6 +187,7 @@ static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
         { 0xBAAABFCCu, nvapi_GPU_GetSystemType },
         { 0x1BE0B8E5u, nvapi_GPU_GetBusId },
         { 0x9ABDD40Du, nvapi_EnumNvidiaDisplayHandle },
+        { 0xD8265D24u, nvapi_GPU_GetArchInfo },
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(*table); ++i)
         if (table[i].id == id) return table[i].fn;

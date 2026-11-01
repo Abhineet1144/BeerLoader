@@ -702,8 +702,25 @@ static void beer_log_guest_stack(const char *tag)
     __asm__ volatile("mov %%fs:g_saved_guest_rsp@tpoff, %0" : "=r"(rsp));
     if (!rsp) return;
     fprintf(stderr, "[%s] guest stack:\n", tag);
-    for (int i = 0; i < 96; ++i) {
-        u64 value = ((const u64 *)rsp)[i];
+    /* BEER_GUEST_STACK_WORDS: scan deeper (an engine's error routine can have a frame of 100+ KiB). Read through
+     * process_vm_readv so the scan stops at the top of the stack instead of faulting. */
+    int words = 96;
+    if (getenv("BEER_GUEST_STACK_WORDS")) words = atoi(getenv("BEER_GUEST_STACK_WORDS"));
+    if (words < 1) words = 1;
+    if (words > 1 << 20) words = 1 << 20;
+    u64 *stack_copy = calloc((size_t)words, sizeof(u64));
+    if (!stack_copy) return;
+    int readable = 0;
+    for (int i = 0; i < words; i += 512) {
+        const int chunk = words - i < 512 ? words - i : 512;
+        struct iovec local = { stack_copy + i, (size_t)chunk * 8 }, remote = { (void *)(uintptr_t)(rsp + (u64)i * 8), (size_t)chunk * 8 };
+        const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        if (got <= 0) break;
+        readable = i + (int)(got / 8);
+        if (got != (ssize_t)chunk * 8) break;
+    }
+    for (int i = 0; i < readable; ++i) {
+        u64 value = stack_copy[i];
         if (value <= 0x10000000ULL || value >= 0x7fffffffffffULL) continue;
         if (value >= (u64)(uintptr_t)g_img &&
             value < (u64)(uintptr_t)g_img + g_img_size) {
@@ -852,6 +869,7 @@ static void beer_log_guest_stack(const char *tag)
                         (unsigned long long)value);
         }
     }
+    free(stack_copy);
 }
 static u64 beer_message_box_result(u32 type)
 {

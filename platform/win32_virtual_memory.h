@@ -45,4 +45,12 @@ int beer_is_bad_string_ptr_a(const char *string, size_t maximum);
 int beer_is_bad_string_ptr_w(const uint16_t *string, size_t maximum);
 void beer_virtual_memory_reset(void);
 
+/* Windows-style bottom-up placement for guest memory: the lowest free range in [64 KiB, 4 GiB), aligned to
+ * `alignment` (at least the 64 KiB allocation granularity), mapped with MAP_FIXED_NOREPLACE so host mappings are
+ * never replaced. Returns MAP_FAILED when the low range is full (callers then place memory as before).
+ * beer_vm_unmap_bottom_up releases a range obtained here (or ignores any other range after unmapping it). */
+void *beer_vm_map_bottom_up(size_t size, size_t alignment, int protection, int extra_flags);
+void beer_vm_unmap_bottom_up(void *base, size_t size);
+int beer_vm_bottom_up_enabled(void);
+
 #endif

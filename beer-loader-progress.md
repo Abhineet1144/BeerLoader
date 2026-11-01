@@ -1,5 +1,7 @@
 # Beer Loader — Active Development Context
 
+RE9 path: /mnt/wwn-0x5000c500c67d4454-part1/Games/Resident Evil Requiem/re9.exe
+
 ## Status 2026-11-01: PRAGMATA and RE4 both stop only at RE Engine's GPU check (Intel UHD 770)
 
 - **PRAGMATA:** unchanged. It shows the TaskDialog "RE ENGINE - Aborted: Unsupported graphics card" after
@@ -2187,3 +2189,99 @@ second) and `BEER_BD11_STATS=1` (now also barriers/render passes per frame and d
   - RE4 reaches its GPU check.
   - PRAGMATA again reaches "Unsupported graphics card" (parked until the NVIDIA GPU returns).
   - RDR2 was not tested: it is not installed on this machine.
+
+### RE9 (Resident Evil Requiem): "Unsupported graphics card" fixed; anti-tamper layout sensitivity remains (2026-10-31)
+
+**The GPU check.** The capability function at exe 0x141a75000–0x141a78300 queries ~30 D3D12 features, then aborts with
+message 0x5182 ("Unsupported graphics card") when `D3D12_OPTIONS11.AtomicInt64OnDescriptorHeapResourceSupported` is
+FALSE (it reads `CheckFeatureSupport(40)` into r15b, exe 0x141a7715d–0x141a771d6). An RTX 2070 supports this; BD12
+just never enabled or reported it. Generic changes, all derived from the Vulkan device:
+
+- **Vulkan device:**
+  - 64-bit atomics enabled: `shaderBufferInt64Atomics` and `shaderSharedInt64Atomics`.
+  - Native 16-bit enabled: `shaderFloat16` plus 16-bit storage access.
+- **CheckFeatureSupport** now reports real values instead of zeros:
+  - OPTIONS: resource binding tier 3 with descriptor indexing, typed UAV loads, fp64, logic op, heap tier 2.
+  - OPTIONS1: WaveOps and Int64 ops.
+  - OPTIONS4: Native16Bit.
+  - OPTIONS9 / OPTIONS11: 64-bit atomics.
+  - Shader model: up to 6.6 when dxil-spirv loads (5.1 otherwise).
+  - Root signature: up to 1.2.
+  - Queue priority.
+- **Bugs fixed:**
+  - ARCHITECTURE reported the GPU as cache-coherent UMA (a stray 0xb000).
+- **ID3D12Device:**
+  - Device3–9 are exposed regardless of ray tracing.
+  - Device8's RESOURCE_DESC1 methods forward to the existing code.
+  - Device4's `GetResourceAllocationInfo1` is implemented.
+  - Bug fixed: `iid_device4` had one wrong byte, so Device4 never matched.
+- **DXGI:**
+  - Factory2–7 with a real `CreateSwapChainForHwnd` (DESC1 → DESC). Slot 15 used to be a no-op returning S_OK.
+  - `IDXGIAdapter4` (GetDesc3).
+  - `IDXGIOutput1`–`6`: GetDesc1 describes an SDR sRGB output. RE9 queried Output6 without checking the HRESULT and
+    crashed on the NULL result.
+- **System queries:**
+  - `D3DKMTOpenAdapterFromLuid`/`FromHdc`/`CloseAdapter`/`QueryAdapterInfo` (platform/win32_d3dkmt.inc): WDDM 2.7,
+    UMD/KMD driver version, adapter type, segment sizes. These used to be the generic stub "succeeding" with zeros.
+  - DXGI `CheckInterfaceSupport` now uses the same driver version (NVIDIA 595.91 → 32.0.15.9591).
+  - `NvAPI_GPU_GetArchInfo` (0xD8265D24), with the architecture taken from the PCI id range.
+  - `GetAdaptersInfo`, from the first active host interface (real MAC). The stub's success-without-data made RE9's
+    start-up crash or hang.
+- **ntdll:**
+  - `Nt*`/`Zw*` exports now carry the complete 32-byte Windows stub. The `syscall` instruction is served by Syscall
+    User Dispatch.
+  - Context-switching services (NtContinue, NtRaiseException, NtCallbackReturn, NtTestAlert) keep the direct jump.
+  - RE9's protection validated these bytes and fell back to service number -1 for all 42 of its direct syscalls.
+  - `BEER_SHORT_NT_STUBS=1` restores the old stubs.
+- **Diagnostics:**
+  - `BEER_GUEST_STACK_WORDS=<n>` deepens the guest stack scan printed at TaskDialog / FatalAppExit. RE Engine's error
+    routine has a 150 KiB frame; 40000 reaches its caller.
+  - Refused `ID3D12Device` QueryInterface IIDs are logged.
+
+**Remaining blocker: the anti-tamper depends on memory layout.**
+- TLS callback[2] (exe RVA 0x16f21780) ends in a computed `ret` to 0. The result depends only on where the main
+  guest stack sits:
+  - 0x1000000 and 0x10000000 pass.
+  - 0x1800000, 0x80000000, 0xa000000000 and the fixed (ASLR off) 0x7fffef5ff000 fail.
+  - With `BEER_ASLR=1`, about half of runs pass.
+  - Since main2's ASLR-off re-exec (for RDR2), RE9 therefore fails every run by default.
+- Past the GPU check, protection code at exe 0x15c3d8096 reads `hi32(host pointer) | 0x078c5ee0`. It combines two
+  allocations that it assumes share a 4 GiB window; Linux's top-down mmap breaks that.
+- Both point to the same root cause: Beer's guest address space doesn't look like Windows' bottom-up, compact
+  allocation (low thread stacks, VirtualAlloc regions clustered together).
+- The proper fix is a Windows-like address-space allocator for guest stacks and `VirtualAlloc`. That is a separate
+  project, and it affects every game.
+- An experiment that only moved stacks below 4 GiB was not enough (thread stacks below the main stack made callback[2]
+  fail again), so it was reverted.
+- Tools:
+  - scratchpad `re9try.sh` retries with `BEER_ASLR=1` until the callback passes.
+  - `BEER_EXCEPTION_DIAGNOSTICS=1` shows the SEH walk.
+
+### Windows-style address space and other generic fixes (RE9Compat, 2026-11-01)
+
+- **Bottom-up guest memory (platform/win32_virtual_memory.c):**
+  - `VirtualAlloc`/`VirtualAlloc2`/`NtAllocateVirtualMemory` without an address now place regions like Windows:
+    lowest free range in [64 KiB, 4 GiB), first fit, 64 KiB granularity, mapped with `MAP_FIXED_NOREPLACE`.
+  - Host mappings found in the way are remembered and skipped. Freed ranges are reused.
+  - `MEM_TOP_DOWN` keeps top-down placement. When the low range is full, allocation falls back to the old placement.
+  - The main guest stack and every `CreateThread` stack also come from this range, sized like Windows: the larger
+    of the image's SizeOfStackReserve and the requested size, plus a guard page. Stacks are released at join.
+  - `BEER_TOPDOWN_VM=1` restores the old layout.
+  - Why it matters:
+    - Images without `DYNAMIC_BASE` get deterministic low allocations on Windows, and code can keep their pointers
+      in 32 bits.
+    - With this change, RE9's start-up TLS callback passes on every run, including the default ASLR-off layout
+      (it used to fail every run).
+- **Complete Windows 10 19045 (22H2) system-service table** (473 services, from j00ru/windows-syscalls). Every Nt/Zw
+  stub now carries the real number instead of an invented 0x8xx one.
+- **Real thread affinity:**
+  - `NtSetInformationThread(ThreadAffinityMask)`, `SetThreadAffinityMask` (returns the previous mask) and
+    `SetThreadGroupAffinity` call `pthread_setaffinity_np`.
+  - Windows processor N maps to host CPU N.
+  - All three used to be ignored.
+- **`BEER_CRASH_MAPS=<file>`** copies /proc/self/maps at a fatal fault.
+- **RE9 status:** stopped. The installed copy is a cracked package. Its crack module (voices38.v38, preferred base
+  0x3b400000; next to it, steam_api64.v38 is the original Steam library set aside) rewrites game code at run time,
+  and the rewritten code faults (exe 0x15cca29a8). Making that module work would mean debugging DRM-bypass logic,
+  which is outside this project's policy. The generic fixes above stand on their own; RE9 needs testing with a
+  legitimate copy.

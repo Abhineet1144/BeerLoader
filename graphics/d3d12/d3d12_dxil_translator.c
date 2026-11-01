@@ -380,6 +380,14 @@ static void add_bool_option(dxil_spv_converter c, dxil_spv_option type, int enab
     g.converter_add_option(c, &opt.base);
 }
 
+int beer_d3d12_dxil_available(void)
+{
+    pthread_mutex_lock(&g_lock);
+    const int ok = load_library();
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
 int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
                               uint32_t stage_namespace,
                               BeerD3D12TranslatedShader *out)

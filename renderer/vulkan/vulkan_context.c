@@ -458,15 +458,23 @@ int beer_vulkan_context_initialize(void)
     }
     const int core13 = (application.apiVersion >= VK_API_VERSION_1_3 &&
                         physical_properties.apiVersion >= VK_API_VERSION_1_3);
+    VkPhysicalDeviceVulkan11Features v11_supported = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES
+    };
     VkPhysicalDeviceVulkan12Features v12_supported = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &v11_supported
     };
     VkPhysicalDeviceVulkan13Features v13_supported = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
         .pNext = &v12_supported
     };
+    VkPhysicalDeviceVulkan11Features v11_enabled = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES
+    };
     VkPhysicalDeviceVulkan12Features v12_enabled = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &v11_enabled
     };
     VkPhysicalDeviceVulkan13Features v13_enabled = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -559,12 +567,21 @@ int beer_vulkan_context_initialize(void)
             s12->shaderUniformTexelBufferArrayNonUniformIndexing;
         v12_enabled.shaderStorageTexelBufferArrayNonUniformIndexing =
             s12->shaderStorageTexelBufferArrayNonUniformIndexing;
+        /* Native 16-bit shader operations (D3D12 Native16BitShaderOpsSupported): DXIL with 16-bit types is
+         * translated to Float16/Int16 arithmetic and 16-bit buffer loads/stores. */
+        v12_enabled.shaderFloat16 = s12->shaderFloat16;
+        /* 64-bit atomics on buffers and group-shared memory (D3D12 AtomicInt64OnDescriptorHeapResource /
+         * AtomicInt64OnGroupShared); RE Engine titles refuse GPUs without them. */
+        v12_enabled.shaderBufferInt64Atomics = s12->shaderBufferInt64Atomics;
+        v12_enabled.shaderSharedInt64Atomics = s12->shaderSharedInt64Atomics;
+        v11_enabled.storageBuffer16BitAccess = v11_supported.storageBuffer16BitAccess;
+        v11_enabled.uniformAndStorageBuffer16BitAccess = v11_supported.uniformAndStorageBuffer16BitAccess;
         v13_enabled.synchronization2 = s13->synchronization2;
         v13_enabled.dynamicRendering = s13->dynamicRendering;
         v13_enabled.maintenance4 = s13->maintenance4;
         v13_enabled.shaderDemoteToHelperInvocation =
             s13->shaderDemoteToHelperInvocation;
-        v12_enabled.pNext = feature_chain;
+        v11_enabled.pNext = feature_chain;
         feature_chain = &v13_enabled;
         g_context.timeline_semaphore = v12_enabled.timelineSemaphore;
         g_context.modern.api_version = physical_properties.apiVersion;
@@ -624,6 +641,10 @@ int beer_vulkan_context_initialize(void)
     g_context.enabled_features.pipelineStatisticsQuery =
         supported.pipelineStatisticsQuery;
     g_context.enabled_features.shaderInt16 = supported.shaderInt16;
+    g_context.modern.native_16bit = core13 && v12_enabled.shaderFloat16 && supported.shaderInt16 &&
+        v11_enabled.storageBuffer16BitAccess && v11_enabled.uniformAndStorageBuffer16BitAccess;
+    g_context.modern.buffer_int64_atomics = core13 && supported.shaderInt64 && v12_enabled.shaderBufferInt64Atomics;
+    g_context.modern.shared_int64_atomics = core13 && supported.shaderInt64 && v12_enabled.shaderSharedInt64Atomics;
     g_context.enabled_features.shaderInt64 = supported.shaderInt64;
     g_context.enabled_features.shaderFloat64 = supported.shaderFloat64;
     /* Features a D3D12-on-Vulkan core needs for full pipeline-state coverage;

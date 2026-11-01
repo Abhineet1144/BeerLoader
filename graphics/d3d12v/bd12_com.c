@@ -7,6 +7,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include "bd12_formats.h"
+#include "d3d12_dxil_translator.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,9 +30,13 @@ static const uint8_t iid_device2[16] = IID(0x1e, 0xa4, 0xba, 0x30, 0x5b, 0xb1,
 static const uint8_t iid_device3[16] = IID(0x15, 0xdc, 0xda, 0x81, 0xad, 0x2b,
     0x92, 0x43, 0x93, 0xc5, 0x10, 0x13, 0x45, 0xc4, 0xaa, 0x98);
 static const uint8_t iid_device4[16] = IID(0x17, 0xdf, 0x65, 0xe8, 0xee, 0xa9,
-    0xf6, 0x46, 0xa4, 0x63, 0x30, 0x98, 0x31, 0x5a, 0xa2, 0xe5);
+    0xf9, 0x46, 0xa4, 0x63, 0x30, 0x98, 0x31, 0x5a, 0xa2, 0xe5);
 static const uint8_t iid_device5[16] = IID(0x3b, 0x17, 0x4f, 0x8b, 0xea, 0x2f,
     0x80, 0x4b, 0x8f, 0x58, 0x43, 0x07, 0x19, 0x1a, 0xb9, 0x5d);
+static const uint8_t iid_device6[16] = IID(0x1b, 0x22, 0x0b, 0xc7, 0xe4, 0x40, 0x17, 0x4a, 0x89, 0xaf, 0x02, 0x5a, 0x07, 0x27, 0xa6, 0xdc);
+static const uint8_t iid_device7[16] = IID(0x53, 0x4b, 0x01, 0x5c, 0xa1, 0x68, 0x9b, 0x4b, 0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b);
+static const uint8_t iid_device8[16] = IID(0xbb, 0xe6, 0x18, 0x92, 0x44, 0xf9, 0x7e, 0x4f, 0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3);
+static const uint8_t iid_device9[16] = IID(0x62, 0xe9, 0x80, 0x4c, 0x32, 0xf0, 0x60, 0x4f, 0xbc, 0x9e, 0xeb, 0xc2, 0xcf, 0xa1, 0xd8, 0x3c);
 static const uint8_t iid_device_downlevel[16] = IID(0x3f, 0xee, 0xea, 0x74,
     0x4b, 0x2f, 0x6d, 0x47, 0x82, 0xba, 0x2b, 0x85, 0xcb, 0x49, 0xe3, 0x10);
 static const uint8_t iid_queue[16] = IID(0xa6, 0x70, 0xc8, 0x0e, 0x7e, 0x5d,
@@ -1180,11 +1185,18 @@ static HR MS dev_query(ComDevice *self, const uint8_t *riid, void **out)
                   !com_iid_equal(riid, iid_device1) &&
                   !com_iid_equal(riid, iid_device2) &&
                   !com_iid_equal(riid, iid_device_downlevel) &&
-                  !(self->bd->rt_enabled &&
-                    (com_iid_equal(riid, iid_device3) ||
-                     com_iid_equal(riid, iid_device4) ||
-                     com_iid_equal(riid, iid_device5)))))
+                  /* Device3-9: the ray tracing entry points check rt_enabled themselves; Device8's RESOURCE_DESC1
+                   * methods are what current engines create every resource with. */
+                  !com_iid_equal(riid, iid_device3) && !com_iid_equal(riid, iid_device4) &&
+                  !com_iid_equal(riid, iid_device5) && !com_iid_equal(riid, iid_device6) &&
+                  !com_iid_equal(riid, iid_device7) && !com_iid_equal(riid, iid_device8) &&
+                  !com_iid_equal(riid, iid_device9))) {
+        static unsigned logged;
+        if (riid && logged++ < 32)
+            fprintf(stderr, "[BD12] ID3D12Device::QueryInterface %02x%02x%02x%02x-%02x%02x-%02x%02x-... -> E_NOINTERFACE\n",
+                    riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6]);
         return HR_E_NOINTERFACE;
+    }
     com_add_ref(&self->obj);
     *out = self;
     return HR_OK;
@@ -1253,14 +1265,61 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
     (void)self;
     if (!data || !size) return HR_E_INVALIDARG;
     { static unsigned seen_mask; if (feature < 32 && !(seen_mask & (1u << feature))) { seen_mask |= 1u << feature; fprintf(stderr, "[BD12] CheckFeatureSupport feature=%u size=%u\n", feature, size); } }
-    if (feature == 0 && size >= 60 && !getenv("BEER_DXR_FEATURES")) {
+    /* The answers describe what BD12 really does on this Vulkan device. A driver never reports shader model 0,
+     * resource binding tier 0 or root signature version 0; games read those as an unsupported GPU. */
+    const VkPhysicalDeviceFeatures *vk_features = beer_vulkan_enabled_features();
+    const int dxil = beer_d3d12_dxil_available();      /* shader model 6 shaders translate through dxil-spirv */
+    const int bindless = self->bd->modern && self->bd->modern->descriptor_indexing;
+    if (feature == 0 && size >= 60 && !getenv("BEER_DXR_FEATURES")) {   /* OPTIONS */
+        uint32_t *f = data;
         memset(data, 0, size);
+        f[0] = vk_features && vk_features->shaderFloat64;          /* DoublePrecisionFloatShaderOps */
+        f[1] = vk_features && vk_features->logicOp;                /* OutputMergerLogicOp */
+        f[4] = bindless ? 3 : 1;                                   /* ResourceBindingTier: heap-indexed tables */
+        f[6] = vk_features && vk_features->shaderStorageImageReadWithoutFormat;   /* TypedUAVLoadAdditionalFormats */
+        f[9] = 40;                                                 /* MaxGPUVirtualAddressBitsPerResource */
+        f[14] = 2;                                                 /* ResourceHeapTier: buffers and textures mix */
         return HR_OK;
     }
-    if (feature == 1 && size >= 16) {
-        uint32_t *fields = data;
-        fields[3] = 0xb000;
-        if (size >= 24) fields[4] = 0xb000;
+    if ((feature == 1 && size >= 16) || (feature == 16 && size >= 20)) {   /* ARCHITECTURE(1): a discrete GPU */
+        uint32_t *f = data;
+        f[1] = f[2] = f[3] = 0;                                    /* not tile-based, not UMA */
+        if (feature == 16) f[4] = 1;                               /* IsolatedMMU */
+        return HR_OK;
+    }
+    if (feature == 7 && size >= 4 && !getenv("BEER_DXR_PROBE_SM")) {   /* SHADER_MODEL: highest supported <= asked */
+        uint32_t *f = data;
+        const uint32_t highest = dxil ? 0x66 : 0x51;
+        if (f[0] > highest) f[0] = highest;
+        return HR_OK;
+    }
+    if (feature == 12 && size >= 4 && !getenv("BEER_DXR_FEATURES")) {   /* ROOT_SIGNATURE: 1.0, 1.1 and 1.2 parse */
+        uint32_t *f = data;
+        if (f[0] > 3) f[0] = 3;
+        if (!f[0]) return HR_E_INVALIDARG;
+        return HR_OK;
+    }
+    if (feature == 23 && size >= 12 && !(self->bd->rt_enabled && getenv("BEER_DXR_FEATURES"))) {   /* OPTIONS4 */
+        uint32_t *f = data;
+        memset(data, 0, size);
+        f[2] = dxil && self->bd->modern && self->bd->modern->native_16bit;   /* Native16BitShaderOpsSupported */
+        return HR_OK;
+    }
+    if (feature == 37 && size >= 24) {                             /* OPTIONS9 */
+        uint32_t *f = data;
+        memset(data, 0, size);
+        f[3] = dxil && self->bd->modern && self->bd->modern->shared_int64_atomics;   /* AtomicInt64OnGroupShared */
+        return HR_OK;
+    }
+    if (feature == 40 && size >= 4) {                              /* OPTIONS11 */
+        uint32_t *f = data;
+        memset(data, 0, size);
+        f[0] = dxil && self->bd->modern && self->bd->modern->buffer_int64_atomics;   /* AtomicInt64OnDescriptorHeapResource */
+        return HR_OK;
+    }
+    if (feature == 20 && size >= 12) {                             /* COMMAND_QUEUE_PRIORITY: normal and high */
+        uint32_t *f = data;
+        f[2] = f[1] == 0 || f[1] == 100;
         return HR_OK;
     }
     /* BEER_DXR_PROBE=1: advertise DXR 1.1 and shader model 6.6 and log what the
@@ -1298,11 +1357,14 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
         }
     }
     if (feature == 8 && size >= 24) {
-        /* OPTIONS1. Wave intrinsics are not translated, so WaveOps stays FALSE, but every device has a
-         * native wave width and callers divide by it. Vulkan does not expose the processor-wide lane
-         * total, so TotalLaneCount reports the one certain value, a single wave's maximum width. */
+        /* OPTIONS1. Wave intrinsics exist only in shader model 6, where dxil-spirv maps them to subgroup
+         * operations. Vulkan does not expose the processor-wide lane total, so TotalLaneCount reports the
+         * one certain value, a single wave's maximum width. */
         uint32_t *f = data;
         memset(data, 0, size);
+        f[0] = dxil;                                               /* WaveOps */
+        f[4] = 1;                                                  /* ExpandedComputeResourceStates */
+        f[5] = vk_features && vk_features->shaderInt64;            /* Int64ShaderOps */
         f[1] = self->bd->wave_lane_min;
         f[2] = self->bd->wave_lane_max;
         f[3] = self->bd->wave_lane_max;
@@ -1357,7 +1419,7 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
             return HR_OK;
         }
         return HR_E_INVALIDARG;
-    case 7: case 8: case 12: case 18: case 19:
+    case 7: case 12: case 18: case 19:
     case 21: case 23: case 27: case 30: case 32:
         memset(data, 0, size);
         return HR_OK;
@@ -2228,7 +2290,7 @@ static HR MS dev_create_heap1(ComDevice *self, const uint8_t *desc,
 static void MS dev_rt_prebuild(ComDevice *self, const void *inputs, uint64_t *info)
 {
     uint64_t sizes[3] = { 0, 0, 0 };
-    bd12_rt_prebuild(self->bd, inputs, sizes);
+    if (self->bd->rt_enabled) bd12_rt_prebuild(self->bd, inputs, sizes);
     memcpy(info, sizes, sizeof(sizes));
 }
 static uint32_t MS dev_check_matching_identifier(void) { return 0; /* compatible */ }
@@ -2265,7 +2327,60 @@ static HR MS dev_enumerate_meta_commands(ComDevice *self, uint32_t *count, void 
 }
 static HR MS dev_meta_command_invalid(void) { return HR_E_INVALIDARG; }
 
-static void *device_vtable[65] = {
+/* GetResourceAllocationInfo1 (RESOURCE_DESC, 56 bytes) / 2 (RESOURCE_DESC1, 64 bytes: the same fields plus the
+ * sampler feedback mip region): the combined allocation, and each resource's offset in it when asked. */
+static void *dev_allocation_info_strided(ComDevice *self, uint64_t *result, uint32_t mask, uint32_t count,
+                                         const uint8_t *descs, size_t stride, uint64_t *info1)
+{
+    uint64_t total = 0, max_align = 65536;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t one[2];
+        dev_get_allocation_info(self, one, mask, 1, descs + (size_t)i * stride);
+        const uint64_t offset = align_up(total, one[1]);
+        if (info1) { info1[i * 3] = offset; info1[i * 3 + 1] = one[1]; info1[i * 3 + 2] = one[0]; }
+        total = offset + one[0];
+        if (one[1] > max_align) max_align = one[1];
+    }
+    result[0] = align_up(total, max_align);
+    result[1] = max_align;
+    return result;
+}
+static void *MS dev_get_allocation_info1(ComDevice *self, uint64_t *result, uint32_t mask, uint32_t count,
+                                         const uint8_t *descs, uint64_t *info1)
+{ return dev_allocation_info_strided(self, result, mask, count, descs, 56, info1); }
+static void *MS dev_get_allocation_info2(ComDevice *self, uint64_t *result, uint32_t mask, uint32_t count,
+                                         const uint8_t *descs, uint64_t *info1)
+{ return dev_allocation_info_strided(self, result, mask, count, descs, 64, info1); }
+
+/* Device6: background shader optimisation has nothing to schedule. */
+static HR MS dev_set_background_processing(ComDevice *self, uint32_t mode, uint32_t action, uint64_t event,
+                                          int32_t *further)
+{ (void)self; (void)mode; (void)action; (void)event; if (further) *further = 0; return HR_OK; }
+
+/* Device8: RESOURCE_DESC1 variants of committed/placed resources and footprints. */
+static HR MS dev_create_committed2(ComDevice *self, const uint8_t *props, uint32_t flags, const uint8_t *desc1,
+                                   uint32_t state, const void *clear, const void *session, const uint8_t *riid,
+                                   void **out)
+{ return dev_create_committed1(self, props, flags, desc1, state, clear, session, riid, out); }
+static HR MS dev_create_placed1(ComDevice *self, ComHeap *heap, uint64_t offset, const uint8_t *desc1,
+                                uint32_t state, const void *clear, const uint8_t *riid, void **out)
+{ return dev_create_placed(self, heap, offset, desc1, state, clear, riid, out); }
+static void MS dev_get_footprints1(ComDevice *self, const uint8_t *desc1, uint32_t first, uint32_t count,
+                                   uint64_t base, uint8_t *layouts, uint32_t *rows, uint64_t *row_sizes,
+                                   uint64_t *total)
+{ dev_get_footprints(self, desc1, first, count, base, layouts, rows, row_sizes, total); }
+static void MS dev_create_feedback_uav(void) {}
+
+/* Device9: queues ignore the creator id; driver shader caches are not offered (as on drivers without them). */
+static HR MS dev_create_queue1(ComDevice *self, const uint32_t *desc, const uint8_t *creator, const uint8_t *riid,
+                               void **out)
+{ (void)creator; return dev_create_queue(self, desc, riid, out); }
+static HR MS dev_create_shader_cache_session(ComDevice *self, const void *desc, const uint8_t *riid, void **out)
+{ (void)self; (void)desc; (void)riid; if (out) *out = NULL; return 0x887a0004u; /* DXGI_ERROR_UNSUPPORTED */ }
+static HR MS dev_shader_cache_control(ComDevice *self, uint32_t kinds, uint32_t control)
+{ (void)self; (void)kinds; (void)control; return 0x887a0004u; }
+
+static void *device_vtable[76] = {
     [0] = dev_query, [1] = dev_add_ref, [2] = dev_release,
     [3] = com_obj_get_private, [4] = com_obj_set_private, [5] = com_obj_set_private_iface,
     [6] = com_obj_set_name, [7] = dev_node_count, [8] = dev_create_queue,
@@ -2288,11 +2403,16 @@ static void *device_vtable[65] = {
     /* Device3 */ [48] = obj_notimpl, [49] = obj_notimpl, [50] = obj_ok,
     /* Device4 */ [51] = dev_create_list1, [52] = obj_notimpl,
     [53] = dev_create_committed1, [54] = dev_create_heap1,
-    [55] = obj_notimpl, [56] = obj_notimpl,
+    [55] = obj_notimpl, [56] = dev_get_allocation_info1,
     /* Device5 */ [57] = obj_notimpl, [58] = dev_remove_device,
     [59] = dev_enumerate_meta_commands, [60] = dev_meta_command_invalid, [61] = dev_meta_command_invalid,
     [62] = dev_create_state_object, [63] = dev_rt_prebuild,
     [64] = dev_check_matching_identifier,
+    /* Device6 */ [65] = dev_set_background_processing,
+    /* Device7 */ [66] = obj_notimpl, [67] = obj_notimpl,
+    /* Device8 */ [68] = dev_get_allocation_info2, [69] = dev_create_committed2, [70] = dev_create_placed1,
+    [71] = dev_create_feedback_uav, [72] = dev_get_footprints1,
+    /* Device9 */ [73] = dev_create_shader_cache_session, [74] = dev_shader_cache_control, [75] = dev_create_queue1,
 };
 
 

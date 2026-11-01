@@ -4,12 +4,132 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 #define BEER_VM_CAPACITY 16384u
+
+/* ---- Bottom-up placement ------------------------------------------------------------------------------------
+ * Windows places VirtualAlloc regions, heaps and thread stacks bottom-up: the lowest free range that fits, from
+ * 64 KiB upward (randomised only for ASLR-enabled images, and still low). Linux mmap is top-down from 0x7fff...,
+ * so guest pointers had all 47 bits set. Code written against Windows can depend on the difference: RE9's
+ * protection (an image without DYNAMIC_BASE) keeps pointers to its own allocations in 32 bits and rebuilt them
+ * with the high half of an unrelated address. Ranges handed out here, and host mappings found in the way, are
+ * kept in a sorted list so a search does not probe them again. BEER_TOPDOWN_VM=1 disables the placement. */
+#define BOTTOM_UP_LOW  UINT64_C(0x10000)
+#define BOTTOM_UP_HIGH UINT64_C(0x100000000)
+
+typedef struct { uintptr_t start, end; int foreign; } BottomUpRange;
+static BottomUpRange *g_ranges;
+static size_t g_range_count, g_range_capacity;
+static pthread_mutex_t g_range_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int beer_vm_bottom_up_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *off = getenv("BEER_TOPDOWN_VM");
+        enabled = !(off && *off && strcmp(off, "0"));
+    }
+    return enabled;
+}
+
+static void range_insert_locked(uintptr_t start, uintptr_t end, int foreign)
+{
+    if (g_range_count == g_range_capacity) {
+        size_t capacity = g_range_capacity ? g_range_capacity * 2 : 256;
+        BottomUpRange *grown = realloc(g_ranges, capacity * sizeof(*grown));
+        if (!grown) return;
+        g_ranges = grown;
+        g_range_capacity = capacity;
+    }
+    size_t at = 0;
+    while (at < g_range_count && g_ranges[at].start < start) ++at;
+    memmove(g_ranges + at + 1, g_ranges + at, (g_range_count - at) * sizeof(*g_ranges));
+    g_ranges[at] = (BottomUpRange){ start, end, foreign };
+    ++g_range_count;
+}
+
+/* End of the host mapping that overlaps [start, end), from /proc/self/maps (0 if none). */
+static uintptr_t host_mapping_end(uintptr_t start, uintptr_t end)
+{
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[512];
+    uintptr_t found = 0;
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long a, b;
+        if (sscanf(line, "%lx-%lx", &a, &b) != 2) continue;
+        if (a >= end) break;
+        if (b > start) { found = b; break; }
+    }
+    fclose(maps);
+    return found;
+}
+
+void *beer_vm_map_bottom_up(size_t size, size_t alignment, int protection, int extra_flags)
+{
+#ifdef MAP_FIXED_NOREPLACE
+    if (!beer_vm_bottom_up_enabled() || !size) return MAP_FAILED;
+    if (alignment < 65536) alignment = 65536;
+    size = (size + 0xffff) & ~(size_t)0xffff;
+    pthread_mutex_lock(&g_range_mutex);
+    uintptr_t candidate = BOTTOM_UP_LOW;
+    void *result = MAP_FAILED;
+    for (int attempts = 0; attempts < 4096; ++attempts) {
+        candidate = (candidate + alignment - 1) & ~(uintptr_t)(alignment - 1);
+        /* Skip known ranges that overlap the candidate (the list is sorted by start). */
+        int moved = 1;
+        while (moved) {
+            moved = 0;
+            for (size_t i = 0; i < g_range_count; ++i) {
+                if (g_ranges[i].start >= candidate + size) break;
+                if (g_ranges[i].end > candidate) {
+                    candidate = (g_ranges[i].end + alignment - 1) & ~(uintptr_t)(alignment - 1);
+                    moved = 1;
+                }
+            }
+        }
+        if (candidate + size > BOTTOM_UP_HIGH || candidate + size < candidate) break;
+        void *mapped = mmap((void *)candidate, size, protection,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | extra_flags, -1, 0);
+        if (mapped == (void *)candidate) {
+            range_insert_locked(candidate, candidate + size, 0);
+            result = mapped;
+            break;
+        }
+        if (mapped != MAP_FAILED) munmap(mapped, size);          /* a kernel that treated the address as a hint */
+        else if (errno != EEXIST) break;
+        /* A host mapping is in the way: remember it and continue after it. */
+        uintptr_t host_end = host_mapping_end(candidate, candidate + size);
+        if (!host_end) host_end = candidate + 65536;
+        range_insert_locked(candidate, host_end, 1);
+        candidate = host_end;
+    }
+    pthread_mutex_unlock(&g_range_mutex);
+    return result;
+#else
+    (void)size; (void)alignment; (void)protection; (void)extra_flags;
+    return MAP_FAILED;
+#endif
+}
+
+void beer_vm_unmap_bottom_up(void *base, size_t size)
+{
+    const uintptr_t start = (uintptr_t)base;
+    pthread_mutex_lock(&g_range_mutex);
+    for (size_t i = 0; i < g_range_count; ++i)
+        if (g_ranges[i].start == start && !g_ranges[i].foreign) {
+            memmove(g_ranges + i, g_ranges + i + 1, (g_range_count - i - 1) * sizeof(*g_ranges));
+            --g_range_count;
+            break;
+        }
+    pthread_mutex_unlock(&g_range_mutex);
+    munmap(base, size);
+}
 
 /* IsBadStringPtr is an obsolete snapshot probe, not a lifetime guarantee.
  * Read through the kernel rather than dereferencing guest memory or borrowing
@@ -179,6 +299,14 @@ static void *virtual_alloc_aligned(void *address, size_t size, uint32_t allocati
         if (!region) { errno = ENOMEM; return NULL; }
         size_t span = region + granularity;
         if (span < region) { errno = ENOMEM; return NULL; }
+        /* Bottom-up like Windows, unless the caller asked for MEM_TOP_DOWN. */
+        void *low = (allocation_type & UINT32_C(0x00100000)) ? MAP_FAILED
+                  : beer_vm_map_bottom_up(region, granularity, host_protection, 0);
+        if (low != MAP_FAILED) {
+            mapped = low;
+            mapped_size = region;
+            goto mapped_done;
+        }
         void *raw = mmap(NULL, span, host_protection, flags, -1, 0);
         if (raw == MAP_FAILED) return NULL;
         uintptr_t base = ((uintptr_t)raw + granularity - 1) & ~(uintptr_t)(granularity - 1);
@@ -190,6 +318,7 @@ static void *virtual_alloc_aligned(void *address, size_t size, uint32_t allocati
     } else {
         mapped = mmap((void *)requested, mapped_size, host_protection, flags, -1, 0);
     }
+mapped_done:
     if (mapped == MAP_FAILED) return NULL;
 #ifndef MAP_FIXED_NOREPLACE
     if (address && mapped != (void *)requested) {
@@ -247,7 +376,8 @@ int beer_virtual_free(void *address, size_t size, uint32_t free_type)
         g_beer_vm_live_bytes -= allocation_size;
         memset(allocation, 0, sizeof(*allocation));
         pthread_mutex_unlock(&g_allocation_mutex);
-        return munmap(base, allocation_size) == 0;
+        beer_vm_unmap_bottom_up(base, allocation_size);
+        return 1;
     }
     if (free_type == BEER_MEM_DECOMMIT && size) {
         size_t page = page_size();

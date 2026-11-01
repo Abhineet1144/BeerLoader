@@ -65,6 +65,9 @@ typedef struct {
     int host_query_reset;
     int maintenance4;
     int demote_to_helper;
+    int native_16bit;          /* shaderFloat16, shaderInt16 and 16-bit storage buffer access */
+    int buffer_int64_atomics;  /* shaderInt64 + shaderBufferInt64Atomics */
+    int shared_int64_atomics;  /* shaderInt64 + shaderSharedInt64Atomics */
     VkDeviceSize uniform_texel_buffer_offset_alignment;
     VkDeviceSize storage_texel_buffer_offset_alignment;
     int uniform_texel_buffer_offset_single_texel;

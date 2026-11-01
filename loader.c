@@ -4458,6 +4458,68 @@ impl_AppPolicyGetThreadInitializationType(u64 process_token, int32_t *initializa
 }
 static u64 __attribute__((ms_abi)) impl_WinHttpCheckPlatform(void) { return 1; }
 
+/* GetAdaptersInfo: the first active, non-loopback host interface as one IP_ADAPTER_INFO (704 bytes on x64). A stub
+ * returning ERROR_SUCCESS without writing the list left callers reading an uninitialised adapter (RE9's start-up
+ * crashed or hung on it); games and protections use the adapter's MAC address as a machine identifier. */
+static void beer_ip_string(char out[16], const struct sockaddr *address)
+{
+    out[0] = 0;
+    if (address && address->sa_family == AF_INET)
+        inet_ntop(AF_INET, &((const struct sockaddr_in *)address)->sin_addr, out, 16);
+    if (!out[0]) snprintf(out, 16, "0.0.0.0");
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetAdaptersInfo(u8 *info, u32 *size)
+{
+    enum { ADAPTER_INFO_SIZE = 704 };
+    if (!size) return 87;                                  /* ERROR_INVALID_PARAMETER */
+    struct ifaddrs *interfaces = NULL;
+    if (getifaddrs(&interfaces) != 0) return 232;          /* ERROR_NO_DATA */
+    struct ifaddrs *link = NULL, *ipv4 = NULL;
+    for (struct ifaddrs *e = interfaces; e; e = e->ifa_next)
+        if (e->ifa_name && e->ifa_addr && !(e->ifa_flags & IFF_LOOPBACK) && (e->ifa_flags & IFF_UP) &&
+            e->ifa_addr->sa_family == AF_PACKET) { link = e; break; }
+    for (struct ifaddrs *e = interfaces; link && e; e = e->ifa_next)
+        if (e->ifa_name && e->ifa_addr && !strcmp(e->ifa_name, link->ifa_name) && e->ifa_addr->sa_family == AF_INET) {
+            ipv4 = e;
+            break;
+        }
+    if (!link) { freeifaddrs(interfaces); return 232; }
+    if (!info || *size < ADAPTER_INFO_SIZE) {
+        *size = ADAPTER_INFO_SIZE;
+        freeifaddrs(interfaces);
+        return 111;                                        /* ERROR_BUFFER_OVERFLOW */
+    }
+    memset(info, 0, ADAPTER_INFO_SIZE);
+    const struct sockaddr_ll *ll = (const struct sockaddr_ll *)link->ifa_addr;
+    const u32 mac_length = ll->sll_halen > 8 ? 8 : ll->sll_halen;
+    u8 mac[8] = {0};
+    memcpy(mac, ll->sll_addr, mac_length);
+    const u32 index = if_nametoindex(link->ifa_name);
+    *(u32 *)(info + 8) = index;                                            /* ComboIndex */
+    snprintf((char *)info + 12, 260, "{%02X%02X%02X%02X-%02X%02X-4000-8000-%02X%02X%02X%02X%02X%02X}",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    snprintf((char *)info + 272, 132, "%s", !strncmp(link->ifa_name, "wl", 2) ? "Wireless Network Adapter"
+                                                                               : "Ethernet Adapter");
+    *(u32 *)(info + 404) = mac_length;                                     /* AddressLength */
+    memcpy(info + 408, mac, 8);                                            /* Address */
+    *(u32 *)(info + 416) = index;                                          /* Index */
+    *(u32 *)(info + 420) = !strncmp(link->ifa_name, "wl", 2) ? 71 : 6;     /* IEEE80211 / ETHERNET_CSMACD */
+    *(u32 *)(info + 424) = 1;                                              /* DhcpEnabled */
+    /* IP_ADDR_STRING lists: { Next, IpAddress[16], IpMask[16], Context } at 440, 488, 536, 592, 640. */
+    beer_ip_string((char *)info + 448, ipv4 ? ipv4->ifa_addr : NULL);
+    beer_ip_string((char *)info + 464, ipv4 ? ipv4->ifa_netmask : NULL);
+    *(u64 *)(info + 432) = (u64)(uintptr_t)(info + 440);                   /* CurrentIpAddress */
+    for (int list = 0; list < 4; ++list) {
+        static const u32 offsets[4] = { 488, 536, 592, 640 };
+        snprintf((char *)info + offsets[list] + 8, 16, "0.0.0.0");
+        snprintf((char *)info + offsets[list] + 24, 16, "0.0.0.0");
+    }
+    freeifaddrs(interfaces);
+    return 0;
+}
+
 /* GetAdaptersAddresses returns one self-contained Windows x64 record for the
  * first active, non-loopback host interface. The old 96-byte prefix claimed
  * Length=96 and omitted the unicast list, MTU, type and operational status;
@@ -6544,6 +6606,30 @@ static const u8 k_iid_idxgi_factory[16] = {
     0xec,0x66,0x71,0x7b,0xc7,0x21,0xae,0x44,
     0xb2,0x1a,0xc9,0xae,0x32,0x1a,0xe3,0x69
 };
+static const u8 k_iid_idxgi_factory2[16] = {  /* 50C83A1C-E072-4C48-87B0-3630FA36A6D0 */
+    0x1c,0x3a,0xc8,0x50,0x72,0xe0,0x48,0x4c,0x87,0xb0,0x36,0x30,0xfa,0x36,0xa6,0xd0 };
+static const u8 k_iid_idxgi_factory3[16] = {  /* 25483823-CD46-4C7D-86CA-47AA95B837BD */
+    0x23,0x38,0x48,0x25,0x46,0xcd,0x7d,0x4c,0x86,0xca,0x47,0xaa,0x95,0xb8,0x37,0xbd };
+static const u8 k_iid_idxgi_factory4[16] = {  /* 1BC6EA02-EF36-464F-BF0C-21CA39E5168A */
+    0x02,0xea,0xc6,0x1b,0x36,0xef,0x4f,0x46,0xbf,0x0c,0x21,0xca,0x39,0xe5,0x16,0x8a };
+static const u8 k_iid_idxgi_factory5[16] = {  /* 7632E1F5-EE65-4DCA-87FD-84CD75F8838D */
+    0xf5,0xe1,0x32,0x76,0x65,0xee,0xca,0x4d,0x87,0xfd,0x84,0xcd,0x75,0xf8,0x83,0x8d };
+static const u8 k_iid_idxgi_factory6[16] = {  /* C1B6694F-FF09-44A9-B03C-77900A0A1D17 */
+    0x4f,0x69,0xb6,0xc1,0x09,0xff,0xa9,0x44,0xb0,0x3c,0x77,0x90,0x0a,0x0a,0x1d,0x17 };
+static const u8 k_iid_idxgi_factory7[16] = {  /* A4966EED-76DB-44DA-84C1-EE9A7AFB20A8 */
+    0xed,0x6e,0x96,0xa4,0xdb,0x76,0xda,0x44,0x84,0xc1,0xee,0x9a,0x7a,0xfb,0x20,0xa8 };
+static const u8 k_iid_idxgi_output1[16] = {  /* 00CDDEA8-939B-4B83-A340-A685226666CC */
+    0xa8,0xde,0xcd,0x00,0x9b,0x93,0x83,0x4b,0xa3,0x40,0xa6,0x85,0x22,0x66,0x66,0xcc };
+static const u8 k_iid_idxgi_output2[16] = {  /* 595E39D1-2724-4663-99B1-DA969DE28364 */
+    0xd1,0x39,0x5e,0x59,0x24,0x27,0x63,0x46,0x99,0xb1,0xda,0x96,0x9d,0xe2,0x83,0x64 };
+static const u8 k_iid_idxgi_output3[16] = {  /* 8A6BB301-7E7E-41F4-A8E0-5B32F7F99B18 */
+    0x01,0xb3,0x6b,0x8a,0x7e,0x7e,0xf4,0x41,0xa8,0xe0,0x5b,0x32,0xf7,0xf9,0x9b,0x18 };
+static const u8 k_iid_idxgi_output4[16] = {  /* DC7DCA35-2196-414D-9F53-617884032A60 */
+    0x35,0xca,0x7d,0xdc,0x96,0x21,0x4d,0x41,0x9f,0x53,0x61,0x78,0x84,0x03,0x2a,0x60 };
+static const u8 k_iid_idxgi_output5[16] = {  /* 80A07424-AB52-42EB-833C-0C42FD282D98 */
+    0x24,0x74,0xa0,0x80,0x52,0xab,0xeb,0x42,0x83,0x3c,0x0c,0x42,0xfd,0x28,0x2d,0x98 };
+static const u8 k_iid_idxgi_output6[16] = {  /* 068346E8-AAEC-4B84-ADD7-137F513F77A1 */
+    0xe8,0x46,0x83,0x06,0xec,0xaa,0x84,0x4b,0xad,0xd7,0x13,0x7f,0x51,0x3f,0x77,0xa1 };
 static const u8 k_iid_idxgi_factory1[16] = {
     0x78,0xae,0x0a,0x77,0x6f,0xf2,0xba,0x4d,
     0xa8,0x29,0x25,0x3c,0x83,0xd1,0xb3,0x87
@@ -6560,6 +6646,9 @@ static const u8 k_iid_idxgi_adapter2[16] = {  /* 0AA1AE0A-FA0E-4B84-8644-E05FF8E
     0x0a,0xae,0xa1,0x0a,0x0e,0xfa,0x84,0x4b,
     0x86,0x44,0xe0,0x5f,0xf8,0xe5,0xac,0xb5
 };
+static const u8 k_iid_idxgi_adapter4[16] = {  /* 3C8D99D1-4FBF-4181-A82C-AF66BF7BD24E */
+    0xd1,0x99,0x8d,0x3c,0xbf,0x4f,0x81,0x41,
+    0xa8,0x2c,0xaf,0x66,0xbf,0x7b,0xd2,0x4e };
 static const u8 k_iid_idxgi_adapter3[16] = {  /* 645967A4-1392-4310-A798-8053CE3E93FD */
     0xa4,0x67,0x59,0x64,0x92,0x13,0x10,0x43,
     0xa7,0x98,0x80,0x53,0xce,0x3e,0x93,0xfd
@@ -6576,7 +6665,10 @@ dxgi_factory_QueryInterface(u64 *obj, const u8 *riid, void **pp)
     *pp = NULL;
     if (!dxgi_iid_equal(riid, k_iid_iunknown) &&
         !dxgi_iid_equal(riid, k_iid_idxgi_factory) &&
-        !dxgi_iid_equal(riid, k_iid_idxgi_factory1))
+        !dxgi_iid_equal(riid, k_iid_idxgi_factory1) &&
+        !dxgi_iid_equal(riid, k_iid_idxgi_factory2) && !dxgi_iid_equal(riid, k_iid_idxgi_factory3) &&
+        !dxgi_iid_equal(riid, k_iid_idxgi_factory4) && !dxgi_iid_equal(riid, k_iid_idxgi_factory5) &&
+        !dxgi_iid_equal(riid, k_iid_idxgi_factory6) && !dxgi_iid_equal(riid, k_iid_idxgi_factory7))
         {
             if (getenv("BEER_COM_DIAGNOSTICS") && riid) fprintf(stderr, "[DXGI QI] %s refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n", "dxgi_factory_QueryInterface", riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6], riid[8], riid[9], riid[10], riid[11], riid[12], riid[13], riid[14], riid[15]); 
             return E_NOINTERFACE;
@@ -6595,7 +6687,8 @@ dxgi_adapter_QueryInterface(u64 *obj, const u8 *riid, void **pp)
         !dxgi_iid_equal(riid, k_iid_idxgi_adapter) &&
         !dxgi_iid_equal(riid, k_iid_idxgi_adapter1) &&
         !dxgi_iid_equal(riid, k_iid_idxgi_adapter2) &&
-        !dxgi_iid_equal(riid, k_iid_idxgi_adapter3))
+        !dxgi_iid_equal(riid, k_iid_idxgi_adapter3) &&
+        !dxgi_iid_equal(riid, k_iid_idxgi_adapter4))
         {
             if (getenv("BEER_COM_DIAGNOSTICS") && riid) fprintf(stderr, "[DXGI QI] %s refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n", "dxgi_adapter_QueryInterface", riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6], riid[8], riid[9], riid[10], riid[11], riid[12], riid[13], riid[14], riid[15]); 
             return E_NOINTERFACE;
@@ -6611,7 +6704,10 @@ dxgi_output_QueryInterface(u64 *obj, const u8 *riid, void **pp)
     if (!pp) return (u64)0x80070057;
     *pp = NULL;
     if (!dxgi_iid_equal(riid, k_iid_iunknown) &&
-        !dxgi_iid_equal(riid, k_iid_idxgi_output))
+        !dxgi_iid_equal(riid, k_iid_idxgi_output) &&
+        !dxgi_iid_equal(riid, k_iid_idxgi_output1) && !dxgi_iid_equal(riid, k_iid_idxgi_output2) &&
+        !dxgi_iid_equal(riid, k_iid_idxgi_output3) && !dxgi_iid_equal(riid, k_iid_idxgi_output4) &&
+        !dxgi_iid_equal(riid, k_iid_idxgi_output5) && !dxgi_iid_equal(riid, k_iid_idxgi_output6))
         {
             if (getenv("BEER_COM_DIAGNOSTICS") && riid) fprintf(stderr, "[DXGI QI] %s refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n", "dxgi_output_QueryInterface", riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6], riid[8], riid[9], riid[10], riid[11], riid[12], riid[13], riid[14], riid[15]); 
             return E_NOINTERFACE;
@@ -8054,6 +8150,50 @@ dxgi_CreateSwapChain(u64 *obj, u64 *device, u64 *desc, u64 **ppSwap)
     return S_OK;
 }
 
+/* IDXGIFactory2::CreateSwapChainForHwnd(device, hwnd, DXGI_SWAP_CHAIN_DESC1 *, DXGI_SWAP_CHAIN_FULLSCREEN_DESC *,
+ * output, swapchain): the same swap chain as CreateSwapChain, from the equivalent DXGI_SWAP_CHAIN_DESC. Factory2-7
+ * are what current engines ask for (adapter by LUID or GPU preference, the tearing check); without them a game
+ * can refuse the GPU. */
+static u64 __attribute__((ms_abi))
+dxgi_CreateSwapChainForHwnd(u64 *obj, u64 *device, u64 hwnd, const u8 *desc1, const u8 *fullscreen, u64 output,
+                            u64 **ppSwap)
+{
+    (void)output;
+    if (!ppSwap) return (u64)0x80070057;
+    *ppSwap = NULL;
+    if (!desc1) return (u64)0x80070057;
+    u8 desc[72];
+    memset(desc, 0, sizeof(desc));
+    memcpy(desc + 0, desc1 + 0, 4);                        /* Width */
+    memcpy(desc + 4, desc1 + 4, 4);                        /* Height */
+    if (fullscreen) {
+        memcpy(desc + 8, fullscreen + 0, 8);               /* RefreshRate */
+        memcpy(desc + 20, fullscreen + 8, 4);              /* ScanlineOrdering */
+        memcpy(desc + 24, fullscreen + 12, 4);             /* Scaling */
+    }
+    memcpy(desc + 16, desc1 + 8, 4);                       /* Format */
+    memcpy(desc + 28, desc1 + 16, 8);                      /* SampleDesc */
+    memcpy(desc + 36, desc1 + 24, 4);                      /* BufferUsage */
+    memcpy(desc + 40, desc1 + 28, 4);                      /* BufferCount */
+    memcpy(desc + 48, &hwnd, 8);                           /* OutputWindow */
+    const u32 windowed = fullscreen ? *(const u32 *)(fullscreen + 16) : 1;
+    memcpy(desc + 56, &windowed, 4);                       /* Windowed */
+    memcpy(desc + 60, desc1 + 36, 4);                      /* SwapEffect */
+    memcpy(desc + 64, desc1 + 44, 4);                      /* Flags */
+    return dxgi_CreateSwapChain(obj, device, (u64 *)desc, ppSwap);
+}
+
+/* Factory2 entry points without a Beer counterpart: core windows and composition swap chains do not exist
+ * outside UWP/DirectComposition, so they report DXGI_ERROR_UNSUPPORTED; the stereo/occlusion/adapter-change
+ * registrations are accepted with a zero cookie (no such events ever fire). */
+static u64 __attribute__((ms_abi)) dxgi_factory_unsupported(void) { return 0x887a0004u; }
+static u64 __attribute__((ms_abi)) dxgi_factory_register3(u64 *obj, u64 a, u64 b, u32 *cookie)
+    { (void)obj; (void)a; (void)b; if (cookie) *cookie = 0; return S_OK; }
+static u64 __attribute__((ms_abi)) dxgi_factory_register2(u64 *obj, u64 a, u32 *cookie)
+    { (void)obj; (void)a; if (cookie) *cookie = 0; return S_OK; }
+static u64 __attribute__((ms_abi)) dxgi_factory_unregister(u64 *obj, u32 cookie) { (void)obj; (void)cookie; return 0; }
+static u64 __attribute__((ms_abi)) dxgi_factory_zero(u64 *obj) { (void)obj; return 0; }
+
 /* IDXGISwapChain::Present — composite any pending MF NV12 frame, then S_OK */
 static u64 __attribute__((ms_abi))
 dxgi_Present(u64 *obj, u32 sync, u32 flags)
@@ -8367,6 +8507,59 @@ dxgi_output_FindClosestMatchingMode(u64 *obj, const u8 *requested, u8 *closest, 
     return S_OK;
 }
 
+/* IDXGIOutput1-6. Engines ask for IDXGIOutput6 (GetDesc1: colour space and luminance for HDR decisions) and use
+ * the result without checking the HRESULT; refusing it crashed RE9 right after device creation. The output is an
+ * 8-bit sRGB (SDR) display without overlays or desktop duplication. MODE_DESC1 = MODE_DESC (28 bytes) + Stereo. */
+static u64 __attribute__((ms_abi))
+dxgi_output_GetDisplayModeList1(u64 *obj, u32 format, u32 flags, u32 *count, u8 *modes1)
+{
+    if (!count) return E_FAIL;
+    if (!modes1) return dxgi_output_GetDisplayModeList(obj, format, flags, count, NULL);
+    u8 modes[64 * 28];
+    u32 n = *count < 64 ? *count : 64;
+    u64 hr = dxgi_output_GetDisplayModeList(obj, format, flags, &n, modes);
+    if (hr != S_OK && hr != 0x887a0003u) return hr;               /* S_OK or DXGI_ERROR_MORE_DATA */
+    for (u32 i = 0; i < n; ++i) {
+        memcpy(modes1 + i * 32, modes + i * 28, 28);
+        *(u32 *)(modes1 + i * 32 + 28) = 0;                        /* Stereo */
+    }
+    *count = n;
+    return hr;
+}
+static u64 __attribute__((ms_abi))
+dxgi_output_FindClosestMatchingMode1(u64 *obj, const u8 *requested1, u8 *closest1, u64 *device)
+{
+    if (!requested1 || !closest1) return E_FAIL;
+    u8 closest[28];
+    u64 hr = dxgi_output_FindClosestMatchingMode(obj, requested1, closest, device);
+    if (hr == S_OK) { memcpy(closest1, closest, 28); *(u32 *)(closest1 + 28) = 0; }
+    return hr;
+}
+static u64 __attribute__((ms_abi)) dxgi_output_unsupported(void) { return 0x887a0004u; }   /* DXGI_ERROR_UNSUPPORTED */
+static u64 __attribute__((ms_abi)) dxgi_output_false(u64 *obj) { (void)obj; return 0; }
+static u64 __attribute__((ms_abi)) dxgi_output_overlay_support(u64 *obj, u32 format, u64 device, u32 *flags)
+    { (void)obj; (void)format; (void)device; if (!flags) return 0x80070057u; *flags = 0; return S_OK; }
+static u64 __attribute__((ms_abi)) dxgi_output_overlay_cs_support(u64 *obj, u32 format, u32 cs, u64 device, u32 *flags)
+    { (void)obj; (void)format; (void)cs; (void)device; if (!flags) return 0x80070057u; *flags = 0; return S_OK; }
+static u64 __attribute__((ms_abi)) dxgi_output_composition_support(u64 *obj, u32 *flags)
+    { (void)obj; if (!flags) return 0x80070057u; *flags = 0; return S_OK; }
+/* DXGI_OUTPUT_DESC1: OUTPUT_DESC (96 bytes) + BitsPerColor, ColorSpace, primaries, white point, luminance. */
+static u64 __attribute__((ms_abi))
+dxgi_output_GetDesc1(u64 *obj, u8 *desc)
+{
+    if (!desc) return 0x80070057u;
+    memset(desc, 0, 152);
+    u64 hr = dxgi_output_GetDesc(obj, desc);
+    if (hr != S_OK) return hr;
+    *(u32 *)(desc + 84) = 1;                                       /* DXGI_MODE_ROTATION_IDENTITY */
+    *(u32 *)(desc + 96) = 8;                                       /* BitsPerColor */
+    *(u32 *)(desc + 100) = 0;                                      /* DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 */
+    const float primaries[11] = { 0.640f, 0.330f, 0.300f, 0.600f, 0.150f, 0.060f, 0.3127f, 0.3290f,
+                                  0.5f, 270.0f, 270.0f };          /* sRGB/D65, min/max/full-frame nits */
+    memcpy(desc + 104, primaries, sizeof(primaries));
+    return S_OK;
+}
+
 static u64 __attribute__((ms_abi))
 dxgi_output_WaitForVBlank(u64 *obj)
 {
@@ -8376,14 +8569,14 @@ dxgi_output_WaitForVBlank(u64 *obj)
     return S_OK;
 }
 
-/* IDXGIAdapter::CheckInterfaceSupport: report a user-mode-driver version (product.version.sub.build
- * packed as four 16-bit fields, 32.0.15.7200 = NVIDIA 572.00) for any device interface, so titles that
- * gate on a minimum driver version see a plausible modern driver. */
+/* IDXGIAdapter::CheckInterfaceSupport: report the user-mode-driver version (product.version.sub.build
+ * packed as four 16-bit fields) for any device interface, the same one D3DKMT reports. */
+static u64 beer_umd_driver_version(void);
 static u64 __attribute__((ms_abi))
 dxgi_adapter_CheckInterfaceSupport(u64 *obj, const void *guid, u64 *umd_version)
 {
     (void)obj; (void)guid;
-    if (umd_version) *umd_version = ((u64)32 << 48) | ((u64)15 << 16) | 7200u;
+    if (umd_version) *umd_version = beer_umd_driver_version();
     return S_OK;
 }
 
@@ -8405,6 +8598,7 @@ static void init_dxgi_adapter_fake(void) {
     g_dxgi_vtab2[15] = (u64)dxgi_adapter_SetVideoMemoryReservation;
     g_dxgi_vtab2[16] = (u64)dxgi_adapter_RegisterVideoMemoryBudgetChangeNotificationEvent;
     g_dxgi_vtab2[17] = (u64)dxgi_adapter_unregister;
+    g_dxgi_vtab2[18] = (u64)dxgi_adapter_GetDesc2;   /* IDXGIAdapter4::GetDesc3: the same layout */
 
     g_dxgi_output_vtab[0] = (u64)dxgi_output_QueryInterface;
     g_dxgi_output_vtab[1] = (u64)dxgi_AddRef;
@@ -8413,6 +8607,16 @@ static void init_dxgi_adapter_fake(void) {
     g_dxgi_output_vtab[8] = (u64)dxgi_output_GetDisplayModeList;
     g_dxgi_output_vtab[9] = (u64)dxgi_output_FindClosestMatchingMode;
     g_dxgi_output_vtab[10] = (u64)dxgi_output_WaitForVBlank;
+    g_dxgi_output_vtab[19] = (u64)dxgi_output_GetDisplayModeList1;          /* IDXGIOutput1 */
+    g_dxgi_output_vtab[20] = (u64)dxgi_output_FindClosestMatchingMode1;
+    g_dxgi_output_vtab[21] = (u64)dxgi_output_unsupported;                  /* GetDisplaySurfaceData1 */
+    g_dxgi_output_vtab[22] = (u64)dxgi_output_unsupported;                  /* DuplicateOutput */
+    g_dxgi_output_vtab[23] = (u64)dxgi_output_false;                        /* IDXGIOutput2::SupportsOverlays */
+    g_dxgi_output_vtab[24] = (u64)dxgi_output_overlay_support;              /* IDXGIOutput3 */
+    g_dxgi_output_vtab[25] = (u64)dxgi_output_overlay_cs_support;           /* IDXGIOutput4 */
+    g_dxgi_output_vtab[26] = (u64)dxgi_output_unsupported;                  /* IDXGIOutput5::DuplicateOutput1 */
+    g_dxgi_output_vtab[27] = (u64)dxgi_output_GetDesc1;                     /* IDXGIOutput6 */
+    g_dxgi_output_vtab[28] = (u64)dxgi_output_composition_support;
 
     g_dxgi_adapter = mmap(NULL, 256, PROT_READ|PROT_WRITE,
                           MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -11033,6 +11237,7 @@ impl_InitializeCriticalSectionEx(WIN_CS *cs, u32 spin, u32 flags)
 /* ---- Threads (real pthread implementation) ---- */
 #define MAX_THREADS 512
 #define THREAD_HANDLE_BASE 0xB2000000u
+
 #define INVALID_HANDLE_VALUE64 UINT64_MAX
 
 typedef struct {
@@ -11044,6 +11249,9 @@ typedef struct {
     u32 tid;
     u32 exit_code;
     pthread_t pt;
+    void *stack;                   /* bottom-up guest stack (beer_vm_map_bottom_up), released after join */
+    size_t stack_size;
+    size_t stack_request;          /* CreateThread dwStackSize (0 = the image default) */
     u64 fn;
     u64 arg;
     u64 creator_rip;
@@ -11200,12 +11408,41 @@ static void *win_thread_trampoline(void *p) {
     return NULL;
 }
 
+/* Stack reserve of a new guest thread, as Windows sizes it: the image's SizeOfStackReserve, or the CreateThread
+ * size when larger, in 64 KiB units. */
+static size_t guest_thread_stack_reserve(size_t requested)
+{
+    size_t reserve = 1u << 20;
+    if (g_img) {
+        const NtHdrs64 *nt = (const NtHdrs64 *)(g_img + ((const DosHdr *)g_img)->lfanew);
+        if (nt->opt.stack_reserve >= 0x10000 && nt->opt.stack_reserve <= (256u << 20))
+            reserve = (size_t)nt->opt.stack_reserve;
+    }
+    if (requested > reserve && requested <= (1024u << 20)) reserve = requested;
+    return (reserve + 0xffff) & ~(size_t)0xffff;
+}
+
 static int thread_start_locked(int id)
 {
     WinThread *t = &g_threads[id];
     if (t->started || !t->used) return 0;
-    if (pthread_create(&t->pt, NULL, win_thread_trampoline, (void *)(intptr_t)id) != 0)
+    /* Guest thread stacks come from the bottom-up guest range like Windows thread stacks (the lowest page is the
+     * guard); the glibc default stack, top-down, when that range is full. */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    const size_t stack_size = guest_thread_stack_reserve(t->stack_request) + 0x1000;
+    void *stack = beer_vm_map_bottom_up(stack_size, 65536, PROT_READ | PROT_WRITE, MAP_NORESERVE);
+    if (stack != MAP_FAILED) {
+        mprotect(stack, 0x1000, PROT_NONE);
+        pthread_attr_setstack(&attr, (u8 *)stack + 0x1000, stack_size - 0x1000);
+    }
+    const int created = pthread_create(&t->pt, &attr, win_thread_trampoline, (void *)(intptr_t)id);
+    pthread_attr_destroy(&attr);
+    if (created != 0) {
+        if (stack != MAP_FAILED) beer_vm_unmap_bottom_up(stack, stack_size);
         return -1;
+    }
+    if (stack != MAP_FAILED) { t->stack = stack; t->stack_size = stack_size; }
     t->started = 1;
     t->suspended = 0;
     return 0;
@@ -11255,11 +11492,12 @@ static u64 thread_wait_handle(u64 h, u32 ms)
 static u64 __attribute__((ms_abi))
 impl_CreateThread(u64 attr, u64 stack, u64 fn, u64 arg, u32 flags, u32 *tid)
 {
-    (void)attr;(void)stack;
+    (void)attr;
     if (g_thread_cnt >= MAX_THREADS) return 0;
     int id = g_thread_cnt++;
     WinThread *t = &g_threads[id];
     memset(t, 0, sizeof(*t));
+    t->stack_request = (size_t)stack;
     t->used = 1;
     t->handle_refs = 1;
     t->exit_code = 259u; /* STILL_ACTIVE */
@@ -12797,6 +13035,7 @@ impl_CloseHandle(u64 h)
             t->used = 0;
             pthread_mutex_unlock(&t->mtx);
             if (t->started) pthread_join(t->pt, NULL);
+            if (t->stack) { beer_vm_unmap_bottom_up(t->stack, t->stack_size); t->stack = NULL; }
             pthread_mutex_destroy(&t->mtx);
             pthread_cond_destroy(&t->cv);
         } else {
@@ -13599,9 +13838,51 @@ impl_VerQueryValueA(const u8 *block, const char *sub_block, const void **value, 
     return impl_VerQueryValueW(block, wide, value, length);
 }
 
-/* SetThreadAffinityMask */
+/* Thread affinity is real: Windows processor N is host CPU N (the numbering win_processor_mask reports). Code that
+ * pins a thread and then checks where it runs (rdtscp's processor id, per-core timing) saw an ignored request as
+ * tampering: RE9's protection pins its thread with NtSetInformationThread(ThreadAffinityMask) and then corrupts
+ * its own code. Handles: the current-thread pseudo handle, or a started guest thread. */
+static int beer_thread_pthread(u64 handle, pthread_t *out)
+{
+    if (handle == (u64)-2) { *out = pthread_self(); return 1; }
+    const int id = thread_id_from_handle(handle);
+    if (id < 0 || !g_threads[id].started) return 0;
+    *out = g_threads[id].pt;
+    return 1;
+}
+
+static u64 beer_thread_affinity(pthread_t thread)
+{
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (pthread_getaffinity_np(thread, sizeof(set), &set) != 0) return win_processor_mask();
+    u64 mask = 0;
+    for (int cpu = 0; cpu < 64; ++cpu) if (CPU_ISSET(cpu, &set)) mask |= (u64)1 << cpu;
+    return mask & win_processor_mask();
+}
+
+/* 1 on success; 0 when the mask names no processor of this machine or the thread is unknown. */
+static int beer_set_thread_affinity(u64 handle, u64 mask, u64 *previous)
+{
+    pthread_t thread;
+    if (!beer_thread_pthread(handle, &thread)) return 0;
+    mask &= win_processor_mask();
+    if (!mask) return 0;
+    if (previous) *previous = beer_thread_affinity(thread);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int cpu = 0; cpu < 64; ++cpu) if (mask & ((u64)1 << cpu)) CPU_SET(cpu, &set);
+    return pthread_setaffinity_np(thread, sizeof(set), &set) == 0;
+}
+
+/* SetThreadAffinityMask: the previous mask, 0 on failure. */
 static u64 __attribute__((ms_abi))
-impl_SetThreadAffinityMask(u64 h, u64 mask) { (void)h;(void)mask; return mask; }
+impl_SetThreadAffinityMask(u64 h, u64 mask)
+{
+    u64 previous = 0;
+    if (!beer_set_thread_affinity(h, mask, &previous)) { g_last_error = 87; return 0; }
+    return previous;
+}
 
 /* SetThreadIdealProcessor returns the previous preferred processor, not a
  * BOOL. Keep the Windows-visible preference per hosted thread; 64 denotes
@@ -17240,7 +17521,13 @@ static u64 __attribute__((ms_abi)) impl_GetErrorMode(void) { return 0; }
 static u64 __attribute__((ms_abi)) impl_Wow64GetSetThreadContext(u64 thread, void *context)
 { (void)thread; (void)context; g_last_error = 87; return 0; }      /* FALSE: not a WOW64 thread */
 static u64 __attribute__((ms_abi)) impl_NtSetInformationThread(u64 thread, u32 info_class, void *info, u32 size)
-{ (void)thread; (void)info_class; (void)info; (void)size; return 0; }   /* STATUS_SUCCESS (also ThreadHideFromDebugger) */
+{
+    if (info_class == 4) {                                   /* ThreadAffinityMask (KAFFINITY) */
+        if (!info || size != 8) return 0xC0000004u;          /* STATUS_INFO_LENGTH_MISMATCH */
+        return beer_set_thread_affinity(thread, *(const u64 *)info, NULL) ? 0 : 0xC000000Du;
+    }
+    return 0;                                                /* STATUS_SUCCESS (also ThreadHideFromDebugger) */
+}
 static u64 __attribute__((ms_abi)) impl_FatalAppExitA(u32 action, const char *message)
 {
     (void)action;
@@ -20512,6 +20799,7 @@ impl___acrt_iob_func(u32 index)
 #include "platform/win32_d3d9.inc"
 #include "platform/win32_display_config.inc"
 #include "platform/win32_nvapi.inc"
+#include "platform/win32_d3dkmt.inc"
 #include "platform/win32_file_search.inc"
 #include "platform/win32_missing_exports.inc"
 static u64 __attribute__((ms_abi))
@@ -20544,10 +20832,13 @@ static u64 __attribute__((ms_abi)) impl_GetThreadGroupAffinity(u64 thread, u64 *
     affinity[0] = win_processor_mask();
     return 1;
 }
+/* GROUP_AFFINITY { KAFFINITY Mask; WORD Group; WORD Reserved[3]; }: processor group 0 only. */
 static u64 __attribute__((ms_abi)) impl_SetThreadGroupAffinity(u64 thread, const u64 *affinity, u64 *previous)
 {
-    (void)thread; (void)affinity;
-    if (previous) { memset(previous, 0, 16); previous[0] = win_processor_mask(); }
+    if (!affinity || ((const u16 *)affinity)[4] != 0) { g_last_error = 87; return 0; }
+    u64 old = 0;
+    if (!beer_set_thread_affinity(thread, affinity[0], &old)) { g_last_error = 87; return 0; }
+    if (previous) { memset(previous, 0, 16); previous[0] = old; }
     return 1;
 }
 /* NtOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID): the process itself yields the pseudo handle. */
@@ -20620,6 +20911,11 @@ static ImplEntry g_impls[] = {
     {"GetVersionExA",                           (ImplFn)impl_GetVersionExA},
     {"WinHttpCheckPlatform",                    (ImplFn)impl_WinHttpCheckPlatform},
     {"GetAdaptersAddresses",                    (ImplFn)impl_GetAdaptersAddresses},
+    {"GetAdaptersInfo",                         (ImplFn)impl_GetAdaptersInfo},
+    {"D3DKMTOpenAdapterFromLuid",               (ImplFn)impl_D3DKMTOpenAdapterFromLuid},
+    {"D3DKMTOpenAdapterFromHdc",                (ImplFn)impl_D3DKMTOpenAdapterFromHdc},
+    {"D3DKMTCloseAdapter",                      (ImplFn)impl_D3DKMTCloseAdapter},
+    {"D3DKMTQueryAdapterInfo",                  (ImplFn)impl_D3DKMTQueryAdapterInfo},
     /* Critical sections */
     {"InitializeCriticalSectionAndSpinCount", (ImplFn)impl_InitializeCriticalSectionAndSpinCount},
     {"InitializeCriticalSection",             (ImplFn)impl_InitializeCriticalSection},
@@ -22031,7 +22327,21 @@ static void fake_pe_exports_build(void)
             if (!target) target = (u64)win_export_stub_zero;
             int service = module->base == HMOD_NTDLL && beer_win32_syscall_is_service_name(name)
                         ? beer_win32_syscall_register(name, (BeerWin32SyscallFn)find_impl(name)) : -1;
-            if (service >= 0) {
+            /* Services that replace the calling thread's context cannot run from the syscall trap. */
+            const int context_service = service >= 0 &&
+                (!strcmp(name + 2, "Continue") || !strcmp(name + 2, "ContinueEx") ||
+                 !strcmp(name + 2, "RaiseException") || !strcmp(name + 2, "CallbackReturn") ||
+                 !strcmp(name + 2, "TestAlert"));
+            if (service >= 0 && !context_service && !getenv("BEER_SHORT_NT_STUBS")) {
+                /* The complete Windows stub (mov r10,rcx; mov eax,n; test [7FFE0308h],1; jne; syscall; ret;
+                 * int 2Eh; ret; nop padding to 32 bytes). Protection code validates these bytes before taking
+                 * the service number, or calls the stub's own `syscall` instruction; with the shorter form
+                 * below RE9's protection fell back to service -1 for every call. The `syscall` is trapped by
+                 * Syscall User Dispatch and served by win32_syscall.c. */
+                beer_win32_syscall_write_stub(stub, FAKE_PE_STUB_SLOT, (u32)service);
+                static const u8 pad[8] = { 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 };
+                memcpy(stub + BEER_WIN32_SYSCALL_STUB_SIZE, pad, sizeof(pad));
+            } else if (service >= 0) {
                 /* Windows syscall stub prefix: code that bypasses hooks reads the service number at +4 and
                  * issues `syscall` itself (served by win32_syscall.c). Known services carry the number of
                  * the Windows build Beer reports, so tables of hard-coded numbers agree with ntdll. */
@@ -28970,6 +29280,15 @@ generic_alloc_skip:
         }
     }
 
+    /* BEER_CRASH_MAPS=<file>: the address-space layout at the fatal fault (for layout-sensitive guest code). */
+    if (getenv("BEER_CRASH_MAPS")) {
+        int in = open("/proc/self/maps", O_RDONLY), out = open(getenv("BEER_CRASH_MAPS"), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        char chunk[4096];
+        ssize_t got;
+        while (in >= 0 && out >= 0 && (got = read(in, chunk, sizeof(chunk))) > 0) (void)!write(out, chunk, (size_t)got);
+        if (in >= 0) close(in);
+        if (out >= 0) close(out);
+    }
     /* Guest return addresses found on the faulting stack (cheap backtrace). */
     if (g_img) {
         u64 buf[1024];
@@ -29548,6 +29867,20 @@ int main(int argc, char **argv)
     g_dxgi_vtab[27] = (u64)dxgi_EnumWarpAdapter;
     g_dxgi_vtab[28] = (u64)dxgi_Factory_CheckFeatureSupport;     /* IDXGIFactory5 */
     g_dxgi_vtab[29] = (u64)dxgi_EnumAdapterByGpuPreference;      /* IDXGIFactory6 */
+    g_dxgi_vtab[14] = (u64)dxgi_factory_zero;                    /* IDXGIFactory2::IsWindowedStereoEnabled */
+    g_dxgi_vtab[15] = (u64)dxgi_CreateSwapChainForHwnd;
+    g_dxgi_vtab[16] = (u64)dxgi_factory_unsupported;             /* CreateSwapChainForCoreWindow */
+    g_dxgi_vtab[17] = (u64)dxgi_factory_unsupported;             /* GetSharedResourceAdapterLuid */
+    g_dxgi_vtab[18] = (u64)dxgi_factory_register3;               /* RegisterStereoStatusWindow */
+    g_dxgi_vtab[19] = (u64)dxgi_factory_register2;               /* RegisterStereoStatusEvent */
+    g_dxgi_vtab[20] = (u64)dxgi_factory_unregister;
+    g_dxgi_vtab[21] = (u64)dxgi_factory_register3;               /* RegisterOcclusionStatusWindow */
+    g_dxgi_vtab[22] = (u64)dxgi_factory_register2;               /* RegisterOcclusionStatusEvent */
+    g_dxgi_vtab[23] = (u64)dxgi_factory_unregister;
+    g_dxgi_vtab[24] = (u64)dxgi_factory_unsupported;             /* CreateSwapChainForComposition */
+    g_dxgi_vtab[25] = (u64)dxgi_factory_zero;                    /* IDXGIFactory3::GetCreationFlags */
+    g_dxgi_vtab[30] = (u64)dxgi_factory_register2;               /* IDXGIFactory7::RegisterAdaptersChangedEvent */
+    g_dxgi_vtab[31] = (u64)dxgi_factory_unregister;
     
     /* vtable[10] also acts as engine allocator – set after CreateSwapChain */
     /* For objects that are NOT a factory, vtable[10] returns a real allocation */
@@ -29582,20 +29915,27 @@ int main(int argc, char **argv)
      * execution off with %rsp pointing at the anchor itself, not at a synthetic
      * value 0x5c8 bytes lower than the true frame base. */
     size_t guest_stack_size = 16 * 1024 * 1024;  /* 16 MB for deep recursion */
-    void *guest_stack = mmap(NULL, guest_stack_size, PROT_READ | PROT_WRITE,
+    /* Bottom-up like a Windows main-thread stack; one extra page below it in the same mapping (a separate MAP_FIXED
+     * page would replace whatever bottom-up placement put just below). */
+    void *guest_stack = beer_vm_map_bottom_up(guest_stack_size + 0x1000, 65536, PROT_READ | PROT_WRITE, 0);
+    u64 guest_stack_low, guest_stack_high;
+    if (guest_stack != MAP_FAILED) {
+        guest_stack_low = (u64)guest_stack;
+        guest_stack_high = (u64)guest_stack + 0x1000 + guest_stack_size;
+    } else {
+        guest_stack = mmap(NULL, guest_stack_size, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (guest_stack == MAP_FAILED)
-        die("mmap(guest_stack): %s", strerror(errno));
-
-    u64 guest_stack_low  = (u64)guest_stack;
-    u64 guest_stack_high = (u64)guest_stack + guest_stack_size;
-    
-    /* Map a guard page below the stack for underflow protection */
-    void *guard_page = mmap((void *)(guest_stack_low - 0x1000), 0x1000,
-                            PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (guard_page != MAP_FAILED) {
-        guest_stack_low -= 0x1000;  /* Extend stack low boundary to include guard page */
+        if (guest_stack == MAP_FAILED)
+            die("mmap(guest_stack): %s", strerror(errno));
+        guest_stack_low  = (u64)guest_stack;
+        guest_stack_high = (u64)guest_stack + guest_stack_size;
+        /* Map a guard page below the stack for underflow protection */
+        void *guard_page = mmap((void *)(guest_stack_low - 0x1000), 0x1000,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (guard_page != MAP_FAILED) {
+            guest_stack_low -= 0x1000;  /* Extend stack low boundary to include guard page */
+        }
     }
     
     /* Reserve 2MB at top for guest runtime, allowing deep recursion */
