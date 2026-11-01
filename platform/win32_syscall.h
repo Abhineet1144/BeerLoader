@@ -12,8 +12,11 @@
  * build reported in the PEB, and execute SYSCALL themselves. Beer emits the
  * same stub shape. For services that exist in the Windows build Beer
  * advertises (10.0.19045, see the PEB), it uses that build's service number.
- * Other Beer-implemented services get numbers from BEER_WIN32_SYSCALL_EXTRA_BASE
- * upward.
+ * The already-defined contiguous 19045 prefix retains those IDs. Other
+ * Beer-implemented services get local numbers immediately after that prefix,
+ * from BEER_WIN32_SYSCALL_EXTRA_BASE upward; these are not claimed as Windows
+ * IDs outside the defined prefix. The native image's physical service-stub
+ * order matches this complete local table, including unsupported catalog slots.
  *
  * Linux Syscall User Dispatch separates guest system calls from host ones. Each
  * thread that runs guest code enables dispatch with a per-thread selector byte.
@@ -27,7 +30,7 @@
  * The 19045 service numbers are the Windows ABI of that build. They are not
  * taken from Wine, whose numbering differs. */
 
-#define BEER_WIN32_SYSCALL_EXTRA_BASE 0x0800u
+#define BEER_WIN32_SYSCALL_EXTRA_BASE 0x0063u
 #define BEER_WIN32_SYSCALL_CAPACITY   0x1000u
 #define BEER_WIN32_SYSCALL_STUB_SIZE  24u
 
@@ -48,6 +51,16 @@ extern __thread uint64_t beer_win32_syscall_resume_rip;
  * share one number, as on Windows. A NULL implementation is valid: the service
  * then answers STATUS_NOT_IMPLEMENTED. Returns -1 when the table is full. */
 int beer_win32_syscall_register(const char *name, BeerWin32SyscallFn fn);
+
+/* The existing first-party service catalog occupies every slot below EXTRA_BASE.
+ * Unimplemented catalog operations return STATUS_NOT_IMPLEMENTED. Implemented
+ * extensions follow contiguously, so native stub address rank and encoded ID
+ * can agree without importing another runtime's export inventory.
+ * Names remain stable for the process lifetime. Initialization/registration
+ * occurs before guest execution; readers must not race registration. */
+size_t beer_win32_syscall_count(void);
+const char *beer_win32_syscall_name(uint32_t number, int zw_alias);
+int beer_win32_syscall_supported(uint32_t number);
 
 /* True for exported Nt or Zw names that are system services on Windows. Other
  * names, such as the Ntdll* window procedures, are ordinary functions. */

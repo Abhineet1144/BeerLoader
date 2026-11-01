@@ -41,6 +41,17 @@ int main(void)
     assert(!beer_win32_syscall_is_service_name("NtGetTickCount"));
     assert(!beer_win32_syscall_is_service_name("RtlGetVersion"));
 
+    assert(beer_win32_syscall_count() == BEER_WIN32_SYSCALL_EXTRA_BASE);
+    for (unsigned i = 0; i < BEER_WIN32_SYSCALL_EXTRA_BASE; ++i) {
+        const char *name = beer_win32_syscall_name(i, 0);
+        const char *alias = beer_win32_syscall_name(i, 1);
+        assert(name && alias && !strncmp(name, "Nt", 2) && !strncmp(alias, "Zw", 2));
+        assert(!strcmp(name + 2, alias + 2));
+        assert(beer_win32_syscall_register(name, NULL) == (int)i);
+        assert(beer_win32_syscall_register(alias, NULL) == (int)i);
+        assert(!beer_win32_syscall_supported(i));
+    }
+
     /* Windows 10 19045 numbers for known services, Beer numbers for others. */
     assert(beer_win32_syscall_register("ZwClose", NULL) == 0x0F);
     assert(beer_win32_syscall_register("NtReadVirtualMemory", NULL) == 0x3F);
@@ -79,7 +90,7 @@ int main(void)
            seen[3] == 0x4444 && seen[4] == 0x5555 && seen[5] == 0x6666);
     assert(call_as_guest(code + 0x40, 0, 0, 0, 0, 0, 0) == BEER_STATUS_NOT_IMPLEMENTED);
     assert(call_as_guest(code + 0x80, 0, 0, 0, 0, 0, 0) == BEER_STATUS_INVALID_SYSTEM_SERVICE);
-    assert(call_as_guest(code + 0xC0, 0, 0, 0, 0, 0, 0) == BEER_STATUS_INVALID_SYSTEM_SERVICE);
+    assert(call_as_guest(code + 0xC0, 0, 0, 0, 0, 0, 0) == BEER_STATUS_NOT_IMPLEMENTED);
 
     /* Host system calls made while blocked are re-executed after re-allowing. */
     beer_win32_syscall_selector = 1;

@@ -79,8 +79,6 @@ static u64 __attribute__((ms_abi)) stub_VariantCopy(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharUpperBuffW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharLowerBuffW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_UnregisterClassA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetClassInfoA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RegisterClipboardFormatA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClipboardFormatNameA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharToOemA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharUpperA(void){ return 0; }
@@ -96,7 +94,6 @@ static u64 __attribute__((ms_abi)) stub_SetClassLongPtrA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FindWindowA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassNameA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_UnregisterClassW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetClassInfoW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_InsertMenuItemW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMenuItemInfoW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetMenuItemInfoW(void){ return 0; }

@@ -111,6 +111,31 @@ int main(void)
                               (uint64_t)(uintptr_t)&stack[16], 8, NULL));
     assert(state[2] == 0); /* host test handler rejected as non-guest code */
 
+    /* A fault before ALLOC_LARGE completes must not call this frame's handler
+     * with an uninitialized frame/cookie. The caller's handler still runs. */
+    functions[0].unwind_data = 0x120;
+    uint8_t *prolog = image + 0x120;
+    prolog[0] = 1 | (1 << 3);
+    prolog[1] = 5;
+    prolog[2] = 2;
+    prolog[4] = 5; prolog[5] = 1; /* ALLOC_LARGE, two-slot encoding */
+    prolog[6] = 8; prolog[7] = 0; /* 64 bytes */
+    uint32_t handler_rva = (uint32_t)(host_handler - base);
+    memcpy(prolog + 8, &handler_rva, sizeof(handler_rva));
+    for (unsigned offset = 0; offset < 5; ++offset) {
+        memset(context, 0, sizeof(context));
+        put64(context, 0xf8, base + 0x20 + offset);
+        put64(context, 0x98, (uint64_t)(uintptr_t)&stack[0]);
+        stack[0] = base + 0x90;
+        stack[1] = base + 0xc0;
+        state[0] = (uint64_t)(uintptr_t)&stack[1];
+        state[2] = 0;
+        assert(beer_seh_dispatch(&record, context, lookup, NULL, NULL,
+            (uint64_t)(uintptr_t)&stack[0], (uint64_t)(uintptr_t)&stack[16], 8, &visited));
+        assert(state[2] == 1 && visited == 2);
+        assert(get64(context, 0xf8) == base + 0x1f0);
+    }
+
     puts("win32 SEH tests passed");
     return 0;
 }

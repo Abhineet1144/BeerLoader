@@ -29,8 +29,11 @@ import storage  # noqa: E402
 from memory_window import MemoryWindow  # noqa: E402
 from objects_window import ObjectsWindow  # noqa: E402
 from overlay_page import OverlayPage, flat_message, load_config as load_overlay_config  # noqa: E402
+from overlay_page import write_loader_file as write_overlay_loader_file  # noqa: E402
 from display_page import DisplayPage, post_message, load_config as load_display_config  # noqa: E402
+from display_page import write_loader_file as write_display_loader_file  # noqa: E402
 from graphics_window import GraphicsWindow, apply_saved as apply_saved_tweaks  # noqa: E402
+from steam_page import DEFAULT_PROVIDER, SteamPage  # noqa: E402
 
 APP_ID = "dev.beer.Manager"
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +45,13 @@ SOCKET_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/beer-%d" % 
     if os.environ.get("XDG_RUNTIME_DIR") else "/tmp/beer-%d" % os.getuid()
 
 AUDIO_BACKENDS = ["fmod", "compat"]
+# BEER_STEAM_API_MODE choices: (setting, label, description). "auto" picks official for Steam installs.
+STEAM_API_MODES = [
+    ("auto", "Automatic", "Your Steam session for games installed from Steam, Beer's offline Steam otherwise"),
+    ("compat", "Beer offline Steam", "Built-in offline Steam API: local user, local saves, no online services"),
+    ("official", "Your Steam session", "Real identity, ownership and tickets from your signed-in account (it must own the game)"),
+    ("guest", "Game's own Steam DLL", "Runs the steam_api64.dll shipped with the game"),
+]
 PRESENTERS = ["Default", "auto", "vulkan", "x11"]
 PRESENT_MODES = ["Default", "fifo", "mailbox", "immediate"]
 # Every launch option the loader understands, as switches: (key, label, environment variable, value, description).
@@ -63,6 +73,8 @@ LAUNCH_FLAGS = [
 BEER_HOME = os.path.expanduser("~/.beer")
 PREFIX_DIR = os.path.join(BEER_HOME, "prefixes")
 TRASH_DIR = os.path.join(BEER_HOME, "trash")
+# Default folder for games the Steam session provider downloads; more can be added in Loader settings.
+STEAM_LIBRARY_DIR = os.path.join(BEER_HOME, "steam-library")
 LEGACY_PREFIX_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "beer", "prefixes")
 PREFIX_SKELETON = [
     "drive_c/Windows/System32", "drive_c/Windows/SysWOW64", "drive_c/Windows/Temp", "drive_c/Program Files",
@@ -177,6 +189,14 @@ def clone_prefix(source, name):
     return path
 
 
+def steam_prefix(appid):
+    """Official Steam installs get their own prefix, so their saves never mix with an imported copy's."""
+    name = "steam-%d" % int(appid)
+    if not os.path.isdir(prefix_path(name)):
+        create_prefix(name)
+    return name
+
+
 def trash_prefix(path):
     """Never deletes: moves the prefix into ~/.beer/trash so saves can always be recovered."""
     os.makedirs(TRASH_DIR, exist_ok=True)
@@ -201,6 +221,7 @@ class Library:
         self.settings = load_json(SETTINGS_FILE, {})
         self.settings.setdefault("loader", os.path.join(REPO, "loader"))
         self.settings.setdefault("vkd3d_library", find_vkd3d_library())
+        self.settings.setdefault("steam_libraries", [STEAM_LIBRARY_DIR])
 
     def save(self):
         save_json(LIBRARY_FILE, {"games": self.games})
@@ -282,6 +303,38 @@ def spoof_environment(game):
         env["BEER_SPOOF_CPU_THREADS"] = str(cpu.get("threads", 16))
         env["BEER_SPOOF_CPU_MHZ"] = str(cpu.get("mhz", 3600))
     return env
+
+
+# ---------------------------------------------------------------- per-game sound (PipeWire / PulseAudio)
+
+def audio_streams(pid):
+    """Playback streams the process opened, as pactl reports them ([] when none or pactl is missing)."""
+    try:
+        out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"], capture_output=True, text=True,
+                             timeout=2).stdout
+        streams = json.loads(out or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    return [s for s in streams if str(s.get("properties", {}).get("application.process.id")) == str(pid)]
+
+
+def stream_volume(stream):
+    values = [c.get("value_percent", "100%") for c in (stream.get("volume") or {}).values()]
+    try:
+        return int(values[0].rstrip("%")) if values else 100
+    except ValueError:
+        return 100
+
+
+def set_streams(streams, volume=None, mute=None):
+    for stream in streams:
+        index = str(stream["index"])
+        if volume is not None:
+            subprocess.run(["pactl", "set-sink-input-volume", index, "%d%%" % volume], timeout=2,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if mute is not None:
+            subprocess.run(["pactl", "set-sink-input-mute", index, "1" if mute else "0"], timeout=2,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def pid_alive(pid):
@@ -376,6 +429,33 @@ class RunningCard(Adw.PreferencesGroup):
         cap.add_suffix(cap_box)
         self.add(cap)
 
+        # Sound: the game's own playback streams in the desktop mixer.
+        self.sound = Adw.ActionRow(title="Volume", subtitle="Waiting for the game to play sound")
+        self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 150, 1)
+        self.volume.set_hexpand(True)
+        self.volume.set_size_request(260, -1)
+        self.volume.set_draw_value(False)
+        self.volume.add_mark(100, Gtk.PositionType.BOTTOM, None)
+        self.volume.connect("value-changed", self._on_volume)
+        self.volume_label = Gtk.Label(label="100%", width_chars=5, xalign=1)
+        self.volume_label.add_css_class("numeric")
+        self.mute = Gtk.ToggleButton(icon_name="audio-volume-high-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Mute")
+        self.mute.add_css_class("flat")
+        self.mute.connect("toggled", self._on_mute)
+        self.sound.add_suffix(self.volume)
+        self.sound.add_suffix(self.volume_label)
+        self.sound.add_suffix(self.mute)
+        self.add(self.sound)
+        game = next((g for g in app.lib.games if g.get("exe") == exe), {})
+        # Only a volume the user chose for this game is reapplied; otherwise the mixer's own level stays.
+        self.saved_volume = int(game["volume"]) if "volume" in game else None
+        self.known_streams = set()
+        self.sound_tick = 0
+        self._setting_sound = False
+        self._set_sound_widgets(self.saved_volume if self.saved_volume is not None else 100, False)
+        self.volume.set_sensitive(False)
+        self.mute.set_sensitive(False)
+
         self.pause = Adw.SwitchRow(title="Pause game time", subtitle="Freezes the clocks the game sees; rendering keeps running")
         self.pause.connect("notify::active", self._on_pause)
         self.add(self.pause)
@@ -444,10 +524,60 @@ class RunningCard(Adw.PreferencesGroup):
         if not self._updating:
             self.control.request({"cmd": "set", "name": "paused", "value": bool(row.get_active())})
 
+    def _set_sound_widgets(self, volume, muted):
+        self._setting_sound = True
+        try:
+            self.volume.set_value(volume)
+            self.volume_label.set_label("%d%%" % volume)
+            self.mute.set_active(muted)
+            self.mute.set_icon_name("audio-volume-muted-symbolic" if muted else "audio-volume-high-symbolic")
+            self.mute.set_tooltip_text("Unmute" if muted else "Mute")
+        finally:
+            self._setting_sound = False
+
+    def _on_volume(self, scale):
+        volume = int(scale.get_value())
+        self.volume_label.set_label("%d%%" % volume)
+        if self._setting_sound:
+            return
+        self.saved_volume = volume
+        set_streams(audio_streams(self.pid), volume=volume)
+        self.app.remember(self.exe, "volume", volume)
+
+    def _on_mute(self, button):
+        muted = button.get_active()
+        button.set_icon_name("audio-volume-muted-symbolic" if muted else "audio-volume-high-symbolic")
+        button.set_tooltip_text("Unmute" if muted else "Mute")
+        if not self._setting_sound:
+            set_streams(audio_streams(self.pid), mute=muted)
+
+    def _refresh_sound(self):
+        streams = audio_streams(self.pid)
+        new = [st for st in streams if st["index"] not in self.known_streams]
+        if new:
+            # Streams opened later (FMOD opens several) get the volume and mute chosen for this game.
+            mute = self.mute.get_active() if self.known_streams else None
+            if self.saved_volume is not None or mute is not None:
+                set_streams(new, volume=self.saved_volume, mute=mute)
+                streams = audio_streams(self.pid)
+            self.known_streams.update(st["index"] for st in new)
+        has_sound = bool(streams)
+        self.volume.set_sensitive(has_sound)
+        self.mute.set_sensitive(has_sound)
+        if not has_sound:
+            self.sound.set_subtitle("Waiting for the game to play sound")
+            return
+        self.sound.set_subtitle("%d stream%s" % (len(streams), "" if len(streams) == 1 else "s"))
+        if not self.volume.has_focus():
+            self._set_sound_widgets(stream_volume(streams[0]), bool(streams[0].get("mute")))
+
     def refresh(self):
         """Returns False when the game is gone."""
         if not pid_alive(self.pid):
             return False
+        self.sound_tick += 1
+        if self.sound_tick % 3 == 1:
+            self._refresh_sound()
         status = self.control.request({"cmd": "status"})
         if not status or not status.get("ok"):
             self.stats.set_subtitle("not responding")
@@ -526,6 +656,22 @@ class GameDialog(Adw.Dialog):
             group.add(row)
         page.add(group)
 
+        steam = Adw.PreferencesGroup(title="Steam")
+        self.steam_mode = Adw.ComboRow(title="Steam API")
+        self.steam_mode.set_model(Gtk.StringList.new([label for _key, label, _d in STEAM_API_MODES]))
+        keys = [key for key, _l, _d in STEAM_API_MODES]
+        current_mode = game.get("steam_mode", "auto")
+        self.steam_mode.set_selected(keys.index(current_mode) if current_mode in keys else 0)
+        self.steam_appid = Adw.EntryRow(title="Steam App ID")
+        self.steam_appid.set_input_purpose(Gtk.InputPurpose.DIGITS)
+        self.steam_appid.set_text(str(game.get("appid", "")) if game.get("appid") else str(game.get("steam_appid", "")))
+        self.steam_appid.set_sensitive(game.get("source") != "steam")
+        self.steam_mode.connect("notify::selected", lambda *_a: self._sync_steam_rows())
+        steam.add(self.steam_mode)
+        steam.add(self.steam_appid)
+        page.add(steam)
+        self._sync_steam_rows()
+
         hw = Adw.PreferencesGroup(title="Hardware shown to the game",
                                   description="Changes what the game is told through Windows APIs (DXGI adapter, display devices, registry CPU "
                                               "name, processor count). The real GPU still renders and CPUID is not changed, so this is "
@@ -599,6 +745,17 @@ class GameDialog(Adw.Dialog):
         view.set_content(page)
         self.set_child(view)
 
+    def _sync_steam_rows(self):
+        _key, _label, description = STEAM_API_MODES[self.steam_mode.get_selected()]
+        self.steam_mode.set_subtitle(description)
+        key = STEAM_API_MODES[self.steam_mode.get_selected()][0]
+        if self.game.get("source") == "steam":
+            self.steam_appid.set_title("Steam App ID (from the install)")
+        elif key == "official":
+            self.steam_appid.set_title("Steam App ID (the game your account must own)")
+        else:
+            self.steam_appid.set_title("Steam App ID (only needed without steam_appid.txt)")
+
     def _sync_hw_rows(self, *_args):
         gpu_custom = self.gpu_choices[self.gpu.get_selected()] == "Custom…"
         cpu_custom = self.cpu_choices[self.cpu.get_selected()] == "Custom…"
@@ -629,6 +786,7 @@ class GameDialog(Adw.Dialog):
             "presenter": PRESENTERS[self.presenter.get_selected()],
             "present_mode": PRESENT_MODES[self.present_mode.get_selected()],
             "flags": {key: row.get_active() for key, row in self.flag_rows.items()},
+            "steam_mode": STEAM_API_MODES[self.steam_mode.get_selected()][0],
             "gpu": {"preset": self.gpu_choices[self.gpu.get_selected()], "name": self.gpu_name.get_text().strip(),
                     "vendor": self.gpu_vendor.get_text().strip(), "device": self.gpu_device.get_text().strip(),
                     "vram": int(self.gpu_vram.get_value())},
@@ -636,6 +794,12 @@ class GameDialog(Adw.Dialog):
                     "vendor": ["GenuineIntel", "AuthenticAMD"][self.cpu_vendor.get_selected()],
                     "threads": int(self.cpu_threads.get_value()), "mhz": int(self.cpu_mhz.get_value())},
         })
+        if self.game.get("source") != "steam":
+            appid = self.steam_appid.get_text().strip()
+            if appid.isdigit() and int(appid) > 0:
+                self.game["steam_appid"] = int(appid)
+            else:
+                self.game.pop("steam_appid", None)
         self.on_save(self.game)
         self.close()
 
@@ -701,7 +865,7 @@ class Manager(Adw.Application):
         if getattr(self, "window", None):
             self.window.present()
             return
-        w = self.window = Adw.ApplicationWindow(application=self, title="Beer", default_width=760, default_height=640)
+        w = self.window = Adw.ApplicationWindow(application=self, title="Beer", default_width=900, default_height=680)
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
@@ -717,8 +881,7 @@ class Manager(Adw.Application):
         view.add_top_bar(header)
 
         # Library page
-        self.library_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        self.library_list.add_css_class("boxed-list")
+        self.library_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         self.library_empty = Adw.StatusPage(icon_name="applications-games-symbolic", title="No games yet",
                                             description="Use the + button to add a game's .exe")
         lib_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -729,6 +892,8 @@ class Manager(Adw.Application):
         lib_scroll = Gtk.ScrolledWindow(vexpand=True)
         lib_scroll.set_child(lib_box)
         self.stack.add_titled_with_icon(lib_scroll, "library", "Library", "view-grid-symbolic")
+        self.steam_page = SteamPage(self)
+        self.stack.add_titled_with_icon(self.steam_page, "steam", "Steam", "avatar-default-symbolic")
 
         # Running page
         self.running_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
@@ -793,23 +958,109 @@ class Manager(Adw.Application):
         if hasattr(self, "prefix_list"):
             self.rebuild_prefixes()
         self.library_list.set_visible(bool(games))
-        for index, game in enumerate(games):
-            row = Adw.ActionRow(title=GLib.markup_escape_text(game["name"]), subtitle=GLib.markup_escape_text(game["exe"]))
-            row.set_subtitle_lines(1)
+        # Games installed by the Steam session provider carry source "steam"; everything else was imported by hand.
+        sections = [("Local Imports", "Games added from an .exe on disk", lambda g: g.get("source") != "steam"),
+                    ("Steam Games", "Downloaded from your Steam account", lambda g: g.get("source") == "steam")]
+        for title, description, belongs in sections:
+            members = [(index, game) for index, game in enumerate(games) if belongs(game)]
+            if not members:
+                continue
+            rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_top=6)
+            rows.add_css_class("boxed-list")
+            for index, game in members:
+                rows.append(self._library_row(index, game))
+            label = Gtk.Label(use_markup=True, xalign=0,
+                              label="<b>%s</b>  <span alpha=\"60%%\">%d · %s</span>" % (title, len(members), description))
+            collapsed = self.lib.settings.setdefault("collapsed_sections", [])
+            section = Gtk.Expander(label_widget=label, expanded=title not in collapsed, child=rows)
+            section.connect("notify::expanded", self._section_toggled, title)
+            self.library_list.append(section)
+
+    def _section_toggled(self, section, _param, title):
+        collapsed = self.lib.settings.setdefault("collapsed_sections", [])
+        if section.get_expanded() and title in collapsed:
+            collapsed.remove(title)
+        elif not section.get_expanded() and title not in collapsed:
+            collapsed.append(title)
+        self.lib.save()
+
+    def _library_row(self, index, game):
+        subtitle = game["exe"]
+        if game.get("source") == "steam":
+            subtitle = "App %s · %s" % (game.get("appid", "?"), game["exe"])
+        row = Adw.ActionRow(title=GLib.markup_escape_text(game["name"]), subtitle=GLib.markup_escape_text(subtitle))
+        row.set_subtitle_lines(1)
+        pid = self.running_pid(game)
+        if pid:
+            badge = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+            dot = Gtk.Image(icon_name="media-record-symbolic", pixel_size=10)
+            dot.add_css_class("success")
+            badge.append(dot)
+            label = Gtk.Label(label="Running")
+            label.add_css_class("success")
+            label.add_css_class("caption-heading")
+            badge.append(label)
+            show = Gtk.Button(icon_name="utilities-system-monitor-symbolic", valign=Gtk.Align.CENTER,
+                              tooltip_text="Show in Running")
+            show.add_css_class("flat")
+            show.connect("clicked", lambda _b: self.stack.set_visible_child_name("running"))
+            row.add_suffix(badge)
+            row.add_suffix(show)
+            play = Gtk.Button(icon_name="media-playback-stop-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Stop")
+            play.add_css_class("destructive-action")
+            play.add_css_class("circular")
+            play.connect("clicked", lambda _b, p=pid: self.stop_game(p))
+        else:
             play = Gtk.Button(icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Launch")
             play.add_css_class("suggested-action")
             play.add_css_class("circular")
             play.connect("clicked", lambda _b, g=game: self.launch(g))
-            edit = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Edit")
-            edit.add_css_class("flat")
-            edit.connect("clicked", lambda _b, i=index: self.edit_game(i))
-            remove = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Remove from library (files are untouched)")
-            remove.add_css_class("flat")
-            remove.connect("clicked", lambda _b, i=index: self.remove_game(i))
-            row.add_suffix(edit)
-            row.add_suffix(remove)
-            row.add_suffix(play)
-            self.library_list.append(row)
+        edit = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Edit")
+        edit.add_css_class("flat")
+        edit.connect("clicked", lambda _b, i=index: self.edit_game(i))
+        remove = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Remove from library (files are untouched)")
+        remove.add_css_class("flat")
+        remove.connect("clicked", lambda _b, i=index: self.remove_game(i))
+        remove.set_sensitive(not pid)
+        row.add_suffix(edit)
+        row.add_suffix(remove)
+        row.add_suffix(play)
+        return row
+
+    def sync_steam_installs(self, records):
+        """Keeps the Library's Steam Games in step with what the provider has installed."""
+        changed = False
+        installed = {r["appid"]: r for r in records if r.get("state") == "installed" and r.get("executable")}
+        for appid, record in installed.items():
+            install_dir = os.path.join(record["folder"], "common", record["installdir"])
+            exe = os.path.join(install_dir, record["executable"])
+            workdir = os.path.join(install_dir, record["workingdir"]) if record.get("workingdir") else ""
+            entry = next((g for g in self.lib.games if g.get("source") == "steam" and g.get("appid") == appid), None)
+            if entry is None:
+                try:
+                    prefix = steam_prefix(appid)
+                except (OSError, ValueError):
+                    prefix = "default"
+                entry = {"name": record.get("name") or "App %d" % appid, "exe": exe, "args": record.get("arguments", ""),
+                         "env": "", "prefix": prefix, "audio": "fmod", "time_scale": 1.0, "fps_limit": 0,
+                         "presenter": "Default", "present_mode": "Default", "flags": {},
+                         "source": "steam", "appid": appid, "steam_folder": record["folder"], "steam_workdir": workdir}
+                self.lib.games.append(entry)
+                changed = True
+            elif entry.get("exe") != exe or entry.get("steam_workdir", "") != workdir:
+                entry["exe"] = exe
+                entry["steam_folder"] = record["folder"]
+                entry["steam_workdir"] = workdir
+                changed = True
+        for entry in list(self.lib.games):
+            # Drop entries whose install is gone, but not ones on a drive that is simply not mounted.
+            if entry.get("source") == "steam" and entry.get("appid") not in installed and \
+                    os.path.isdir(os.path.join(entry.get("steam_folder", ""), "beer-steam")):
+                self.lib.games.remove(entry)
+                changed = True
+        if changed:
+            self.lib.save()
+            self.rebuild_library()
 
     def remember(self, exe, key, value):
         for game in self.lib.games:
@@ -965,15 +1216,74 @@ class Manager(Adw.Application):
         loader.set_text(self.lib.settings["loader"])
         vkd3d = Adw.EntryRow(title="vkd3d-shader library")
         vkd3d.set_text(self.lib.settings["vkd3d_library"])
+        bandwidth = Adw.SpinRow.new_with_range(0, 1000, 1)
+        bandwidth.set_title("Steam download limit")
+        bandwidth.set_subtitle("MB/s, 0 for no limit")
+        bandwidth.set_value(float(self.lib.settings.get("steam_bandwidth_mbps") or 0))
+        languages = ["english", "french", "german", "italian", "spanish", "latam", "portuguese", "brazilian", "russian",
+                     "polish", "japanese", "koreana", "schinese", "tchinese", "turkish", "ukrainian", "thai"]
+        language = Adw.ComboRow(title="Steam game language", model=Gtk.StringList.new(languages))
+        current = self.lib.settings.get("steam_language", "english")
+        language.set_selected(languages.index(current) if current in languages else 0)
+        provider = Adw.EntryRow(title="Steam session provider")
+        provider.set_text(self.lib.settings.get("steam_provider") or DEFAULT_PROVIDER)
         group.add(loader)
         group.add(vkd3d)
+        group.add(provider)
         page.add(group)
+
+        steam_group = Adw.PreferencesGroup(title="Steam downloads",
+                                           description="Folders games from your Steam account are installed into. "
+                                                       "Removing a folder from this list never deletes the games in it.")
+        add_folder = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Add a folder")
+        add_folder.add_css_class("flat")
+        steam_group.set_header_suffix(add_folder)
+        page.add(steam_group)
+        steam_options = Adw.PreferencesGroup()
+        steam_options.add(language)
+        steam_options.add(bandwidth)
+        page.add(steam_options)
+        folders = list(self.lib.settings.get("steam_libraries") or [STEAM_LIBRARY_DIR])
+        folder_rows = []
+
+        def show_folders():
+            for row in folder_rows:
+                steam_group.remove(row)
+            folder_rows.clear()
+            for folder in folders:
+                row = Adw.ActionRow(title=GLib.markup_escape_text(folder))
+                remove = Gtk.Button(icon_name="list-remove-symbolic", valign=Gtk.Align.CENTER,
+                                    tooltip_text="Remove from the list (files are untouched)")
+                remove.add_css_class("flat")
+                remove.set_sensitive(len(folders) > 1)
+                remove.connect("clicked", lambda _b, f=folder: (folders.remove(f), show_folders()))
+                row.add_suffix(remove)
+                steam_group.add(row)
+                folder_rows.append(row)
+
+        def folder_picked(chooser, result):
+            try:
+                picked = chooser.select_folder_finish(result)
+            except GLib.Error:
+                return
+            if picked and picked.get_path() not in folders:
+                folders.append(picked.get_path())
+                show_folders()
+        add_folder.connect("clicked", lambda _b: Gtk.FileDialog(title="Choose a Steam downloads folder")
+                           .select_folder(self.window, None, folder_picked))
+        show_folders()
         view.set_content(page)
         dialog.set_child(view)
 
         def closed(_d):
             self.lib.settings["loader"] = loader.get_text().strip() or os.path.join(REPO, "loader")
             self.lib.settings["vkd3d_library"] = vkd3d.get_text().strip()
+            self.lib.settings["steam_libraries"] = folders
+            self.lib.settings["steam_provider"] = provider.get_text().strip() or DEFAULT_PROVIDER
+            self.lib.settings["steam_bandwidth_mbps"] = bandwidth.get_value()
+            self.lib.settings["steam_language"] = languages[language.get_selected()]
+            self.steam_page.send_bandwidth()
+            self.steam_page._refresh_installs()
             self.lib.save()
         dialog.connect("closed", closed)
         dialog.present(self.window)
@@ -988,6 +1298,17 @@ class Manager(Adw.Application):
             self.toast("Game exe not found — is the drive mounted?")
             return
         env = dict(os.environ)
+        appid = game.get("appid") if game.get("source") == "steam" else game.get("steam_appid")
+        if appid:
+            # As Steam does for the games it launches.
+            env["SteamAppId"] = env["SteamGameId"] = str(appid)
+        if game.get("steam_workdir"):
+            env["BEER_WORKING_DIR"] = game["steam_workdir"]     # the launch option's working directory
+        mode = game.get("steam_mode", "auto")
+        if mode == "auto":
+            mode = "official" if game.get("source") == "steam" else None
+        if mode:
+            env["BEER_STEAM_API_MODE"] = mode
         if self.lib.settings.get("vkd3d_library"):
             env["BEER_VKD3D_SHADER_LIBRARY"] = self.lib.settings["vkd3d_library"]
         scale = float(game.get("time_scale", 1.0))
@@ -1004,7 +1325,7 @@ class Manager(Adw.Application):
                 key, value = item.split("=", 1)
                 env[key] = value
         env.update(spoof_environment(game))
-        env["BEER_OVERLAY_JSON"] = json.dumps(flat_message(load_overlay_config()))
+        env["BEER_OVERLAY_JSON"] = json.dumps(flat_message(load_overlay_config(), starting=True))
         env["BEER_POST_JSON"] = json.dumps(post_message(load_display_config()))
         cmd = [loader, "--audio=%s" % game.get("audio", "fmod"), "--prefix=%s" % prefix_path(game.get("prefix", "default"))]
         flags = game.get("flags", {})
@@ -1103,6 +1424,9 @@ class Manager(Adw.Application):
                 log = started[1]
                 card = RunningCard(self, pid, path, name, log, exe)
                 apply_saved_tweaks(card.control, exe)
+                # Games started from a terminal get the saved overlay and display settings too.
+                card.control.request(flat_message(load_overlay_config(), starting=pid not in self.children))
+                card.control.request(post_message(load_display_config()))
                 self.cards[pid] = card
                 self.running_box.append(card)
         for pid in list(self.cards):
@@ -1112,10 +1436,31 @@ class Manager(Adw.Application):
                 card.control.close()
                 del self.cards[pid]
         self.running_empty.set_visible(not self.cards)
+        running = {(card.exe, card.name): pid for pid, card in self.cards.items()}
+        if running != getattr(self, "running_games", None):
+            self.running_games = running
+            self.rebuild_library()
         return True
+
+    def running_pid(self, game):
+        """PID of the running copy of a library game (matched by exe, or by name for launcher games)."""
+        for (exe, name), pid in getattr(self, "running_games", {}).items():
+            if exe == game.get("exe") or name == game.get("name"):
+                return pid
+        return None
+
+
+def write_loader_settings():
+    """The loader reads these flat copies when it was started without the manager."""
+    try:
+        write_overlay_loader_file(load_overlay_config())
+        write_display_loader_file(load_display_config())
+    except OSError:
+        pass
 
 
 def main():
+    write_loader_settings()
     return Manager().run(sys.argv)
 
 

@@ -36,6 +36,12 @@ int main(void)
     void *two = beer_veh_add(0, tail_two);
     void *first = beer_veh_add(1, first_handler);
     assert(one && two && first);
+    int unrelated = 0;
+    assert(!beer_veh_remove(&unrelated));
+    assert(!beer_veh_remove((void *)1));
+    assert(!beer_veh_remove((void *)UINTPTR_MAX));
+    assert(!beer_veh_remove((char *)one + 1));
+    assert(!beer_veh_remove((char *)two + 4));
 
     assert(beer_veh_dispatch((void *)(uintptr_t)0x1234));
     assert(call_count == 1 && calls[0] == 3);

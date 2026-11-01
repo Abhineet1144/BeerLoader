@@ -82,6 +82,8 @@ void beer_post_init(const char *exe_path)
     char *dot = strrchr(post.game, '.');
     if (dot) *dot = 0;
     const char *json = getenv("BEER_POST_JSON");
+    static char saved[4096];
+    if ((!json || !*json) && beer_read_config("display-loader.json", saved, sizeof(saved))) json = saved;
     if (json && *json) {
         pthread_mutex_lock(&post.lock);
         apply(json);

@@ -190,13 +190,29 @@ static uint64_t read_u64(const void *value)
     return result;
 }
 
+/* UNWIND_CODE operands occupy slots too; they are not separate operations. */
+static unsigned unwind_operation_slots(unsigned op, unsigned op_info)
+{
+    switch (op) {
+    case UWOP_PUSH_NONVOL:
+    case UWOP_ALLOC_SMALL:
+    case UWOP_SET_FPREG: return 1;
+    case UWOP_ALLOC_LARGE: return op_info == 0 ? 2 : op_info == 1 ? 3 : 0;
+    case UWOP_SAVE_NONVOL:
+    case UWOP_SAVE_XMM128: return 2;
+    case UWOP_SAVE_NONVOL_FAR:
+    case UWOP_SAVE_XMM128_FAR: return 3;
+    case UWOP_PUSH_MACHFRAME: return op_info <= 1 ? 1 : 0;
+    default: return 0;
+    }
+}
+
 uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
                             uint64_t control_pc,
                             const BeerRuntimeFunction *function_entry,
                             void *context_record, uint64_t *handler_data,
                             uint64_t *establisher_frame, int *ok)
 {
-    (void)control_pc;
     if (ok) *ok = 0;
     if (handler_data) *handler_data = 0;
     if (!image_base || !function_entry || !context_record) return 0;
@@ -206,6 +222,13 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
     memcpy(saved, context, sizeof(saved));
     const BeerRuntimeFunction *entry = function_entry;
     uint64_t handler = 0;
+    if (!entry->unwind_data) goto fail;
+    const uint8_t *first_info =
+        (const uint8_t *)(uintptr_t)(image_base + entry->unwind_data);
+    uint64_t prolog_offset = control_pc >= image_base &&
+                            control_pc - image_base >= entry->begin_address
+        ? control_pc - image_base - entry->begin_address : UINT64_MAX;
+    int in_prolog = prolog_offset <= first_info[1];
     /* The establisher frame is the frame's own stack pointer as the function
      * body sees it: the frame register minus its scaled offset when the
      * function has one, otherwise RSP at the unwind point, i.e. BEFORE the
@@ -213,11 +236,22 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
      * buffer's Frame and what C++/SEH language handlers expect). */
     uint64_t body_frame;
     {
-        const uint8_t *first_info =
-            (const uint8_t *)(uintptr_t)(image_base + function_entry->unwind_data);
         const unsigned first_frame_reg = first_info[3] & 15u;
         const unsigned first_frame_offset = first_info[3] >> 4;
-        body_frame = first_frame_reg
+        /* A chained region's frame was already established in its parent. */
+        int frame_established = !in_prolog || (first_info[0] >> 3 & UNW_FLAG_CHAININFO);
+        if (in_prolog) {
+            for (unsigned i = 0; i < first_info[2];) {
+                unsigned op = first_info[4 + i * 2 + 1] & 15u;
+                unsigned op_info = first_info[4 + i * 2 + 1] >> 4;
+                unsigned slots = unwind_operation_slots(op, op_info);
+                if (!slots || slots > first_info[2] - i) goto fail;
+                if (op == UWOP_SET_FPREG && first_info[4 + i * 2] <= prolog_offset)
+                    frame_established = 1;
+                i += slots;
+            }
+        }
+        body_frame = first_frame_reg && frame_established
             ? get_gp(context, first_frame_reg) - (uint64_t)first_frame_offset * 16
             : get_gp(context, 4);
     }
@@ -238,7 +272,18 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
         for (unsigned index = 0; index < count;) {
             unsigned op = codes[index * 2 + 1] & 15u;
             unsigned op_info = codes[index * 2 + 1] >> 4;
+            unsigned slots = unwind_operation_slots(op, op_info);
+            if (!slots || slots > count - index) goto fail;
+            /* Only completed operations exist in a partial prologue. Parent
+             * chained records describe earlier regions and are unwound fully.
+             * Microsoft x64 unwind procedure, case (b): no handler here. */
+            if (chain == 0 && in_prolog && codes[index * 2] > prolog_offset) {
+                index += slots;
+                continue;
+            }
             uint64_t offset;
+            uint64_t save_base = frame_reg
+                ? get_gp(context, frame_reg) - (uint64_t)frame_offset * 16 : rsp;
             switch (op) {
             case UWOP_PUSH_NONVOL:
                 if (op_info >= 16) goto fail;
@@ -270,28 +315,28 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
                 if (op_info >= 16 || index + 1 >= count) goto fail;
                 offset = (uint64_t)read_u16(codes + (index + 1) * 2) * 8;
                 set_gp(context, op_info,
-                       read_u64((const void *)(uintptr_t)(rsp + offset)));
+                      read_u64((const void *)(uintptr_t)(save_base + offset)));
                 index += 2;
                 break;
             case UWOP_SAVE_NONVOL_FAR:
                 if (op_info >= 16 || index + 2 >= count) goto fail;
                 offset = read_u32(codes + (index + 1) * 2);
                 set_gp(context, op_info,
-                       read_u64((const void *)(uintptr_t)(rsp + offset)));
+                      read_u64((const void *)(uintptr_t)(save_base + offset)));
                 index += 3;
                 break;
             case UWOP_SAVE_XMM128:
                 if (op_info >= 16 || index + 1 >= count) goto fail;
                 offset = (uint64_t)read_u16(codes + (index + 1) * 2) * 16;
                 memcpy(context + 0x1a0 + op_info * 16,
-                       (const void *)(uintptr_t)(rsp + offset), 16);
+                      (const void *)(uintptr_t)(save_base + offset), 16);
                 index += 2;
                 break;
             case UWOP_SAVE_XMM128_FAR:
                 if (op_info >= 16 || index + 2 >= count) goto fail;
                 offset = read_u32(codes + (index + 1) * 2);
                 memcpy(context + 0x1a0 + op_info * 16,
-                       (const void *)(uintptr_t)(rsp + offset), 16);
+                      (const void *)(uintptr_t)(save_base + offset), 16);
                 index += 3;
                 break;
             case UWOP_PUSH_MACHFRAME: {
@@ -316,13 +361,14 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
         const uint8_t *tail = codes + padded * 2u;
         if (flags & UNW_FLAG_CHAININFO) {
             if (flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) goto fail;
+            if (chain == 15) goto fail; /* Cyclic/excessive chain: no guessed unwind. */
             entry = (const BeerRuntimeFunction *)tail;
             continue;
         }
         /* Only the handler class the caller asked for (EHANDLER while
          * searching, UHANDLER while unwinding) is reported. */
         if (flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) {
-            if (!(flags & handler_type)) break;
+            if (in_prolog || !(flags & handler_type)) break;
             uint32_t handler_rva = read_u32(tail);
             handler = image_base + handler_rva;
             if (handler_data) *handler_data = (uint64_t)(uintptr_t)(tail + 4);

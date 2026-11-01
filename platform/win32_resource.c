@@ -160,3 +160,60 @@ uint64_t __attribute__((ms_abi)) beer_SizeofResource(uint64_t module, uint64_t r
 }
 
 uint64_t __attribute__((ms_abi)) beer_FreeResource(uint64_t data) { (void)data; return 0; }
+
+/* EnumResourceNames(module, type, callback, param): calls callback(module, type, name, param) for
+ * each name under the type, names first and then integer IDs, as the resource directory orders them.
+ * A string name is passed as a NUL-terminated copy; the callback returning FALSE stops the walk. */
+typedef int32_t (__attribute__((ms_abi)) *BeerEnumResNameProc)(uint64_t module, uint64_t type, uint64_t name,
+                                                                 uint64_t param);
+static uint64_t enum_resource_names(uint64_t module, uint64_t type, uint64_t reported_type, uint64_t callback,
+                                    uint64_t param, int wide)
+{
+    uint64_t base = module ? module : g_default_module;
+    uint32_t rva, size, target;
+    if (!callback) return 0;
+    if (!base || !image_directory(base, &rva, &size)) return 0;
+    uint64_t root = base + rva;
+    if (!find_entry(root, 0, type, 0, 0, &target) || !(target & 0x80000000u)) return 0;
+    uint32_t directory = target & 0x7fffffffu;
+    struct { uint32_t characteristics, timestamp; uint16_t major, minor, named, ids; } header;
+    if (!rd(root + directory, &header, sizeof(header))) return 0;
+    uint32_t count = (uint32_t)header.named + header.ids;
+    if (count > 4096) return 0;
+    int any = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t entry[2];
+        if (!rd(root + directory + 16 + i * 8, entry, 8)) return 0;
+        uint64_t name;
+        uint16_t wide_name[257];
+        char narrow_name[257];
+        if (i < header.named) {
+            uint16_t length;
+            uint64_t string = root + (entry[0] & 0x7fffffffu);
+            if (!rd(string, &length, 2) || length > 256 || !rd(string + 2, wide_name, (size_t)length * 2)) return 0;
+            wide_name[length] = 0;
+            if (wide) {
+                name = (uint64_t)(uintptr_t)wide_name;
+            } else {
+                for (uint16_t c = 0; c <= length; ++c) narrow_name[c] = wide_name[c] < 0x80 ? (char)wide_name[c] : '?';
+                name = (uint64_t)(uintptr_t)narrow_name;
+            }
+        } else {
+            name = entry[0] & 0xffffu;                    /* MAKEINTRESOURCE */
+        }
+        any = 1;
+        if (!((BeerEnumResNameProc)(uintptr_t)callback)(module, reported_type, name, param)) break;
+    }
+    return any;
+}
+uint64_t __attribute__((ms_abi)) beer_EnumResourceNamesW(uint64_t module, uint64_t type, uint64_t callback,
+                                                          uint64_t param)
+{
+    return enum_resource_names(module, type, type, callback, param, 1);
+}
+uint64_t __attribute__((ms_abi)) beer_EnumResourceNamesA(uint64_t module, uint64_t type, uint64_t callback,
+                                                          uint64_t param)
+{
+    uint16_t buffer[256];
+    return enum_resource_names(module, widen(type, buffer, 256), type, callback, param, 0);
+}

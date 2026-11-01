@@ -178,6 +178,20 @@ int beer_json_string(const char *json, const char *key, char *out, size_t size)
 }
 
 /* Parses a JSON number (or true/false) into milli units without floating point. */
+int beer_read_config(const char *name, char *out, size_t size)
+{
+    const char *home = getenv("HOME");
+    char path[1024];
+    if (!home || !*home || !size || snprintf(path, sizeof(path), "%s/.beer/%s", home, name) >= (int)sizeof(path))
+        return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t n = fread(out, 1, size - 1, f);
+    fclose(f);
+    out[n] = 0;
+    return n > 0;
+}
+
 int beer_json_milli(const char *json, const char *key, int32_t *out)
 {
     const char *p = beer_json_find(json, key);

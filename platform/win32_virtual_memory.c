@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
@@ -63,6 +64,7 @@ typedef struct BeerAllocation {
     void *base;
     size_t size;
     uint32_t allocation_protect;
+    uint32_t *page_protect; /* Requested guest protection; zero means reserved. */
 } BeerAllocation;
 
 static BeerAllocation g_allocations[BEER_VM_CAPACITY];
@@ -95,7 +97,11 @@ static int windows_to_host_protection(uint32_t protection)
     case BEER_PAGE_NOACCESS: return PROT_NONE;
     case BEER_PAGE_READONLY: return PROT_READ;
     case BEER_PAGE_READWRITE: return PROT_READ | PROT_WRITE;
-    case BEER_PAGE_EXECUTE: return PROT_EXEC;
+    /* Conventional Windows x86 page tables cannot prohibit data reads while
+     * allowing execution. Linux PROT_EXEC alone can instead enable an implicit
+     * execute-only protection key. Preserve the x86 guest's effective access,
+     * independently of the host, and keep requested flags in page metadata. */
+    case BEER_PAGE_EXECUTE: return PROT_EXEC | PROT_READ;
     case BEER_PAGE_EXECUTE_READ: return PROT_EXEC | PROT_READ;
     case BEER_PAGE_EXECUTE_READWRITE: return PROT_EXEC | PROT_READ | PROT_WRITE;
     default: return -1;
@@ -142,6 +148,7 @@ static void *virtual_alloc_aligned(void *address, size_t size, uint32_t allocati
     size_t page = page_size();
     uintptr_t requested = align_down((uintptr_t)address, page);
     size_t prefix = address ? (uintptr_t)address - requested : 0;
+    if (size > SIZE_MAX - prefix) { errno = ENOMEM; return NULL; }
     size_t mapped_size = align_up_size(size + prefix, page);
     if (!mapped_size) {
         errno = ENOMEM;
@@ -153,17 +160,28 @@ static void *virtual_alloc_aligned(void *address, size_t size, uint32_t allocati
         pthread_mutex_lock(&g_allocation_mutex);
         BeerAllocation *existing = find_allocation_locked((void *)requested);
         int inside = existing &&
-            requested + mapped_size <= (uintptr_t)existing->base + existing->size;
-        pthread_mutex_unlock(&g_allocation_mutex);
+            mapped_size <= existing->size - (requested - (uintptr_t)existing->base);
         if (existing) {
             if (!inside || !(allocation_type & BEER_MEM_COMMIT) ||
-                (allocation_type & BEER_MEM_RESERVE && !(allocation_type & BEER_MEM_COMMIT))) {
+                (allocation_type & BEER_MEM_RESERVE)) {
+                pthread_mutex_unlock(&g_allocation_mutex);
                 errno = EEXIST;
                 return NULL;
             }
-            if (mprotect((void *)requested, mapped_size, host_protection) != 0) return NULL;
-            return address;
+            if (mprotect((void *)requested, mapped_size, host_protection) != 0) {
+                pthread_mutex_unlock(&g_allocation_mutex);
+                return NULL;
+            }
+            size_t first = (requested - (uintptr_t)existing->base) / page;
+            for (size_t i = 0; i < mapped_size / page; ++i)
+                existing->page_protect[first + i] = protection;
+            pthread_mutex_unlock(&g_allocation_mutex);
+            return (void *)requested;
         }
+        pthread_mutex_unlock(&g_allocation_mutex);
+        /* A nonnull commit-only address must belong to an existing reservation;
+         * mmap must not silently turn an invalid commit into a fresh reserve. */
+        if (!(allocation_type & BEER_MEM_RESERVE)) { errno = EINVAL; return NULL; }
     }
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_FIXED_NOREPLACE
@@ -198,6 +216,10 @@ static void *virtual_alloc_aligned(void *address, size_t size, uint32_t allocati
         return NULL;
     }
 #endif
+    uint32_t *page_protect = calloc(mapped_size / page, sizeof(*page_protect));
+    if (!page_protect) { munmap(mapped, mapped_size); errno = ENOMEM; return NULL; }
+    if (allocation_type & BEER_MEM_COMMIT)
+        for (size_t i = 0; i < mapped_size / page; ++i) page_protect[i] = protection;
     pthread_mutex_lock(&g_allocation_mutex);
     BeerAllocation *slot = NULL;
     for (size_t index = 0; index < BEER_VM_CAPACITY; ++index)
@@ -207,9 +229,11 @@ static void *virtual_alloc_aligned(void *address, size_t size, uint32_t allocati
         slot->base = mapped;
         slot->size = mapped_size;
         slot->allocation_protect = protection;
+        slot->page_protect = page_protect;
     }
     pthread_mutex_unlock(&g_allocation_mutex);
     if (!slot) {
+        free(page_protect);
         munmap(mapped, mapped_size);
         errno = ENOMEM;
         return NULL;
@@ -245,6 +269,7 @@ int beer_virtual_free(void *address, size_t size, uint32_t free_type)
         void *base = allocation->base;
         size_t allocation_size = allocation->size;
         g_beer_vm_live_bytes -= allocation_size;
+        free(allocation->page_protect);
         memset(allocation, 0, sizeof(*allocation));
         pthread_mutex_unlock(&g_allocation_mutex);
         return munmap(base, allocation_size) == 0;
@@ -252,9 +277,21 @@ int beer_virtual_free(void *address, size_t size, uint32_t free_type)
     if (free_type == BEER_MEM_DECOMMIT && size) {
         size_t page = page_size();
         uintptr_t base = align_down((uintptr_t)address, page);
-        size_t length = align_up_size((uintptr_t)address - base + size, page);
-        if (!length || mprotect((void *)base, length, PROT_NONE) != 0) return 0;
+        size_t prefix = (uintptr_t)address - base;
+        if (size > SIZE_MAX - prefix) return 0;
+        size_t length = align_up_size(prefix + size, page);
+        if (!length) return 0;
+        pthread_mutex_lock(&g_allocation_mutex);
+        BeerAllocation *allocation = find_allocation_locked((void *)base);
+        if (!allocation || length > allocation->size - (base - (uintptr_t)allocation->base) ||
+            mprotect((void *)base, length, PROT_NONE) != 0) {
+            pthread_mutex_unlock(&g_allocation_mutex);
+            return 0;
+        }
         (void)madvise((void *)base, length, MADV_DONTNEED);
+        size_t first = (base - (uintptr_t)allocation->base) / page;
+        memset(allocation->page_protect + first, 0, length / page * sizeof(uint32_t));
+        pthread_mutex_unlock(&g_allocation_mutex);
         return 1;
     }
     return 0;
@@ -307,8 +344,11 @@ size_t beer_virtual_query(const void *address, BeerMemoryBasicInformation *info,
         info->state = BEER_MEM_FREE;
         return sizeof(*info);
     }
-    info->base_address = start;
-    info->region_size = end - start;
+    /* VirtualQuery starts at the requested page, then scans FORWARD. Returning
+     * an earlier VMA/allocation base gives incorrect sizes to region walkers. */
+    uintptr_t query_start = align_down(value, page_size());
+    info->base_address = query_start;
+    info->region_size = end - query_start;
     info->state = BEER_MEM_COMMIT;
     info->protect = host_to_windows_protection(read, write, execute);
     info->type = shared ? BEER_MEM_MAPPED : BEER_MEM_PRIVATE;
@@ -319,6 +359,15 @@ size_t beer_virtual_query(const void *address, BeerMemoryBasicInformation *info,
         info->allocation_base = (uint64_t)(uintptr_t)allocation->base;
         info->allocation_protect = allocation->allocation_protect;
         info->type = BEER_MEM_PRIVATE;
+        size_t page = page_size();
+        size_t index = (value - (uintptr_t)allocation->base) / page;
+        uint32_t protection = allocation->page_protect[index];
+        size_t first = index, last = index + 1, count = allocation->size / page;
+        while (last < count && allocation->page_protect[last] == protection) ++last;
+        info->base_address = (uintptr_t)allocation->base + first * page;
+        info->region_size = (last - first) * page;
+        info->state = protection ? BEER_MEM_COMMIT : BEER_MEM_RESERVE;
+        info->protect = protection ? protection : BEER_PAGE_NOACCESS;
     } else {
         info->allocation_base = start;
         info->allocation_protect = info->protect;
@@ -338,8 +387,33 @@ int beer_virtual_protect(void *address, size_t size, uint32_t new_protection,
     if (host_protection < 0) return 0;
     size_t page = page_size();
     uintptr_t base = align_down((uintptr_t)address, page);
-    size_t length = align_up_size((uintptr_t)address - base + size, page);
-    if (!length || mprotect((void *)base, length, host_protection) != 0) return 0;
+    size_t prefix = (uintptr_t)address - base;
+    if (size > SIZE_MAX - prefix) return 0;
+    size_t length = align_up_size(prefix + size, page);
+    if (!length) return 0;
+    pthread_mutex_lock(&g_allocation_mutex);
+    BeerAllocation *allocation = find_allocation_locked((void *)base);
+    size_t first = allocation ? (base - (uintptr_t)allocation->base) / page : 0;
+    if (allocation) {
+        if (length > allocation->size - (base - (uintptr_t)allocation->base)) {
+            pthread_mutex_unlock(&g_allocation_mutex);
+            return 0;
+        }
+        for (size_t i = 0; i < length / page; ++i)
+            if (!allocation->page_protect[first + i]) {
+                pthread_mutex_unlock(&g_allocation_mutex);
+                return 0;
+            }
+        info.protect = allocation->page_protect[first];
+    }
+    if (mprotect((void *)base, length, host_protection) != 0) {
+        pthread_mutex_unlock(&g_allocation_mutex);
+        return 0;
+    }
+    if (allocation)
+        for (size_t i = 0; i < length / page; ++i)
+            allocation->page_protect[first + i] = new_protection;
+    pthread_mutex_unlock(&g_allocation_mutex);
     if (old_protection) *old_protection = info.protect;
     return 1;
 }
@@ -350,7 +424,9 @@ void beer_virtual_memory_reset(void)
     for (size_t index = 0; index < BEER_VM_CAPACITY; ++index) {
         if (g_allocations[index].base)
             munmap(g_allocations[index].base, g_allocations[index].size);
+        free(g_allocations[index].page_protect);
         memset(&g_allocations[index], 0, sizeof(g_allocations[index]));
     }
+    g_beer_vm_live_bytes = 0;
     pthread_mutex_unlock(&g_allocation_mutex);
 }
