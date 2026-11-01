@@ -89,6 +89,11 @@ uint32_t cm_public_ip(Cm *cm);
 uint32_t cm_logon_age(Cm *cm);
 /* Sends a message without waiting for a reply. */
 int cm_send(Cm *cm, uint32_t emsg, const PbBuf *body);
+/* As cm_request / cm_send, with CMsgProtoBufHeader.routing_appid set (app-scoped services such as
+ * matchmaking route on it). */
+int cm_request_routed(Cm *cm, uint32_t emsg, const PbBuf *body, uint32_t routing_appid, int pending_field,
+                      int timeout_ms, CmPart **parts);
+int cm_send_routed(Cm *cm, uint32_t emsg, const PbBuf *body, uint32_t routing_appid);
 /* Sends ClientLogOff and waits briefly for the server to end the session. */
 void cm_logoff(Cm *cm);
 

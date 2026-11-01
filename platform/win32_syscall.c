@@ -38,6 +38,10 @@ __asm__(
     "    jmp *%fs:beer_win32_syscall_resume_rip@tpoff\n"
 );
 
+static BeerWin32ContinueFn g_continue;
+
+void beer_win32_syscall_set_continue(BeerWin32ContinueFn fn) { g_continue = fn; }
+
 typedef struct {
     char name[64];              /* canonical Nt<Name>; empty when unused */
     BeerWin32SyscallFn fn;
@@ -311,7 +315,23 @@ static void beer_win32_syscall_signal(int sig, siginfo_t *info, void *context)
     if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(stack))
         memset(stack, 0, sizeof(stack));
 
-    if (service && service->fn) {
+    if (service && g_continue && !strcmp(service->name, "NtContinue")) {
+        const uint64_t context = (uint64_t)regs[REG_R10];
+        status = g_continue(uc, context, (uint64_t)regs[REG_RDX]);
+        if (g_trace < 0) g_trace = getenv("BEER_API_TRACE") != NULL || getenv("BEER_SYSCALL_DIAGNOSTICS") != NULL;
+        if (g_trace) {
+            char line[160];
+            int length = snprintf(line, sizeof(line), "[SYSCALL] 0x%x NtContinue(%llx) rip=%llx -> 0x%x, resume rip=%llx rsp=%llx\n",
+                                  number, (unsigned long long)context, (unsigned long long)rip, (unsigned)status,
+                                  (unsigned long long)regs[REG_RIP], (unsigned long long)regs[REG_RSP]);
+            if (length > 0) (void)!write(2, line, (size_t)length);
+        }
+        if (status == 0) {                  /* the frame now holds the CONTEXT's registers */
+            beer_win32_syscall_resume_rip = (uint64_t)regs[REG_RIP];
+            regs[REG_RIP] = (greg_t)(uintptr_t)beer_win32_syscall_resume;
+            return;
+        }
+    } else if (service && service->fn) {
         status = (uint32_t)service->fn((uint64_t)regs[REG_R10], (uint64_t)regs[REG_RDX],
                                        (uint64_t)regs[REG_R8], (uint64_t)regs[REG_R9],
                                        stack[0], stack[1], stack[2], stack[3],

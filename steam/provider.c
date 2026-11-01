@@ -330,9 +330,11 @@ static void library_reset(void)
     pthread_mutex_unlock(&g.lock);
 }
 
+static void broadcast_mms_event(uint32_t emsg, const uint8_t *body, size_t len);
 static void on_message(void *context, uint32_t emsg, const uint8_t *body, size_t len)
 {
     (void)context;
+    if (emsg >= 6601u && emsg <= 6627u) { broadcast_mms_event(emsg, body, len); return; }
     if (emsg == EMSG_CLIENT_GAME_CONNECT_TOKENS) {
         PbReader r = { body, body + len };
         PbField f;
@@ -1047,15 +1049,9 @@ static void handle_game_request(const char *op, const char *id, const char *line
     int signed_in = g.state == STATE_SIGNED_IN;
     pthread_mutex_unlock(&g.lock);
     if (!signed_in) { game_error(event, id, "not signed in to Steam"); return; }
-    if (!appid || !app_owned(appid)) { game_error(event, id, "this account does not own the app"); return; }
 
-    if (!strcmp(op, "auth_ticket")) { issue_auth_ticket(id, appid); return; }
-    if (!strcmp(op, "cancel_auth_ticket")) {
-        char handle[16] = "";
-        json_get(line, "handle", handle, sizeof(handle));
-        cancel_auth_ticket(id, (uint32_t)strtoul(handle, NULL, 10));
-        return;
-    }
+    if (!appid) { game_error(event, id, "no app ID"); return; }
+
     if (!strcmp(op, "game_session")) {
         size_t count;
         uint32_t *owned = owned_apps(&count);
@@ -1077,6 +1073,19 @@ static void handle_game_request(const char *op, const char *id, const char *line
              "\"account\":\"%s\",\"persona\":\"%s\",\"owned\":[%s]}",
              idj, appid, (unsigned long long)steamid, account, persona, list ? list : "");
         free(list);
+        return;
+    }
+
+    /* game_session above is identity only (SteamID, persona, and the owned-app list the game checks
+     * itself), so it is answered for any app. Everything below is entitlement-bearing: auth and app
+     * tickets are only minted for apps this account owns. */
+    if (!app_owned(appid)) { game_error(event, id, "this account does not own the app"); return; }
+
+    if (!strcmp(op, "auth_ticket")) { issue_auth_ticket(id, appid); return; }
+    if (!strcmp(op, "cancel_auth_ticket")) {
+        char handle[16] = "";
+        json_get(line, "handle", handle, sizeof(handle));
+        cancel_auth_ticket(id, (uint32_t)strtoul(handle, NULL, 10));
         return;
     }
 
@@ -1124,6 +1133,133 @@ static void handle_game_request(const char *op, const char *id, const char *line
 
 /* ---------------------------------------------------------------- socket server */
 
+/* ------------------------------------------------------------ matchmaking */
+
+/* Steam's matchmaking (MMS) message range and the unsolicited events in it. Games build the message
+ * bodies; the provider only relays them for the signed-in session, routed to the app as the Steam client
+ * routes them, and only for apps this account owns. */
+#define EMSG_MMS_FIRST 6601u
+#define EMSG_MMS_LAST 6627u
+#define EMSG_CLIENT_GAMES_PLAYED_WITH_DATA_BLOB 5410u
+#define EMSG_CLIENT_CHANGE_STATUS 716u
+
+static __thread int t_client_fd = -1;          /* the client connection handle_request is serving */
+static struct { int fd; uint32_t appid; uint32_t pid; } g_playing[MAX_CLIENTS];
+static pthread_mutex_t g_playing_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* CMsgClientGamesPlayed with every game a connected client reported running (empty: none). */
+static void send_games_played(void)
+{
+    PbBuf msg = {0};
+    pthread_mutex_lock(&g_playing_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!g_playing[i].appid) continue;
+        PbBuf game = {0};
+        pb_fixed64(&game, 2, g_playing[i].appid);      /* game_id: a plain app's GameID is its app ID */
+        pb_u64(&game, 9, g_playing[i].pid);             /* process_id */
+        pb_msg(&msg, 1, &game);
+        pb_free(&game);
+    }
+    pthread_mutex_unlock(&g_playing_lock);
+    pb_u64(&msg, 2, 20);                                /* client_os_type: Windows 10, what the game is */
+    cm_send(g.cm, EMSG_CLIENT_GAMES_PLAYED_WITH_DATA_BLOB, &msg);
+    pb_free(&msg);
+}
+
+static void games_played_clear_client(int fd)
+{
+    int changed = 0;
+    pthread_mutex_lock(&g_playing_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (g_playing[i].appid && g_playing[i].fd == fd) { g_playing[i].appid = 0; changed = 1; }
+    pthread_mutex_unlock(&g_playing_lock);
+    if (changed && cm_logged_on(g.cm)) send_games_played();
+}
+
+static int session_app_allowed(const char *event, const char *id, uint32_t appid)
+{
+    pthread_mutex_lock(&g.lock);
+    int signed_in = g.state == STATE_SIGNED_IN;
+    pthread_mutex_unlock(&g.lock);
+    if (!signed_in) { game_error(event, id, "not signed in to Steam"); return 0; }
+    if (!appid) { game_error(event, id, "no app ID"); return 0; }
+    if (!app_owned(appid)) { game_error(event, id, "this account does not own the app"); return 0; }
+    return 1;
+}
+
+static void handle_mms_request(const char *op, const char *id, const char *line)
+{
+    char appid_text[16] = "", emsg_text[16] = "", pid_text[16] = "", idj[140];
+    json_get(line, "appid", appid_text, sizeof(appid_text));
+    json_get(line, "emsg", emsg_text, sizeof(emsg_text));
+    json_get(line, "pid", pid_text, sizeof(pid_text));
+    const uint32_t appid = (uint32_t)strtoul(appid_text, NULL, 10);
+    const uint32_t emsg = (uint32_t)strtoul(emsg_text, NULL, 10);
+    json_escape(idj, sizeof(idj), id);
+    if (!session_app_allowed(op, id, appid)) return;
+
+    if (!strcmp(op, "games_played")) {
+        /* Friends see a running game (and can join its lobby) only while the user is online; the Steam client
+         * is online from sign-in, so mark the session online (CMsgClientChangeStatus.persona_state = Online). */
+        static int online;
+        if (!online) {
+            PbBuf status = {0};
+            pb_u64(&status, 1, 1);
+            online = cm_send(g.cm, EMSG_CLIENT_CHANGE_STATUS, &status);
+            pb_free(&status);
+        }
+        pthread_mutex_lock(&g_playing_lock);
+        int slot = -1;
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if ((g_playing[i].appid && g_playing[i].fd == t_client_fd) || (slot < 0 && !g_playing[i].appid)) slot = i;
+        if (slot >= 0) g_playing[slot] = (typeof(g_playing[0])){ t_client_fd, appid, (uint32_t)strtoul(pid_text, NULL, 10) };
+        pthread_mutex_unlock(&g_playing_lock);
+        send_games_played();
+        emit("{\"event\":\"games_played\",\"id\":\"%s\",\"ok\":true,\"appid\":%u}", idj, appid);
+        return;
+    }
+
+    if (emsg < EMSG_MMS_FIRST || emsg > EMSG_MMS_LAST) { game_error(op, id, "not a matchmaking message"); return; }
+    char *hex = malloc(strlen(line) + 1);
+    uint8_t *body = malloc(strlen(line) / 2 + 1);
+    if (!hex || !body) { free(hex); free(body); game_error(op, id, "out of memory"); return; }
+    hex[0] = 0;
+    json_get(line, "body", hex, strlen(line) + 1);
+    PbBuf request = {0};
+    pb_raw(&request, body, unhex(hex, body, strlen(line) / 2 + 1));
+    free(hex);
+    free(body);
+
+    if (!strcmp(op, "mms_send")) {
+        int sent = cm_send_routed(g.cm, emsg, &request, appid);
+        pb_free(&request);
+        if (!sent) { game_error(op, id, "not connected to Steam"); return; }
+        emit("{\"event\":\"mms_send\",\"id\":\"%s\",\"ok\":true}", idj);
+        return;
+    }
+    CmPart *parts = NULL;
+    int done = cm_request_routed(g.cm, emsg, &request, appid, 0, 15000, &parts);
+    pb_free(&request);
+    if (!done || !parts) { cm_parts_free(parts); game_error(op, id, "Steam did not answer"); return; }
+    char *reply = malloc(parts->body.len * 2 + 1);
+    if (!reply) { cm_parts_free(parts); game_error(op, id, "out of memory"); return; }
+    hex_text(parts->body.data, parts->body.len, reply);
+    cm_parts_free(parts);
+    emit("{\"event\":\"mms_request\",\"id\":\"%s\",\"ok\":true,\"body\":\"%s\"}", idj, reply);
+    free(reply);
+}
+
+/* Unsolicited matchmaking messages (lobby data, members joining or leaving, chat, game server set) go to
+ * every game client; each keeps the ones for its own app and lobbies. */
+static void broadcast_mms_event(uint32_t emsg, const uint8_t *body, size_t len)
+{
+    char *text = malloc(len * 2 + 1);
+    if (!text) return;
+    hex_text(body, len, text);
+    emit("{\"event\":\"mms_event\",\"emsg\":%u,\"body\":\"%s\"}", emsg, text);
+    free(text);
+}
+
 static void handle_request(char *line)
 {
     char op[64] = "", id[64] = "";
@@ -1136,6 +1272,8 @@ static void handle_request(char *line)
     } else if (!strcmp(op, "game_session") || !strcmp(op, "app_ticket") || !strcmp(op, "encrypted_ticket") ||
                !strcmp(op, "auth_ticket") || !strcmp(op, "cancel_auth_ticket")) {
         handle_game_request(op, id, line);
+    } else if (!strcmp(op, "mms_request") || !strcmp(op, "mms_send") || !strcmp(op, "games_played")) {
+        handle_mms_request(op, id, line);
     } else if (!strcmp(op, "installs")) {
         char folders[8192] = "";
         json_get(line, "folders", folders, sizeof(folders));
@@ -1190,9 +1328,11 @@ static void handle_request(char *line)
     memset(line, 0, strlen(line));
 }
 
+static void games_played_clear_client(int fd);
 static void *client_thread(void *arg)
 {
     int fd = (int)(intptr_t)arg;
+    t_client_fd = fd;
     char buf[8192];
     size_t len = 0;
     for (;;) {
@@ -1211,6 +1351,7 @@ static void *client_thread(void *arg)
         if (len == sizeof(buf) - 1) len = 0;   /* oversized line: drop it */
     }
     memset(buf, 0, sizeof(buf));
+    games_played_clear_client(fd);                /* the game exited: Steam no longer shows it running */
     pthread_mutex_lock(&g.lock);
     for (int i = 0; i < g.client_count; i++)
         if (g.clients[i] == fd) { g.clients[i] = g.clients[--g.client_count]; break; }

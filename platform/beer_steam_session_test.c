@@ -28,7 +28,8 @@ static void reply_to(int fd, const char *line)
         snprintf(out, sizeof(out), "{\"event\":\"game_session\",\"id\":\"%s\",\"ok\":true,\"appid\":480,"
                  "\"steamid\":\"76561198000000001\",\"account\":\"tester\",\"persona\":\"Tes\\\"ter\",\"owned\":[480,481,1000]}", id);
     else if (!strcmp(op, "game_session"))
-        snprintf(out, sizeof(out), "{\"event\":\"game_session\",\"id\":\"%s\",\"ok\":false,\"error\":\"this account does not own the app\"}", id);
+        snprintf(out, sizeof(out), "{\"event\":\"game_session\",\"id\":\"%s\",\"ok\":true,\"appid\":999,"
+                 "\"steamid\":\"76561198000000001\",\"account\":\"tester\",\"persona\":\"Tes\\\"ter\",\"owned\":[480,481,1000]}", id);
     else if (!strcmp(op, "app_ticket"))
         snprintf(out, sizeof(out), "{\"event\":\"app_ticket\",\"id\":\"%s\",\"ok\":true,\"appid\":480,\"ticket\":\"0a0b0c0d\"}", id);
     else if (!strcmp(op, "encrypted_ticket") && strstr(line, "\"userdata\":\"cafe\""))
@@ -83,8 +84,9 @@ int main(void)
     pthread_t thread;
     pthread_create(&thread, NULL, serve, NULL);
 
-    assert(!beer_steam_session_open(999, err, sizeof(err)));
-    assert(strstr(err, "does not own"));
+    assert(beer_steam_session_open(999, err, sizeof(err)));
+    assert(beer_steam_session_active());
+    assert(!beer_steam_session_owns(999));
     assert(beer_steam_session_open(480, err, sizeof(err)));
     assert(beer_steam_session_active());
     assert(beer_steam_session_steamid() == 76561198000000001ull);

@@ -72,6 +72,13 @@ int beer_win32_syscall_is_service_name(const char *name);
  * Returns BEER_WIN32_SYSCALL_STUB_SIZE, or 0 when capacity is too small. */
 size_t beer_win32_syscall_write_stub(uint8_t *out, size_t capacity, uint32_t number);
 
+/* NtContinue does not return to its caller: it replaces the thread's registers with a CONTEXT.
+ * For a guest SYSCALL the loader supplies the conversion, which writes the CONTEXT
+ * into the signal frame (a ucontext_t) and returns 0, or returns a failure NTSTATUS
+ * and leaves the frame unchanged. */
+typedef uint32_t (*BeerWin32ContinueFn)(void *ucontext, uint64_t context, uint64_t test_alert);
+void beer_win32_syscall_set_continue(BeerWin32ContinueFn fn);
+
 /* Installs the SIGSYS handler and enables dispatch on the calling thread.
  * Returns 1 on success and 0 if the host lacks Syscall User Dispatch. */
 int beer_win32_syscall_install(void);

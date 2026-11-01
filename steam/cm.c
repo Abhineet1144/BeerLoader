@@ -115,8 +115,17 @@ static void wake(Cm *cm)
     if (write(cm->wake_fd, &one, sizeof(one)) < 0) { /* already signalled */ }
 }
 
-/* Builds and queues a packet. Caller holds no lock. */
+/* Builds and queues a packet. Caller holds no lock. routing_appid (CMsgProtoBufHeader field 3) routes
+ * app-scoped requests such as matchmaking to the app's backend; 0 omits it. */
+static int enqueue_routed(Cm *cm, uint32_t emsg, uint64_t job_source, const char *job_name, const PbBuf *body,
+                          uint32_t routing_appid);
 static int enqueue(Cm *cm, uint32_t emsg, uint64_t job_source, const char *job_name, const PbBuf *body)
+{
+    return enqueue_routed(cm, emsg, job_source, job_name, body, 0);
+}
+
+static int enqueue_routed(Cm *cm, uint32_t emsg, uint64_t job_source, const char *job_name, const PbBuf *body,
+                          uint32_t routing_appid)
 {
     PbBuf header = {0};
     pthread_mutex_lock(&cm->lock);
@@ -125,6 +134,7 @@ static int enqueue(Cm *cm, uint32_t emsg, uint64_t job_source, const char *job_n
     pthread_mutex_unlock(&cm->lock);
     pb_fixed64(&header, 1, steamid);
     pb_i32(&header, 2, session);
+    if (routing_appid) pb_u64(&header, 3, routing_appid);
     if (job_source != JOB_NONE) pb_fixed64(&header, 10, job_source);
     pb_string(&header, 12, job_name);
 
@@ -466,6 +476,12 @@ void cm_parts_free(CmPart *parts)
 
 int cm_request(Cm *cm, uint32_t emsg, const PbBuf *body, int pending_field, int timeout_ms, CmPart **parts)
 {
+    return cm_request_routed(cm, emsg, body, 0, pending_field, timeout_ms, parts);
+}
+
+int cm_request_routed(Cm *cm, uint32_t emsg, const PbBuf *body, uint32_t routing_appid, int pending_field,
+                      int timeout_ms, CmPart **parts)
+{
     *parts = NULL;
     Job *job = calloc(1, sizeof(*job));
     if (!job) return 0;
@@ -477,7 +493,7 @@ int cm_request(Cm *cm, uint32_t emsg, const PbBuf *body, int pending_field, int 
     cm->jobs = job;
     pthread_mutex_unlock(&cm->lock);
 
-    int sent = enqueue(cm, emsg, job->id, NULL, body);
+    int sent = enqueue_routed(cm, emsg, job->id, NULL, body, routing_appid);
     struct timespec deadline;
     deadline_after(&deadline, timeout_ms);
     pthread_mutex_lock(&cm->lock);
@@ -569,6 +585,11 @@ uint32_t cm_logon_age(Cm *cm)
 int cm_send(Cm *cm, uint32_t emsg, const PbBuf *body)
 {
     return enqueue(cm, emsg, JOB_NONE, NULL, body);
+}
+
+int cm_send_routed(Cm *cm, uint32_t emsg, const PbBuf *body, uint32_t routing_appid)
+{
+    return enqueue_routed(cm, emsg, JOB_NONE, NULL, body, routing_appid);
 }
 
 void cm_logoff(Cm *cm)

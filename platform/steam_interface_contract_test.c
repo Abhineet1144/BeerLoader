@@ -11,11 +11,19 @@ int main(void)
     assert(vtable[12] == 0x12);
     assert(vtable[13] == 0x13);
     assert(vtable[14] == 0x14);
+    assert(BEER_STEAM_UTILS_SLOT_GET_STEAM_UI_LANGUAGE == 23);
 
     assert(beer_steam_is_offline_input_interface("steaminput006"));
     assert(beer_steam_is_offline_input_interface("steamcontroller008"));
     assert(!beer_steam_is_offline_input_interface("steamutils010"));
     assert(!beer_steam_is_offline_input_interface(NULL));
+
+    assert(!beer_steam_legacy_session_connected(0, 0, 0, 1, 1));
+    assert(beer_steam_legacy_session_connected(0, 0, 1, 1, 1));
+    assert(!beer_steam_legacy_session_connected(0, 0, 1, 0, 1));
+    assert(!beer_steam_legacy_session_connected(0, 0, 1, 1, 0));
+    assert(!beer_steam_legacy_session_connected(1, 0, 1, 1, 1));
+    assert(beer_steam_legacy_session_connected(1, 1, 1, 1, 1));
 
     puts("steam interface contract test passed");
     return 0;

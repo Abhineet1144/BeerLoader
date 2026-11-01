@@ -1,5 +1,203 @@
 # Beer Loader — Active Development Context
 
+## Taskbar icons: PNG icon images and largest-first fallback (2026-11-01)
+
+Chained Together, Sekiro and Stellar Blade showed no taskbar icon (RE8/RE4/PRAGMATA did). pe_load_application_icon
+picked the largest RT_ICON entry and decoded it only as a DIB; modern exes store the 256x256 image as PNG (CT: five
+DIB sizes + PNG 256; Sekiro: a single PNG), so decoding failed and no smaller size was tried. Now entries are tried
+largest-first and the first that decodes wins; platform/beer_icon_png.{h,c} decodes 8-bit non-interlaced PNG (grey,
+grey+alpha, RGB, RGBA, palette+tRNS, all row filters) with zlib. Test platform/beer_icon_png_test.c in test-input;
+real CT and Sekiro icons decode (256x256). User confirmed CT and Sekiro icons appear.
+
+## Steam online, phase 1: lobbies (MMS) through the session provider (2026-11-01)
+
+How CT's OnlineFix copy works on Windows (checked): OnlineFix.ini RealAppId=2567870, FakeAppId=480 - the game talks
+to the user's running Steam client as Spacewar (480); lobbies, invites and P2P use that account under app 480.
+Beer now does what the Steam client does for that session:
+- Persona: SteamAPI_Init (Valve steam_api64 via onlinefix) failed because SteamMatchMaking009,
+  SteamMatchMakingServers002 and SteamNetworking006 returned NULL -> Unreal used its Null subsystem (computer
+  name). Networking/matchmaking/parties/game-search now get an offline object (every slot 0) when not backed.
+- Provider (steam/provider.c, cm.c): routing_appid (CMsgProtoBufHeader field 3) on routed requests; ops
+  mms_request / mms_send (only EMsg 6601-6627, only for owned apps - 480 is owned), games_played
+  (ClientGamesPlayedWithDataBlob 5410, cleared when the game's connection closes), ClientChangeStatus Online when
+  a game starts (friends see "playing", can join); unsolicited MMS messages broadcast as mms_event.
+  game_session (identity only) is now answered for unowned apps; tickets stay ownership-gated.
+- Session client: dynamic request lines, keeps mms_event lines, non-blocking event poll (trylock).
+- platform/beer_steam_mms.{h,c}: lobby list/create/join/leave, lobby + member data (binary KeyValues), chat,
+  game server, owner, invites; async calls + SteamAPICallCompleted_t; Win64 callback layouts (503-513, 703).
+  Unit test (fake transport, ASan/UBSan) in make test-steam. Live test against Steam: created a 480 lobby, set
+  data, found it with a filtered list, received LobbyEnter/LobbyDataUpdate/call completions, left.
+- Loader (platform/win32_steam_matchmaking.inc): ISteamMatchmaking009 (38 slots, hidden-pointer CSteamID
+  returns), Steam_BGetCallback / FreeLastCallback / GetAPICallResult deliver it to Valve's steam_api64,
+  ISteamUtils call results, facade RunCallbacks/RegisterCallResult, ISteamFriends::GetFriendPersonaName from
+  lobby members. Started at ConnectToGlobalUser / SteamAPI_Init in official mode.
+Not yet: joinable flag on the wire (local only), lobby invites received (LobbyInvite_t), friends list/presence
+(ISteamFriends counts), and phase 2 transport: CT requests SteamNetworkingSockets012 + SteamNetworkingUtils004
+(Steam Datagram Relay), still the offline object. Logs: /tmp/beer-ct-mms.log.
+
+## Chained Together — mouse works: menu, settings and window mode (2026-11-01)
+
+User-confirmed: hover and clicks work on the 2D UI and the 3D menu buttons; the settings menu applies borderless
+fullscreen and it is preserved. Generic contracts fixed, in the order they surfaced (each was blocking on its own):
+1. Window position: real ConfigureNotify x/y is relative to the WM frame -> translated to root (see entry below);
+   GetWindowRect origin includes the frame; creation-time WM_MOVE carries the client origin, not the outer corner.
+2. ClientToScreen / MapWindowPoints were stubs returning 0 -> real (inverse of ScreenToClient).
+3. WindowFromPoint was a stub returning 0 (Slate's IsCursorDirectlyOverSlateWindow) -> window vs desktop by
+   window rect; SetCapture/GetCapture/ReleaseCapture keep real capture state (GetCapture was a 0 stub).
+4. GetWindowInfo was a generic zero stub -> WINDOWINFO from the window/client rects, styles, borders.
+5. GDI regions were all stubs (FWindowsWindow::IsPointInWindow = PtInRegion on CreateRectRgn/RoundRectRgn):
+   win32_gdi.c now has region objects (rect, round rect/ellipse, CombineRgn AND/OR/XOR/DIFF/COPY trees,
+   PtInRegion, OffsetRgn, GetRgnBox, SetRectRgn, SetWindowRgn takes ownership; GetObjectType = OBJ_REGION).
+   Standalone ASan/UBSan test passed (scratch, not yet in the Makefile).
+6. GetRawInputDeviceInfo accepted 0x2000000e instead of RIDI_DEVICENAME (0x20000007): Unreal's
+   QueryConnectedMice counted no mouse, IsMouseAttached() was false and every cursor->world click/hover trace was
+   skipped (2D UMG still worked - the split that identified it).
+Text: A8_UNORM SRVs now sample (0,0,0,R) via a per-view Vulkan swizzle (bd12_image_view_swizzled,
+bd12_dxgi_view_swizzle; BD11 and D3D12 SRV paths; UAVs stay identity) - UI text was solid blocks.
+Known tooling bug: with BEER_API_TRACE, a delay-load RaiseException (0xc06d007f) cannot unwind past the traced
+thunk (frame 1 pc=0xb), the guest handler never runs and CT calls NULL - avoid API trace for CT.
+Validation: `make -o test-native-loader test-input` and `make test-ki-dispatcher` pass; Sekiro 90 s gate (own
+prefix) ~60 fps, no crash; RE8 last passed before the input changes. Logs: /tmp/beer-ct-manual{2,5,7,8,9}.log.
+
+## Chained Together — mouse position: window origin was frame-relative (2026-11-01)
+
+Clicks and keys did reach CT (WM_LBUTTONDOWN taken, SetCapture/ReleaseCapture, WM_KEYDOWN Esc), but Unreal's UI
+never hit anything. Manual clicks at client 3,2 / 632,468 were at screen 643,399 / 1272,865 (client origin
+640,397), while Beer reported the window at 25,62: a real ConfigureNotify of a reparented window carries the
+position inside the WM frame, and Beer stored it as the screen position (GetWindowRect, ScreenToClient, WM_MOVE)
+against root-coordinate GetCursorPos - a ~615,335 px offset.
+Fixes: non-synthetic ConfigureNotify positions are translated to root (XTranslateCoordinates; synthetic ones are
+already root per ICCCM); GetWindowRect's origin now subtracts the frame (it was the client origin with an outer
+size); ClientToScreen and MapWindowPoints are real (they were stubs returning 0 with the point unchanged).
+Window size was fine (1264x682 = client of the 1280x720 the game requested). RE8 75 s gate passes.
+Logs: /tmp/beer-ct-manual.log, /tmp/beer-ct-manual2.log.
+
+## Chained Together — frames reach the window; window mode is the game's own (2026-11-01)
+
+The window stayed empty although BD11 frames were correct: `beer_present_bd12_image` accepted only DXGI 28/29
+(RGBA8) and 87/88 (BGRA8) back buffers and returned 0 for anything else, silently. CT's flip-model back buffer is
+24 (R10G10B10A2_UNORM). Format 24 now takes the blit path (vkCmdBlitImage converts to the swapchain format; like
+BGRA it bypasses the optional post filter); other formats log once `[PRESENT] ... not presentable yet`.
+BD11 FPS now reports present time (27-42 ms/s); throughput dropped from ~13 to ~6.5-11 fps once presenting.
+
+Window frame: CT creates its window with WS_OVERLAPPEDWINDOW (0xCF0000), goes borderless fullscreen 2560x1440, then
+its own settings code issues `setres 1280x720` windowed and restores the overlapped style - Beer mirrors those
+requests (decorated, resizable, maximize). Not from GameUserSettings.ini (experiment with 2560x1440 saved, then
+restored byte-identical): same switch. CT's V_SaveGame (Saved/SaveGames/Save.sav, created on the first successful
+Beer run) is the likely source; GetDisplayModeList is never called. Changing Window Mode in the game's settings menu
+is the expected way to get borderless fullscreen. RE8 75 s gate passes. Logs: /tmp/beer-ct-pres.log, /tmp/beer-ct-ini.log.
+
+## Chained Together — main menu renders (BD11 DispatchIndirect was never executed) (2026-11-01)
+
+The black window was not a lighting or present problem: lighting produced a normal HDR scene (mean ~0.35), but
+the tonemapper sampled a 1264x684 R11G11B10F texture that nothing wrote. Tracing showed Unreal binding it as CS
+UAV u0 (with u1/u2) and unbinding it four times with no dispatch in between: those were DispatchIndirect calls,
+and `do_dispatch_any` returned early on `!x || !y || !z`, which is always true for the indirect path (counts
+come from the GPU buffer). Every ID3D11DeviceContext::DispatchIndirect in BD11 was silently dropped. Fix: the
+zero-group check applies only to direct dispatches.
+
+Result: CT shows its full main menu (scene, logo, buttons) at ~13.5 fps on UHD 770. Remaining visible defect:
+small UI text strings (bottom centre/left/right) render as solid white blocks — glyph atlas sampling is next.
+Ruled out on the way: base-pass depth (GREATER_EQUAL, coverage normal), invariant position (already applied),
+copies (none in the frame), ID3D11DeviceContext1 (QI refused, not used).
+New BD11 trace output (only with BEER_BD11_TRACE=<frame>): CS SRV inputs and UAV resources, image-less UAVs,
+CSSetUnorderedAccessViews calls (with BEER_BD11_TRACE_CS), PS UAVs, and SRV bind flags / NO-IMAGE.
+RE8 75 s gate passes. Frames: ~/.cache/beer-ct-frames-20261101d. Logs: /tmp/beer-ct-cs6.log, /tmp/beer-ct-di.log.
+
+## Chained Together — renders (13 fps, black screen with text drawn as solid blocks) (2026-11-01)
+
+Starting point: after BD11 device creation the shipping child sat in Unreal's "Platform Initialization" scope
+forever (Sleep(33) loop). Fixed generic contracts, in order of discovery:
+1. **System-directory LoadLibrary vs an app-local same-name DLL.** The app-local `winmm.dll` proxy calls
+   `LoadLibraryW("C:\Windows\System32\winmm.dll")`; Beer returned the proxy itself (base-name match), so its
+   forwarders called themselves. `dll_name_to_handle_in(..., system_only=1)` skips application-local guest images
+   for System32 paths of Windows runtime DLLs (both A/W paths); API-set and preloaded system modules unchanged.
+2. **SetupDiGetClassDevsExA/W** were unimplemented (generic stub returned 0, a non-INVALID_HANDLE_VALUE handle).
+   Now the same empty local device set as SetupDiGetClassDevsW; remote machine / foreign set / reserved fail with
+   INVALID_HANDLE_VALUE.
+3. **Display adapter driver keys**: `Control\Class\{4d36e968-...}\0000` and the `Control\Video\{BEER0001...}\0000`
+   key named by EnumDisplayDevices' DeviceKey now hold DriverDesc (= DXGI description), ProviderName (vendor),
+   MatchingDeviceId (PCI id) and DriverVersion = the UMD version DXGI CheckInterfaceSupport already reports
+   (single definition `BEER_UMD_VERSION_*`). Seeded lazily on first access below `Control`. CT does not open these
+   keys in the current path; kept as a consistency contract (its Intel driver-version parse of an empty
+   GRHIAdapterInternalDriverVersion no longer appears first).
+4. **BD11 CreateInputLayout with zero elements** (descriptors may be NULL) is valid D3D11; Unreal binds an
+   empty layout for SV_VertexID-only vertex shaders. BD11 returned E_INVALIDARG -> UE LowLevelFatalError in
+   D3D11Util.cpp:236, then a teardown crash in the event pool (lock cmpxchg on NULL) and exit 0xC0000005.
+Diagnostic: `BEER_BD11_DUMP_PRESENT` now also dumps R10G10B10A2 (format 24) back buffers.
+
+Result: CT creates its swap chain (2560x1440 windowed, then 1264x682), compiles new pipelines and presents at
+~13 fps on UHD 770 for the full 150 s, no fatal. Present dumps (#100..#1600) show a black screen with three
+short text runs (bottom centre, bottom-left, bottom-right) drawn as solid rectangles: glyph-atlas sampling (alpha
+or format) is the next BD11 suspect. Also seen: `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion` is absent from
+Beer's registry; GetSystemPowerStatus, LoadCursorFromFileW, GetFinalPathNameByHandleW, OleInitialize are stubs.
+
+Validation: `make -o test-native-loader test-input` passes (native-loader still stops at the known CreateProcess
+assertion); `make test-d3d11` does not link (pre-existing missing beer_control_inject_key / beer_guest_module_info).
+RE8 75 s gate: BD12 ready, presenter up, no crash. Logs: /tmp/beer-ct-winmm.log, /tmp/beer-ct-il.log,
+/tmp/beer-ct-frames3.log, /tmp/beer-re8-after-ct-winmm.log; frames in ~/.cache/beer-ct-frames-20261101c.
+
+## Chained Together — SteamUtils language contract clears onlinefix fault (2026-11-01)
+
+The first real post-attach failure was isolated before changing callback or event behavior. `onlinefix64.dll`
+completed `DLL_PROCESS_ATTACH`, obtained `SteamUtils010`, then faulted at module RVA `0x51e03` while executing
+an internal byte-string scan with both the string base (`RDX`) and index (`RBX`) equal to zero. Unreal's later
+60-second event waits were crash-report fallout, not a Steam-ready event.
+
+The missing generic contract was `ISteamUtils010::GetSteamUILanguage`: Beer left slot 23 as the default
+NULL-return function. The method is pointer-returning and requires a stable language string. Slot 23 now returns
+Beer's existing stable `"english"` string, and the interface contract test asserts the native slot number. No
+callback was fabricated, no event was forced, and no executable-specific condition was added.
+
+Result: the null string fault is gone. A 150-second capped CT run completes onlinefix attach and SteamAPI init,
+then reaches DXGI, creates BD12 on Intel UHD 770, and reports a ready BD11 device without a fatal, rejected DLL,
+or first-pass access violation. The run ended only at the external timeout. RE8 passed the exact-build 75-second
+gate with ready BD12/BD11 devices and repeated 1920x1080/2560x1440 Vulkan swapchains; no fatal/device-loss path.
+
+Validation: serial capped loader build, `platform/steam_interface_contract_test`, source diagnostics, and
+`git diff --check` pass. Logs: `/tmp/beer-ct-steam-language-final.log`,
+`/tmp/beer-re8-after-steam-language.log`.
+
+## FH6 — Wow64PrepareForException, NtContinue syscall, mapped file names, GLOBALROOT paths (2026-11-01)
+
+Supersedes the "KiUserExceptionDispatcher missing" boundary below: the export exists (commit 70b91f0).
+Policy now has a "Test workloads" section: third-party-modified installs are valid workloads; fixes stay generic.
+
+Evidence (read-only disassembly of the main exe): startup resolves six ntdll exports by XXH3 name hash
+(KiUserExceptionDispatcher, Rtl{Add,Remove}VectoredExceptionHandler, DbgUiRemoteBreakin, RtlUserThreadStart,
+RtlExitUserThread), follows jmp chains, then requires KiUserExceptionDispatcher to start with Windows' x64 shape
+`cld; mov rax,[rip+Wow64PrepareForException]` and writes its handler into that ntdll variable. Beer's entry did not
+have that shape, so it took a deliberate failure branch (junk bytes -> #GP at +0x535f2d8, the old "NULL access").
+The handler then services scrambled function prologues (#UD) and resumes each through a raw `NtContinue` syscall.
+
+Retained generic contracts:
+- KiUserExceptionDispatcher entry = `cld; mov rax,[rip+Wow64PrepareForException]; test; jz; lea rcx,[rsp+4F0];
+  mov rdx,rsp; call rax; jmp body` (31 bytes); body = previous dispatch stub. Body and the variable live in ntdll's
+  private tail (`FAKE_PE_NTDLL_PRIVATE_RVA`, last two pages kept out of export stubs so a two-page VirtualProtect
+  of the variable's page stays in the image). Faults are delivered through the entry when it is patched OR the
+  variable is set. Test: `make test-ki-dispatcher` (unset/set variable, argument order, disp32 layout; O2 + ASan).
+- NtContinue: raw SYSCALL path applies the CONTEXT into the signal frame by ContextFlags (CONTROL, INTEGER,
+  FLOATING_POINT = FXSAVE bytes 0..415, keeping the kernel xstate marker); export path = restore without record.
+  Debug registers are not applied (logged under BEER_EXCEPTION_DIAGNOSTICS). Test added to win32_syscall_test.c.
+- NtQueryVirtualMemory class 2 (MemoryMappedFilenameInformation): UNICODE_STRING + `\Device\HarddiskVolumeN\...`
+  for addresses in the exe or guest DLL images; STATUS_INVALID_ADDRESS otherwise, STATUS_BUFFER_OVERFLOW when short.
+- `resolve_windows_host_path` accepts `\??\GLOBALROOT\Device\HarddiskVolumeN\x` and `\Device\HarddiskVolumeN\x`,
+  using the same drive<->device map as QueryDosDevice (`beer_dos_drive_device`).
+
+FH6 result: game installs its pre-handler (0x14546b989), opens and maps `Fanatec.Devices.bin`, flushes its image,
+and services ~22 #UD exceptions via NtContinue into its trampoline page (0x14c3000xx). New stop: for the #UD at
++0x52eebac its decision routine (+0x5356b48) returns 0 and the pre-handler takes its own jmp-0 path (RIP=0, RSP=0).
+The routine also recognises 0x80000003/0x80000004 (with CONTEXT Dr7) and 0xC0000096 at `f3 6c` call gates; why
+this one is declined is not established. Open contract gaps seen: NtQuerySystemInformation(5) and an
+NtQueryInformationFile class returning INVALID_INFO_CLASS; Beer maps #GP from privileged instructions
+(in/ins/out/outs/hlt) to 0xC0000005 where Windows reports 0xC0000096. onlinefix64.dll still reports
+"Initialization error 1". No guest bytes, branches or results were forced.
+
+Validation: `make test-ki-dispatcher`; syscall test O2 + ASan/UBSan; `make -o test-native-loader test-input` all
+pass; `test-native-loader` still stops at the known CreateProcess assertion (line 186, unrelated). RE8 75 s gate:
+BD12 device ready, no crash/unhandled. Logs: /tmp/beer-fh6-wow64.log, /tmp/beer-fh6-globalroot.log,
+/tmp/beer-fh6-ntcontinue2.log, /tmp/beer-re8-after-fh6-ki.log.
+
 ## Chained Together — new Steam session checked; integration/services missing (2026-11-01)
 
 Checked root launcher and shipping image under
@@ -322,6 +520,31 @@ callbacks, but does not reach a Vulkan/BD12 device or gameplay:
 The null-call path uses Beer's existing emergency redirect, so a normal host
 process return is not evidence of a successful game launch. No GPU capability
 conclusion can be drawn from this run. Log: `/tmp/beer-fh6-current.log`.
+
+## What triggers RE Engine's "Unsupported graphics card" (PRAGMATA, found 2026-11-01)
+
+The check is two D3D12 feature answers in `os/renderDeviceDX12.cpp` (device init, PRAGMATA.exe
+0x140dc5000..0x140dc6700). GPU vendor, device ID, VRAM, driver version and NVAPI play no part: the
+spoofed RTX 2070 SUPER identity (10de:1e84) and the real Intel 8086:4680 both fail and pass the same way.
+
+1. **Shader model, 0x140dc62ab..0x140dc6544.** `CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, {0x69})`.
+   If that fails, it retries with `{0x62}`. It aborts (code 0x5001, plain message) unless
+   HighestShaderModel >= **6.2**. A result >= 6.6 only enables an optional path.
+2. **64-bit atomics, 0x140dc542a / 0x140dc65e9.** `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11 = 40)`.
+   If **AtomicInt64OnDescriptorHeapResourceSupported** is FALSE (and an engine config byte at
+   `[r12+0xb9]` is set, as it is for PRAGMATA), it aborts with code 0x5023, using the format
+   "%ls is not supported AtomicInt64OnDescriptorHeapResourceSupported." in the trailing `%ls` line.
+
+BD12 currently answers SHADER_MODEL with 0 and zeroes OPTIONS11, so gate 1 fires. When a temporary
+experiment returned SM 6.6 alone, gate 2 fired. With both returned, the message is gone and PRAGMATA
+runs on until SIGSEGV at 0x154bfbc59, which is expected because the features are claimed but not implemented.
+The experiment was removed again. A real fix means BD12 reporting a shader model and 64-bit atomics
+that the DXBC/DXIL translator and the Vulkan device actually provide (shaderInt64, shaderBufferInt64Atomics,
+VK_EXT_shader_image_atomic_int64). On a stack such as Proton/vkd3d-proton, the same message on a capable
+GPU points to the driver not exposing int64 image atomics, or to a translator that is too old.
+
+Debug aid: `BEER_GUEST_STACK_SLOTS=N` (default 96) deepens the guest stack scan of message/TaskDialog
+logs. The engine's abort helper has frames of 0x8d8 and 0x2050 bytes, so its caller appears near slot 1348.
 
 ## Status 2026-11-01: PRAGMATA and RE4 both stop only at RE Engine's GPU check (Intel UHD 770)
 
@@ -2716,3 +2939,38 @@ The fix is to implement the APIs, each reporting what Beer's environment really 
 - RE8: 75-second gate, no crash or fatal.
 
 Logs: `/tmp/beer-prag-final.log`, `/tmp/beer-re4-recheck8.log`, `/tmp/beer-re8-final.log`.
+
+### Chained Together — sparse system exports and USER32 checkpoint (2026-11-01, paused)
+
+Work continued from the user-restored compatibility baseline and was kept incremental. The synthetic `WS2_32.dll` PE now derives its implemented legacy ordinal surface from the canonical ordinal resolver instead of a second drifting name list. The sparse function table reserves enough entries through public ordinal 151, so it no longer overlaps and corrupts the adjacent export-name table. Real, implementation-backed contracts added or exposed during this sequence include `select`, `send`, `shutdown`, `htonl`/`htons`/`ntohl`/`ntohs`, `gethostbyaddr`/`gethostbyname`, `getservbyname`, `WSAIoctl`, and `__WSAFDIsSet`. Missing named-dispatch registrations for `send` and host lookup were corrected. No game-specific ordinal rule was added.
+
+`WLDAP32.dll` now has a compatibility-module identity before dependent DLL process attach, with public ordinal 27 (`ldap_next_entry`) represented in its sparse PE export table. Beer has no LDAP backend, so that pointer API conservatively returns the documented end-of-enumeration value rather than false data. The next dependency, `GetUserObjectInformationW`, now has a minimal USER32 desktop/window-station contract: stable pseudo handles for `WinSta0` and `Default`, correct `UOI_NAME` required-size/buffer behavior, and errors for unsupported indices or invalid handles.
+
+Validation on the exact final binary:
+- Serial loader build passes under `MemoryMax=6G`, `MemoryHigh=5500M`, `MemorySwapMax=1G`.
+- Kernel32 and filesystem-policy focused tests pass; source/Markdown diagnostics and `git diff --check` pass.
+- The normal `ChainedTogether.exe` launcher starts the shipping child. The WLDAP ordinal-27 error is gone. `onlinefix64.dll` now reaches a later missing `USER32!MessageBoxA` contract and rejects `DLL_PROCESS_ATTACH`; Beer nevertheless continues to Steam initialization and ready BD12/BD11 devices. This continuation is not proof that the dependency initialized successfully. The next task is to implement/publish truthful `MessageBoxA` parity with the existing dialog path, then retest the dependency attach result—without broad export additions.
+- RE8 passed the mandatory 75-second compatibility gate on this exact binary: ready BD12 and BD11 devices, repeated 1920x1080/2560x1440 Vulkan swapchains, media/audio initialization, no fatal loader error, and termination only by the external bound.
+
+Risks and handoff notes:
+- Shared synthetic PE/export changes can affect every executable. Continue one documented contract at a time and repeat RE8 (plus RE4 when practical) before retention.
+- The broader native-loader suite still has a separately known `CreateProcess` expectation/history; do not weaken unrelated assertions to make Winsock/WLDAP work pass.
+- `GetUserObjectInformationW` currently implements only `UOI_NAME`; expand only when a trace proves another documented index is needed.
+- No title name, app ID, hash, RVA, guest patch, entitlement fabrication, or protection bypass was introduced.
+
+Logs: `/tmp/beer-ct-userobject-final.log`, `/tmp/beer-re8-after-ct-userobject.log`.
+
+### Chained Together — onlinefix64 attach succeeds after sparse WLDAP completion (2026-11-01)
+
+Continued incrementally from the user-restored compatibility baseline. No title name, app ID, executable hash/RVA, guest patch, entitlement fabrication, or bulk foreign export inventory was added. An external Windows-compatible runtime was used only to identify individual documented public ordinal names after each fresh hard-error trace.
+
+Retained generic WLDAP32 offline contracts now include the sparse public ordinals required by the dependency: `ldap_msgfree` (41), `ldap_result` (50), `ldap_simple_bind_s` (60), and `ldap_set_option` (211), in addition to the previously implemented empty-result/enumeration and cleanup functions. Beer has no LDAP session or transport backend, so these functions return truthful empty/error results rather than fabricating a connected directory service. Each ordinal is wired consistently through the canonical resolver, named implementation table, compatibility-module manifest, sparse PE export table, guest-DLL import binding, and native-loader contract assertions.
+
+Validation on the exact final binary:
+- Serial capped build passes with `MemoryMax=6G`, `MemoryHigh=5500M`, and `MemorySwapMax=1G`.
+- `make -o test-native-loader test-input` passes all focused CPU-side tests.
+- Source diagnostics and `git diff --check` pass.
+- The normal `ChainedTogether.exe` launcher starts the shipping child. `onlinefix64.dll` now returns `TRUE` from `DLL_PROCESS_ATTACH`; `SteamAPI_Init` reports that the application-local module loaded successfully. No further missing-ordinal or hard-error line appeared during the 150-second bounded run.
+- RE8 passed its mandatory 75-second regression gate on this exact build: BD12 and BD11 became ready, repeated Vulkan swapchains were created/presented, no fatal/device-loss line appeared, and termination was only by the external timeout.
+
+Do not broaden WLDAP preemptively. Add another documented contract only if a fresh trace proves it is required. Logs: `/tmp/beer-ct-wldap211.log`, `/tmp/beer-re8-after-ct-wldap.log`, `/tmp/beer-ct-wldap60-tests.log`.

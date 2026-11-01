@@ -296,15 +296,20 @@ static u64 __attribute__((ms_abi)) beer_NtProtectVirtualMemory(u64 process, void
     return 0;
 }
 
+/* NT device behind a DOS drive letter (the targets of \??\C: and \??\Z:), or NULL. */
+static const char *beer_dos_drive_device(u16 letter)
+{
+    letter |= 0x20;
+    if (letter == 'c') return "\\Device\\HarddiskVolume1";
+    if (letter == 'z') return "\\Device\\HarddiskVolume2";
+    return NULL;
+}
+
 static u64 __attribute__((ms_abi)) beer_QueryDosDeviceW(const u16 *name, u16 *target, u32 size)
 {
-    static const char c_dev[] = "\\Device\\HarddiskVolume1";
-    static const char z_dev[] = "\\Device\\HarddiskVolume2";
     const char *dev = NULL;
     if (name && name[0] && name[1] == ':' && !name[2]) {
-        u16 letter = name[0] | 0x20;
-        if (letter == 'c') dev = c_dev;
-        else if (letter == 'z') dev = z_dev;
+        dev = beer_dos_drive_device(name[0]);
     } else if (!name) {
         /* Enumerate: the DOS device names we expose. */
         static const char list[] = "C:\0Z:\0";
@@ -702,7 +707,11 @@ static void beer_log_guest_stack(const char *tag)
     __asm__ volatile("mov %%fs:g_saved_guest_rsp@tpoff, %0" : "=r"(rsp));
     if (!rsp) return;
     fprintf(stderr, "[%s] guest stack:\n", tag);
-    for (int i = 0; i < 96; ++i) {
+    /* BEER_GUEST_STACK_SLOTS reaches callers above large frames (the scan reads that many qwords). */
+    const char *slots_env = getenv("BEER_GUEST_STACK_SLOTS");
+    int slots = slots_env ? atoi(slots_env) : 96;
+    if (slots < 1 || slots > 8192) slots = 96;
+    for (int i = 0; i < slots; ++i) {
         u64 value = ((const u64 *)rsp)[i];
         if (value <= 0x10000000ULL || value >= 0x7fffffffffffULL) continue;
         if (value >= (u64)(uintptr_t)g_img &&

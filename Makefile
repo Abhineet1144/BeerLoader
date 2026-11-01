@@ -10,7 +10,7 @@ MEDIA_SRCS = media/media_foundation.c
 PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
-				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/win32_native_heap.c platform/win32_shell_strings.c
+				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_shell_strings.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
                renderer/vulkan/vulkan_post.c \
@@ -62,6 +62,8 @@ test-steam:
 	/tmp/beer-steam-vdf-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_session_test.c platform/beer_steam_session.c -lpthread -o /tmp/beer-steam-session-test
 	/tmp/beer-steam-session-test
+	$(CC) -O2 -Wall -Wextra -D_GNU_SOURCE -Iplatform platform/beer_steam_mms_test.c platform/beer_steam_mms.c -lpthread -o /tmp/beer-steam-mms-test
+	/tmp/beer-steam-mms-test
 
 # Hot: every BEER_* switch lookup goes through it.
 platform/beer_env.o: platform/beer_env.c platform/beer_env.h
@@ -200,6 +202,8 @@ test-input: test-native-loader test-shell-strings test-adapter-info
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/window_style_policy_test.c -o /tmp/beer-window-style-policy-test
 	/tmp/beer-window-style-policy-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/window_icon_policy_test.c -o /tmp/beer-window-icon-policy-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_icon_png_test.c platform/beer_icon_png.c -lz -o /tmp/beer-icon-png-test
+	/tmp/beer-icon-png-test
 	/tmp/beer-window-icon-policy-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/guid_compat_test.c -o /tmp/beer-guid-compat-test
 	/tmp/beer-guid-compat-test

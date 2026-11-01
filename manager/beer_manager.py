@@ -49,7 +49,7 @@ AUDIO_BACKENDS = ["fmod", "compat"]
 STEAM_API_MODES = [
     ("auto", "Automatic", "Your Steam session for games installed from Steam, Beer's offline Steam otherwise"),
     ("compat", "Beer offline Steam", "Built-in offline Steam API: local user, local saves, no online services"),
-    ("official", "Your Steam session", "Real identity, ownership and tickets from your signed-in account (it must own the game)"),
+    ("official", "Your Steam session", "Real identity from your signed-in account; ownership and tickets remain limited to owned games"),
     ("guest", "Game's own Steam DLL", "Runs the steam_api64.dll shipped with the game"),
 ]
 PRESENTERS = ["Default", "auto", "vulkan", "x11"]

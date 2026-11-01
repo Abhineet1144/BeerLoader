@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "beer_steam_session.h"
 
 #include <errno.h>
@@ -25,7 +28,39 @@ static struct {
     unsigned next_id;
     char *pending;               /* received bytes not yet split into lines */
     size_t pending_len;
-} g = { PTHREAD_MUTEX_INITIALIZER, -1, 0, 0, 0, "", NULL, 0, 1, NULL, 0 };
+    char *events[256];           /* matchmaking event lines kept for the game (oldest first) */
+    unsigned event_count;
+} g = { PTHREAD_MUTEX_INITIALIZER, -1, 0, 0, 0, "", NULL, 0, 1, NULL, 0, { NULL }, 0 };
+
+/* Keeps a broadcast line the game must see later (matchmaking events); others are dropped. Takes the line. */
+static void keep_event_line(char *line)
+{
+    if (!strstr(line, "\"event\":\"mms_event\"")) { free(line); return; }
+    if (g.event_count == sizeof(g.events) / sizeof(*g.events)) {      /* full: drop the oldest */
+        free(g.events[0]);
+        memmove(g.events, g.events + 1, sizeof(g.events) - sizeof(*g.events));
+        g.event_count--;
+    }
+    g.events[g.event_count++] = line;
+}
+
+/* Splits complete lines out of g.pending; returns the line containing want (caller frees) or NULL. */
+static char *take_lines(const char *want)
+{
+    for (;;) {
+        char *newline = g.pending ? memchr(g.pending, '\n', g.pending_len) : NULL;
+        if (!newline) return NULL;
+        size_t len = (size_t)(newline - g.pending);
+        char *line = malloc(len + 1);
+        if (!line) return NULL;
+        memcpy(line, g.pending, len);
+        line[len] = 0;
+        memmove(g.pending, newline + 1, g.pending_len - len - 1);
+        g.pending_len -= len + 1;
+        if (want && strstr(line, want)) return line;
+        keep_event_line(line);
+    }
+}
 
 int beer_steam_session_socket_path(char *out, size_t cap)
 {
@@ -76,27 +111,18 @@ static int json_value(const char *json, const char *key, char *out, size_t cap)
 static char *request(const char *op, const char *fields)
 {
     if (g.fd < 0 && (g.fd = connect_provider()) < 0) return NULL;
-    char id[32], line[4400];
+    char id[32];
     snprintf(id, sizeof(id), "game%u", g.next_id++);
-    int n = snprintf(line, sizeof(line), "{\"op\":\"%s\",\"id\":\"%s\"%s%s}\n", op, id, fields ? "," : "",
+    char *line = NULL;
+    int n = asprintf(&line, "{\"op\":\"%s\",\"id\":\"%s\"%s%s}\n", op, id, fields ? "," : "",
                      fields ? fields : "");
-    if (n <= 0 || (size_t)n >= sizeof(line) || send(g.fd, line, (size_t)n, MSG_NOSIGNAL) != n) goto lost;
+    if (n <= 0 || send(g.fd, line, (size_t)n, MSG_NOSIGNAL) != n) { free(line); goto lost; }
+    free(line);
     char want[64];
     snprintf(want, sizeof(want), "\"id\":\"%s\"", id);
     for (;;) {
-        char *newline = g.pending ? memchr(g.pending, '\n', g.pending_len) : NULL;
-        if (newline) {
-            size_t len = (size_t)(newline - g.pending);
-            char *reply = malloc(len + 1);
-            if (!reply) goto lost;
-            memcpy(reply, g.pending, len);
-            reply[len] = 0;
-            memmove(g.pending, newline + 1, g.pending_len - len - 1);
-            g.pending_len -= len + 1;
-            if (strstr(reply, want)) return reply;
-            free(reply);
-            continue;
-        }
+        char *reply = take_lines(want);
+        if (reply) return reply;
         char chunk[16384];
         ssize_t got = recv(g.fd, chunk, sizeof(chunk), 0);
         if (got <= 0) goto lost;
@@ -271,4 +297,117 @@ size_t beer_steam_session_encrypted_ticket(uint32_t appid, const void *userdata,
                                            uint8_t *out, size_t cap)
 {
     return ticket_request("encrypted_ticket", appid, userdata, userdata_len, out, cap);
+}
+
+/* ---- Matchmaking relay ---- */
+
+static char *hex_of(const void *data, size_t len)
+{
+    char *text = malloc(len * 2 + 1);
+    if (!text) return NULL;
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        text[2 * i] = digits[((const uint8_t *)data)[i] >> 4];
+        text[2 * i + 1] = digits[((const uint8_t *)data)[i] & 15];
+    }
+    text[2 * len] = 0;
+    return text;
+}
+
+/* Decodes the hex string value of key in line into out; returns the byte count, -1 if absent or too big. */
+static long hex_field(const char *line, const char *key, uint8_t *out, size_t cap)
+{
+    char pattern[48];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char *hex = strstr(line, pattern);
+    if (!hex) return -1;
+    hex += strlen(pattern);
+    size_t len = 0;
+    for (; hex[0] && hex[1] && hex[0] != '"'; hex += 2) {
+        unsigned value;
+        if (len >= cap || sscanf(hex, "%2x", &value) != 1) return -1;
+        out[len++] = (uint8_t)value;
+    }
+    return *hex == '"' ? (long)len : -1;
+}
+
+static char *mms_line(const char *op, uint32_t appid, uint32_t emsg, const void *body, size_t len)
+{
+    char *hex = hex_of(body, len), *fields = NULL;
+    if (!hex) return NULL;
+    if (asprintf(&fields, "\"appid\":\"%u\",\"emsg\":\"%u\",\"body\":\"%s\"", appid, emsg, hex) < 0) fields = NULL;
+    free(hex);
+    pthread_mutex_lock(&g.lock);
+    char *reply = fields && g.active ? request(op, fields) : NULL;
+    pthread_mutex_unlock(&g.lock);
+    free(fields);
+    return reply;
+}
+
+long beer_steam_session_mms_request(uint32_t appid, uint32_t emsg, const void *body, size_t len,
+                                    uint8_t *out, size_t cap)
+{
+    char *reply = mms_line("mms_request", appid, emsg, body, len);
+    char err[256];
+    long got = -1;
+    if (reply_ok(reply, err, sizeof(err))) got = hex_field(reply, "body", out, cap);
+    else fprintf(stderr, "[STEAM] matchmaking request %u for app %u failed: %s\n", emsg, appid, err);
+    free(reply);
+    return got;
+}
+
+int beer_steam_session_mms_send(uint32_t appid, uint32_t emsg, const void *body, size_t len)
+{
+    char *reply = mms_line("mms_send", appid, emsg, body, len);
+    char err[256];
+    int ok = reply_ok(reply, err, sizeof(err));
+    if (!ok) fprintf(stderr, "[STEAM] matchmaking message %u for app %u failed: %s\n", emsg, appid, err);
+    free(reply);
+    return ok;
+}
+
+int beer_steam_session_games_played(uint32_t appid, uint32_t pid)
+{
+    char fields[96], err[256];
+    snprintf(fields, sizeof(fields), "\"appid\":\"%u\",\"pid\":\"%u\"", appid, pid);
+    pthread_mutex_lock(&g.lock);
+    char *reply = g.active ? request("games_played", fields) : NULL;
+    pthread_mutex_unlock(&g.lock);
+    int ok = reply_ok(reply, err, sizeof(err));
+    if (!ok) fprintf(stderr, "[STEAM] games_played for app %u failed: %s\n", appid, err);
+    free(reply);
+    return ok;
+}
+
+long beer_steam_session_next_mms_event(uint32_t *emsg, uint8_t *out, size_t cap)
+{
+    /* Called from the game's callback pump: never wait behind a request that is waiting for Steam (its reply
+     * loop queues the events that arrive meanwhile). */
+    if (pthread_mutex_trylock(&g.lock)) return -1;
+    if (g.fd >= 0) {                              /* collect what arrived since the last request */
+        for (;;) {
+            char chunk[16384];
+            ssize_t got = recv(g.fd, chunk, sizeof(chunk), MSG_DONTWAIT);
+            if (got <= 0) break;
+            char *grown = realloc(g.pending, g.pending_len + (size_t)got);
+            if (!grown) break;
+            g.pending = grown;
+            memcpy(g.pending + g.pending_len, chunk, (size_t)got);
+            g.pending_len += (size_t)got;
+        }
+        take_lines(NULL);
+    }
+    long len = -1;
+    while (g.event_count && len < 0) {
+        char *line = g.events[0];
+        memmove(g.events, g.events + 1, (g.event_count - 1) * sizeof(*g.events));
+        g.event_count--;
+        char text[16] = "";
+        json_value(line, "emsg", text, sizeof(text));
+        *emsg = (uint32_t)strtoul(text, NULL, 10);
+        len = hex_field(line, "body", out, cap);
+        free(line);
+    }
+    pthread_mutex_unlock(&g.lock);
+    return len;
 }

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 static uint64_t seen[6];
@@ -16,6 +17,22 @@ service_six(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t
     (void)g; (void)h; (void)i; (void)j; (void)k; (void)l;
     seen[0] = a; seen[1] = b; seen[2] = c; seen[3] = d; seen[4] = e; seen[5] = f;
     return 0x12345678u;
+}
+
+/* NtContinue: the loader's conversion rewrites the signal frame. This one resumes at the stub's
+ * trailing ret with RAX set, as a CONTEXT naming that address would. */
+static uint8_t *continue_ret;
+static uint64_t continue_context, continue_alert;
+
+static uint32_t continue_to(void *ucontext, uint64_t context, uint64_t test_alert)
+{
+    ucontext_t *uc = ucontext;
+    continue_context = context;
+    continue_alert = test_alert;
+    if (!context) return 0xC0000005u;
+    uc->uc_mcontext.gregs[REG_RAX] = 0x600DF00D;
+    uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)continue_ret;
+    return 0;
 }
 
 typedef uint64_t (__attribute__((ms_abi)) *SixArgs)(uint64_t, uint64_t, uint64_t, uint64_t,
@@ -91,6 +108,15 @@ int main(void)
     assert(call_as_guest(code + 0x40, 0, 0, 0, 0, 0, 0) == BEER_STATUS_NOT_IMPLEMENTED);
     assert(call_as_guest(code + 0x80, 0, 0, 0, 0, 0, 0) == BEER_STATUS_INVALID_SYSTEM_SERVICE);
     assert(call_as_guest(code + 0xC0, 0, 0, 0, 0, 0, 0) == BEER_STATUS_NOT_IMPLEMENTED);
+
+    /* NtContinue (19045 service 0x43) resumes where the CONTEXT says; a rejected CONTEXT
+     * returns the conversion's status to the caller. */
+    beer_win32_syscall_write_stub(code + 0x100, 0x100, 0x43);
+    continue_ret = code + 0x100 + 20;                   /* the stub's ret after syscall */
+    beer_win32_syscall_set_continue(continue_to);
+    assert(call_as_guest(code + 0x100, 0x7000, 1, 0, 0, 0, 0) == 0x600DF00D);
+    assert(continue_context == 0x7000 && continue_alert == 1);
+    assert(call_as_guest(code + 0x100, 0, 0, 0, 0, 0, 0) == 0xC0000005u);
 
     /* Host system calls made while blocked are re-executed after re-allowing. */
     beer_win32_syscall_selector = 1;

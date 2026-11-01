@@ -221,6 +221,7 @@ typedef struct {
     int (*GrabPointer)(Display *, Window, Bool, unsigned int, int, int, Window,
                        Cursor, unsigned long);
     int (*UngrabPointer)(Display *, unsigned long);
+    int (*TranslateCoordinates)(Display *, Window, Window, int, int, int *, int *, Window *);
     int pointer_confine_wanted;   /* ClipCursor active */
     int win_decorated;            /* last set_style */
     int focused;
@@ -337,6 +338,7 @@ static int initialize_locked(void)
     X11_LOAD(GetEventData, "XGetEventData");
     X11_LOAD(FreeEventData, "XFreeEventData");
     X11_LOAD(UngrabPointer, "XUngrabPointer");
+    X11_LOAD(TranslateCoordinates, "XTranslateCoordinates");
 
     g_x11.InitThreads();
     g_x11.SetErrorHandler(beer_x_error_handler);
@@ -1340,6 +1342,20 @@ int xwayland_window_poll_event(XwaylandEvent *out)
             break;
         case 22: {
             XConfigureEvent *configure = (XConfigureEvent *)&event;
+            /* A real ConfigureNotify of a reparented window gives its position inside the window manager's
+             * frame; only synthetic ones (ICCCM) carry root coordinates. Window positions are screen
+             * positions (GetWindowRect, ScreenToClient, WM_MOVE), and GetCursorPos reports root
+             * coordinates, so use the window's root origin. */
+            if (!configure->send_event) {
+                int root_x = 0, root_y = 0;
+                Window child = 0;
+                if (g_x11.TranslateCoordinates(g_x11.display, g_x11.window,
+                                               g_x11.DefaultRootWindow(g_x11.display),
+                                               0, 0, &root_x, &root_y, &child)) {
+                    configure->x = root_x;
+                    configure->y = root_y;
+                }
+            }
             g_x11.x = configure->x; g_x11.y = configure->y;
             g_x11.width = configure->width; g_x11.height = configure->height;
             /* An X11 ConfigureNotify changes the drawable's client extent.

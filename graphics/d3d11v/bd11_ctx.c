@@ -129,6 +129,12 @@ static void apply_state(B11Context *ctx, const B11Op *op)
     }
     case B11_OP_SET_UAV_CS: {
         const struct { B11Obj *obj; uint32_t initial; } *e = op->data;
+        if (g_b11_trace_frame >= 0 && (long)ctx->obj.dev->frame == g_b11_trace_frame && getenv("BEER_BD11_TRACE_CS")) {
+            fprintf(stderr, "[BD11 CSUAV] start=%u num=%u:", op->a, op->b);
+            for (uint32_t i = 0; i < op->b; ++i)
+                fprintf(stderr, " %p", e[i].obj ? (void *)((B11View *)e[i].obj)->resource : NULL);
+            fprintf(stderr, "\n");
+        }
         for (uint32_t i = 0; i < op->b && op->a + i < B11_MAX_UAV; ++i) {
             set_obj(&s->uav[B11_STAGE_CS][op->a + i], e[i].obj);
             s->uav_initial[B11_STAGE_CS][op->a + i] = e[i].initial;
@@ -1043,9 +1049,18 @@ static void b11_trace_cs_outputs(B11Context *ctx, B11Shader *cs, uint32_t gx, ui
 {
     B11Device *dev = ctx->obj.dev;
     fprintf(stderr, "[BD11 CS] cs=%016llx groups=%u,%u,%u\n", (unsigned long long)cs->hash, gx, gy, gz);
+    for (int i = 0; i < B11_MAX_SRV; ++i) {
+        B11View *v = (B11View *)ctx->st.srv[B11_STAGE_CS][i];
+        if (v && v->resource && v->resource->kind == B11_TEXTURE) {
+            const B11Texture *t = (const B11Texture *)v->resource;
+            fprintf(stderr, "    t%d res=%p fmt=%u %ux%u\n", i, (void *)t, t->desc.format, t->desc.width, t->desc.height);
+        }
+    }
     for (int i = 0; i < B11_MAX_UAV; ++i) {
         B11View *v = (B11View *)ctx->st.uav[B11_STAGE_CS][i];
         B11Texture *t = v && v->resource && v->resource->kind == B11_TEXTURE ? (B11Texture *)v->resource : NULL;
+        if (t && !t->image) fprintf(stderr, "    u%d res=%p fmt=%u %ux%u: no image\n", i, (void *)t, t->desc.format, t->desc.width, t->desc.height);
+        if (v && !t && (!v->resource || v->resource->kind != B11_BUFFER)) fprintf(stderr, "    u%d view without resource\n", i);
         if (!t || !t->image) continue;
         if (t->desc.format != 10) {                 /* other formats: report size/format and whether anything non-zero was written */
             const uint32_t bw = bd12_dxgi_bytes(t->desc.format);
@@ -1063,7 +1078,7 @@ static void b11_trace_cs_outputs(B11Context *ctx, B11Shader *cs, uint32_t gx, ui
             const uint32_t *wd = rb2->cpu;
             size_t nz = 0, total = (size_t)w2 * h2 * sl2 * bw / 4;
             for (size_t k = 0; k < total; ++k) nz += wd[k] != 0;
-            fprintf(stderr, "    u%d fmt=%u %ux%ux%u: %zu/%zu non-zero words, first %08x %08x %08x %08x\n", i, t->desc.format, w2, h2, sl2, nz, total, wd[0], wd[1], wd[2], wd[3]);
+            fprintf(stderr, "    u%d res=%p fmt=%u %ux%ux%u: %zu/%zu non-zero words, first %08x %08x %08x %08x\n", i, (void *)t, t->desc.format, w2, h2, sl2, nz, total, wd[0], wd[1], wd[2], wd[3]);
             bd12_buffer_destroy(rb2);
             continue;
         }
@@ -1101,7 +1116,7 @@ static void do_dispatch_any(B11Context *ctx, uint32_t x, uint32_t y, uint32_t z,
 {
     B11Device *dev = ctx->obj.dev;
     B11Shader *cs = (B11Shader *)ctx->st.shader[B11_STAGE_CS];
-    if (!cs || !x || !y || !z) return;
+    if (!cs || (!args && (!x || !y || !z))) return;   /* indirect: the group counts come from the GPU buffer */
     BD12CmdList *cmd = b11_cmd(dev);
     if (ctx->generation != dev->cmd_generation) {
         ctx->generation = dev->cmd_generation;
@@ -1156,6 +1171,7 @@ static void trace_draw(B11Context *ctx, const char *kind, const B11Op *op)
             s->topology, s->rtv_count, s->rtv_count && s->rtv[0] ? ((B11View *)s->rtv[0])->format : 0, s->viewport_count,
             s->viewports[0][0], s->viewports[0][1], s->viewports[0][2], s->viewports[0][3], s->viewports[0][4], s->viewports[0][5]);
     for (uint32_t i = 0; i < s->rtv_count; ++i) if (s->rtv[i]) fprintf(stderr, "    rtv[%u] res=%p\n", i, (void *)((B11View *)s->rtv[i])->resource);
+    for (int i = 0; i < B11_MAX_UAV; ++i) if (s->uav[B11_STAGE_PS][i]) fprintf(stderr, "    psuav[%d] res=%p\n", i, (void *)((B11View *)s->uav[B11_STAGE_PS][i])->resource);
     for (int i = 0; i < B11_MAX_SRV; ++i) if (s->srv[4][i]) fprintf(stderr, "    srv4[%d] res=%p\n", i, (void *)((B11View *)s->srv[4][i])->resource);
     const B11State *bl = (const B11State *)s->blend, *dp = (const B11State *)s->depth, *rs = (const B11State *)s->raster;
     if (bl) { const uint32_t *w = (const uint32_t *)bl->desc; fprintf(stderr, "    blend: en=%u src=%u dst=%u op=%u a:%u/%u/%u mask=%x\n", w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]); }
@@ -1174,8 +1190,9 @@ static void trace_draw(B11Context *ctx, const char *kind, const B11Op *op)
             if (!v) continue;
             if (v->resource->kind == B11_TEXTURE) {
                 B11Texture *t = (B11Texture *)v->resource;
-                fprintf(stderr, "    srv[%d][%d] tex %ux%u fmt=%u mips=%u view fmt=%u mip=%u+%u layers=%u+%u state=%x\n", st, i, t->desc.width, t->desc.height,
-                        t->desc.format, t->desc.mips, v->format, v->base_mip, v->mip_count, v->base_layer, v->layer_count, t->state);
+                fprintf(stderr, "    srv[%d][%d] tex %ux%u fmt=%u mips=%u view fmt=%u mip=%u+%u layers=%u+%u state=%x bind=%x%s\n", st, i, t->desc.width, t->desc.height,
+                        t->desc.format, t->desc.mips, v->format, v->base_mip, v->mip_count, v->base_layer, v->layer_count, t->state,
+                        t->desc.bind, t->image ? "" : " NO-IMAGE");
             } else fprintf(stderr, "    srv[%d][%d] buffer bytes=%u first=%u count=%u\n", st, i, ((B11Buffer *)v->resource)->desc.byte_width, v->first, v->count);
         }
         for (int i = 0; i < B11_MAX_CBV; ++i) {

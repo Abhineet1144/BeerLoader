@@ -13,7 +13,17 @@
 
 /* ---------------------------------------------------------------- objects */
 
-enum { OBJ_NONE, OBJ_BITMAP, OBJ_FONT, OBJ_BRUSH, OBJ_PEN };
+enum { OBJ_NONE, OBJ_BITMAP, OBJ_FONT, OBJ_BRUSH, OBJ_PEN, OBJ_REGION };
+
+/* A region is a small shape tree: rectangles, rounded rectangles / ellipses, and CombineRgn results.
+ * Point queries evaluate the tree. Coordinates follow GDI: right and bottom edges are exclusive. */
+typedef struct Rgn {
+    int kind;                    /* 0 rect, 1 round rect (ellipse when the radii cover the box), 2 combine */
+    int32_t l, t, r, b, ew, eh;  /* bounds; ellipse width/height for round rects */
+    int mode;                    /* combine: RGN_AND 1, RGN_OR 2, RGN_XOR 3, RGN_DIFF 4 */
+    struct Rgn *a, *b2;
+} Rgn;
+static void rgn_free(Rgn *r);
 
 typedef struct {
     int w, h, bpp, stride, topdown, is_dib;
@@ -26,6 +36,7 @@ typedef struct {
     uint8_t logfont[92];         /* OBJ_FONT (LOGFONTW) */
     uint32_t color;              /* OBJ_BRUSH / OBJ_PEN, COLORREF */
     int style, width;
+    Rgn *region;                 /* OBJ_REGION */
 } Obj;
 
 #define OBJ_MAX 8192
@@ -76,6 +87,7 @@ static void obj_free(uint64_t handle)
     Obj *o = obj_get(handle);
     if (!o) return;
     if (o->type == OBJ_BITMAP) free(o->surface.bits);
+    if (o->type == OBJ_REGION) rgn_free(o->region);
     free(o);
     g_objects[handle - OBJ_BASE - 1] = NULL;
 }
@@ -865,7 +877,8 @@ uint32_t GDI_MS beer_GetObjectType(uint64_t object)
     LOCK();
     Obj *o = obj_get(object);
     uint32_t t = 0;
-    if (o) t = o->type == OBJ_PEN ? 1 : o->type == OBJ_BRUSH ? 2 : o->type == OBJ_BITMAP ? 7 : 6;
+    if (o) t = o->type == OBJ_PEN ? 1 : o->type == OBJ_BRUSH ? 2 : o->type == OBJ_BITMAP ? 7 :
+               o->type == OBJ_REGION ? 8 : 6;
     else if (object == BEER_GDI_WINDOW_DC || (object >= DC_BASE && object < DC_BASE + DC_MAX)) t = 3;
     UNLOCK();
     return t;
@@ -1263,4 +1276,224 @@ int GDI_MS beer_TransparentBlt(uint64_t dst, int x, int y, int w, int h, uint64_
     }
     UNLOCK();
     return ok;
+}
+
+/* ---- Regions ---- */
+static void rgn_free(Rgn *r)
+{
+    if (!r) return;
+    rgn_free(r->a);
+    rgn_free(r->b2);
+    free(r);
+}
+
+static Rgn *rgn_clone(const Rgn *r)
+{
+    if (!r) return NULL;
+    Rgn *c = malloc(sizeof(*c));
+    if (!c) return NULL;
+    *c = *r;
+    c->a = rgn_clone(r->a);
+    c->b2 = rgn_clone(r->b2);
+    if ((r->a && !c->a) || (r->b2 && !c->b2)) { rgn_free(c); return NULL; }
+    return c;
+}
+
+static int rgn_contains(const Rgn *r, int32_t x, int32_t y)
+{
+    if (!r) return 0;
+    if (r->kind == 2) {
+        const int a = rgn_contains(r->a, x, y), b = rgn_contains(r->b2, x, y);
+        switch (r->mode) {
+        case 1: return a && b;
+        case 2: return a || b;
+        case 3: return a != b;
+        case 4: return a && !b;
+        default: return a;
+        }
+    }
+    if (x < r->l || x >= r->r || y < r->t || y >= r->b) return 0;
+    if (r->kind == 0 || r->ew <= 0 || r->eh <= 0) return 1;
+    /* Round rect: outside the corner ellipses (radii ew/2, eh/2) a point in the box is inside. */
+    const double rx = r->ew / 2.0, ry = r->eh / 2.0, px = x + 0.5, py = y + 0.5;
+    const double cx = px < r->l + rx ? r->l + rx : px > r->r - rx ? r->r - rx : px;
+    const double cy = py < r->t + ry ? r->t + ry : py > r->b - ry ? r->b - ry : py;
+    const double dx = (px - cx) / rx, dy = (py - cy) / ry;
+    return dx * dx + dy * dy <= 1.0;
+}
+
+static void rgn_bounds(const Rgn *r, int32_t *l, int32_t *t, int32_t *rr, int32_t *b)
+{
+    if (!r) { *l = *t = *rr = *b = 0; return; }
+    if (r->kind != 2) { *l = r->l; *t = r->t; *rr = r->r; *b = r->b; return; }
+    int32_t al, at, ar, ab, bl, bt, br, bb;
+    rgn_bounds(r->a, &al, &at, &ar, &ab);
+    rgn_bounds(r->b2, &bl, &bt, &br, &bb);
+    if (r->mode == 1) {                    /* AND: intersection of the bounds */
+        *l = al > bl ? al : bl; *t = at > bt ? at : bt; *rr = ar < br ? ar : br; *b = ab < bb ? ab : bb;
+    } else if (r->mode == 4 || r->mode == 5) {
+        *l = al; *t = at; *rr = ar; *b = ab;
+    } else {                               /* OR / XOR: union of the bounds */
+        const int ae = al >= ar || at >= ab, be = bl >= br || bt >= bb;
+        if (ae) { *l = bl; *t = bt; *rr = br; *b = bb; return; }
+        if (be) { *l = al; *t = at; *rr = ar; *b = ab; return; }
+        *l = al < bl ? al : bl; *t = at < bt ? at : bt; *rr = ar > br ? ar : br; *b = ab > bb ? ab : bb;
+    }
+    if (*l >= *rr || *t >= *b) *l = *t = *rr = *b = 0;
+}
+
+static void rgn_offset(Rgn *r, int32_t dx, int32_t dy)
+{
+    if (!r) return;
+    r->l += dx; r->r += dx; r->t += dy; r->b += dy;
+    rgn_offset(r->a, dx, dy);
+    rgn_offset(r->b2, dx, dy);
+}
+
+/* NULLREGION 1, SIMPLEREGION 2, COMPLEXREGION 3 */
+static int rgn_complexity(const Rgn *r)
+{
+    int32_t l, t, rr, b;
+    rgn_bounds(r, &l, &t, &rr, &b);
+    if (l >= rr || t >= b) return 1;
+    return r->kind == 0 ? 2 : 3;
+}
+
+static uint64_t region_new(Rgn *shape)
+{
+    if (!shape) return 0;
+    uint64_t h = obj_new(OBJ_REGION);
+    Obj *o = obj_get(h);
+    if (!o) { rgn_free(shape); return 0; }
+    o->region = shape;
+    return h;
+}
+
+static Rgn *rgn_shape(int kind, int32_t l, int32_t t, int32_t r, int32_t b, int32_t ew, int32_t eh)
+{
+    Rgn *g = calloc(1, sizeof(*g));
+    if (!g) return NULL;
+    g->kind = kind;
+    g->l = l < r ? l : r; g->r = l < r ? r : l;   /* GDI normalizes the corners */
+    g->t = t < b ? t : b; g->b = t < b ? b : t;
+    g->ew = ew < 0 ? -ew : ew; g->eh = eh < 0 ? -eh : eh;
+    return g;
+}
+
+uint64_t GDI_MS beer_CreateRectRgn(int left, int top, int right, int bottom)
+{
+    LOCK();
+    uint64_t h = region_new(rgn_shape(0, left, top, right, bottom, 0, 0));
+    UNLOCK();
+    return h;
+}
+
+uint64_t GDI_MS beer_CreateRoundRectRgn(int left, int top, int right, int bottom, int ew, int eh)
+{
+    LOCK();
+    uint64_t h = region_new(rgn_shape(1, left, top, right, bottom, ew, eh));
+    UNLOCK();
+    return h;
+}
+
+uint64_t GDI_MS beer_CreateEllipticRgn(int left, int top, int right, int bottom)
+{
+    LOCK();
+    uint64_t h = region_new(rgn_shape(1, left, top, right, bottom, right - left, bottom - top));
+    UNLOCK();
+    return h;
+}
+
+int GDI_MS beer_CombineRgn(uint64_t dest, uint64_t src1, uint64_t src2, int mode)
+{
+    LOCK();
+    Obj *d = obj_get(dest), *a = obj_get(src1), *b = obj_get(src2);
+    int result = 0;                                   /* ERROR */
+    if (d && d->type == OBJ_REGION && a && a->type == OBJ_REGION && mode >= 1 && mode <= 5 &&
+        (mode == 5 || (b && b->type == OBJ_REGION))) {
+        Rgn *shape;
+        if (mode == 5) {
+            shape = rgn_clone(a->region);
+        } else {
+            shape = calloc(1, sizeof(*shape));
+            if (shape) {
+                shape->kind = 2;
+                shape->mode = mode;
+                shape->a = rgn_clone(a->region);
+                shape->b2 = rgn_clone(b->region);
+                if (!shape->a || !shape->b2) { rgn_free(shape); shape = NULL; }
+            }
+        }
+        if (shape) {                                  /* dest may be one of the sources: replace after cloning */
+            rgn_free(d->region);
+            d->region = shape;
+            result = rgn_complexity(shape);
+        }
+    }
+    UNLOCK();
+    return result;
+}
+
+int GDI_MS beer_PtInRegion(uint64_t region, int x, int y)
+{
+    LOCK();
+    Obj *o = obj_get(region);
+    const int inside = o && o->type == OBJ_REGION && rgn_contains(o->region, x, y);
+    if (getenv("BEER_INPUT_DIAGNOSTICS")) {
+        static int logs, last_x = -99999, last_y = -99999, last_inside = -1;
+        if ((x != last_x || y != last_y || inside != last_inside) && logs++ < 300) {
+            int32_t l = 0, t = 0, r = 0, b = 0;
+            if (o && o->type == OBJ_REGION) rgn_bounds(o->region, &l, &t, &r, &b);
+            fprintf(stderr, "[GDI] PtInRegion(%d,%d) region=%d,%d-%d,%d kind=%d -> %d\n", x, y, l, t, r, b,
+                    o && o->type == OBJ_REGION && o->region ? o->region->kind : -1, inside);
+        }
+        last_x = x; last_y = y; last_inside = inside;
+    }
+    UNLOCK();
+    return inside;
+}
+
+int GDI_MS beer_OffsetRgn(uint64_t region, int dx, int dy)
+{
+    LOCK();
+    Obj *o = obj_get(region);
+    int result = 0;
+    if (o && o->type == OBJ_REGION) {
+        rgn_offset(o->region, dx, dy);
+        result = rgn_complexity(o->region);
+    }
+    UNLOCK();
+    return result;
+}
+
+int GDI_MS beer_GetRgnBox(uint64_t region, int32_t *rect)
+{
+    LOCK();
+    Obj *o = obj_get(region);
+    int result = 0;
+    if (o && o->type == OBJ_REGION && rect) {
+        rgn_bounds(o->region, &rect[0], &rect[1], &rect[2], &rect[3]);
+        result = rgn_complexity(o->region);
+    }
+    UNLOCK();
+    return result;
+}
+
+int GDI_MS beer_SetRectRgn(uint64_t region, int left, int top, int right, int bottom)
+{
+    LOCK();
+    Obj *o = obj_get(region);
+    Rgn *shape = o && o->type == OBJ_REGION ? rgn_shape(0, left, top, right, bottom, 0, 0) : NULL;
+    if (shape) { rgn_free(o->region); o->region = shape; }
+    UNLOCK();
+    return shape != NULL;
+}
+
+/* SetWindowRgn hands the region to the system: it must not be used or deleted by the caller afterwards.
+ * Beer composes the window itself, so the shape is accepted and released. */
+int GDI_MS beer_SetWindowRgn(uint64_t window, uint64_t region, int redraw)
+{
+    (void)window; (void)redraw;
+    if (region) beer_DeleteObject(region);
+    return 1;
 }

@@ -121,7 +121,6 @@ static u64 __attribute__((ms_abi)) stub_CountClipboardFormats(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumClipboardFormats(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EmptyClipboard(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_IsClipboardFormatAvailable(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetCapture(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnableWindow(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMenu(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetMenu(void){ return 0; }
@@ -138,7 +137,6 @@ static u64 __attribute__((ms_abi)) stub_DeleteMenu(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMenuItemRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_WindowFromDC(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetDCEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetWindowRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_InvalidateRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RedrawWindow(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ScrollWindowEx(void){ return 0; }
@@ -151,9 +149,6 @@ static u64 __attribute__((ms_abi)) stub_HideCaret(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ShowCaret(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetCaretPos(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetCaretPos(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_ClientToScreen(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_MapWindowPoints(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_WindowFromPoint(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetSysColor(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetSysColorBrush(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetSysColors(void){ return 0; }
@@ -200,14 +195,10 @@ static u64 __attribute__((ms_abi)) stub_GetTextExtentExPointW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetRandomRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Arc(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Chord(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CombineRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreateBrushIndirect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreateDIBitmap(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateEllipticRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreatePenIndirect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CreatePatternBrush(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateRectRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateRoundRectRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Ellipse(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EqualRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExcludeClipRect(void){ return 0; }
@@ -222,7 +213,6 @@ static u64 __attribute__((ms_abi)) stub_GetCurrentObject(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetDIBits(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMapMode(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetRegionData(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetRgnBox(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetTextAlign(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetViewportExtEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetViewportOrgEx(void){ return 0; }
@@ -231,10 +221,8 @@ static u64 __attribute__((ms_abi)) stub_GetWindowOrgEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_IntersectClipRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_LineTo(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_MaskBlt(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_OffsetRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Pie(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_PaintRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_PtInRegion(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RectInRegion(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RectVisible(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RealizePalette(void){ return 0; }
@@ -244,7 +232,6 @@ static u64 __attribute__((ms_abi)) stub_ExtSelectClipRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SelectPalette(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetMapMode(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetPolyFillMode(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetRectRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetROP2(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetTextCharacterExtra(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetArcDirection(void){ return 0; }

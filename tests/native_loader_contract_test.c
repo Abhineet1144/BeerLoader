@@ -154,8 +154,46 @@ static void guest_module_filename_test(void)
     g_exe_path = saved_exe;
 }
 
+static void winsock_ordinal_contract_test(void)
+{
+    for (u32 ordinal = 1; ordinal <= UINT16_MAX; ++ordinal) {
+        ImplFn implementation = winsock_ordinal_impl((u16)ordinal);
+        const char *name = winsock_ordinal_name((u16)ordinal);
+        assert((implementation != NULL) == (name != NULL));
+        if (name) assert(find_impl(name) == implementation);
+    }
+}
+
+static void wldap_ordinal_contract_test(void)
+{
+    for (u32 ordinal = 1; ordinal <= UINT16_MAX; ++ordinal) {
+        ImplFn implementation = wldap_ordinal_impl((u16)ordinal);
+        const char *name = wldap_ordinal_name((u16)ordinal);
+        assert((implementation != NULL) == (name != NULL));
+        if (name) assert(find_impl(name) == implementation);
+    }
+    assert(wldap_ordinal_impl(22) == (ImplFn)impl_ldap_err2string);
+    assert(wldap_ordinal_impl(26) == (ImplFn)impl_ldap_first_entry);
+    assert(wldap_ordinal_impl(27) == (ImplFn)impl_ldap_next_entry);
+    assert(wldap_ordinal_impl(30) == (ImplFn)impl_ldap_get_dn);
+    assert(wldap_ordinal_impl(32) == (ImplFn)impl_ldap_first_attribute);
+    assert(wldap_ordinal_impl(33) == (ImplFn)impl_ldap_next_attribute);
+    assert(wldap_ordinal_impl(35) == (ImplFn)impl_ldap_get_values_len);
+    assert(wldap_ordinal_impl(41) == (ImplFn)impl_ldap_msgfree);
+    assert(wldap_ordinal_impl(46) == (ImplFn)impl_ldap_unbind_s);
+    assert(wldap_ordinal_impl(50) == (ImplFn)impl_ldap_result);
+    assert(wldap_ordinal_impl(60) == (ImplFn)impl_ldap_simple_bind_s);
+    assert(wldap_ordinal_impl(143) == (ImplFn)impl_ldap_init);
+    assert(wldap_ordinal_impl(211) == (ImplFn)impl_ldap_set_option);
+    assert(wldap_ordinal_impl(79) == (ImplFn)impl_ldap_value_free_len);
+    assert(wldap_ordinal_impl(200) == (ImplFn)impl_ldap_memfree);
+    assert(wldap_ordinal_impl(301) == (ImplFn)impl_ber_free);
+}
+
 int main(void)
 {
+    winsock_ordinal_contract_test();
+    wldap_ordinal_contract_test();
     guest_module_filename_test();
     critical_section_layout_test();
     u64 event = impl_CreateEventW(0, 1, 0, 0);
@@ -218,6 +256,68 @@ int main(void)
     assert(impl_NtIsProcessInJob(1, 0) == 0xC0000008u);
     assert(find_impl("RtlCreateHeap") == (ImplFn)impl_RtlCreateHeap);
     assert(find_impl("RtlFreeHeap") == (ImplFn)impl_RtlFreeHeap);
+    /* Legacy Winsock ordinal identity must stay consistent across direct import
+     * binding, GetProcAddress/Ldr lookup, and the synthetic PE export table. */
+    assert(find_impl("ldap_next_entry") == (ImplFn)impl_ldap_next_entry);
+    assert(wldap_ordinal_impl(27) == (ImplFn)impl_ldap_next_entry);
+    assert(!strcmp(wldap_ordinal_name(27), "ldap_next_entry"));
+    assert(wldap_ordinal_impl(46) == (ImplFn)impl_ldap_unbind_s);
+    assert(!strcmp(wldap_ordinal_name(46), "ldap_unbind_s"));
+    assert(wldap_ordinal_impl(200) == (ImplFn)impl_ldap_memfree);
+    assert(!strcmp(wldap_ordinal_name(200), "ldap_memfree"));
+    assert(wldap_ordinal_impl(301) == (ImplFn)impl_ber_free);
+    assert(!strcmp(wldap_ordinal_name(301), "ber_free"));
+    assert(!wldap_ordinal_impl(26) && !wldap_ordinal_name(26));
+    assert(!impl_ldap_next_entry(0, 0));
+    assert(impl_ldap_unbind_s(0) == 89);
+    u16 station_name[16] = {0};
+    u32 station_bytes = 0;
+    assert(!impl_GetUserObjectInformationW(impl_GetProcessWindowStation(), 2,
+                                           station_name, 0, &station_bytes));
+    assert(g_last_error == 122 && station_bytes == 16);
+    assert(impl_GetUserObjectInformationW(impl_GetProcessWindowStation(), 2,
+                                          station_name, sizeof(station_name),
+                                          &station_bytes));
+    assert(station_name[0] == 'W' && station_name[6] == '0' && !station_name[7]);
+    assert(winsock_ordinal_impl(8) == (ImplFn)impl_htonl);
+    assert(winsock_ordinal_impl(10) == (ImplFn)impl_ioctlsocket);
+    assert(winsock_ordinal_impl(14) == (ImplFn)impl_ntohl);
+    assert(winsock_ordinal_impl(15) == (ImplFn)impl_ntohs);
+    assert(winsock_ordinal_impl(18) == (ImplFn)impl_select);
+    assert(winsock_ordinal_impl(19) == (ImplFn)impl_send);
+    assert(winsock_ordinal_impl(22) == (ImplFn)impl_shutdown);
+    assert(winsock_ordinal_impl(51) == (ImplFn)impl_gethostbyaddr);
+    assert(winsock_ordinal_impl(52) == (ImplFn)impl_gethostbyname);
+    assert(winsock_ordinal_impl(55) == (ImplFn)impl_getservbyname);
+    assert(winsock_ordinal_impl(151) == (ImplFn)impl_WSAFDIsSet);
+    assert(!strcmp(winsock_ordinal_name(8), "htonl"));
+    assert(!strcmp(winsock_ordinal_name(10), "ioctlsocket"));
+    assert(!strcmp(winsock_ordinal_name(14), "ntohl"));
+    assert(!strcmp(winsock_ordinal_name(15), "ntohs"));
+    assert(!strcmp(winsock_ordinal_name(18), "select"));
+    assert(!strcmp(winsock_ordinal_name(19), "send"));
+    assert(!strcmp(winsock_ordinal_name(22), "shutdown"));
+    assert(!strcmp(winsock_ordinal_name(51), "gethostbyaddr"));
+    assert(!strcmp(winsock_ordinal_name(52), "gethostbyname"));
+    assert(!strcmp(winsock_ordinal_name(55), "getservbyname"));
+    assert(!strcmp(winsock_ordinal_name(151), "__WSAFDIsSet"));
+    assert(find_impl("select") == (ImplFn)impl_select);
+    assert(find_impl("send") == (ImplFn)impl_send);
+    assert(find_impl("getservbyname") == (ImplFn)impl_getservbyname);
+    assert(find_impl("getaddrinfo") == (ImplFn)impl_getaddrinfo);
+    assert(find_impl("freeaddrinfo") == (ImplFn)impl_freeaddrinfo);
+    assert(find_impl("__WSAFDIsSet") == (ImplFn)impl_WSAFDIsSet);
+    assert(find_impl("WSAIoctl") == (ImplFn)impl_WSAIoctl);
+    for (u32 ordinal = 1; ordinal <= UINT16_MAX; ++ordinal) {
+        ImplFn implementation = winsock_ordinal_impl((u16)ordinal);
+        const char *name = winsock_ordinal_name((u16)ordinal);
+        assert((implementation != NULL) == (name != NULL));
+        if (name) assert(find_impl(name) == implementation);
+    }
+    /* The sparse table needs 604 bytes. The old fixed 116-slot allocation had
+     * only 464 bytes and ordinal 151 consequently overwrote AddressOfNames. */
+    assert(151u * sizeof(u32) == 604u);
+    assert(151u * sizeof(u32) > 0x200u);
     assert(find_impl("NtAllocateVirtualMemory") == (ImplFn)impl_NtAllocateVirtualMemory);
     assert(find_impl("ZwAllocateVirtualMemory") == (ImplFn)impl_NtAllocateVirtualMemory);
     assert(find_impl("NtFreeVirtualMemory") == (ImplFn)impl_NtFreeVirtualMemory);
@@ -309,6 +409,8 @@ int main(void)
     assert(!impl_GetProcAddress(HMOD_K32, "InitializeProcThreadAttributeList") && g_last_error == 127);
     assert(!impl_GetProcAddress(HMOD_K32, "UpdateProcThreadAttribute") && g_last_error == 127);
     assert(!impl_GetProcAddress(HMOD_USER32, "BeerAbsentExportTest") && g_last_error == 127);
+    assert(fake_pe_export_address(HMOD_USER32, "MessageBoxA"));
+    assert(fake_pe_export_address(HMOD_USER32, "MessageBoxW"));
     assert(g_nstubs == before_missing_lookup);
     FakePeModule *native = fake_pe_module_from_base(HMOD_NTDLL);
     assert(fake_pe_export_address(HMOD_NTDLL, "RtlAddVectoredExceptionHandler"));

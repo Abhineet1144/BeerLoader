@@ -124,6 +124,44 @@ static void reg_seed_vc_runtime(void)
     reg_add_dword(key, "rbld", version[3]);
 }
 
+/* User-mode display driver version Beer reports, product.version.sub.build: IDXGIAdapter::CheckInterfaceSupport
+ * and the adapter's driver key below carry the same value. */
+#define BEER_UMD_VERSION_PRODUCT 32u
+#define BEER_UMD_VERSION_MAJOR   0u
+#define BEER_UMD_VERSION_MINOR   15u
+#define BEER_UMD_VERSION_BUILD   7200u
+
+/* The display adapter's driver key, seeded on first access below Control (it needs the host GPU): the
+ * display-class instance and the Video key that EnumDisplayDevices' DeviceKey names hold the same driver
+ * values, as on Windows: DriverDesc is the DXGI adapter description, ProviderName the vendor, MatchingDeviceId
+ * the PCI id, DriverVersion the reported UMD version. */
+static void reg_seed_display_driver_locked(void)
+{
+    static int seeded;
+    if (seeded) return;
+    seeded = 1;
+    static char desc[160], matching[64], version[32];
+    BeerHostGpuInfo gpu;
+    const int have = beer_vulkan_host_gpu_info(&gpu);
+    const u32 vendor = have ? gpu.vendor_id : 0x1414u;
+    snprintf(desc, sizeof(desc), "%s", have ? gpu.name : "Beer Virtual D3D11 Adapter");
+    snprintf(matching, sizeof(matching), "pci\\ven_%04x&dev_%04x", vendor, have ? gpu.device_id : 1u);
+    snprintf(version, sizeof(version), "%u.%u.%u.%u", BEER_UMD_VERSION_PRODUCT, BEER_UMD_VERSION_MAJOR,
+             BEER_UMD_VERSION_MINOR, BEER_UMD_VERSION_BUILD);
+    const char *provider = vendor == 0x8086u ? "Intel Corporation" : vendor == 0x10deu ? "NVIDIA"
+                         : vendor == 0x1002u ? "Advanced Micro Devices, Inc." : "Beer";
+    static const char *const keys[] = {
+        "hklm\\system\\currentcontrolset\\control\\class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000",
+        "hklm\\system\\currentcontrolset\\control\\video\\{beer0001-0000-0000-0000-000000000000}\\0000",
+    };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(*keys); ++i) {
+        reg_add_sz(keys[i], "driverdesc", desc);
+        reg_add_sz(keys[i], "providername", provider);
+        reg_add_sz(keys[i], "driverversion", version);
+        reg_add_sz(keys[i], "matchingdeviceid", matching);
+    }
+}
+
 static void reg_seed_locked(void)
 {
     if (g_reg_value_count) return;
@@ -210,6 +248,7 @@ static u64 reg_open(u64 key, const char *subkey, u64 *result)
     u64 status = 6;                                       /* ERROR_INVALID_HANDLE */
     if (reg_key_path(key, path, sizeof(path))) {
         if (subkey) reg_append_path(path, sizeof(path), subkey);
+        if (!strncmp(path, "hklm\\system\\currentcontrolset\\control", 37)) reg_seed_display_driver_locked();
         status = 2;                                       /* ERROR_FILE_NOT_FOUND */
         if (g_reg_value_count > 0 && reg_key_exists_locked(path) && result) {
             for (int i = 0; i < BEER_REG_MAX_HANDLES; ++i)

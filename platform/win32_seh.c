@@ -99,8 +99,16 @@ int beer_seh_dispatch(BeerExceptionRecord64 *record, void *context_record,
             dispatcher.handler_data = handler_data;
             dispatcher.scope_index = 0;
 
+            if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
+                fprintf(stderr, "[SEH] calling handler 0x%llx for frame %u pc=0x%llx establisher=0x%llx\n",
+                        (unsigned long long)handler, frame_index,
+                        (unsigned long long)control_pc,
+                        (unsigned long long)establisher_frame);
             int32_t disposition = ((BeerLanguageHandler)(uintptr_t)handler)(
                 record, establisher_frame, context_record, &dispatcher);
+            if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
+                fprintf(stderr, "[SEH] handler 0x%llx returned disposition %d\n",
+                        (unsigned long long)handler, disposition);
             if (disposition == BEER_EXCEPTION_DISPOSITION_CONTINUE_EXECUTION)
                 return (record->flags & BEER_EXCEPTION_NONCONTINUABLE) ? 0 : 1;
             if (disposition != BEER_EXCEPTION_DISPOSITION_CONTINUE_SEARCH)
