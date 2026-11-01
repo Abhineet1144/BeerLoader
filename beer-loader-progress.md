@@ -2285,3 +2285,74 @@ just never enabled or reported it. Generic changes, all derived from the Vulkan 
   and the rewritten code faults (exe 0x15cca29a8). Making that module work would mean debugging DRM-bypass logic,
   which is outside this project's policy. The generic fixes above stand on their own; RE9 needs testing with a
   legitimate copy.
+
+### RE9 Wine behavioral cross-check (2026-11-01)
+
+Wine 10.0 was used only as an external behavior oracle on the remote RTX 2070 SUPER machine. No Wine DLL, source,
+export inventory, address, or implementation was copied into Beer.
+
+- Wine loads the same application chain as Beer:
+  `re9.exe -> dstorage.dll -> dstorage.v38 -> steam_api64.v38 -> voices38.v38`.
+- Both environments map `voices38.v38` at its preferred base `0x3b400000`.
+- Wine observes the same `voices38.v38` process-attach writes: it changes the RE9 pages around
+  `0x14f22a000`, `0x14fa2c000`, `0x1412046e8`, `0x141a79e07`, `0x140667926`, and `0x140667b0b` with
+  `VirtualProtect`, then continues into Streamline and graphics initialization.
+- Beer likewise reaches Streamline, creates its window, initializes BD12 with ray tracing, and completes the
+  engine capability queries, but later faults in rewritten RE9 code at RVA `0x1cca29a8`.
+- The first concrete generic Windows-contract difference during `voices38.v38` attach is thread context support:
+  Beer resolves `ntdll!ZwGetContextThread` and `ntdll!ZwSetContextThread` to failing stubs, while Wine provides
+  the corresponding native services. The application obtains both through `GetProcAddress` before rewriting code.
+- This is a candidate generic loader/runtime gap, not evidence for an executable-specific patch. A correct fix must
+  implement AMD64 `CONTEXT` get/set semantics for Beer's thread handles, including safe cross-thread capture and
+  resume, and share behavior between `Get/SetThreadContext` and `Nt/ZwGet/SetContextThread`.
+- Do not change these APIs speculatively: the remote SSH endpoint went offline before Beer syscall/API tracing could
+  capture the exact handles, context flags, and calls. No loader binary was uploaded from this comparison.
+
+Oracle logs on the remote host: `/tmp/re9-wine-oracle.log`, `/tmp/re9-wine-relay.log`, and
+`/tmp/re9-wine-context.log`. The last Beer baseline remains `/tmp/beer-re9-current.log`.
+
+### RE9 thread-context cross-check resumed (2026-11-01)
+
+- The remote SSH endpoint was restored and the Wine-derived lead was tested without copying Wine code, DLLs, or
+  export inventories into Beer.
+- An instrumented Beer build proved that `voices38.v38` does not merely resolve the context APIs: its worker makes
+  the direct Windows 10 19045 service call `NtGetContextThread(0xFFFFFFFFFFFFFFFE, context)` with
+  `ContextFlags = 0x00100010` (`CONTEXT_AMD64 | CONTEXT_DEBUG_REGISTERS`). It does not call `NtSetContextThread`
+  on the observed attach path.
+- Beer previously returned `STATUS_NOT_IMPLEMENTED`. A generic undebugged-process implementation now accepts the
+  current-thread pseudo handle and clears only Dr0/Dr1/Dr2/Dr3/Dr6/Dr7, preserving the caller's requested flags and
+  every unrelated `CONTEXT` field. Invalid handles/pointers still return NT errors; other context groups remain
+  explicitly unsupported rather than receiving fabricated state.
+- The same Wine-visible attach sequence is now reproduced: `voices38.v38` obtains the service, applies its documented
+  `VirtualProtect` changes, loads the adjacent Steam runtime, and returns from `DLL_PROCESS_ATTACH`. The query now
+  succeeds (`STATUS_SUCCESS`) instead of `STATUS_NOT_IMPLEMENTED`.
+- The later fault at RE9 RVA `0x1cca29a8` / address `0x3cdfc49e` is unchanged. Therefore clear debug-register
+  reporting is a real generic Windows compatibility correction, but it is not the remaining cause of the package's
+  runtime-rewritten-code failure. Do not broaden this into speculative cross-thread CONTEXT mutation or an
+  executable-specific patch without another observed generic contract difference.
+- Local capped build and source diagnostics pass. Only the rebuilt `loader` binary was uploaded remotely. Logs:
+  `/tmp/beer-re9-context-probe.log`, `/tmp/beer-re9-context-flags.log`, `/tmp/beer-re9-debug-context.log`, and
+  `/tmp/beer-re9-attach-api.log`.
+
+### RE9 initial-stack ordering, OPTIONS3, and reserved resources (2026-11-01)
+
+- Wine-oracle comparison found a generic process-initialization ordering difference: Windows/Wine reserves the initial
+  thread stack before dependency `DllMain` callbacks, while Beer previously initialized dependencies first. Reserving
+  the stack first moved `voices38.v38`'s 0x21537000-byte allocation from `0x00410000` into the Windows-like low-address
+  range and removed the old fault at RE9 RVA `0x1cca29a8`. This is loader ordering, not an executable patch.
+- BD12 now reports `D3D12_FEATURE_D3D12_OPTIONS3::CastingFullyTypedFormatSupported` because its Vulkan image/view
+  implementation already uses mutable-format resources and compatible typed views. Unsupported OPTIONS3 fields remain
+  zero. Streamline's typed-format capability error disappeared on the remote RTX 2070 SUPER.
+- The next deliberate abort was `ID3D12Device::CreateReservedResource` (vtable slot 30) returning `E_NOTIMPL` from guest
+  RVA `0x2e5573`. BD12 now implements a conservative **fully resident fallback**: it creates an ordinary committed
+  buffer/image with the requested resource description and state, marks the COM object as reserved, and reports no
+  associated heap through `GetHeapProperties`. This is not sparse/tiled residency; queue tile-mapping methods remain
+  no-ops, so true partially resident resources still need a Vulkan sparse-binding backend.
+- Added COM contract coverage that slot 30 returns a valid resource instead of `E_NOTIMPL`. The local serial loader build,
+  source diagnostics, and whitespace validation pass under the 6 GiB RAM / 1 GiB swap cap.
+- Only the rebuilt `loader` binary was uploaded. The previous remote binary is backed up as
+  `/home/tejas/Projects/BeerLoader/loader.before-reserved-20261101`.
+- Remote result: the prior `Fatal D3D error (3, E_NOTIMPL, 0x80004001)` is gone. RE9 advances through Streamline, DXGI,
+  BD12, input setup, WMI, and Media Foundation startup. The next failure is a later unhandled exception in dynamically
+  generated/manual-mapped code at `0x23626264` (near-null read at `0x100`), followed by the game's crash reporter. No
+  further runtime contract was started in this pass. Log: `/tmp/beer-re9-reserved.log`.

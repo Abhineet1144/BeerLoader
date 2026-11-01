@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <time.h>
 
 /* D3D12_RESOURCE_STATES values (identical numeric encoding). */

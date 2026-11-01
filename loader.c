@@ -17520,6 +17520,52 @@ static u64 __attribute__((ms_abi)) impl_CheckRemoteDebuggerPresent(u64 process, 
 static u64 __attribute__((ms_abi)) impl_GetErrorMode(void) { return 0; }
 static u64 __attribute__((ms_abi)) impl_Wow64GetSetThreadContext(u64 thread, void *context)
 { (void)thread; (void)context; g_last_error = 87; return 0; }      /* FALSE: not a WOW64 thread */
+/* Named probes preserve the previous generic STATUS_NOT_IMPLEMENTED behavior while making
+ * Nt/Zw thread-context calls visible to BEER_API_TRACE.  Do not mutate a context until the
+ * requested handles and ContextFlags have been observed and covered by a generic test. */
+static u64 __attribute__((ms_abi)) impl_NtGetContextThreadProbe(u64 thread, void *context)
+{
+    enum {
+        CONTEXT_AMD64 = 0x00100000u,
+        CONTEXT_DEBUG_REGISTERS = CONTEXT_AMD64 | 0x10u,
+        STATUS_INVALID_HANDLE = 0xC0000008u,
+        STATUS_INVALID_PARAMETER = 0xC000000Du,
+        STATUS_NOT_IMPLEMENTED = 0xC0000002u
+    };
+    if (!context) return STATUS_INVALID_PARAMETER;
+    if (thread != (u64)-2 && thread_id_from_handle(thread) < 0)
+        return STATUS_INVALID_HANDLE;
+
+    u32 flags = 0;
+    struct iovec local = { &flags, sizeof(flags) };
+    struct iovec remote = { (u8 *)context + 0x30, sizeof(flags) };
+    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(flags))
+        return STATUS_INVALID_PARAMETER;
+
+    u64 status = STATUS_NOT_IMPLEMENTED;
+    if (flags == CONTEXT_DEBUG_REGISTERS) {
+        /* Beer does not install hardware breakpoints in guest threads.  An
+         * undebugged Windows process therefore observes all AMD64 debug
+         * registers clear.  Write only the requested CONTEXT group. */
+        static const size_t offsets[] = { 0x48, 0x50, 0x58, 0x60, 0x68, 0x70 };
+        const u64 zero = 0;
+        status = 0;
+        for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+            local = (struct iovec){ (void *)&zero, sizeof(zero) };
+            remote = (struct iovec){ (u8 *)context + offsets[i], sizeof(zero) };
+            if (process_vm_writev(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(zero)) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+        }
+    }
+    if (getenv("BEER_THREAD_CONTEXT_DIAGNOSTICS"))
+        fprintf(stderr, "[THREADCTX] NtGetContextThread(handle=0x%llx context=%p flags=0x%x) -> 0x%llx\n",
+                (unsigned long long)thread, context, flags, (unsigned long long)status);
+    return status;
+}
+static u64 __attribute__((ms_abi)) impl_NtSetContextThreadProbe(u64 thread, const void *context)
+{ (void)thread; (void)context; return 0xC0000002u; }
 static u64 __attribute__((ms_abi)) impl_NtSetInformationThread(u64 thread, u32 info_class, void *info, u32 size)
 {
     if (info_class == 4) {                                   /* ThreadAffinityMask (KAFFINITY) */
@@ -20986,6 +21032,10 @@ static ImplEntry g_impls[] = {
     {"GetErrorMode",                          (ImplFn)impl_GetErrorMode},
     {"Wow64GetThreadContext",                 (ImplFn)impl_Wow64GetSetThreadContext},
     {"Wow64SetThreadContext",                 (ImplFn)impl_Wow64GetSetThreadContext},
+    {"NtGetContextThread",                    (ImplFn)impl_NtGetContextThreadProbe},
+    {"ZwGetContextThread",                    (ImplFn)impl_NtGetContextThreadProbe},
+    {"NtSetContextThread",                    (ImplFn)impl_NtSetContextThreadProbe},
+    {"ZwSetContextThread",                    (ImplFn)impl_NtSetContextThreadProbe},
     {"NtSetInformationThread",                (ImplFn)impl_NtSetInformationThreadNative},
     {"ZwSetInformationThread",                (ImplFn)impl_NtSetInformationThreadNative},
     {"FatalAppExitA",                         (ImplFn)impl_FatalAppExitA},
@@ -29839,6 +29889,33 @@ int main(int argc, char **argv)
     setup_teb_peb();
     pe_initialize_security_cookie();
 
+    /* Windows reserves the initial thread's stack before it calls dependency
+     * DLL_PROCESS_ATTACH routines.  Besides making the TEB contract possible,
+     * that reservation is part of the process address-space topology observed
+     * by subsequent bottom-up VirtualAlloc calls.  Reserve it now, but keep
+     * DllMain on Beer's guarded host-call stack; entry-frame setup and TEB stack
+     * publication still happen immediately before the executable handoff. */
+    const size_t guest_stack_size = 16 * 1024 * 1024;
+    void *guest_stack = beer_vm_map_bottom_up(guest_stack_size + 0x1000, 65536,
+                                               PROT_READ | PROT_WRITE, 0);
+    u64 guest_stack_low, guest_stack_high;
+    if (guest_stack != MAP_FAILED) {
+        guest_stack_low = (u64)guest_stack;
+        guest_stack_high = (u64)guest_stack + 0x1000 + guest_stack_size;
+    } else {
+        guest_stack = mmap(NULL, guest_stack_size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (guest_stack == MAP_FAILED)
+            die("mmap(guest_stack): %s", strerror(errno));
+        guest_stack_low = (u64)guest_stack;
+        guest_stack_high = (u64)guest_stack + guest_stack_size;
+        void *guard_page = mmap((void *)(guest_stack_low - 0x1000), 0x1000,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (guard_page != MAP_FAILED)
+            guest_stack_low -= 0x1000;
+    }
+
     {
         int n = patch_transaction_assertions();
         if (n) printf("[PATCH] Disabled %d Transaction-failed assertion branches\n", n);
@@ -29908,36 +29985,9 @@ int main(int argc, char **argv)
      */
     typedef void __attribute__((ms_abi)) (*WinEntry)(void);
 
-    /* Keep the synthetic startup stack well inside the mapped region. The real
-     * helper we are emulating takes a normal Windows x64 caller frame, where the
-     * current %rsp is the frame anchor and the saved return address is at
-     * [rsp+0x5c8]. We therefore seed the frame relative to that anchor and hand
-     * execution off with %rsp pointing at the anchor itself, not at a synthetic
-     * value 0x5c8 bytes lower than the true frame base. */
-    size_t guest_stack_size = 16 * 1024 * 1024;  /* 16 MB for deep recursion */
-    /* Bottom-up like a Windows main-thread stack; one extra page below it in the same mapping (a separate MAP_FIXED
-     * page would replace whatever bottom-up placement put just below). */
-    void *guest_stack = beer_vm_map_bottom_up(guest_stack_size + 0x1000, 65536, PROT_READ | PROT_WRITE, 0);
-    u64 guest_stack_low, guest_stack_high;
-    if (guest_stack != MAP_FAILED) {
-        guest_stack_low = (u64)guest_stack;
-        guest_stack_high = (u64)guest_stack + 0x1000 + guest_stack_size;
-    } else {
-        guest_stack = mmap(NULL, guest_stack_size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (guest_stack == MAP_FAILED)
-            die("mmap(guest_stack): %s", strerror(errno));
-        guest_stack_low  = (u64)guest_stack;
-        guest_stack_high = (u64)guest_stack + guest_stack_size;
-        /* Map a guard page below the stack for underflow protection */
-        void *guard_page = mmap((void *)(guest_stack_low - 0x1000), 0x1000,
-                                PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (guard_page != MAP_FAILED) {
-            guest_stack_low -= 0x1000;  /* Extend stack low boundary to include guard page */
-        }
-    }
-    
+    /* The initial stack reservation was made before dependency process attach,
+     * as it is by the Windows loader. Build the executable's entry frame in that
+     * reservation now. */
     /* Reserve 2MB at top for guest runtime, allowing deep recursion */
     u64 guest_rsp = (guest_stack_high - 0x200000) & ~0xF;
     /* Entry RSP must be 8 mod 16, as after a real `call` on Windows x64. */

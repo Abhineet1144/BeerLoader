@@ -142,6 +142,7 @@ typedef struct ComResource {
     uint64_t width;
     uint32_t height, depth_or_layers, mips, dxgi_format, flags;
     uint32_t planes;              /* 2 for combined depth/stencil */
+    uint32_t reserved;            /* CreateReservedResource: fully-resident emulation */
 } ComResource;
 
 typedef struct ComDescHeap {

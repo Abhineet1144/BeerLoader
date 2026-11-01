@@ -112,6 +112,37 @@ int main(void)
     CHECK(((HR(MS *)(void *, uint64_t, uint32_t, const uint8_t *, void **))V(dev, 36))(
               dev, 0, 0, com_iid_iunknown, &fence) == 0, "fence");
 
+    uint32_t options3[5] = { 0xffffffffu, 0, 0xffffffffu, 0xffffffffu, 0xffffffffu };
+    CHECK(((HR(MS *)(void *, uint32_t, void *, uint32_t))V(dev, 13))(
+              dev, 21, options3, sizeof(options3)) == 0,
+          "CheckFeatureSupport OPTIONS3");
+    CHECK(options3[1] == 1, "OPTIONS3 fully typed format casting");
+    CHECK(options3[0] == 0 && options3[2] == 0 && options3[3] == 0 && options3[4] == 0,
+          "OPTIONS3 unsupported fields remain disabled");
+
+    /* Reserved resources are emulated with fully resident backing until BD12
+     * grows a sparse-binding backend.  The COM contract must still create a
+     * normal resource object rather than returning E_NOTIMPL. */
+    uint8_t reserved_desc[56] = { 0 };
+    uint32_t reserved_dim = 1, reserved_height = 1, reserved_samples = 1,
+             reserved_layout = 1;
+    uint16_t reserved_depth = 1, reserved_mips = 1;
+    uint64_t reserved_width = 65536;
+    memcpy(reserved_desc, &reserved_dim, 4);
+    memcpy(reserved_desc + 16, &reserved_width, 8);
+    memcpy(reserved_desc + 24, &reserved_height, 4);
+    memcpy(reserved_desc + 28, &reserved_depth, 2);
+    memcpy(reserved_desc + 30, &reserved_mips, 2);
+    memcpy(reserved_desc + 36, &reserved_samples, 4);
+    memcpy(reserved_desc + 44, &reserved_layout, 4);
+    void *reserved = NULL;
+    CHECK(((HR(MS *)(void *, const void *, uint32_t, const void *,
+                     const uint8_t *, void **))V(dev, 30))(
+              dev, reserved_desc, 0, NULL, com_iid_iunknown, &reserved) == 0 &&
+              reserved,
+          "CreateReservedResource fully-resident fallback");
+    if (reserved) ((uint32_t(MS *)(void *))V(reserved, 2))(reserved);
+
     enum { N = 4096 };
     void *upload = make_buffer(dev, 2, N, 0xac3);
     void *def = make_buffer(dev, 1, N, 0);

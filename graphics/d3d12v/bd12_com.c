@@ -1299,6 +1299,17 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
         if (!f[0]) return HR_E_INVALIDARG;
         return HR_OK;
     }
+    if (feature == 21 && size >= 20) {                             /* OPTIONS3 */
+        uint32_t *f = data;
+        memset(data, 0, size);
+        /* BD12 creates textures with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT and
+         * resolves typed RTV/SRV/UAV views through the Vulkan-compatible
+         * format class.  This is the D3D12 fully-typed casting contract.
+         * Keep view instancing, barycentrics and WriteBufferImmediate disabled
+         * until their command-list behavior is implemented. */
+        f[1] = 1;                                                  /* CastingFullyTypedFormatSupported */
+        return HR_OK;
+    }
     if (feature == 23 && size >= 12 && !(self->bd->rt_enabled && getenv("BEER_DXR_FEATURES"))) {   /* OPTIONS4 */
         uint32_t *f = data;
         memset(data, 0, size);
@@ -1866,6 +1877,17 @@ static HR MS dev_create_placed(ComDevice *self, ComHeap *heap, uint64_t offset,
                            riid, out);
 }
 
+static HR MS dev_create_reserved(ComDevice *self, const uint8_t *desc,
+                                 uint32_t state, const void *clear,
+                                 const uint8_t *riid, void **out)
+{
+    (void)clear;
+    HR hr = create_resource(self, NULL, 0, NULL, 0, desc, state, riid, out);
+    if (hr == HR_OK && out && *out)
+        ((ComResource *)*out)->reserved = 1;
+    return hr;
+}
+
 static HR MS dev_create_fence(ComDevice *self, uint64_t initial, uint32_t flags,
                               const uint8_t *riid, void **out)
 {
@@ -2393,7 +2415,7 @@ static void *device_vtable[76] = {
     [23] = dev_copy_descriptors, [24] = dev_copy_descriptors_simple,
     [25] = dev_get_allocation_info, [26] = dev_get_custom_heap_props,
     [27] = dev_create_committed, [28] = dev_create_heap,
-    [29] = dev_create_placed, [30] = obj_notimpl, [31] = obj_notimpl,
+    [29] = dev_create_placed, [30] = dev_create_reserved, [31] = obj_notimpl,
     [32] = obj_notimpl, [33] = obj_notimpl, [34] = obj_ok, [35] = obj_ok,
     [36] = dev_create_fence, [37] = dev_removed_reason,
     [38] = dev_get_footprints, [39] = dev_create_query_heap, [40] = obj_ok,
