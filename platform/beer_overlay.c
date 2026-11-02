@@ -371,7 +371,11 @@ static void config_json(char *out, size_t size)
 
 void beer_overlay_init(void)
 {
+    /* The manager passes its settings at launch; a game started from a terminal reads the copy the
+     * manager keeps in ~/.beer, so it looks the same either way. */
     const char *json = getenv("BEER_OVERLAY_JSON");
+    static char saved[4096];
+    if ((!json || !*json) && beer_read_config("overlay-loader.json", saved, sizeof(saved))) json = saved;
     if (json && *json) {
         pthread_mutex_lock(&ov.lock);
         apply_config(json);

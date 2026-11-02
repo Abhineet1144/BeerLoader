@@ -179,7 +179,7 @@ static B11HR B11_MS sc_present(B11Swap *s, uint32_t sync, uint32_t flags)
     }
     BD12Buffer *dump = NULL;
     const char *dump_list = getenv("BEER_BD11_DUMP_PRESENT");   /* comma list of present numbers, files go to BEER_BD11_DUMP_DIR */
-    if (dump_list && s->back->image && s->format == 28) {
+    if (dump_list && s->back->image && (s->format == 28 || s->format == 24)) {   /* RGBA8 or RGB10A2 */
         char key[24], hay[512];
         snprintf(key, sizeof(key), ",%u,", s->present_count);
         snprintf(hay, sizeof(hay), ",%s,", dump_list);
@@ -205,7 +205,17 @@ static B11HR B11_MS sc_present(B11Swap *s, uint32_t sync, uint32_t flags)
         if (f && dump->cpu) {
             fprintf(f, "P6\n%u %u\n255\n", s->width, s->height);
             const uint8_t *px = dump->cpu;
-            for (size_t i = 0; i < (size_t)s->width * s->height; ++i) fwrite(px + i * 4, 1, 3, f);
+            for (size_t i = 0; i < (size_t)s->width * s->height; ++i) {
+                if (s->format == 24) {
+                    uint32_t v;
+                    memcpy(&v, px + i * 4, 4);
+                    const uint8_t rgb[3] = { (uint8_t)((v & 0x3ff) >> 2), (uint8_t)(((v >> 10) & 0x3ff) >> 2),
+                                             (uint8_t)(((v >> 20) & 0x3ff) >> 2) };
+                    fwrite(rgb, 1, 3, f);
+                } else {
+                    fwrite(px + i * 4, 1, 3, f);
+                }
+            }
         }
         if (f) fclose(f);
         bd12_buffer_destroy(dump);

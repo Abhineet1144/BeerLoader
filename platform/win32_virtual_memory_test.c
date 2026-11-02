@@ -92,8 +92,82 @@ static void test_reserve_and_validation(void)
     assert(!beer_virtual_query(memory, &info, sizeof(info) - 1));
 }
 
+static void test_forward_query_and_commit_boundaries(void)
+{
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char *memory = beer_virtual_alloc(NULL, page * 4,
+        BEER_MEM_RESERVE | BEER_MEM_COMMIT, BEER_PAGE_READWRITE);
+    assert(memory);
+    BeerMemoryBasicInformation info, allocation;
+    assert(beer_virtual_query(memory, &allocation, sizeof(allocation)));
+    for (size_t i = 0; i < 4; ++i) {
+        assert(beer_virtual_query(memory + i * page + 19, &info, sizeof(info)));
+        assert(info.base_address == (uintptr_t)memory + i * page);
+        assert(info.region_size == allocation.region_size - i * page);
+        assert(info.allocation_base == (uintptr_t)memory);
+    }
+    uint32_t old;
+    assert(beer_virtual_protect(memory + 3 * page, page, BEER_PAGE_READONLY, &old));
+    assert(beer_virtual_query(memory + page + 19, &info, sizeof(info)));
+    assert(info.base_address == (uintptr_t)memory + page && info.region_size == 2 * page);
+    assert(beer_virtual_free(memory + page, 2 * page, BEER_MEM_DECOMMIT));
+    assert(beer_virtual_query(memory + 2 * page + 19, &info, sizeof(info)));
+    assert(info.base_address == (uintptr_t)memory + 2 * page && info.region_size == page);
+    assert(info.state == BEER_MEM_RESERVE);
+    assert(beer_virtual_alloc(memory + page + 19, page, BEER_MEM_COMMIT,
+        BEER_PAGE_READWRITE) == memory + page);
+    memory[page + 19] = 0xA5;
+    assert(beer_virtual_alloc(memory + page + 19, 1, BEER_MEM_COMMIT,
+        BEER_PAGE_READWRITE) == memory + page);
+    assert(memory[page + 19] == 0xA5); /* Recommit preserves existing data. */
+    assert(!beer_virtual_alloc(memory, page, BEER_MEM_RESERVE | BEER_MEM_COMMIT,
+        BEER_PAGE_READWRITE));
+    assert(beer_virtual_free(memory, 0, BEER_MEM_RELEASE));
+    assert(!beer_virtual_alloc(memory, page, BEER_MEM_COMMIT, BEER_PAGE_READWRITE));
+
+    /* Apply the same forward-query contract to host-backed mappings outside
+     * Beer's VirtualAlloc registry (e.g. PE image mappings). */
+    memory = mmap(NULL, page * 4, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(memory != MAP_FAILED);
+    assert(mprotect(memory + 3 * page, page, PROT_NONE) == 0);
+    assert(beer_virtual_query(memory + page + 19, &info, sizeof(info)));
+    assert(info.base_address == (uintptr_t)memory + page && info.region_size == 2 * page);
+    assert(munmap(memory, page * 4) == 0);
+}
+
 int main(void)
 {
+    test_forward_query_and_commit_boundaries();
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char *memory = beer_virtual_alloc(NULL, page * 2,
+        BEER_MEM_RESERVE | BEER_MEM_COMMIT, BEER_PAGE_READWRITE);
+    assert(memory);
+    memory[0] = 0xA5;
+    uint32_t old = 0;
+    BeerMemoryBasicInformation info;
+    assert(beer_virtual_protect(memory, page, BEER_PAGE_EXECUTE, &old));
+    assert(old == BEER_PAGE_READWRITE);
+    assert(*(volatile unsigned char *)memory == 0xA5);
+    assert(beer_virtual_query(memory, &info, sizeof(info)));
+    assert(info.protect == BEER_PAGE_EXECUTE && info.region_size == page);
+    assert(info.allocation_protect == BEER_PAGE_READWRITE);
+    assert(beer_virtual_query(memory + page, &info, sizeof(info)));
+    assert(info.protect == BEER_PAGE_READWRITE);
+    assert(beer_virtual_protect(memory, page, BEER_PAGE_EXECUTE_READ, &old));
+    assert(old == BEER_PAGE_EXECUTE);
+    assert(beer_virtual_query(memory, &info, sizeof(info)));
+    assert(info.protect == BEER_PAGE_EXECUTE_READ);
+    assert(!beer_virtual_protect(memory, SIZE_MAX, BEER_PAGE_READWRITE, &old));
+    assert(beer_virtual_free(memory, page, BEER_MEM_DECOMMIT));
+    assert(beer_virtual_query(memory, &info, sizeof(info)));
+    assert(info.state == BEER_MEM_RESERVE && info.protect == BEER_PAGE_NOACCESS);
+    assert(!beer_virtual_protect(memory, page * 2, BEER_PAGE_READWRITE, &old));
+    assert(beer_virtual_alloc(memory, page, BEER_MEM_COMMIT, BEER_PAGE_EXECUTE) == memory);
+    assert(*(volatile unsigned char *)memory == 0);
+    assert(beer_virtual_query(memory, &info, sizeof(info)));
+    assert(info.state == BEER_MEM_COMMIT && info.protect == BEER_PAGE_EXECUTE);
+    assert(beer_virtual_free(memory, 0, BEER_MEM_RELEASE));
     test_allocate_query_protect_release();
     test_reserve_and_validation();
     test_string_pointer_probes();

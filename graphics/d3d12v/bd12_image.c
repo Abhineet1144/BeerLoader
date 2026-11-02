@@ -270,6 +270,16 @@ VkImageView bd12_image_view(BD12Image *image, VkImageViewType type,
                             uint32_t base_mip, uint32_t mip_count,
                             uint32_t base_layer, uint32_t layer_count)
 {
+    return bd12_image_view_swizzled(image, type, format, aspect, base_mip, mip_count,
+                                    base_layer, layer_count, 0);
+}
+
+VkImageView bd12_image_view_swizzled(BD12Image *image, VkImageViewType type,
+                                     VkFormat format, VkImageAspectFlags aspect,
+                                     uint32_t base_mip, uint32_t mip_count,
+                                     uint32_t base_layer, uint32_t layer_count,
+                                     uint32_t swizzle)
+{
     BD12Device *device = image->device;
     const uint32_t mips = image->desc.mip_levels;
     const uint32_t layers = image->desc.type == VK_IMAGE_TYPE_3D ? 1 :
@@ -297,7 +307,8 @@ VkImageView bd12_image_view(BD12Image *image, VkImageViewType type,
         const BD12ImageViewEntry *v = &image->views[i];
         if (v->type == type && v->format == format && v->aspect == aspect &&
             v->base_mip == base_mip && v->mip_count == mip_count &&
-            v->base_layer == base_layer && v->layer_count == layer_count) {
+            v->base_layer == base_layer && v->layer_count == layer_count &&
+            v->swizzle == swizzle) {
             found = v->view;
             break;
         }
@@ -308,6 +319,8 @@ VkImageView bd12_image_view(BD12Image *image, VkImageViewType type,
             .image = image->image,
             .viewType = type,
             .format = format,
+            .components = { (VkComponentSwizzle)(swizzle & 0xff), (VkComponentSwizzle)((swizzle >> 8) & 0xff),
+                            (VkComponentSwizzle)((swizzle >> 16) & 0xff), (VkComponentSwizzle)(swizzle >> 24) },
             .subresourceRange = { aspect, base_mip, mip_count, base_layer,
                                   layer_count }
         };
@@ -329,7 +342,7 @@ VkImageView bd12_image_view(BD12Image *image, VkImageViewType type,
             if (found)
                 image->views[image->view_count++] = (BD12ImageViewEntry){
                     type, format, aspect, base_mip, mip_count, base_layer,
-                    layer_count, found };
+                    layer_count, swizzle, found };
         } else {
             found = VK_NULL_HANDLE;
         }
@@ -564,18 +577,33 @@ void bd12_cmd_copy_image(BD12CmdList *list, BD12Image *dst, BD12ImagePoint at,
 
 /* Image and sampler descriptors ----------------------------------------------------- */
 
+static int write_image_mapped(BD12DescriptorHeap *heap, uint32_t index,
+                              BD12DescriptorKind kind, BD12Image *image,
+                              VkImageViewType type, VkFormat format, uint32_t base_mip,
+                              uint32_t mip_count, uint32_t base_layer,
+                              uint32_t layer_count, VkImageAspectFlags aspect, uint32_t swizzle);
 static int write_image_aspect(BD12DescriptorHeap *heap, uint32_t index,
                               BD12DescriptorKind kind, BD12Image *image,
                               VkImageViewType type, VkFormat format, uint32_t base_mip,
                               uint32_t mip_count, uint32_t base_layer,
                               uint32_t layer_count, VkImageAspectFlags aspect)
 {
+    return write_image_mapped(heap, index, kind, image, type, format, base_mip, mip_count,
+                              base_layer, layer_count, aspect, 0);
+}
+
+static int write_image_mapped(BD12DescriptorHeap *heap, uint32_t index,
+                              BD12DescriptorKind kind, BD12Image *image,
+                              VkImageViewType type, VkFormat format, uint32_t base_mip,
+                              uint32_t mip_count, uint32_t base_layer,
+                              uint32_t layer_count, VkImageAspectFlags aspect, uint32_t swizzle)
+{
     if (index >= heap->count) return 0;
     BD12Descriptor *d = &heap->descriptors[index];
     memset(d, 0, sizeof(*d));
     if (!image) return 1;                      /* null descriptor */
-    VkImageView view = bd12_image_view(image, type, format, aspect, base_mip,
-                                       mip_count, base_layer, layer_count);
+    VkImageView view = bd12_image_view_swizzled(image, type, format, aspect, base_mip, mip_count, base_layer,
+                                                layer_count, kind == BD12_DESC_UAV_IMAGE ? 0 : swizzle);
     if (!view) return 0;
     d->kind = kind;
     d->image = image;
@@ -766,4 +794,14 @@ int bd12_descriptor_write_dsv(BD12DescriptorHeap *heap, uint32_t index,
                             (read_only_depth && image && (image->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) ?
                                 VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL :
                                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+}
+
+int bd12_descriptor_write_image_srv_mapped(BD12DescriptorHeap *heap, uint32_t index,
+                                           BD12Image *image, VkImageViewType type,
+                                           VkFormat format, uint32_t base_mip,
+                                           uint32_t mip_count, uint32_t base_layer,
+                                           uint32_t layer_count, uint32_t swizzle)
+{
+    return write_image_mapped(heap, index, BD12_DESC_SRV_IMAGE, image, type, format, base_mip,
+                              mip_count, base_layer, layer_count, 0, swizzle);
 }

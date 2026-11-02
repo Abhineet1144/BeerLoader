@@ -10,10 +10,14 @@ loader.o: loader.c platform/beer_env.h graphics/d3d11/d3d11_compat.h \
  renderer/vulkan/vulkan_bridge.h platform/win32_nt_section.h \
  platform/win32_virtual_memory.h platform/win32_entry.h \
  platform/win32_ui_language.h platform/win32_onexit.h \
- platform/win32_crt_init.h platform/win32_process_parameters.h \
+ platform/win32_crt_init.h platform/win32_shell_strings.h \
+ platform/win32_command_line.h platform/win32_process_parameters.h \
  platform/win32_ip_adapter.h platform/win32_vectored_exception.h \
  platform/win32_unwind.h platform/win32_seh.h platform/win32_unwind.h \
  platform/win32_syscall.h platform/beer_message_dialog.h \
+ platform/beer_steam_session.h platform/beer_steam_mms.h \
+ platform/beer_icon_png.h platform/win32_ki_dispatcher.h \
+ platform/win32_native_heap.h platform/win32_static_tls.h \
  renderer/vulkan/vulkan_graphics.h renderer/vulkan/vulkan_renderer.h \
  platform/xwayland_backend.h renderer/vulkan/vulkan_context.h \
  platform/directinput_format.h platform/guid_compat.h \
@@ -23,13 +27,15 @@ loader.o: loader.c platform/beer_env.h graphics/d3d11/d3d11_compat.h \
  platform/window_icon_policy.h audio/audio_backend.h \
  audio/wasapi_compat.h media/media_foundation.h \
  renderer/vulkan/vulkan_indexed_renderer.h \
- platform/win32_kernel32_export_names.inc platform/win32_registry.inc \
+ platform/win32_kernel32_export_names.inc platform/win32_adapter_info.h \
+ platform/win32_registry.inc platform/win32_steam_matchmaking.inc \
  platform/win32_wmi.inc platform/win32_tsf.h \
  platform/win32_advapi_misc.inc platform/win32_process.inc \
  platform/win32_d3d9.inc platform/win32_display_config.inc \
  platform/win32_nvapi.inc platform/win32_d3dkmt.inc \
  platform/win32_file_search.inc platform/win32_missing_exports.inc \
- platform/win32_native_info.inc platform/win32_crypt32.inc \
+ platform/win32_native_info.inc platform/win32_uxtheme.inc \
+ platform/win32_user_misc.inc platform/win32_crypt32.inc \
  platform/win32_missing_exports_table.inc
 platform/beer_env.h:
 graphics/d3d11/d3d11_compat.h:
@@ -58,6 +64,8 @@ platform/win32_entry.h:
 platform/win32_ui_language.h:
 platform/win32_onexit.h:
 platform/win32_crt_init.h:
+platform/win32_shell_strings.h:
+platform/win32_command_line.h:
 platform/win32_process_parameters.h:
 platform/win32_ip_adapter.h:
 platform/win32_vectored_exception.h:
@@ -66,6 +74,12 @@ platform/win32_seh.h:
 platform/win32_unwind.h:
 platform/win32_syscall.h:
 platform/beer_message_dialog.h:
+platform/beer_steam_session.h:
+platform/beer_steam_mms.h:
+platform/beer_icon_png.h:
+platform/win32_ki_dispatcher.h:
+platform/win32_native_heap.h:
+platform/win32_static_tls.h:
 renderer/vulkan/vulkan_graphics.h:
 renderer/vulkan/vulkan_renderer.h:
 platform/xwayland_backend.h:
@@ -84,7 +98,9 @@ audio/wasapi_compat.h:
 media/media_foundation.h:
 renderer/vulkan/vulkan_indexed_renderer.h:
 platform/win32_kernel32_export_names.inc:
+platform/win32_adapter_info.h:
 platform/win32_registry.inc:
+platform/win32_steam_matchmaking.inc:
 platform/win32_wmi.inc:
 platform/win32_tsf.h:
 platform/win32_advapi_misc.inc:
@@ -96,5 +112,7 @@ platform/win32_d3dkmt.inc:
 platform/win32_file_search.inc:
 platform/win32_missing_exports.inc:
 platform/win32_native_info.inc:
+platform/win32_uxtheme.inc:
+platform/win32_user_misc.inc:
 platform/win32_crypt32.inc:
 platform/win32_missing_exports_table.inc:

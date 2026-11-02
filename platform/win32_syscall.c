@@ -38,6 +38,10 @@ __asm__(
     "    jmp *%fs:beer_win32_syscall_resume_rip@tpoff\n"
 );
 
+static BeerWin32ContinueFn g_continue;
+
+void beer_win32_syscall_set_continue(BeerWin32ContinueFn fn) { g_continue = fn; }
+
 typedef struct {
     char name[64];              /* canonical Nt<Name>; empty when unused */
     BeerWin32SyscallFn fn;
@@ -228,12 +232,48 @@ int beer_win32_syscall_is_service_name(const char *name)
     return name[2] >= 'A' && name[2] <= 'Z';
 }
 
+static char g_service_aliases[BEER_WIN32_SYSCALL_CAPACITY][64];
+static int g_catalog_initialized;
+
+static void service_catalog_init(void)
+{
+    if (g_catalog_initialized) return;
+    _Static_assert(sizeof(g_windows_19045) / sizeof(*g_windows_19045) ==
+                   BEER_WIN32_SYSCALL_EXTRA_BASE, "service prefix must be contiguous");
+    for (size_t i = 0; i < sizeof(g_windows_19045) / sizeof(*g_windows_19045); ++i) {
+        unsigned number = g_windows_19045[i].number;
+        snprintf(g_services[number].name, sizeof(g_services[number].name), "%s", g_windows_19045[i].name);
+        snprintf(g_service_aliases[number], sizeof(g_service_aliases[number]), "Zw%s", g_windows_19045[i].name + 2);
+    }
+    g_catalog_initialized = 1;
+}
+
+size_t beer_win32_syscall_count(void)
+{
+    service_catalog_init();
+    return g_next_extra;
+}
+
+const char *beer_win32_syscall_name(uint32_t number, int zw_alias)
+{
+    service_catalog_init();
+    if (number >= g_next_extra || !g_services[number].name[0]) return NULL;
+    return zw_alias ? g_service_aliases[number] : g_services[number].name;
+}
+
+int beer_win32_syscall_supported(uint32_t number)
+{
+    service_catalog_init();
+    return number < g_next_extra && g_services[number].fn != NULL;
+}
+
 int beer_win32_syscall_register(const char *name, BeerWin32SyscallFn fn)
 {
     if (!beer_win32_syscall_is_service_name(name) || strlen(name) >= sizeof(g_services[0].name))
         return -1;
     char canonical[64];
     snprintf(canonical, sizeof(canonical), "Nt%s", name + 2);
+    service_catalog_init();
     int number = -1;
     for (size_t i = 0; i < sizeof(g_windows_19045) / sizeof(*g_windows_19045); ++i)
         if (!strcmp(g_windows_19045[i].name, canonical)) number = g_windows_19045[i].number;
@@ -246,7 +286,10 @@ int beer_win32_syscall_register(const char *name, BeerWin32SyscallFn fn)
         number = (int)g_next_extra++;
     }
     BeerWin32Service *service = &g_services[number];
-    if (!service->name[0]) memcpy(service->name, canonical, sizeof(canonical));
+    if (!service->name[0]) {
+        snprintf(service->name, sizeof(service->name), "%s", canonical);
+        snprintf(g_service_aliases[number], sizeof(g_service_aliases[number]), "Zw%s", canonical + 2);
+    }
     if (!service->fn) service->fn = fn;
     return number;
 }
@@ -403,7 +446,23 @@ static void beer_win32_syscall_signal(int sig, siginfo_t *info, void *context)
     if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(stack))
         memset(stack, 0, sizeof(stack));
 
-    if (service && service->fn) {
+    if (service && g_continue && !strcmp(service->name, "NtContinue")) {
+        const uint64_t context = (uint64_t)regs[REG_R10];
+        status = g_continue(uc, context, (uint64_t)regs[REG_RDX]);
+        if (g_trace < 0) g_trace = getenv("BEER_API_TRACE") != NULL || getenv("BEER_SYSCALL_DIAGNOSTICS") != NULL;
+        if (g_trace) {
+            char line[160];
+            int length = snprintf(line, sizeof(line), "[SYSCALL] 0x%x NtContinue(%llx) rip=%llx -> 0x%x, resume rip=%llx rsp=%llx\n",
+                                  number, (unsigned long long)context, (unsigned long long)rip, (unsigned)status,
+                                  (unsigned long long)regs[REG_RIP], (unsigned long long)regs[REG_RSP]);
+            if (length > 0) (void)!write(2, line, (size_t)length);
+        }
+        if (status == 0) {                  /* the frame now holds the CONTEXT's registers */
+            beer_win32_syscall_resume_rip = (uint64_t)regs[REG_RIP];
+            regs[REG_RIP] = (greg_t)(uintptr_t)beer_win32_syscall_resume;
+            return;
+        }
+    } else if (service && service->fn) {
         status = (uint32_t)service->fn((uint64_t)regs[REG_R10], (uint64_t)regs[REG_RDX],
                                        (uint64_t)regs[REG_R8], (uint64_t)regs[REG_R9],
                                        stack[0], stack[1], stack[2], stack[3],
@@ -448,6 +507,8 @@ void beer_win32_syscall_thread_init(void)
         if (!reported++) perror("[SYSCALL] PR_SET_SYSCALL_USER_DISPATCH");
     }
 }
+
+int beer_win32_syscall_active(void) { return g_installed; }
 
 int beer_win32_syscall_install(void)
 {

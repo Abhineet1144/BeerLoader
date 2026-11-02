@@ -16,6 +16,8 @@ from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
 import storage  # noqa: E402
 
 OVERLAY_FILE = storage.path("overlay.json")
+# Flat copy the loader reads itself when it was not started by the manager (BEER_OVERLAY_JSON unset).
+OVERLAY_LOADER_FILE = storage.path("overlay-loader.json")
 
 FIELDS = [("fps", "FPS"), ("frametime", "Frame time"), ("cpu", "CPU usage"), ("ram", "Memory (RAM)"),
           ("threads", "Thread count"), ("speed", "Game speed"), ("uptime", "Uptime"),
@@ -31,6 +33,7 @@ DEFAULT = {
     "pins": {"enabled": True, "x": 0.01, "y": 0.30, "size": 1},
     "colors": {"panel": "12161c", "text": "e8e8e8", "accent": "8fe3a0"},
     "opacity": 0.85,
+    "show_on_start": True,
 }
 
 
@@ -46,6 +49,8 @@ def load_config():
             cfg[key].update(value)
     if isinstance(data.get("opacity"), (int, float)):
         cfg["opacity"] = data["opacity"]
+    if isinstance(data.get("show_on_start"), bool):
+        cfg["show_on_start"] = data["show_on_start"]
     return cfg
 
 
@@ -55,9 +60,19 @@ def save_config(cfg):
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
     os.replace(tmp, OVERLAY_FILE)
+    write_loader_file(cfg)
 
 
-def flat_message(cfg, command="overlay_set"):
+def write_loader_file(cfg):
+    """Keeps ~/.beer/overlay-loader.json in step, including whether the overlay starts visible."""
+    message = flat_message(cfg, starting=True)
+    tmp = OVERLAY_LOADER_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(message, f)
+    os.replace(tmp, OVERLAY_LOADER_FILE)
+
+
+def flat_message(cfg, command="overlay_set", starting=False):
     mods = (1 if cfg["hotkey"]["shift"] else 0) | (4 if cfg["hotkey"]["ctrl"] else 0) | (8 if cfg["hotkey"]["alt"] else 0)
     r, p = cfg["resources"], cfg["pins"]
     return {
@@ -66,6 +81,8 @@ def flat_message(cfg, command="overlay_set"):
         "fields": ",".join(r["fields"]),
         "res_enabled": r["enabled"], "res_x": round(r["x"], 4), "res_y": round(r["y"], 4), "res_size": r["size"],
         "pin_enabled": p["enabled"], "pin_x": round(p["x"], 4), "pin_y": round(p["y"], 4), "pin_size": p["size"],
+        # Visibility is only set when a game starts; later setting changes must not re-show a hidden overlay.
+        **({"visible": bool(cfg.get("show_on_start", True))} if starting else {}),
     }
 
 
@@ -124,6 +141,12 @@ class OverlayPage(Gtk.Box):
         show_button.connect("clicked", lambda _b: self._broadcast({"cmd": "overlay_toggle"}))
         show.add_suffix(show_button)
         top.add(show)
+        self.show_on_start = Adw.SwitchRow(title="Show when a game starts",
+                                           subtitle="Also for games started from a terminal (the loader reads ~/.beer/overlay-loader.json)")
+        self.show_on_start.set_active(bool(self.cfg.get("show_on_start", True)))
+        self.show_on_start.connect("notify::active", lambda row, _p: (self.cfg.__setitem__("show_on_start", row.get_active()),
+                                                                       save_config(self.cfg)))
+        top.add(self.show_on_start)
         body.append(top)
 
         # --- layout editor

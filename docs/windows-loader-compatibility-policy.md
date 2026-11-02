@@ -24,6 +24,12 @@ Beer may:
 
 Reference environments must remain external oracles. Their binaries, source, private export inventories, fixed addresses, and implementation constants must not become Beer dependencies.
 
+## Test workloads
+
+Beer is a general compatibility layer, so any locally installed copy, including one already modified by a third party (bundled Steam/platform emulators, patched launchers), is a valid workload for finding Windows-contract gaps. Fixes found that way are kept only as generic contracts that pass the review checklist below; nothing is made specific to the modification.
+
+The boundary is circumvention by Beer itself: Beer must not bypass DRM, licensing, or ownership checks in an unmodified copy, and the prohibited items below apply equally to modified copies.
+
 ## Prohibited work
 
 Beer must not:

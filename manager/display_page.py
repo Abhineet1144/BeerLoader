@@ -57,6 +57,15 @@ def save_config(cfg):
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
     os.replace(tmp, DISPLAY_FILE)
+    write_loader_file(cfg)
+
+
+def write_loader_file(cfg):
+    """Flat copy the loader reads when started without the manager (BEER_POST_JSON unset)."""
+    path = os.path.join(os.path.dirname(DISPLAY_FILE), "display-loader.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(post_message(cfg), f)
+    os.replace(path + ".tmp", path)
 
 
 def post_message(cfg):

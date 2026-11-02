@@ -1636,8 +1636,8 @@ static void MS dev_create_srv_impl(ComDevice *self, ComResource *r,
     }
     mips = clamp_mips(mips, mip, total_mips);
     if (count == UINT32_MAX) count = layers - first;
-    bd12_descriptor_write_image_srv(&heap, 0, r->image, type, format, mip, mips,
-                                    first, count);
+    bd12_descriptor_write_image_srv_mapped(&heap, 0, r->image, type, format, mip, mips, first, count,
+                                           bd12_dxgi_view_swizzle(desc && rd32(desc) ? rd32(desc) : r->dxgi_format));
 }
 
 static void MS dev_create_uav_impl(ComDevice *self, ComResource *r, ComResource *counter,

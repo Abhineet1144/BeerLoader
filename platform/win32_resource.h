@@ -26,5 +26,10 @@ uint64_t __attribute__((ms_abi)) beer_LoadResource(uint64_t module, uint64_t res
 uint64_t __attribute__((ms_abi)) beer_LockResource(uint64_t data);
 uint64_t __attribute__((ms_abi)) beer_SizeofResource(uint64_t module, uint64_t resource);
 uint64_t __attribute__((ms_abi)) beer_FreeResource(uint64_t data);
+/* EnumResourceNamesA/W. Returns FALSE (0) when the type does not exist or the walk could not start. */
+uint64_t __attribute__((ms_abi)) beer_EnumResourceNamesW(uint64_t module, uint64_t type, uint64_t callback,
+                                                          uint64_t param);
+uint64_t __attribute__((ms_abi)) beer_EnumResourceNamesA(uint64_t module, uint64_t type, uint64_t callback,
+                                                          uint64_t param);
 
 #endif

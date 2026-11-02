@@ -48,8 +48,12 @@ void *beer_veh_add(uint32_t first, BeerVectoredExceptionHandler handler)
 int beer_veh_remove(void *handle)
 {
     if (!handle) return 0;
-    BeerVehEntry *entry = handle;
-    if (entry < g_entries || entry >= g_entries + BEER_VEH_CAPACITY) return 0;
+    /* Opaque handles must identify a whole registry entry, not an interior
+     * byte. Pointer ordering between unrelated objects is undefined in C. */
+    uintptr_t address = (uintptr_t)handle, base = (uintptr_t)g_entries;
+    if (address < base || address - base >= sizeof(g_entries) ||
+        (address - base) % sizeof(g_entries[0])) return 0;
+    BeerVehEntry *entry = &g_entries[(address - base) / sizeof(g_entries[0])];
     if (atomic_exchange_explicit(&entry->active, 0, memory_order_acq_rel) != 1)
         return 0;
     atomic_store_explicit(&entry->handler, 0, memory_order_release);

@@ -69,7 +69,7 @@ static u64 __attribute__((ms_abi)) impl_MapGenericMask(u32 *access, const u32 *m
 /* ---- anonymous pipes ---- */
 static u64 __attribute__((ms_abi)) impl_CreatePipe(u64 *read_handle, u64 *write_handle, const void *attributes, u32 size)
 {
-    (void)attributes; (void)size;
+    note_inheritable_sa((u64)(uintptr_t)attributes); (void)size;
     int fds[2];
     if (!read_handle || !write_handle) { g_last_error = 87; return 0; }
     if (pipe2(fds, O_CLOEXEC) != 0) { g_last_error = 4; return 0; }
@@ -81,7 +81,11 @@ static u64 __attribute__((ms_abi)) impl_CreatePipe(u64 *read_handle, u64 *write_
     return 1;
 }
 static u64 __attribute__((ms_abi)) impl_SetHandleInformation(u64 handle, u32 mask, u32 flags)
-    { (void)handle; (void)mask; (void)flags; return 1; }
+{
+    (void)handle;
+    if ((mask & flags) & 1u) g_inheritable_handles = 1;    /* HANDLE_FLAG_INHERIT */
+    return 1;
+}
 
 /* ---- timer queue ---- */
 typedef struct { u64 callback, parameter; u32 due, period, flags; _Atomic(int) cancelled; _Atomic(int) running; } BeerQueueTimer;
@@ -179,10 +183,10 @@ static void beer_mapping_name(const u16 *wide, char *out, size_t size)
     out[i] = 0;
 }
 static u64 __attribute__((ms_abi)) impl_CreateFileMappingA(u64 file, void *attributes, u32 protect, u32 size_high, u32 size_low, const char *name)
-    { (void)attributes; return beer_create_file_mapping(file, protect, size_high, size_low, name); }
+    { note_inheritable_sa((u64)(uintptr_t)attributes); return beer_create_file_mapping(file, protect, size_high, size_low, name); }
 static u64 __attribute__((ms_abi)) impl_CreateFileMappingW(u64 file, void *attributes, u32 protect, u32 size_high, u32 size_low, const u16 *name)
 {
-    (void)attributes;
+    note_inheritable_sa((u64)(uintptr_t)attributes);
     char narrow[260];
     beer_mapping_name(name, narrow, sizeof(narrow));
     return beer_create_file_mapping(file, protect, size_high, size_low, name ? narrow : NULL);

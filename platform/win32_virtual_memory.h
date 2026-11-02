@@ -39,6 +39,9 @@ void *beer_virtual_alloc_aligned(size_t size, size_t alignment, uint32_t allocat
 int beer_virtual_free(void *address, size_t size, uint32_t free_type);
 int beer_virtual_protect(void *address, size_t size, uint32_t new_protection,
                          uint32_t *old_protection);
+/* BaseAddress is the requested address rounded DOWN to a page. RegionSize
+ * covers only subsequent pages sharing state/protection/allocation identity;
+ * AllocationBase alone identifies the beginning of the whole allocation. */
 size_t beer_virtual_query(const void *address, BeerMemoryBasicInformation *info,
                           size_t info_size);
 int beer_is_bad_string_ptr_a(const char *string, size_t maximum);

@@ -690,6 +690,29 @@ impl_ReadConsoleA(u64 console, void *buffer, u32 count, u32 *read, const void *c
     return impl_ReadConsoleW(console, buffer, count, read, control);
 }
 
+/* Console input records: with no console attached every handle is a non-console handle, so these
+ * fail the same way (no events, ERROR_INVALID_HANDLE). */
+static u64 __attribute__((ms_abi)) impl_ReadConsoleInputW(u64 console, void *records, u32 count, u32 *read)
+{
+    (void)console; (void)records; (void)count;
+    if (read) *read = 0;
+    g_last_error = 6;
+    return 0;
+}
+static u64 __attribute__((ms_abi)) impl_GetNumberOfConsoleInputEvents(u64 console, u32 *count)
+{
+    (void)console;
+    if (count) *count = 0;
+    g_last_error = 6;
+    return 0;
+}
+static u64 __attribute__((ms_abi)) impl_FlushConsoleInputBuffer(u64 console)
+{
+    (void)console;
+    g_last_error = 6;
+    return 0;
+}
+
 /* SwitchToThread: yield the processor to another ready thread. Linux does not report whether another
  * thread ran, so the call answers TRUE (a switch was requested) only when the host yield succeeded. */
 static u64 __attribute__((ms_abi)) impl_SwitchToThread(void)
@@ -751,5 +774,290 @@ static u64 __attribute__((ms_abi)) impl_PropVariantToStringAlloc(const u8 *value
     for (size_t i = 0; i < length; i++) copy[i] = wide ? wide[i] : (u8)narrow[i];
     copy[length] = 0;
     *out = copy;
+    return 0;
+}
+
+/* ---- PSAPI (K32*) module and memory information ---------------------------------------------- */
+
+/* Base, SizeOfImage and entry point of a module this process has loaded: the executable, a guest
+ * DLL, or one of Beer's system modules (each backed by a valid PE header). 0 for anything else. */
+static int psapi_module_info(u64 module, u64 *base, u32 *size, u64 *entry)
+{
+    u64 b = module ? module : (u64)g_img;
+    if (!b || (b != (u64)g_img && !guest_dll_from_handle(b) && !fake_pe_module_from_base(b))) return 0;
+    const u8 *image = (const u8 *)(uintptr_t)b;
+    if (image[0] != 'M' || image[1] != 'Z') return 0;
+    u32 nt_offset;
+    memcpy(&nt_offset, image + 0x3c, 4);
+    const u8 *nt = image + nt_offset;
+    if (nt_offset > 0x1000 || memcmp(nt, "PE\0\0", 4)) return 0;
+    const u8 *opt = nt + 24;
+    u32 entry_rva, image_size;
+    memcpy(&entry_rva, opt + 16, 4);
+    memcpy(&image_size, opt + 56, 4);
+    *base = b;
+    *size = image_size;
+    *entry = entry_rva ? b + entry_rva : 0;
+    return 1;
+}
+
+/* GetModuleInformation(hProcess, hModule, MODULEINFO { base, SizeOfImage, EntryPoint }, cb). */
+static u64 __attribute__((ms_abi)) impl_K32GetModuleInformation(u64 process, u64 module, u8 *info, u32 cb)
+{
+    if (!native_is_current_process(process)) { g_last_error = 6; return 0; }    /* ERROR_INVALID_HANDLE */
+    if (!info || cb < 24) { g_last_error = 122; return 0; }                      /* ERROR_INSUFFICIENT_BUFFER */
+    u64 base, entry;
+    u32 size;
+    if (!psapi_module_info(module, &base, &size, &entry)) { g_last_error = 126; return 0; }   /* ERROR_MOD_NOT_FOUND */
+    memset(info, 0, 24);
+    memcpy(info, &base, 8);
+    memcpy(info + 8, &size, 4);
+    memcpy(info + 16, &entry, 8);
+    g_last_error = 0;
+    return 1;
+}
+
+/* GetProcessMemoryInfo(hProcess, PROCESS_MEMORY_COUNTERS[_EX], cb) from /proc/self: page faults,
+ * peak/current working set (VmHWM/VmRSS) and committed memory (VmPeak/VmSize; private = VmSize). */
+static u64 __attribute__((ms_abi)) impl_K32GetProcessMemoryInfo(u64 process, u8 *counters, u32 cb)
+{
+    if (!native_is_current_process(process)) { g_last_error = 6; return 0; }
+    if (!counters || cb < 72) { g_last_error = 122; return 0; }
+    unsigned long long peak = 0, size = 0, hwm = 0, rss = 0, minflt = 0, majflt = 0, kb;
+    char line[256];
+    FILE *status = fopen("/proc/self/status", "r");
+    while (status && fgets(line, sizeof(line), status)) {
+        if (sscanf(line, "VmPeak: %llu", &kb) == 1) peak = kb * 1024;
+        else if (sscanf(line, "VmSize: %llu", &kb) == 1) size = kb * 1024;
+        else if (sscanf(line, "VmHWM: %llu", &kb) == 1) hwm = kb * 1024;
+        else if (sscanf(line, "VmRSS: %llu", &kb) == 1) rss = kb * 1024;
+    }
+    if (status) fclose(status);
+    FILE *stat = fopen("/proc/self/stat", "r");
+    if (stat) {
+        /* Fields 10 and 12 are minflt and majflt; skip the comm field, which may contain spaces. */
+        char buf[1024];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, stat);
+        buf[n] = 0;
+        char *p = strrchr(buf, ')');
+        if (p) sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %llu %*u %llu", &minflt, &majflt);
+        fclose(stat);
+    }
+    u32 struct_size = cb >= 80 ? 80 : 72, faults = (u32)(minflt + majflt);
+    u64 fields[8] = { hwm, rss, 0, 0, 0, 0, size, peak };   /* working sets, pool quotas, pagefile (commit) */
+    memset(counters, 0, struct_size);
+    memcpy(counters, &struct_size, 4);
+    memcpy(counters + 4, &faults, 4);
+    memcpy(counters + 8, fields, sizeof(fields));
+    if (struct_size == 80) memcpy(counters + 72, &size, 8);   /* PROCESS_MEMORY_COUNTERS_EX.PrivateUsage */
+    g_last_error = 0;
+    return 1;
+}
+
+/* GlobalMemoryStatus: MEMORYSTATUS (SIZE_T fields) from GlobalMemoryStatusEx's 64-bit values. */
+static u64 __attribute__((ms_abi)) impl_GlobalMemoryStatus(u8 *status)
+{
+    if (!status) return 0;
+    WIN_MEMORYSTATUSEX info;
+    memset(&info, 0, sizeof(info));
+    info.length = sizeof(info);
+    if (!impl_GlobalMemoryStatusEx(&info)) return 0;
+    const u8 *ex = (const u8 *)&info;
+    u32 out_length = 56;
+    memcpy(status, &out_length, 4);
+    memcpy(status + 4, ex + 4, 4);                       /* dwMemoryLoad */
+    memcpy(status + 8, ex + 8, 48);                      /* phys, page file, virtual: total/available */
+    return 0;
+}
+
+/* AppPolicyGetProcessTerminationMethod: a desktop (non-packaged) process ends through ExitProcess. */
+static u64 __attribute__((ms_abi)) impl_AppPolicyGetProcessTerminationMethod(u64 token, u32 *policy)
+{
+    (void)token;
+    if (!policy) return 87;                              /* ERROR_INVALID_PARAMETER */
+    *policy = 0;                                         /* AppPolicyProcessTerminationMethod_ExitProcess */
+    return 0;
+}
+
+/* Toolhelp heap walking: Beer's snapshots do not record heap lists, so there are no entries. */
+static u64 __attribute__((ms_abi)) impl_Heap32ListFirst(u64 snapshot, void *list)
+{
+    (void)snapshot; (void)list;
+    g_last_error = 18;                                   /* ERROR_NO_MORE_FILES */
+    return 0;
+}
+static u64 __attribute__((ms_abi)) impl_Heap32First(void *entry, u32 process, u64 heap)
+{
+    (void)entry; (void)process; (void)heap;
+    g_last_error = 18;
+    return 0;
+}
+
+/* NtGetContextThread / NtSetContextThread (ZwGetContextThread / ZwSetContextThread).
+ * Beer does not expose another thread's register state, so only the debug-register part of an x64
+ * CONTEXT (CONTEXT_AMD64 | CONTEXT_DEBUG_REGISTERS, Dr0-Dr3/Dr6/Dr7 at +0x48..+0x77) is supported:
+ * Beer never arms hardware breakpoints for the guest, so they read as clear, and clearing them is
+ * already satisfied. Requests for any other part fail with STATUS_NOT_SUPPORTED rather than returning
+ * a partly filled context. This matches the kernel32 GetThreadContext above. */
+#define BEER_CONTEXT_AMD64 0x100000u
+#define BEER_CONTEXT_DEBUG_REGISTERS 0x10u
+static u64 __attribute__((ms_abi)) impl_NtGetContextThread(u64 thread, u8 *context)
+{
+    (void)thread;
+    if (!context) return 0xC000000Du;                    /* STATUS_INVALID_PARAMETER */
+    u32 flags;
+    memcpy(&flags, context + 0x30, 4);
+    if (!(flags & BEER_CONTEXT_AMD64) || (flags & ~(BEER_CONTEXT_AMD64 | BEER_CONTEXT_DEBUG_REGISTERS)))
+        return 0xC00000BBu;                              /* STATUS_NOT_SUPPORTED */
+    if (flags & BEER_CONTEXT_DEBUG_REGISTERS) memset(context + 0x48, 0, 0x30);
+    return 0;
+}
+static u64 __attribute__((ms_abi)) impl_NtSetContextThread(u64 thread, const u8 *context)
+{
+    (void)thread;
+    if (!context) return 0xC000000Du;
+    u32 flags;
+    memcpy(&flags, context + 0x30, 4);
+    if (!(flags & BEER_CONTEXT_AMD64) || (flags & ~(BEER_CONTEXT_AMD64 | BEER_CONTEXT_DEBUG_REGISTERS)))
+        return 0xC00000BBu;
+    static const u8 clear[0x30];
+    if ((flags & BEER_CONTEXT_DEBUG_REGISTERS) && memcmp(context + 0x48, clear, sizeof(clear)))
+        return 0xC00000BBu;                              /* arming breakpoints is not supported */
+    return 0;
+}
+
+/* CoTaskMemAlloc / CoTaskMemRealloc: the task allocator is the host heap, matching CoTaskMemFree. */
+static u64 __attribute__((ms_abi)) impl_CoTaskMemAlloc(u64 size)
+{
+    return (u64)(uintptr_t)malloc(size ? (size_t)size : 1);
+}
+static u64 __attribute__((ms_abi)) impl_CoTaskMemRealloc(void *block, u64 size)
+{
+    return (u64)(uintptr_t)realloc(block, size ? (size_t)size : 1);
+}
+
+/* GetNumaNodeProcessorMaskEx(node, GROUP_AFFINITY *): one node (0) holding every CPU, in group 0. */
+static u64 __attribute__((ms_abi)) impl_GetNumaNodeProcessorMaskEx(u16 node, u8 *affinity)
+{
+    if (!affinity || node != 0) { g_last_error = 87; return 0; }
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    u64 mask = cpus >= 64 ? ~0ull : cpus > 0 ? (1ull << cpus) - 1 : 1;
+    memset(affinity, 0, 16);                             /* KAFFINITY Mask; WORD Group; WORD Reserved[3] */
+    memcpy(affinity, &mask, 8);
+    g_last_error = 0;
+    return 1;
+}
+
+/* GetKeyNameText(lParam, buffer, size): the US-layout name of the key in the scan code bits of a
+ * keyboard message's lParam (bits 16-23, extended flag bit 24, "don't care" left/right bit 25). */
+static const char *key_name_for(u32 scan, int extended, int either_side)
+{
+    static const char *const base[0x59] = {
+        [0x01] = "Esc", [0x02] = "1", [0x03] = "2", [0x04] = "3", [0x05] = "4", [0x06] = "5", [0x07] = "6",
+        [0x08] = "7", [0x09] = "8", [0x0A] = "9", [0x0B] = "0", [0x0C] = "-", [0x0D] = "=", [0x0E] = "Backspace",
+        [0x0F] = "Tab", [0x10] = "Q", [0x11] = "W", [0x12] = "E", [0x13] = "R", [0x14] = "T", [0x15] = "Y",
+        [0x16] = "U", [0x17] = "I", [0x18] = "O", [0x19] = "P", [0x1A] = "[", [0x1B] = "]", [0x1C] = "Enter",
+        [0x1D] = "Ctrl", [0x1E] = "A", [0x1F] = "S", [0x20] = "D", [0x21] = "F", [0x22] = "G", [0x23] = "H",
+        [0x24] = "J", [0x25] = "K", [0x26] = "L", [0x27] = ";", [0x28] = "'", [0x29] = "`", [0x2A] = "Shift",
+        [0x2B] = "\\", [0x2C] = "Z", [0x2D] = "X", [0x2E] = "C", [0x2F] = "V", [0x30] = "B", [0x31] = "N",
+        [0x32] = "M", [0x33] = ",", [0x34] = ".", [0x35] = "/", [0x36] = "Right Shift", [0x37] = "Num *",
+        [0x38] = "Alt", [0x39] = "Space", [0x3A] = "Caps Lock", [0x3B] = "F1", [0x3C] = "F2", [0x3D] = "F3",
+        [0x3E] = "F4", [0x3F] = "F5", [0x40] = "F6", [0x41] = "F7", [0x42] = "F8", [0x43] = "F9",
+        [0x44] = "F10", [0x45] = "Pause", [0x46] = "Scroll Lock", [0x47] = "Num 7", [0x48] = "Num 8",
+        [0x49] = "Num 9", [0x4A] = "Num -", [0x4B] = "Num 4", [0x4C] = "Num 5", [0x4D] = "Num 6",
+        [0x4E] = "Num +", [0x4F] = "Num 1", [0x50] = "Num 2", [0x51] = "Num 3", [0x52] = "Num 0",
+        [0x53] = "Num Del", [0x57] = "F11", [0x58] = "F12",
+    };
+    if (extended) {
+        switch (scan) {
+        case 0x1C: return "Num Enter";
+        case 0x1D: return either_side ? "Ctrl" : "Right Ctrl";
+        case 0x35: return "Num /";
+        case 0x37: return "Prnt Scrn";
+        case 0x38: return either_side ? "Alt" : "Right Alt";
+        case 0x45: return "Num Lock";
+        case 0x47: return "Home";
+        case 0x48: return "Up";
+        case 0x49: return "Page Up";
+        case 0x4B: return "Left";
+        case 0x4D: return "Right";
+        case 0x4F: return "End";
+        case 0x50: return "Down";
+        case 0x51: return "Page Down";
+        case 0x52: return "Insert";
+        case 0x53: return "Delete";
+        case 0x5B: return "Left Windows";
+        case 0x5C: return "Right Windows";
+        case 0x5D: return "Application";
+        default: return NULL;
+        }
+    }
+    if (scan == 0x36 && either_side) return "Shift";
+    return scan < sizeof(base) / sizeof(*base) ? base[scan] : NULL;
+}
+static u64 __attribute__((ms_abi)) impl_GetKeyNameTextW(s32 lparam, u16 *buffer, s32 size)
+{
+    const char *name = key_name_for(((u32)lparam >> 16) & 0xFF, ((u32)lparam >> 24) & 1, ((u32)lparam >> 25) & 1);
+    if (!buffer || size <= 0) return 0;
+    if (!name) { buffer[0] = 0; return 0; }
+    s32 n = 0;
+    for (; name[n] && n < size - 1; n++) buffer[n] = (u8)name[n];
+    buffer[n] = 0;
+    return (u64)n;
+}
+static u64 __attribute__((ms_abi)) impl_GetKeyNameTextA(s32 lparam, char *buffer, s32 size)
+{
+    const char *name = key_name_for(((u32)lparam >> 16) & 0xFF, ((u32)lparam >> 24) & 1, ((u32)lparam >> 25) & 1);
+    if (!buffer || size <= 0) return 0;
+    if (!name) { buffer[0] = 0; return 0; }
+    s32 n = 0;
+    for (; name[n] && n < size - 1; n++) buffer[n] = name[n];
+    buffer[n] = 0;
+    return (u64)n;
+}
+
+/* HidP_GetCaps: Beer exposes no HID devices, so no valid preparsed data can exist. */
+static u64 __attribute__((ms_abi)) impl_HidP_GetCaps(void *preparsed, void *caps)
+{
+    (void)preparsed; (void)caps;
+    return 0xC0110001u;                                  /* HIDP_STATUS_INVALID_PREPARSED_DATA */
+}
+
+/* Console management with no console attached to the process (see ReadConsoleW above). */
+static u64 __attribute__((ms_abi)) impl_AttachConsole(u32 process)
+{
+    (void)process;
+    g_last_error = 6;                                    /* ERROR_INVALID_HANDLE: no console to attach to */
+    return 0;
+}
+static u64 __attribute__((ms_abi)) impl_AllocConsole(void)
+{
+    g_last_error = 50;                                   /* ERROR_NOT_SUPPORTED: Beer creates no consoles */
+    return 0;
+}
+static u64 __attribute__((ms_abi)) impl_FreeConsole(void)
+{
+    g_last_error = 87;                                   /* nothing is attached */
+    return 0;
+}
+static u64 __attribute__((ms_abi)) impl_GetConsoleWindow(void) { return 0; }
+static u64 __attribute__((ms_abi)) impl_console_invalid_handle(void)
+{
+    g_last_error = 6;
+    return 0;
+}
+/* A handler can be registered; with no console, no control event is ever delivered to it. */
+static u64 __attribute__((ms_abi)) impl_SetConsoleCtrlHandler(u64 handler, u32 add)
+{
+    (void)handler; (void)add;
+    return 1;
+}
+
+/* SetThreadExecutionState: Beer does not control the host's power management (keeping the display
+ * or system awake), so the request reports failure (0) instead of claiming it took effect. */
+static u64 __attribute__((ms_abi)) impl_SetThreadExecutionState(u32 flags)
+{
+    (void)flags;
+    g_last_error = 50;                                   /* ERROR_NOT_SUPPORTED */
     return 0;
 }

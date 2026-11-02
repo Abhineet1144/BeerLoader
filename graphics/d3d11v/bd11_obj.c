@@ -715,7 +715,8 @@ static B11HR create_view(B11Device *dev, uint32_t kind, B11Obj *res, const uint3
             if (format == 22 || format == 47)
                 ok = bd12_descriptor_write_image_srv_aspect(v->heap, 0, t->image, vt, vf, mip, mips, layer, layers, VK_IMAGE_ASPECT_STENCIL_BIT);
             else
-                ok = bd12_descriptor_write_image_srv(v->heap, 0, t->image, vt, vf, mip, mips, layer, layers);
+                ok = bd12_descriptor_write_image_srv_mapped(v->heap, 0, t->image, vt, vf, mip, mips, layer, layers,
+                                                            bd12_dxgi_view_swizzle(format));
         } else if (kind == B11_UAV) {
             VkImageViewType vt = dim == 2 ? VK_IMAGE_VIEW_TYPE_1D : dim == 3 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY :
                                  dim == 4 ? VK_IMAGE_VIEW_TYPE_2D : dim == 5 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY :
@@ -826,15 +827,19 @@ static B11HR B11_MS dev_create_input_layout(B11Device *dev, const uint8_t *eleme
                                             const void *bytecode, size_t length, void **out)
 {
     (void)bytecode; (void)length;
-    if (!out || !elements || !count || count > 32) return B11_E_INVALIDARG;
+    /* An empty layout (no elements, descriptors may be NULL) is valid: vertex shaders that read only
+     * system values such as SV_VertexID are bound with one. */
+    if (!out || (count && !elements) || count > 32) return B11_E_INVALIDARG;
     *out = NULL;
     B11Layout *l = b11_obj_new(dev, B11_LAYOUT, sizeof(*l), vt_child, layout_destroy);
     if (!l) return B11_E_OUTOFMEMORY;
     l->count = count;
-    l->elements = malloc((size_t)count * 32);
-    l->names = calloc(count, sizeof(*l->names));
-    if (!l->elements || !l->names) { layout_destroy(&l->obj); return B11_E_OUTOFMEMORY; }
-    memcpy(l->elements, elements, (size_t)count * 32);
+    if (count) {
+        l->elements = malloc((size_t)count * 32);
+        l->names = calloc(count, sizeof(*l->names));
+        if (!l->elements || !l->names) { layout_destroy(&l->obj); return B11_E_OUTOFMEMORY; }
+        memcpy(l->elements, elements, (size_t)count * 32);
+    }
     for (uint32_t i = 0; i < count; ++i) {
         const char *name = NULL;
         memcpy(&name, elements + (size_t)i * 32, sizeof(name));

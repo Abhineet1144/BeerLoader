@@ -21,6 +21,9 @@ void beer_control_frame_limit_wait(void);   /* applies the live frame cap; call 
 const char *beer_json_find(const char *json, const char *key);
 int beer_json_string(const char *json, const char *key, char *out, size_t size);
 int beer_json_milli(const char *json, const char *key, int32_t *out);   /* number or bool as milli units */
+/* Reads ~/.beer/<name> (a settings file the manager writes for the loader) into out, NUL-terminated.
+ * Returns 1 when it was read. */
+int beer_read_config(const char *name, char *out, size_t size);
 
 /* Stats the overlay shows */
 uint64_t beer_control_frames(void);

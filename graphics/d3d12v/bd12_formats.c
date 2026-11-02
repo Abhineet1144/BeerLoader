@@ -121,3 +121,12 @@ int bd12_dxgi_reads_stencil(uint32_t f)
 {
     return f == 22 || f == 47;
 }
+
+/* D3D samples A8_UNORM as (0, 0, 0, A); Beer stores it as R8, so its views read (0, 0, 0, R). */
+uint32_t bd12_dxgi_view_swizzle(uint32_t f)
+{
+    if (f == 65)                                   /* r, g, b = ZERO, a = R; one byte each, r lowest */
+        return (uint32_t)VK_COMPONENT_SWIZZLE_ZERO | ((uint32_t)VK_COMPONENT_SWIZZLE_ZERO << 8) |
+               ((uint32_t)VK_COMPONENT_SWIZZLE_ZERO << 16) | ((uint32_t)VK_COMPONENT_SWIZZLE_R << 24);
+    return 0;
+}

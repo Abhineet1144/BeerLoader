@@ -175,6 +175,7 @@ typedef struct {
     VkFormat format;
     VkImageAspectFlags aspect;
     uint32_t base_mip, mip_count, base_layer, layer_count;
+    uint32_t swizzle;             /* BD12_SWIZZLE packing, 0 = identity */
     VkImageView view;
 } BD12ImageViewEntry;
 
@@ -858,6 +859,16 @@ VkImageView bd12_image_view(BD12Image *image, VkImageViewType type,
                             uint32_t base_mip,
                             uint32_t mip_count, uint32_t base_layer,
                             uint32_t layer_count);
+/* Component swizzle of a sampled view, one VkComponentSwizzle per byte (r, g, b, a from the low byte); 0 is the
+ * identity. bd12_dxgi_view_swizzle gives the mapping D3D defines for a view format (A8_UNORM reads (0,0,0,R)
+ * from its R8 storage). Storage (UAV) views always use the identity. */
+#define BD12_SWIZZLE(r, g, b, a) ((uint32_t)(r) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16) | ((uint32_t)(a) << 24))
+uint32_t bd12_dxgi_view_swizzle(uint32_t dxgi_format);
+VkImageView bd12_image_view_swizzled(BD12Image *image, VkImageViewType type,
+                                     VkFormat format, VkImageAspectFlags aspect,
+                                     uint32_t base_mip, uint32_t mip_count,
+                                     uint32_t base_layer, uint32_t layer_count,
+                                     uint32_t swizzle);
 /* Texel/block geometry of a format aspect. */
 void bd12_format_block(VkFormat format, VkImageAspectFlags aspect,
                        uint32_t *block_width, uint32_t *block_height,
@@ -906,6 +917,12 @@ int bd12_descriptor_write_image_srv(BD12DescriptorHeap *heap, uint32_t index,
                                     VkFormat format, uint32_t base_mip,
                                     uint32_t mip_count, uint32_t base_layer,
                                     uint32_t layer_count);
+/* As bd12_descriptor_write_image_srv, with the view's component swizzle (bd12_dxgi_view_swizzle). */
+int bd12_descriptor_write_image_srv_mapped(BD12DescriptorHeap *heap, uint32_t index,
+                                           BD12Image *image, VkImageViewType type,
+                                           VkFormat format, uint32_t base_mip,
+                                           uint32_t mip_count, uint32_t base_layer,
+                                           uint32_t layer_count, uint32_t swizzle);
 int bd12_descriptor_write_image_uav(BD12DescriptorHeap *heap, uint32_t index,
                                     BD12Image *image, VkImageViewType type,
                                     VkFormat format, uint32_t mip,

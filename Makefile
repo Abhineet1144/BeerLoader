@@ -10,7 +10,7 @@ MEDIA_SRCS = media/media_foundation.c
 PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
-                platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c
+				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_shell_strings.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
                renderer/vulkan/vulkan_post.c \
@@ -41,6 +41,29 @@ DEPS = $(OBJS:.o=.d)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
+
+# Steam session provider: a separate program (see docs/steam-library-broker-design.md), built with
+# normal userspace flags rather than the loader's.
+STEAM_PROVIDER = beer-steam
+STEAM_SRCS = steam/provider.c steam/cm.c steam/auth.c steam/library.c steam/content.c steam/http.c steam/install.c \
+             steam/net.c steam/pb.c steam/secret.c steam/vdf.c
+STEAM_CFLAGS = -O2 -g -Wall -Wextra -Wno-format-truncation -D_GNU_SOURCE
+$(STEAM_PROVIDER): $(STEAM_SRCS) $(wildcard steam/*.h)
+	$(CC) $(STEAM_CFLAGS) -o $@ $(STEAM_SRCS) -lssl -lcrypto -lz -lzstd -lpthread -ldl
+
+test-ki-dispatcher:
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_ki_dispatcher_test.c -o /tmp/beer-ki-dispatcher-test
+	/tmp/beer-ki-dispatcher-test
+
+test-steam:
+	$(CC) $(STEAM_CFLAGS) steam/pb_test.c steam/pb.c -o /tmp/beer-steam-pb-test
+	/tmp/beer-steam-pb-test
+	$(CC) $(STEAM_CFLAGS) steam/vdf_test.c steam/vdf.c -o /tmp/beer-steam-vdf-test
+	/tmp/beer-steam-vdf-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_session_test.c platform/beer_steam_session.c -lpthread -o /tmp/beer-steam-session-test
+	/tmp/beer-steam-session-test
+	$(CC) -O2 -Wall -Wextra -D_GNU_SOURCE -Iplatform platform/beer_steam_mms_test.c platform/beer_steam_mms.c -lpthread -o /tmp/beer-steam-mms-test
+	/tmp/beer-steam-mms-test
 
 # Hot: every BEER_* switch lookup goes through it.
 platform/beer_env.o: platform/beer_env.c platform/beer_env.h
@@ -80,6 +103,9 @@ platform/win32_onexit.o: platform/win32_onexit.c platform/win32_onexit.h
 platform/win32_crt_init.o: platform/win32_crt_init.c platform/win32_crt_init.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
 
+platform/win32_shell_strings.o: platform/win32_shell_strings.c platform/win32_shell_strings.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
 graphics/d3d12/d3d12_shader_translator.o: graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_shader_translator.h
 	$(CC) $(RENDER_CFLAGS) -c $< -o $@
 
@@ -117,7 +143,7 @@ renderer/vulkan/vulkan_indexed_renderer.o: renderer/vulkan/vulkan_indexed_render
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-.PHONY: test-bd12-rt dxil-spirv clean smoke-cli test-audio test-d3d11 test-d3d12 test-d3d12v test-media test-renderer test-input
+.PHONY: test-bd12-rt dxil-spirv clean smoke-cli test-audio test-d3d11 test-d3d12 test-d3d12v test-media test-renderer test-input test-steam test-ki-dispatcher
 
 test-d3d11: $(filter-out loader.o,$(OBJS))
 	$(CC) -O2 -Wall -Wextra -pthread -Igraphics/d3d11 \
@@ -126,7 +152,33 @@ test-d3d11: $(filter-out loader.o,$(OBJS))
 	/tmp/beer-d3d11-lifetime-test
 	rm -f /tmp/beer-d3d11-lifetime-test
 
-test-input:
+test-native-loader: $(filter-out loader.o,$(OBJS))
+	$(CC) -O2 -Wall -Wextra -pthread -Iplatform platform/win32_native_heap_test.c platform/win32_native_heap.c -o /tmp/beer-win32-native-heap-test
+	/tmp/beer-win32-native-heap-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_static_tls_test.c -o /tmp/beer-win32-static-tls-test
+	/tmp/beer-win32-static-tls-test
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections tests/native_loader_contract_test.c $(filter-out loader.o,$(OBJS)) $(LDFLAGS) -o /tmp/beer-native-loader-contract-test
+	/tmp/beer-native-loader-contract-test
+	rm -f /tmp/beer-native-loader-contract-test
+	rm -f /tmp/beer-win32-native-heap-test /tmp/beer-win32-static-tls-test
+
+.PHONY: test-native-loader
+
+test-adapter-info:
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_adapter_info_test.c -o /tmp/beer-adapter-info-test
+	/tmp/beer-adapter-info-test
+
+.PHONY: test-adapter-info
+
+test-shell-strings:
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_shell_strings_test.c platform/win32_shell_strings.c -o /tmp/beer-shell-strings-test
+	/tmp/beer-shell-strings-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_command_line_test.c -o /tmp/beer-command-line-test
+	/tmp/beer-command-line-test
+
+.PHONY: test-shell-strings
+
+test-input: test-native-loader test-shell-strings test-adapter-info
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_syscall_test.c platform/win32_syscall.c -o /tmp/beer-win32-syscall-test
 	/tmp/beer-win32-syscall-test
 	rm -f /tmp/beer-win32-syscall-test
@@ -150,6 +202,8 @@ test-input:
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/window_style_policy_test.c -o /tmp/beer-window-style-policy-test
 	/tmp/beer-window-style-policy-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/window_icon_policy_test.c -o /tmp/beer-window-icon-policy-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_icon_png_test.c platform/beer_icon_png.c -lz -o /tmp/beer-icon-png-test
+	/tmp/beer-icon-png-test
 	/tmp/beer-window-icon-policy-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/guid_compat_test.c -o /tmp/beer-guid-compat-test
 	/tmp/beer-guid-compat-test
@@ -243,7 +297,7 @@ test-d3d12v:
 	rm -f /tmp/bd12-com-test /tmp/bd12-m1-test /tmp/bd12-m2-test /tmp/bd12-m3-test /tmp/bd12-m4-test /tmp/bd12-m4.vert.spv /tmp/bd12-m4.frag.spv /tmp/bd12-m1.spv /tmp/bd12-m2.spv /tmp/bd12-m3.spv
 
 test-d3d12:
-	$(CC) -O2 -Wall -Wextra -pthread -Igraphics/d3d12 graphics/d3d12/d3d12_shader_translator_test.c graphics/d3d12/d3d12_shader_translator.c -ldl -o /tmp/beer-d3d12-shader-translator-test
+	$(CC) -O2 -Wall -Wextra -pthread -Igraphics/d3d12 -Ithird_party/dxil-spirv graphics/d3d12/d3d12_shader_translator_test.c graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_dxil_translator.c -ldl -o /tmp/beer-d3d12-shader-translator-test
 	@if test -f /tmp/beer-d3d12-31b662b443572be7.dxbc; then \
 		/tmp/beer-d3d12-shader-translator-test /tmp/beer-d3d12-31b662b443572be7.dxbc; \
 	else \

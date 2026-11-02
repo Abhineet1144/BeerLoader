@@ -89,4 +89,14 @@ int GDI_MS beer_AlphaBlend(uint64_t dst, int x, int y, int w, int h, uint64_t sr
 int GDI_MS beer_TransparentBlt(uint64_t dst, int x, int y, int w, int h, uint64_t src, int sx, int sy,
                                int sw, int sh, uint32_t color);
 
+uint64_t GDI_MS beer_CreateRectRgn(int left, int top, int right, int bottom);
+uint64_t GDI_MS beer_CreateRoundRectRgn(int left, int top, int right, int bottom, int ew, int eh);
+uint64_t GDI_MS beer_CreateEllipticRgn(int left, int top, int right, int bottom);
+int GDI_MS beer_CombineRgn(uint64_t dest, uint64_t src1, uint64_t src2, int mode);
+int GDI_MS beer_PtInRegion(uint64_t region, int x, int y);
+int GDI_MS beer_OffsetRgn(uint64_t region, int dx, int dy);
+int GDI_MS beer_GetRgnBox(uint64_t region, int32_t *rect);
+int GDI_MS beer_SetRectRgn(uint64_t region, int left, int top, int right, int bottom);
+int GDI_MS beer_SetWindowRgn(uint64_t window, uint64_t region, int redraw);
+
 #endif
