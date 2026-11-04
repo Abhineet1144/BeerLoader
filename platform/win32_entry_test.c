@@ -4,9 +4,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <asm/prctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#define BEER_TEST_PEB 0x7ffde000u
+static uint64_t beer_test_teb[32];
 
 uintptr_t beer_test_entry_rsp;
 unsigned beer_test_tls_ran;
@@ -15,7 +20,8 @@ extern void beer_test_pe_entry(void);
 
 /* An actual ABI boundary test: TLS uses all home slots and an aligned SIMD
  * store, clobbers volatile registers, and returns. The PE entry checks the
- * exact final RSP, TLS ordering, cleared argument registers, and return slot. */
+ * exact final RSP, TLS ordering, RCX = PEB (TEB+0x60), cleared RDX/R8/R9,
+ * zeroed nonvolatile registers, and the return slot. */
 __asm__(
     ".pushsection .text\n"
     ".global beer_test_tls_runner\n"
@@ -44,10 +50,19 @@ __asm__(
     "    jne 9f\n"
     "    cmpl $1, beer_test_tls_ran(%rip)\n"
     "    jne 9f\n"
-    "    or %rcx, %rax\n"
+    "    cmp $0x7ffde000, %rcx\n"
+    "    jne 9f\n"
     "    or %rdx, %rax\n"
     "    or %r8, %rax\n"
     "    or %r9, %rax\n"
+    "    or %rbx, %rax\n"
+    "    or %rbp, %rax\n"
+    "    or %rsi, %rax\n"
+    "    or %rdi, %rax\n"
+    "    or %r12, %rax\n"
+    "    or %r13, %rax\n"
+    "    or %r14, %rax\n"
+    "    or %r15, %rax\n"
     "    jnz 9f\n"
     "    xor %edi, %edi\n"
     "    jmp 8f\n"
@@ -70,9 +85,12 @@ int main(void)
         *(uintptr_t *)beer_test_entry_rsp = 0x1234;
         pid_t child = fork();
         assert(child >= 0);
-        if (!child)
+        if (!child) {
+            beer_test_teb[0x60 / 8] = BEER_TEST_PEB;
+            if (syscall(SYS_arch_prctl, ARCH_SET_GS, (uintptr_t)beer_test_teb) != 0) _exit(2);
             beer_guest_enter(beer_test_entry_rsp, beer_test_tls_runner,
                              (uintptr_t)beer_test_pe_entry);
+        }
         int status = 0;
         assert(waitpid(child, &status, 0) == child);
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);

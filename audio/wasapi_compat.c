@@ -14,6 +14,7 @@
 #define E_NOINTERFACE UINT64_C(0x80004002)
 #define E_POINTER UINT64_C(0x80004003)
 #define E_FAIL UINT64_C(0x80004005)
+#define E_OUTOFMEMORY UINT64_C(0x8007000e)
 #define E_INVALIDARG UINT64_C(0x80070057)
 #define AUDCLNT_E_NOT_INITIALIZED UINT64_C(0x88890001)
 #define AUDCLNT_E_ALREADY_INITIALIZED UINT64_C(0x88890002)
@@ -284,19 +285,77 @@ static uint64_t __attribute__((ms_abi)) device_get_id(void *self, uint16_t **id)
     return *id ? S_OK : E_FAIL;
 }
 
-/* IPropertyStore: every value is the endpoint's friendly name (PKEY_Device_FriendlyName and its siblings). */
+/* IPropertyStore of the endpoint. Each key answers with its Windows type:
+ *  - device and interface names (PKEY_Device_*, PKEY_DeviceInterface_FriendlyName): VT_LPWSTR;
+ *  - PKEY_AudioEngine_DeviceFormat / _OEMFormat: VT_BLOB with the endpoint's WAVEFORMATEXTENSIBLE, 48 kHz
+ *    stereo 32-bit float as Windows audio devices report it. Audio engines derive their stream format from it:
+ *    Wwise keeps the container and only switches the subtype to float, so a 16-bit PCM device format turned into
+ *    an invalid 16-bit "float" format that Initialize rejected, and RE9 retried forever. Float streams are
+ *    accepted and converted to PCM16 on release;
+ *  - PKEY_AudioEndpoint_FormFactor (Speakers) and _PhysicalSpeakers (front left + right): VT_UI4;
+ *  - anything else: VT_EMPTY, as Windows returns for a property the device does not have.
+ * Answering every key with the name made audio engines read a string as a format blob (RE9 crashed reading
+ * WAVEFORMATEX.nChannels through a null pointer). Strings and blobs are CoTaskMem (host heap) allocations,
+ * released by PropVariantClear. */
+static const uint8_t pkey_device_name_fmtid[16] = {        /* {a45c254e-df1c-4efd-8020-67d146a850e0} */
+    0x4e,0x25,0x5c,0xa4,0x1c,0xdf,0xfd,0x4e,0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0
+};
+static const uint8_t pkey_interface_name_fmtid[16] = {     /* {026e516e-b814-414b-83cd-856d6fef4822} */
+    0x6e,0x51,0x6e,0x02,0x14,0xb8,0x4b,0x41,0x83,0xcd,0x85,0x6d,0x6f,0xef,0x48,0x22
+};
+static const uint8_t pkey_device_format_fmtid[16] = {      /* {f19f064d-082c-4e27-bc73-6882a1bb8e4c} */
+    0x4d,0x06,0x9f,0xf1,0x2c,0x08,0x27,0x4e,0xbc,0x73,0x68,0x82,0xa1,0xbb,0x8e,0x4c
+};
+static const uint8_t pkey_oem_format_fmtid[16] = {         /* {e4870e26-3cc5-4cd2-ba46-ca0a9a70ed04} */
+    0x26,0x0e,0x87,0xe4,0xc5,0x3c,0xd2,0x4c,0xba,0x46,0xca,0x0a,0x9a,0x70,0xed,0x04
+};
+static const uint8_t pkey_endpoint_fmtid[16] = {           /* {1da5d803-d492-4edd-8c23-e0c0ffee7f0e} */
+    0x03,0xd8,0xa5,0x1d,0x92,0xd4,0xdd,0x4e,0x8c,0x23,0xe0,0xc0,0xff,0xee,0x7f,0x0e
+};
+static const uint8_t ksdataformat_subtype_float[16] = {    /* {00000003-0000-0010-8000-00aa00389b71} */
+    0x03,0x00,0x00,0x00,0x00,0x00,0x10,0x00,0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71
+};
+
 static uint64_t __attribute__((ms_abi)) store_get_count(void *self, uint32_t *count)
 { (void)self; if (!count) return E_POINTER; *count = 0; return S_OK; }
 static uint64_t __attribute__((ms_abi)) store_get_at(void *self, uint32_t index, void *key)
 { (void)self; (void)index; (void)key; return E_FAIL; }
 static uint64_t __attribute__((ms_abi)) store_get_value(void *self, const void *key, uint8_t *value)
 {
-    (void)self; (void)key;
-    if (!value) return E_POINTER;
-    memset(value, 0, 24);                                  /* PROPVARIANT */
-    *(uint16_t *)value = 31;                               /* VT_LPWSTR */
-    *(uint16_t **)(value + 8) = wasapi_wide_dup("Beer Audio Output");
-    return S_OK;
+    (void)self;
+    if (!value || !key) return E_POINTER;
+    memset(value, 0, 24);                                  /* PROPVARIANT: vt at +0, value at +8 */
+    const uint8_t *fmtid = key;
+    uint32_t pid;
+    memcpy(&pid, fmtid + 16, 4);
+    if (!memcmp(fmtid, pkey_device_name_fmtid, 16) || !memcmp(fmtid, pkey_interface_name_fmtid, 16)) {
+        uint16_t *name = wasapi_wide_dup("Beer Audio Output");
+        if (!name) return E_OUTOFMEMORY;
+        *(uint16_t *)value = 31;                           /* VT_LPWSTR */
+        *(uint16_t **)(value + 8) = name;
+        return S_OK;
+    }
+    if (!memcmp(fmtid, pkey_device_format_fmtid, 16) || !memcmp(fmtid, pkey_oem_format_fmtid, 16)) {
+        uint8_t *format = calloc(1, 40);                   /* WAVEFORMATEXTENSIBLE */
+        if (!format) return E_OUTOFMEMORY;
+        const WaveFormat base = {0xfffe, 2, 48000, 384000, 8, 32, 22};
+        const uint16_t valid_bits = 32;
+        const uint32_t channel_mask = 3;                   /* SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT */
+        memcpy(format, &base, sizeof(base));
+        memcpy(format + 18, &valid_bits, 2);
+        memcpy(format + 20, &channel_mask, 4);
+        memcpy(format + 24, ksdataformat_subtype_float, 16);
+        *(uint16_t *)value = 65;                           /* VT_BLOB: cbSize at +8, pBlobData at +16 */
+        *(uint32_t *)(value + 8) = 40;
+        *(uint8_t **)(value + 16) = format;
+        return S_OK;
+    }
+    if (!memcmp(fmtid, pkey_endpoint_fmtid, 16) && (pid == 0 || pid == 3)) {
+        *(uint16_t *)value = 19;                           /* VT_UI4 */
+        *(uint32_t *)(value + 8) = pid == 0 ? 1u : 3u;     /* FormFactor Speakers / front left + right */
+        return S_OK;
+    }
+    return S_OK;                                           /* VT_EMPTY */
 }
 static uint64_t __attribute__((ms_abi)) store_ok(void *self, ...)
 { (void)self; return S_OK; }
@@ -332,6 +391,8 @@ static int supported_format(const WaveFormat *format)
            extensible[6] == (kind == 1 ? 1 : 3) && !memcmp(extensible + 8, subtype_tail, 14) ? kind : 0;
 }
 
+static uint64_t audio_client_initialize_body(BeerWasapi *owner, uint32_t share_mode, int64_t buffer_duration,
+                                             const WaveFormat *format);
 static uint64_t __attribute__((ms_abi)) audio_client_initialize(
     void *self, uint32_t share_mode, uint32_t stream_flags,
     int64_t buffer_duration, int64_t periodicity, const WaveFormat *format,
@@ -339,16 +400,32 @@ static uint64_t __attribute__((ms_abi)) audio_client_initialize(
 {
     (void)session_guid;
     BeerWasapi *owner = wasapi_interface(self)->owner;
+    const uint64_t result = audio_client_initialize_body(owner, share_mode, buffer_duration, format);
     fprintf(stderr,
             "[WASAPI] IAudioClient::Initialize mode=%u flags=0x%x "
-            "duration=%lld periodicity=%lld format=%u/%u/%u/%u\n",
+            "duration=%lld periodicity=%lld format=%u/%u/%u/%u -> 0x%llx\n",
             share_mode, stream_flags, (long long)buffer_duration,
             (long long)periodicity, format ? format->tag : 0,
             format ? format->channels : 0, format ? format->rate : 0,
-            format ? format->bits : 0);
+            format ? format->bits : 0, (unsigned long long)result);
+    return result;
+}
+static uint64_t audio_client_initialize_body(BeerWasapi *owner, uint32_t share_mode, int64_t buffer_duration,
+                                             const WaveFormat *format)
+{
     if (owner->initialized) return AUDCLNT_E_ALREADY_INITIALIZED;
     const int kind = supported_format(format);
-    if (!kind) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    if (!kind) {
+        static int logged;
+        if (format && logged++ < 4) {
+            const uint8_t *bytes = (const uint8_t *)format;
+            const unsigned size = 18u + (format->tag == 0xfffe ? format->extra : 0u);
+            fprintf(stderr, "[WASAPI] unsupported format bytes:");
+            for (unsigned i = 0; i < size && i < 40; ++i) fprintf(stderr, " %02x", bytes[i]);
+            fprintf(stderr, "\n");
+        }
+        return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    }
     /* The stream is always PCM16; a float client's packets are converted on release. */
     owner->format = *format;
     owner->format.tag = 1;
@@ -414,11 +491,22 @@ static uint64_t __attribute__((ms_abi)) audio_client_is_supported(void *self,
 static uint64_t __attribute__((ms_abi)) audio_client_get_mix_format(void *self,
                                                                     WaveFormat **format)
 {
+    /* The shared-mode mix format on Windows is always 32-bit float WAVE_FORMAT_EXTENSIBLE, and engines build
+     * their stream format from it: Wwise copies the base fields and marks the result float, so the old 16-bit
+     * PCM mix format became an invalid 16-bit "float" request that Initialize rejected (RE9 retried forever).
+     * Float streams are accepted and converted to PCM16 on release. */
     (void)self;
     if (!format) return E_POINTER;
-    *format = calloc(1, sizeof(**format));
-    if (!*format) return E_FAIL;
-    **format = (WaveFormat){1, 2, 48000, 192000, 4, 16, 0};
+    uint8_t *mix = calloc(1, 40);                          /* WAVEFORMATEXTENSIBLE, CoTaskMem (host heap) */
+    if (!mix) return E_FAIL;
+    const WaveFormat base = {0xfffe, 2, 48000, 384000, 8, 32, 22};
+    const uint16_t valid_bits = 32;
+    const uint32_t channel_mask = 3;                       /* SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT */
+    memcpy(mix, &base, sizeof(base));
+    memcpy(mix + 18, &valid_bits, 2);
+    memcpy(mix + 20, &channel_mask, 4);
+    memcpy(mix + 24, ksdataformat_subtype_float, 16);
+    *format = (WaveFormat *)mix;
     return S_OK;
 }
 static uint64_t __attribute__((ms_abi)) audio_client_get_period(void *self,

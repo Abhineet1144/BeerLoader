@@ -99,6 +99,24 @@ int beer_install_function_table_callback(uint64_t table_identifier,
     return 0;
 }
 
+int beer_dynamic_function_table_covers(uint64_t address)
+{
+    for (unsigned slot = 0; slot < BEER_FUNCTION_TABLE_CAPACITY; ++slot) {
+        unsigned kind = atomic_load_explicit(&dynamic_tables[slot].kind, memory_order_acquire);
+        const BeerDynamicFunctionTable *registration = &dynamic_tables[slot];
+        if (address < registration->base) continue;
+        if (kind == BEER_FUNCTION_TABLE_CALLBACK) {
+            if (address - registration->base < registration->length) return 1;
+        } else if (kind == BEER_FUNCTION_TABLE_FIXED) {
+            uint32_t end = 0;
+            for (uint32_t i = 0; i < registration->count; ++i)
+                if (registration->table[i].end_address > end) end = registration->table[i].end_address;
+            if (address - registration->base < end) return 1;
+        }
+    }
+    return 0;
+}
+
 const BeerRuntimeFunction *beer_lookup_dynamic_function_entry(uint64_t control_pc,
                                                                uint64_t *image_base)
 {

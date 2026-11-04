@@ -179,6 +179,9 @@ test-shell-strings:
 .PHONY: test-shell-strings
 
 test-input: test-native-loader test-shell-strings test-adapter-info
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_version_test.c platform/win32_version.c -o /tmp/beer-win32-version-test
+	/tmp/beer-win32-version-test
+	rm -f /tmp/beer-win32-version-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_syscall_test.c platform/win32_syscall.c -o /tmp/beer-win32-syscall-test
 	/tmp/beer-win32-syscall-test
 	rm -f /tmp/beer-win32-syscall-test

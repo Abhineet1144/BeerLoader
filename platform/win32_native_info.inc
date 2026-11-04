@@ -720,6 +720,16 @@ static u64 __attribute__((ms_abi)) impl_SwitchToThread(void)
     return sched_yield() == 0 ? 1 : 0;
 }
 
+/* QueryIoRingCapabilities (kernelbase, Windows 11). Beer has no I/O ring, so it reports
+ * HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) and clears the capabilities, as a system without the feature does.
+ * The generic missing-export stub returned 0 (S_OK) and left the struct unwritten: DirectStorage then chose
+ * its IoRing path and polled forever for completions that never came (RE9 stopped after five frames). */
+static u64 __attribute__((ms_abi)) impl_QueryIoRingCapabilities(u8 *capabilities)
+{
+    if (capabilities) memset(capabilities, 0, 16);   /* IORING_CAPABILITIES: version, two queue sizes, flags */
+    return 0x80070032ull;
+}
+
 /* PROPVARIANT (24 bytes on Win64): vt at +0, value at +8. Strings returned by property stores are
  * CoTaskMem (host heap) allocations; BSTRs belong to the OleAut32 allocator. */
 static u64 __attribute__((ms_abi)) impl_PropVariantClear(u8 *value)
@@ -728,6 +738,7 @@ static u64 __attribute__((ms_abi)) impl_PropVariantClear(u8 *value)
     u16 vt = *(u16 *)value;
     void *data = *(void **)(value + 8);
     if ((vt == 30 || vt == 31) && data) free(data);                       /* VT_LPSTR / VT_LPWSTR */
+    else if (vt == 65 || vt == 70) free(*(void **)(value + 16));          /* VT_BLOB / VT_BLOB_OBJECT: pBlobData */
     else if (vt == 8 && data) impl_SysFreeString(data);                   /* VT_BSTR */
     else if ((vt == 9 || vt == 13) && data)                               /* VT_DISPATCH / VT_UNKNOWN */
         ((u64 (__attribute__((ms_abi)) *)(void *))(*(void ***)data)[2])(data);

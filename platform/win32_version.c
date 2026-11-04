@@ -42,6 +42,39 @@ static int resource_entry(FILE *f, uint64_t root, uint32_t directory, uint32_t i
     return 0;
 }
 
+int beer_system_version_resource(uint8_t **data, uint32_t *size)
+{
+    static const uint16_t key[] = {
+        'V','S','_','V','E','R','S','I','O','N','_','I','N','F','O',0
+    };
+    enum { fixed_size = 13 * 4 };
+    const size_t header_and_key = 6 + sizeof(key);
+    const size_t value_offset = (header_and_key + 3u) & ~(size_t)3u;
+    const size_t total = value_offset + fixed_size;
+    if (!data || !size || total > UINT16_MAX) return 0;
+
+    uint8_t *block = calloc(1, total);
+    if (!block) return 0;
+    const uint16_t length = (uint16_t)total, value_length = fixed_size, type = 0;
+    memcpy(block, &length, 2);
+    memcpy(block + 2, &value_length, 2);
+    memcpy(block + 4, &type, 2);
+    memcpy(block + 6, key, sizeof(key));
+
+    /* VS_FIXEDFILEINFO for the Windows 10 build Beer advertises through its
+     * PEB/version APIs. Keep this metadata coherent with those process fields. */
+    const uint32_t fixed[13] = {
+        0xFEEF04BDu, 0x00010000u,
+        0x000A0000u, 0x4A650000u, /* FileVersion 10.0.19045.0 */
+        0x000A0000u, 0x4A650000u, /* ProductVersion 10.0.19045.0 */
+        0x0000003Fu, 0, 0x00040004u, 0x00000002u, 0, 0, 0
+    };
+    memcpy(block + value_offset, fixed, sizeof(fixed));
+    *data = block;
+    *size = (uint32_t)total;
+    return 1;
+}
+
 int beer_pe_version_resource(const char *host_path, uint8_t **data, uint32_t *size)
 {
     FILE *f = fopen(host_path, "rb");

@@ -107,6 +107,7 @@
 #include "win32_ki_dispatcher.h"
 #include "win32_native_heap.h"
 #include "win32_static_tls.h"
+#include "graphics/beer_fake_caps.h"
 #include "renderer/vulkan/vulkan_graphics.h"
 #include "renderer/vulkan/vulkan_renderer.h"
 #include "platform/xwayland_backend.h"
@@ -1528,6 +1529,37 @@ static void emit_impl_thunk(int idx, u64 fn_ptr)
 
     p[16] = 0xFF; p[17] = 0xE0;      /* jmp rax (back to original JMP) */
     memset(p + 18, 0x90, 6);         /* nop pad */
+}
+
+/* COM methods implemented in this file are reached through the guest's vtable call, not through an import thunk.
+ * This file is built without SSE, so GCC cannot keep the Windows x64 nonvolatile XMM6-XMM15 across the libc and X11
+ * calls these methods make: a guest that kept a value in XMM6/7 across, for example,
+ * IDXGIOutput::GetDisplayModeList read it back as zero (RE8's display-mode filter then dropped every mode and
+ * the game crashed or left borderless mode). Vtable entries are therefore routed through the dispatch trampoline,
+ * which saves XMM6-XMM15 and switches to the host call stack like an import call. AddRef/Release stay direct:
+ * they touch no SIMD state, and host code calls them too. */
+static u64 beer_guest_com_entry(u64 fn, const char *iface, size_t slot)
+{
+    static u64 known_fn[512], known_thunk[512];
+    static size_t known;
+    for (size_t i = 0; i < known; ++i)
+        if (known_fn[i] == fn) return known_thunk[i];
+    if (g_nstubs >= MAX_STUBS || known >= sizeof(known_fn) / sizeof(*known_fn)) return fn;
+    char name[64];
+    snprintf(name, sizeof(name), "%s[%zu]", iface, slot);
+    g_snames[g_nstubs] = strdup(name);
+    emit_impl_thunk(g_nstubs, fn);
+    const u64 thunk = (u64)(g_tramp + g_nstubs * THUNK_SZ);
+    ++g_nstubs;
+    known_fn[known] = fn;
+    known_thunk[known++] = thunk;
+    return thunk;
+}
+
+static void beer_guest_com_vtable(u64 *vtable, size_t count, const char *iface)
+{
+    for (size_t i = 0; i < count; ++i)
+        if (vtable[i] && i != 1 && i != 2) vtable[i] = beer_guest_com_entry(vtable[i], iface, i);
 }
 
 /* BEER_API_TRACE=1: every guest->host API call is logged (name + first four arguments). The wrapper
@@ -4002,7 +4034,17 @@ impl_QueryPerformanceFrequency(u64 *out)
 
 /* ---- Error ---- */
 static u64 __attribute__((ms_abi)) impl_GetLastError(void)  { return g_last_error; }
-static u64 __attribute__((ms_abi)) impl_SetLastError(u32 e) { g_last_error = e; return 0; }
+/* SetLastError returns nothing, but Windows' implementation loads the TEB from gs:[0x30] into RAX and stores the
+ * value at TEB+0x68 (LastErrorValue), so RAX holds the TEB on return; Wine does the same. RE9's protection uses
+ * that RAX, and a 0 sent it down a crashing path. */
+static u64 __attribute__((ms_abi)) impl_SetLastError(u32 e)
+{
+    g_last_error = e;
+    u64 teb = 0;
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb));
+    if (teb) *(volatile u32 *)(uintptr_t)(teb + 0x68) = e;
+    return teb;
+}
 
 /* ---- Misc ---- */
 static u64 __attribute__((ms_abi)) impl_IsDebuggerPresent(void)    { return 0; }
@@ -4804,6 +4846,58 @@ static u64 __attribute__((ms_abi)) impl_timeGetTime(void) {
 }
 static u64 __attribute__((ms_abi)) impl_timeBeginPeriod(u32 p) { (void)p; return 0; }
 static u64 __attribute__((ms_abi)) impl_timeEndPeriod(u32 p)   { (void)p; return 0; }
+
+/* Windows 10 exposes timer resolution in 100 ns units. Beer does not alter the
+ * host-wide Linux timer quantum, but its nanosleep/timer paths can honor the
+ * requested interval, so preserve the process-visible query/set contract. */
+enum {
+    BEER_TIMER_RESOLUTION_MINIMUM = 5000u,   /* 0.5 ms */
+    BEER_TIMER_RESOLUTION_MAXIMUM = 156250u  /* 15.625 ms */
+};
+static _Atomic(u32) g_timer_resolution = BEER_TIMER_RESOLUTION_MAXIMUM;
+
+static u64 __attribute__((ms_abi))
+impl_NtQueryTimerResolution(u32 *maximum, u32 *minimum, u32 *current)
+{
+    if (!maximum || !minimum || !current) return 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+    *maximum = BEER_TIMER_RESOLUTION_MAXIMUM;
+    *minimum = BEER_TIMER_RESOLUTION_MINIMUM;
+    *current = atomic_load_explicit(&g_timer_resolution, memory_order_relaxed);
+    return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_NtSetTimerResolution(u32 desired, u32 set_resolution, u32 *current)
+{
+    if (!current) return 0xC000000Du;
+    u32 selected = BEER_TIMER_RESOLUTION_MAXIMUM;
+    if (set_resolution) {
+        selected = desired;
+        if (selected < BEER_TIMER_RESOLUTION_MINIMUM) selected = BEER_TIMER_RESOLUTION_MINIMUM;
+        if (selected > BEER_TIMER_RESOLUTION_MAXIMUM) selected = BEER_TIMER_RESOLUTION_MAXIMUM;
+    }
+    atomic_store_explicit(&g_timer_resolution, selected, memory_order_relaxed);
+    *current = selected;
+    return 0;
+}
+
+static int beer_timer_resolution_self_test(void)
+{
+    u32 maximum = 0, minimum = 0, current = 0;
+    if (impl_NtQueryTimerResolution(&maximum, &minimum, &current) != 0 ||
+        maximum != BEER_TIMER_RESOLUTION_MAXIMUM || minimum != BEER_TIMER_RESOLUTION_MINIMUM ||
+        current != BEER_TIMER_RESOLUTION_MAXIMUM)
+        return 0;
+    if (impl_NtSetTimerResolution(1, 1, &current) != 0 || current != BEER_TIMER_RESOLUTION_MINIMUM)
+        return 0;
+    if (impl_NtSetTimerResolution(UINT32_MAX, 1, &current) != 0 ||
+        current != BEER_TIMER_RESOLUTION_MAXIMUM)
+        return 0;
+    if (impl_NtSetTimerResolution(BEER_TIMER_RESOLUTION_MINIMUM, 0, &current) != 0 ||
+        current != BEER_TIMER_RESOLUTION_MAXIMUM)
+        return 0;
+    return impl_NtQueryTimerResolution(NULL, &minimum, &current) == 0xC000000Du;
+}
 
 /* FMOD probes optional Windows registry settings during output setup. Returning
  * ERROR_SUCCESS from a generic stub without initializing its output handles or
@@ -9124,6 +9218,17 @@ static IDXGISwapChain *g_dxgi_swapchain = NULL;
 extern int32_t b11_device_create_for_loader(void **device, void **context);
 extern int32_t b11_swapchain_create_for_loader(void *device, const void *desc, void **out);
 extern int b11_is_device(const void *object);
+extern void b11_device_set_feature_level(void *device, u32 level);
+/* BD11 grants 11_0. With BEER_FAKE_CAPS it grants the highest requested level up to 12_1 (default list: 12_1). */
+static u32 d3d11_granted_feature_level(const u32 *levels, u32 count)
+{
+    if (!beer_fake_caps()) return D3D_FEATURE_LEVEL_11_0;
+    if (!levels || !count) return 0xc100;
+    u32 best = 0;
+    for (u32 i = 0; i < count; i++)
+        if (levels[i] <= 0xc100 && levels[i] > best) best = levels[i];
+    return best ? best : D3D_FEATURE_LEVEL_11_0;
+}
 static int beer_use_bd11(void)
 {
     static int cached = -1;
@@ -9196,9 +9301,11 @@ impl_D3D11CreateDevice(u64 adapter, u32 driver_type, u64 software,
         void *device = NULL, *context = NULL;
         if (b11_device_create_for_loader(&device, &context) != 0) return (u64)0x80004005;
         g_api_createdevice = 1;
+        u32 level = d3d11_granted_feature_level(feature_levels, n_levels);
+        b11_device_set_feature_level(device, level);
         fprintf(stderr, "[D3D11] CreateDevice -> BD11 device=%p context=%p\n", device, context);
         if (ppDevice) *ppDevice = (u64 *)device; else d3d11_retain_com_output(NULL);
-        if (pFeatureLevel) *pFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+        if (pFeatureLevel) *pFeatureLevel = level;
         if (ppContext) *ppContext = (u64 *)context;
         return S_OK;
     }
@@ -9235,10 +9342,12 @@ impl_D3D11CreateDeviceAndSwapChain(u64 adapter, u32 dtype, u64 sw, u32 flags,
     if (beer_use_bd11() && swdesc && ppSwap) {
         void *device = NULL, *context = NULL, *swap = NULL;
         if (b11_device_create_for_loader(&device, &context) != 0) return (u64)0x80004005;
+        u32 level = d3d11_granted_feature_level(fls, nfl);
+        b11_device_set_feature_level(device, level);
         int32_t hr = b11_swapchain_create_for_loader(device, swdesc, &swap);
         if (hr != 0) return (u64)(uint32_t)hr;
         if (ppDevice) *ppDevice = (u64 *)device;
-        if (pFL) *pFL = D3D_FEATURE_LEVEL_11_0;
+        if (pFL) *pFL = level;
         if (ppCtx) *ppCtx = (u64 *)context;
         *ppSwap = (u64 *)swap;
         return S_OK;
@@ -9268,6 +9377,7 @@ int bd12_com_is_queue(const void *object);
 u64 bd12_com_create_swapchain(void *queue, const u8 *desc, void **out);
 void bd12_com_set_event_factory(u64 (*fn)(void));
 void bd12_com_set_dxgi_factory(void *factory);
+void bd12_com_set_dxgi_output(void *output);
 
 /* Manual-reset event that starts signaled: the frame-latency waitable object of a swap chain. */
 static u64 beer_signaled_event_handle(void);
@@ -9562,7 +9672,7 @@ dxgi_output_GetDesc(u64 *obj, u8 *desc)
     *(s32 *)(desc + 72) = screen_w;
     *(s32 *)(desc + 76) = screen_h;
     *(u32 *)(desc + 80) = 1;          /* AttachedToDesktop */
-    *(u64 *)(desc + 88) = 0x10001;     /* stable virtual monitor handle */
+    *(u64 *)(desc + 88) = 0xD0000002u; /* the HMONITOR MonitorFromWindow / EnumDisplayMonitors report */
     return S_OK;
 }
 
@@ -9693,13 +9803,14 @@ dxgi_output_FindClosestMatchingMode1(u64 *obj, const u8 *requested1, u8 *closest
     return hr;
 }
 static u64 __attribute__((ms_abi)) dxgi_output_unsupported(void) { return 0x887a0004u; }   /* DXGI_ERROR_UNSUPPORTED */
-static u64 __attribute__((ms_abi)) dxgi_output_false(u64 *obj) { (void)obj; return 0; }
+/* With BEER_FAKE_CAPS the overlay, composition and HDR queries below answer supported; presentation stays SDR. */
+static u64 __attribute__((ms_abi)) dxgi_output_false(u64 *obj) { (void)obj; return beer_fake_caps() ? 1 : 0; }
 static u64 __attribute__((ms_abi)) dxgi_output_overlay_support(u64 *obj, u32 format, u64 device, u32 *flags)
-    { (void)obj; (void)format; (void)device; if (!flags) return 0x80070057u; *flags = 0; return S_OK; }
+    { (void)obj; (void)format; (void)device; if (!flags) return 0x80070057u; *flags = beer_fake_caps() ? 3u : 0; return S_OK; }
 static u64 __attribute__((ms_abi)) dxgi_output_overlay_cs_support(u64 *obj, u32 format, u32 cs, u64 device, u32 *flags)
-    { (void)obj; (void)format; (void)cs; (void)device; if (!flags) return 0x80070057u; *flags = 0; return S_OK; }
+    { (void)obj; (void)format; (void)cs; (void)device; if (!flags) return 0x80070057u; *flags = beer_fake_caps() ? 1u : 0; return S_OK; }
 static u64 __attribute__((ms_abi)) dxgi_output_composition_support(u64 *obj, u32 *flags)
-    { (void)obj; if (!flags) return 0x80070057u; *flags = 0; return S_OK; }
+    { (void)obj; if (!flags) return 0x80070057u; *flags = beer_fake_caps() ? 7u : 0; return S_OK; }
 /* DXGI_OUTPUT_DESC1: OUTPUT_DESC (96 bytes) + BitsPerColor, ColorSpace, primaries, white point, luminance. */
 static u64 __attribute__((ms_abi))
 dxgi_output_GetDesc1(u64 *obj, u8 *desc)
@@ -9714,6 +9825,13 @@ dxgi_output_GetDesc1(u64 *obj, u8 *desc)
     const float primaries[11] = { 0.640f, 0.330f, 0.300f, 0.600f, 0.150f, 0.060f, 0.3127f, 0.3290f,
                                   0.5f, 270.0f, 270.0f };          /* sRGB/D65, min/max/full-frame nits */
     memcpy(desc + 104, primaries, sizeof(primaries));
+    if (beer_fake_caps()) {                                        /* HDR10 display: 10 bpc, ST.2084/BT.2020 */
+        const float hdr[11] = { 0.708f, 0.292f, 0.170f, 0.797f, 0.131f, 0.046f, 0.3127f, 0.3290f,
+                                0.01f, 1000.0f, 600.0f };
+        *(u32 *)(desc + 96) = 10;
+        *(u32 *)(desc + 100) = 12;                                 /* DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 */
+        memcpy(desc + 104, hdr, sizeof(hdr));
+    }
     return S_OK;
 }
 
@@ -9784,6 +9902,7 @@ static void init_dxgi_adapter_fake(void) {
     if (g_dxgi_output != MAP_FAILED) g_dxgi_output[0] = (u64)g_dxgi_output_vtab;
     else g_dxgi_output = NULL;
     d3d11_device_set_dxgi_adapter(g_dxgi_adapter);
+    bd12_com_set_dxgi_output(g_dxgi_output);
 }
 
 static u64 __attribute__((ms_abi))
@@ -9838,6 +9957,7 @@ dxgi_Factory_CheckFeatureSupport(u64 *obj, u32 feature, void *data, u32 size)
     (void)obj;
     if (!data || !size) return 0x80070057u;
     memset(data, 0, size);                 /* DXGI_FEATURE_PRESENT_ALLOW_TEARING etc.: FALSE */
+    if (feature == 0 && beer_fake_caps() && size >= 4) *(u32 *)data = 1;   /* tearing flags are ignored */
     return feature == 0 ? S_OK : 0x80070057u;
 }
 
@@ -11979,7 +12099,10 @@ impl_CM_Locate_DevNodeA(u32 *devinst, const char *device_id, u32 flags)
 static u64 __attribute__((ms_abi))
 impl_CM_Locate_DevNodeW(u32 *devinst, const u16 *device_id, u32 flags)
 {
-    (void)flags;
+    if (getenv("BEER_CFGMGR_DIAGNOSTICS"))
+        fprintf(stderr, "[CFGMGR] CM_Locate_DevNodeW(devinst=%p, id=%p, flags=0x%x) caller=0x%llx\n",
+                (void *)devinst, (const void *)device_id, flags,
+                (unsigned long long)(g_saved_guest_rsp ? *(const u64 *)(uintptr_t)g_saved_guest_rsp : 0));
     if (!devinst) return BEER_CR_INVALID_POINTER;
     *devinst = 0;
     if (!cfgmgr_root_id_matches_w(device_id)) return BEER_CR_NO_SUCH_DEVNODE;
@@ -12019,6 +12142,125 @@ impl_CM_Get_Device_IDW(u32 devinst, u16 *buffer, u32 buffer_length, u32 flags)
     if (buffer_length < length + 1u) return BEER_CR_BUFFER_SMALL;
     for (size_t i = 0; i <= length; ++i) buffer[i] = (u8)BEER_ROOT_DEVICE_ID_A[i];
     return BEER_CR_SUCCESS;
+}
+
+/* CM_Get_Device_ID_List(_Size)W: the device-instance IDs matching a filter, as one double-NUL-terminated list.
+ * The display adapter Beer renders on is listed for the display class filter (CM_GETIDLIST_FILTER_CLASS with
+ * {4d36e968-e325-11ce-bfc1-08002be10318}) and for an unfiltered request, with the PCI identity EnumDisplayDevices
+ * reports. Any other filter yields an empty list (a lone NUL, length 1). Windows always has a display adapter:
+ * Chained Together dereferences the first entry of the display-class list unchecked, so an empty list crashed it.
+ * Locating that ID still answers CR_NO_SUCH_DEVNODE (Beer's device tree has only the root), which callers handle.
+ * The generic stub had returned CR_SUCCESS without writing the length or the list. */
+#define BEER_CM_GETIDLIST_FILTER_CLASS 0x200u
+static int cfgmgr_display_class_filter(const u16 *filter)
+{
+    static const char display[] = "{4d36e968-e325-11ce-bfc1-08002be10318}";
+    if (!filter) return 0;
+    for (size_t i = 0;; ++i) {
+        u16 a = filter[i], b = (u8)display[i];
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (a != b) return 0;
+        if (!a) return 1;
+    }
+}
+/* Writes the list as UTF-16 into out (capacity in characters, may be 0 to measure); returns the length including
+ * the final NUL. */
+static u32 cfgmgr_device_id_list(const u16 *filter, u32 flags, u16 *out, u32 capacity)
+{
+    char id[160] = "";
+    const int display = (flags & BEER_CM_GETIDLIST_FILTER_CLASS) ? cfgmgr_display_class_filter(filter) : flags == 0;
+    BeerHostGpuInfo gpu;
+    if (display && beer_vulkan_host_gpu_info(&gpu))
+        snprintf(id, sizeof(id), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_%02X\\3&BEER&0&10",
+                 gpu.vendor_id, gpu.device_id, gpu.revision);
+    const u32 length = id[0] ? (u32)strlen(id) + 2u : 1u;
+    if (out && capacity >= length) {
+        u32 k = 0;
+        for (; id[k]; ++k) out[k] = (u8)id[k];
+        if (id[0]) out[k++] = 0;
+        out[k] = 0;
+    }
+    return length;
+}
+static u64 __attribute__((ms_abi))
+impl_CM_Get_Device_ID_List_SizeW(u32 *length, const u16 *filter, u32 flags)
+{
+    if (!length) return BEER_CR_INVALID_POINTER;
+    *length = cfgmgr_device_id_list(filter, flags, NULL, 0);
+    return BEER_CR_SUCCESS;
+}
+static u64 __attribute__((ms_abi))
+impl_CM_Get_Device_ID_ListW(const u16 *filter, u16 *buffer, u32 length, u32 flags)
+{
+    if (!buffer) return BEER_CR_INVALID_POINTER;
+    if (length < cfgmgr_device_id_list(filter, flags, NULL, 0)) return BEER_CR_BUFFER_SMALL;
+    cfgmgr_device_id_list(filter, flags, buffer, length);
+    return BEER_CR_SUCCESS;
+}
+static void cfgmgr_widen(const char *in, u16 *out, size_t capacity)
+{
+    size_t i = 0;
+    for (; in && in[i] && i + 1 < capacity; ++i) out[i] = (u8)in[i];
+    out[i] = 0;
+}
+static u64 __attribute__((ms_abi))
+impl_CM_Get_Device_ID_List_SizeA(u32 *length, const char *filter, u32 flags)
+{
+    u16 wide[64];
+    cfgmgr_widen(filter, wide, 64);
+    return impl_CM_Get_Device_ID_List_SizeW(length, filter ? wide : NULL, flags);
+}
+static u64 __attribute__((ms_abi))
+impl_CM_Get_Device_ID_ListA(const char *filter, char *buffer, u32 length, u32 flags)
+{
+    if (!buffer) return BEER_CR_INVALID_POINTER;
+    u16 wide_filter[64], list[192];
+    cfgmgr_widen(filter, wide_filter, 64);
+    const u32 needed = cfgmgr_device_id_list(filter ? wide_filter : NULL, flags, NULL, 0);
+    if (length < needed || needed > 192) return BEER_CR_BUFFER_SMALL;
+    cfgmgr_device_id_list(filter ? wide_filter : NULL, flags, list, 192);
+    for (u32 i = 0; i < needed; ++i) buffer[i] = (char)list[i];
+    return BEER_CR_SUCCESS;
+}
+
+/* CM_MapCrToWin32Err(CONFIGRET, DWORD default): the Win32 error for a CONFIGRET; unmapped codes give the default. */
+static u64 __attribute__((ms_abi))
+impl_CM_MapCrToWin32Err(u32 code, u32 default_error)
+{
+    switch (code) {
+    case 0x00: return 0;      /* CR_SUCCESS */
+    case 0x02: return 8;      /* CR_OUT_OF_MEMORY -> ERROR_NOT_ENOUGH_MEMORY */
+    case 0x03: return 1784;   /* CR_INVALID_POINTER -> ERROR_INVALID_USER_BUFFER */
+    case 0x04: return 1004;   /* CR_INVALID_FLAG -> ERROR_INVALID_FLAGS */
+    case 0x05: case 0x1f: return 13;   /* CR_INVALID_DEVNODE / CR_INVALID_DATA -> ERROR_INVALID_DATA */
+    case 0x0d: case 0x25: return 1168; /* CR_NO_SUCH_DEVNODE / CR_NO_SUCH_VALUE -> ERROR_NOT_FOUND */
+    case 0x1a: return 122;    /* CR_BUFFER_SMALL -> ERROR_INSUFFICIENT_BUFFER */
+    default: return default_error;
+    }
+}
+/* CM_Get_DevNode_PropertyW(devinst, key, type, buffer, size, flags): Beer's device tree has only the root node and
+ * it carries no properties. */
+static u64 __attribute__((ms_abi))
+impl_CM_Get_DevNode_PropertyW(u32 devinst, const void *key, u32 *type, u8 *buffer, u32 *size, u32 flags)
+{
+    (void)buffer; (void)flags;
+    if (!key || !type || !size) return BEER_CR_INVALID_POINTER;
+    if (devinst != BEER_ROOT_DEVINST) return BEER_CR_INVALID_DEVNODE;
+    return 0x25u;   /* CR_NO_SUCH_VALUE */
+}
+
+/* StringFromGUID2: "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" in upper case; returns the characters written including
+ * the NUL (39), or 0 when the buffer is smaller. */
+static u64 __attribute__((ms_abi))
+impl_StringFromGUID2(const u8 *guid, u16 *buffer, s32 capacity)
+{
+    if (!guid || !buffer || capacity < 39) return 0;
+    char text[40];
+    snprintf(text, sizeof(text), "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+             *(const u32 *)guid, *(const u16 *)(guid + 4), *(const u16 *)(guid + 6), guid[8], guid[9],
+             guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]);
+    for (int i = 0; i < 39; ++i) buffer[i] = (u8)text[i];
+    return 39;
 }
 
 static u64 __attribute__((ms_abi))
@@ -12664,6 +12906,7 @@ typedef struct {
     void *stack;                   /* bottom-up guest stack (beer_vm_map_bottom_up), released after join */
     size_t stack_size;
     size_t stack_request;          /* CreateThread dwStackSize (0 = the image default) */
+    int guest_stack_own;           /* the guest entry runs on stack..stack+stack_size, not the pthread stack */
     u64 fn;
     u64 arg;
     u64 creator_rip;
@@ -12750,7 +12993,35 @@ static void thread_done_cleanup(void *p)
  * cannot rely on those skipped epilogues. Keep the pthread/C frame behind an
  * assembly boundary that restores the host's SysV nonvolatile registers
  * unconditionally when the guest eventually returns. */
-extern u64 beer_call_thread_entry(u64 fn, u64 arg);
+/* With guest_top (the thread's TEB StackBase) the entry runs on the thread's own guest stack, as on Windows:
+ * RtlUserThreadStart/BaseThreadInitThunk leave the entry RSP at StackBase-0x88 and the zeroed initial context's
+ * nonvolatile registers. The pthread's host stack (glibc's thread descriptor and TLS live at its top) is never
+ * part of guest memory. guest_top 0 calls the entry on the current stack. */
+static void set_teb_stack_bounds(u64 stack_low, u64 stack_high);
+__thread u64 t_thread_entry_host_rsp;   /* referenced from asm only */
+/* Runs the SysV host function fn(arg) with RSP just below stack_top. Windows runs DLL_THREAD_ATTACH (DllMain and
+ * the executable's TLS callbacks) on the new thread's own stack, under ntdll's LdrInitializeThunk frames, before
+ * the entry point; with the guest stack separate from the pthread stack, the notifications move there too. */
+__thread u64 t_on_stack_host_rsp;       /* referenced from asm only */
+extern void beer_call_on_guest_stack(void (*fn)(u32), u32 arg, u64 stack_top);
+__asm__(
+    ".text\n"
+    ".global beer_call_on_guest_stack\n"
+    ".type beer_call_on_guest_stack,@function\n"
+    "beer_call_on_guest_stack:\n"
+    "    push %rbp\n"
+    "    mov %rsp, %fs:t_on_stack_host_rsp@tpoff\n"
+    "    mov %rdi, %rax\n"
+    "    mov %esi, %edi\n"
+    "    lea -0x800(%rdx), %rsp\n"
+    "    and $-16, %rsp\n"
+    "    call *%rax\n"
+    "    mov %fs:t_on_stack_host_rsp@tpoff, %rsp\n"
+    "    pop %rbp\n"
+    "    ret\n"
+    ".size beer_call_on_guest_stack,.-beer_call_on_guest_stack\n"
+);
+extern u64 beer_call_thread_entry(u64 fn, u64 arg, u64 guest_top);
 __asm__(
     ".text\n"
     ".global beer_call_thread_entry\n"
@@ -12764,10 +13035,33 @@ __asm__(
     "    push %r15\n"
     "    mov %rdi, %rax\n"       /* Windows thread entry address. */
     "    mov %rsi, %rcx\n"       /* First Windows x64 argument. */
-    "    sub $0x28, %rsp\n"      /* Shadow space and pre-call alignment. */
+    "    test %rdx, %rdx\n"
+    "    jz 1f\n"
+    "    mov %rsp, %fs:t_thread_entry_host_rsp@tpoff\n"
+    "    lea -0x80(%rdx), %rsp\n"   /* call pushes the return address: entry RSP = StackBase-0x88 */
+    "    and $-16, %rsp\n"
+    "    xor %r8d, %r8d\n"
+    "    xor %r9d, %r9d\n"
+    "    xor %ebx, %ebx\n"
+    "    xor %ebp, %ebp\n"
+    "    xor %edx, %edx\n"
+    "    xor %esi, %esi\n"
+    "    xor %edi, %edi\n"
+    "    xor %r12d, %r12d\n"
+    "    xor %r13d, %r13d\n"
+    "    xor %r14d, %r14d\n"
+    "    xor %r15d, %r15d\n"
+    "    movb $1, %fs:beer_win32_syscall_selector@tpoff\n"
     "    call *%rax\n"
+    "    movb $0, %fs:beer_win32_syscall_selector@tpoff\n"
+    "    mov %fs:t_thread_entry_host_rsp@tpoff, %rsp\n"
+    "    jmp 2f\n"
+    "1:  sub $0x28, %rsp\n"      /* Shadow space and pre-call alignment. */
+    "    movb $1, %fs:beer_win32_syscall_selector@tpoff\n"
+    "    call *%rax\n"
+    "    movb $0, %fs:beer_win32_syscall_selector@tpoff\n"
     "    add $0x28, %rsp\n"
-    "    pop %r15\n"
+    "2:  pop %r15\n"
     "    pop %r14\n"
     "    pop %r13\n"
     "    pop %r12\n"
@@ -12797,7 +13091,15 @@ static void *win_thread_trampoline(void *p) {
     pthread_cond_broadcast(&t->cv);
     pthread_mutex_unlock(&t->mtx);
 
-    guest_dll_notify_thread(2 /* DLL_THREAD_ATTACH */);
+    if (t->guest_stack_own && t->stack) {
+        const u64 low = (u64)(uintptr_t)t->stack + 0x1000, high = (u64)(uintptr_t)t->stack + t->stack_size;
+        set_teb_stack_bounds(low, high);
+        g_current_guest_stack_low = low;
+        g_current_guest_stack_high = high;
+        beer_call_on_guest_stack(guest_dll_notify_thread, 2 /* DLL_THREAD_ATTACH */, high);
+    } else {
+        guest_dll_notify_thread(2 /* DLL_THREAD_ATTACH */);
+    }
     if (getenv("BEER_THREAD_DIAGNOSTICS"))
         fprintf(stderr,
                 "[THREAD] start id=%u fn=0x%llx arg=0x%llx creator=0x%llx\n",
@@ -12810,7 +13112,15 @@ static void *win_thread_trampoline(void *p) {
     /* Ensure done is signalled even if thread exits via pthread_exit (ExitThread) */
     pthread_cleanup_push(thread_done_cleanup, (void *)(intptr_t)id);
 
-    u64 exit_code = beer_call_thread_entry(t->fn, t->arg);
+    u64 guest_top = 0;
+    if (t->guest_stack_own && t->stack) {
+        const u64 low = (u64)(uintptr_t)t->stack + 0x1000, high = (u64)(uintptr_t)t->stack + t->stack_size;
+        set_teb_stack_bounds(low, high);
+        g_current_guest_stack_low = low;
+        g_current_guest_stack_high = high;
+        guest_top = high;
+    }
+    u64 exit_code = beer_call_thread_entry(t->fn, t->arg, guest_top);
     pthread_mutex_lock(&t->mtx);
     t->exit_code = (u32)exit_code;
     pthread_mutex_unlock(&t->mtx);
@@ -12842,19 +13152,24 @@ static int thread_start_locked(int id)
      * guard); the glibc default stack, top-down, when that range is full. */
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    const size_t stack_size = guest_thread_stack_reserve(t->stack_request) + 0x1000;
+    /* The guest stack is the reservation alone (its lowest page the guard); the pthread runs Beer's host code on
+     * its own glibc stack and switches to the guest stack for the entry (beer_call_thread_entry).
+     * BEER_THREAD_STACK_LEGACY=1 runs the guest on the pthread stack inside the reservation, as before. */
+    const int legacy_stack = getenv("BEER_THREAD_STACK_LEGACY") != NULL;
+    const size_t stack_size = guest_thread_stack_reserve(t->stack_request) + (legacy_stack ? 0x1000u : 0u);
     void *stack = beer_vm_map_bottom_up(stack_size, 65536, PROT_READ | PROT_WRITE, MAP_NORESERVE);
     if (stack != MAP_FAILED) {
         mprotect(stack, 0x1000, PROT_NONE);
-        pthread_attr_setstack(&attr, (u8 *)stack + 0x1000, stack_size - 0x1000);
+        if (legacy_stack) pthread_attr_setstack(&attr, (u8 *)stack + 0x1000, stack_size - 0x1000);
+        t->stack = stack; t->stack_size = stack_size; t->guest_stack_own = !legacy_stack;
     }
     const int created = pthread_create(&t->pt, &attr, win_thread_trampoline, (void *)(intptr_t)id);
     pthread_attr_destroy(&attr);
     if (created != 0) {
         if (stack != MAP_FAILED) beer_vm_unmap_bottom_up(stack, stack_size);
+        t->stack = NULL; t->stack_size = 0; t->guest_stack_own = 0;
         return -1;
     }
-    if (stack != MAP_FAILED) { t->stack = stack; t->stack_size = stack_size; }
     t->started = 1;
     t->suspended = 0;
     return 0;
@@ -15330,8 +15645,29 @@ impl_GetFileVersionInfoSizeW(const u16 *path, u32 *handle)
     u8 *data = NULL;
     u32 size = 0;
     if (handle) *handle = 0;
+    if (getenv("BEER_VERSION_DIAGNOSTICS")) {
+        char guest[1024];
+        size_t i = 0;
+        for (; path && path[i] && i + 1 < sizeof(guest); ++i)
+            guest[i] = path[i] < 0x80 ? (char)path[i] : '?';
+        guest[i] = 0;
+        fprintf(stderr, "[VERSION] GetFileVersionInfoSizeW path=\"%s\"\n", path ? guest : "(null)");
+    }
     if (!wide_to_host_path(path, host, sizeof(host))) { g_last_error = 2; fprintf(stderr, "[VERSION] cannot resolve path\n"); return 0; }
+    if (getenv("BEER_VERSION_DIAGNOSTICS"))
+        fprintf(stderr, "[VERSION] resolved host path=\"%s\"\n", host);
     if (access(host, F_OK) != 0) {
+        char guest_path[1024];
+        size_t guest_length = 0;
+        for (; path && path[guest_length] && guest_length + 1 < sizeof(guest_path); ++guest_length)
+            guest_path[guest_length] = path[guest_length] < 0x80 ? (char)path[guest_length] : '?';
+        guest_path[guest_length] = 0;
+        if (synthetic_system_module_base(guest_path) &&
+            beer_system_version_resource(&data, &size)) {
+            free(data);
+            g_last_error = 0;
+            return size;
+        }
         if (getenv("BEER_HOOK_PROBE")) {
             /* Experiment: what does the (possibly hooked) guest-visible CreateFileW say about this path? */
             u64 (__attribute__((ms_abi)) *guest_create_file)(const u16 *, u32, u32, void *, u32, u32, u64) = NULL;
@@ -15370,8 +15706,22 @@ impl_GetFileVersionInfoW(const u16 *path, u32 handle, u32 length, u8 *buffer)
     char host[1024];
     u8 *data = NULL;
     u32 size = 0;
-    if (!buffer || !wide_to_host_path(path, host, sizeof(host)) || access(host, F_OK) != 0) { g_last_error = 2; return 0; }
-    if (!beer_pe_version_resource(host, &data, &size)) { g_last_error = 1813; return 0; }
+    if (!buffer || !wide_to_host_path(path, host, sizeof(host))) { g_last_error = 2; return 0; }
+    if (access(host, F_OK) != 0) {
+        char guest_path[1024];
+        size_t guest_length = 0;
+        for (; path && path[guest_length] && guest_length + 1 < sizeof(guest_path); ++guest_length)
+            guest_path[guest_length] = path[guest_length] < 0x80 ? (char)path[guest_length] : '?';
+        guest_path[guest_length] = 0;
+        if (!synthetic_system_module_base(guest_path) ||
+            !beer_system_version_resource(&data, &size)) {
+            g_last_error = 2;
+            return 0;
+        }
+    } else if (!beer_pe_version_resource(host, &data, &size)) {
+        g_last_error = 1813;
+        return 0;
+    }
     memcpy(buffer, data, size < length ? size : length);
     free(data);
     return 1;
@@ -18307,6 +18657,10 @@ static u64 set_window_long_value(u64 hw, s32 index, u64 value)
     if (index == -4) g_window_proc = value;
     else if (index == -21) g_window_userdata = value;
     else if (index == -16) {
+        if (getenv("BEER_WINDOW_DIAGNOSTICS"))
+            fprintf(stderr, "[WIN] SetWindowLong(GWL_STYLE, 0x%08llx) was 0x%08llx caller=0x%llx\n",
+                    (unsigned long long)value, (unsigned long long)g_window_style,
+                    (unsigned long long)(g_saved_guest_rsp ? *(const u64 *)(uintptr_t)g_saved_guest_rsp : 0));
         g_window_style = value;
         if (xwayland_window_exists())
             xwayland_window_set_style(
@@ -19440,7 +19794,7 @@ static void *user_work_item_thread(void *argument)
             fprintf(stderr, "[GS] QueueUserWorkItem: arch_prctl failed: %d\n", gs_rc);
     }
     guest_dll_notify_thread(2 /* DLL_THREAD_ATTACH */);
-    beer_call_thread_entry(work->callback, work->context);
+    beer_call_thread_entry(work->callback, work->context, 0);
     guest_dll_notify_thread(3 /* DLL_THREAD_DETACH */);
     free(work);
     return NULL;
@@ -23126,6 +23480,10 @@ static ImplEntry g_impls[] = {
     {"ZwQueryVirtualMemory",                  (ImplFn)impl_NtQueryVirtualMemory},
     {"NtDelayExecution",                      (ImplFn)impl_NtDelayExecution},
     {"ZwDelayExecution",                      (ImplFn)impl_NtDelayExecution},
+    {"NtQueryTimerResolution",                (ImplFn)impl_NtQueryTimerResolution},
+    {"ZwQueryTimerResolution",                (ImplFn)impl_NtQueryTimerResolution},
+    {"NtSetTimerResolution",                  (ImplFn)impl_NtSetTimerResolution},
+    {"ZwSetTimerResolution",                  (ImplFn)impl_NtSetTimerResolution},
     {"NtRaiseHardError",                      (ImplFn)impl_NtRaiseHardError},
     {"ZwRaiseHardError",                      (ImplFn)impl_NtRaiseHardError},
     {"NtOpenSection",                         (ImplFn)impl_NtOpenSection},
@@ -23140,6 +23498,7 @@ static ImplEntry g_impls[] = {
     {"RoGetActivationFactory",                (ImplFn)impl_RoGetActivationFactory},
     {"ReadConsoleW",                          (ImplFn)impl_ReadConsoleW},
     {"SwitchToThread",                        (ImplFn)impl_SwitchToThread},
+    {"QueryIoRingCapabilities",               (ImplFn)impl_QueryIoRingCapabilities},
     {"ReadConsoleInputW",                     (ImplFn)impl_ReadConsoleInputW},
     {"ReadConsoleInputA",                     (ImplFn)impl_ReadConsoleInputW},
     {"PeekConsoleInputW",                     (ImplFn)impl_ReadConsoleInputW},
@@ -23224,6 +23583,13 @@ static ImplEntry g_impls[] = {
     {"CM_Get_Device_IDW",                    (ImplFn)impl_CM_Get_Device_IDW},
     {"CM_Get_Device_ID",                     (ImplFn)impl_CM_Get_Device_IDW},
     {"CM_Get_Device_ID_Size",                (ImplFn)impl_CM_Get_Device_ID_Size},
+    {"CM_Get_Device_ID_List_SizeW",          (ImplFn)impl_CM_Get_Device_ID_List_SizeW},
+    {"CM_Get_Device_ID_List_SizeA",          (ImplFn)impl_CM_Get_Device_ID_List_SizeA},
+    {"CM_Get_Device_ID_ListW",               (ImplFn)impl_CM_Get_Device_ID_ListW},
+    {"CM_Get_Device_ID_ListA",               (ImplFn)impl_CM_Get_Device_ID_ListA},
+    {"StringFromGUID2",                      (ImplFn)impl_StringFromGUID2},
+    {"CM_MapCrToWin32Err",                   (ImplFn)impl_CM_MapCrToWin32Err},
+    {"CM_Get_DevNode_PropertyW",             (ImplFn)impl_CM_Get_DevNode_PropertyW},
     {"SetupDiGetClassDevsA",                  (ImplFn)impl_SetupDiGetClassDevsA},
     {"SetupDiGetClassDevsW",                  (ImplFn)impl_SetupDiGetClassDevsW},
     {"SetupDiGetClassDevsExA",                (ImplFn)impl_SetupDiGetClassDevsExA},
@@ -25323,9 +25689,9 @@ static GuestDll *guest_dll_finish(GuestDll *dll)
     if (tls_directory->size >= sizeof(TLS_DIR64) &&
         guest_dll_rva_valid(dll, tls_directory->rva, sizeof(TLS_DIR64))) {
         TLS_DIR64 *tls = (TLS_DIR64 *)(dll->image + tls_directory->rva);
-        /* Recursive imports change the global count. The published record's
-         * stable ordinal, not that count, owns its static TLS slot. */
-        dll->tls_index = beer_static_tls_slot((size_t)(dll - g_guest_dlls), TLS_SLOTS);
+        /* The next free static TLS index, as the Windows loader numbers modules that have TLS. */
+        static uint32_t next_tls_slot;
+        dll->tls_index = beer_static_tls_next_slot(&next_tls_slot, TLS_SLOTS);
         if (dll->tls_index == UINT32_MAX) die("static TLS slots exhausted for %s", dll->name);
         dll->tls_start = tls->StartAddr;
         dll->tls_raw_size = tls->EndAddr >= tls->StartAddr
@@ -25681,13 +26047,73 @@ static u64 virtual_fs_load_library(const char *name)
 
 static volatile int g_exe_tls_attached;   /* set once the process-attach pass over the executable's callbacks has finished */
 
+/* Calls a TLS callback or DllMain (ms_abi fn(image, reason, NULL)) with the guest-visible register state of a
+ * Windows loader call: Beer's host values (thread pointer, host heap and stack addresses) in the nonvolatile
+ * registers would otherwise reach the guest, which saves them on its stack and in RE9's case mixes them into its
+ * protection checks. */
+/* slot is what RAX holds at entry: for a TLS callback, the address of its entry in AddressOfCallBacks (the
+ * loader walks that array; Wine leaves RAX there and the callback in R10, and RE9's protection consumes RAX). */
+extern u64 beer_call_init_routine(void *fn, void *image, u32 reason, u64 slot);
+__asm__(
+    ".text\n"
+    ".global beer_call_init_routine\n"
+    ".type beer_call_init_routine,@function\n"
+    "beer_call_init_routine:\n"
+    "    push %rbp\n"
+    "    push %rbx\n"
+    "    push %r12\n"
+    "    push %r13\n"
+    "    push %r14\n"
+    "    push %r15\n"
+    "    mov %rsp, %rbp\n"
+    "    and $-16, %rsp\n"
+    "    sub $0x20, %rsp\n"         /* home space */
+    "    mov %rdi, %r10\n"
+    "    mov %rcx, %rax\n"          /* slot (4th SysV argument) */
+    "    mov %rsi, %rcx\n"
+    "    xor %r8d, %r8d\n"
+    "    xor %r9d, %r9d\n"
+    "    xor %r11d, %r11d\n"
+    "    xor %ebx, %ebx\n"
+    "    xor %r12d, %r12d\n"
+    "    xor %r13d, %r13d\n"
+    "    xor %r14d, %r14d\n"
+    "    xor %r15d, %r15d\n"
+    "    push %rbp\n"              /* rbp keeps our frame: saved below the home space */
+    "    sub $8, %rsp\n"
+    "    push %rdi\n"
+    "    push %rsi\n"
+    "    xor %esi, %esi\n"
+    "    xor %edi, %edi\n"
+    "    sub $0x20, %rsp\n"
+    "    movb $1, %fs:beer_win32_syscall_selector@tpoff\n"   /* guest code: its system calls are served */
+    "    call *%r10\n"
+    "    movb $0, %fs:beer_win32_syscall_selector@tpoff\n"
+    "    add $0x20, %rsp\n"
+    "    pop %rsi\n"
+    "    pop %rdi\n"
+    "    add $8, %rsp\n"
+    "    pop %rbp\n"
+    "    mov %rbp, %rsp\n"
+    "    pop %r15\n"
+    "    pop %r14\n"
+    "    pop %r13\n"
+    "    pop %r12\n"
+    "    pop %rbx\n"
+    "    pop %rbp\n"
+    "    ret\n"
+    ".size beer_call_init_routine,.-beer_call_init_routine\n"
+);
+
 /* The Windows loader hands DLL_THREAD_ATTACH/DETACH to the executable's own TLS callbacks as well; packers (Arxan)
- * run their per-thread anti-debug checks there.  Opt-in (BEER_EXE_THREAD_TLS=1) until they run faithfully: with
- * process-attach callbacks on by default, RDR2's Arxan thread callback left a worker spinning in Sleep(0) and the
- * game never presented a frame. */
+ * run their per-thread checks there, and RE9's protection initialises per-thread state its workers read. They were
+ * opt-in after RDR2's Arxan thread callback left a worker spinning in Sleep(0); at that time these callbacks ran
+ * with guest system calls passed straight to Linux (the syscall selector was not set for direct guest calls).
+ * On by default now; BEER_EXE_THREAD_TLS=0 turns them off. */
 static void exe_tls_notify_thread(u32 reason)
 {
-    if (!g_exe_tls_attached || !g_img || !getenv("BEER_EXE_THREAD_TLS")) return;
+    const char *enabled = getenv("BEER_EXE_THREAD_TLS");
+    if (!g_exe_tls_attached || !g_img || (enabled && !strcmp(enabled, "0"))) return;
     NtHdrs64 *nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
     DataDir *directory = &nt->opt.dirs[9];
     if (directory->size < sizeof(TLS_DIR64)) return;
@@ -25696,7 +26122,7 @@ static void exe_tls_notify_thread(u32 reason)
     typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
     TlsCallback *callbacks = (TlsCallback *)(uintptr_t)tls->AddrOfCallbacks;
     for (size_t n = 0; n < 64 && callbacks[n]; ++n)
-        callbacks[n](g_img, reason, NULL);
+        beer_call_init_routine((void *)callbacks[n], g_img, reason, (u64)(uintptr_t)&callbacks[n]);
 }
 
 static void guest_dll_notify_thread(u32 reason)
@@ -25707,14 +26133,14 @@ static void guest_dll_notify_thread(u32 reason)
         if (!dll->entry_called || !dll->image) continue;
         NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
         if (dll->tls_callbacks) {
-            typedef void __attribute__((ms_abi)) (*TlsCallback)(void *, u32, void *);
-            TlsCallback *callbacks = (TlsCallback *)dll->tls_callbacks;
+            u64 *callbacks = (u64 *)(uintptr_t)dll->tls_callbacks;
             for (size_t n = 0; n < 64 && callbacks[n]; ++n)
-                callbacks[n](dll->image, reason, NULL);
+                beer_call_init_routine((void *)(uintptr_t)callbacks[n], dll->image, reason,
+                                       (u64)(uintptr_t)&callbacks[n]);
         }
         if (nt->opt.entry_rva) {
-            typedef int __attribute__((ms_abi)) (*DllEntry)(void *, u32, void *);
-            ((DllEntry)(dll->image + nt->opt.entry_rva))(dll->image, reason, NULL);
+            void *entry = dll->image + nt->opt.entry_rva;
+            beer_call_init_routine(entry, dll->image, reason, (u64)(uintptr_t)entry);
         }
     }
     if (reason == 3) exe_tls_notify_thread(reason);
@@ -28262,11 +28688,38 @@ __asm__(
 );
 
 extern void __attribute__((ms_abi)) beer_restore_context_asm(void *context);
+
+/* RtlUnwind/longjmp resuming guest code directly, without returning through the dispatch trampoline (a handler
+ * Beer called from its fault-signal handler, on the host-call stack): do what the trampoline's return does. The TEB
+ * stack bounds go back to the guest's (left describing the host-call stack, guest stack probes misbehave),
+ * SavedGuestRsp is cleared, and guest system calls are blocked again. The fault signals are unblocked too: the
+ * handler never returns, so they would stay masked and the guest's next fault would kill the process. */
+static __thread u8 *t_seh_exception_ctx;
+static void beer_prepare_direct_guest_resume(u64 target_rsp)
+{
+    if (target_rsp >= g_host_call_stack_base && target_rsp < g_host_call_stack_top + 0x1000) return;
+    u64 limit = 0;
+    __asm__ volatile("mov %%gs:0x10, %0" : "=r"(limit));
+    if (limit == g_host_call_stack_base && g_teb_guest_stack_base) {
+        __asm__ volatile("mov %0, %%gs:0x10" :: "r"(g_teb_guest_stack_limit) : "memory");
+        __asm__ volatile("mov %0, %%gs:0x8" :: "r"(g_teb_guest_stack_base) : "memory");
+    }
+    g_saved_guest_rsp = 0;
+    /* The exception dispatch that called the handler never returns, so its in-progress state is cleared here;
+     * otherwise every later fault on this thread is refused dispatch. */
+    g_delivering_vectored_exception = 0;
+    t_seh_exception_ctx = NULL;
+    sigset_t faults;
+    sigemptyset(&faults);
+    sigaddset(&faults, SIGSEGV); sigaddset(&faults, SIGBUS); sigaddset(&faults, SIGILL);
+    sigaddset(&faults, SIGFPE); sigaddset(&faults, SIGTRAP);
+    pthread_sigmask(SIG_UNBLOCK, &faults, NULL);
+    beer_win32_syscall_selector = 1;      /* last: no host system call may follow */
+}
 /* CONTEXT of the exception currently being dispatched on this thread (first pass). A language handler that
  * calls RtlUnwindEx from the host-call stack (where Beer's dispatcher runs) would, on Windows, unwind through
  * the OS dispatcher's frames back to the faulting frame; Beer's dispatcher has no unwind data, so the second
  * pass starts from the original exception context instead. */
-static __thread u8 *t_seh_exception_ctx;
 static __thread int t_unwind_depth;
 
 /* Exception records handed to guest handlers must not live on the host-call stack: a C++ catch resumes the
@@ -28638,6 +29091,7 @@ beer_rtl_unwind_helper(u8 *ctx, u64 target_frame, u64 target_ip,
                         "(g_saved_guest_rsp=0x%lx)\n", *(u64 *)(current + 0xf8), *(u64 *)(current + 0x98),
                         *(u64 *)(current + 0x90), saved_guest_rsp);
             }
+            beer_prepare_direct_guest_resume(*(u64 *)(current + 0x98));
             beer_restore_context_asm(current);                    /* no return */
         }
         memcpy(current, next, sizeof(current));
@@ -28665,6 +29119,7 @@ beer_rtl_unwind_helper(u8 *ctx, u64 target_frame, u64 target_ip,
         for (int i = 0; i < 10; ++i) memcpy(restore + 0x200 + i * 16, jb + 0x60 + i * 16, 16);   /* Xmm6-15 */
         *(u64 *)(restore + 0x78) = return_value;  /* Rax */
         fprintf(stderr, "[UNWIND] longjmp across stacks: restoring jmp_buf %p directly (rip=0x%lx)\n", (const void *)jb, *(u64 *)(restore + 0xf8));
+        beer_prepare_direct_guest_resume(*(u64 *)(restore + 0x98));
         beer_restore_context_asm(restore);        /* no return */
     }
 }
@@ -28959,10 +29414,13 @@ static const BeerRuntimeFunction *beer_seh_lookup(u64 control_pc, u64 *image_bas
         impl_RtlLookupFunctionEntry(control_pc, image_base, NULL);
 }
 
+/* Language handlers may live in runtime-generated code that registered its own unwind data (RtlAddFunctionTable /
+ * RtlInstallFunctionTableCallback), as RE9's protection module does; Windows dispatches to them like any other.
+ * Refusing them left its deliberate faults unhandled. */
 static int beer_seh_executable(u64 address, void *opaque)
 {
     (void)opaque;
-    return is_valid_resume_target(address);
+    return is_valid_resume_target(address) || beer_dynamic_function_table_covers(address);
 }
 
 static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
@@ -32288,6 +32746,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "NVAPI logical GPU contract: %s\n", passed ? "PASS" : "FAIL");
         return passed ? 0 : 1;
     }
+    if (getenv("BEER_SELF_TEST_TIMER_RESOLUTION")) {
+        int passed = beer_timer_resolution_self_test();
+        fprintf(stderr, "NT timer-resolution contract: %s\n", passed ? "PASS" : "FAIL");
+        return passed ? 0 : 1;
+    }
     if (getenv("BEER_SELF_TEST_CRYPT_PROV_PARAM")) {
         u32 length = 0;
         u32 value = 0;
@@ -32585,15 +33048,32 @@ int main(int argc, char **argv)
      * by subsequent bottom-up VirtualAlloc calls.  Reserve it now, but keep
      * DllMain on Beer's guarded host-call stack; entry-frame setup and TEB stack
      * publication still happen immediately before the executable handoff. */
-    const size_t guest_stack_size = 16 * 1024 * 1024;
-    void *guest_stack = beer_vm_map_bottom_up(guest_stack_size + 0x1000, 65536,
-                                               PROT_READ | PROT_WRITE, 0);
+    /* Like Windows, the reservation is the executable's SizeOfStackReserve (64 KiB units), so the initial stack
+     * occupies the same low range: RE9's protection mixes stack addresses into its checks, and a fixed 16 MiB
+     * stack moved them (RE9 asks for 4 MiB). Beer runs some host code (BD12 COM methods) on the guest stack, so
+     * reservations below 1 MiB are raised to 1 MiB. BEER_GUEST_STACK_16M=1 restores the fixed 16 MiB stack. */
+    size_t guest_stack_size = 16 * 1024 * 1024;
+    if (!getenv("BEER_GUEST_STACK_16M")) {
+        const NtHdrs64 *stack_nt = (const NtHdrs64 *)(g_img + ((const DosHdr *)g_img)->lfanew);
+        const u64 reserve = stack_nt->opt.stack_reserve;
+        if (reserve && reserve <= (256ull << 20))
+            guest_stack_size = (size_t)((reserve + 0xffffu) & ~(u64)0xffffu);
+        if (guest_stack_size < (1u << 20)) guest_stack_size = 1u << 20;
+    }
+    /* Layout: the reservation (TEB StackLimit..StackBase, its first page the guard page, as on Windows), then one
+     * headroom page above StackBase for Beer's synthetic entry frame, so the guest's entry RSP can sit where Windows
+     * puts it (StackBase-0x88). Windows and Wine map system data (NLS tables) into the first 64 KiB granule before
+     * the initial stack, so the stack starts at 0x20000; Beer reserves that granule too. RE9's protection fails
+     * its TLS callback when the stack starts at 0x10000 instead. */
+    const int legacy_stack = getenv("BEER_GUEST_STACK_16M") != NULL;
+    if (!legacy_stack) (void)beer_vm_map_bottom_up(0x10000, 0x10000, PROT_NONE, MAP_NORESERVE);
+    void *guest_stack = beer_vm_map_bottom_up(guest_stack_size + 0x1000, 65536, PROT_READ | PROT_WRITE, 0);
     u64 guest_stack_low, guest_stack_high;
     if (guest_stack != MAP_FAILED) {
         guest_stack_low = (u64)guest_stack;
-        guest_stack_high = (u64)guest_stack + 0x1000 + guest_stack_size;
+        guest_stack_high = (u64)guest_stack + guest_stack_size + (legacy_stack ? 0x1000u : 0u);
     } else {
-        guest_stack = mmap(NULL, guest_stack_size, PROT_READ | PROT_WRITE,
+        guest_stack = mmap(NULL, guest_stack_size + 0x1000, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (guest_stack == MAP_FAILED)
             die("mmap(guest_stack): %s", strerror(errno));
@@ -32648,6 +33128,21 @@ int main(int argc, char **argv)
     g_dxgi_vtab[25] = (u64)dxgi_factory_zero;                    /* IDXGIFactory3::GetCreationFlags */
     g_dxgi_vtab[30] = (u64)dxgi_factory_register2;               /* IDXGIFactory7::RegisterAdaptersChangedEvent */
     g_dxgi_vtab[31] = (u64)dxgi_factory_unregister;
+    beer_guest_com_vtable(g_dxgi_vtab, DXGI_VTAB_SZ, "IDXGIFactory");
+    beer_guest_com_vtable(g_dxgi_vtab2, DXGI_VTAB2_SZ, "IDXGIAdapter");
+    beer_guest_com_vtable(g_dxgi_output_vtab, sizeof(g_dxgi_output_vtab) / sizeof(*g_dxgi_output_vtab), "IDXGIOutput");
+    /* DirectInput and DirectSound objects are guest-called COM objects implemented in this file, so they need the
+     * same routing. RE9's game loop keeps its QueryPerformanceFrequency in XMM6 across the frame;
+     * IDirectInputDevice8::GetDeviceState returned with XMM6 clobbered, the frame limiter divided by ~0, and the
+     * loop never ended after the third frame. */
+    beer_guest_com_vtable((u64 *)g_dinput_vtable, sizeof(g_dinput_vtable) / sizeof(*g_dinput_vtable), "IDirectInput8");
+    beer_guest_com_vtable((u64 *)g_dinput_device_vtable, sizeof(g_dinput_device_vtable) / sizeof(*g_dinput_device_vtable),
+                          "IDirectInputDevice8");
+    beer_guest_com_vtable((u64 *)g_direct_sound_vtable, sizeof(g_direct_sound_vtable) / sizeof(*g_direct_sound_vtable),
+                          "IDirectSound8");
+    beer_guest_com_vtable((u64 *)g_direct_sound_buffer_vtable,
+                          sizeof(g_direct_sound_buffer_vtable) / sizeof(*g_direct_sound_buffer_vtable),
+                          "IDirectSoundBuffer8");
     
     /* vtable[10] also acts as engine allocator – set after CreateSwapChain */
     /* For objects that are NOT a factory, vtable[10] returns a real allocation */
@@ -32678,8 +33173,12 @@ int main(int argc, char **argv)
     /* The initial stack reservation was made before dependency process attach,
      * as it is by the Windows loader. Build the executable's entry frame in that
      * reservation now. */
-    /* Reserve 2MB at top for guest runtime, allowing deep recursion */
-    u64 guest_rsp = (guest_stack_high - 0x200000) & ~0xF;
+    /* The entry RSP is StackBase-0x88, as on Windows, where only RtlUserThreadStart's and BaseThreadInitThunk's
+     * frames lie above it (Wine matches). RE9's protection derives values from stack depth, so the old placement
+     * 2 MiB below the top (from early bring-up) changed its result. seed_guest_entry_frame's 0x1000 bytes above
+     * the entry RSP extend into the headroom page above StackBase. BEER_GUEST_STACK_16M=1 restores the old layout. */
+    u64 guest_rsp = getenv("BEER_GUEST_STACK_16M") ? (guest_stack_high - 0x200000) & ~0xF
+                                                   : (guest_stack_high & ~0xFull) + 0x570;
     /* Entry RSP must be 8 mod 16, as after a real `call` on Windows x64. */
     u64 guest_frame_base = guest_rsp - 0x600;
     /* Entry RSP must be 8 mod 16 (as after a real `call`). BEER_ALIGN_OLD=1

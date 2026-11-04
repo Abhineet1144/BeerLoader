@@ -4,21 +4,15 @@
 
 int main(void)
 {
-    uint32_t slots[128] = {0};
-    /* Finish the deepest dependency first, then its parents, as recursive
-     * import loading does. Every module must retain a distinct slot. */
-    for (size_t count = 32; count; --count) {
-        uint32_t slot = beer_static_tls_slot(count - 1, 128);
-        assert(slot == count && !slots[slot]);
-        slots[slot] = 1;
-    }
-    assert(!slots[0]);
-    assert(beer_static_tls_slot(0, 128) == 1);
-    assert(beer_static_tls_slot(126, 128) == 127);
-    assert(beer_static_tls_slot(127, 128) == UINT32_MAX);
-    assert(beer_static_tls_slot(0, 0) == UINT32_MAX);
-    assert(beer_static_tls_slot(0, 1) == UINT32_MAX);
-    assert(beer_static_tls_slot(SIZE_MAX, 128) == UINT32_MAX);
+    /* Modules with TLS are numbered 1, 2, 3, ... in the order their TLS is set up; slot 0 is the executable's. */
+    uint32_t next = 0;
+    for (uint32_t expected = 1; expected < 128; ++expected)
+        assert(beer_static_tls_next_slot(&next, 128) == expected);
+    assert(beer_static_tls_next_slot(&next, 128) == UINT32_MAX);
+    next = 0;
+    assert(beer_static_tls_next_slot(&next, 1) == UINT32_MAX);
+    assert(beer_static_tls_next_slot(&next, 0) == UINT32_MAX);
+    assert(beer_static_tls_next_slot(NULL, 128) == UINT32_MAX);
     puts("static TLS slot contract: PASS");
     return 0;
 }

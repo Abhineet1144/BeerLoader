@@ -5,6 +5,7 @@
  * through the BD12 core. */
 
 #include "bd12_com.h"
+#include "../beer_fake_caps.h"
 #include "bd12_formats.h"
 
 #include <stdio.h>
@@ -24,6 +25,12 @@ static const uint8_t iid_list3[16] = { 0xa7, 0x83, 0xda, 0x6f, 0x4c, 0xb8, 0x38,
     0x4e, 0x9a, 0xc8, 0xc7, 0xbd, 0x22, 0x01, 0x6b, 0x3d };
 static const uint8_t iid_list4[16] = { 0x8e, 0x31, 0x54, 0x87, 0xa9, 0xd3, 0x41,
     0x45, 0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74 };
+/* ID3D12GraphicsCommandList5 (RSSetShadingRate[Image]) and 6 (DispatchMesh): exposed only with BEER_FAKE_CAPS,
+ * where those commands do nothing. */
+static const uint8_t iid_list5[16] = { 0x59, 0x08, 0x05, 0x55, 0x24, 0x40, 0x4c,
+    0x47, 0x87, 0xf5, 0x64, 0x72, 0xea, 0xee, 0x44, 0xea };
+static const uint8_t iid_list6[16] = { 0x90, 0x78, 0x82, 0xc3, 0x48, 0xe5, 0xfa,
+    0x4c, 0x96, 0xcf, 0x56, 0x89, 0xa9, 0x37, 0x0f, 0x80 };
 static const uint8_t iid_command_list[16] = { 0x1c, 0xd9, 0x16, 0x71, 0xe4,
     0xe7, 0xce, 0x47, 0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5 };
 static const uint8_t iid_pso[16] = { 0xf3, 0x30, 0x5a, 0x76, 0x24, 0xf6, 0x6f,
@@ -235,8 +242,18 @@ HR com_create_pso(ComDevice *dev, const void *desc, int kind,
     if (!p) return HR_E_OUTOFMEMORY;
     p->compute = tmp.cs_size != 0;
     if (!p->compute && (!tmp.vs_size)) {
-        free(p);
-        return HR_E_INVALIDARG;
+        if (!beer_fake_caps()) {
+            free(p);
+            return HR_E_INVALIDARG;
+        }
+        /* BEER_FAKE_CAPS: a mesh/amplification pipeline (no VS or CS) becomes an inert pipeline: it binds as no
+         * pipeline and its draws are dropped. */
+        p->state = 3;
+        pthread_mutex_init(&p->lock, NULL);
+        pthread_cond_init(&p->cond, NULL);
+        com_obj_init(&p->obj, COM_PSO, pso_vtable, dev, pso_destroy);
+        *out = p;
+        return HR_OK;
     }
     if (!bd12_pso_clone(&tmp, &p->desc)) {
         free(p);
@@ -372,9 +389,11 @@ static HR MS list_query(ComObj *s, const uint8_t *r, void **o)
 {
     if (r && com_iid_equal(r, iid_command_list))
         return com_obj_query(s, r, o, iid_command_list, NULL);
-    if (r && s->dev->bd->rt_enabled &&
+    if (r && (s->dev->bd->rt_enabled || beer_fake_caps()) &&
         (com_iid_equal(r, iid_list1) || com_iid_equal(r, iid_list2) ||
          com_iid_equal(r, iid_list3) || com_iid_equal(r, iid_list4)))
+        return com_obj_query(s, r, o, r, NULL);
+    if (r && beer_fake_caps() && (com_iid_equal(r, iid_list5) || com_iid_equal(r, iid_list6)))
         return com_obj_query(s, r, o, r, NULL);
     return com_obj_query(s, r, o, iid_list, NULL);
 }
@@ -479,7 +498,7 @@ HR com_create_list(ComDevice *dev, uint32_t type, ComObj *allocator,
     if (!l) return HR_E_OUTOFMEMORY;
     l->type = type;
     com_obj_init(&l->obj, COM_LIST, NULL, dev, list_destroy);
-    extern void *com_list_vtable_[77];
+    extern void *com_list_vtable_[80];
     l->obj.vtable = com_list_vtable_;
     if (!list_start(l, (ComAllocator *)allocator, (ComPso *)pso)) {
         com_release(&l->obj);
@@ -1212,7 +1231,7 @@ static void MS cl_rt_copy(ComList *l, uint64_t dst, uint64_t src, uint32_t mode)
     bd12_cmd_copy_as(c, dst, src, mode);
 }
 
-void *com_list_vtable_[77] = {
+void *com_list_vtable_[80] = {
     [0] = list_query, [1] = com_add_ref, [2] = com_release,
     [3] = com_obj_get_private, [4] = com_obj_set_private,
     [5] = com_obj_set_private_iface, [6] = com_obj_set_name,
@@ -1243,4 +1262,6 @@ void *com_list_vtable_[77] = {
     /* List4 */ [68] = cl_noop, [69] = cl_noop, [70] = cl_noop, [71] = cl_noop,
     [72] = cl_rt_build, [73] = cl_rt_emit, [74] = cl_rt_copy,
     [75] = cl_rt_set_pso1, [76] = cl_rt_dispatch_rays,
+    /* List5: RSSetShadingRate, RSSetShadingRateImage; List6: DispatchMesh (BEER_FAKE_CAPS only: no-ops) */
+    [77] = cl_noop, [78] = cl_noop, [79] = cl_noop,
 };

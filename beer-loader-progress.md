@@ -3224,3 +3224,367 @@ Validation on the exact final binary:
 - RE8 passed its mandatory 75-second regression gate on this exact build: BD12 and BD11 became ready, repeated Vulkan swapchains were created/presented, no fatal/device-loss line appeared, and termination was only by the external timeout.
 
 Do not broaden WLDAP preemptively. Add another documented contract only if a fresh trace proves it is required. Logs: `/tmp/beer-ct-wldap211.log`, `/tmp/beer-re8-after-ct-wldap.log`, `/tmp/beer-ct-wldap60-tests.log`.
+
+### BEER_FAKE_CAPS testing switch (2026-11-02)
+
+- `BEER_FAKE_CAPS=1` makes D3D12, D3D11 and DXGI capability queries report supported. Using a feature Beer does not
+  back then does nothing. This is for finding which capability check stops a title, never for normal play. The switch
+  lives in `graphics/beer_fake_caps.h`, uses one process-wide state, and prints a single `[CAPS]` notice.
+- **D3D12 (`bd12_com.c` `fake_feature`).**
+  - OPTIONS through OPTIONS16 report their top tiers.
+  - Feature level is up to 12_2, root signature up to 1.2, and the requested shader model is kept.
+  - Format support is all bits; MSAA quality is 1.
+  - Raytracing state objects are inert when raytracing is not backed; acceleration-structure prebuild sizes are
+    64 KiB.
+  - ID3D12GraphicsCommandList5/6 are exposed. Their VRS and DispatchMesh methods are no-ops, and mesh pipelines are
+    inert.
+- **D3D11 (`bd11_obj.c`, `loader.c`).**
+  - CheckFeatureSupport, format support and MSAA quality report supported.
+  - D3D11CreateDevice grants the highest requested level up to 12_1. ID3D11Device::GetFeatureLevel returns that same
+    level.
+- **DXGI (`loader.c`, `bd12_com.c`).**
+  - Tearing support reports TRUE; swap chains already ignore the tearing flags.
+  - Overlays, overlay and color-space support, and hardware composition report supported.
+  - IDXGIOutput6::GetDesc1 describes an HDR10 display: 10 bpc, ST.2084/BT.2020, 1000 nits.
+  - Swap chains accept every color space; presentation stays SDR.
+- **Stays false on purpose.** These features have no entry point in Beer, so a "supported" answer would send the title
+  to a missing method instead of a no-op:
+  - ID3D12Device10+ / List7+: enhanced barriers, relaxed casting, GPU upload heaps, work graphs.
+  - The D3D11 features that need Context1/2: ClearView, Discard, constant-buffer offsets, tiled resources.
+- **Checks.** Sekiro (D3D11) and RE8 (D3D12) start and present identically with the switch off and on, with no crash.
+  - With it off, no notice is printed and every answer is unchanged.
+  - Logs: `/tmp/beer-caps-sekiro-{0,1}.log`, `/tmp/beer-caps-re8-{0,1}.log`.
+  - `make test-input`, `test-steam` and `test-ki-dispatcher` pass (after the merge of main into RE9Compat).
+
+### Shader model 6.6 cost, bindless mirror replay, RE8 display modes (2026-11-02)
+
+- **SM 6.6 is costly in RE8.**
+  - When BD12 reports SM 6.6, RE8 switches to its DXIL shader set. Those shaders are bindless, so the 1,000,000-slot
+    heap mirror is needed.
+  - Measured over the first 75 s: 2.57 GiB anon+swap at SM 6.6, versus 1.65 GiB with
+    `BEER_D3D12_SHADER_MODEL=5.1` (the same as main).
+  - The new manager switch "Limit D3D12 to shader model 5.1" sets that variable. The default stays the highest
+    supported model, so titles that need SM 6 still start.
+- **Bindless mirror: descriptors written earlier are now replayed.**
+  - The first bindless draw creates the mirror (`bd12_mirror_prepare`), and descriptors written before that were
+    lost, so shaders read empty slots.
+  - The mirror now copies the whole heap in once when it is created. `write_range` skips every slot whose image or
+    buffer is gone (live set + serial), which was the reason replay had been avoided.
+  - Creating the mirror together with the heap instead made RE8's loading far slower: 1 DXIL shader translated in
+    75 s, against 173 with lazy creation plus replay.
+- **XMM6-XMM15 clobbered by loader.c COM methods.**
+  - loader.c is built with `-mno-sse`, so its ms_abi methods cannot preserve the Windows nonvolatile XMM registers.
+    The libc and X11 calls inside them overwrite those registers.
+  - RE8 kept its display-mode filter bounds in XMM6/7 across `IDXGIOutput::GetDisplayModeList`. It got zero back,
+    filtered out every mode, and crashed indexing the empty list.
+  - The DXGI factory, adapter and output vtables now go through the dispatch trampoline (`beer_guest_com_vtable`),
+    which saves XMM6-XMM15 the way an import call does. AddRef/Release stay direct.
+  - Other loader-side COM objects (DirectInput, audio, MF) likely need the same treatment; not done yet.
+- **Swap-chain output and monitor handle.**
+  - `IDXGISwapChain::GetContainingOutput` (BD12 and BD11) returned `DXGI_ERROR_NOT_FOUND`. RE8's Borderless and
+    FullScreen modes then fell back to a captioned window. It now returns the loader's DXGI output, and so does
+    `GetFullscreenState`'s target when the swap chain is fullscreen.
+  - `DXGI_OUTPUT_DESC.Monitor` now reports the same HMONITOR as MonitorFromWindow and EnumDisplayMonitors
+    (0xD0000002 instead of 0x10001).
+- **Still open: RE8 Borderless and FullScreen revert to `WindowMode=Normal`.**
+  - The game's display-state function (`0x144bc6560`) merges its initial dirty flags (3) on the first check after
+    the window mode is applied. Its caller (`0x1449e85d5`) then calls `SetWindowMode(0)`.
+  - Next step: find what Windows does differently at that first check. The order of window-mode application and the
+    first display check is the suspect.
+  - RE8's `config.ini` was restored after every test (backup: scratchpad `re8-config.ini.orig`).
+- Diagnostics: `BEER_WINDOW_DIAGNOSTICS` now logs GWL_STYLE changes with the guest caller.
+
+### RE9 NVAPI committed-resource bridge (2026-11-03)
+
+- Identified public NVAPI query ID `0x027E98AE` from NVIDIA's published `nvapi.h` as
+  `NvAPI_D3D12_CreateCommittedResource`. Beer now exposes a strict adapter over the existing
+  `ID3D12Device::CreateCommittedResource` vtable slot rather than copying a foreign NVAPI implementation.
+- Ordinary resources are delegated to BD12. NVIDIA-specific HTEX / CPU-visible-video-memory flags return
+  `NVAPI_NOT_SUPPORTED`; malformed params return the documented argument/version failures. The capability-query
+  form (`ppvResource == NULL`) initializes `pSupported` without creating/leaking a resource.
+- The existing NVAPI self-test now covers unsupported flags, capability probing, and real forwarding through a
+  fake D3D12 device vtable. Serial build, NVAPI self-test, CLI smoke tests, diagnostics, and `git diff --check` pass.
+- Only the rebuilt `loader` was uploaded to the remote host (SHA-256
+  `4325dd10a69cc8346d8cfec69aa6e9b8ce81d28199f8acaeee93b594644c5006`); the previous remote binary was backed up.
+- Runtime A/B remains pending: the remote desktop currently has no active user Xwayland/Wayland compositor
+  (`/tmp/.X11-unix` contains only GDM sockets owned by `gdm-greeter`), so an RE9 launch would block before graphics
+  and would not evaluate this NVAPI contract. VRAM is otherwise free (~7.5 GiB). Do not infer runtime progress until
+  the graphical session is restored.
+
+### RE9 NVAPI committed-resource/display A/B (2026-11-03)
+
+- Restored graphical-session testing on the remote RTX 2070 SUPER (`DISPLAY=:0`, current Mutter Xauthority); VRAM was
+  free and no stale RE9 process was active.
+- `NvAPI_D3D12_CreateCommittedResource` (`0x027E98AE`) is now proven to be called three times. Runtime arguments use
+  `NV_RESOURCE_PARAMS_V1::NVResourceFlags = CPUVISIBLE_VIDMEM (2)`. Beer now treats that documented bit as an
+  allocation-placement hint and delegates to ordinary BD12 committed-resource creation; HTEX and unknown flag bits
+  remain unsupported. Focused self-tests cover unsupported HTEX, capability probing and delegated creation.
+- Identified `0xAE457190` from NVIDIA's public `nvapi.h` as `NvAPI_DISP_GetDisplayIdByDisplayName`, not a guessed
+  interface. Beer now maps its single active Windows display (`\\.\DISPLAY1`) to opaque display id 1 and rejects
+  unknown display names. The NVAPI self-test covers both outcomes.
+- Both interfaces are now served in the remote binary (SHA-256
+  `9a7fc1e4f0d0b111c84ed6b46f1594d8f6463c9fe16ef3ffe4e7efc82e3c37b1`). The prior remote binary was backed up.
+- Result: RE9 still reaches the same package-generated/manual-mapped crash dialog after MF startup. The run exits
+  normally through its crash reporter (`RC=0`); no NVAPI interface-0xAE457190 failure remains. These are valid generic
+  NVAPI corrections but are not the root cause of the generated-region fault.
+- Remote log: `/tmp/beer-re9-nvapi-display.log`.
+
+### RE9 on the local Intel UHD 770 (2026-11-04)
+
+- Install: `/mnt/FE5007855007443D/Games/Resident Evil Requiem` (the `re9` folder next to it holds only the installer).
+- RE9 runs through the TLS callbacks, Streamline, BD12, DXGI, DirectInput, WMI, TSF and `MFStartup`.
+- **Failure.** RE9 then shows its own "An unhandled exception occurred" dialog. The SIGSEGV at `0x2362x264` (FA 0x100)
+  that the earlier notes describe happens after that dialog, in the crash-report path.
+- **The first fault** (`BEER_EXCEPTION_DIAGNOSTICS=1`):
+  - A write to 0x100 inside a runtime-generated module (base about 0x23615000).
+  - The module registered its own unwind handler; the handler declines the exception.
+  - The faulting routine is a square-and-multiply modular exponentiation. It stores its result through `[r12+8]`.
+  - Its caller (generated `+0x17d926`) runs one protected computation. Depending on the result (a compare against a
+    function address in the module), it passes a struct whose field +8 is the constant 0x100.
+  - That looks like a deliberate crash after a failed integrity check.
+  - Inputs and register values are identical in every run, so a constant answer differs from Windows.
+- **Ruled out:**
+  - `BEER_SHORT_NT_STUBS=1`, `BEER_ASLR=1`, `BEER_STEAM_API_MODE=guest`: same fault, same registers.
+  - `BEER_TOPDOWN_VM=1`: fails earlier, in TLS callback[2], so bottom-up placement is required.
+  - The stubs fixed below.
+  - Wine 10 on this machine is no help as a reference: it stops at Streamline about 25 s in.
+- **Fixed generic gaps** (the calls used to "succeed" without writing their outputs):
+  - `StringFromGUID2`.
+  - `CM_Get_Device_ID_List_Size{W,A}` / `CM_Get_Device_ID_List{W,A}`: an empty, properly terminated list, consistent
+    with Beer's root-only device tree. Intel XeSS enumerates the display class with them.
+- `BEER_API_TRACE` breaks C++ exception unwinding in RE9 (an XeSS C++ throw then goes unhandled), as it did in
+  Chained Together. Don't use it for RE9 runs.
+
+### RE9 against plain Wine (2026-11-04, later)
+
+- **Wine is a working reference.** Plain `wine ./re9.exe` (default `~/.wine`, which has vkd3d-proton) passes
+  Beer's failure point and renders. Under the 6 GiB cap it is OOM-killed after about 2 minutes. A fresh prefix
+  without vkd3d-proton stalls at Streamline.
+- **Debugging Wine.** `ptrace_scope=1` blocks attaching. Run gdb as the parent of
+  `/usr/lib/x86_64-linux-gnu/wine/wine ./re9.exe` in all-stop mode with a pending `break vkCreateDevice`. Then
+  search memory for the compare bytes `488d05379ae8fff548f7c6910435f149390424`: the module layout is identical,
+  with the compare at base+0x17c899.
+- **Fixed, generic: the initial thread's registers.** `beer_guest_enter` now enters the exe as Windows does:
+  RCX = PEB, and RBX/RBP/RSI/RDI/R12-R15 zeroed. RBP used to carry Beer's host `main()` frame (0x7fffffffe3a0) into
+  the guest. The entry ABI test covers it.
+- **The difference that remains.**
+  - At the compare, `r15` is 0x5acbfd under Wine and 0xf9f54d / 0xfbf54d under Beer. The value moves with the
+    module base, so it is computed, probably from addresses.
+  - It is XOR-encoded into the second protected call's struct. That call then reaches the modular-exponentiation
+    routine that stores through 0x100; under Wine it never does.
+  - Stack layout also differs: Wine's main stack top is about 0x420000, because RE9's `SizeOfStackReserve` is
+    4 MiB. Beer always reserves 16 MiB (0x10000-0x1011000) and places the entry RSP 2 MiB below the top.
+- **Tried and reverted:** sizing the main stack from `SizeOfStackReserve`. With the entry frame still 2 MiB below
+  the top, RE9 failed earlier, in its startup code.
+- **Next step:** size the stack from the exe and put the entry RSP just below the top, as on Windows (Wine's is
+  about top-0x60). Then rerun the `r15` comparison.
+
+### Windows-shaped initial stack, display device list (2026-11-04, evening)
+
+- **Initial thread stack (generic).**
+  - The reservation is now the exe's `SizeOfStackReserve`, rounded to 64 KiB with a 1 MiB floor. It used to be a
+    fixed 16 MiB.
+  - The guard page lies inside the reservation, so TEB `StackBase` = base + reservation.
+  - Beer first reserves the lowest 64 KiB granule, where Windows and Wine map NLS data, so the stack starts at
+    0x20000.
+  - The entry RSP is `StackBase`-0x88, as on Windows. It used to be 2 MiB below the top. One headroom page above
+    `StackBase` holds Beer's synthetic entry frame.
+  - RE9 now has exactly Wine's layout: 0x20000-0x420000, entry RSP 0x41ff78. At the protection compare, rbp, rsp,
+    r12, r14 and r15 (0x5acbfd) all match Wine.
+  - With the stack at 0x10000, TLS callback[2] fails. `BEER_GUEST_STACK_16M=1` restores the old layout.
+  - Checked: Sekiro (1 MiB reserve), RE8 and Chained Together run and render.
+- **Display-class device list.**
+  - `CM_Get_Device_ID_List{,_Size}{W,A}` now list the rendering GPU (`PCI\VEN_..&DEV_..&SUBSYS_00000000&REV_..\3&BEER&0&10`)
+    for the display class filter and for unfiltered requests; other filters get an empty list.
+  - The empty list from this morning crashed Chained Together: it dereferences the first display-class entry
+    unchecked. `CM_Locate_DevNodeW` still answers `CR_NO_SUCH_DEVNODE` for that ID, and the game handles it.
+  - Also implemented `CM_MapCrToWin32Err` (documented mappings, otherwise the caller's default) and
+    `CM_Get_DevNode_PropertyW` (root has no properties; other devnodes are invalid). Both were success-returning
+    stubs.
+  - `BEER_CFGMGR_DIAGNOSTICS` now logs the W calls with their guest caller.
+- **RE9 still open.**
+  - Even with the identical stack state and an identical struct passed to the second protected call (module
+    base+0xfdcc), Beer reaches the store through 0x100 and Wine doesn't. That call's path therefore depends on other
+    state.
+  - Single-stepping showed the path calls `GetLastError` (kernelbase) within 86 instructions.
+  - Next: a reliable step-and-skip-calls tracer, run in both Beer and Wine, to find the first diverging instruction
+    or API result. In gdb Python commands, `continue`/`advance` didn't resume reliably; consider a gdb `Breakpoint`
+    subclass with `stop()` returning False plus recorded events.
+
+### RE9 protection: SetLastError RAX, SEH in registered dynamic code, direct guest resume, thread stacks, TLS indexes (2026-11-04, night)
+
+Method: hardware-breakpoint fingerprints (`GetLastError` hits with RCX and return address) and single-step traces
+(module- or exe-relative offsets plus registers), run in Beer and in plain Wine (`~/.wine`, gdb as the parent of
+`/usr/lib/x86_64-linux-gnu/wine/wine`), then diffed. The scripts were in the scratchpad (`tools/trace2.py`).
+
+All fixes below are generic Windows behaviour.
+
+- **`SetLastError` returns the TEB in RAX.** Windows' implementation loads `gs:[0x30]` and stores to TEB+0x68, and
+  Wine matches. RE9's protection consumes that RAX. Beer also mirrors the value into TEB+0x68 now.
+- **Language handlers in registered dynamic code.**
+  - `beer_seh_executable` accepted only image, guest-DLL and trampoline addresses, so the dispatcher computed the
+    handler of RE9's runtime-generated module and then refused to call it.
+  - It now also accepts ranges registered with `RtlAddFunctionTable` / `RtlInstallFunctionTableCallback`
+    (`beer_dynamic_function_table_covers`).
+  - The protection's deliberate write to 0x100 is now caught by its own handler, as under Wine.
+- **Direct guest resume from `RtlUnwind` (and longjmp across stacks).** The handler calls `RtlUnwindEx` from Beer's
+  fault-signal handler. `beer_prepare_direct_guest_resume` now does what the trampoline's return does:
+  - restore the guest TEB stack bounds;
+  - clear SavedGuestRsp, `g_delivering_vectored_exception` and the dispatch context;
+  - unblock SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGTRAP;
+  - set the syscall selector back to guest.
+
+  Before, the next deliberate fault killed the process (SIGSEGV still blocked) or was refused dispatch. Six of
+  RE9's deliberate faults are now handled.
+- **Guest threads have Windows-shaped stacks.**
+  - The bottom-up reservation is the guest stack only. The pthread runs on its own glibc stack, so glibc's thread
+    descriptor and TLS are no longer at the top of guest memory.
+  - `beer_call_thread_entry` switches to the guest stack and enters with RSP = StackBase-0x88, RCX = argument and the
+    nonvolatile registers zeroed.
+  - The thread-attach notifications (DllMain, TLS callbacks) run on the guest stack at StackBase-0x800
+    (`beer_call_on_guest_stack`).
+  - `BEER_THREAD_STACK_LEGACY=1` restores the old layout.
+- **Static TLS indexes are numbered like Windows.** The exe is 0, and modules with a TLS directory take 1, 2, 3, ...
+  in setup order (`beer_static_tls_next_slot`). Before, the index was the DLL's ordinal among all guest DLLs (RE9:
+  10, 11, 12, 14).
+- **Executable thread-attach TLS callbacks** (still opt-in, `BEER_EXE_THREAD_TLS=1`) are called through
+  `beer_call_init_routine`, with Wine's entry state: RAX = address of the callback's AddressOfCallBacks slot,
+  R10 = the callback, nonvolatile registers zeroed.
+- **Checked:** Sekiro, RE8 and Chained Together render with no fatals. `test-input`, `test-steam` and
+  `test-ki-dispatcher` pass. aarch64 loader.c errors are unchanged (25 = committed).
+- **RE9, current boundary.**
+  - Default (exe thread TLS callbacks off): a worker thread's protected routine
+    (call 0x15a4d69b3 -> ... -> 0x15e3487c6) reads a thread-local variable from the exe's TLS block. It is set under
+    Wine but zero under Beer, so the routine dereferences NULL.
+  - Under Wine the exe's thread-attach TLS callbacks run for every thread and presumably set it.
+  - With `BEER_EXE_THREAD_TLS=1`, the first thread-attach callback (0x156f21780, edx=2) faults at 0x15d00fc51.
+    Diff vs Wine: the path splits at 0x156f22e2c, a `cmove` fed by an index computed from the thread's StackBase
+    (Beer 0x22670000 gives 8, Wine 0x23350000 gives 1) and a value read through ThreadLocalStoragePointer.
+  - Windows randomizes stacks, so the index is not the bug; what it selects (TLS array contents and their heap
+    placement) is the next thing to compare. Beer's TEB and TLS arrays are host mmaps (0x7ffff...); Wine's TLS
+    array is in the process heap (0x26c33fb0).
+
+### RE9: guest system calls during direct guest calls; exe thread-attach TLS on by default (2026-11-04, late night)
+
+- **Root cause of the thread-attach failures.** Beer's Syscall User Dispatch selector is set to "block" only by the
+  dispatch trampoline's return to the guest.
+  - Guest code that Beer calls directly (TLS callbacks, DllMain, thread entries) ran with guest SYSCALL
+    instructions going straight to Linux until its first import call returned.
+  - RE9's thread-attach callback starts with `ZwAllocateVirtualMemory` through the full Windows stub. Linux ran
+    syscall 0x18 (`sched_yield`), which returned 0 and wrote nothing, and the protection then used the unset base.
+  - `beer_call_init_routine` and `beer_call_thread_entry` now set the selector to block around the guest call.
+    A host system call made while blocked is trapped and re-executed, so this is safe.
+  - DllMain and DLL TLS callbacks on thread attach/detach also go through `beer_call_init_routine`.
+- **The `StackBase mod 9 == 1` check** inside that callback is an opaque predicate. Both branches work once the
+  system calls are served (tested with a temporary experiment, since removed).
+- **Executable thread-attach TLS callbacks are on by default** (`BEER_EXE_THREAD_TLS=0` turns them off). They were
+  opt-in because RDR2's Arxan thread callback hung, most likely because of the same system-call bug. RDR2 is not
+  installed here, so that is untested.
+  - Sekiro, RE8 and Chained Together render, and the unit tests pass.
+- **RE9 now** gets past the protection's thread checks, through DirectInput device creation. It then crashes in the
+  engine (`0x156792b02`, read of 0x8): a job thread looks a key up in a hash map whose bucket array was never
+  allocated.
+  - The map is filled by F2 (`0x1453c9b10`), which F1 (`0x1453c6530`) calls with a count read from a message
+    object (`[r12+0x34]`).
+  - Under Wine the count is 10 (later 8): a list of engine objects (vtable `0x14af61c30`, no RTTI). Under Beer it
+    is 0.
+  - The cause was BD12's `D3D12_OPTIONS.TiledResourcesTier = 0` (see the next entry), not device enumeration.
+
+### RE9: TiledResourcesTier 2 and GetResourceTiling (2026-11-05)
+
+- **Cause of the empty map.**
+  - F1 (`0x1453c6530`) passes F2 a list of five CPU-visible GPU buffers: four with vtable `0x14af61c30` (heap types
+    3 and 2, readback and upload) and one with `0x14af61e40`.
+  - Under Wine the message lists 10 entries. Under Beer it has count 0 and a null array.
+  - Bisecting the BEER_FAKE_CAPS answers found the deciding field: `TiledResourcesTier`. At tier 0 or 1, RE9
+    crashes. At tier 2 or higher, it creates about 11 small reserved buffers (4 B to 2 MiB, UAV) and continues.
+  - The tier-0 path is effectively untested on Windows, because D3D12 hardware generally reports tier 2 or higher.
+- **Fix** (`graphics/d3d12v/bd12_com.c`):
+  - OPTIONS reports `TiledResourcesTier 2`.
+  - Reserved resources stay fully resident.
+  - `GetResourceTiling` now fills its outputs with the D3D12 standard 64 KiB tile shapes, packed mip tails per
+    slice, and subresource tilings. It was an empty stub that left them uninitialized.
+  - `UpdateTileMappings` and `CopyTileMappings` stay no-ops. They log once, because heap-tile aliasing and
+    zero-reading NULL tiles are not reproduced.
+  - RE9 does not call them during startup. A title that relies on mappings needs real Vulkan sparse binding
+    (this Intel UHD 770 driver supports sparse buffers and 2D images).
+- **Tests.** `bd12_com_test` covers the tier, a one-tile buffer, and a 2D array with a packed tail.
+  - `make test-d3d12v` does not link: its source lists predate bd12_live, cbtweak and formats. The COM test was
+    run by linking it with all BD12 sources and stubs for the DXIL translator and JSON helpers.
+- **Checks.**
+  - Sekiro (title screen, 57 fps), Chained Together (menu) and RE8 (loading) render.
+  - test-input, test-steam and test-ki-dispatcher pass.
+  - bd12_com.c compiles for ARM64.
+- **Debugging note.** gdb hardware breakpoints do not fire on Beer's main guest thread. Use software breakpoints
+  there, set after `beer_guest_enter`. BEER_HWBP needs perf_event_open, which is denied on this PC.
+- **RE9 now.** No crash, about 1.7 GiB peak. It creates the swap chain and presenter but presents nothing.
+  - The init job thread waits forever in `WaitForSingleObject([obj+0x3a90])`, called from `0x145555ebf`.
+  - The main thread idles in GetMessageW. This is the next boundary.
+  - `BEER_API_TRACE` still breaks C++ exception unwinding in RE9 (an XeSS throw goes unhandled).
+
+### RE9: residency fence, XMM6 in DirectInput, audio formats, IoRing caps (2026-11-05)
+
+RE9 now presents about 140 frames (black screen), then stops. Each fix below moved the stop point later.
+
+- **`ID3D12Device3::EnqueueMakeResident` never signalled its fence** (`graphics/d3d12v/bd12_com.c`, slot 50).
+  - It was `obj_ok`. RE9's F1 queues a GPU `Wait` on that fence (renderer `+0xf33248`, value `+0xf33250`).
+  - All D3D12 queues share one Vulkan queue, and every submission waits on the previous one. So the unsignalled
+    wait stalled all GPU work, and the presenter's `vkDeviceWaitIdle` (in `destroy_swapchain`) hung while
+    holding `g_x11.lock`. The main thread then blocked in `GetMessageW`.
+  - BD12 never evicts, so `EnqueueMakeResident` now signals the fence immediately. `bd12_com_test` covers it.
+  - The structural risk stays: a D3D12 queue wait on a fence that a later submission from another queue signals
+    would still deadlock the single serial Vulkan timeline.
+- **DirectInput and DirectSound COM methods clobbered XMM6–15** (`loader.c`).
+  - `loader.c` is built with `-mno-sse`, so its ms_abi methods cannot preserve the nonvolatile XMM registers
+    across libc calls. RE9's game loop keeps `QueryPerformanceFrequency` in XMM6; after
+    `IDirectInputDevice8::GetDeviceState` it held a host pointer.
+  - The frame limiter (`0x140093310`) then divided by ~0, its accumulator became 0x8000000000000000, and the loop
+    never ended after the third frame.
+  - The `IDirectInput8`, `IDirectInputDevice8`, `IDirectSound8` and `IDirectSoundBuffer8` vtables now go through
+    `beer_guest_com_vtable`, like DXGI. AddRef and Release stay direct.
+  - The other `loader.c` vtables have the same exposure and are not routed yet: Steam (not COM; slots 1 and 2
+    are not AddRef/Release), FMOD, D3D blob and D3D11.
+- **The endpoint `IPropertyStore` answered every key with the device name** (`audio/wasapi_compat.c`).
+  - RE9's audio (Wwise) read `PKEY_AudioEngine_DeviceFormat` as a blob and crashed reading `nChannels` at
+    address 0x2.
+  - Keys now return their Windows types:
+    - names (`PKEY_Device_*`, `PKEY_DeviceInterface_FriendlyName`): VT_LPWSTR;
+    - device and OEM format: a VT_BLOB holding a 48 kHz stereo float32 WAVEFORMATEXTENSIBLE;
+    - FormFactor and PhysicalSpeakers: VT_UI4;
+    - anything else: VT_EMPTY.
+  - `PropVariantClear` now frees VT_BLOB data (`platform/win32_native_info.inc`).
+- **`GetMixFormat` returned 16-bit PCM.** On Windows the shared-mode mix format is always float32 extensible.
+  - Wwise copies the base fields and marks the format float. That produced 16-bit/align-4 "float", which
+    `Initialize` rejected (AUDCLNT_E_UNSUPPORTED_FORMAT), and RE9 retried about 1300 times.
+  - It now returns 48 kHz stereo float32 extensible; float clients are converted to PCM16 as before.
+  - `Initialize` logs its result, and the bytes of a rejected format (first 4 only).
+  - `test-audio` passes.
+  - This changes what every WASAPI game sees, so regression-check the FMOD and WASAPI titles.
+- **`QueryIoRingCapabilities`** resolved to the generic zero stub, which means S_OK with the capabilities left
+  unwritten. It now reports `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)` with cleared capabilities.
+  - DirectStorage looks it up, but no call was seen before the stall. This is a correctness fix, not RE9's
+    current blocker.
+- **Current boundary: a per-frame job never completes.**
+  - Every frame the game loop dispatcher (`0x14561b5c0`) sets the job manager `*0x14e815d98`:
+    `+0x1b8` = 0 (done) and `+0x1bc` = 2 (expected), at `0x14561b72f`/`0x14561b739`.
+  - It pushes tasks to the scheduler `*0x14e83a698`, a lock-free tagged queue at `+8..+0x20`, waking workers with
+    SetEvent. It then spins in `0x1455e5000` (predicate `0x1456d8870`: done == expected and every item's
+    `+0xdb8 == -1`).
+  - At the stall: done=1, expected=2, all queues empty, all 11 workers waiting on their events
+    (`0x60000280..28a`), and all 12 manager items idle. The game-loop thread completed its own terminal job
+    (`0x14531d874` inside `0x14531d740`). The second terminal job is never finished.
+  - Next step: log every write to `+0x1b8`/`+0x1bc` over many frames (watchpoints work on worker threads). Then
+    compare which thread normally finishes the second terminal job with what happens in the last frame, and
+    check DirectStorage. Its worker polls an SRW lock in a loop, and another thread sits in
+    `WaitForMultipleObjectsEx(3, alertable, INFINITE)` (Wwise or DirectStorage).
+- **Measurement notes.**
+  - The `[FENCE] Present #` log prints only the first 5 presents and then every 300th, so "5" means "under 300".
+    Count with a gdb breakpoint on `sc_present`.
+  - The overlay's FPS freezes at its last value when presents stop.
+  - 0x406d1388 (thread naming) exceptions are normal. The one C++ exception before the stall is handled.
+- **Regression status for this batch: not verified.**
+  - Sekiro, RE8 and Chained Together still rendered after the DirectInput/DirectSound routing, before the audio
+    format change.
+  - Chained Together's overlay read 7.2 fps against 15.2 earlier, and Sekiro ran gameplay at 7.6 fps. A
+    possible slowdown from routing DirectInput through the trampoline was not A/B tested.
+  - These checks are deferred until RE9 works, by the user's choice (separate branch).

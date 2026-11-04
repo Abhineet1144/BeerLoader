@@ -31,6 +31,9 @@ int beer_install_function_table_callback(uint64_t table_identifier,
 const BeerRuntimeFunction *beer_lookup_dynamic_function_entry(uint64_t control_pc,
                                                                uint64_t *image_base);
 void beer_reset_dynamic_function_tables(void);
+/* True when address lies in a range registered with RtlAddFunctionTable (base to the furthest entry end) or
+ * RtlInstallFunctionTableCallback (base, length): code the process generated and described for unwinding. */
+int beer_dynamic_function_table_covers(uint64_t address);
 
 /* Applies one AMD64 UNWIND_INFO record to a Windows CONTEXT. Returns the
  * language-specific exception handler, or zero when none is present. Invalid

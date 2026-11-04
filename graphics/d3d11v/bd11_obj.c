@@ -3,6 +3,7 @@
  * creation methods. The immediate/deferred context lives in bd11_ctx.c. */
 
 #include "bd11.h"
+#include "../beer_fake_caps.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -986,6 +987,7 @@ static B11HR B11_MS dev_check_format_support(B11Device *dev, uint32_t format, ui
     (void)dev;
     if (!support) return B11_E_INVALIDARG;
     *support = 0;
+    if (beer_fake_caps()) { *support = 0xffffffffu; return B11_S_OK; }   /* testing: every format, every use */
     if (bd12_dxgi_to_vk(format) == VK_FORMAT_UNDEFINED && bd12_dxgi_resource_to_vk(format, 1) == VK_FORMAT_UNDEFINED)
         return B11_E_FAIL;
     uint32_t s = 0x1 | 0x2 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x1000 | 0x2000 |
@@ -999,14 +1001,54 @@ static B11HR B11_MS dev_check_ms_quality(B11Device *dev, uint32_t format, uint32
 {
     (void)dev; (void)format;
     if (!levels) return B11_E_INVALIDARG;
+    if (beer_fake_caps()) { *levels = samples >= 1 && samples <= 32 ? 1 : 0; return B11_S_OK; }
     *levels = (samples == 1 || samples == 2 || samples == 4 || samples == 8) ? 1 : 0;
     return B11_S_OK;
 }
 static void B11_MS dev_check_counter_info(B11Device *dev, uint32_t *info) { (void)dev; if (info) memset(info, 0, 24); }
+/* BEER_FAKE_CAPS: every D3D11_FEATURE answered "supported", except what needs ID3D11DeviceContext1/2 methods
+ * BD11 does not expose (ClearView, Discard*, constant-buffer offsets/partial updates, tiled resources), which
+ * would lead a title to a missing interface instead of a no-op. Returns 1 when answered. */
+static int fake_feature_support(uint32_t feature, void *data, uint32_t size, B11HR *hr)
+{
+    uint32_t *f = data;
+    *hr = B11_S_OK;
+#define FILL(min_size, ...) do { if (size < (min_size)) { *hr = B11_E_INVALIDARG; return 1; } \
+        const uint32_t v_[] = { __VA_ARGS__ }; memset(data, 0, size); memcpy(data, v_, sizeof(v_)); return 1; } while (0)
+    switch (feature) {
+    case 0: FILL(8, 1, 1);                          /* THREADING: concurrent creates, command lists */
+    case 1: FILL(4, 1);                             /* DOUBLES */
+    case 2: if (size < 8) { *hr = B11_E_INVALIDARG; return 1; } f[1] = 0xffffffffu; return 1;   /* FORMAT_SUPPORT */
+    case 3: if (size < 8) { *hr = B11_E_INVALIDARG; return 1; } f[1] = 0x7fffu; return 1;       /* FORMAT_SUPPORT2 */
+    case 4: FILL(4, 1);                             /* D3D10_X_HARDWARE_OPTIONS */
+    case 5: FILL(56, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1);   /* D3D11_OPTIONS (see above for the 0s) */
+    case 7: FILL(4, 1);                             /* D3D9_OPTIONS */
+    case 8: FILL(8, 3, 3);                          /* SHADER_MIN_PRECISION_SUPPORT: 10 and 16 bit */
+    case 9: FILL(4, 1);                             /* D3D9_SHADOW_SUPPORT */
+    case 10: FILL(16, 0, 1, 0, 1);                  /* D3D11_OPTIONS1: min/max filtering, map on default buffers */
+    case 11: FILL(4, 1);                            /* D3D9_SIMPLE_INSTANCING_SUPPORT */
+    case 12: FILL(4, 1);                            /* MARKER_SUPPORT */
+    case 13: FILL(16, 1, 1, 1, 1);                  /* D3D9_OPTIONS1 */
+    case 14: FILL(32, 1, 1, 1, 3, 0, 1, 0, 0);      /* D3D11_OPTIONS2: stencil ref, typed UAV loads, ROVs, CR tier 3 */
+    case 15: FILL(4, 1);                            /* D3D11_OPTIONS3 */
+    case 16: FILL(8, 40, 40);                       /* GPU_VIRTUAL_ADDRESS_SUPPORT */
+    case 17: FILL(4, 1);                            /* D3D11_OPTIONS4 */
+    case 18: FILL(4, 1);                            /* SHADER_CACHE */
+    case 19: FILL(4, 3);                            /* D3D11_OPTIONS5: shared resource tier 3 */
+    case 20: FILL(8, 1, 3);                         /* DISPLAYABLE */
+    default: return 0;
+    }
+#undef FILL
+}
+
 static B11HR B11_MS dev_check_feature_support(B11Device *dev, uint32_t feature, void *data, uint32_t size)
 {
     (void)dev;
     if (!data) return B11_E_INVALIDARG;
+    if (beer_fake_caps()) {
+        B11HR hr;
+        if (fake_feature_support(feature, data, size, &hr)) return hr;
+    }
     switch (feature) {
     case 0: if (size >= 8) { ((uint32_t *)data)[0] = 1; ((uint32_t *)data)[1] = 0; } return B11_S_OK;
     case 4: if (size >= 4) ((uint32_t *)data)[0] = 1; return B11_S_OK;

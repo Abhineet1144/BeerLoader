@@ -6,6 +6,10 @@
 /* Reads the RT_VERSION resource of a PE file. On success *data is malloc'ed (caller frees). */
 int beer_pe_version_resource(const char *host_path, uint8_t **data, uint32_t *size);
 
+/* Builds the VS_VERSIONINFO exposed by Beer-owned Windows runtime modules.
+ * The returned block follows the same malloc/free ownership as file resources. */
+int beer_system_version_resource(uint8_t **data, uint32_t *size);
+
 /* VerQueryValueW over a VS_VERSIONINFO block. Returns 1 and sets *value/*length (length in
  * characters for string values, bytes otherwise) or 0 when the sub-block does not exist. */
 int beer_version_query(const uint8_t *block, uint32_t block_size, const uint16_t *sub_block,

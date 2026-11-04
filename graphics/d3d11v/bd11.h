@@ -362,6 +362,7 @@ BD12Buffer *b11_buffer_current(B11Buffer *b);
 BD12Buffer *b11_buffer_write_backing(B11Buffer *b, int discard);
 extern void *g_b11_device_vtable[43];
 B11HR b11_device_create_for_loader(void **device, void **context);
+void b11_device_set_feature_level(void *device, uint32_t level);
 
 /* context (bd11_ctx.c) */
 void b11_context_init_vtable(void);

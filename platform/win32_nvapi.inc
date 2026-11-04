@@ -173,6 +173,21 @@ static int __attribute__((ms_abi)) nvapi_EnumNvidiaDisplayHandle(u32 index, u64 
     return NVAPI_OK;
 }
 
+/* Beer exposes one active Windows display (\\.\\DISPLAY1), matching the
+ * DXGI/USER32 topology.  NVAPI display ids are opaque nonzero values. */
+static int __attribute__((ms_abi))
+nvapi_DISP_GetDisplayIdByDisplayName(const char *display_name, u32 *display_id)
+{
+    if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
+    if (!display_name || !display_id) return NVAPI_INVALID_ARGUMENT;
+    if (strcasecmp(display_name, "\\\\.\\DISPLAY1") != 0 &&
+        strcasecmp(display_name, "\\\\DISPLAY1") != 0 &&
+        strcasecmp(display_name, "DISPLAY1") != 0)
+        return NVAPI_ERROR;
+    *display_id = 1;
+    return NVAPI_OK;
+}
+
 /* A single physical adapter also forms one logical GPU.  Streamline uses this
  * documented relationship to associate NVAPI capabilities with its DXGI
  * adapter; returning NO_IMPLEMENTATION discards otherwise valid GPU data. */
@@ -230,17 +245,32 @@ nvapi_D3D12_CreateCommittedResource(void *device, const void *heap_properties,
                                     const u32 *nv_params, const u8 *riid,
                                     void **resource, u8 *supported)
 {
+    if (getenv("BEER_NVAPI_DIAGNOSTICS"))
+        fprintf(stderr,
+                "[NVAPI] D3D12_CreateCommittedResource device=%p heap=%p flags=0x%x "
+                "desc=%p state=0x%x clear=%p params=%p riid=%p out=%p supported=%p\n",
+                device, heap_properties, heap_flags, resource_desc, initial_state,
+                clear_value, nv_params, riid, resource, supported);
     if (resource) *resource = NULL;
     if (supported) *supported = 0;
     if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
-    if (!device || !heap_properties || !resource_desc || !riid)
+    if (!device || !heap_properties || !resource_desc || !nv_params || !riid ||
+        (!resource && !supported))
         return NVAPI_INVALID_ARGUMENT;
-    if (nv_params) {
-        const u32 version = nv_params[0];
-        if ((version & 0xffffu) < 8u || (version >> 16) != 1u)
-            return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
-        if (nv_params[1] != 0)
-            return NVAPI_NOT_SUPPORTED;
+    const u32 version = nv_params[0];
+    if ((version & 0xffffu) < 8u || (version >> 16) != 1u)
+        return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    /* CPUVISIBLE_VIDMEM is only an allocation-placement hint.  BD12 already
+     * honors the upload/readback heap properties supplied by the caller, so
+     * accepting this bit preserves ordinary resource semantics.  HTEX changes
+     * texture sampling/mip behavior and remains unsupported. */
+    if (nv_params[1] & ~2u)
+        return NVAPI_NOT_SUPPORTED;
+    /* NVIDIA documents ppvResource == NULL as a capability query.  Do not
+     * create and immediately leak a D3D12 resource in that mode. */
+    if (!resource) {
+        *supported = 1;
+        return NVAPI_OK;
     }
     /* ID3D12Device::CreateCommittedResource is vtable slot 27. */
     void **vtable = *(void ***)device;
@@ -256,6 +286,24 @@ nvapi_D3D12_CreateCommittedResource(void *device, const void *heap_properties,
     if (resource) *resource = created;
     if (supported) *supported = 1;
     return NVAPI_OK;
+}
+
+static int g_nvapi_test_create_calls;
+
+static u32 __attribute__((ms_abi))
+nvapi_test_CreateCommittedResource(void *device, const void *heap_properties,
+                                   u32 heap_flags, const void *resource_desc,
+                                   u32 initial_state, const void *clear_value,
+                                   const u8 *riid, void **resource)
+{
+    (void)device;
+    (void)clear_value;
+    if (!heap_properties || !resource_desc || !riid || heap_flags != 3u ||
+        initial_state != 7u)
+        return 0x80070057u;
+    ++g_nvapi_test_create_calls;
+    if (resource) *resource = (void *)(uintptr_t)0x12345678u;
+    return 0;
 }
 
 static int nvapi_logical_gpu_self_test(void)
@@ -279,11 +327,46 @@ static int nvapi_logical_gpu_self_test(void)
     if (nvapi_GetLogicalGPUFromPhysicalGPU(0, &logical) != NVAPI_INVALID_HANDLE ||
         nvapi_GetLogicalGPUFromPhysicalGPU(NVAPI_GPU_HANDLE, NULL) != NVAPI_INVALID_ARGUMENT)
         return 0;
+    u32 display_id = 0;
+    if (nvapi_DISP_GetDisplayIdByDisplayName("\\\\.\\DISPLAY1", &display_id) != NVAPI_OK ||
+        display_id != 1 ||
+        nvapi_DISP_GetDisplayIdByDisplayName("\\\\.\\DISPLAY9", &display_id) != NVAPI_ERROR)
+        return 0;
     u32 params[2] = { 8u | (1u << 16), 1u };
     u8 supported = 1;
-    return nvapi_D3D12_CreateCommittedResource((void *)1, (void *)1, 0,
-        (void *)1, 0, NULL, params, (const u8 *)1, NULL, &supported) == NVAPI_NOT_SUPPORTED &&
-        supported == 0;
+    if (nvapi_D3D12_CreateCommittedResource((void *)1, (void *)1, 0,
+            (void *)1, 0, NULL, params, (const u8 *)1, NULL, &supported) != NVAPI_NOT_SUPPORTED ||
+        supported != 0)
+        return 0;
+
+    /* CPU-visible video memory is a placement hint and must retain ordinary
+     * committed-resource capability when the supplied heap is otherwise valid. */
+    params[1] = 2u;
+    supported = 0;
+    if (nvapi_D3D12_CreateCommittedResource((void *)1, (void *)1, 0,
+            (void *)1, 0, NULL, params, (const u8 *)1, NULL, &supported) != NVAPI_OK ||
+        supported != 1)
+        return 0;
+
+    void *vtable[28] = {0};
+    vtable[27] = nvapi_test_CreateCommittedResource;
+    void **device = vtable;
+    params[1] = 0;
+    supported = 0;
+    g_nvapi_test_create_calls = 0;
+    if (nvapi_D3D12_CreateCommittedResource(&device, (void *)1, 3,
+            (void *)1, 7, NULL, params, (const u8 *)1, NULL, &supported) != NVAPI_OK ||
+        supported != 1 || g_nvapi_test_create_calls != 0)
+        return 0;
+
+    void *resource = NULL;
+    supported = 0;
+    if (nvapi_D3D12_CreateCommittedResource(&device, (void *)1, 3,
+            (void *)1, 7, NULL, params, (const u8 *)1, &resource, &supported) != NVAPI_OK ||
+        supported != 1 || resource != (void *)(uintptr_t)0x12345678u ||
+        g_nvapi_test_create_calls != 1)
+        return 0;
+    return 1;
 }
 
 static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
@@ -303,6 +386,7 @@ static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
         { 0xBAAABFCCu, nvapi_GPU_GetSystemType },
         { 0x1BE0B8E5u, nvapi_GPU_GetBusId },
         { 0x9ABDD40Du, nvapi_EnumNvidiaDisplayHandle },
+        { 0xAE457190u, nvapi_DISP_GetDisplayIdByDisplayName },
         { 0xADD604D1u, nvapi_GetLogicalGPUFromPhysicalGPU },
         { 0xAEA3FA32u, nvapi_GetPhysicalGPUsFromLogicalGPU },
         { 0x842B066Eu, nvapi_GPU_GetLogicalGpuInfo },

@@ -16,11 +16,25 @@ __asm__(
     "    call *%rsi\n"
     "    mov 0x20(%rsp), %r11\n"
     "    add $0x28, %rsp\n"
+    /* As on Windows, the initial thread enters the image with RCX = PEB
+     * (BaseThreadInitThunk passes RtlUserThreadStart's argument) and the
+     * nonvolatile registers of the zeroed initial context. Carrying Beer's
+     * host values in would put host addresses into the guest: RBP held the
+     * Linux main() frame (0x7fff...), and RE9's protection, which saves and
+     * mixes the caller's registers, then failed its integrity check. */
+    "    mov %gs:0x60, %rcx\n"
     "    xor %eax, %eax\n"
-    "    xor %ecx, %ecx\n"
     "    xor %edx, %edx\n"
     "    xor %r8d, %r8d\n"
     "    xor %r9d, %r9d\n"
+    "    xor %ebx, %ebx\n"
+    "    xor %ebp, %ebp\n"
+    "    xor %esi, %esi\n"
+    "    xor %edi, %edi\n"
+    "    xor %r12d, %r12d\n"
+    "    xor %r13d, %r13d\n"
+    "    xor %r14d, %r14d\n"
+    "    xor %r15d, %r15d\n"
     "    jmp *%r11\n"
     ".size beer_guest_enter,.-beer_guest_enter\n"
     ".popsection\n"

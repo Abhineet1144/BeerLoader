@@ -256,12 +256,13 @@ static BD12HeapMirror *mirror_ensure(BD12DescriptorHeap *heap)
         device->vk.DestroyDescriptorPool(device->device, mirror->pool, NULL);
         goto fail;
     }
-    /* Descriptors written before the mirror existed are not replayed: heap
-     * slots routinely keep handles of destroyed resources, and handing those to
-     * the driver crashes it. Mirrors are therefore created with the heap. */
+    /* The first bindless draw usually creates the mirror, after the title has filled much of the heap. Those
+     * descriptors are copied in once. Slots routinely keep handles of destroyed resources, which would crash
+     * the driver; write_range skips every descriptor whose image or buffer is no longer alive (bd12_live). */
     heap->mirror = mirror;
-    fprintf(stderr, "[BD12] descriptor heap mirror created (%u slots)\n",
-            heap->count < BD12_MIRROR_COUNT ? heap->count : BD12_MIRROR_COUNT);
+    const uint32_t slots = heap->count < BD12_MIRROR_COUNT ? heap->count : BD12_MIRROR_COUNT;
+    write_range(heap, 0, slots);
+    fprintf(stderr, "[BD12] descriptor heap mirror created (%u slots)\n", slots);
     return mirror;
 fail:
     fprintf(stderr, "[BD12] descriptor heap mirror creation failed\n");

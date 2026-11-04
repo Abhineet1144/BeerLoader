@@ -395,8 +395,11 @@ int main(void)
     assert(!impl_RtlFreeHeap(process, 0, p));
     assert(!impl_RtlAllocateHeap(process, 0, UINT64_MAX));
     assert(impl_RtlDestroyHeap(process) == process);
-    assert(beer_static_tls_slot((size_t)(&g_guest_dlls[0] - g_guest_dlls), TLS_SLOTS) == 1);
-    assert(beer_static_tls_slot((size_t)(&g_guest_dlls[31] - g_guest_dlls), TLS_SLOTS) == 32);
+    {
+        uint32_t next = 0;
+        assert(beer_static_tls_next_slot(&next, TLS_SLOTS) == 1);
+        assert(beer_static_tls_next_slot(&next, TLS_SLOTS) == 2);
+    }
     /* Build the actual synthetic PE images and walk their real export table.
      * Names must remain PE-sorted while addresses follow service ID order. */
     g_tramp = mmap(NULL, (size_t)MAX_STUBS * THUNK_SZ, PROT_READ | PROT_WRITE | PROT_EXEC,

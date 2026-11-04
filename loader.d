@@ -18,14 +18,14 @@ loader.o: loader.c platform/beer_env.h graphics/d3d11/d3d11_compat.h \
  platform/beer_steam_session.h platform/beer_steam_mms.h \
  platform/beer_icon_png.h platform/win32_ki_dispatcher.h \
  platform/win32_native_heap.h platform/win32_static_tls.h \
- renderer/vulkan/vulkan_graphics.h renderer/vulkan/vulkan_renderer.h \
- platform/xwayland_backend.h renderer/vulkan/vulkan_context.h \
- platform/directinput_format.h platform/guid_compat.h \
- platform/steam_offline_policy.h platform/steam_interface_contract.h \
- platform/win32_input.h platform/win32_keyboard_text.h \
- platform/win32_filesystem_policy.h platform/window_style_policy.h \
- platform/window_icon_policy.h audio/audio_backend.h \
- audio/wasapi_compat.h media/media_foundation.h \
+ graphics/beer_fake_caps.h renderer/vulkan/vulkan_graphics.h \
+ renderer/vulkan/vulkan_renderer.h platform/xwayland_backend.h \
+ renderer/vulkan/vulkan_context.h platform/directinput_format.h \
+ platform/guid_compat.h platform/steam_offline_policy.h \
+ platform/steam_interface_contract.h platform/win32_input.h \
+ platform/win32_keyboard_text.h platform/win32_filesystem_policy.h \
+ platform/window_style_policy.h platform/window_icon_policy.h \
+ audio/audio_backend.h audio/wasapi_compat.h media/media_foundation.h \
  renderer/vulkan/vulkan_indexed_renderer.h \
  platform/win32_kernel32_export_names.inc platform/win32_adapter_info.h \
  platform/win32_registry.inc platform/win32_steam_matchmaking.inc \
@@ -80,6 +80,7 @@ platform/beer_icon_png.h:
 platform/win32_ki_dispatcher.h:
 platform/win32_native_heap.h:
 platform/win32_static_tls.h:
+graphics/beer_fake_caps.h:
 renderer/vulkan/vulkan_graphics.h:
 renderer/vulkan/vulkan_renderer.h:
 platform/xwayland_backend.h:

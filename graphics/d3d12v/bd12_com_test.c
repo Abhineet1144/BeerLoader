@@ -111,6 +111,18 @@ int main(void)
                                           com_iid_iunknown, &list) == 0, "list");
     CHECK(((HR(MS *)(void *, uint64_t, uint32_t, const uint8_t *, void **))V(dev, 36))(
               dev, 0, 0, com_iid_iunknown, &fence) == 0, "fence");
+    {
+        void *resident_fence = NULL;
+        CHECK(((HR(MS *)(void *, uint64_t, uint32_t, const uint8_t *, void **))V(dev, 36))(
+                  dev, 0, 0, com_iid_iunknown, &resident_fence) == 0 && resident_fence, "fence for EnqueueMakeResident");
+        if (resident_fence) {
+            CHECK(((HR(MS *)(void *, uint32_t, uint32_t, void *const *, void *, uint64_t))V(dev, 50))(
+                      dev, 0, 0, NULL, resident_fence, 5) == 0 &&
+                      ((uint64_t(MS *)(void *))V(resident_fence, 8))(resident_fence) == 5,
+                  "EnqueueMakeResident signals its fence");
+            ((uint32_t(MS *)(void *))V(resident_fence, 2))(resident_fence);
+        }
+    }
 
     uint32_t options3[5] = { 0xffffffffu, 0, 0xffffffffu, 0xffffffffu, 0xffffffffu };
     CHECK(((HR(MS *)(void *, uint32_t, void *, uint32_t))V(dev, 13))(
@@ -141,7 +153,52 @@ int main(void)
               dev, reserved_desc, 0, NULL, com_iid_iunknown, &reserved) == 0 &&
               reserved,
           "CreateReservedResource fully-resident fallback");
-    if (reserved) ((uint32_t(MS *)(void *))V(reserved, 2))(reserved);
+    typedef void(MS * TilingFn)(void *, void *, uint32_t *, uint8_t *, uint32_t *, uint32_t *, uint32_t, uint8_t *);
+    if (reserved) {
+        uint32_t tiles = 0, shape[3] = { 0 }, count = 4;
+        uint8_t packed[12], tilings[48];
+        memset(packed, 0xcc, sizeof(packed));
+        ((TilingFn)V(dev, 42))(dev, reserved, &tiles, packed, shape, &count, 0, tilings);
+        uint32_t wt, start; uint16_t ht, dt;
+        memcpy(&wt, tilings, 4); memcpy(&ht, tilings + 4, 2); memcpy(&dt, tilings + 6, 2); memcpy(&start, tilings + 8, 4);
+        CHECK(tiles == 1 && shape[0] == 65536 && shape[1] == 1 && shape[2] == 1 && packed[0] == 0 && packed[1] == 0 &&
+                  count == 1 && wt == 1 && ht == 1 && dt == 1 && start == 0,
+              "GetResourceTiling: 64 KiB reserved buffer is one standard tile");
+        ((uint32_t(MS *)(void *))V(reserved, 2))(reserved);
+    }
+    uint32_t options[15];
+    memset(options, 0xff, sizeof(options));
+    CHECK(((HR(MS *)(void *, uint32_t, void *, uint32_t))V(dev, 13))(dev, 0, options, 60) == 0 && options[3] == 2,
+          "OPTIONS TiledResourcesTier 2");
+    {
+        /* 512x512 RGBA8, 10 mips, 2 slices: tiles are 128x128, so mips 0-2 (16, 4, 1 tiles) are standard and
+         * mips 3-9 (64x64 down to 1x1, 21844 bytes) share one packed tile per slice. */
+        uint8_t tex[56] = { 0 };
+        uint32_t dim = 3, h = 512, samples = 1, format = 28;
+        uint16_t slices = 2, mips = 10;
+        uint64_t w = 512;
+        memcpy(tex, &dim, 4); memcpy(tex + 16, &w, 8); memcpy(tex + 24, &h, 4); memcpy(tex + 28, &slices, 2);
+        memcpy(tex + 30, &mips, 2); memcpy(tex + 32, &format, 4); memcpy(tex + 36, &samples, 4);
+        void *t = NULL;
+        CHECK(((HR(MS *)(void *, const void *, uint32_t, const void *, const uint8_t *, void **))V(dev, 30))(
+                  dev, tex, 0, NULL, com_iid_iunknown, &t) == 0 && t, "CreateReservedResource 2D array");
+        if (t) {
+            uint32_t tiles = 0, shape[3] = { 0 }, count = 20, packed_tiles, packed_start;
+            uint8_t packed[12], tilings[20 * 12];
+            ((TilingFn)V(dev, 42))(dev, t, &tiles, packed, shape, &count, 0, tilings);
+            memcpy(&packed_tiles, packed + 4, 4); memcpy(&packed_start, packed + 8, 4);
+            uint32_t w2, s1, s2, s11, s13; uint16_t h2;
+            memcpy(&w2, tilings + 2 * 12, 4); memcpy(&h2, tilings + 2 * 12 + 4, 2);
+            memcpy(&s1, tilings + 1 * 12 + 8, 4); memcpy(&s2, tilings + 2 * 12 + 8, 4);
+            memcpy(&s11, tilings + 11 * 12 + 8, 4); memcpy(&s13, tilings + 13 * 12 + 8, 4);
+            CHECK(shape[0] == 128 && shape[1] == 128 && shape[2] == 1, "GetResourceTiling: RGBA8 tile is 128x128");
+            CHECK(packed[0] == 3 && packed[1] == 7 && packed_tiles == 1 && packed_start == 21 && tiles == 44,
+                  "GetResourceTiling: 3 standard mips, 7 packed mips in one tile, 22 tiles per slice");
+            CHECK(count == 20 && w2 == 1 && h2 == 1 && s1 == 16 && s2 == 20 && s11 == 38 && s13 == 0xffffffffu,
+                  "GetResourceTiling: subresource tilings follow slice and mip order");
+            ((uint32_t(MS *)(void *))V(t, 2))(t);
+        }
+    }
 
     enum { N = 4096 };
     void *upload = make_buffer(dev, 2, N, 0xac3);

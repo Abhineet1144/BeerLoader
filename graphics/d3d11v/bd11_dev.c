@@ -130,6 +130,12 @@ B11HR b11_device_create_for_loader(void **device, void **context)
     return B11_S_OK;
 }
 
+/* The feature level D3D11CreateDevice granted (reported again by ID3D11Device::GetFeatureLevel). */
+void b11_device_set_feature_level(void *device, uint32_t level)
+{
+    if (device && level) ((B11Device *)device)->feature_level = level;
+}
+
 /* Upload slices ------------------------------------------------------------------------------- */
 #define SLICE_CLASSES 18                   /* 256 B .. 32 MiB */
 #define SLICE_CHUNK (4u << 20)

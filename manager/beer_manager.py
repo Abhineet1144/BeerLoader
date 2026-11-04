@@ -60,6 +60,7 @@ LAUNCH_FLAGS = [
     ("no_rt", "Disable ray tracing", "BEER_NO_RT", "1", "Never enable the Vulkan ray tracing extensions"),
     ("no_post", "Disable final-image passes", "BEER_NO_POST", "1", "No effects, overlay blending or screenshots; the overlay falls back to opaque boxes"),
     ("legacy_d3d11", "Use the legacy D3D11 path", "BEER_D3D11_LEGACY", "1", "Old D3D11 renderer instead of BD11 (the default)"),
+    ("d3d12_sm51", "Limit D3D12 to shader model 5.1", "BEER_D3D12_SHADER_MODEL", "5.1", "Games that also ship DXBC shaders use them instead of SM 6.6 (DXIL): less memory, no bindless heap mirror. Games that need SM 6 refuse to start"),
     ("hide_steam_registry", "Hide the fake Steam registry keys", "BEER_FAKE_STEAM_REGISTRY", "0", "For games that behave differently when Steam looks installed"),
     ("known_patches", "Enable known guest-code patches", "BEER_ENABLE_KNOWN_TARGET_PATCHES", "1", ""),
     ("transaction_patches", "Enable transaction patches", "BEER_ENABLE_TRANSACTION_PATCHES", "1", ""),

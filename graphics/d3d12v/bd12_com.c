@@ -4,11 +4,14 @@
  * allocators and pipeline states are in bd12_com_list.c. */
 
 #include "bd12_com.h"
+#include "../beer_fake_caps.h"
+int beer_fake_caps_state;
 #include <sys/syscall.h>
 #include <unistd.h>
 #include "bd12_formats.h"
 #include "d3d12_dxil_translator.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -480,6 +483,15 @@ static HR MS fence_signal(ComFence *f, uint64_t value)
         fprintf(stderr, "[FENCE] CPU Signal fence=%p value=%llu\n", (void *)f, (unsigned long long)value);
     return bd12_fence_signal_cpu(f->fence, value) ? HR_OK : HR_E_FAIL;
 }
+/* ID3D12Device3::EnqueueMakeResident(flags, count, objects, fence, value). BD12 never evicts, so every object is
+ * already resident and the fence is signalled at once. Returning S_OK without signalling left a game's GPU wait on
+ * that fence pending forever, and with every queue sharing one Vulkan queue that stalled all rendering (RE9). */
+static HR MS dev_enqueue_make_resident(void *self, uint32_t flags, uint32_t count, void *const *objects,
+                                       ComFence *fence, uint64_t value)
+{
+    (void)self; (void)flags; (void)count; (void)objects;
+    return fence ? fence_signal(fence, value) : HR_E_INVALIDARG;
+}
 static void *fence_vtable[11] = {
     [0] = fence_query, [1] = com_add_ref, [2] = com_release,
     [3] = com_obj_get_private, [4] = com_obj_set_private, [5] = com_obj_set_private_iface,
@@ -584,7 +596,17 @@ static void *MS queue_get_desc(ComQueue *q, uint32_t *result)
 static void MS queue_marker(ComQueue *q, uint32_t a, const void *b, uint32_t c)
 { (void)q; (void)a; (void)b; (void)c; }
 static void MS queue_end_event(ComQueue *q) { (void)q; }
-static void MS queue_tile_noop(void) {}
+/* UpdateTileMappings / CopyTileMappings. Reserved resources are fully resident (dev_create_reserved), so every
+ * tile already has its own memory and a mapping changes nothing. What this cannot reproduce is two resources
+ * sharing heap tiles, or a NULL-mapped tile reading zero after it was written; say so once, so a title that
+ * depends on that shows up in the log. */
+static void MS queue_tile_noop(void)
+{
+    static _Atomic int reported;
+    if (!atomic_exchange(&reported, 1))
+        fprintf(stderr, "[BD12] tile mappings requested: reserved resources are fully resident, "
+                        "mappings are not applied\n");
+}
 
 static void *queue_vtable[19] = {
     [0] = queue_query, [1] = com_add_ref, [2] = com_release,
@@ -1259,11 +1281,103 @@ static HR MS dev_create_list(ComDevice *self, uint32_t node, uint32_t type,
     return com_create_list(self, type, allocator, pso, riid, out);
 }
 
+/* BEER_FAKE_CAPS (graphics/beer_fake_caps.h): every feature Beer can turn into a no-op is reported supported.
+ * Returns 1 with *hr set when it answered; other features (architecture, format info, ...) keep the real
+ * answer. Feature numbers are D3D12_FEATURE values. */
+static int fake_feature(ComDevice *self, uint32_t feature, void *data, uint32_t size, HR *hr)
+{
+    uint32_t *f = data;
+    *hr = HR_OK;
+#define FILL(min_size, ...) do { if (size < (min_size)) { *hr = HR_E_INVALIDARG; return 1; } \
+        const uint32_t v_[] = { __VA_ARGS__ }; memset(data, 0, size); memcpy(data, v_, sizeof(v_)); return 1; } while (0)
+    switch (feature) {
+    case 0:  /* OPTIONS: fp64, logic op, min precision 10/16, tiled tier 4, binding tier 3, stencil ref, typed UAV
+              * loads, ROVs, conservative raster tier 3, 40-bit VA, 64KB swizzle, -, cross-adapter row major,
+              * VP/RT index from any shader, resource heap tier 2 */
+        FILL(60, 1, 1, 3, 4, 3, 1, 1, 1, 3, 40, 1, 0, 1, 1, 2);
+    case 2:  /* FEATURE_LEVELS: the highest requested, up to 12_2 */
+        if (size >= 24) {
+            uint8_t *d = data;
+            const uint32_t count = *(uint32_t *)d;
+            const uint32_t *requested = *(const uint32_t **)(d + 8);
+            uint32_t best = 0;
+            for (uint32_t i = 0; requested && i < count; ++i)
+                if (requested[i] <= 0xc200u && requested[i] > best) best = requested[i];
+            *(uint32_t *)(d + 16) = best;
+            *hr = best ? HR_OK : HR_E_INVALIDARG;
+            return 1;
+        }
+        *hr = HR_E_INVALIDARG;
+        return 1;
+    case 3:  /* FORMAT_SUPPORT: every Support1/Support2 bit */
+        if (size < 12) { *hr = HR_E_INVALIDARG; return 1; }
+        f[1] = 0xffffffffu;
+        f[2] = 0x7fffu;
+        return 1;
+    case 4:  /* MULTISAMPLE_QUALITY_LEVELS: one quality level at any sample count */
+        if (size < 16) { *hr = HR_E_INVALIDARG; return 1; }
+        f[3] = 1;
+        return 1;
+    case 7:  /* SHADER_MODEL: whatever was asked (the highest the caller knows) */
+        if (size < 4) { *hr = HR_E_INVALIDARG; return 1; }
+        return 1;
+    case 8:  /* OPTIONS1: wave ops, lane counts, expanded compute states, int64 */
+        FILL(24, 1, self->bd->wave_lane_min ? self->bd->wave_lane_min : 32,
+             self->bd->wave_lane_max ? self->bd->wave_lane_max : 32, 0x2800, 1, 1);
+    case 12: /* ROOT_SIGNATURE: up to 1.2 */
+        if (size < 4) { *hr = HR_E_INVALIDARG; return 1; }
+        if (f[0] > 3) f[0] = 3;
+        if (!f[0]) *hr = HR_E_INVALIDARG;
+        return 1;
+    case 18: FILL(8, 1, 2);                         /* OPTIONS2: depth bounds, sample positions tier 2 */
+    case 19: FILL(4, 0x1u | 0x4u | 0x8u);           /* SHADER_CACHE: single PSO, automatic in-process and disk */
+    case 20:                                        /* COMMAND_QUEUE_PRIORITY: every priority */
+        if (size < 12) { *hr = HR_E_INVALIDARG; return 1; }
+        f[2] = 1;
+        return 1;
+    case 21: FILL(20, 1, 1, 7, 3, 1);               /* OPTIONS3: copy timestamps, casting, WriteBufferImmediate, view
+                                                     * instancing tier 3, barycentrics */
+    case 23: FILL(12, 1, 2, 1);                     /* OPTIONS4: 64KB MSAA, shared tier 2, 16-bit ops */
+    case 27: FILL(12, 1, 2, 11);                    /* OPTIONS5: SRV-only tiled tier 3, render passes tier 2, DXR 1.1 */
+    case 28: FILL(8, 1, 2);                         /* DISPLAYABLE */
+    case 30: FILL(20, 1, 1, 2, 16, 1);              /* OPTIONS6: VRS tier 2, 16px tiles, background processing */
+    case 32: FILL(8, 10, 100);                      /* OPTIONS7: mesh shader tier 1, sampler feedback 1.0 */
+    case 36: FILL(4, 1);                            /* OPTIONS8: unaligned block textures */
+    case 37: FILL(24, 1, 1, 1, 1, 1, 10);           /* OPTIONS9: mesh stats/RT index, int64 atomics, WaveMMA tier 1 */
+    case 39: FILL(8, 1, 1);                         /* OPTIONS10: VRS sum combiner, per-primitive rate in MS */
+    case 40: FILL(4, 1);                            /* OPTIONS11: int64 atomics on descriptor-heap resources */
+    case 41: FILL(12, 1, 0, 0);                     /* OPTIONS12: culled-primitive stats; no enhanced barriers or
+                                                     * relaxed casting (they need ID3D12Device10 / List7) */
+    case 42: FILL(24, 1, 1, 1, 1, 1, 1);            /* OPTIONS13 */
+    case 43: FILL(12, 1, 1, 1);                     /* OPTIONS14 */
+    case 44: FILL(8, 1, 1);                         /* OPTIONS15: triangle fans, dynamic strip cut */
+    case 45: FILL(8, 1, 0);                         /* OPTIONS16: dynamic depth bias; no GPU upload heaps */
+    default: return 0;
+    }
+#undef FILL
+}
+
+/* BEER_D3D12_SHADER_MODEL=5.1|6.0..6.6 caps the shader model reported to games (the manager's D3D12 option).
+ * Shader model 6 shaders run through dxil-spirv and, when they index the descriptor heap directly, need the
+ * bindless heap mirror; 5.1 keeps a title on its DXBC shaders. Unset: the highest BD12 supports. */
+static uint32_t shader_model_limit(uint32_t highest)
+{
+    const char *value = getenv("BEER_D3D12_SHADER_MODEL");
+    unsigned major = 0, minor = 0;
+    if (!value || sscanf(value, "%u.%u", &major, &minor) != 2 || major < 5 || major > 6 || minor > 9) return highest;
+    const uint32_t limit = (major << 4) | minor;
+    return limit < highest ? limit : highest;
+}
+
 static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
                                uint32_t size)
 {
     (void)self;
     if (!data || !size) return HR_E_INVALIDARG;
+    if (beer_fake_caps()) {
+        HR hr;
+        if (fake_feature(self, feature, data, size, &hr)) return hr;
+    }
     { static unsigned seen_mask; if (feature < 32 && !(seen_mask & (1u << feature))) { seen_mask |= 1u << feature; fprintf(stderr, "[BD12] CheckFeatureSupport feature=%u size=%u\n", feature, size); } }
     /* The answers describe what BD12 really does on this Vulkan device. A driver never reports shader model 0,
      * resource binding tier 0 or root signature version 0; games read those as an unsupported GPU. */
@@ -1275,6 +1389,10 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
         memset(data, 0, size);
         f[0] = vk_features && vk_features->shaderFloat64;          /* DoublePrecisionFloatShaderOps */
         f[1] = vk_features && vk_features->logicOp;                /* OutputMergerLogicOp */
+        /* TiledResourcesTier 2, the level of D3D12 hardware generally. Reserved resources are fully resident
+         * (dev_create_reserved) and GetResourceTiling reports the standard tile layout. Tier 0 is not a safe
+         * "unsupported": RE9 then takes a path that never builds a map its job threads look up and crashes. */
+        f[3] = 2;
         f[4] = bindless ? 3 : 1;                                   /* ResourceBindingTier: heap-indexed tables */
         f[6] = vk_features && vk_features->shaderStorageImageReadWithoutFormat;   /* TypedUAVLoadAdditionalFormats */
         f[9] = 40;                                                 /* MaxGPUVirtualAddressBitsPerResource */
@@ -1289,7 +1407,7 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
     }
     if (feature == 7 && size >= 4 && !getenv("BEER_DXR_PROBE_SM")) {   /* SHADER_MODEL: highest supported <= asked */
         uint32_t *f = data;
-        const uint32_t highest = dxil ? 0x66 : 0x51;
+        const uint32_t highest = shader_model_limit(dxil ? 0x66 : 0x51);
         if (f[0] > highest) f[0] = highest;
         return HR_OK;
     }
@@ -1471,7 +1589,7 @@ static HR MS dev_create_descriptor_heap(ComDevice *self, const uint32_t *desc,
     if (!h->heap) { free(h); return HR_E_OUTOFMEMORY; }
     /* Shader-visible CBV/SRV/UAV heaps get a bindless mirror up front when
      * shader model 6 is exposed (BEER_DXR_PROBE_SM), so every later write is
-     * mirrored. */
+     * mirrored. Otherwise the first bindless draw creates it (bd12_mirror.c). */
     if (type == 0 && (desc[2] & 1) && count >= 1024 && getenv("BEER_DXR_PROBE_SM"))
         bd12_mirror_enable(h->heap);
     memcpy(h->desc, desc, sizeof(h->desc));
@@ -2042,7 +2160,111 @@ static HR MS dev_create_command_signature(ComDevice *self, const uint8_t *desc,
     return HR_OK;
 }
 
-static void MS dev_get_resource_tiling(void) {}
+/* ID3D12Device::GetResourceTiling with the D3D12 standard 64 KiB tile shapes. Buffers are 64 KiB x 1 x 1;
+ * textures use the standard swizzle shape for their block size. A mip goes into the packed tail once it is
+ * smaller than a tile in any dimension; every array slice has its own tail, after its standard mips.
+ * Output structs: D3D12_PACKED_MIP_INFO {u8 standard, u8 packed, u32 tiles, u32 start} (12 bytes),
+ * D3D12_TILE_SHAPE {u32 w, h, d}, D3D12_SUBRESOURCE_TILING {u32 width, u16 height, u16 depth, u32 start}. */
+static void bd12_standard_tile_shape(const ComResource *r, uint32_t shape[3])
+{
+    shape[0] = 65536; shape[1] = shape[2] = 1;
+    if (r->dimension == 1) return;
+    uint32_t bw = 1, bh = 1, bytes = 4;
+    const VkFormat vk = bd12_dxgi_to_vk(r->dxgi_format);
+    if (vk != VK_FORMAT_UNDEFINED) bd12_format_block(vk, VK_IMAGE_ASPECT_COLOR_BIT, &bw, &bh, &bytes);
+    if (!bytes) bytes = 4;
+    uint32_t w, h, d = 1;                               /* in blocks */
+    if (r->dimension == 4) {
+        switch (bytes) {
+        case 1:  w = 64; h = 32; d = 32; break;
+        case 2:  w = 32; h = 32; d = 32; break;
+        case 8:  w = 32; h = 16; d = 16; break;
+        case 16: w = 16; h = 16; d = 16; break;
+        default: w = 32; h = 32; d = 16; break;
+        }
+    } else if (r->dimension == 2) {
+        w = 65536 / bytes; h = 1;
+    } else {
+        switch (bytes) {
+        case 1:  w = 256; h = 256; break;
+        case 2:  w = 256; h = 128; break;
+        case 8:  w = 128; h = 64;  break;
+        case 16: w = 64;  h = 64;  break;
+        default: w = 128; h = 128; break;
+        }
+    }
+    shape[0] = w * bw; shape[1] = h * bh; shape[2] = d;
+}
+
+static void MS dev_get_resource_tiling(ComDevice *self, ComResource *r, uint32_t *total_tiles, uint8_t *packed,
+                                       uint32_t *tile_shape, uint32_t *subresource_count, uint32_t first,
+                                       uint8_t *tilings)
+{
+    (void)self;
+    if (!r) return;
+    uint32_t shape[3];
+    bd12_standard_tile_shape(r, shape);
+    if (tile_shape) memcpy(tile_shape, shape, sizeof(shape));
+    const int is_3d = r->dimension == 4;
+    const uint32_t mips = r->dimension == 1 ? 1 : (r->mips ? r->mips : 1);
+    const uint32_t layers = (r->dimension == 1 || is_3d) ? 1 : (r->depth_or_layers ? r->depth_or_layers : 1);
+    const uint64_t width = r->width ? r->width : 1;
+    const uint32_t height = r->dimension == 1 ? 1 : (r->height ? r->height : 1);
+    const uint32_t depth = is_3d ? (r->depth_or_layers ? r->depth_or_layers : 1) : 1;
+
+    uint32_t standard = 0, standard_tiles = 0;            /* per array slice */
+    uint64_t packed_bytes = 0;
+    uint32_t mip_tiles[16] = { 0 };
+    for (uint32_t m = 0; m < mips && m < 16; ++m) {
+        const uint64_t w = width >> m ? width >> m : 1;
+        const uint32_t h = height >> m ? height >> m : 1, d = depth >> m ? depth >> m : 1;
+        const int fits = r->dimension == 1 ||
+                         (w >= shape[0] && h >= shape[1] && (!is_3d || d >= shape[2]));
+        if (fits && standard == m) {
+            mip_tiles[m] = (uint32_t)(((w + shape[0] - 1) / shape[0]) * ((h + shape[1] - 1) / shape[1]) *
+                                      ((d + shape[2] - 1) / shape[2]));
+            standard_tiles += mip_tiles[m];
+            ++standard;
+        } else {
+            uint32_t bw = 1, bh = 1, bytes = 4;
+            const VkFormat vk = bd12_dxgi_to_vk(r->dxgi_format);
+            if (vk != VK_FORMAT_UNDEFINED) bd12_format_block(vk, VK_IMAGE_ASPECT_COLOR_BIT, &bw, &bh, &bytes);
+            packed_bytes += ((w + bw - 1) / bw) * ((h + bh - 1) / bh) * (uint64_t)d * bytes;
+        }
+    }
+    const uint32_t packed_mips = mips > standard ? mips - standard : 0;
+    const uint32_t packed_tiles = packed_mips ? (uint32_t)((packed_bytes + 65535) / 65536) : 0;
+    const uint32_t per_slice = standard_tiles + packed_tiles;
+    if (total_tiles) *total_tiles = per_slice * layers;
+    if (packed) {                                         /* all zero for a buffer, which has no mips */
+        memset(packed, 0, 12);
+        if (r->dimension != 1) packed[0] = (uint8_t)standard;
+        packed[1] = (uint8_t)packed_mips;
+        const uint32_t start = packed_mips ? standard_tiles : 0;
+        memcpy(packed + 4, &packed_tiles, 4);
+        memcpy(packed + 8, &start, 4);
+    }
+    if (!subresource_count) return;
+    const uint32_t subresources = mips * layers;
+    uint32_t wanted = *subresource_count, written = 0;
+    for (uint32_t s = first; tilings && s < subresources && written < wanted; ++s, ++written) {
+        const uint32_t m = s % mips, layer = s / mips;
+        uint8_t *t = tilings + 12 * written;
+        uint32_t wt = 0, start = 0xffffffffu;             /* D3D12_PACKED_TILE */
+        uint16_t ht = 0, dt = 0;
+        if (m < standard) {
+            const uint64_t w = width >> m ? width >> m : 1;
+            const uint32_t h = height >> m ? height >> m : 1, d = depth >> m ? depth >> m : 1;
+            wt = (uint32_t)((w + shape[0] - 1) / shape[0]);
+            ht = (uint16_t)((h + shape[1] - 1) / shape[1]);
+            dt = (uint16_t)((d + shape[2] - 1) / shape[2]);
+            start = layer * per_slice;
+            for (uint32_t k = 0; k < m; ++k) start += mip_tiles[k];
+        }
+        memcpy(t, &wt, 4); memcpy(t + 4, &ht, 2); memcpy(t + 6, &dt, 2); memcpy(t + 8, &start, 4);
+    }
+    *subresource_count = written;
+}
 static uint64_t *MS dev_get_luid(ComDevice *self, uint64_t *result)
 {
     (void)self;
@@ -2181,6 +2403,8 @@ static uint32_t MS sop_add_ref(void **p) { return com_add_ref(&SO_FROM_PROPS(p)-
 static uint32_t MS sop_release(void **p) { return com_release(&SO_FROM_PROPS(p)->obj); }
 static const void *MS sop_identifier(void **p, const uint16_t *name)
 {
+    static const uint8_t inert_identifier[32];        /* BEER_FAKE_CAPS state objects: a valid, empty identifier */
+    if (!SO_FROM_PROPS(p)->rt && beer_fake_caps()) return inert_identifier;
     char ascii[128];
     dxr_ascii((const uint8_t *)name, ascii, sizeof(ascii));
     return bd12_rt_pipeline_identifier(SO_FROM_PROPS(p)->rt, ascii);
@@ -2200,12 +2424,28 @@ static void *so_vtable[7] = {
 /* GetDevice is slot 7; the state object has no methods of its own beyond ID3D12Object. */
 static void *so_vtable8[8];
 
+/* BEER_FAKE_CAPS: a state object with no pipeline; its rays are skipped and its identifiers are empty. */
+static HR inert_state_object(ComDevice *self, const uint8_t *riid, void **out)
+{
+    ComStateObject *so = calloc(1, sizeof(*so));
+    if (!so) return HR_E_OUTOFMEMORY;
+    if (!so_vtable8[0]) {
+        memcpy(so_vtable8, so_vtable, sizeof(so_vtable));
+        so_vtable8[7] = (void *)com_obj_get_device;
+    }
+    so->props_vtable = so_props_vtable;
+    com_obj_init(&so->obj, COM_PSO, so_vtable8, self, so_destroy);
+    HR hr = so_query(&so->obj, riid ? riid : iid_state_object, out);
+    com_release(&so->obj);
+    return hr;
+}
+
 static HR MS dev_create_state_object(ComDevice *self, const uint8_t *desc,
                                      const uint8_t *riid, void **out)
 {
     if (out) *out = NULL;
     if (!desc || !out) return HR_E_INVALIDARG;
-    if (!self->bd->rt_enabled) return HR_E_NOTIMPL;
+    if (!self->bd->rt_enabled) return beer_fake_caps() ? inert_state_object(self, riid, out) : HR_E_NOTIMPL;
     dxr_dump_state_object(desc);
     const uint32_t count = rd32(desc + 4);
     const uint8_t *subs = (const uint8_t *)(uintptr_t)rd64(desc + 8);
@@ -2290,7 +2530,7 @@ fail:
     for (uint32_t i = 0; i < d.library_count; ++i) free(d.libraries[i].exports);
     free(d.libraries);
     free(d.hit_groups);
-    return HR_E_FAIL;
+    return beer_fake_caps() ? inert_state_object(self, riid, out) : HR_E_FAIL;
 }
 static HR MS dev_create_committed1(ComDevice *self, const uint8_t *props,
                                    uint32_t flags, const uint8_t *desc,
@@ -2313,6 +2553,7 @@ static void MS dev_rt_prebuild(ComDevice *self, const void *inputs, uint64_t *in
 {
     uint64_t sizes[3] = { 0, 0, 0 };
     if (self->bd->rt_enabled) bd12_rt_prebuild(self->bd, inputs, sizes);
+    else if (beer_fake_caps()) sizes[0] = sizes[1] = sizes[2] = 65536;   /* buffers the title can allocate */
     memcpy(info, sizes, sizeof(sizes));
 }
 static uint32_t MS dev_check_matching_identifier(void) { return 0; /* compatible */ }
@@ -2422,7 +2663,7 @@ static void *device_vtable[76] = {
     [41] = dev_create_command_signature, [42] = dev_get_resource_tiling,
     [43] = dev_get_luid, [44] = obj_notimpl, [45] = obj_notimpl,
     [46] = obj_ok, [47] = dev_create_pso,
-    /* Device3 */ [48] = obj_notimpl, [49] = obj_notimpl, [50] = obj_ok,
+    /* Device3 */ [48] = obj_notimpl, [49] = obj_notimpl, [50] = dev_enqueue_make_resident,
     /* Device4 */ [51] = dev_create_list1, [52] = obj_notimpl,
     [53] = dev_create_committed1, [54] = dev_create_heap1,
     [55] = obj_notimpl, [56] = dev_get_allocation_info1,
@@ -2466,6 +2707,14 @@ static uint64_t (*g_event_factory)(void);
 static void *g_dxgi_factory_object;
 void bd12_com_set_event_factory(uint64_t (*fn)(void)) { g_event_factory = fn; }
 void bd12_com_set_dxgi_factory(void *factory) { g_dxgi_factory_object = factory; }
+/* The loader's IDXGIOutput for the one monitor: GetContainingOutput answers it, as Windows answers the output the
+ * window is on. RE Engine leaves borderless and fullscreen modes (back to a captioned window) when it gets none. */
+static void *g_dxgi_output_object;
+void bd12_com_set_dxgi_output(void *output) { g_dxgi_output_object = output; }
+void *bd12_com_dxgi_output_ref(void)
+{
+    return g_dxgi_output_object;            /* process-lifetime; its AddRef/Release do not count */
+}
 
 static void swapchain_release_buffers(ComSwapChain *sc)
 {
@@ -2587,7 +2836,7 @@ static HR MS sc_set_fullscreen(ComSwapChain *sc, int32_t fullscreen, void *targe
 static HR MS sc_get_fullscreen(ComSwapChain *sc, int32_t *fullscreen, void **target)
 {
     if (fullscreen) *fullscreen = (int32_t)sc->fullscreen;
-    if (target) *target = NULL;
+    if (target) *target = sc->fullscreen ? bd12_com_dxgi_output_ref() : NULL;
     return HR_OK;
 }
 static HR MS sc_get_desc(ComSwapChain *sc, uint8_t *d)
@@ -2632,8 +2881,9 @@ static HR MS sc_resize_target(ComSwapChain *sc, const void *mode) { (void)sc; (v
 static HR MS sc_get_containing_output(ComSwapChain *sc, void **out)
 {
     (void)sc;
-    if (out) *out = NULL;
-    return HR_NOT_FOUND;
+    if (!out) return HR_E_INVALIDARG;
+    *out = bd12_com_dxgi_output_ref();
+    return *out ? HR_OK : HR_NOT_FOUND;
 }
 static HR MS sc_get_frame_statistics(ComSwapChain *sc, void *stats) { (void)sc; (void)stats; return HR_DXGI_INVALID_CALL; }
 static HR MS sc_get_last_present_count(ComSwapChain *sc, uint32_t *count)
@@ -2711,10 +2961,11 @@ static HR MS sc_check_color_space(ComSwapChain *sc, uint32_t space, uint32_t *su
 {
     (void)sc;
     if (!support) return HR_E_INVALIDARG;
+    if (beer_fake_caps()) { *support = 3u; return HR_OK; }   /* PRESENT | OVERLAY_PRESENT, presented as sRGB */
     *support = (space == 0 || space == 1) ? 1u : 0u;   /* sRGB / scRGB: DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT */
     return HR_OK;
 }
-static HR MS sc_set_color_space(ComSwapChain *sc, uint32_t space) { (void)sc; return space <= 1 ? HR_OK : HR_E_INVALIDARG; }
+static HR MS sc_set_color_space(ComSwapChain *sc, uint32_t space) { (void)sc; return space <= 1 || beer_fake_caps() ? HR_OK : HR_E_INVALIDARG; }
 static HR MS sc_resize_buffers1(ComSwapChain *sc, uint32_t count, uint32_t w, uint32_t h, uint32_t format,
                                 uint32_t flags, const uint32_t *masks, void *const *queues)
 {

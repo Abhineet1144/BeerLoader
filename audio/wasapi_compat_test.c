@@ -65,6 +65,35 @@ int main(void)
     v = *(void ***)enumerator;
     if (((GetDefaultFn)v[4])(enumerator, 0, 0, &device) != S_OK || !device) return 5;
     v = *(void ***)device;
+    {   /* IPropertyStore answers each key with its Windows type. */
+        typedef uint64_t __attribute__((ms_abi)) (*OpenStoreFn)(void *, uint32_t, void **);
+        typedef uint64_t __attribute__((ms_abi)) (*GetValueFn)(void *, const void *, uint8_t *);
+        static const uint8_t friendly_name[20] = {0x4e,0x25,0x5c,0xa4,0x1c,0xdf,0xfd,0x4e,0x80,0x20,0x67,0xd1,
+                                                  0x46,0xa8,0x50,0xe0,14,0,0,0};
+        static const uint8_t device_format[20] = {0x4d,0x06,0x9f,0xf1,0x2c,0x08,0x27,0x4e,0xbc,0x73,0x68,0x82,
+                                                   0xa1,0xbb,0x8e,0x4c,0,0,0,0};
+        static const uint8_t form_factor[20] = {0x03,0xd8,0xa5,0x1d,0x92,0xd4,0xdd,0x4e,0x8c,0x23,0xe0,0xc0,
+                                                0xff,0xee,0x7f,0x0e,0,0,0,0};
+        static const uint8_t unknown_key[20] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,1,0,0,0};
+        void *store = NULL;
+        if (((OpenStoreFn)v[4])(device, 0, &store) != S_OK || !store) return 30;
+        void **sv = *(void ***)store;
+        uint8_t pv[24];
+        if (((GetValueFn)sv[5])(store, friendly_name, pv) != S_OK || *(uint16_t *)pv != 31 ||
+            !*(uint16_t **)(pv + 8) || (*(uint16_t **)(pv + 8))[0] != 'B') return 31;
+        free(*(uint16_t **)(pv + 8));
+        if (((GetValueFn)sv[5])(store, device_format, pv) != S_OK || *(uint16_t *)pv != 65 ||
+            *(uint32_t *)(pv + 8) != 40 || !*(uint8_t **)(pv + 16)) return 32;
+        const WaveFormat *device_wf = *(const WaveFormat **)(pv + 16);
+        if (device_wf->tag != 0xfffe || device_wf->channels != 2 || device_wf->rate != 48000 ||
+            device_wf->bits != 32 || device_wf->block_align != 8 || device_wf->extra != 22 ||
+            ((const uint8_t *)device_wf)[24] != 3) return 33;
+        free(*(uint8_t **)(pv + 16));
+        if (((GetValueFn)sv[5])(store, form_factor, pv) != S_OK || *(uint16_t *)pv != 19 ||
+            *(uint32_t *)(pv + 8) != 1) return 34;
+        if (((GetValueFn)sv[5])(store, unknown_key, pv) != S_OK || *(uint16_t *)pv != 0) return 35;
+        ((ReleaseFn)sv[2])(store);
+    }
     if (((ActivateFn)v[3])(device, iid_client, 1, NULL, &client) != S_OK || !client) return 6;
     WaveFormat format = {1, 2, 48000, 192000, 4, 16, 0};
     v = *(void ***)client;

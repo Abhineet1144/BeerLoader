@@ -4,7 +4,8 @@ graphics/d3d11v/bd11_obj.o: graphics/d3d11v/bd11_obj.c \
  graphics/d3d11v/../d3d12v/bd12_vk_functions.h \
  graphics/d3d11v/../d3d12v/bd12_vk_rt_functions.h \
  graphics/d3d11v/../d3d12v/bd12_formats.h \
- graphics/d3d11v/../d3d12v/bd12.h graphics/d3d11v/../d3d12v/bd12_pso.h
+ graphics/d3d11v/../d3d12v/bd12.h graphics/d3d11v/../d3d12v/bd12_pso.h \
+ graphics/d3d11v/../beer_fake_caps.h
 platform/beer_env.h:
 graphics/d3d11v/bd11.h:
 graphics/d3d11v/../d3d12v/bd12.h:
@@ -14,3 +15,4 @@ graphics/d3d11v/../d3d12v/bd12_vk_rt_functions.h:
 graphics/d3d11v/../d3d12v/bd12_formats.h:
 graphics/d3d11v/../d3d12v/bd12.h:
 graphics/d3d11v/../d3d12v/bd12_pso.h:
+graphics/d3d11v/../beer_fake_caps.h:

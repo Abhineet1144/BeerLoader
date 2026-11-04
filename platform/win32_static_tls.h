@@ -4,13 +4,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Slot zero belongs to the executable. Published module ordinals never change
- * when recursive imports append more records to the loader's module table. */
-static inline uint32_t beer_static_tls_slot(size_t module_ordinal, size_t slots)
+/* Static TLS indexes as the Windows loader assigns them: slot zero belongs to the executable, and each module
+ * that has a TLS directory takes the next free index when its TLS is set up (load order). Modules without TLS
+ * take none, so the first DLL with TLS gets index 1 whatever its place in the module list; code that reads
+ * ThreadLocalStoragePointer[_tls_index] relies on that numbering. Returns UINT32_MAX when the table is full. */
+static inline uint32_t beer_static_tls_next_slot(uint32_t *next, size_t slots)
 {
-    if (slots <= 1 || module_ordinal >= slots - 1 || module_ordinal >= UINT32_MAX)
-        return UINT32_MAX;
-    return (uint32_t)module_ordinal + 1;
+    if (!next || slots <= 1) return UINT32_MAX;
+    if (*next == 0) *next = 1;
+    if (*next >= slots) return UINT32_MAX;
+    return (*next)++;
 }
 
 #endif

@@ -357,11 +357,13 @@ static B11HR B11_MS sc_resize_target(B11Swap *s, const uint32_t *mode)
     (void)s; (void)mode;
     return B11_S_OK;
 }
+void *bd12_com_dxgi_output_ref(void);
 static B11HR B11_MS sc_get_output(B11Swap *s, void **out)
 {
     (void)s;
-    if (out) *out = NULL;
-    return B11_DXGI_ERROR_NOT_FOUND;
+    if (!out) return B11_E_INVALIDARG;
+    *out = bd12_com_dxgi_output_ref();     /* the monitor the window is on (bd12_com.c) */
+    return *out ? B11_S_OK : B11_DXGI_ERROR_NOT_FOUND;
 }
 static B11HR B11_MS sc_get_stats(B11Swap *s, void *stats)
 {
