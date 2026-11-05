@@ -535,11 +535,16 @@ static int va_insert(BD12Device *device, BD12Buffer *buffer)
 static void va_remove(BD12Device *device, const BD12Buffer *buffer)
 {
     pthread_mutex_lock(&device->va_lock);
-    size_t index = va_lower_bound(device, buffer->va);
-    if (index < device->va_count && device->va_table[index].buffer == buffer) {
+    /* Placed resources that alias the same heap offset share one device address, so several entries can have this
+     * VA. Checking only the first left a destroyed buffer in the table when another alias sorted ahead of it, and a
+     * later root-descriptor lookup returned freed memory (RE9). */
+    for (size_t index = va_lower_bound(device, buffer->va);
+         index < device->va_count && device->va_table[index].va == buffer->va; ++index) {
+        if (device->va_table[index].buffer != buffer) continue;
         memmove(&device->va_table[index], &device->va_table[index + 1],
                 (device->va_count - index - 1) * sizeof(*device->va_table));
         --device->va_count;
+        break;
     }
     pthread_mutex_unlock(&device->va_lock);
 }

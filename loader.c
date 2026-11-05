@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <setjmp.h>
 #include <sys/time.h>
@@ -1937,16 +1938,28 @@ _Static_assert(offsetof(WIN_CS, LockCount) == 8, "Win64 critical section lock co
 _Static_assert(offsetof(WIN_CS, RecursionCount) == 12, "Win64 critical section recursion");
 _Static_assert(offsetof(WIN_CS, OwningThread) == 16, "Win64 critical section owner");
 
+/* A critical section's host state. Windows does not tie a critical section to its owner the way a pthread mutex
+ * is tied: LeaveCriticalSection decrements the recursion count and releases the lock whichever thread calls it,
+ * and job systems rely on that (RE9 enters a section on one thread and leaves it on another). A pthread mutex
+ * refused that unlock (EPERM) and stayed locked forever, so the lock is a binary semaphore, which any thread may
+ * release, with the owner and recursion count kept beside it. */
 typedef struct CsBackend {
     WIN_CS *section;
-    pthread_mutex_t mutex;
+    sem_t lock;                   /* 1 = free */
+    _Atomic(u64) owner;           /* Windows thread id of the holder, 0 when free */
+    s32 recursion;                /* written only by the holder */
     struct CsBackend *next;
+    long owner_tid;               /* host thread holding it (diagnostics: SIGUSR1 stack dump) */
+    u64 owner_rip;                /* guest return address of the Enter that acquired it */
 } CsBackend;
+static __thread WIN_CS *g_dbg_cs_wait;   /* critical section this thread is blocked entering */
 static CsBackend *g_cs_backends[256];
 static pthread_mutex_t g_cs_backend_lock = PTHREAD_MUTEX_INITIALIZER;
 static WIN_CS g_loader_critical_section;
 
-static pthread_mutex_t g_fallback_cs_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CsBackend g_fallback_cs;             /* shared by sections at impossible addresses */
+static pthread_once_t g_fallback_cs_once = PTHREAD_ONCE_INIT;
+static void fallback_cs_init(void) { sem_init(&g_fallback_cs.lock, 0, 1); }
 static __thread u64 g_cached_windows_thread_id;
 /* Set when the guest creates its top-level window. Keeping this near the
  * synchronization core lets focused diagnostics follow the actual UI/main
@@ -1994,31 +2007,47 @@ static int cs_ptr_is_valid(const WIN_CS *cs)
     return p != WIN_CS_MAGIC && p >= 0x10000 && p <= 0x00007fffffffffffULL;
 }
 
-static pthread_mutex_t *cs_get_or_create_mutex(WIN_CS *cs)
+static CsBackend *cs_backend(WIN_CS *cs)
 {
-    if (!cs_ptr_is_valid(cs))
-        return &g_fallback_cs_mutex;
+    if (!cs_ptr_is_valid(cs)) {
+        pthread_once(&g_fallback_cs_once, fallback_cs_init);
+        return &g_fallback_cs;
+    }
     size_t bucket = ((uintptr_t)cs >> 3) & 255u;
     pthread_mutex_lock(&g_cs_backend_lock);
     for (CsBackend *p = g_cs_backends[bucket]; p; p = p->next) {
         if (p->section == cs) {
             pthread_mutex_unlock(&g_cs_backend_lock);
-            return &p->mutex;
+            return p;
         }
     }
     CsBackend *p = host_alloc(sizeof(*p));
     if (!p) die("critical-section backend allocation failed");
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    int result = pthread_mutex_init(&p->mutex, &attr);
-    pthread_mutexattr_destroy(&attr);
-    if (result) die("critical-section mutex initialization failed: %d", result);
+    memset(p, 0, sizeof(*p));
+    if (sem_init(&p->lock, 0, 1) != 0) die("critical-section semaphore initialization failed");
     p->section = cs;
     p->next = g_cs_backends[bucket];
     g_cs_backends[bucket] = p;
     pthread_mutex_unlock(&g_cs_backend_lock);
-    return &p->mutex;
+    return p;
+}
+
+/* The guest-visible fields follow Windows: LockCount -1 when free, RecursionCount and OwningThread of the holder. */
+static void cs_publish(WIN_CS *cs, const CsBackend *b, int lock_delta)
+{
+    if (b == &g_fallback_cs) return;
+    cs->RecursionCount = b->recursion;
+    cs->LockCount += lock_delta;
+    cs->OwningThread = atomic_load_explicit(&b->owner, memory_order_relaxed);
+}
+
+static void cs_take(WIN_CS *cs, CsBackend *b, u64 me)
+{
+    atomic_store_explicit(&b->owner, me, memory_order_relaxed);
+    b->recursion = 1;
+    b->owner_tid = (long)syscall(SYS_gettid);
+    b->owner_rip = g_dispatch_incoming_return;
+    cs_publish(cs, b, 1);
 }
 
 static u64 __attribute__((ms_abi))
@@ -2035,7 +2064,7 @@ impl_InitializeCriticalSectionAndSpinCount(WIN_CS *cs, u32 spin)
     memset(cs, 0, sizeof(*cs));
     cs->LockCount  = -1;
     cs->SpinCount  = spin;
-    cs_get_or_create_mutex(cs);
+    cs_backend(cs);
     return 1; /* TRUE */
 }
 
@@ -2054,11 +2083,10 @@ impl_DeleteCriticalSection(WIN_CS *cs)
     for (CsBackend **slot = &g_cs_backends[bucket]; *slot; slot = &(*slot)->next) {
         CsBackend *p = *slot;
         if (p->section != cs) continue;
-        if (pthread_mutex_destroy(&p->mutex) == 0) {
-            *slot = p->next;
-            host_free(p, sizeof(*p));
-            memset(cs, 0, sizeof(*cs));
-        }
+        *slot = p->next;
+        sem_destroy(&p->lock);
+        host_free(p, sizeof(*p));
+        memset(cs, 0, sizeof(*cs));
         break;
     }
     pthread_mutex_unlock(&g_cs_backend_lock);
@@ -2069,12 +2097,16 @@ static u64 __attribute__((ms_abi))
 impl_EnterCriticalSection(WIN_CS *cs)
 {
     if (!cs) return 0;
-    int valid = cs_ptr_is_valid(cs);
-    pthread_mutex_t *m = cs_get_or_create_mutex(cs);
-    int lock_result = pthread_mutex_trylock(m);
-    if (lock_result == EBUSY) {
+    CsBackend *b = cs_backend(cs);
+    const u64 me = current_windows_thread_id();
+    if (atomic_load_explicit(&b->owner, memory_order_relaxed) == me && b->recursion > 0) {
+        ++b->recursion;
+        cs_publish(cs, b, 1);
+        return 0;
+    }
+    if (sem_trywait(&b->lock) != 0) {
         if (getenv("BEER_MAIN_THREAD_DIAGNOSTICS") && g_window_thread_id &&
-            current_windows_thread_id() == g_window_thread_id) {
+            me == g_window_thread_id) {
             static _Atomic(u32) main_cs_contention_logs;
             u32 trace = atomic_fetch_add(&main_cs_contention_logs, 1);
             if (trace < 256)
@@ -2084,15 +2116,11 @@ impl_EnterCriticalSection(WIN_CS *cs)
                         (void *)cs, (unsigned long long)cs->OwningThread,
                         (unsigned long long)g_dispatch_incoming_return);
         }
-        pthread_mutex_lock(m);
-    } else if (lock_result != 0) {
-        pthread_mutex_lock(m);
+        g_dbg_cs_wait = cs;
+        while (sem_wait(&b->lock) != 0 && errno == EINTR) {}
+        g_dbg_cs_wait = NULL;
     }
-    if (valid) {
-        cs->RecursionCount++;
-        cs->LockCount++;
-        cs->OwningThread = current_windows_thread_id();
-    }
+    cs_take(cs, b, me);
     return 0;
 }
 
@@ -2100,15 +2128,22 @@ static u64 __attribute__((ms_abi))
 impl_LeaveCriticalSection(WIN_CS *cs)
 {
     if (!cs) return 0;
-    int valid = cs_ptr_is_valid(cs);
-    pthread_mutex_t *m = cs_get_or_create_mutex(cs);
-    if (valid && cs->RecursionCount > 0) {
-        cs->RecursionCount--;
-        cs->LockCount--;
-        if (cs->RecursionCount == 0)
-            cs->OwningThread = 0;
+    CsBackend *b = cs_backend(cs);
+    if (b->recursion <= 0) {                      /* unbalanced Leave: Windows corrupts the section; ignore it */
+        static _Atomic(u32) unbalanced;
+        if (atomic_fetch_add(&unbalanced, 1) < 16)
+            fprintf(stderr, "[CS] LeaveCriticalSection(%p) on a free section, caller rva=0x%llx\n",
+                    (void *)cs, (unsigned long long)(g_dispatch_incoming_return - (u64)g_img));
+        return 0;
     }
-    pthread_mutex_unlock(m);
+    if (--b->recursion == 0) {
+        atomic_store_explicit(&b->owner, 0, memory_order_relaxed);
+        b->owner_tid = 0;
+        cs_publish(cs, b, -1);
+        sem_post(&b->lock);                       /* any thread may release, as on Windows */
+    } else {
+        cs_publish(cs, b, -1);
+    }
     return 0;
 }
 
@@ -2116,17 +2151,16 @@ static u64 __attribute__((ms_abi))
 impl_TryEnterCriticalSection(WIN_CS *cs)
 {
     if (!cs) return 0;
-    int valid = cs_ptr_is_valid(cs);
-    pthread_mutex_t *m = cs_get_or_create_mutex(cs);
-    if (pthread_mutex_trylock(m) == 0) {
-        if (valid) {
-            cs->RecursionCount++;
-            cs->LockCount++;
-            cs->OwningThread = current_windows_thread_id();
-        }
-        return 1; /* TRUE */
+    CsBackend *b = cs_backend(cs);
+    const u64 me = current_windows_thread_id();
+    if (atomic_load_explicit(&b->owner, memory_order_relaxed) == me && b->recursion > 0) {
+        ++b->recursion;
+        cs_publish(cs, b, 1);
+        return 1;
     }
-    return 0; /* FALSE */
+    if (sem_trywait(&b->lock) != 0) return 0; /* FALSE */
+    cs_take(cs, b, me);
+    return 1; /* TRUE */
 }
 
 /* ---- Exception table lookup ---- */
@@ -12688,40 +12722,76 @@ impl_SleepConditionVariableCS(u64 *cv, WIN_CS *cs, u32 ms)
  * zero-initialized and retain their Windows layout. */
 #define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1u
 
+/* The lock state is kept explicitly (writer flag, reader count) under a short-held mutex instead of in a
+ * pthread_rwlock. Windows does not tie an SRW lock to the thread that acquired it, and code releases locks
+ * acquired on other threads; glibc decides "writer unlock" by comparing the caller with the recorded writer, so
+ * such a release was taken as a reader unlock, corrupted the lock and left waiters blocked for good (RE9's job
+ * system). Waiting writers are served before new readers. */
 typedef struct {
-    pthread_rwlock_t lock;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    int writer;                     /* an exclusive hold is active */
+    int writers_waiting;
     volatile long owner_tid;        /* diagnostics (kill -USR1): exclusive holder and where it acquired */
     volatile u64 owner_rip;
-    volatile int readers;
+    volatile int readers;           /* shared holds */
     volatile u64 reader_rip;
 } WinSrwLock;
 __thread WinSrwLock *g_dbg_srw_wait;   /* lock this thread is blocked acquiring */
 
 static void srw_wrlock_dbg(WinSrwLock *e)
 {
-    if (pthread_rwlock_trywrlock(&e->lock) != 0) {
+    pthread_mutex_lock(&e->mutex);
+    if (e->writer || e->readers) {
         g_dbg_srw_wait = e;
-        pthread_rwlock_wrlock(&e->lock);
+        ++e->writers_waiting;
+        while (e->writer || e->readers) pthread_cond_wait(&e->changed, &e->mutex);
+        --e->writers_waiting;
         g_dbg_srw_wait = NULL;
     }
+    e->writer = 1;
     e->owner_tid = syscall(SYS_gettid);
     e->owner_rip = g_dispatch_incoming_return;
+    pthread_mutex_unlock(&e->mutex);
 }
 static void srw_rdlock_dbg(WinSrwLock *e)
 {
-    if (pthread_rwlock_tryrdlock(&e->lock) != 0) {
+    pthread_mutex_lock(&e->mutex);
+    if (e->writer || e->writers_waiting) {
         g_dbg_srw_wait = e;
-        pthread_rwlock_rdlock(&e->lock);
+        while (e->writer || e->writers_waiting) pthread_cond_wait(&e->changed, &e->mutex);
         g_dbg_srw_wait = NULL;
     }
-    __atomic_add_fetch(&e->readers, 1, __ATOMIC_RELAXED);
+    ++e->readers;
     e->reader_rip = g_dispatch_incoming_return;
+    pthread_mutex_unlock(&e->mutex);
 }
 static void srw_unlock_dbg(WinSrwLock *e, int exclusive)
 {
-    if (exclusive) e->owner_tid = 0;
-    else __atomic_sub_fetch(&e->readers, 1, __ATOMIC_RELAXED);
-    pthread_rwlock_unlock(&e->lock);
+    pthread_mutex_lock(&e->mutex);
+    if (exclusive) {
+        e->writer = 0;
+        e->owner_tid = 0;
+    } else if (e->readers > 0) {
+        --e->readers;
+    }
+    if (!e->writer && !e->readers) pthread_cond_broadcast(&e->changed);
+    pthread_mutex_unlock(&e->mutex);
+}
+static int srw_trylock(WinSrwLock *e, int exclusive)
+{
+    pthread_mutex_lock(&e->mutex);
+    const int ok = exclusive ? !e->writer && !e->readers : !e->writer && !e->writers_waiting;
+    if (ok && exclusive) {
+        e->writer = 1;
+        e->owner_tid = syscall(SYS_gettid);
+        e->owner_rip = g_dispatch_incoming_return;
+    } else if (ok) {
+        ++e->readers;
+        e->reader_rip = g_dispatch_incoming_return;
+    }
+    pthread_mutex_unlock(&e->mutex);
+    return ok;
 }
 
 static WinSrwLock *srw_lock_get(u64 *address, int create)
@@ -12740,16 +12810,18 @@ static WinSrwLock *srw_lock_get(u64 *address, int create)
     WinSrwLock *candidate = host_alloc(sizeof(*candidate));
     if (!candidate) return NULL;
     memset(candidate, 0, sizeof(*candidate));
-    if (pthread_rwlock_init(&candidate->lock, NULL) != 0) {
+    if (pthread_mutex_init(&candidate->mutex, NULL) != 0) {
         host_free(candidate, sizeof(*candidate));
         return NULL;
     }
+    pthread_cond_init(&candidate->changed, NULL);
 
     u64 expected = 0;
     if (!__atomic_compare_exchange_n(address, &expected,
                                      (u64)(uintptr_t)candidate, 0,
                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
-        pthread_rwlock_destroy(&candidate->lock);
+        pthread_cond_destroy(&candidate->changed);
+        pthread_mutex_destroy(&candidate->mutex);
         host_free(candidate, sizeof(*candidate));
         return (WinSrwLock *)(uintptr_t)expected;
     }
@@ -12774,7 +12846,7 @@ static u64 __attribute__((ms_abi)) impl_AcquireSRWLockExclusive(u64 *lock)
 static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockExclusive(u64 *lock)
 {
     WinSrwLock *entry = srw_lock_get(lock, 1);
-    return entry && pthread_rwlock_trywrlock(&entry->lock) == 0;
+    return entry && srw_trylock(entry, 1);
 }
 
 static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockExclusive(u64 *lock)
@@ -12794,7 +12866,7 @@ static u64 __attribute__((ms_abi)) impl_AcquireSRWLockShared(u64 *lock)
 static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockShared(u64 *lock)
 {
     WinSrwLock *entry = srw_lock_get(lock, 1);
-    return entry && pthread_rwlock_tryrdlock(&entry->lock) == 0;
+    return entry && srw_trylock(entry, 0);
 }
 
 static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockShared(u64 *lock)
@@ -32518,6 +32590,15 @@ static void on_dump_stacks(int sig, siginfo_t *info, void *uctx)
                                      (unsigned long long)(ev->creator_rip >= base ? ev->creator_rip - base : 0),
                                      (unsigned long long)(ev->last_signaler_rip >= base ? ev->last_signaler_rip - base : 0));
         }
+    }
+    if (g_dbg_cs_wait) {
+        WIN_CS *cs = g_dbg_cs_wait;
+        const CsBackend *backend = cs_backend(cs);
+        used += (size_t)snprintf(out + used, sizeof(out) - used,
+                                 "[STACKS]   blocked on CRITICAL_SECTION %p: OwningThread=%llu RecursionCount=%d LockCount=%d host owner tid=%ld (entered from rva=0x%llx)\n",
+                                 (void *)cs, (unsigned long long)cs->OwningThread, (int)cs->RecursionCount, (int)cs->LockCount,
+                                 backend ? backend->owner_tid : 0L,
+                                 (unsigned long long)(backend && backend->owner_rip >= (u64)g_img ? backend->owner_rip - (u64)g_img : 0));
     }
     if (g_dbg_srw_wait)
         used += (size_t)snprintf(out + used, sizeof(out) - used, "[STACKS]   blocked on SRWLOCK %p: exclusive owner tid=%ld (acquired from rva=0x%llx), readers=%d (last reader rva=0x%llx)\n",

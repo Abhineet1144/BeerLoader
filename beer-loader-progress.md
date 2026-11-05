@@ -3588,3 +3588,44 @@ RE9 now presents about 140 frames (black screen), then stops. Each fix below mov
   - Chained Together's overlay read 7.2 fps against 15.2 earlier, and Sekiro ran gameplay at 7.6 fps. A
     possible slowdown from routing DirectInput through the trampoline was not A/B tested.
   - These checks are deferred until RE9 works, by the user's choice (separate branch).
+
+### RE9: critical sections and SRW locks released by another thread, aliased VA entries, one audio client per Activate (2026-11-04)
+
+RE9 used to stall after about 140 frames (the per-frame job never completed). It now presents steadily at ~110-125 fps
+(RTX 2070 SUPER, 1920x1080) for 4+ minutes with no freeze or exception. All fixes are generic.
+
+- **Critical sections can be left by a different thread** (`loader.c`, `impl_*CriticalSection`).
+  - The stall was a critical section entered on one thread and left on another. The section had been a recursive
+    pthread mutex, which refuses an unlock by a non-owner (EPERM) and stays locked forever. The guest's
+    `CRITICAL_SECTION` fields said "free", so the next worker to enter blocked and its job never finished.
+  - Seen: entered at RE9 RVA 0x27cb2a on one thread, left at RVA 0x5315538 on another.
+  - Each section is now a binary semaphore (any thread may release it, as with Windows'
+    `LeaveCriticalSection`), plus owner and recursion bookkeeping. A Leave of a free section is logged (`[CS]`) and
+    ignored.
+  - `SleepConditionVariableCS` uses the same Enter/Leave.
+- **SRW locks likewise** (`srw_*_dbg`).
+  - They were built on `pthread_rwlock`, where glibc decides "writer unlock" by comparing the caller with the
+    recorded writer. A release from another thread was taken as a reader unlock and corrupted the lock.
+  - The state (writer flag, reader count, waiting writers) is now explicit under a short-held mutex plus condition
+    variable. Waiting writers come before new readers.
+  - `TryAcquireSRWLock*` share the same logic.
+- **Diagnostics.**
+  - The SIGUSR1 stack dump now prints `blocked on CRITICAL_SECTION <addr>`, with the guest fields, the host owner tid
+    and the guest RVA where the owner entered.
+- **BD12 VA table kept freed buffers** (`bd12_device.c`, `va_remove`).
+  - Placed resources that alias one heap offset share a device address. `va_remove` only checked the first entry
+    with that VA, so destroying an alias that sorted later left its entry in the table.
+  - A later root SRV/UAV resolved the address to freed memory. The fault was in `buffer_view_impl`, from
+    `cl_dispatch` → `resolve_one`; the freed buffer still carried a glibc tcache header.
+  - `va_remove` now searches all entries with the same VA.
+- **WASAPI: every `IMMDevice::Activate(IAudioClient)` creates an independent client**
+  (`audio/wasapi_compat.c`, `wasapi_owner_new`).
+  - The same initialized client used to come back, so the second stream's `Initialize` failed with
+    `AUDCLNT_E_ALREADY_INITIALIZED` and RE9 (Wwise) retried it ~1700 times.
+  - Now both streams initialize first time. `test-audio`'s WASAPI test passes.
+- **Still open.**
+  - The one Beer audio stream is silent (RMS 0) at the start screen, including after Enter presses.
+  - RSS grows by ~3 MB/s while running (3.2 → 4.0 GiB in 4 minutes); the source isn't found yet.
+  - What is on screen is unverified here. Beer's screenshot hook only runs in the presenter's post pass, and RE9's
+    R10G10B10A2 back buffer takes the direct-blit path (`vulkan_presenter.c`, `direct_blit`), which skips it.
+  - Not regression-tested on other titles. The critical-section and SRW changes affect every game.

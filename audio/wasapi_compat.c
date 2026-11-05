@@ -226,6 +226,8 @@ static uint64_t __attribute__((ms_abi)) enumerator_enum_endpoints(
 static uint64_t __attribute__((ms_abi)) enumerator_notify(void *self, void *callback)
 { (void)self; (void)callback; return S_OK; }
 
+static BeerWasapi *wasapi_owner_new(void);
+
 static uint64_t __attribute__((ms_abi)) device_activate(void *self, const void *iid,
                                                         uint32_t context,
                                                         void *parameters,
@@ -236,6 +238,15 @@ static uint64_t __attribute__((ms_abi)) device_activate(void *self, const void *
     *object = NULL;
     BeerWasapi *owner = wasapi_interface(self)->owner;
     void *selected = select_interface(owner, iid);
+    /* Every Activate(IAudioClient) creates an independent client, as on Windows: engines open several streams on
+     * one endpoint, and handing back the same, already initialized client made Initialize fail
+     * (AUDCLNT_E_ALREADY_INITIALIZED) and RE9's audio retry it about 1700 times. */
+    BeerWasapi *fresh = NULL;
+    if (selected && selected == (void *)&owner->audio_client) {
+        fresh = wasapi_owner_new();
+        if (!fresh) return E_OUTOFMEMORY;
+        selected = &fresh->audio_client;
+    }
     static atomic_uint diagnostics;
     unsigned diagnostic = atomic_fetch_add_explicit(&diagnostics, 1,
                                                      memory_order_relaxed);
@@ -251,7 +262,7 @@ static uint64_t __attribute__((ms_abi)) device_activate(void *self, const void *
                 id[13], id[14], id[15], selected ? "S_OK" : "E_NOINTERFACE");
     }
     if (!selected) return E_NOINTERFACE;
-    wasapi_add_ref(selected);
+    if (!fresh) wasapi_add_ref(selected);            /* a fresh client starts with its one reference */
     *object = selected;
     return S_OK;
 }
@@ -925,16 +936,11 @@ static void *audio_clock_vtable[6] = {
     clock_get_frequency, clock_get_position, clock_get_characteristics
 };
 
-uint64_t beer_wasapi_create_instance(const void *class_id, const void *interface_id,
-                                     void **object)
+/* One Beer WASAPI object graph: enumerator, endpoint and one audio client with its services. */
+static BeerWasapi *wasapi_owner_new(void)
 {
-    if (!object) return E_POINTER;
-    *object = NULL;
-    if (!guid_equal(class_id, clsid_mmdevice_enumerator) ||
-        !guid_equal(interface_id, iid_device_enumerator))
-        return E_NOINTERFACE;
     BeerWasapi *owner = calloc(1, sizeof(*owner));
-    if (!owner) return E_FAIL;
+    if (!owner) return NULL;
     atomic_init(&owner->references, 1);
     owner->enumerator = (BeerWasapiInterface){enumerator_vtable, owner};
     owner->collection = (BeerWasapiInterface){collection_vtable, owner};
@@ -952,8 +958,21 @@ uint64_t beer_wasapi_create_instance(const void *class_id, const void *interface
     if (pthread_create(&owner->worker, NULL, wasapi_event_worker, owner) != 0) {
         atomic_store_explicit(&owner->worker_running, 0, memory_order_release);
         free(owner);
-        return E_FAIL;
+        return NULL;
     }
+    return owner;
+}
+
+uint64_t beer_wasapi_create_instance(const void *class_id, const void *interface_id,
+                                     void **object)
+{
+    if (!object) return E_POINTER;
+    *object = NULL;
+    if (!guid_equal(class_id, clsid_mmdevice_enumerator) ||
+        !guid_equal(interface_id, iid_device_enumerator))
+        return E_NOINTERFACE;
+    BeerWasapi *owner = wasapi_owner_new();
+    if (!owner) return E_FAIL;
     *object = &owner->enumerator;
     return S_OK;
 }
