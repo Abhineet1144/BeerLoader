@@ -121,6 +121,8 @@ BD12Device *bd12_device_create(void)
         modern->uniform_texel_buffer_offset_alignment ?
         modern->uniform_texel_buffer_offset_alignment :
         properties.limits.minTexelBufferOffsetAlignment;
+    device->min_storage_buffer_alignment = properties.limits.minStorageBufferOffsetAlignment ?
+        properties.limits.minStorageBufferOffsetAlignment : 1;
     device->min_storage_texel_alignment =
         modern->storage_texel_buffer_offset_alignment ?
         modern->storage_texel_buffer_offset_alignment :
@@ -140,6 +142,10 @@ BD12Device *bd12_device_create(void)
         mkdir(dir, 0700);
         snprintf(device->pipeline_cache_path, sizeof(device->pipeline_cache_path), "%s/pipelines-%04x-%04x-%08x.bin",
                  dir, properties.vendorID, properties.deviceID, properties.driverVersion);
+        memcpy(device->pipeline_identity, &properties.vendorID, 4);
+        memcpy(device->pipeline_identity + 4, &properties.deviceID, 4);
+        memcpy(device->pipeline_identity + 8, &properties.driverVersion, 4);
+        memcpy(device->pipeline_identity + 12, properties.pipelineCacheUUID, 16);
         void *blob = NULL;
         size_t blob_size = 0;
         FILE *f = getenv("BEER_NO_PIPELINE_CACHE") ? NULL : fopen(device->pipeline_cache_path, "rb");

@@ -25,6 +25,30 @@
 #define BEER_PAGE_EXECUTE_READWRITE UINT32_C(0x40)
 #define BEER_PAGE_EXECUTE_WRITECOPY UINT32_C(0x80)
 
+void *beer_mmap_granular(size_t length, int prot, int flags, int fd, long offset)
+{
+    const size_t granularity = 0x10000;
+    if (!length || length > SIZE_MAX - granularity) { errno = EINVAL; return MAP_FAILED; }
+    /* Reserve one granule more, then keep the aligned part and give the slack back. */
+    size_t span = length + granularity;
+    uint8_t *raw = mmap(NULL, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) return MAP_FAILED;
+    uint8_t *base = (uint8_t *)(((uintptr_t)raw + granularity - 1) & ~(uintptr_t)(granularity - 1));
+    size_t mapped_length = (length + 0xfff) & ~(size_t)0xfff;
+    if (base > raw) munmap(raw, (size_t)(base - raw));
+    if (raw + span > base + mapped_length) munmap(base + mapped_length, (size_t)(raw + span - (base + mapped_length)));
+#ifdef MAP_FIXED_NOREPLACE
+    flags &= ~MAP_FIXED_NOREPLACE;
+#endif
+    void *result = mmap(base, length, prot, flags | MAP_FIXED, fd, (off_t)offset);
+    if (result == MAP_FAILED) {
+        int saved = errno;
+        munmap(base, mapped_length);
+        errno = saved;
+    }
+    return result;
+}
+
 typedef struct {
     int used;
     int fd;
@@ -116,7 +140,8 @@ static uint32_t map_image_view(int fd, void **base_address, size_t *view_size, v
 #ifdef MAP_FIXED_NOREPLACE
     if (requested) flags |= MAP_FIXED_NOREPLACE;
 #endif
-    void *mapped = mmap(requested, length, PROT_READ | PROT_WRITE, flags, -1, 0);
+    void *mapped = requested ? mmap(requested, length, PROT_READ | PROT_WRITE, flags, -1, 0)
+                             : beer_mmap_granular(length, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (mapped == MAP_FAILED)
         return requested && (errno == EEXIST || errno == EINVAL)
             ? BEER_STATUS_CONFLICTING_ADDRESSES : BEER_STATUS_NO_MEMORY;
@@ -273,7 +298,8 @@ uint32_t beer_nt_section_map(uint64_t handle, void **base_address,
     int map_prot = prot;
     if (section_prot > 0 && fd_mode >= 0 && (fd_mode & O_ACCMODE) == O_RDWR)
         map_prot |= section_prot & (PROT_READ | PROT_WRITE);
-    void *mapped = mmap(requested, length, map_prot, flags, section.fd, (off_t)offset_value);
+    void *mapped = requested ? mmap(requested, length, map_prot, flags, section.fd, (off_t)offset_value)
+                             : beer_mmap_granular(length, map_prot, flags, section.fd, (long)offset_value);
     if (getenv("BEER_FILE_DIAGNOSTICS"))
         fprintf(stderr, "[SECTION] map handle=0x%llx prot=0x%x section_prot=0x%x fd_mode=0x%x -> %p len=0x%zx\n",
                 (unsigned long long)handle, protection, section.protection, fd_mode, mapped, length);

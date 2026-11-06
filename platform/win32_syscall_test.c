@@ -118,6 +118,23 @@ int main(void)
     assert(continue_context == 0x7000 && continue_alert == 1);
     assert(call_as_guest(code + 0x100, 0, 0, 0, 0, 0, 0) == 0xC0000005u);
 
+    /* After a serviced call RCX holds the address after the syscall instruction and R11 holds RFLAGS,
+     * as the instruction leaves them: mov eax,nt; mov r10,rcx; mov ecx,0xdead; mov r11d,0xbeef;
+     * syscall; mov rax,rcx|r11; ret. */
+    for (int which = 0; which < 2; ++which) {
+        uint8_t *p = code + 0x140 + which * 0x20;
+        static const uint8_t body[] = { 0x4C, 0x8B, 0xD1, 0xB9, 0xAD, 0xDE, 0, 0,
+                                        0x41, 0xBB, 0xEF, 0xBE, 0, 0, 0x0F, 0x05 };
+        p[0] = 0xB8;
+        memcpy(p + 1, &nt, 4);
+        memcpy(p + 5, body, sizeof(body));
+        static const uint8_t from_rcx[] = { 0x48, 0x89, 0xC8, 0xC3 }, from_r11[] = { 0x4C, 0x89, 0xD8, 0xC3 };
+        memcpy(p + 21, which ? from_r11 : from_rcx, 4);
+    }
+    assert(call_as_guest(code + 0x140, 0, 0, 0, 0, 0, 0) == (uint64_t)(uintptr_t)(code + 0x140 + 21));
+    uint64_t flags = call_as_guest(code + 0x160, 0, 0, 0, 0, 0, 0);
+    assert(flags != 0xbeef && (flags & 0x2) && (flags & 0x200));   /* reserved bit 1 and IF are set */
+
     /* Host system calls made while blocked are re-executed after re-allowing. */
     beer_win32_syscall_selector = 1;
     assert(getpid() > 0);

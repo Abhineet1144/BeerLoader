@@ -10,8 +10,10 @@
  * Windows. Everything is parsed from the file's own signature data; nothing is
  * synthesized. Unsupported parameters fail with the native error codes. */
 
+#include <openssl/bio.h>
 #include <openssl/pkcs7.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #define BEER_CRYPT_ENCODING        0x00010001u   /* X509_ASN_ENCODING | PKCS_7_ASN_ENCODING */
 #define BEER_CRYPT_E_INVALID_MSG_TYPE 0x80091004u
@@ -556,4 +558,275 @@ static void crypt_wintrust_signature_settings(const u8 *trust_data)
     PKCS7_free(p7);
     if (flags & 0x2u) *(u32 *)(settings + 0x0c) = secondary;    /* WSS_GET_SECONDARY_SIG_COUNT */
     *(u32 *)(settings + 0x10) = (flags & 0x1u) ? *(const u32 *)(settings + 4) : 0;   /* WSS_VERIFY_SPECIFIC */
+}
+
+/* CertGetNameStringA/W(PCCERT_CONTEXT, dwType, dwFlags, pvTypePara, psz, cch): a name read from the certificate's
+ * own subject (or issuer with CERT_NAME_ISSUER_FLAG 0x1). Types: 1 EMAIL, 2 RDN (comma-separated, OpenSSL's RFC 2253
+ * order reversed into the Windows X.500 order), 3 ATTR (pvTypePara = OID string), 4 SIMPLE_DISPLAY and 5
+ * FRIENDLY_DISPLAY (CN, else OU, else O, else e-mail), 6 DNS (CN). Returns characters written including the
+ * terminator; with no buffer (or cch 0) the size needed. An absent name is the empty string (returns 1), as on
+ * Windows. */
+static size_t crypt_name_attribute(X509_NAME *name, int nid, char *out, size_t size)
+{
+    out[0] = 0;
+    const int index = name ? X509_NAME_get_index_by_NID(name, nid, -1) : -1;
+    if (index < 0) return 0;
+    ASN1_STRING *value = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, index));
+    unsigned char *utf8 = NULL;
+    const int length = value ? ASN1_STRING_to_UTF8(&utf8, value) : -1;
+    if (length < 0) return 0;
+    snprintf(out, size, "%.*s", length, (const char *)utf8);
+    OPENSSL_free(utf8);
+    return strlen(out);
+}
+
+static void crypt_cert_name(const u8 *context, u32 type, u32 flags, const void *type_parameter, char *out, size_t size)
+{
+    out[0] = 0;
+    if (!context) return;
+    const unsigned char *der = (const unsigned char *)(uintptr_t)*(const u64 *)(context + 0x08);
+    X509 *cert = der ? d2i_X509(NULL, &der, (long)*(const u32 *)(context + 0x10)) : NULL;
+    if (!cert) return;
+    X509_NAME *name = (flags & 0x1u) ? X509_get_issuer_name(cert) : X509_get_subject_name(cert);
+    switch (type) {
+    case 1:                                                    /* CERT_NAME_EMAIL_TYPE */
+        crypt_name_attribute(name, NID_pkcs9_emailAddress, out, size);
+        break;
+    case 2: {                                                  /* CERT_NAME_RDN_TYPE */
+        BIO *bio = BIO_new(BIO_s_mem());
+        if (bio && X509_NAME_print_ex(bio, name, 0, XN_FLAG_ONELINE & ~ASN1_STRFLGS_ESC_MSB & ~XN_FLAG_SPC_EQ) >= 0) {
+            const int length = BIO_read(bio, out, (int)size - 1);
+            out[length > 0 ? length : 0] = 0;
+        }
+        BIO_free(bio);
+        break;
+    }
+    case 3: {                                                  /* CERT_NAME_ATTR_TYPE */
+        const char *oid = type_parameter;
+        ASN1_OBJECT *object = oid ? OBJ_txt2obj(oid, 1) : NULL;
+        if (object) crypt_name_attribute(name, OBJ_obj2nid(object), out, size);
+        ASN1_OBJECT_free(object);
+        break;
+    }
+    case 4: case 5: case 6:                                    /* SIMPLE_DISPLAY, FRIENDLY_DISPLAY, DNS */
+        if (!crypt_name_attribute(name, NID_commonName, out, size) && type != 6 &&
+            !crypt_name_attribute(name, NID_organizationalUnitName, out, size) &&
+            !crypt_name_attribute(name, NID_organizationName, out, size))
+            crypt_name_attribute(name, NID_pkcs9_emailAddress, out, size);
+        break;
+    default:
+        break;
+    }
+    X509_free(cert);
+}
+
+static u64 __attribute__((ms_abi))
+impl_CertGetNameStringA(const u8 *context, u32 type, u32 flags, const void *type_parameter, char *buffer, u32 count)
+{
+    char name[1024];
+    crypt_cert_name(context, type, flags, type_parameter, name, sizeof(name));
+    const size_t length = strlen(name);
+    if (!buffer || !count) return (u64)(length + 1);
+    const size_t written = length < count ? length : count - 1;
+    memcpy(buffer, name, written);
+    buffer[written] = 0;
+    return (u64)(written + 1);
+}
+
+static u64 __attribute__((ms_abi))
+impl_CertGetNameStringW(const u8 *context, u32 type, u32 flags, const void *type_parameter, u16 *buffer, u32 count)
+{
+    char name[1024];
+    crypt_cert_name(context, type, flags, type_parameter, name, sizeof(name));
+    u16 wide[1024];
+    size_t length = 0;
+    for (const unsigned char *p = (const unsigned char *)name; *p && length + 1 < sizeof(wide) / sizeof(*wide);) {
+        u32 c = *p++;                                          /* UTF-8 -> UTF-16 (BMP) */
+        if (c >= 0xc0 && c < 0xe0 && *p) c = ((c & 0x1f) << 6) | (*p++ & 0x3f);
+        else if (c >= 0xe0 && c < 0xf0 && p[0] && p[1]) { c = ((c & 0x0f) << 12) | ((p[0] & 0x3f) << 6) | (p[1] & 0x3f); p += 2; }
+        wide[length++] = (u16)c;
+    }
+    if (!buffer || !count) return (u64)(length + 1);
+    const size_t written = length < count ? length : count - 1;
+    memcpy(buffer, wide, written * sizeof(u16));
+    buffer[written] = 0;
+    return (u64)(written + 1);
+}
+
+/* CertGetIssuerCertificateFromStore(hCertStore, pSubjectContext, pPrevIssuerContext, *pdwFlags): the next certificate
+ * in the store that issued the subject. Flags in, cleared on success: CERT_STORE_SIGNATURE_FLAG 0x1 (the subject's
+ * signature verifies with the issuer's key), CERT_STORE_TIME_VALIDITY_FLAG 0x2 (the subject is valid now);
+ * CERT_STORE_REVOCATION_FLAG 0x4 stays set with CERT_STORE_NO_CRL_FLAG 0x10000 (no CRL is available). A self-signed
+ * subject has no issuer here (CRYPT_E_SELF_SIGNED). pPrevIssuerContext is freed, as on Windows. */
+static u64 __attribute__((ms_abi))
+impl_CertGetIssuerCertificateFromStore(u64 handle, const u8 *subject_context, const u8 *previous, u32 *flags)
+{
+    BeerCertStore *store = cert_store(handle);
+    if (!store || !subject_context) { g_last_error = 87; return 0; }
+    int start = 0;
+    if (previous) {
+        start = (int)*(const u32 *)(previous - 16) + 1;
+        free((void *)(previous - 16));
+    }
+    const unsigned char *der = (const unsigned char *)(uintptr_t)*(const u64 *)(subject_context + 0x08);
+    X509 *subject = der ? d2i_X509(NULL, &der, (long)*(const u32 *)(subject_context + 0x10)) : NULL;
+    if (!subject) { g_last_error = BEER_CRYPT_E_NOT_FOUND; return 0; }
+    if (X509_check_issued(subject, subject) == X509_V_OK) {
+        X509_free(subject);
+        g_last_error = 0x80092007u;                            /* CRYPT_E_SELF_SIGNED */
+        return 0;
+    }
+    for (int i = start; i < sk_X509_num(store->certs); ++i) {
+        X509 *issuer = sk_X509_value(store->certs, i);
+        if (X509_check_issued(issuer, subject) != X509_V_OK) continue;
+        if (flags) {
+            EVP_PKEY *key = X509_get0_pubkey(issuer);
+            if ((*flags & 0x1u) && key && X509_verify(subject, key) == 1) *flags &= ~0x1u;
+            if ((*flags & 0x2u) && X509_cmp_current_time(X509_get0_notBefore(subject)) < 0 &&
+                X509_cmp_current_time(X509_get0_notAfter(subject)) > 0)
+                *flags &= ~0x2u;
+            if (*flags & 0x4u) *flags |= 0x10000u;
+        }
+        X509_free(subject);
+        size_t size = crypt_cert_context(NULL, issuer, handle);
+        u8 *allocation = calloc(1, 16 + size);
+        if (!allocation) { g_last_error = 8; return 0; }
+        *(u32 *)allocation = (u32)i;
+        crypt_cert_context(allocation + 16, issuer, handle);
+        return (u64)(uintptr_t)(allocation + 16);
+    }
+    X509_free(subject);
+    g_last_error = BEER_CRYPT_E_NOT_FOUND;
+    return 0;
+}
+
+/* ---- WinVerifyTrust state (WTD_STATEACTION_VERIFY) and the WTHelper* accessors ----
+ * CRYPT_PROVIDER_DATA (0xf0 bytes x64): pWintrustData@0x08, chStores@0x58, pahStores@0x60, dwEncoding@0x68,
+ * hMsg@0x70, csSigners@0x78, pasSigners@0x80, dwSubjectChoice@0x98, dwProvFlags@0xc8.
+ * CRYPT_PROVIDER_SGNR (0x40): sftVerifyAsOf@0x04, csCertChain@0x0c, pasCertChain@0x10, psSigner@0x20.
+ * CRYPT_PROVIDER_CERT (0x58): pCert@0x08, fTrustedRoot@0x14, fSelfSigned@0x18, dwConfidence@0x24.
+ * Built from the file's own signature: the signer, its certificate chain through the certificates embedded in the
+ * signature (ending at a self-signed root when present), the signer information, the message and its store. Beer
+ * does not decide trust beyond that (WinVerifyTrust's result is unchanged). */
+#define BEER_TRUST_STATE_MAGIC 0x54535254u   /* "TRST" */
+#define BEER_TRUST_CHAIN_MAX 8
+typedef struct {
+    u32 magic;
+    u8 provider[0xf0];
+    u8 signer[0x40];
+    u8 certs[BEER_TRUST_CHAIN_MAX][0x58];
+    u64 contexts[BEER_TRUST_CHAIN_MAX];
+    u64 store_array[1];
+    u64 msg, store;
+    void *signer_info;
+} BeerTrustState;
+
+static u64 crypt_context_for(X509 *cert, u64 store)
+{
+    size_t size = crypt_cert_context(NULL, cert, store);
+    u8 *allocation = calloc(1, 16 + size);
+    if (!allocation) return 0;
+    crypt_cert_context(allocation + 16, cert, store);
+    return (u64)(uintptr_t)(allocation + 16);
+}
+
+static u64 crypt_trust_state_create(const char *host_path, const u8 *trust_data)
+{
+    PKCS7 *p7 = crypt_pe_signature(host_path);
+    if (!p7 || !PKCS7_type_is_signed(p7)) { PKCS7_free(p7); return 0; }
+    STACK_OF(PKCS7_SIGNER_INFO) *signers = PKCS7_get_signer_info(p7);
+    PKCS7_SIGNER_INFO *signer_info = signers && sk_PKCS7_SIGNER_INFO_num(signers) > 0
+        ? sk_PKCS7_SIGNER_INFO_value(signers, 0) : NULL;
+    BeerTrustState *state = signer_info ? calloc(1, sizeof(*state)) : NULL;
+    if (!state) { PKCS7_free(p7); return 0; }
+    state->magic = BEER_TRUST_STATE_MAGIC;
+    BeerCertStore *store = cert_store_from_p7(p7);
+    state->store = (u64)(uintptr_t)store;
+    BeerCryptMsg *message = calloc(1, sizeof(*message));
+    if (message) { message->magic = BEER_CRYPT_MSG_MAGIC; message->p7 = p7; p7 = NULL; }
+    state->msg = (u64)(uintptr_t)message;
+    PKCS7 *signed_data = message ? message->p7 : p7;
+
+    /* Chain: the signing certificate, then each issuer found among the embedded certificates. */
+    u32 chain = 0;
+    X509 *current = PKCS7_cert_from_signer_info(signed_data, signer_info);
+    STACK_OF(X509) *certs = store ? store->certs : NULL;
+    while (current && chain < BEER_TRUST_CHAIN_MAX) {
+        u8 *entry = state->certs[chain];
+        const int self_signed = X509_check_issued(current, current) == X509_V_OK;
+        *(u32 *)entry = 0x58;
+        state->contexts[chain] = crypt_context_for(current, state->store);
+        *(u64 *)(entry + 0x08) = state->contexts[chain];
+        *(u32 *)(entry + 0x18) = (u32)self_signed;              /* fSelfSigned */
+        ++chain;
+        if (self_signed) break;
+        X509 *next = NULL;
+        for (int i = 0; certs && i < sk_X509_num(certs) && !next; ++i) {
+            X509 *candidate = sk_X509_value(certs, i);
+            if (candidate != current && X509_check_issued(candidate, current) == X509_V_OK) next = candidate;
+        }
+        current = next;
+    }
+    u32 info_length = 0;
+    if (message && impl_CryptMsgGetParam(state->msg, 6, 0, NULL, &info_length) && info_length &&
+        (state->signer_info = calloc(1, info_length)) &&
+        !impl_CryptMsgGetParam(state->msg, 6, 0, state->signer_info, &info_length)) {
+        free(state->signer_info);
+        state->signer_info = NULL;
+    }
+    u8 *signer = state->signer;
+    *(u32 *)signer = 0x40;
+    u64 now = 0;
+    impl_GetSystemTimeAsFileTime(&now);
+    memcpy(signer + 0x04, &now, 8);
+    *(u32 *)(signer + 0x0c) = chain;
+    *(u64 *)(signer + 0x10) = (u64)(uintptr_t)state->certs;
+    *(u64 *)(signer + 0x20) = (u64)(uintptr_t)state->signer_info;
+
+    u8 *provider = state->provider;
+    state->store_array[0] = state->store;
+    *(u32 *)provider = 0xf0;
+    *(u64 *)(provider + 0x08) = (u64)(uintptr_t)trust_data;
+    *(u32 *)(provider + 0x58) = state->store ? 1 : 0;
+    *(u64 *)(provider + 0x60) = (u64)(uintptr_t)state->store_array;
+    *(u32 *)(provider + 0x68) = BEER_CRYPT_ENCODING;
+    *(u64 *)(provider + 0x70) = state->msg;
+    *(u32 *)(provider + 0x78) = 1;
+    *(u64 *)(provider + 0x80) = (u64)(uintptr_t)state->signer;
+    *(u32 *)(provider + 0x98) = 1;                              /* CPD_CHOICE_SIP */
+    PKCS7_free(p7);
+    return (u64)(uintptr_t)state;
+}
+
+static void crypt_trust_state_close(u64 handle)
+{
+    BeerTrustState *state = (BeerTrustState *)(uintptr_t)handle;
+    if (!state || state->magic != BEER_TRUST_STATE_MAGIC) return;
+    state->magic = 0;
+    for (int i = 0; i < BEER_TRUST_CHAIN_MAX; ++i)
+        if (state->contexts[i]) impl_CertFreeCertificateContext((void *)(uintptr_t)state->contexts[i]);
+    if (state->msg) impl_CryptMsgClose(state->msg);
+    if (state->store) impl_CertCloseStore(state->store, 0);
+    free(state->signer_info);
+    free(state);
+}
+
+static u64 __attribute__((ms_abi)) impl_WTHelperProvDataFromStateData(u64 handle)
+{
+    BeerTrustState *state = (BeerTrustState *)(uintptr_t)handle;
+    return state && state->magic == BEER_TRUST_STATE_MAGIC ? (u64)(uintptr_t)state->provider : 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_WTHelperGetProvSignerFromChain(u8 *provider, u32 index, u32 counter_signer, u32 counter_index)
+{
+    (void)counter_index;
+    if (!provider || counter_signer || index >= *(const u32 *)(provider + 0x78)) return 0;   /* no counter-signers */
+    return *(const u64 *)(provider + 0x80) + (u64)index * 0x40;
+}
+
+static u64 __attribute__((ms_abi)) impl_WTHelperGetProvCertFromChain(u8 *signer, u32 index)
+{
+    if (!signer || index >= *(const u32 *)(signer + 0x0c)) return 0;
+    return *(const u64 *)(signer + 0x10) + (u64)index * 0x58;
 }

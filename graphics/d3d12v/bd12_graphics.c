@@ -355,6 +355,7 @@ void bd12_cmd_set_graphics_root_signature(BD12CmdList *list,
     if (list->graphics.root_signature == signature) return;
     memset(list->graphics.arguments, 0, sizeof(list->graphics.arguments));
     list->graphics.root_signature = signature;
+    ++list->graphics.epoch;
 }
 
 void bd12_cmd_set_graphics_root_constants(BD12CmdList *list, uint32_t parameter,
@@ -365,22 +366,28 @@ void bd12_cmd_set_graphics_root_constants(BD12CmdList *list, uint32_t parameter,
         dest_offset + count > BD12_MAX_ROOT_CONSTANTS)
         return;
     BD12RootArgument *arg = &list->graphics.arguments[parameter];
+    if (arg->cbv_valid && !memcmp(&arg->constants[dest_offset], data, count * sizeof(uint32_t))) return;
     memcpy(&arg->constants[dest_offset], data, count * sizeof(uint32_t));
     arg->cbv_valid = 0;
+    ++list->graphics.epoch;
 }
 
 void bd12_cmd_set_graphics_root_va(BD12CmdList *list, uint32_t parameter,
                                    uint64_t gpu_va)
 {
-    if (parameter < BD12_MAX_ROOT_PARAMETERS)
+    if (parameter < BD12_MAX_ROOT_PARAMETERS && list->graphics.arguments[parameter].value != gpu_va) {
         list->graphics.arguments[parameter].value = gpu_va;
+        ++list->graphics.epoch;
+    }
 }
 
 void bd12_cmd_set_graphics_root_table(BD12CmdList *list, uint32_t parameter,
                                       uint64_t gpu_handle)
 {
-    if (parameter < BD12_MAX_ROOT_PARAMETERS)
+    if (parameter < BD12_MAX_ROOT_PARAMETERS && list->graphics.arguments[parameter].value != gpu_handle) {
         list->graphics.arguments[parameter].value = gpu_handle;
+        ++list->graphics.epoch;
+    }
 }
 
 void bd12_cmd_set_graphics_pipeline(BD12CmdList *list,

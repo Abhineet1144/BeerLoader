@@ -45,6 +45,7 @@ static struct {
     uint32_t panel_color, text_color, accent_color;
     int opacity;         /* panel opacity, permille */
     int fields;
+    int row;             /* layout: 0 = panels (one value per line), 1 = one compact line per box */
     Box box[2];          /* 0 = resources, 1 = pinned values */
     Pin pins[MAX_PINS];
     /* sampler */
@@ -53,6 +54,7 @@ static struct {
     uint64_t rss_mb, threads;
     char resource_text[512];
     uint64_t pin_ns;
+    int pin_count;
     char pin_text[1024];
 } ov = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
@@ -111,23 +113,38 @@ static void draw_glyph(uint8_t *buffer, int stride_px, int x, int y, const Overl
         }
 }
 
-/* Renders `text` (lines separated by \n; a line starting with \x01 is the accent-coloured title). */
+/* Renders `text` (lines separated by \n; \x01 switches to the accent colour, \x02 back to the text colour, \x04 to a
+ * dim colour, and a new line starts in the text colour). The frame-time graph goes below the text, or, when the
+ * text holds a \x03, into that slot of the line (GRAPH_SLOT character cells wide). */
+#define GRAPH_SLOT 12
 static int render_box(Box *box, const char *text, int graph, uint64_t graph_stamp)
 {
+    const int inline_graph = strchr(text, '\x03') != NULL;
+    if (inline_graph) graph = 1;
     if (!strcmp(box->text, text) && box->pixels && (!graph || box->graph_stamp == graph_stamp)) return 0;
     const OverlayFont *font = &overlay_fonts[box->size < 0 ? 0 : box->size >= OVERLAY_FONT_COUNT ? OVERLAY_FONT_COUNT - 1 : box->size];
     int lines = 1, longest = 0, current = 0;
     for (const char *p = text; *p; ++p) {
         if (*p == '\n') { ++lines; current = 0; continue; }
-        if (*p == '\x01') continue;
-        if (++current > longest) longest = current;
+        if (*p == '\x01' || *p == '\x02' || *p == '\x04') continue;
+        current += *p == '\x03' ? GRAPH_SLOT : 1;
+        if (current > longest) longest = current;
     }
     const int pad = font->cell_h / 3 + 2;
-    const int graph_h = graph ? font->cell_h * 3 : 0;
-    int graph_w = longest * font->cell_w;
-    if (graph && graph_w < font->cell_w * 28) graph_w = font->cell_w * 28;
-    const int w = (graph ? graph_w : longest * font->cell_w) + pad * 2;
-    const int h = lines * font->cell_h + pad * 2 + (graph ? graph_h + pad : 0);
+    const int text_w = longest * font->cell_w;
+    int graph_w, graph_h, w, h, slot_x = pad, slot_y = pad;
+    if (inline_graph) {
+        graph_w = font->cell_w * GRAPH_SLOT - font->cell_w;   /* half a cell of space on each side */
+        graph_h = font->cell_h - 4;
+        w = text_w + pad * 2;
+        h = lines * font->cell_h + pad * 2;
+    } else {
+        graph_h = graph ? font->cell_h * 3 : 0;
+        graph_w = text_w;
+        if (graph && graph_w < font->cell_w * 28) graph_w = font->cell_w * 28;
+        w = (graph ? graph_w : text_w) + pad * 2;
+        h = lines * font->cell_h + pad * 2 + (graph ? graph_h + pad : 0);
+    }
     const size_t need = (size_t)w * h * 4;
     if (need > box->capacity) {
         uint8_t *grown = realloc(box->pixels, need);
@@ -143,15 +160,27 @@ static int render_box(Box *box, const char *text, int graph, uint64_t graph_stam
     for (int i = 0; i < h; ++i) { put_pixel(box->pixels + (size_t)i * w * 4, ov.accent_color, 255); put_pixel(box->pixels + ((size_t)i * w + w - 1) * 4, ov.accent_color, 255); }
     int line = 0, col = 0;
     uint32_t color = ov.text_color;
+    const uint32_t dim = (((ov.text_color & 0xff) + (ov.panel_color & 0xff)) / 2) |
+                         (((((ov.text_color >> 8) & 0xff) + ((ov.panel_color >> 8) & 0xff)) / 2) << 8) |
+                         (((((ov.text_color >> 16) & 0xff) + ((ov.panel_color >> 16) & 0xff)) / 2) << 16);
     for (const char *p = text; *p; ++p) {
         if (*p == '\n') { ++line; col = 0; color = ov.text_color; continue; }
         if (*p == '\x01') { color = ov.accent_color; continue; }
+        if (*p == '\x02') { color = ov.text_color; continue; }
+        if (*p == '\x04') { color = dim; continue; }
+        if (*p == '\x03') {
+            slot_x = pad + col * font->cell_w + font->cell_w / 2;
+            slot_y = pad + line * font->cell_h + 2;
+            col += GRAPH_SLOT;
+            continue;
+        }
         draw_glyph(box->pixels, w, pad + col * font->cell_w, pad + line * font->cell_h, font, *p, color);
         ++col;
     }
     if (graph) {
         /* Frame-time bars: newest on the right, green <= 16.7 ms, yellow <= 33.3 ms, red above; dim 60 fps guide line. */
-        const int gx = pad, gy = pad + lines * font->cell_h + pad / 2;
+        const int gx = inline_graph ? slot_x : pad;
+        const int gy = inline_graph ? slot_y : pad + lines * font->cell_h + pad / 2;
         const unsigned head = atomic_load_explicit(&frame_head, memory_order_relaxed);
         const int bars = graph_w / 2 < FRAME_RING ? graph_w / 2 : FRAME_RING;
         uint32_t peak = 33333;
@@ -197,6 +226,88 @@ static int render_box(Box *box, const char *text, int graph, uint64_t graph_stam
 
 /* ---- content ---- */
 
+/* One value of the panel layout: a padded "Label      value" line. */
+static void add_item(char **cursor, char *end, const char *label, const char *value)
+{
+    char *c = *cursor;
+    if (c >= end) return;
+    c += snprintf(c, (size_t)(end - c), "\n%-10s %s", label, value);
+    *cursor = c < end ? c : end - 1;
+}
+
+/* One group of the row layout: "LABEL values", separated from the previous group by a dim bar. */
+static void add_segment(char **cursor, char *end, const char *label, const char *values)
+{
+    char *c = *cursor;
+    if (c >= end) return;
+    const int first = c == ov.resource_text || c == ov.pin_text;
+    c += snprintf(c, (size_t)(end - c), "%s\x01%s\x02 %s", first ? "" : "\x04 | \x02", label, values);
+    *cursor = c < end ? c : end - 1;
+}
+
+/* Gigabytes with one decimal, the way the row layout shows memory. */
+static void format_gb(char *out, size_t size, uint64_t mb)
+{
+    const uint64_t tenths = (mb * 10 + 512) / 1024;
+    snprintf(out, size, "%llu.%lluG", (unsigned long long)(tenths / 10), (unsigned long long)(tenths % 10));
+}
+
+/* Row layout: few, grouped values like MangoHud's horizontal bar.
+ *   CPU 12% | GPU 35% 4.6G | RAM 2.4G | FPS 60 16.7ms [graph] | 23:14:46 */
+static void build_row(void)
+{
+    char *c = ov.resource_text, *end = c + sizeof(ov.resource_text);
+    *c = 0;
+    char values[96], part[32];
+    if (ov.fields & FIELD_CPU) {
+        const long logical = sysconf(_SC_NPROCESSORS_ONLN) > 0 ? sysconf(_SC_NPROCESSORS_ONLN) : 1;
+        snprintf(values, sizeof(values), "%d%%", (ov.cpu_x10 / (int)logical + 5) / 10);
+        add_segment(&c, end, "CPU", values);
+    }
+    if (ov.fields & (FIELD_GPU | FIELD_VRAM)) {
+        int util = 0;
+        uint64_t used = 0, total = 0, mine = 0;
+        const int have = beer_gpu_stats_get(&util, &used, &total, &mine);
+        values[0] = 0;
+        if (ov.fields & FIELD_GPU) snprintf(values, sizeof(values), have ? "%d%%" : "n/a", util);
+        if ((ov.fields & FIELD_VRAM) && have && total) {
+            format_gb(part, sizeof(part), used);
+            snprintf(values + strlen(values), sizeof(values) - strlen(values), "%s%s", values[0] ? " " : "", part);
+        }
+        if (values[0]) add_segment(&c, end, "GPU", values);
+    }
+    if (ov.fields & FIELD_RAM) {
+        format_gb(values, sizeof(values), ov.rss_mb);
+        add_segment(&c, end, "RAM", values);
+    }
+    if (ov.fields & (FIELD_FPS | FIELD_FRAMETIME | FIELD_GRAPH)) {
+        values[0] = 0;
+        if (ov.fields & FIELD_FPS) snprintf(values, sizeof(values), "%d", (ov.fps_x10 + 5) / 10);
+        if ((ov.fields & FIELD_FRAMETIME) && ov.fps_x10 > 0) {
+            const int ms_x10 = 100000 / ov.fps_x10;
+            snprintf(values + strlen(values), sizeof(values) - strlen(values), "%s%d.%dms", values[0] ? " " : "", ms_x10 / 10, ms_x10 % 10);
+        }
+        if (ov.fields & FIELD_GRAPH) snprintf(values + strlen(values), sizeof(values) - strlen(values), "%s\x03", values[0] ? " " : "");
+        add_segment(&c, end, "FPS", values);
+    }
+    if (ov.fields & FIELD_SPEED) {
+        const int s = beer_control_paused() ? 0 : beer_control_time_scale_milli();
+        if (beer_control_paused()) add_segment(&c, end, "SPEED", "paused");
+        else if (s != 1000) {
+            snprintf(values, sizeof(values), "%d.%02dx", s / 1000, (s % 1000) / 10);
+            add_segment(&c, end, "SPEED", values);
+        }
+    }
+    if (ov.fields & FIELD_CLOCK) {
+        time_t t = time(NULL);
+        struct tm local;
+        localtime_r(&t, &local);
+        snprintf(values, sizeof(values), "%02d:%02d:%02d", local.tm_hour, local.tm_min, local.tm_sec);
+        /* the time needs no label */
+        if (c < end) c += snprintf(c, (size_t)(end - c), "%s%s", c == ov.resource_text ? "" : "\x04 | \x02", values);
+    }
+}
+
 static void sample_resources(void)
 {
     const uint64_t now = now_ns();
@@ -211,49 +322,70 @@ static void sample_resources(void)
     }
     ov.sample_ns = now; ov.sample_frames = frames; ov.sample_ticks = ticks;
     ov.rss_mb = rss_kb / 1024; ov.threads = threads;
+    if (ov.row) { build_row(); return; }
     char *c = ov.resource_text, *end = c + sizeof(ov.resource_text);
+    char value[96];
     c += snprintf(c, (size_t)(end - c), "\x01" "Resources");
-    if (ov.fields & FIELD_FPS) c += snprintf(c, (size_t)(end - c), "\nFPS        %d.%d", ov.fps_x10 / 10, ov.fps_x10 % 10);
+    if (ov.fields & FIELD_FPS) {
+        snprintf(value, sizeof(value), "%d.%d", ov.fps_x10 / 10, ov.fps_x10 % 10);
+        add_item(&c, end, "FPS", value);
+    }
     if ((ov.fields & FIELD_FRAMETIME) && ov.fps_x10 > 0) {
         const int ms_x10 = 100000 / ov.fps_x10;
-        c += snprintf(c, (size_t)(end - c), "\nFrame time %d.%d ms", ms_x10 / 10, ms_x10 % 10);
+        snprintf(value, sizeof(value), "%d.%d ms", ms_x10 / 10, ms_x10 % 10);
+        add_item(&c, end, "Frame time", value);
     }
     if (ov.fields & FIELD_CPU) {
         /* Share of the whole machine (like a task manager), plus how many cores' worth of work that is. */
         const long logical = sysconf(_SC_NPROCESSORS_ONLN) > 0 ? sysconf(_SC_NPROCESSORS_ONLN) : 1;
         const int total_x10 = ov.cpu_x10 / (int)logical;
-        c += snprintf(c, (size_t)(end - c), "\nCPU        %d.%d%% (%d.%d cores)", total_x10 / 10, total_x10 % 10, ov.cpu_x10 / 1000, (ov.cpu_x10 / 100) % 10);
+        snprintf(value, sizeof(value), "%d.%d%% (%d.%d cores)", total_x10 / 10, total_x10 % 10, ov.cpu_x10 / 1000, (ov.cpu_x10 / 100) % 10);
+        add_item(&c, end, "CPU", value);
     }
-    if (ov.fields & FIELD_RAM) c += snprintf(c, (size_t)(end - c), "\nRAM        %llu MB", (unsigned long long)ov.rss_mb);
-    if (ov.fields & FIELD_THREADS) c += snprintf(c, (size_t)(end - c), "\nThreads    %llu", (unsigned long long)ov.threads);
+    if (ov.fields & FIELD_RAM) {
+        snprintf(value, sizeof(value), "%llu MB", (unsigned long long)ov.rss_mb);
+        add_item(&c, end, "RAM", value);
+    }
+    if (ov.fields & FIELD_THREADS) {
+        snprintf(value, sizeof(value), "%llu", (unsigned long long)ov.threads);
+        add_item(&c, end, "Threads", value);
+    }
     if (ov.fields & FIELD_SPEED) {
         const int s = beer_control_paused() ? 0 : beer_control_time_scale_milli();
-        c += snprintf(c, (size_t)(end - c), "\nSpeed      %d.%02dx%s", s / 1000, (s % 1000) / 10, beer_control_paused() ? " (paused)" : "");
+        snprintf(value, sizeof(value), "%d.%02dx%s", s / 1000, (s % 1000) / 10, beer_control_paused() ? " (paused)" : "");
+        add_item(&c, end, "Speed", value);
     }
     if (ov.fields & (FIELD_GPU | FIELD_VRAM)) {
         int util = 0;
         uint64_t used = 0, total = 0, mine = 0;
         const int have = beer_gpu_stats_get(&util, &used, &total, &mine);
         if (ov.fields & FIELD_GPU) {
-            if (have) c += snprintf(c, (size_t)(end - c), "\nGPU        %d%%", util);
-            else c += snprintf(c, (size_t)(end - c), "\nGPU        n/a");
+            if (have) snprintf(value, sizeof(value), "%d%%", util);
+            else snprintf(value, sizeof(value), "n/a");
+            add_item(&c, end, "GPU", value);
         }
         if (ov.fields & FIELD_VRAM) {
             if (have && total) {
-                c += snprintf(c, (size_t)(end - c), "\nVRAM       %llu / %llu MB", (unsigned long long)used, (unsigned long long)total);
-                if (mine) c += snprintf(c, (size_t)(end - c), "\n  this game %llu MB", (unsigned long long)mine);
-            } else c += snprintf(c, (size_t)(end - c), "\nVRAM       n/a");
+                snprintf(value, sizeof(value), "%llu / %llu MB", (unsigned long long)used, (unsigned long long)total);
+                add_item(&c, end, "VRAM", value);
+                if (mine) {
+                    snprintf(value, sizeof(value), "%llu MB", (unsigned long long)mine);
+                    add_item(&c, end, "  this game", value);
+                }
+            } else add_item(&c, end, "VRAM", "n/a");
         }
     }
     if (ov.fields & FIELD_CLOCK) {
         time_t t = time(NULL);
         struct tm local;
         localtime_r(&t, &local);
-        c += snprintf(c, (size_t)(end - c), "\nTime       %02d:%02d:%02d", local.tm_hour, local.tm_min, local.tm_sec);
+        snprintf(value, sizeof(value), "%02d:%02d:%02d", local.tm_hour, local.tm_min, local.tm_sec);
+        add_item(&c, end, "Time", value);
     }
     if (ov.fields & FIELD_UPTIME) {
         const unsigned long long up = beer_control_uptime_s();
-        c += snprintf(c, (size_t)(end - c), "\nUptime     %llu:%02llu", up / 60, up % 60);
+        snprintf(value, sizeof(value), "%llu:%02llu", up / 60, up % 60);
+        add_item(&c, end, "Uptime", value);
     }
 }
 
@@ -263,16 +395,18 @@ static void build_pins(void)
     if (ov.pin_ns && now - ov.pin_ns < 150000000ull) return;
     ov.pin_ns = now;
     char *c = ov.pin_text, *end = c + sizeof(ov.pin_text);
-    c += snprintf(c, (size_t)(end - c), "\x01" "Pinned memory");
-    int any = 0;
+    *c = 0;
+    if (!ov.row) c += snprintf(c, (size_t)(end - c), "\x01" "Pinned memory");
+    int count = 0;
     for (int i = 0; i < MAX_PINS && end - c > 80; ++i) {
         if (!ov.pins[i].used) continue;
-        any = 1;
+        ++count;
         char value[48];
         if (!beer_memory_peek(ov.pins[i].addr, ov.pins[i].type, value, sizeof(value))) snprintf(value, sizeof(value), "??");
-        c += snprintf(c, (size_t)(end - c), "\n%s: %s", ov.pins[i].label, value);
+        if (ov.row) add_segment(&c, end, ov.pins[i].label, value);
+        else c += snprintf(c, (size_t)(end - c), "\n%s: %s", ov.pins[i].label, value);
     }
-    if (!any) snprintf(c, (size_t)(end - c), "\nNothing pinned yet.\nPin values from the manager's\nMemory window.");
+    ov.pin_count = count;   /* the pinned box is only drawn while something is pinned */
 }
 
 int beer_overlay_frame(int out_w, int out_h, BeerOverlayRect rects[2])
@@ -285,8 +419,8 @@ int beer_overlay_frame(int out_w, int out_h, BeerOverlayRect rects[2])
         const char *texts[2] = { ov.resource_text, ov.pin_text };
         for (int i = 0; i < 2; ++i) {
             Box *box = &ov.box[i];
-            if (!box->enabled) continue;
-            render_box(box, texts[i], i == 0 && (ov.fields & FIELD_GRAPH), now_ns() / 100000000ull);
+            if (!box->enabled || (i == 1 && !ov.pin_count) || !texts[i][0]) continue;
+            render_box(box, texts[i], !ov.row && i == 0 && (ov.fields & FIELD_GRAPH), now_ns() / 100000000ull);
             if (!box->pixels) continue;
             int x = (int)((long long)out_w * box->x / 1000), y = (int)((long long)out_h * box->y / 1000);
             if (x + box->w > out_w) x = out_w - box->w;
@@ -343,7 +477,15 @@ static void apply_config(const char *request)
     if (beer_json_string(request, "text_color", text, sizeof(text))) ov.text_color = (uint32_t)strtoul(text, NULL, 16) & 0xffffff;
     if (beer_json_string(request, "accent_color", text, sizeof(text))) ov.accent_color = (uint32_t)strtoul(text, NULL, 16) & 0xffffff;
     if (beer_json_milli(request, "opacity", &v)) ov.opacity = v < 100 ? 100 : v > 1000 ? 1000 : v;
-    if (beer_json_string(request, "fields", text, sizeof(text))) fields_from_string(text);
+    if (beer_json_string(request, "fields", text, sizeof(text))) {
+        fields_from_string(text);
+        ov.sample_ns = 0;   /* rebuild the text with the new fields */
+    }
+    if (beer_json_string(request, "layout", text, sizeof(text))) {
+        ov.row = !strcmp(text, "row");
+        ov.sample_ns = 0;   /* rebuild both texts in the new layout */
+        ov.pin_ns = 0;
+    }
     static const char *const prefix[2] = { "res_", "pin_" };
     for (int i = 0; i < 2; ++i) {
         char key[24];
@@ -362,9 +504,9 @@ static void apply_config(const char *request)
 static void config_json(char *out, size_t size)
 {
     snprintf(out, size,
-             "{\"ok\":true,\"visible\":%s,\"hotkey_keysym\":%lu,\"hotkey_mods\":%u,\"panel_color\":\"%06x\",\"text_color\":\"%06x\",\"accent_color\":\"%06x\",\"opacity\":%d.%03d,"
+             "{\"ok\":true,\"layout\":\"%s\",\"visible\":%s,\"hotkey_keysym\":%lu,\"hotkey_mods\":%u,\"panel_color\":\"%06x\",\"text_color\":\"%06x\",\"accent_color\":\"%06x\",\"opacity\":%d.%03d,"
              "\"res_enabled\":%s,\"res_x\":%d.%03d,\"res_y\":%d.%03d,\"res_size\":%d,\"pin_enabled\":%s,\"pin_x\":%d.%03d,\"pin_y\":%d.%03d,\"pin_size\":%d}\n",
-             ov.visible ? "true" : "false", ov.hotkey_keysym, ov.hotkey_mods, ov.panel_color, ov.text_color, ov.accent_color, ov.opacity / 1000, ov.opacity % 1000,
+             ov.row ? "row" : "panel", ov.visible ? "true" : "false", ov.hotkey_keysym, ov.hotkey_mods, ov.panel_color, ov.text_color, ov.accent_color, ov.opacity / 1000, ov.opacity % 1000,
              ov.box[0].enabled ? "true" : "false", ov.box[0].x / 1000, ov.box[0].x % 1000, ov.box[0].y / 1000, ov.box[0].y % 1000, ov.box[0].size,
              ov.box[1].enabled ? "true" : "false", ov.box[1].x / 1000, ov.box[1].x % 1000, ov.box[1].y / 1000, ov.box[1].y % 1000, ov.box[1].size);
 }

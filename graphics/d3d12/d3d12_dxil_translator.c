@@ -136,6 +136,7 @@ typedef struct {
     int failed;
     uint32_t words_per_stage;    /* push words available to this collection (RT pipelines share a wider block) */
     int accel_ok;                /* ray tracing acceleration structures are allowed */
+    int ssbo;                    /* raw/structured buffers become storage buffers (second attempt) */
 } Collect;
 
 #define PUSH_WORDS_PER_STAGE 4u
@@ -281,16 +282,22 @@ static int assign_bindless_class(Collect *c, uint32_t type, const dxil_spv_d3d_b
     return 1;
 }
 
-static void fill(dxil_spv_vulkan_binding *out, uint32_t binding,
-                 const dxil_spv_d3d_binding *d)
+/* A set-0 binding for (type, d). Raw and structured buffers are texel buffers, or storage buffers in ssbo mode. */
+static void fill(Collect *c, uint32_t type, dxil_spv_vulkan_binding *out, const dxil_spv_d3d_binding *d)
 {
+    const uint32_t binding = assign(c, type, d);
     memset(out, 0, sizeof(*out));
     out->set = 0;
     out->binding = binding;
     const int untyped = d->kind == DXIL_SPV_RESOURCE_KIND_RAW_BUFFER ||
                         d->kind == DXIL_SPV_RESOURCE_KIND_STRUCTURED_BUFFER;
-    out->descriptor_type = untyped ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER :
-                                     DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
+    out->descriptor_type = !untyped ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY :
+                           c->ssbo ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_SSBO :
+                                     DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER;
+    if (untyped && c->ssbo && !c->failed)
+        for (uint32_t i = 0; i < c->shader->descriptor_count; ++i)
+            if (c->shader->descriptors[i].binding == binding && !c->shader->descriptors[i].bindless)
+                c->shader->descriptors[i].ssbo = 1;
 }
 
 static dxil_spv_bool srv_cb(void *user, const dxil_spv_d3d_binding *d,
@@ -300,14 +307,14 @@ static dxil_spv_bool srv_cb(void *user, const dxil_spv_d3d_binding *d,
     memset(out, 0, sizeof(*out));
     if (d->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE) {
         if (!c->accel_ok) { c->failed = 1; return DXIL_SPV_FALSE; }
-        fill(&out->buffer_binding, assign(c, BEER_D3D12_SHADER_DESCRIPTOR_SRV, d), d);
+        fill(c, BEER_D3D12_SHADER_DESCRIPTOR_SRV, &out->buffer_binding, d);
         return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
     }
     if (wants_bindless(d, BEER_D3D12_SHADER_DESCRIPTOR_SRV)) {
         assign_bindless(c, BEER_D3D12_SHADER_DESCRIPTOR_SRV, d, &out->buffer_binding);
         return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
     }
-    fill(&out->buffer_binding, assign(c, BEER_D3D12_SHADER_DESCRIPTOR_SRV, d), d);
+    fill(c, BEER_D3D12_SHADER_DESCRIPTOR_SRV, &out->buffer_binding, d);
     return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
 }
 
@@ -319,7 +326,7 @@ static dxil_spv_bool sampler_cb(void *user, const dxil_spv_d3d_binding *d,
         assign_bindless_class(c, BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER, d, out, HEAP_CLASS_SAMPLER);
         return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
     }
-    fill(out, assign(c, BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER, d), d);
+    fill(c, BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER, out, d);
     return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
 }
 
@@ -333,16 +340,14 @@ static dxil_spv_bool uav_cb(void *user, const dxil_spv_uav_d3d_binding *d,
                         &out->buffer_binding);
         return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
     }
-    fill(&out->buffer_binding, assign(c, BEER_D3D12_SHADER_DESCRIPTOR_UAV, &d->d3d_binding),
-         &d->d3d_binding);
+    fill(c, BEER_D3D12_SHADER_DESCRIPTOR_UAV, &out->buffer_binding, &d->d3d_binding);
     if (d->has_counter) {
         /* Hidden counter buffers are not backed by a D3D12 resource BD12 knows
          * about; give them a binding of their own so the shader stays valid. */
         dxil_spv_d3d_binding counter = d->d3d_binding;
         counter.register_space = 0xfffe;
         counter.kind = DXIL_SPV_RESOURCE_KIND_RAW_BUFFER;
-        fill(&out->counter_binding, assign(c, BEER_D3D12_SHADER_DESCRIPTOR_UAV, &counter),
-             &counter);
+        fill(c, BEER_D3D12_SHADER_DESCRIPTOR_UAV, &out->counter_binding, &counter);
     }
     return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
 }
@@ -404,7 +409,7 @@ int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
     dxil_spv_converter converter = NULL;
     /* accel_ok: inline ray queries (DXR 1.1) in ordinary compute/pixel shaders bind an acceleration structure SRV too;
      * refusing it dropped RE8's ray-traced shadow/AO passes, which left the lighting black. */
-    Collect collect = { out, stage_namespace, 0, 0, 0, PUSH_WORDS_PER_STAGE, 1 };
+    Collect collect = { out, stage_namespace, 0, 0, 0, PUSH_WORDS_PER_STAGE, 1, 0 };
     if (g.parse_dxil_blob(container, size, &blob) != DXIL_SPV_SUCCESS) {
         fprintf(stderr, "[DXIL] failed to parse DXIL blob\n");
         goto done;
@@ -419,6 +424,7 @@ int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
         default: collect.stage = 0; break;
         }
     }
+retry:
     if (g.create_converter(blob, &converter) != DXIL_SPV_SUCCESS) goto done;
     /* Push block covering this stage's word window. */
     g.converter_set_root_constant_word_count(converter,
@@ -429,7 +435,24 @@ int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
     g.converter_set_cbv_remapper(converter, cbv_cb, &collect);
     add_bool_option(converter, DXIL_SPV_OPTION_SHADER_DEMOTE_TO_HELPER, 1);
     add_bool_option(converter, DXIL_SPV_OPTION_TYPED_UAV_READ_WITHOUT_FORMAT, 1);
+    if (collect.ssbo) {
+        /* Storage-buffer descriptors point at the view's first byte (BD12 binds the exact offset), so no offset
+         * emulation: that needs a bindless offset buffer. */
+        dxil_spv_option_ssbo_alignment align = { { DXIL_SPV_OPTION_SSBO_ALIGNMENT }, 1 };
+        g.converter_add_option(converter, &align.base);
+    }
     if (g.converter_run(converter) != DXIL_SPV_SUCCESS || collect.failed) {
+        if (!collect.failed && !collect.ssbo) {
+            /* Texel buffers cannot express everything raw/structured buffers allow (64-bit raw loads and stores):
+             * translate again with those buffers as storage buffers. */
+            g.converter_free(converter);
+            converter = NULL;
+            out->descriptor_count = 0;
+            collect.next = collect.bindless = 0;
+            collect.ssbo = 1;
+            fprintf(stderr, "[DXIL] retrying with raw/structured buffers as storage buffers\n");
+            goto retry;
+        }
         fprintf(stderr, "[DXIL] conversion failed%s\n",
                 collect.failed ? " (unsupported resource)" : "");
         goto done;
@@ -466,7 +489,7 @@ int beer_d3d12_dxil_translate_library(const uint8_t *container, size_t size, Bee
     g.begin_thread_allocator_context();
     g.set_thread_log_callback(log_cb, NULL);
     dxil_spv_parsed_blob blob = NULL;
-    Collect collect = { shared, 0, 0, 0, 0, RT_PUSH_WORDS, 1 };
+    Collect collect = { shared, 0, 0, 0, 0, RT_PUSH_WORDS, 1, 0 };
     unsigned entries = 0;
     if (g.parse_dxil_blob(container, size, &blob) != DXIL_SPV_SUCCESS ||
         g.parsed_blob_get_num_entry_points(blob, &entries) != DXIL_SPV_SUCCESS) {

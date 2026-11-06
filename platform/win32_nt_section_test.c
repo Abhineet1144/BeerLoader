@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 static void test_anonymous_section_is_shared(void)
@@ -21,6 +22,8 @@ static void test_anonymous_section_is_shared(void)
     assert(first && first_size == 8192);
     assert(beer_nt_section_map(section, &second, 0, NULL, &second_size, 1, 0, 0x04) == 0);
     assert(second && second_size == 4096);
+    /* Views land on the 64 KiB allocation granularity, as on Windows. */
+    assert(((uintptr_t)first & 0xffff) == 0 && ((uintptr_t)second & 0xffff) == 0);
 
     memcpy(first, "shared", 7);
     assert(memcmp(second, "shared", 7) == 0);
@@ -105,6 +108,19 @@ static void test_image_section_layout(void)
     assert(beer_nt_section_close(section));
 }
 
+static void test_granular_mapping(void)
+{
+    /* Odd sizes and repeated calls keep returning 64 KiB-aligned, usable memory. */
+    void *blocks[8];
+    for (int i = 0; i < 8; ++i) {
+        size_t length = 0x3000 + (size_t)i * 0x11000;
+        blocks[i] = beer_mmap_granular(length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        assert(blocks[i] != MAP_FAILED && ((uintptr_t)blocks[i] & 0xffff) == 0);
+        memset(blocks[i], 0x5a, length);
+        assert(munmap(blocks[i], length) == 0);
+    }
+}
+
 static void test_invalid_inputs(void)
 {
     uint64_t section = 123;
@@ -122,6 +138,7 @@ int main(void)
     test_file_backed_section();
     test_image_section_identity();
     test_image_section_layout();
+    test_granular_mapping();
     test_invalid_inputs();
     beer_nt_section_reset();
     puts("Win32 NT section tests passed");

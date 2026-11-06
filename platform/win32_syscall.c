@@ -493,6 +493,11 @@ static void beer_win32_syscall_signal(int sig, siginfo_t *info, void *context)
         }
     }
     regs[REG_RAX] = (greg_t)status;
+    /* The syscall instruction itself loads RCX with the return address and R11 with RFLAGS, and sysret
+     * returns them that way. Under syscall user dispatch the instruction is not executed, so the guest
+     * would see its old RCX/R11; code that checks them after a direct system call (protectors) diverges. */
+    regs[REG_RCX] = (greg_t)rip;
+    regs[REG_R11] = regs[REG_EFL];
     beer_win32_syscall_resume_rip = rip;
     regs[REG_RIP] = (greg_t)(uintptr_t)beer_win32_syscall_resume;
 }

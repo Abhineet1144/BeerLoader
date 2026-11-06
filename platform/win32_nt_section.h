@@ -26,4 +26,10 @@ int beer_nt_section_is_image(uint64_t handle);
 int beer_nt_section_close(uint64_t handle);
 void beer_nt_section_reset(void);
 
+/* mmap at a kernel-chosen address that is a multiple of the 64 KiB allocation granularity, as every
+ * Windows image, view and reservation is. Code locates module headers by rounding an address down to
+ * 64 KiB and scanning for "MZ"; a 4 KiB-aligned image breaks it. Same arguments and result as mmap
+ * with a NULL address (MAP_FIXED is added internally). */
+void *beer_mmap_granular(size_t length, int prot, int flags, int fd, long offset);
+
 #endif

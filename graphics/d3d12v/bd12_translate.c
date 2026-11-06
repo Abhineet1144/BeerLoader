@@ -30,7 +30,8 @@ BD12ComputePipeline *bd12_compute_pipeline_create_dxbc(
             .binding = d->binding,
             .bindless = d->bindless,
             .push_word = d->push_word,
-            .heap_class = d->heap_class
+            .heap_class = d->heap_class,
+            .is_ssbo = d->ssbo
         };
     }
     BD12ComputePipeline *pipeline = bd12_compute_pipeline_create_bound(

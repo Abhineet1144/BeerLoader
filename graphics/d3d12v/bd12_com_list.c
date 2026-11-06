@@ -8,6 +8,7 @@
 #include "../beer_fake_caps.h"
 #include "bd12_formats.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -213,6 +214,11 @@ static HR MS pso_cached_blob(ComObj *s, void **blob)
     (void)s;
     if (blob) *blob = NULL;
     return HR_E_NOTIMPL;
+}
+/* ID3D12PipelineLibrary records whether a stored pipeline is a compute pipeline. */
+int com_pso_is_compute(ComObj *pso)
+{
+    return pso && pso->kind == COM_PSO && ((ComPso *)pso)->compute;
 }
 static void *pso_vtable[9] = {
     [0] = pso_query, [1] = com_add_ref, [2] = com_release,
@@ -524,6 +530,14 @@ BD12CmdList *com_list_finish(ComObj *obj)
 #define LIST_CUR(l) bd12_canary_check(__func__); BD12CmdList *c = (l)->open ? (l)->cur : NULL; if (!c) return
 #define LIST_CUR_V(l, v) bd12_canary_check(__func__); BD12CmdList *c = (l)->open ? (l)->cur : NULL; if (!c) return (v)
 
+/* The commands being recorded by an open ID3D12GraphicsCommandList, for NVAPI's CUDA launches; NULL when closed. */
+BD12CmdList *com_list_open_commands(ComObj *list)
+{
+    if (!list || list->kind != COM_LIST) return NULL;
+    ComList *l = (ComList *)list;
+    return l->open ? l->cur : NULL;
+}
+
 static uint32_t MS cl_get_type(ComList *l) { return l->type; }
 
 static HR MS cl_close(ComList *l)
@@ -632,6 +646,19 @@ static void MS cl_copy_texture_region(ComList *l, const uint8_t *dst,
         h = clamp_extent(h, dy, mh);
         d = clamp_extent(d, dz, md);
         if (!w || !h || !d) return;
+        if (w >= 960 && getenv("BEER_BD12_UPLOAD_LOG")) {     /* large uploads: video planes, streamed textures */
+            static uint64_t seen[128];
+            static _Atomic uint32_t seen_count;
+            const uint64_t key = ((uint64_t)fmt << 48) ^ ((uint64_t)w << 32) ^ ((uint64_t)h << 16) ^ dr->dxgi_format;
+            int known = 0;
+            const uint32_t count = atomic_load(&seen_count);
+            for (uint32_t i = 0; i < count && i < 128 && !known; ++i) known = seen[i] == key;
+            if (!known && count < 128) { seen[atomic_fetch_add(&seen_count, 1) % 128] = key; }
+            if (!known && count < 128)
+                fprintf(stderr, "[BD12] upload %ux%u footprint fmt=%u pitch=%u off=%llu -> texture fmt=%u %llux%u sub=%u at %u,%u\n",
+                        w, h, fmt, pitch, (unsigned long long)off, dr->dxgi_format, (unsigned long long)dr->width,
+                        dr->height, sub, dx, dy);
+        }
         bd12_cmd_copy_buffer_to_image(c, dr->image,
             (BD12ImagePoint){ sub, (int32_t)dx, (int32_t)dy, (int32_t)dz },
             sr->buffer, off, pitch, w, h, d);

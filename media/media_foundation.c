@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -45,9 +46,21 @@ void beer_mf_set_present_fn(void *fn)
 /* Called at IMF2DBuffer::Lock2DSize / IMFMediaBuffer::Lock time.
  * Converts the NV12 frame to RGBA immediately so the raw buffer pointer
  * does not need to outlive the sample release. */
+static int mf_composite_enabled(void)
+{
+    /* Off by default: games draw their decoded video themselves once the output media type is complete
+     * (MF_MT_FRAME_SIZE and friends); replacing the frame hid their menus (Onimusha's title).
+     * BEER_MF_COMPOSITE=1 restores the old direct blit of decoded frames. */
+    static int enabled = -1;
+    if (enabled < 0) { const char *v = getenv("BEER_MF_COMPOSITE"); enabled = v && *v && strcmp(v, "0"); }
+    return enabled;
+}
+
 void beer_mf_notify_lock(const uint8_t *nv12_data, uint32_t width,
                           uint32_t height, int32_t stride)
 {
+    /* The RGBA copy only feeds the optional direct blit; converting every 4K frame cost a fifth of the CPU. */
+    if (!mf_composite_enabled()) return;
     if (!nv12_data || !width || !height || stride <= 0) return;
 
     size_t rgba_size = (size_t)width * height * 4;
@@ -117,6 +130,7 @@ void beer_mf_notify_unlock(void) { /* nothing — RGBA cache is already written 
 int beer_mf_composite_pending_frame(void)
 {
     if (!g_mf_present_fn) return 0;
+    if (!mf_composite_enabled()) return 0;
 
     pthread_mutex_lock(&g_mf_frame_lock);
     int      ready  = g_mf_rgba_ready;
@@ -213,6 +227,9 @@ void beer_mf_set_async_callback_invoker(BeerMfAsyncCallbackInvokeFn on_read_samp
     g_async_on_flush       = on_flush;
 }
 
+static BeerMfWorkerStartFn g_mf_worker_start;
+void beer_mf_set_worker_starter(BeerMfWorkerStartFn start) { g_mf_worker_start = start; }
+
 static int mf_guid_equal(const BeerMfGuid *a, const BeerMfGuid *b);
 
 static void mf_sample_diagnostic(const char *operation, const void *object,
@@ -258,24 +275,54 @@ static const BeerMfGuid g_iid_imf_audio_media_type = {{
     0xc3, 0xad, 0xa0, 0x26, 0x26, 0xce, 0x72, 0x46,
     0x93, 0x04, 0x69, 0x55, 0x2e, 0xdd, 0x3f, 0xaf
 }};
+/* MF_MT_FRAME_SIZE {1652C33D-D6B2-4012-B834-72030849A37D} and MF_MT_FRAME_RATE {C459A2E8-3D2C-4E44-B132-FEE5156C7BB0}
+ * (mfapi.h). Beer used other GUIDs here (keys RE Engine sets privately on its requested type), so the output type
+ * never had a frame size: Onimusha locked every decoded frame and dropped it, leaving its title video black. */
 static const BeerMfGuid g_mf_mt_frame_size = {{
-    0xe2, 0xae, 0x85, 0x16, 0x87, 0x0f, 0x57, 0x4a,
-    0xb7, 0xa3, 0x33, 0xda, 0xe3, 0x13, 0x76, 0x55
+    0x3d, 0xc3, 0x52, 0x16, 0xb2, 0xd6, 0x12, 0x40, 0xb8, 0x34, 0x72, 0x03, 0x08, 0x49, 0xa3, 0x7d
 }};
 static const BeerMfGuid g_mf_mt_frame_rate = {{
-    0xc5, 0xc6, 0x47, 0xc4, 0x8c, 0x4e, 0xb5, 0x4b,
-    0x8a, 0xf4, 0xb0, 0x46, 0x4d, 0x18, 0x3a, 0xc8
+    0xe8, 0xa2, 0x59, 0xc4, 0x2c, 0x3d, 0x44, 0x4e, 0xb1, 0x32, 0xfe, 0xe5, 0x15, 0x6c, 0x7b, 0xb0
+}};
+/* The rest of a decoder's uncompressed video output type (mfapi.h). */
+static const BeerMfGuid g_mf_mt_default_stride = {{       /* 644B4E48-1E02-4516-B0EB-C01CA9D49AC6, UINT32 bytes per row */
+    0x48, 0x4e, 0x4b, 0x64, 0x02, 0x1e, 0x16, 0x45, 0xb0, 0xeb, 0xc0, 0x1c, 0xa9, 0xd4, 0x9a, 0xc6
+}};
+static const BeerMfGuid g_mf_mt_pixel_aspect_ratio = {{   /* C6376A1E-8D0A-4027-BE45-6D9A0AD39BB6, UINT64 1:1 */
+    0x1e, 0x6a, 0x37, 0xc6, 0x0a, 0x8d, 0x27, 0x40, 0xbe, 0x45, 0x6d, 0x9a, 0x0a, 0xd3, 0x9b, 0xb6
+}};
+static const BeerMfGuid g_mf_mt_interlace_mode = {{       /* E2724BB8-E676-4806-B4B2-A8D6EFB44CCD, 2 = progressive */
+    0xb8, 0x4b, 0x72, 0xe2, 0x76, 0xe6, 0x06, 0x48, 0xb4, 0xb2, 0xa8, 0xd6, 0xef, 0xb4, 0x4c, 0xcd
+}};
+static const BeerMfGuid g_mf_mt_all_samples_independent = {{   /* C9173739-5E56-461C-B713-46FB995CB95F */
+    0x39, 0x37, 0x17, 0xc9, 0x56, 0x5e, 0x1c, 0x46, 0xb7, 0x13, 0x46, 0xfb, 0x99, 0x5c, 0xb9, 0x5f
+}};
+static const BeerMfGuid g_mf_mt_fixed_size_samples = {{   /* B8EBEFAF-B718-4E04-B0A9-116775E3321B */
+    0xaf, 0xef, 0xeb, 0xb8, 0x18, 0xb7, 0x04, 0x4e, 0xb0, 0xa9, 0x11, 0x67, 0x75, 0xe3, 0x32, 0x1b
+}};
+static const BeerMfGuid g_mf_mt_sample_size = {{          /* DAD3AB78-1990-408B-BCE2-EBA673DACC10 */
+    0x78, 0xab, 0xd3, 0xda, 0x90, 0x19, 0x8b, 0x40, 0xbc, 0xe2, 0xeb, 0xa6, 0x73, 0xda, 0xcc, 0x10
 }};
 /* MF_PD_DURATION: presentation duration in 100-nanosecond units. */
 static const BeerMfGuid g_mf_pd_duration = {{
     0x33, 0x0d, 0x99, 0x6c, 0x8e, 0xbb, 0x7a, 0x47,
     0x85, 0x98, 0x0d, 0x5d, 0x96, 0xfc, 0xd8, 0x8a
 }};
-/* MF_SOURCE_READER_ASYNC_CALLBACK: {9159BB7C-6A2C-4F75-A3CE-6E5D63F28090}
+/* MF_SOURCE_READER_ASYNC_CALLBACK (mfreadwrite.h): {1E3DBEAC-BB43-4C35-B507-CD644464C965}.
  * Callers store an IMFSourceReaderCallback via SetUnknown on the attributes
- * bag passed to MFCreateSourceReaderFromByteStream.  Beer extracts it at
- * construction time and calls OnReadSample/OnFlush after each operation. */
+ * bag passed to MFCreateSourceReaderFromByteStream; the reader is then
+ * asynchronous (ReadSample has no outputs and the result arrives through
+ * OnReadSample). Beer extracts it at construction time and calls
+ * OnReadSample/OnFlush after each operation. Missing the SDK key left RE9's
+ * logo video reader synchronous: its ReadSample result was dropped and the
+ * game waited on a black screen for OnReadSample. */
 static const BeerMfGuid g_mf_source_reader_async_callback = {{
+    0xac, 0xbe, 0x3d, 0x1e, 0x43, 0xbb, 0x35, 0x4c,
+    0xb5, 0x07, 0xcd, 0x64, 0x44, 0x64, 0xc9, 0x65
+}};
+/* The key the reader recognised before ({9159BB7C-6A2C-4F75-A3CE-6E5D63F28090}); RE8 is known to work with it,
+ * so it stays accepted as a fallback. */
+static const BeerMfGuid g_mf_source_reader_async_callback_legacy = {{
     0x7c, 0xbb, 0x59, 0x91, 0x2c, 0x6a, 0x75, 0x4f,
     0xa3, 0xce, 0x6e, 0x5d, 0x63, 0xf2, 0x80, 0x90
 }};
@@ -288,6 +335,38 @@ static const BeerMfGuid g_iid_imf_2d_buffer2 = {{
     0xa6, 0x5e, 0xae, 0x33, 0x16, 0x43, 0x6f, 0x43,
     0x8d, 0xdd, 0xd7, 0x3d, 0x22, 0xf8, 0x29, 0xec
 }};
+
+static const BeerMfGuid g_iid_iunknown = {{
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46
+}};
+static const BeerMfGuid g_iid_imf_media_buffer = {{       /* 045FA593-8799-42B8-BC8D-8968C6453507 */
+    0x93, 0xa5, 0x5f, 0x04, 0x99, 0x87, 0xb8, 0x42, 0xbc, 0x8d, 0x89, 0x68, 0xc6, 0x45, 0x35, 0x07
+}};
+static const BeerMfGuid g_iid_imf_sample = {{             /* C40A00F2-B93A-4D80-AE8C-5A1C634F58E4 */
+    0xf2, 0x00, 0x0a, 0xc4, 0x3a, 0xb9, 0x80, 0x4d, 0xae, 0x8c, 0x5a, 0x1c, 0x63, 0x4f, 0x58, 0xe4
+}};
+static const BeerMfGuid g_iid_imf_attributes = {{         /* 2CD2D921-C447-44A7-A13C-4ADABFC247E3 */
+    0x21, 0xd9, 0xd2, 0x2c, 0x47, 0xc4, 0xa7, 0x44, 0xa1, 0x3c, 0x4a, 0xda, 0xbf, 0xc2, 0x47, 0xe3
+}};
+
+/* Logs each interface an object refused, once (IMFDXGIBuffer on a system-memory buffer is the usual one). */
+static void mf_log_refused(const char *object, const void *iid)
+{
+    static BeerMfGuid seen[32];
+    static int count;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    if (!iid) return;
+    pthread_mutex_lock(&lock);
+    int known = 0;
+    for (int i = 0; i < count && !known; ++i) known = !memcmp(&seen[i], iid, sizeof(seen[i]));
+    if (!known && count < 32) memcpy(&seen[count++], iid, sizeof(seen[0]));
+    pthread_mutex_unlock(&lock);
+    if (known) return;
+    const uint8_t *g = iid;
+    fprintf(stderr, "[MF] %s::QueryInterface %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x -> "
+                    "E_NOINTERFACE\n", object, g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11],
+            g[12], g[13], g[14], g[15]);
+}
 
 static int mf_diagnostic_trace(void)
 {
@@ -430,6 +509,25 @@ static BeerMfAttributeEntry *mf_attributes_set_entry(BeerMfAttributes *self,
     return entry;
 }
 
+/* BEER_MF_DIAGNOSTICS: each attribute a caller asks for that is not set, once per key and kind. */
+static void mf_note_missing(const char *kind, const BeerMfGuid *key)
+{
+    if (!getenv("BEER_MF_DIAGNOSTICS") || !key) return;
+    static BeerMfGuid seen[64];
+    static char kinds[64];
+    static int count;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    int known = 0;
+    for (int i = 0; i < count && !known; ++i) known = kinds[i] == kind[0] && mf_guid_equal(&seen[i], key);
+    if (!known && count < 64) { seen[count] = *key; kinds[count++] = kind[0]; }
+    pthread_mutex_unlock(&lock);
+    if (known) return;
+    const uint8_t *g = (const uint8_t *)key;
+    fprintf(stderr, "[MF DIAG] Get%s %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x -> not found\n", kind,
+            g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+}
+
 static uint64_t __attribute__((ms_abi))
 mf_attributes_get_uint32(BeerMfAttributes *self, const BeerMfGuid *key,
                           uint32_t *value)
@@ -439,6 +537,7 @@ mf_attributes_get_uint32(BeerMfAttributes *self, const BeerMfGuid *key,
     int index = mf_attributes_find(self, key);
     if (index < 0 || self->entries[index].type != BEER_MF_ATTRIBUTE_UINT32) {
         mf_unlock(&self->lock);
+        mf_note_missing("UINT32", key);
         return BEER_MF_E_NOT_FOUND;
     }
     *value = self->entries[index].value.u32;
@@ -455,6 +554,7 @@ mf_attributes_get_uint64(BeerMfAttributes *self, const BeerMfGuid *key,
     int index = mf_attributes_find(self, key);
     if (index < 0 || self->entries[index].type != BEER_MF_ATTRIBUTE_UINT64) {
         mf_unlock(&self->lock);
+        mf_note_missing("UINT64", key);
         return BEER_MF_E_NOT_FOUND;
     }
     *value = self->entries[index].value.u64;
@@ -471,6 +571,7 @@ mf_attributes_get_guid(BeerMfAttributes *self, const BeerMfGuid *key,
     int index = mf_attributes_find(self, key);
     if (index < 0 || self->entries[index].type != BEER_MF_ATTRIBUTE_GUID) {
         mf_unlock(&self->lock);
+        mf_note_missing("GUID", key);
         return BEER_MF_E_NOT_FOUND;
     }
     *value = self->entries[index].value.guid;
@@ -900,12 +1001,23 @@ typedef struct BeerMfSourceReader {
     uint32_t audio_frame_size;
     uint32_t audio_frame_index;
     uint64_t duration_100ns;
+    /* Asynchronous mode (async_callback set): ReadSample/Flush requests queued for the worker thread. */
+    pthread_mutex_t async_lock;
+    pthread_cond_t async_cond;
+    struct { uint32_t kind, stream, flags; } async_queue[64];   /* kind: 0 read, 1 flush */
+    uint32_t async_head, async_count;
+    int async_worker_running, async_worker_stop, async_free_on_exit;
 } BeerMfSourceReader;
 
 static uint64_t __attribute__((ms_abi))
 mf_shell_query_interface(BeerMfShell *self, const void *iid, void **output)
 {
-    (void)iid;
+    if (getenv("BEER_MF_DIAGNOSTICS") && iid) {
+        const uint8_t *g = iid;
+        fprintf(stderr, "[MF QI] object=%p vtable=%p iid=%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x "
+                        "caller=%p\n", (void *)self, (void *)self->vtable, g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6],
+                g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15], __builtin_return_address(0));
+    }
     if (!output) return BEER_E_POINTER;
     *output = self;
     atomic_fetch_add_explicit(&self->references, 1, memory_order_relaxed);
@@ -946,6 +1058,13 @@ mf_media_buffer_query(BeerMfMediaBuffer *self, const BeerMfGuid *iid, void **out
         mf_sample_diagnostic("buffer-query-2d", self,
                              mf_guid_equal(iid, &g_iid_imf_2d_buffer2) ? 2 : 1);
         return BEER_S_OK;
+    }
+    /* A system-memory buffer is IMFMediaBuffer and IMF2DBuffer(2) only. Answering every IID made games that ask
+     * for IMFDXGIBuffer (GPU-texture samples) call buffer methods through the wrong vtable slots and drop the
+     * frame; on Windows the query fails and they read the locked bytes. */
+    if (!iid || (!mf_guid_equal(iid, &g_iid_iunknown) && !mf_guid_equal(iid, &g_iid_imf_media_buffer))) {
+        mf_log_refused("IMFMediaBuffer", iid);
+        return BEER_E_NOINTERFACE;
     }
     *output = self;
     atomic_fetch_add_explicit(&self->references, 1, memory_order_relaxed);
@@ -1186,8 +1305,13 @@ static void *g_2d_buffer_vtable[12] = {
 static uint64_t __attribute__((ms_abi))
 mf_sample_query(BeerMfSample *self, const void *iid, void **output)
 {
-    (void)iid;
     if (!output) return BEER_E_POINTER;
+    *output = NULL;
+    if (!iid || (!mf_guid_equal(iid, &g_iid_iunknown) && !mf_guid_equal(iid, &g_iid_imf_sample) &&
+                 !mf_guid_equal(iid, &g_iid_imf_attributes))) {
+        mf_log_refused("IMFSample", iid);
+        return BEER_E_NOINTERFACE;
+    }
     *output = self;
     atomic_fetch_add_explicit(&self->references, 1, memory_order_relaxed);
     return BEER_S_OK;
@@ -1515,12 +1639,10 @@ static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
     return 1;
 }
 
-static uint64_t __attribute__((ms_abi))
-mf_source_reader_release(BeerMfSourceReader *self)
+static uint64_t
+mf_source_reader_free(BeerMfSourceReader *self)
 {
-    uint32_t references = atomic_fetch_sub_explicit(&self->references, 1,
-                                                     memory_order_acq_rel) - 1;
-    if (!references) {
+    {
         mf_source_reader_stop_decoder(self);
         if (self->decoder_input_path) { unlink(self->decoder_input_path); free(self->decoder_input_path); }
         free(self->frame_data);
@@ -1532,7 +1654,29 @@ mf_source_reader_release(BeerMfSourceReader *self)
         if (self->native_media_type) mf_unknown_release(self->native_media_type);
         if (self->audio_media_type) mf_unknown_release(self->audio_media_type);
         if (self->owner) mf_unknown_release(self->owner);
+        pthread_mutex_destroy(&self->async_lock);
+        pthread_cond_destroy(&self->async_cond);
         free(self);
+    }
+    return 0;
+}
+
+static uint64_t __attribute__((ms_abi))
+mf_source_reader_release(BeerMfSourceReader *self)
+{
+    uint32_t references = atomic_fetch_sub_explicit(&self->references, 1,
+                                                     memory_order_acq_rel) - 1;
+    if (!references) {
+        pthread_mutex_lock(&self->async_lock);
+        if (self->async_worker_running) {        /* the worker frees the reader once its current request is done */
+            self->async_worker_stop = 1;
+            self->async_free_on_exit = 1;
+            pthread_cond_broadcast(&self->async_cond);
+            pthread_mutex_unlock(&self->async_lock);
+            return 0;
+        }
+        pthread_mutex_unlock(&self->async_lock);
+        mf_source_reader_free(self);
     }
     return references;
 }
@@ -1633,6 +1777,9 @@ mf_source_reader_set_current_media_type(BeerMfSourceReader *self,
     void *accepted_type = media_type;
     if (stream == 0 || stream == UINT32_C(0xfffffffc)) {
         slot = &self->current_media_type;
+        /* Like the audio stream: the reader's output type is the decoder's complete NV12 type (frame size, rate,
+         * stride, ...), not the partial type the caller passed to request it. */
+        if (self->native_media_type) accepted_type = self->native_media_type;
     } else if (stream == 1 || stream == UINT32_C(0xfffffffd)) {
         slot = &self->current_audio_media_type;
         /* Preserve the canonical audio object's IMFAudioMediaType identity while
@@ -1672,11 +1819,86 @@ static uint64_t __attribute__((ms_abi))
 mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
                              uint32_t flags, uint32_t *actual_stream,
                              uint32_t *stream_flags, int64_t *timestamp,
+                             void **sample);
+
+/* Asynchronous source reader: requests run on one worker thread per reader, which calls the guest's
+ * IMFSourceReaderCallback, as Media Foundation's work queue does. Caller holds no lock. */
+static void *mf_source_reader_async_main(void *arg)
+{
+    BeerMfSourceReader *self = arg;
+    pthread_mutex_lock(&self->async_lock);
+    for (;;) {
+        while (!self->async_count && !self->async_worker_stop)
+            pthread_cond_wait(&self->async_cond, &self->async_lock);
+        if (self->async_worker_stop) break;
+        const uint32_t kind = self->async_queue[self->async_head].kind;
+        const uint32_t stream = self->async_queue[self->async_head].stream;
+        const uint32_t flags = self->async_queue[self->async_head].flags;
+        self->async_head = (self->async_head + 1) % 64;
+        --self->async_count;
+        pthread_mutex_unlock(&self->async_lock);
+        if (kind == 0) {
+            /* With output pointers the read completes synchronously here and reports through OnReadSample. */
+            uint32_t actual = 0, sflags = 0;
+            int64_t ts = 0;
+            void *produced = NULL;
+            mf_source_reader_read_sample(self, stream, flags, &actual, &sflags, &ts, &produced);
+            if (produced) mf_sample_release(produced);
+        } else if (g_async_on_flush) {
+            g_async_on_flush(self->async_callback, stream);
+        }
+        pthread_mutex_lock(&self->async_lock);
+    }
+    const int free_reader = self->async_free_on_exit;
+    self->async_worker_running = 0;
+    pthread_mutex_unlock(&self->async_lock);
+    if (free_reader) mf_source_reader_free(self);
+    return NULL;
+}
+
+/* Queues an asynchronous ReadSample (kind 0) or Flush (kind 1). A Flush drops the reads still queued, which on
+ * Windows complete without samples before OnFlush; here they are simply not issued. */
+static uint64_t mf_source_reader_async_enqueue(BeerMfSourceReader *self, uint32_t kind, uint32_t stream,
+                                               uint32_t flags)
+{
+    pthread_mutex_lock(&self->async_lock);
+    if (kind == 1) self->async_count = 0;
+    if (self->async_count == 64) {
+        pthread_mutex_unlock(&self->async_lock);
+        return UINT64_C(0xC00D36B5);                     /* MF_E_NOTACCEPTING: too many pending requests */
+    }
+    const uint32_t slot = (self->async_head + self->async_count) % 64;
+    self->async_queue[slot].kind = kind;
+    self->async_queue[slot].stream = stream;
+    self->async_queue[slot].flags = flags;
+    ++self->async_count;
+    if (!self->async_worker_running) {
+        self->async_worker_running = 1;
+        if (!g_mf_worker_start(mf_source_reader_async_main, self)) {
+            self->async_worker_running = 0;
+            self->async_count = 0;
+            pthread_mutex_unlock(&self->async_lock);
+            return BEER_E_NOTIMPL;
+        }
+    }
+    pthread_cond_signal(&self->async_cond);
+    pthread_mutex_unlock(&self->async_lock);
+    return BEER_S_OK;
+}
+
+static uint64_t __attribute__((ms_abi))
+mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
+                             uint32_t flags, uint32_t *actual_stream,
+                             uint32_t *stream_flags, int64_t *timestamp,
                              void **sample)
 {
     if (mf_diagnostic_trace())
         fprintf(stderr, "[MF DIAG] ReadSample stream=%u flags=0x%x\n",
                 stream, flags);
+    /* Asynchronous reader: ReadSample has no outputs and completes later through OnReadSample. */
+    if (self->async_callback && g_async_on_read_sample && g_mf_worker_start &&
+        !actual_stream && !stream_flags && !timestamp && !sample)
+        return mf_source_reader_async_enqueue(self, 0, stream, flags);
     /* Stream selection and A/V ordering come from the requested source-reader
      * stream and decoded timestamps. Outstanding sample count is owned by the
      * caller and must not alter selection semantics. */
@@ -1732,28 +1954,30 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
                 self->video_width, self->video_height,
                 (int32_t)self->video_width);
             if (!decoded) return BEER_E_NOTIMPL;
+            const int64_t decoded_timestamp = decoded->timestamp;
             if (stream_flags) *stream_flags = 0;
-            if (timestamp) *timestamp = decoded->timestamp;
-            if (sample) *sample = decoded;
-            else mf_sample_release(decoded);
+            if (timestamp) *timestamp = decoded_timestamp;
+            if (sample) *sample = decoded;      /* the synchronous caller owns this reference */
             self->frame_index++;
             self->next_video_timestamp += frame_duration;
             mf_sample_diagnostic("read-video-sample", decoded,
-                                 (uint64_t)decoded->timestamp);
+                                 (uint64_t)decoded_timestamp);
             self->end_of_stream = 0;
             self->eos_reported = 0;
             atomic_store_explicit(&self->terminal_eos, 0, memory_order_release);
-            /* Async Source Reader contract: complete the pending read through
-             * IMFSourceReaderCallback when the caller supplied one. */
+            /* Async Source Reader contract: the result arrives through IMFSourceReaderCallback::OnReadSample, which
+             * receives the sample and AddRefs it if it keeps it; the reader drops its own reference after the call.
+             * An asynchronous ReadSample has no output pointers, so the sample must come from `decoded` itself:
+             * passing *sample (NULL there) delivered empty callbacks, and the frame was freed before its timestamp
+             * was read (RE9's logo video never showed). */
             if (self->async_callback && g_async_on_read_sample) {
-                void *cb_sample = sample ? *sample : NULL;
-                /* Callee holds one reference to the sample on our behalf.
-                 * AddRef the sample once; do NOT separately AddRef the buffer
-                 * (the sample already owns a buffer reference). */
-                if (cb_sample) mf_sample_add_ref(cb_sample);
+                if (sample) mf_sample_add_ref(decoded);   /* our reference for the duration of the call */
                 g_async_on_read_sample(self->async_callback,
                                        BEER_S_OK, resolved_stream, 0,
-                                       decoded->timestamp, cb_sample);
+                                       decoded_timestamp, decoded);
+                mf_sample_release(decoded);
+            } else if (!sample) {
+                mf_sample_release(decoded);
             }
             return BEER_S_OK;
         }
@@ -1785,10 +2009,10 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
                 self->next_audio_timestamp, frame_duration,
                 self->audio_frame_size / 8, 1, self->audio_frame_size);
             if (!decoded) return BEER_E_NOTIMPL;
+            const int64_t decoded_timestamp = decoded->timestamp;
             if (stream_flags) *stream_flags = 0;
-            if (timestamp) *timestamp = decoded->timestamp;
-            if (sample) *sample = decoded;
-            else mf_sample_release(decoded);
+            if (timestamp) *timestamp = decoded_timestamp;
+            if (sample) *sample = decoded;      /* the synchronous caller owns this reference */
             self->audio_frame_index++;
             self->next_audio_timestamp += frame_duration;
             if (getenv("BEER_MF_AUDIO_DUMP")) {
@@ -1801,18 +2025,19 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
                 }
             }
             mf_sample_diagnostic("read-audio-sample", decoded,
-                                 (uint64_t)decoded->timestamp);
+                                 (uint64_t)decoded_timestamp);
             self->end_of_stream = 0;
             self->eos_reported = 0;
             atomic_store_explicit(&self->terminal_eos, 0, memory_order_release);
+            /* Same contract as the video path: OnReadSample gets the sample, the reader drops its reference after. */
             if (self->async_callback && g_async_on_read_sample) {
-                void *cb_sample = sample ? *sample : NULL;
-                /* One AddRef for the callee's reference; buffer ref is owned
-                 * by the sample and must not be separately incremented. */
-                if (cb_sample) mf_sample_add_ref(cb_sample);
+                if (sample) mf_sample_add_ref(decoded);
                 g_async_on_read_sample(self->async_callback,
                                        BEER_S_OK, resolved_stream, 0,
-                                       decoded->timestamp, cb_sample);
+                                       decoded_timestamp, decoded);
+                mf_sample_release(decoded);
+            } else if (!sample) {
+                mf_sample_release(decoded);
             }
             return BEER_S_OK;
         }
@@ -1848,8 +2073,10 @@ mf_source_reader_flush(BeerMfSourceReader *self, uint32_t stream)
         self->end_of_stream = 0;
         self->eos_reported = 0;
     }
-    if (self->async_callback && g_async_on_flush)
+    if (self->async_callback && g_async_on_flush) {
+        if (g_mf_worker_start) return mf_source_reader_async_enqueue(self, 1, stream, 0);
         g_async_on_flush(self->async_callback, stream);
+    }
     return BEER_S_OK;
 }
 
@@ -2026,6 +2253,8 @@ beer_mf_create_source_reader_from_byte_stream(void *byte_stream,
     shell->video_rate_numerator = 60;
     shell->video_rate_denominator = 1;
     shell->audio_frame_size = 480u * 2u * sizeof(int16_t); /* 10 ms at 48 kHz. */
+    pthread_mutex_init(&shell->async_lock, NULL);
+    pthread_cond_init(&shell->async_cond, NULL);
     mf_probe_stream_header(byte_stream);
     mf_probe_stream_with_ffmpeg(byte_stream);
     if (mf_dump_stream(byte_stream, &shell->decoder_input_path))
@@ -2063,7 +2292,13 @@ beer_mf_create_source_reader_from_byte_stream(void *byte_stream,
                                      shell->video_height) != BEER_S_OK ||
         mf_attributes_set_uint64(native_type, &g_mf_mt_frame_rate,
                                  ((uint64_t)shell->video_rate_numerator << 32) |
-                                     shell->video_rate_denominator) != BEER_S_OK) {
+                                     shell->video_rate_denominator) != BEER_S_OK ||
+        mf_attributes_set_uint32(native_type, &g_mf_mt_default_stride, shell->video_width) != BEER_S_OK ||
+        mf_attributes_set_uint64(native_type, &g_mf_mt_pixel_aspect_ratio, (UINT64_C(1) << 32) | 1u) != BEER_S_OK ||
+        mf_attributes_set_uint32(native_type, &g_mf_mt_interlace_mode, 2) != BEER_S_OK ||
+        mf_attributes_set_uint32(native_type, &g_mf_mt_all_samples_independent, 1) != BEER_S_OK ||
+        mf_attributes_set_uint32(native_type, &g_mf_mt_fixed_size_samples, 1) != BEER_S_OK ||
+        mf_attributes_set_uint32(native_type, &g_mf_mt_sample_size, shell->frame_size) != BEER_S_OK) {
         mf_unknown_release(shell->native_media_type);
         free(shell);
         return BEER_E_NOTIMPL;
@@ -2118,6 +2353,11 @@ beer_mf_create_source_reader_from_byte_stream(void *byte_stream,
         if (attr_vtable && attr_vtable[17]) {
             uint64_t hr = ((GetUnknownFn)attr_vtable[17])(
                 attributes, &g_mf_source_reader_async_callback, NULL, &cb);
+            if (hr != BEER_S_OK || !cb) {
+                cb = NULL;
+                hr = ((GetUnknownFn)attr_vtable[17])(
+                    attributes, &g_mf_source_reader_async_callback_legacy, NULL, &cb);
+            }
             if (hr == BEER_S_OK && cb) {
                 shell->async_callback = cb; /* already AddRef'd by GetUnknown */
                 fprintf(stderr,

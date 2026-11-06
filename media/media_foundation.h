@@ -21,6 +21,13 @@ typedef uint64_t (*BeerMfAsyncFlushInvokeFn)(
 void beer_mf_set_async_callback_invoker(BeerMfAsyncCallbackInvokeFn on_read_sample,
                                         BeerMfAsyncFlushInvokeFn on_flush);
 
+/* Starts fn(arg) on a host thread that may call guest code (TEB installed, DLL thread attach/detach notified),
+ * returning nonzero on success. Asynchronous source readers complete ReadSample/Flush on such a thread, as
+ * Media Foundation's work queue does: completing them inside the caller's ReadSample deadlocks callers that
+ * hold a lock their OnReadSample also takes (RE9's logo video). */
+typedef int (*BeerMfWorkerStartFn)(void *(*fn)(void *), void *arg);
+void beer_mf_set_worker_starter(BeerMfWorkerStartFn start);
+
 uint64_t __attribute__((ms_abi)) beer_mf_startup(uint32_t version, uint32_t flags);
 uint64_t __attribute__((ms_abi)) beer_mf_shutdown(void);
 uint64_t __attribute__((ms_abi)) beer_mf_create_dxgi_device_manager(

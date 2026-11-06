@@ -84,6 +84,11 @@ struct ComDevice {
     pthread_cond_t wait_cond;
     ComWaiter *waiters;
     int waiter_started;
+    /* D3D12 queues run independently, but every BD12 submission goes to one Vulkan queue in order. A queue Wait
+     * whose fence value has not been signalled or queued yet is therefore held on the CPU, with everything after
+     * it on that queue, until a Signal claims the value (see queue_push in bd12_com.c). */
+    pthread_mutex_t defer_lock;
+    struct ComQueue *deferred;    /* queues with held operations */
 };
 
 extern ComDevice *g_com_device;
@@ -184,6 +189,8 @@ HR com_create_list(ComDevice *dev, uint32_t type, ComObj *allocator,
 /* kind: 0 legacy graphics desc, 1 legacy compute desc, 2 stream desc. */
 HR com_create_pso(ComDevice *dev, const void *desc, int kind,
                   const uint8_t *riid, void **out);
+/* ID3D12Device1::CreatePipelineLibrary (bd12_pipelib.c). */
+HR com_create_pipeline_library(ComDevice *dev, const void *blob, size_t size, const uint8_t *riid, void **out);
 /* Closes the list if it is still open and returns its recorded commands. */
 BD12CmdList *com_list_finish(ComObj *list);
 
@@ -205,5 +212,7 @@ int bd12_com_is_queue(const void *object);
 uint64_t bd12_com_create_swapchain(void *queue, const uint8_t *desc, void **out);
 void bd12_com_set_event_factory(uint64_t (*fn)(void));   /* creates a signaled manual-reset event handle */
 void bd12_com_set_dxgi_factory(void *factory);
+/* Resizes a window's client area (IDXGISwapChain::ResizeTarget); returns nonzero on success. */
+void bd12_com_set_window_client_resizer(int (*fn)(uint64_t hwnd, uint32_t width, uint32_t height));
 
 #endif

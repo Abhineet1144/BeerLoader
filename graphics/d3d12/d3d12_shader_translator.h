@@ -46,6 +46,9 @@ typedef struct BeerD3D12ShaderDescriptor {
     uint32_t bindless;
     uint32_t push_word;
     uint32_t heap_class;
+    /* A raw or structured buffer bound as a Vulkan storage buffer instead of a texel buffer: shaders that access
+     * them in ways texel buffers cannot express (64-bit raw loads and stores) are translated this way. */
+    uint32_t ssbo;
 } BeerD3D12ShaderDescriptor;
 
 typedef struct BeerD3D12TranslatedShader {

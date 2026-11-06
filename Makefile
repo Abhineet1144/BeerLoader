@@ -7,7 +7,7 @@ TARGET = loader
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
 MEDIA_SRCS = media/media_foundation.c
-PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
+PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_winhttp_url.c platform/win32_winhttp.c platform/win32_full_path.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
 				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_shell_strings.c
@@ -28,7 +28,7 @@ GRAPHICS_SRCS = graphics/d3d11/d3d11_impl.c \
                 graphics/d3d12v/bd12_image.c graphics/d3d12v/bd12_graphics.c \
                 graphics/d3d12v/bd12_extra.c graphics/d3d12v/bd12_formats.c \
                 graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c \
-                graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c \
+                graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c graphics/d3d12v/bd12_pipelib.c graphics/d3d12v/bd12_cuda.c \
                 graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_mirror.c graphics/d3d12v/bd12_rtpipe.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_live.c \
                 graphics/d3d12v/bd12_capture.c graphics/d3d12v/bd12_cbtweak.c \
                 graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c \
@@ -104,6 +104,19 @@ platform/win32_crt_init.o: platform/win32_crt_init.c platform/win32_crt_init.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
 
 platform/win32_shell_strings.o: platform/win32_shell_strings.c platform/win32_shell_strings.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
+# COM objects the guest calls directly through their vtables (no dispatch trampoline): WASAPI, Media Foundation and
+# Text Services. With -mno-sse GCC cannot keep the Win64 nonvolatile XMM6-XMM15 across the libc calls these methods
+# make, so callers saw them clobbered (the same fault that stopped RE9's frame limiter through DirectInput).
+# With SSE, GCC saves and restores XMM6-XMM15 in every ms_abi function.
+audio/wasapi_compat.o: audio/wasapi_compat.c audio/wasapi_compat.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Iaudio -c $< -o $@
+
+media/media_foundation.o: media/media_foundation.c media/media_foundation.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Imedia -c $< -o $@
+
+platform/win32_tsf.o: platform/win32_tsf.c platform/win32_tsf.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
 
 graphics/d3d12/d3d12_shader_translator.o: graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_shader_translator.h
@@ -182,6 +195,21 @@ test-input: test-native-loader test-shell-strings test-adapter-info
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_version_test.c platform/win32_version.c -o /tmp/beer-win32-version-test
 	/tmp/beer-win32-version-test
 	rm -f /tmp/beer-win32-version-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_overlay_test.c platform/beer_overlay.c -lpthread -o /tmp/beer-overlay-test
+	/tmp/beer-overlay-test
+	rm -f /tmp/beer-overlay-test
+	$(CC) -O2 -Wall -Wextra -DBD12_PIPELIB_STANDALONE graphics/d3d12v/bd12_pipelib_test.c graphics/d3d12v/bd12_pipelib.c -o /tmp/beer-pipelib-test
+	/tmp/beer-pipelib-test
+	rm -f /tmp/beer-pipelib-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_full_path_test.c platform/win32_full_path.c -o /tmp/beer-full-path-test
+	/tmp/beer-full-path-test
+	rm -f /tmp/beer-full-path-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_winhttp_test.c platform/win32_winhttp.c -lpthread -o /tmp/beer-winhttp-test
+	/tmp/beer-winhttp-test > /dev/null
+	rm -f /tmp/beer-winhttp-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_winhttp_url_test.c platform/win32_winhttp_url.c -o /tmp/beer-winhttp-url-test
+	/tmp/beer-winhttp-url-test
+	rm -f /tmp/beer-winhttp-url-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_syscall_test.c platform/win32_syscall.c -o /tmp/beer-win32-syscall-test
 	/tmp/beer-win32-syscall-test
 	rm -f /tmp/beer-win32-syscall-test
@@ -291,7 +319,7 @@ test-d3d12v:
 	$(CC) $(D3D12V_CFLAGS) graphics/d3d12v/bd12_m2_test.c $(D3D12V_SRCS) renderer/vulkan/vulkan_context.c $(LDFLAGS) -o /tmp/bd12-m2-test
 	$(CC) $(D3D12V_CFLAGS) graphics/d3d12v/bd12_m3_test.c $(D3D12V_SRCS) renderer/vulkan/vulkan_context.c $(LDFLAGS) -o /tmp/bd12-m3-test
 	$(CC) $(D3D12V_CFLAGS) graphics/d3d12v/bd12_m4_test.c $(D3D12V_SRCS) renderer/vulkan/vulkan_context.c $(LDFLAGS) -o /tmp/bd12-m4-test
-	$(CC) $(D3D12V_CFLAGS) -Igraphics/d3d12 graphics/d3d12v/bd12_com_test.c $(D3D12V_SRCS) graphics/d3d12v/bd12_formats.c graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c graphics/d3d12/d3d12_shader_translator.c renderer/vulkan/vulkan_context.c $(LDFLAGS) -o /tmp/bd12-com-test
+	$(CC) $(D3D12V_CFLAGS) -Igraphics/d3d12 graphics/d3d12v/bd12_com_test.c $(D3D12V_SRCS) graphics/d3d12v/bd12_formats.c graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c graphics/d3d12v/bd12_pipelib.c graphics/d3d12/d3d12_shader_translator.c renderer/vulkan/vulkan_context.c $(LDFLAGS) -o /tmp/bd12-com-test
 	/tmp/bd12-m1-test /tmp/bd12-m1.spv
 	/tmp/bd12-m2-test /tmp/bd12-m2.spv
 	/tmp/bd12-m3-test /tmp/bd12-m3.spv

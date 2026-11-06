@@ -177,7 +177,7 @@ static int build(BD12RtPipeline *p)
             .is_buffer = s->resource_type == BEER_D3D12_SHADER_RESOURCE_BUFFER,
             .is_accel = s->resource_type == BEER_D3D12_SHADER_RESOURCE_ACCEL,
             .count = s->count ? s->count : 1, .binding = s->binding, .bindless = s->bindless,
-            .push_word = s->push_word, .heap_class = s->heap_class
+            .push_word = s->push_word, .heap_class = s->heap_class, .is_ssbo = s->ssbo
         };
     }
     copy = calloc(shared->descriptor_count ? shared->descriptor_count : 1, sizeof(*copy));

@@ -308,6 +308,7 @@ static u64 g_real_fmod_internal_get_event;
 static u64 g_real_fmod_internal_event_start;
 
 static GuestDll *guest_dll_load(const char *name);
+static int app_local_dll_exists(const char *dll_name);
 static void guest_dll_publish_loader_entry(GuestDll *dll);
 static void guest_dll_initialize_all(void);
 static int iocp_from_handle(u64 h);
@@ -824,7 +825,10 @@ static int is_guest_stack_rsp(u64 rsp)
     u64 high = g_current_guest_stack_high ? g_current_guest_stack_high : g_guest_stack_high;
     if (!low || !high)
         return 1; /* no guest stack window recorded yet: permissive until setup */
-    return rsp > low + 0x200 && rsp < high - 0x200;
+    /* The top of the stack is in use: threads start at StackBase-0x80 and the main thread at StackBase-0x88, as on
+     * Windows, so their outermost frames lie within the last 0x200 bytes. Excluding them turned a fault there into
+     * "[FATAL] Invalid RSP" instead of exception dispatch (PRAGMATA, RSP = StackBase-0x158). */
+    return rsp > low + 0x200 && rsp <= high;
 }
 
 static void clamp_rsp_to_entry_baseline(ucontext_t *uc, u64 rsp)
@@ -1606,7 +1610,8 @@ beer_trace_log(u64 idx, u64 a, u64 b, u64 c, u64 d)
         const char *nm = idx < MAX_STUBS && g_snames[idx] ? g_snames[idx] : "?";
         char list[256]; snprintf(list, sizeof(list), "%s", filter);
         pass = 0;
-        for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ","))
+        char *save = NULL;                       /* strtok_r: many guest threads trace at once */
+        for (char *tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
             if (strstr(nm, tok)) { pass = 1; break; }
     }
     if (pass) {
@@ -4740,6 +4745,26 @@ impl_AppPolicyGetThreadInitializationType(u64 process_token, int32_t *initializa
         initialization_type);
 }
 static u64 __attribute__((ms_abi)) impl_WinHttpCheckPlatform(void) { return 1; }
+#include "platform/win32_winhttp_url.h"
+#include "platform/win32_winhttp.h"
+static void winhttp_set_error(uint32_t error) { g_last_error = error; }
+static uint64_t winhttp_caller(void) { return g_dispatch_incoming_return; }
+static u64 __attribute__((ms_abi))
+impl_WinHttpCrackUrl(const u16 *url, u32 length, u32 flags, BeerUrlComponents *components)
+{
+    u32 error = beer_winhttp_crack_url(url, length, flags, components);
+    g_last_error = error;            /* ERROR_SUCCESS on success, as WinHTTP leaves it */
+    static _Atomic int logged;
+    if (url && atomic_fetch_add(&logged, 1) < 32) {
+        char text[256];
+        size_t n = 0;
+        for (; n + 1 < sizeof(text) && (length ? n < length : url[n] != 0); ++n)
+            text[n] = url[n] >= 32 && url[n] < 127 ? (char)url[n] : '?';
+        text[n] = 0;
+        fprintf(stderr, "[WINHTTP] CrackUrl(\"%s\", flags=0x%x) -> %s\n", text, flags, error ? "error" : "ok");
+    }
+    return !error;
+}
 
 #include "platform/win32_adapter_info.h"
 static u64 __attribute__((ms_abi)) impl_GetAdaptersInfo(void *adapters, u32 *size)
@@ -8925,6 +8950,8 @@ impl_SHGetSpecialFolderPathA(u64 hwnd, char *buf, s32 csidl, u32 create)
 
 static int wide_to_host_path(const u16 *path, char *out, size_t size);
 static void crypt_wintrust_signature_settings(const u8 *trust_data);
+static u64 crypt_trust_state_create(const char *host_path, const u8 *trust_data);
+static void crypt_trust_state_close(u64 handle);
 static void beer_log_guest_stack(const char *tag);
 /* WinVerifyTrust (x64 WINTRUST_DATA: dwUnionChoice @32, pFile @40, dwStateAction @48, hWVTStateData @56;
  * WINTRUST_FILE_INFO: pcwszFilePath @8). Beer cannot validate Authenticode chains, so a file that exists verifies and a
@@ -8934,7 +8961,11 @@ static u64 __attribute__((ms_abi)) impl_WinVerifyTrust(u64 hwnd, const void *act
     (void)hwnd; (void)action;
     if (!data) return 87;
     const u32 choice = *(u32 *)(data + 32), state_action = *(u32 *)(data + 48);
-    if (state_action == 2) return 0;                                  /* WTD_STATEACTION_CLOSE */
+    if (state_action == 2) {                                          /* WTD_STATEACTION_CLOSE */
+        crypt_trust_state_close(*(u64 *)(data + 56));
+        *(u64 *)(data + 56) = 0;
+        return 0;
+    }
     if (choice != 1) return 0;                                        /* WTD_CHOICE_FILE only */
     const u8 *file = *(u8 **)(data + 40);
     const u16 *path = file ? *(const u16 **)(file + 8) : NULL;
@@ -8942,6 +8973,8 @@ static u64 __attribute__((ms_abi)) impl_WinVerifyTrust(u64 hwnd, const void *act
     if (!path || !wide_to_host_path(path, host, sizeof(host))) return 2;
     if (access(host, F_OK) != 0) return 2;
     crypt_wintrust_signature_settings(data);   /* nested-signature count read from the file itself */
+    if (state_action == 1)                     /* WTD_STATEACTION_VERIFY: provider data for the WTHelper* calls */
+        *(u64 *)(data + 56) = crypt_trust_state_create(host, data);
     return 0;
 }
 
@@ -9411,6 +9444,7 @@ int bd12_com_is_queue(const void *object);
 u64 bd12_com_create_swapchain(void *queue, const u8 *desc, void **out);
 void bd12_com_set_event_factory(u64 (*fn)(void));
 void bd12_com_set_dxgi_factory(void *factory);
+void bd12_com_set_window_client_resizer(int (*fn)(uint64_t hwnd, uint32_t width, uint32_t height));
 void bd12_com_set_dxgi_output(void *output);
 
 /* Manual-reset event that starts signaled: the frame-latency waitable object of a swap chain. */
@@ -10527,6 +10561,33 @@ impl_SetEvent(u64 h)
 static void beer_signal_guest_event(uint64_t event_handle)
 {
     impl_SetEvent(event_handle);
+}
+
+/* Worker threads for asynchronous Media Foundation readers: a host thread prepared to call guest code like the
+ * threadpool's (TEB installed, DLL_THREAD_ATTACH/DETACH delivered), running fn(arg). */
+typedef struct { void *(*fn)(void *); void *arg; } BeerMfWorkerStart;
+static void *beer_mf_worker_main(void *opaque)
+{
+    BeerMfWorkerStart start = *(BeerMfWorkerStart *)opaque;
+    free(opaque);
+    void *teb = alloc_teb_for_thread();
+    if (teb && syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)teb) != 0)
+        fprintf(stderr, "[GS] MF worker: arch_prctl failed\n");
+    guest_dll_notify_thread(2 /* DLL_THREAD_ATTACH */);
+    void *result = start.fn(start.arg);
+    guest_dll_notify_thread(3 /* DLL_THREAD_DETACH */);
+    return result;
+}
+static int beer_mf_start_guest_worker(void *(*fn)(void *), void *arg)
+{
+    BeerMfWorkerStart *start = malloc(sizeof(*start));
+    if (!start) return 0;
+    start->fn = fn;
+    start->arg = arg;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, beer_mf_worker_main, start) != 0) { free(start); return 0; }
+    pthread_detach(thread);
+    return 1;
 }
 
 /* IMFSourceReaderCallback::OnReadSample trampoline.
@@ -13639,66 +13700,15 @@ impl_GetTempPathA(u32 size, char *buffer)
     return length;
 }
 
+#include "platform/win32_full_path.h"
+static u64 __attribute__((ms_abi)) impl_GetCurrentDirectoryA(u32 size, char *buffer);
+/* GetFullPathName resolution (platform/win32_full_path.c) against the process's current directory. */
 static size_t win_full_path_a(const char *path, char *out, size_t cap)
 {
-    if (!path || !out || cap == 0) return 0;
-
-    char joined[4096];
-    size_t used = 0;
-    int absolute = path[0] == '/' || path[0] == '\\' ||
-                   (((path[0] >= 'A' && path[0] <= 'Z') ||
-                     (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':');
-    if (!absolute) {
-        char cwd[2048];
-        if (!getcwd(cwd, sizeof(cwd))) return 0;
-        joined[used++] = 'Z';
-        joined[used++] = ':';
-        for (size_t i = 0; cwd[i] && used + 1 < sizeof(joined); i++)
-            joined[used++] = cwd[i] == '/' ? '\\' : cwd[i];
-        if (used && joined[used - 1] != '\\' && used + 1 < sizeof(joined))
-            joined[used++] = '\\';
-    }
-    for (size_t i = 0; path[i] && used + 1 < sizeof(joined); i++)
-        joined[used++] = path[i] == '/' ? '\\' : path[i];
-    joined[used] = 0;
-
-    /* Lexically collapse duplicate separators and dot components.  This keeps
-     * Windows root paths stable ("\\" stays "\\") instead of repeatedly
-     * presenting the root separator as a file-name component. */
-    size_t prefix = 0, n = 0;
-    if (used >= 2 && joined[1] == ':') {
-        if (n + 2 < cap) { out[n++] = joined[0]; out[n++] = ':'; }
-        prefix = 2;
-    }
-    int rooted = joined[prefix] == '\\';
-    if (rooted && n + 1 < cap) out[n++] = '\\';
-
-    size_t component_starts[256];
-    size_t component_count = 0;
-    size_t i = prefix + (rooted ? 1 : 0);
-    while (i < used) {
-        while (joined[i] == '\\') i++;
-        size_t start = i;
-        while (i < used && joined[i] != '\\') i++;
-        size_t len = i - start;
-        if (!len || (len == 1 && joined[start] == '.')) continue;
-        if (len == 2 && joined[start] == '.' && joined[start + 1] == '.') {
-            if (component_count) n = component_starts[--component_count];
-            continue;
-        }
-        size_t rollback = n;
-        if (n && out[n - 1] != '\\') {
-            if (n + 1 >= cap) return 0;
-            out[n++] = '\\';
-        }
-        if (n + len >= cap) return 0;
-        component_starts[component_count < 256 ? component_count++ : 255] = rollback;
-        memcpy(out + n, joined + start, len);
-        n += len;
-    }
-    if (n == 0 && rooted) out[n++] = '\\';
-    out[n] = 0;
-    return n;
+    char current[PATH_MAX + 3];
+    const u64 length = impl_GetCurrentDirectoryA(sizeof(current), current);
+    if (!length || length >= sizeof(current)) current[0] = 0;
+    return beer_win32_full_path(path, current, out, cap);
 }
 
 static u64 __attribute__((ms_abi))
@@ -16214,7 +16224,10 @@ static u64 create_native_window(s32 x, s32 y, s32 w, s32 h, const char *title)
     /* CW_USEDEFAULT is 0x80000000. XWayland's compositor chooses final placement. */
     if ((u32)x == 0x80000000u) x = 0;
     if ((u32)y == 0x80000000u) y = 0;
-    if (!xwayland_window_create(x, y, w, h, title, 1)) {
+    /* Created hidden, as Win32 creates windows: the caller applies style, size hints and icon, then maps it
+     * (WS_VISIBLE or ShowWindow). Mapping before the undecorated hint made GNOME's mutter frame the window and
+     * leave it with a 51x88 input region, so borderless games let every click through to the window below. */
+    if (!xwayland_window_create(x, y, w, h, title, 0)) {
         g_last_error = 1407; /* ERROR_CANNOT_FIND_WND_CLASS / backend unavailable */
         return 0;
     }
@@ -16329,6 +16342,7 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
      * client coordinates. Keep the native/presentation origin at (0,0); only
      * the extent is derived from Beer's declared frame metrics. */
     xwayland_window_set_client_rect(0, 0, client_w, client_h);
+    if (style & 0x10000000u) (void)xwayland_window_show(1);      /* WS_VISIBLE */
     int screen_width = 1920, screen_height = 1080;
     xwayland_get_screen_size(&screen_width, &screen_height);
     s32 policy_x = (u32)x == 0x80000000u ? 0 : x;
@@ -16533,6 +16547,15 @@ impl_SetWindowPos(u64 hw, u64 ins, s32 x, s32 y, s32 w, s32 h, u32 flags) {
     fprintf(stderr, "[WIN] SetWindowPos(%d,%d %dx%d flags=0x%x)\n", x, y, w, h, flags);
     return resize_native_from_outer(x, y, w, h,
                                     !(flags & 0x0002), !(flags & 0x0001));
+}
+/* IDXGISwapChain::ResizeTarget: the window's client area becomes width x height, keeping its position. */
+static int beer_resize_window_client(uint64_t hwnd, uint32_t width, uint32_t height)
+{
+    if (hwnd != FAKE_HWND) return 0;
+    WIN_RECT rect = { 0, 0, (s32)width, (s32)height };
+    impl_AdjustWindowRectEx(&rect, (u32)g_window_style, 0, (u32)g_window_exstyle);
+    return impl_SetWindowPos(hwnd, 0, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                             0x0002u | 0x0004u | 0x0010u /* NOMOVE | NOZORDER | NOACTIVATE */) != 0;
 }
 static u64 __attribute__((ms_abi))
 impl_GetDC(u64 hw) { (void)hw; return FAKE_HDC; }
@@ -20109,6 +20132,7 @@ typedef struct WinTPWait {
     u64             timeout_ms;
     volatile int    active;
     volatile int    cancel;
+    u32             generation;   /* bumped by every SetThreadpoolWait */
     pthread_t       thr;
     pthread_mutex_t mtx;
     pthread_cond_t  cv;
@@ -20126,9 +20150,11 @@ static void *tp_wait_thread(void *arg)
     typedef void __attribute__((ms_abi)) (*WaitCB)(u64,u64,u64,u32);
     u64 handle;
     u64 timeout_ms;
+    u32 generation;
     pthread_mutex_lock(&w->mtx);
     handle = w->handle;
     timeout_ms = w->timeout_ms;
+    generation = w->generation;
     pthread_mutex_unlock(&w->mtx);
 
     /* A Windows thread-pool wait fires only after the registered handle is
@@ -20141,6 +20167,16 @@ static void *tp_wait_thread(void *arg)
     for (;;) {
         pthread_mutex_lock(&w->mtx);
         int stop = w->cancel;
+        /* SetThreadpoolWait on a wait that is still pending replaces it, as on Windows: wait for the new handle
+         * with the new timeout. Keeping the first handle lost re-arms, and DirectStorage then waited for a
+         * completion that was signalled on another event (RE9 stopped loading). */
+        if (!stop && w->generation != generation) {
+            generation = w->generation;
+            handle = w->handle;
+            timeout_ms = w->timeout_ms;
+            wait_ms = timeout_ms > UINT32_MAX ? 0xFFFFFFFFu : (u32)timeout_ms;
+            elapsed = 0;
+        }
         pthread_mutex_unlock(&w->mtx);
         if (stop) break;
         u32 slice = wait_ms == 0xFFFFFFFFu ? 10u :
@@ -20197,6 +20233,7 @@ impl_SetThreadpoolWait(WinTPWait *w, u64 handle, s64 *timeout)
             w->timeout_ms = (remaining_100ns + 9999u) / 10000u;
         }
         w->cancel = 0;
+        ++w->generation;
         if (!w->active) {
             w->active = 1;
             if (pthread_create(&w->thr, NULL, tp_wait_thread, w) == 0)
@@ -23249,6 +23286,27 @@ static ImplEntry g_impls[] = {
     {"GetVersionExW",                           (ImplFn)impl_GetVersionExW},
     {"GetVersionExA",                           (ImplFn)impl_GetVersionExA},
     {"WinHttpCheckPlatform",                    (ImplFn)impl_WinHttpCheckPlatform},
+    {"WinHttpCrackUrl",                         (ImplFn)impl_WinHttpCrackUrl},
+    {"WinHttpOpen",                             (ImplFn)beer_WinHttpOpen},
+    {"WinHttpConnect",                          (ImplFn)beer_WinHttpConnect},
+    {"WinHttpOpenRequest",                      (ImplFn)beer_WinHttpOpenRequest},
+    {"WinHttpSetStatusCallback",                (ImplFn)beer_WinHttpSetStatusCallback},
+    {"WinHttpSetOption",                        (ImplFn)beer_WinHttpSetOption},
+    {"WinHttpQueryOption",                      (ImplFn)beer_WinHttpQueryOption},
+    {"WinHttpSetTimeouts",                      (ImplFn)beer_WinHttpSetTimeouts},
+    {"WinHttpAddRequestHeaders",                (ImplFn)beer_WinHttpAddRequestHeaders},
+    {"WinHttpSetCredentials",                   (ImplFn)beer_WinHttpSetCredentials},
+    {"WinHttpSendRequest",                      (ImplFn)beer_WinHttpSendRequest},
+    {"WinHttpWriteData",                        (ImplFn)beer_WinHttpWriteData},
+    {"WinHttpReceiveResponse",                  (ImplFn)beer_WinHttpReceiveResponse},
+    {"WinHttpQueryHeaders",                     (ImplFn)beer_WinHttpQueryHeaders},
+    {"WinHttpQueryDataAvailable",               (ImplFn)beer_WinHttpQueryDataAvailable},
+    {"WinHttpReadData",                         (ImplFn)beer_WinHttpReadData},
+    {"WinHttpCloseHandle",                      (ImplFn)beer_WinHttpCloseHandle},
+    {"WinHttpGetIEProxyConfigForCurrentUser",   (ImplFn)beer_WinHttpGetIEProxyConfigForCurrentUser},
+    {"WinHttpGetDefaultProxyConfiguration",     (ImplFn)beer_WinHttpGetDefaultProxyConfiguration},
+    {"WinHttpGetProxyForUrl",                   (ImplFn)beer_WinHttpGetProxyForUrl},
+    {"WinHttpDetectAutoProxyConfigUrl",         (ImplFn)beer_WinHttpDetectAutoProxyConfigUrl},
     {"GetAdaptersAddresses",                    (ImplFn)impl_GetAdaptersAddresses},
     {"GetAdaptersInfo",                         (ImplFn)impl_GetAdaptersInfo},
     {"NotifyAddrChange",                        (ImplFn)impl_NotifyAddrChange},
@@ -23637,6 +23695,12 @@ static ImplEntry g_impls[] = {
     {"CertOpenStore",                         (ImplFn)impl_CertOpenStore},
     {"CertCloseStore",                        (ImplFn)impl_CertCloseStore},
     {"CertFindCertificateInStore",            (ImplFn)impl_CertFindCertificateInStore},
+    {"CertGetNameStringA",                    (ImplFn)impl_CertGetNameStringA},
+    {"CertGetNameStringW",                    (ImplFn)impl_CertGetNameStringW},
+    {"CertGetIssuerCertificateFromStore",     (ImplFn)impl_CertGetIssuerCertificateFromStore},
+    {"WTHelperProvDataFromStateData",         (ImplFn)impl_WTHelperProvDataFromStateData},
+    {"WTHelperGetProvSignerFromChain",        (ImplFn)impl_WTHelperGetProvSignerFromChain},
+    {"WTHelperGetProvCertFromChain",          (ImplFn)impl_WTHelperGetProvCertFromChain},
     {"CertFreeCertificateContext",            (ImplFn)impl_CertFreeCertificateContext},
     {"CryptDecodeObjectEx",                   (ImplFn)impl_CryptDecodeObjectEx},
     {"PathRemoveFileSpecA",                   (ImplFn)impl_PathRemoveFileSpecA},
@@ -24853,8 +24917,12 @@ static void fake_pe_exports_build(void)
      * from which to derive ownership. Publish only the trust API Beer actually
      * implements; the module remains a normal distinct PE identity. */
     FakePeModule *wintrust = fake_pe_module_from_base(HMOD_WINTRUST);
-    if (find_impl("WinVerifyTrust"))
-        fake_pe_add_export(wintrust, "WinVerifyTrust", capacity);
+    static const char *const wintrust_exports[] = {
+        "WinVerifyTrust", "WTHelperProvDataFromStateData", "WTHelperGetProvSignerFromChain",
+        "WTHelperGetProvCertFromChain",
+    };
+    for (size_t i = 0; i < sizeof(wintrust_exports) / sizeof(*wintrust_exports); ++i)
+        if (find_impl(wintrust_exports[i])) fake_pe_add_export(wintrust, wintrust_exports[i], capacity);
 
     /* USER32 is a preloaded synthetic module, so DLLs loaded after the initial
      * import scan must still see Beer-owned documented entry points in its PE
@@ -25317,8 +25385,7 @@ static void pe_load(const char *path)
                  -1, 0);
     if (g_img == MAP_FAILED) {
         /* preferred address busy – try anywhere */
-        g_img = mmap(NULL, imgsz, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        g_img = beer_mmap_granular(imgsz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (g_img == MAP_FAILED) die("mmap(image): %s", strerror(errno));
         printf("[PE]  Preferred base busy; loaded at 0x%lx (need relocs)\n", (u64)g_img);
     } else {
@@ -25419,6 +25486,7 @@ guest_oodle_decompress_trace(const void *compressed, s64 compressed_size,
     return result;
 }
 
+static u64 guest_dll_resolve_forwarder(GuestDll *from, const char *forwarder, int depth);
 static u64 guest_dll_export_by_ordinal(GuestDll *dll, u32 ordinal)
 {
     if (!dll || !dll->image) return 0;
@@ -25429,11 +25497,51 @@ static u64 guest_dll_export_by_ordinal(GuestDll *dll, u32 ordinal)
     if (ordinal < exports->ordinal_base || ordinal - exports->ordinal_base >= exports->function_count) return 0;
     if (!guest_dll_rva_valid(dll, exports->functions_rva, (size_t)exports->function_count * sizeof(u32))) return 0;
     u32 rva = ((u32 *)(dll->image + exports->functions_rva))[ordinal - exports->ordinal_base];
-    if (!rva || (rva >= dir->rva && rva < dir->rva + dir->size) || !guest_dll_rva_valid(dll, rva, 1)) return 0;
+    if (rva >= dir->rva && rva < dir->rva + dir->size)
+        return guest_dll_resolve_forwarder(dll, (const char *)(dll->image + rva), 0);
+    if (!rva || !guest_dll_rva_valid(dll, rva, 1)) return 0;
     return (u64)(dll->image + rva);
 }
 
+/* Follows a PE export forwarder ("module.Function" or "module.#ordinal") as the Windows loader does: the module is
+ * everything before the last dot (function names have none) and gets ".dll" only when it has no extension of its
+ * own. So "vcruntime140.v38.memcmp" names the module file "vcruntime140.v38", which a proxy DLL shipped next to the
+ * game forwards all of its exports to (Onimusha's vcruntime140.dll forwards all 71). Forwarders into Beer's own
+ * system modules resolve through their synthetic exports. depth guards against forwarding cycles. */
+static u64 guest_dll_export_depth(GuestDll *dll, const char *name, int depth);
+static u64 fake_pe_base_for_import(const char *lower);
+static u64 guest_dll_resolve_forwarder(GuestDll *from, const char *forwarder, int depth)
+{
+    if (!forwarder || depth > 8) return 0;
+    if (from && !guest_dll_rva_valid(from, (u32)((const u8 *)forwarder - from->image), 4)) return 0;
+    const char *dot = strrchr(forwarder, '.');
+    if (!dot || dot == forwarder || !dot[1]) return 0;
+    char module[260];
+    size_t length = (size_t)(dot - forwarder);
+    if (length + 5 > sizeof(module)) return 0;
+    memcpy(module, forwarder, length);
+    module[length] = 0;
+    if (!memchr(module, '.', length)) memcpy(module + length, ".dll", 5);
+    const char *function = dot + 1;
+    char lower[64];
+    lowercase_dll_basename(module, lower, sizeof(lower));
+    GuestDll *target = guest_dll_find(module);
+    if (!target && !fake_pe_base_for_import(lower)) target = guest_dll_load(module);
+    if (target == from) target = NULL;           /* a module forwarding to itself */
+    if (target) {
+        if (function[0] == '#') return guest_dll_export_by_ordinal(target, (u32)strtoul(function + 1, NULL, 10));
+        return guest_dll_export_depth(target, function, depth + 1);
+    }
+    const u64 system = fake_pe_base_for_import(lower);
+    return system && function[0] != '#' ? fake_pe_export_address(system, function) : 0;
+}
+
 static u64 guest_dll_export(GuestDll *dll, const char *name)
+{
+    return guest_dll_export_depth(dll, name, 0);
+}
+
+static u64 guest_dll_export_depth(GuestDll *dll, const char *name, int depth)
 {
     if (!dll || !dll->image || !name) return 0;
     NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
@@ -25457,10 +25565,9 @@ static u64 guest_dll_export(GuestDll *dll, const char *name)
         u16 ordinal = ordinals[i];
         if (ordinal >= exports->function_count) return 0;
         u32 rva = functions[ordinal];
-        /* Forwarded exports point back into the export directory. Oodle does
-         * not use them for the imported functions, so reject rather than
-         * pretending the forwarder string is executable code. */
-        if (rva >= dir->rva && rva < dir->rva + dir->size) return 0;
+        /* Forwarded exports point back into the export directory: follow the forwarder string. */
+        if (rva >= dir->rva && rva < dir->rva + dir->size)
+            return guest_dll_resolve_forwarder(dll, (const char *)(dll->image + rva), depth);
         if (!guest_dll_rva_valid(dll, rva, 1)) return 0;
         return (u64)(dll->image + rva);
     }
@@ -25707,8 +25814,8 @@ static GuestDll *guest_dll_load(const char *name)
                       PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (dll->image == MAP_FAILED)
-        dll->image = mmap(NULL, dll->image_size, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        dll->image = beer_mmap_granular(dll->image_size, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (dll->image == MAP_FAILED) {
         munmap(file, (size_t)st.st_size); return NULL;
     }
@@ -25751,6 +25858,9 @@ static GuestDll *guest_dll_finish(GuestDll *dll)
                     *(u64 *)(dll->image + block->page_rva + (entries[i] & 0xfff)) += dll->delta;
             cursor += block->block_sz;
         }
+        /* The Windows loader records the actual base in the mapped header after relocating, so code that
+         * computes its own delta as (address - OptionalHeader.ImageBase) sees zero, as it does for the exe. */
+        mapped_nt->opt.imagebase = (u64)dll->image;
     }
 
     g_loading_guest_dll = dll;
@@ -27524,7 +27634,12 @@ static void __attribute__((ms_abi)) executable_tls_process_attach(void)
         if (sigsetjmp(g_executable_tls_fault_env, 1) == 0) {
             g_executable_tls_callback_active = 1;
             if (timeout_ms) executable_tls_arm_timeout(timeout_ms);
-            callbacks[index](g_img, 1 /* DLL_PROCESS_ATTACH */, NULL);
+            /* Same entry as Windows' loader and the thread-attach path: Windows register state, and the
+             * system-call dispatch selector set to block while guest code runs. A plain call left it allowing,
+             * so a callback's own `syscall` went to Linux: Onimusha's protection issued NtAllocateVirtualMemory
+             * (0x18, sched_yield on Linux), got nothing back and faulted on the unset base. */
+            beer_call_init_routine((void *)callbacks[index], g_img, 1 /* DLL_PROCESS_ATTACH */,
+                                   (u64)(uintptr_t)&callbacks[index]);
             executable_tls_arm_timeout(0);
             g_executable_tls_callback_active = 0;
             fprintf(stderr,
@@ -29284,6 +29399,23 @@ static u32 beer_signal_exception_code(int sig)
     }
 }
 
+/* Fill the two ACCESS_VIOLATION parameters as Windows does. A general-protection fault (a non-canonical
+ * address; Linux delivers SIGSEGV with si_code SI_KERNEL and si_addr 0) is reported with read flag 0 and
+ * fault address 0xffffffffffffffff, not 0. */
+static void beer_access_violation_info(const siginfo_t *si, const ucontext_t *uc, u64 address,
+                                       u64 *information)
+{
+    u64 fault = (u64)si->si_addr;
+    u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
+    if (si->si_signo == SIGSEGV && si->si_code == SI_KERNEL) {
+        information[0] = 0;
+        information[1] = ~0ull;
+        return;
+    }
+    information[0] = fault == address ? 8u : ((error & 2u) ? 1u : 0u);
+    information[1] = fault;
+}
+
 static void beer_context_from_ucontext(u8 *context, const ucontext_t *uc)
 {
     memset(context, 0, 0x4d0);
@@ -29414,11 +29546,8 @@ static int beer_dispatch_signal_to_ki_hook(int sig, siginfo_t *si, ucontext_t *u
     }
     record.address = (u64)uc->uc_mcontext.gregs[REG_RIP];
     if (!is_int_trap && (sig == SIGSEGV || sig == SIGBUS)) {
-        u64 fault = (u64)si->si_addr;
-        u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
         record.parameter_count = 2;
-        record.information[0] = fault == record.address ? 8u : ((error & 2u) ? 1u : 0u);
-        record.information[1] = fault;
+        beer_access_violation_info(si, uc, record.address, record.information);
     }
 
     enum { MACHINE_FRAME = 0x28 };
@@ -29458,11 +29587,8 @@ static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, ucontext_t *uc)
     }
     record.address = (u64)uc->uc_mcontext.gregs[REG_RIP];
     if (!is_int_trap && (sig == SIGSEGV || sig == SIGBUS)) {
-        u64 fault = (u64)si->si_addr;
-        u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
         record.parameter_count = 2;
-        record.information[0] = fault == record.address ? 8u : ((error & 2u) ? 1u : 0u);
-        record.information[1] = fault;
+        beer_access_violation_info(si, uc, record.address, record.information);
     }
 
     u8 context[0x4d0] __attribute__((aligned(16)));
@@ -29511,11 +29637,8 @@ static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
     }
     (*record_ptr).address = (u64)uc->uc_mcontext.gregs[REG_RIP];
     if (!is_int_trap && (sig == SIGSEGV || sig == SIGBUS)) {
-        u64 fault = (u64)si->si_addr;
-        u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
         (*record_ptr).parameter_count = 2;
-        (*record_ptr).information[0] = fault == (*record_ptr).address ? 8u : ((error & 2u) ? 1u : 0u);
-        (*record_ptr).information[1] = fault;
+        beer_access_violation_info(si, uc, (*record_ptr).address, (*record_ptr).information);
     }
 
     u8 context[0x4d0] __attribute__((aligned(16)));
@@ -29590,11 +29713,8 @@ static int beer_dispatch_signal_to_top_level_filter(int sig, siginfo_t *si, ucon
     record.code = beer_signal_exception_code(sig);
     record.address = (u64)uc->uc_mcontext.gregs[REG_RIP];
     if (sig == SIGSEGV || sig == SIGBUS) {
-        u64 fault = (u64)si->si_addr;
-        u64 error = (u64)uc->uc_mcontext.gregs[REG_ERR];
         record.parameter_count = 2;
-        record.information[0] = fault == record.address ? 8u : ((error & 2u) ? 1u : 0u);
-        record.information[1] = fault;
+        beer_access_violation_info(si, uc, record.address, record.information);
     }
     u8 context[0x4d0] __attribute__((aligned(16)));
     beer_context_from_ucontext(context, uc);
@@ -30106,7 +30226,8 @@ static void beer_thread_dump_handler(int sig, siginfo_t *si, void *uctx)
         }
         for (size_t k = 0; k < got / 8 && shown < 24 && n + 24 < sizeof(text); ++k) {
             u64 v = copy[k];
-            if ((v >= 0x140000000ull && v < 0x148000000ull) || (v >= 0x7ffff5000000ull && v < 0x7ffff9000000ull)) {
+            /* the executable (images reach several hundred MB) and guest DLLs, which load just below the host libraries */
+            if ((v >= 0x140000000ull && v < 0x180000000ull) || (v >= 0x7ff000000000ull && v < 0x7ffff9000000ull)) {
                 n += (size_t)snprintf(text + n, sizeof(text) - n, " %llx", (unsigned long long)v);
                 ++shown;
             }
@@ -32783,9 +32904,18 @@ static void prof_dump(int sig)
     if (!g_prof_capturing) {
         g_prof_count = 0;
         g_prof_capturing = 1;
+        const struct itimerval timer = { {0, 1000}, {0, 1000} };
+        setitimer(ITIMER_PROF, &timer, NULL);
         return;
     }
     g_prof_capturing = 0;
+    {
+        const char *mode = getenv("BEER_PROF_SAMPLE");
+        if (mode && !strcmp(mode, "wait")) {
+            const struct itimerval off = { {0, 0}, {0, 0} };
+            setitimer(ITIMER_PROF, &off, NULL);
+        }
+    }
     if (g_prof_count > BEER_PROF_MAX) g_prof_count = BEER_PROF_MAX;
     FILE *out = fopen("/tmp/beer-prof.txt", "w");
     if (!out) return;
@@ -32815,7 +32945,9 @@ static void prof_start(void)
     sigaction(SIGPROF, &pa, NULL);
     signal(SIGUSR2, prof_dump);
     const char *mode = getenv("BEER_PROF_SAMPLE");
-    if (mode && !strcmp(mode, "wait")) g_prof_capturing = 0;
+    /* "wait": no timer until the first SIGUSR2. SIGPROF arriving during the guest's startup (protected executables
+     * check their own code and timing there) crashed Onimusha within two seconds. */
+    if (mode && !strcmp(mode, "wait")) { g_prof_capturing = 0; return; }
     struct itimerval timer = { {0, 1000}, {0, 1000} };
     setitimer(ITIMER_PROF, &timer, NULL);
 }
@@ -32930,8 +33062,13 @@ int main(int argc, char **argv)
      */
     beer_mf_set_async_callback_invoker(beer_mf_invoke_on_read_sample,
                                        beer_mf_invoke_on_flush);
+    beer_mf_set_worker_starter(beer_mf_start_guest_worker);
+    /* Asynchronous WinHTTP delivers its callbacks on the same kind of guest-capable worker. */
+    beer_winhttp_configure(winhttp_set_error, beer_mf_start_guest_worker);
+    beer_winhttp_set_caller(winhttp_caller);
     bd12_com_set_image_presenter(beer_present_bd12_image);
     bd12_com_set_event_factory(beer_signaled_event_handle);
+    bd12_com_set_window_client_resizer(beer_resize_window_client);
     bd12_com_set_dxgi_factory(g_dxgi_factory);
 
     XwaylandPresenter presenter = XWAYLAND_PRESENTER_AUTO;
@@ -33038,12 +33175,18 @@ int main(int argc, char **argv)
             fprintf(stderr, "[STEAM] application metadata AppId=%u\n", app_id);
         }
         const char *steam_mode = getenv("BEER_STEAM_API_MODE");
-        g_steam_api_guest_mode = steam_mode && !strcasecmp(steam_mode, "guest");
-        g_steam_api_official = steam_mode && !strcasecmp(steam_mode, "official");
+        if (steam_mode && !*steam_mode) steam_mode = NULL;
         if (steam_mode && strcasecmp(steam_mode, "guest") &&
             strcasecmp(steam_mode, "compat") && strcasecmp(steam_mode, "official"))
             die("BEER_STEAM_API_MODE must be 'compat', 'guest' or 'official'");
-        fprintf(stderr, "[STEAM] static Steam API mode: %s\n",
+        /* Without an explicit mode, an application that ships its own steam_api64.dll runs it, as
+         * Windows would load the application-local module; applications may verify that module's
+         * code. Applications without one keep the offline facade. */
+        int steam_auto = !steam_mode;
+        if (steam_auto) steam_mode = app_local_dll_exists("steam_api64.dll") ? "guest" : "compat";
+        g_steam_api_guest_mode = !strcasecmp(steam_mode, "guest");
+        g_steam_api_official = !strcasecmp(steam_mode, "official");
+        fprintf(stderr, "[STEAM] static Steam API mode%s: %s\n", steam_auto ? " (automatic)" : "",
                 g_steam_api_guest_mode ? "application-local guest module" :
                 g_steam_api_official ? "Beer facade backed by the signed-in Steam session" :
                                        "Beer offline compatibility facade");

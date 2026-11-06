@@ -23,6 +23,8 @@ FIELDS = [("fps", "FPS"), ("frametime", "Frame time"), ("cpu", "CPU usage"), ("r
           ("threads", "Thread count"), ("speed", "Game speed"), ("uptime", "Uptime"),
           ("gpu", "GPU usage"), ("vram", "Video memory (VRAM)"), ("clock", "Clock (time of day)"), ("graph", "Frame time graph")]
 SIZES = ["Small", "Medium", "Large"]
+# Box styles: (setting, label). "row" draws each box as one compact line, like MangoHud's horizontal bar.
+LAYOUTS = [("panel", "Panels (one value per line)"), ("row", "Single row (compact: CPU | GPU | RAM | FPS | time)")]
 # Overlay font cells (matching platform/overlay_font.h) used to draw an accurate preview.
 CELLS = [(8, 17), (12, 24), (17, 33)]
 REF_W, REF_H = 1920, 1080
@@ -34,6 +36,7 @@ DEFAULT = {
     "colors": {"panel": "12161c", "text": "e8e8e8", "accent": "8fe3a0"},
     "opacity": 0.85,
     "show_on_start": True,
+    "layout": "panel",
 }
 
 
@@ -51,6 +54,8 @@ def load_config():
         cfg["opacity"] = data["opacity"]
     if isinstance(data.get("show_on_start"), bool):
         cfg["show_on_start"] = data["show_on_start"]
+    if data.get("layout") in [key for key, _ in LAYOUTS]:
+        cfg["layout"] = data["layout"]
     return cfg
 
 
@@ -78,7 +83,7 @@ def flat_message(cfg, command="overlay_set", starting=False):
     return {
         "cmd": command, "hotkey_keysym": cfg["hotkey"]["keysym"], "hotkey_mods": mods,
         "opacity": round(cfg.get("opacity", 0.85), 3), "panel_color": cfg["colors"]["panel"], "text_color": cfg["colors"]["text"], "accent_color": cfg["colors"]["accent"],
-        "fields": ",".join(r["fields"]),
+        "fields": ",".join(r["fields"]), "layout": cfg.get("layout", "panel"),
         "res_enabled": r["enabled"], "res_x": round(r["x"], 4), "res_y": round(r["y"], 4), "res_size": r["size"],
         "pin_enabled": p["enabled"], "pin_x": round(p["x"], 4), "pin_y": round(p["y"], 4), "pin_size": p["size"],
         # Visibility is only set when a game starts; later setting changes must not re-show a hidden overlay.
@@ -86,10 +91,38 @@ def flat_message(cfg, command="overlay_set", starting=False):
     }
 
 
+def row_text(cfg, which):
+    """The one-line text the row layout shows for a box (sample values), grouped as the loader draws it:
+    CPU 12% | GPU 35% 4.6G | RAM 2.4G | FPS 60 16.7ms [graph] | 23:14:46"""
+    if which != "resources":
+        return "label 100 | label 42"
+    fields = cfg["resources"]["fields"]
+    parts = []
+    if "cpu" in fields:
+        parts.append("CPU 12%")
+    gpu = " ".join(v for k, v in (("gpu", "35%"), ("vram", "4.6G")) if k in fields)
+    if gpu:
+        parts.append("GPU " + gpu)
+    if "ram" in fields:
+        parts.append("RAM 2.4G")
+    fps = " ".join(v for k, v in (("fps", "60"), ("frametime", "16.7ms"), ("graph", "▁▂▁▃▁▁▂▁▁▅▁")) if k in fields)
+    if fps:
+        parts.append("FPS " + fps)
+    if "clock" in fields:
+        parts.append("21:04:33")
+    return " | ".join(parts)
+
+
 def box_pixels(cfg, which):
     """Approximate pixel size of a box at the 1080p reference, as the loader would draw it."""
     box = cfg[which]
     cw, ch = CELLS[max(0, min(2, box["size"]))]
+    pad = ch // 3 + 2
+    if cfg.get("layout") == "row":
+        text = row_text(cfg, which)
+        # the graph takes 12 cells in the loader; the preview draws it as 11 block characters
+        width = (len(text) + (1 if which == "resources" and "graph" in box["fields"] else 0)) * cw + pad * 2
+        return width, ch + pad * 2
     if which == "resources":
         lines = 1 + len([f for f in box["fields"] if f != "graph"]) + (1 if "graph" in box["fields"] else 0) * 3.4
         lines = int(round(lines))
@@ -151,6 +184,11 @@ class OverlayPage(Gtk.Box):
 
         # --- layout editor
         layout = Adw.PreferencesGroup(title="Layout", description="Drag the boxes to where you want them on the screen.")
+        self.layout_row = Adw.ComboRow(title="Style", subtitle="Single row puts each box on one line, like MangoHud's horizontal bar",
+                                       model=Gtk.StringList.new([label for _key, label in LAYOUTS]))
+        self.layout_row.set_selected(next((i for i, (key, _l) in enumerate(LAYOUTS) if key == self.cfg["layout"]), 0))
+        self.layout_row.connect("notify::selected", self._changed)
+        layout.add(self.layout_row)
         self.area = Gtk.DrawingArea(content_width=640, content_height=360, halign=Gtk.Align.CENTER)
         self.area.set_draw_func(self._draw)
         drag = Gtk.GestureDrag()
@@ -183,7 +221,8 @@ class OverlayPage(Gtk.Box):
         body.append(res)
 
         pins = Adw.PreferencesGroup(title="Pinned memory box",
-                                    description="Pin values from a running game: Memory… → add to the watch list → Pin.")
+                                    description="Pin values from a running game: Memory… → add to the watch list → Pin. "
+                                                "The box only appears in the game while something is pinned.")
         self.pin_enabled = Adw.SwitchRow(title="Show this box")
         self.pin_enabled.set_active(self.cfg["pins"]["enabled"])
         self.pin_enabled.connect("notify::active", self._changed)
@@ -221,6 +260,7 @@ class OverlayPage(Gtk.Box):
         if self._building:
             return
         r, p = self.cfg["resources"], self.cfg["pins"]
+        self.cfg["layout"] = LAYOUTS[self.layout_row.get_selected()][0]
         r["enabled"] = self.res_enabled.get_active()
         r["size"] = self.res_size.get_selected()
         r["fields"] = [key for key, _ in FIELDS if self.field_rows[key].get_active()]
@@ -311,6 +351,15 @@ class OverlayPage(Gtk.Box):
             cr.set_line_width(2 if which == self.selected else 1)
             cr.rectangle(x + 0.5, y + 0.5, w - 1, h - 1)
             cr.stroke()
+            if self.cfg.get("layout") == "row":
+                cr.set_source_rgb(text.red, text.green, text.blue)
+                cr.set_font_size(max(6, h * 0.55))
+                extents = cr.text_extents(row_text(self.cfg, which))
+                if extents.width > 0 and extents.width > w - 8:
+                    cr.set_font_size(max(4, h * 0.55 * (w - 8) / extents.width))
+                cr.move_to(x + 4, y + h * 0.72)
+                cr.show_text(row_text(self.cfg, which))
+                continue
             cr.set_source_rgb(accent.red, accent.green, accent.blue)
             cr.set_font_size(max(9, min(h / 4, 15)))
             cr.move_to(x + 6, y + 6 + max(9, min(h / 4, 15)))

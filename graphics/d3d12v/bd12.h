@@ -69,6 +69,9 @@ struct BD12Device {
     uint32_t queue_family;
     VkPipelineCache pipeline_cache;      /* persisted under ~/.cache/beer between runs */
     char pipeline_cache_path[512];
+    /* What compiled pipelines depend on: vendorID, deviceID, driverVersion and the Vulkan pipelineCacheUUID.
+     * ID3D12PipelineLibrary blobs carry it and are refused on another GPU or driver. */
+    uint8_t pipeline_identity[28];
     uint32_t pipeline_cache_new;         /* pipelines built since the last save */
     uint64_t pipeline_cache_saved_ms;
     const BeerVulkanModern *modern;
@@ -83,6 +86,7 @@ struct BD12Device {
     uint32_t wave_lane_max;
     VkDeviceSize min_uniform_texel_alignment;
     VkDeviceSize min_storage_texel_alignment;
+    VkDeviceSize min_storage_buffer_alignment;
     int uniform_texel_single_alignment;
     int storage_texel_single_alignment;
 
@@ -342,6 +346,7 @@ typedef struct {
     uint32_t push_word;           /* bindless: push-constant word with the heap index */
     uint32_t heap_class;          /* bindless: heap-mirror binding 0..3 */
     uint32_t is_accel;            /* SRV is a ray tracing acceleration structure */
+    uint32_t is_ssbo;             /* raw/structured buffer bound as a storage buffer (not a texel buffer) */
     /* Root parameters that can satisfy this binding, found once per root signature (resolve_one). */
     uint32_t cand_serial;         /* root signature serial the list below was built for (0 = none) */
     uint32_t cand_count;          /* 0xff = too many, scan every parameter */
@@ -387,7 +392,23 @@ typedef struct {
 typedef struct {
     BD12RootSignature *root_signature;
     BD12RootArgument arguments[BD12_MAX_ROOT_PARAMETERS];
+    uint64_t epoch;               /* bumped whenever the root signature or an argument changes value */
 } BD12BindState;
+
+/* Every write into a descriptor (view creation, copies): resolved descriptor sets built before it may be stale. */
+extern uint64_t g_bd12_descriptor_epoch;
+#define BD12_DESCRIPTORS_WRITTEN() __atomic_add_fetch(&g_bd12_descriptor_epoch, 1, __ATOMIC_RELAXED)
+
+/* Per-list cache of resolved set-0 descriptor sets (bd12_resolve_descriptor_set). */
+#define BD12_RESOLVE_CACHE 8
+typedef struct {
+    VkDescriptorSetLayout layout;
+    const void *bindings;
+    uint32_t binding_count;
+    uint64_t state_epoch, descriptor_epoch;
+    const void *heaps[2];
+    VkDescriptorSet set;
+} BD12ResolveCacheEntry;
 
 /* Per-allocator record-time storage: descriptor pools and constant scratch.
  * Both are recycled when the allocator is reset (after the GPU is done). */
@@ -569,6 +590,8 @@ typedef struct BD12CmdList {
     uint32_t command_buffer_allocated;
 
     int recording;
+    BD12ResolveCacheEntry resolve_cache[2][BD12_RESOLVE_CACHE];   /* [graphics, compute] */
+    uint32_t resolve_cache_next[2];
     /* Optional descriptor-set resolver (BD11): when set, draws and dispatches ask it for the
      * set-0 descriptor set instead of resolving against a root signature. */
     BD12RtPipeline *rt_pipeline;  /* SetPipelineState1 */

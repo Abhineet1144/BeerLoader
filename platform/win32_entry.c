@@ -18,14 +18,17 @@ __asm__(
     "    add $0x28, %rsp\n"
     /* As on Windows, the initial thread enters the image with RCX = PEB
      * (BaseThreadInitThunk passes RtlUserThreadStart's argument) and the
-     * nonvolatile registers of the zeroed initial context. Carrying Beer's
+     * nonvolatile registers of the zeroed initial context (RDX = entry and R8 = PEB, see below). Carrying Beer's
      * host values in would put host addresses into the guest: RBP held the
      * Linux main() frame (0x7fff...), and RE9's protection, which saves and
      * mixes the caller's registers, then failed its integrity check. */
+    /* kernel32!BaseThreadInitThunk(reserved, StartAddress, Parameter) calls the entry with the parameter in RCX and
+     * leaves StartAddress in RDX and the parameter in R8 (Wine's entry state is the same). Onimusha's protection
+     * mixes them into its control flow; with RDX and R8 zeroed it jumped into the middle of an instruction. */
     "    mov %gs:0x60, %rcx\n"
     "    xor %eax, %eax\n"
-    "    xor %edx, %edx\n"
-    "    xor %r8d, %r8d\n"
+    "    mov %r11, %rdx\n"
+    "    mov %rcx, %r8\n"
     "    xor %r9d, %r9d\n"
     "    xor %ebx, %ebx\n"
     "    xor %ebp, %ebp\n"

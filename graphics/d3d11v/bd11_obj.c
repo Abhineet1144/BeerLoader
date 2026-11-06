@@ -974,6 +974,13 @@ static B11HR B11_MS dev_qi(B11Obj *self, const uint8_t *riid, void **out)
 static uint32_t B11_MS dev_addref(B11Obj *self) { return b11_add_ref(self); }
 static uint32_t B11_MS dev_release(B11Obj *self) { return b11_release(self); }
 static B11HR B11_MS dev_notimpl(void) { return B11_E_NOTIMPL; }
+static B11HR B11_MS dev_open_shared_resource(B11Device *dev, uint64_t handle, const uint8_t *riid, void **out)
+{
+    (void)dev; (void)riid;
+    if (out) *out = NULL;
+    fprintf(stderr, "[BD11] ID3D11Device::OpenSharedResource(handle=0x%llx) -> E_NOTIMPL\n", (unsigned long long)handle);
+    return B11_E_NOTIMPL;
+}
 static B11HR B11_MS dev_create_deferred(B11Device *dev, uint32_t flags, void **out)
 {
     if (!out) return B11_E_INVALIDARG;
@@ -1105,7 +1112,7 @@ void b11_init_vtables(void)
     d[18] = (void *)dev_create_cs; d[19] = (void *)dev_create_linkage;
     d[20] = (void *)dev_create_blend; d[21] = (void *)dev_create_depth; d[22] = (void *)dev_create_raster;
     d[23] = (void *)dev_create_sampler; d[24] = (void *)dev_create_query; d[25] = (void *)dev_create_query;
-    d[27] = (void *)dev_create_deferred;
+    d[27] = (void *)dev_create_deferred; d[28] = (void *)dev_open_shared_resource;
     d[29] = (void *)dev_check_format_support; d[30] = (void *)dev_check_ms_quality;
     d[31] = (void *)dev_check_counter_info; d[33] = (void *)dev_check_feature_support;
     d[34] = (void *)child_get_private; d[35] = (void *)child_set_private; d[36] = (void *)child_set_private_iface;

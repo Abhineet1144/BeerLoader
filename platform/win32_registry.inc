@@ -160,11 +160,42 @@ static void reg_seed_display_driver_locked(void)
     }
 }
 
+/* NVIDIA NGX (DLSS) core: the Windows-side nvngx.dll/_nvngx.dll that the Linux driver ships for Wine-based
+ * loaders, located through HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore "FullPath" as on a Windows driver
+ * install. Published only when the driver's copy exists; the path is the Linux directory through drive Z:.
+ * BEER_NGX_PATH=<linux dir> overrides the search. */
+static void reg_seed_nvidia_ngx(void)
+{
+    static const char *const candidates[] = {
+        "/usr/lib/x86_64-linux-gnu/nvidia/wine", "/usr/lib64/nvidia/wine", "/usr/lib/nvidia/wine",
+    };
+    const char *chosen = getenv("BEER_NGX_PATH");
+    char probe[PATH_MAX];
+    if (chosen && *chosen) {
+        snprintf(probe, sizeof(probe), "%s/_nvngx.dll", chosen);
+        if (access(probe, R_OK)) chosen = NULL;
+    } else chosen = NULL;
+    for (size_t i = 0; !chosen && i < sizeof(candidates) / sizeof(*candidates); ++i) {
+        snprintf(probe, sizeof(probe), "%s/_nvngx.dll", candidates[i]);
+        if (!access(probe, R_OK)) chosen = candidates[i];
+    }
+    if (!chosen) return;
+    static char windows_path[160];
+    snprintf(windows_path, sizeof(windows_path), "Z:%s", chosen);
+    for (char *c = windows_path; *c; ++c) if (*c == '/') *c = '\\';
+    reg_add_sz("hklm\\software\\nvidia corporation\\global\\ngxcore", "fullpath", windows_path);
+    /* The kernel driver's service key exists on any NVIDIA install (Type 1 = kernel driver, Start 3 = demand). */
+    reg_add_dword("hklm\\system\\currentcontrolset\\services\\nvlddmkm", "type", 1);
+    reg_add_dword("hklm\\system\\currentcontrolset\\services\\nvlddmkm", "start", 3);
+    fprintf(stderr, "[NGX] NGXCore FullPath=%s\n", windows_path);
+}
+
 static void reg_seed_locked(void)
 {
     if (g_reg_value_count) return;
     reg_seed_hardware();
     reg_seed_vc_runtime();
+    reg_seed_nvidia_ngx();
     {   /* Launchers look for their sibling launcher through its install folder: point it at the game directory. */
         char folder[160];
         snprintf(folder, sizeof(folder), "%s", g_exe_path ? g_exe_path : "");

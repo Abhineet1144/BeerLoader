@@ -477,11 +477,14 @@ static HR MS fence_set_event(ComFence *f, uint64_t value, uint64_t event)
     add_waiter(f->obj.dev, f, value, event);
     return HR_OK;
 }
+static void queue_flush_deferred(ComDevice *dev);
 static HR MS fence_signal(ComFence *f, uint64_t value)
 {
     if (fence_diag())
         fprintf(stderr, "[FENCE] CPU Signal fence=%p value=%llu\n", (void *)f, (unsigned long long)value);
-    return bd12_fence_signal_cpu(f->fence, value) ? HR_OK : HR_E_FAIL;
+    const int ok = bd12_fence_signal_cpu(f->fence, value);
+    if (ok && f->obj.dev) queue_flush_deferred(f->obj.dev);   /* a held queue Wait may now be satisfiable */
+    return ok ? HR_OK : HR_E_FAIL;
 }
 /* ID3D12Device3::EnqueueMakeResident(flags, count, objects, fence, value). BD12 never evicts, so every object is
  * already resident and the fence is signalled at once. Returning S_OK without signalling left a game's GPU wait on
@@ -501,17 +504,52 @@ static void *fence_vtable[11] = {
 
 /* Queue -------------------------------------------------------------------- */
 
+/* A queue operation held on the CPU (see queue_push). */
+typedef struct QueueOp {
+    int kind;                     /* QUEUE_OP_* */
+    uint32_t count;
+    BD12CmdList **lists;          /* QUEUE_OP_EXECUTE: recorded lists, owned by their allocators */
+    ComFence *fence;              /* QUEUE_OP_SIGNAL / QUEUE_OP_WAIT (referenced while held) */
+    uint64_t value;
+    ComResource *texture;         /* QUEUE_OP_PRESENT (referenced while held) */
+} QueueOp;
+enum { QUEUE_OP_EXECUTE, QUEUE_OP_SIGNAL, QUEUE_OP_WAIT, QUEUE_OP_PRESENT };
+
 typedef struct ComQueue {
     ComObj obj;
     struct { void **vtable; } downlevel;
     uint32_t desc[4];
+    QueueOp *held;                /* in submission order; guarded by dev->defer_lock */
+    uint32_t held_count, held_capacity;
+    struct ComQueue *next_deferred;
 } ComQueue;
 
 static Bd12ImagePresenter g_presenter;
 void bd12_com_set_image_presenter(Bd12ImagePresenter p) { g_presenter = p; }
 Bd12ImagePresenter bd12_com_get_image_presenter(void) { return g_presenter; }
 
-static void queue_destroy(ComObj *o) { free(o); }
+static void queue_release_op(QueueOp *op)
+{
+    free(op->lists);
+    if (op->fence) com_release(&op->fence->obj);
+    if (op->texture) com_release(&op->texture->obj);
+}
+static void queue_destroy(ComObj *o)
+{
+    ComQueue *q = (ComQueue *)o;
+    ComDevice *dev = q->obj.dev;
+    if (dev) {
+        pthread_mutex_lock(&dev->defer_lock);
+        for (ComQueue **link = &dev->deferred; *link; link = &(*link)->next_deferred)
+            if (*link == q) { *link = q->next_deferred; break; }
+        pthread_mutex_unlock(&dev->defer_lock);
+    }
+    if (q->held_count)
+        fprintf(stderr, "[BD12] queue %p destroyed with %u held operations\n", (void *)q, q->held_count);
+    for (uint32_t i = 0; i < q->held_count; ++i) queue_release_op(&q->held[i]);
+    free(q->held);
+    free(q);
+}
 
 static HR MS queue_query(ComQueue *q, const uint8_t *riid, void **out)
 {
@@ -526,24 +564,122 @@ static HR MS queue_query(ComQueue *q, const uint8_t *riid, void **out)
     return com_obj_query(&q->obj, riid, out, iid_queue, NULL);
 }
 
+static HR present_epilogue(ComQueue *q, ComResource *texture);
+
+/* A Wait can go to the GPU once its value has been signalled or queued ahead of it: BD12Fence.signaled is
+ * claimed inside com_submit (under submit_lock) before the Vulkan submission, and by CPU signals. */
+static int queue_wait_ready(const QueueOp *op)
+{
+    return __atomic_load_n(&op->fence->fence->signaled, __ATOMIC_ACQUIRE) >= op->value;
+}
+
+static HR queue_run_op(ComQueue *q, QueueOp *op)
+{
+    ComDevice *dev = q->obj.dev;
+    switch (op->kind) {
+    case QUEUE_OP_EXECUTE:
+        for (uint32_t done = 0; done < op->count; done += 64) {
+            const uint32_t n = op->count - done < 64 ? op->count - done : 64;
+            if (com_submit(dev, op->lists + done, n, NULL, 0, NULL, 0) != VK_SUCCESS) return HR_E_FAIL;
+        }
+        return HR_OK;
+    case QUEUE_OP_SIGNAL: {
+        BD12FenceOp signal = { op->fence->fence, op->value };
+        return com_submit(dev, NULL, 0, NULL, 0, &signal, 1) == VK_SUCCESS ? HR_OK : HR_E_FAIL;
+    }
+    case QUEUE_OP_WAIT: {
+        BD12FenceOp wait = { op->fence->fence, op->value };
+        return com_submit(dev, NULL, 0, &wait, 1, NULL, 0) == VK_SUCCESS ? HR_OK : HR_E_FAIL;
+    }
+    case QUEUE_OP_PRESENT:
+        return present_epilogue(q, op->texture);
+    }
+    return HR_E_FAIL;
+}
+
+/* Runs every held operation that has become possible, across queues, until nothing moves (a released Signal can
+ * release another queue's Wait). Caller holds dev->defer_lock. */
+static void queue_flush_deferred_locked(ComDevice *dev)
+{
+    for (int progress = 1; progress;) {
+        progress = 0;
+        for (ComQueue **link = &dev->deferred; *link;) {
+            ComQueue *q = *link;
+            uint32_t ran = 0;
+            while (ran < q->held_count) {
+                QueueOp *op = &q->held[ran];
+                if (op->kind == QUEUE_OP_WAIT && !queue_wait_ready(op)) break;
+                queue_run_op(q, op);
+                queue_release_op(op);
+                ++ran;
+            }
+            if (ran) {
+                progress = 1;
+                memmove(q->held, q->held + ran, (q->held_count - ran) * sizeof(*q->held));
+                q->held_count -= ran;
+            }
+            if (!q->held_count) *link = q->next_deferred;
+            else link = &q->next_deferred;
+        }
+    }
+}
+static void queue_flush_deferred(ComDevice *dev)
+{
+    pthread_mutex_lock(&dev->defer_lock);
+    if (dev->deferred) queue_flush_deferred_locked(dev);
+    pthread_mutex_unlock(&dev->defer_lock);
+}
+
+/* Submits a queue operation in queue order. A queue with held work keeps holding; a Wait that cannot be
+ * satisfied yet starts holding. Everything else goes straight to the GPU, outside defer_lock so presents and
+ * large submissions do not serialize other queues. `op` is consumed (its references move or are released). */
+static HR queue_push(ComQueue *q, QueueOp *op)
+{
+    ComDevice *dev = q->obj.dev;
+    pthread_mutex_lock(&dev->defer_lock);
+    if (!q->held_count && !(op->kind == QUEUE_OP_WAIT && !queue_wait_ready(op))) {
+        pthread_mutex_unlock(&dev->defer_lock);
+        const HR hr = queue_run_op(q, op);
+        const int signal = op->kind == QUEUE_OP_SIGNAL;
+        queue_release_op(op);
+        if (signal) queue_flush_deferred(dev);
+        return hr;
+    }
+    if (q->held_count == q->held_capacity) {
+        const uint32_t capacity = q->held_capacity ? q->held_capacity * 2 : 16;
+        QueueOp *grown = realloc(q->held, capacity * sizeof(*grown));
+        if (!grown) {
+            pthread_mutex_unlock(&dev->defer_lock);
+            queue_release_op(op);
+            return HR_E_OUTOFMEMORY;
+        }
+        q->held = grown;
+        q->held_capacity = capacity;
+    }
+    if (!q->held_count) {
+        q->next_deferred = dev->deferred;
+        dev->deferred = q;
+        if (fence_diag())
+            fprintf(stderr, "[FENCE] queue %p holds its work: Wait fence=%p value=%llu not yet signalled\n",
+                    (void *)q, (void *)op->fence, (unsigned long long)op->value);
+    }
+    q->held[q->held_count++] = *op;
+    pthread_mutex_unlock(&dev->defer_lock);
+    return HR_OK;
+}
 static void MS queue_execute(ComQueue *q, uint32_t count, ComObj *const *lists)
 {
     BD12_PROF_BEGIN();
     { extern uint64_t g_bd12_render_tid; g_bd12_render_tid = (uint64_t)syscall(SYS_gettid); }
     bd12_prof_report();
-    BD12CmdList *batch[64];
-    uint32_t n = 0;
-    ComDevice *dev = q->obj.dev;
-    for (uint32_t i = 0; i < count; ++i) {
+    QueueOp op = { .kind = QUEUE_OP_EXECUTE };
+    op.lists = count ? malloc(count * sizeof(*op.lists)) : NULL;
+    for (uint32_t i = 0; op.lists && i < count; ++i) {
         BD12CmdList *recorded = lists[i] ? com_list_finish(lists[i]) : NULL;
-        if (!recorded) continue;
-        batch[n++] = recorded;
-        if (n == 64) {
-            com_submit(dev, batch, n, NULL, 0, NULL, 0);
-            n = 0;
-        }
+        if (recorded) op.lists[op.count++] = recorded;
     }
-    if (n) com_submit(dev, batch, n, NULL, 0, NULL, 0);
+    if (op.count) queue_push(q, &op);
+    else free(op.lists);
     BD12_PROF_END(BD12_PROF_EXECUTE);
 }
 
@@ -557,20 +693,20 @@ static HR MS queue_signal(ComQueue *q, ComFence *f, uint64_t value)
                 (unsigned long long)value);
         return HR_E_INVALIDARG;
     }
-    BD12FenceOp s = { f->fence, value };
     if (fence_diag())
         fprintf(stderr, "[FENCE] queue %p Signal fence=%p value=%llu\n", (void *)q, (void *)f, (unsigned long long)value);
-    return com_submit(q->obj.dev, NULL, 0, NULL, 0, &s, 1) == VK_SUCCESS ?
-           HR_OK : HR_E_FAIL;
+    com_add_ref(&f->obj);
+    QueueOp op = { .kind = QUEUE_OP_SIGNAL, .fence = f, .value = value };
+    return queue_push(q, &op);
 }
 static HR MS queue_wait(ComQueue *q, ComFence *f, uint64_t value)
 {
-    if (!q || !f) return HR_E_INVALIDARG;
-    BD12FenceOp w = { f->fence, value };
+    if (!q || !f || !f->fence) return HR_E_INVALIDARG;
     if (fence_diag())
         fprintf(stderr, "[FENCE] queue %p Wait fence=%p value=%llu\n", (void *)q, (void *)f, (unsigned long long)value);
-    return com_submit(q->obj.dev, NULL, 0, &w, 1, NULL, 0) == VK_SUCCESS ?
-           HR_OK : HR_E_FAIL;
+    com_add_ref(&f->obj);
+    QueueOp op = { .kind = QUEUE_OP_WAIT, .fence = f, .value = value };
+    return queue_push(q, &op);
 }
 static HR MS queue_frequency(ComQueue *q, uint64_t *freq)
 {
@@ -635,7 +771,6 @@ static uint32_t MS dl_release(void *iface)
     return com_release(&queue_from_downlevel(iface)->obj);
 }
 
-static HR present_epilogue(ComQueue *q, ComResource *texture);
 static HR MS dl_present(void *iface, ComObj *list, ComResource *texture,
                         uint64_t window, uint32_t flags)
 {
@@ -646,9 +781,15 @@ static HR MS dl_present(void *iface, ComObj *list, ComResource *texture,
         bd12_trace_frame_advance();
         return HR_E_INVALIDARG;
     }
+    (void)dev;
     BD12CmdList *recorded = com_list_finish(list);
-    if (recorded) com_submit(dev, &recorded, 1, NULL, 0, NULL, 0);
-    return present_epilogue(q, texture);
+    if (recorded) {
+        QueueOp op = { .kind = QUEUE_OP_EXECUTE, .count = 1, .lists = malloc(sizeof(BD12CmdList *)) };
+        if (op.lists) { op.lists[0] = recorded; queue_push(q, &op); }
+    }
+    com_add_ref(&texture->obj);
+    QueueOp present = { .kind = QUEUE_OP_PRESENT, .texture = texture };
+    return queue_push(q, &present);
 }
 
 /* Everything after the recorded work is submitted: epoch advance, capture hooks, then hand the image to the
@@ -764,7 +905,11 @@ static void resource_free(ComDevice *dev, void *ptr)
     if (r->heap) com_release(&r->heap->obj);
     free(r);
 }
-static void resource_destroy(ComObj *o) { com_defer(o->dev, resource_free, o); }
+static void resource_destroy(ComObj *o)
+{
+    BD12_DESCRIPTORS_WRITTEN();   /* descriptors naming it now resolve as null: cached sets are stale */
+    com_defer(o->dev, resource_free, o);
+}
 
 static HR MS resource_query(ComObj *s, const uint8_t *r, void **o)
 { return com_obj_query(s, r, o, iid_resource, NULL); }
@@ -869,7 +1014,14 @@ static int image_desc_from(const ComResource *r, BD12ImageDesc *d)
               r->dimension == 4 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     d->allow_depth_stencil = (r->flags & 2) != 0;
     d->format = bd12_dxgi_resource_to_vk(r->dxgi_format, d->allow_depth_stencil);
-    if (d->format == VK_FORMAT_UNDEFINED) return 0;
+    if (d->format == VK_FORMAT_UNDEFINED) {
+        static uint64_t logged[4];          /* once per DXGI format below 256 */
+        const uint32_t f = r->dxgi_format;
+        if (f < 256 && !(__atomic_fetch_or(&logged[f / 64], 1ull << (f % 64), __ATOMIC_RELAXED) & (1ull << (f % 64))))
+            fprintf(stderr, "[BD12] texture with DXGI format %u (%llux%u) is not supported; creation fails\n", f,
+                    (unsigned long long)r->width, r->height);
+        return 0;
+    }
     d->width = (uint32_t)r->width;
     d->height = r->height;
     d->depth_or_layers = r->depth_or_layers;
@@ -1215,8 +1367,10 @@ static HR MS dev_query(ComDevice *self, const uint8_t *riid, void **out)
                   !com_iid_equal(riid, iid_device9))) {
         static unsigned logged;
         if (riid && logged++ < 32)
-            fprintf(stderr, "[BD12] ID3D12Device::QueryInterface %02x%02x%02x%02x-%02x%02x-%02x%02x-... -> E_NOINTERFACE\n",
-                    riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6]);
+            fprintf(stderr, "[BD12] ID3D12Device::QueryInterface %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+                            "%02x%02x%02x%02x%02x%02x -> E_NOINTERFACE (caller %p)\n",
+                    riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6], riid[8], riid[9],
+                    riid[10], riid[11], riid[12], riid[13], riid[14], riid[15], __builtin_return_address(0));
         return HR_E_NOINTERFACE;
     }
     com_add_ref(&self->obj);
@@ -1518,7 +1672,10 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
             const uint32_t format = f[0];
             f[1] = f[2] = 0;
             const VkFormat vk = bd12_dxgi_to_vk(format);
-            if (vk == VK_FORMAT_UNDEFINED || !self->bd->get_format_properties) return HR_OK;
+            if (vk == VK_FORMAT_UNDEFINED || !self->bd->get_format_properties) {
+                if (getenv("BEER_BD12_FORMAT_LOG")) fprintf(stderr, "[BD12] FORMAT_SUPPORT %u -> unknown format\n", format);
+                return HR_OK;
+            }
             VkFormatProperties props;
             self->bd->get_format_properties(self->bd->physical_device, vk, &props);
             const VkFormatFeatureFlags t = props.optimalTilingFeatures, b = props.bufferFeatures;
@@ -1538,6 +1695,12 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
                 s1 |= 0x80000;                                                        /* swapchain formats: display */
             f[1] = s1;
             f[2] = s2;
+            if (getenv("BEER_BD12_FORMAT_LOG")) {     /* which formats a game asks about, and the answer */
+                static uint64_t asked[4];
+                if (format < 256 && !(__atomic_fetch_or(&asked[format / 64], 1ull << (format % 64), __ATOMIC_RELAXED) &
+                                      (1ull << (format % 64))))
+                    fprintf(stderr, "[BD12] FORMAT_SUPPORT %u -> 0x%x 0x%x\n", format, s1, s2);
+            }
             return HR_OK;
         }
         return HR_E_INVALIDARG;
@@ -1548,7 +1711,19 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
             return HR_OK;
         }
         return HR_E_INVALIDARG;
-    case 7: case 12: case 18: case 19:
+    case 19:                                        /* SHADER_CACHE */
+        if (size < 4) return HR_E_INVALIDARG;
+        /* BEER_D3D12_PIPELINE_LIBRARY=1 offers LIBRARY (bd12_pipelib.c) with the automatic in-process and on-disk
+         * caches (one VkPipelineCache saved under ~/.cache/beer). Off by default: Onimusha then runs its
+         * first-run shader compilation, which fills the game's 640 MB block arena about 20 s in and crashes
+         * (not yet understood; vkd3d-proton completes it). SINGLE_PSO is not offered: GetCachedBlob and CachedPSO
+         * are not implemented. CreatePipelineLibrary itself always works. */
+        {
+            const char *library = getenv("BEER_D3D12_PIPELINE_LIBRARY");
+            *(uint32_t *)data = library && *library && strcmp(library, "0") ? 0x2u | 0x4u | 0x8u : 0u;
+        }
+        return HR_OK;
+    case 7: case 12: case 18:
     case 21: case 23: case 27: case 30: case 32:
         memset(data, 0, size);
         return HR_OK;
@@ -1872,6 +2047,7 @@ static void MS dev_create_sampler(ComDevice *self, const uint8_t *desc,
     VkSamplerCreateInfo info = sampler_from_desc(desc, 0);
     BD12DescriptorHeap heap = temp_heap(self, dest);
     bd12_descriptor_write_sampler(&heap, 0, &info);
+    BD12_DESCRIPTORS_WRITTEN();
 }
 
 static void MS dev_copy_descriptors_simple(ComDevice *self, uint32_t count,
@@ -2643,6 +2819,32 @@ static HR MS dev_create_shader_cache_session(ComDevice *self, const void *desc, 
 static HR MS dev_shader_cache_control(ComDevice *self, uint32_t kinds, uint32_t control)
 { (void)self; (void)kinds; (void)control; return 0x887a0004u; }
 
+static HR MS dev_create_shared_handle(ComDevice *self, ComObj *object, const void *attributes, uint32_t access,
+                                      const uint16_t *name, uint64_t *handle)
+{
+    (void)self; (void)attributes; (void)access; (void)name;
+    if (handle) *handle = 0;
+    fprintf(stderr, "[BD12] CreateSharedHandle(object=%p kind=%u) -> E_NOTIMPL\n", (void *)object, object ? object->kind : 0);
+    return HR_E_NOTIMPL;
+}
+static HR MS dev_open_shared_handle(ComDevice *self, uint64_t handle, const uint8_t *riid, void **out)
+{
+    (void)self; (void)riid;
+    if (out) *out = NULL;
+    fprintf(stderr, "[BD12] OpenSharedHandle(0x%llx) -> E_NOTIMPL\n", (unsigned long long)handle);
+    return HR_E_NOTIMPL;
+}
+static HR MS dev_open_shared_handle_by_name(ComDevice *self, const uint16_t *name, uint32_t access, uint64_t *handle)
+{
+    (void)self; (void)name; (void)access;
+    if (handle) *handle = 0;
+    fprintf(stderr, "[BD12] OpenSharedHandleByName -> E_NOTIMPL\n");
+    return HR_E_NOTIMPL;
+}
+
+static HR MS dev_create_pipeline_library(ComDevice *self, const void *blob, uint64_t size, const uint8_t *riid,
+                                         void **out) { return com_create_pipeline_library(self, blob, (size_t)size, riid, out); }
+
 static void *device_vtable[76] = {
     [0] = dev_query, [1] = dev_add_ref, [2] = dev_release,
     [3] = com_obj_get_private, [4] = com_obj_set_private, [5] = com_obj_set_private_iface,
@@ -2656,12 +2858,12 @@ static void *device_vtable[76] = {
     [23] = dev_copy_descriptors, [24] = dev_copy_descriptors_simple,
     [25] = dev_get_allocation_info, [26] = dev_get_custom_heap_props,
     [27] = dev_create_committed, [28] = dev_create_heap,
-    [29] = dev_create_placed, [30] = dev_create_reserved, [31] = obj_notimpl,
-    [32] = obj_notimpl, [33] = obj_notimpl, [34] = obj_ok, [35] = obj_ok,
+    [29] = dev_create_placed, [30] = dev_create_reserved, [31] = dev_create_shared_handle,
+    [32] = dev_open_shared_handle, [33] = dev_open_shared_handle_by_name, [34] = obj_ok, [35] = obj_ok,
     [36] = dev_create_fence, [37] = dev_removed_reason,
     [38] = dev_get_footprints, [39] = dev_create_query_heap, [40] = obj_ok,
     [41] = dev_create_command_signature, [42] = dev_get_resource_tiling,
-    [43] = dev_get_luid, [44] = obj_notimpl, [45] = obj_notimpl,
+    [43] = dev_get_luid, [44] = dev_create_pipeline_library, [45] = obj_notimpl,
     [46] = obj_ok, [47] = dev_create_pso,
     /* Device3 */ [48] = obj_notimpl, [49] = obj_notimpl, [50] = dev_enqueue_make_resident,
     /* Device4 */ [51] = dev_create_list1, [52] = obj_notimpl,
@@ -2810,7 +3012,12 @@ static HR MS sc_present(ComSwapChain *sc, uint32_t sync, uint32_t flags)
      * back buffer nor advances the buffer index. Treating it as a real present doubles every frame. */
     if (flags & 0x1u) return HR_OK;
     ComResource *texture = sc->buffers[sc->index % (sc->buffer_count ? sc->buffer_count : 1)];
-    HR hr = texture ? present_epilogue(sc->queue, texture) : HR_E_FAIL;
+    HR hr = HR_E_FAIL;
+    if (texture) {                      /* in queue order: held behind any held work of the swapchain's queue */
+        com_add_ref(&texture->obj);
+        QueueOp op = { .kind = QUEUE_OP_PRESENT, .texture = texture };
+        hr = queue_push(sc->queue, &op);
+    }
     sc->index = (sc->index + 1) % (sc->buffer_count ? sc->buffer_count : 1);
     ++sc->present_count;
     return hr == HR_E_NOTIMPL ? HR_OK : hr;     /* no presenter attached: nothing to show, not an error */
@@ -2877,7 +3084,26 @@ static HR MS sc_resize_buffers(ComSwapChain *sc, uint32_t count, uint32_t w, uin
 {
     return swapchain_resize(sc, count, w, h, format, flags);
 }
-static HR MS sc_resize_target(ComSwapChain *sc, const void *mode) { (void)sc; (void)mode; return HR_OK; }
+/* Window client resize for ResizeTarget, set by the loader (hwnd, client width, client height). */
+static int (*g_window_client_resizer)(uint64_t hwnd, uint32_t width, uint32_t height);
+void bd12_com_set_window_client_resizer(int (*fn)(uint64_t hwnd, uint32_t width, uint32_t height))
+{
+    g_window_client_resizer = fn;
+}
+/* IDXGISwapChain::ResizeTarget(DXGI_MODE_DESC): windowed, it resizes the window's client area to the mode's size
+ * (zero keeps that dimension). Games size borderless windows this way (Onimusha). With no display mode switching,
+ * a fullscreen target becomes a window of the mode's size too. */
+static HR MS sc_resize_target(ComSwapChain *sc, const void *mode)
+{
+    if (!mode) return HR_E_INVALIDARG;
+    uint32_t width, height;
+    memcpy(&width, mode, 4);
+    memcpy(&height, (const uint8_t *)mode + 4, 4);
+    fprintf(stderr, "[BD12] ResizeTarget(%ux%u)%s\n", width, height, sc->fullscreen ? " fullscreen" : "");
+    if (width && height && g_window_client_resizer && !g_window_client_resizer(sc->hwnd, width, height))
+        return HR_E_FAIL;
+    return HR_OK;
+}
 static HR MS sc_get_containing_output(ComSwapChain *sc, void **out)
 {
     (void)sc;
@@ -3057,6 +3283,7 @@ uint64_t MS beer_bd12_create_device(const uint8_t *riid, void **out)
                 dev = NULL;
             } else {
                 pthread_mutex_init(&dev->submit_lock, NULL);
+                pthread_mutex_init(&dev->defer_lock, NULL);
                 pthread_mutex_init(&dev->grave_lock, NULL);
                 pthread_mutex_init(&dev->wait_lock, NULL);
                 pthread_cond_init(&dev->wait_cond, NULL);

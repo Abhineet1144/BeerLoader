@@ -243,6 +243,8 @@ int bd12_cmd_list_begin(BD12CmdList *list)
     list->compute_pipeline = NULL;
     memset(&list->compute, 0, sizeof(list->compute));
     memset(&list->graphics, 0, sizeof(list->graphics));
+    memset(list->resolve_cache, 0, sizeof(list->resolve_cache));   /* its sets came from the reset allocator */
+    memset(list->resolve_cache_next, 0, sizeof(list->resolve_cache_next));
     memset(&list->gfx, 0, sizeof(list->gfx));
     memset(list->dispatch_flight, 0, sizeof(list->dispatch_flight));
     list->dispatch_count = 0;

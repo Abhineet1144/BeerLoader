@@ -4,6 +4,8 @@
 #include "bd12_formats.h"
 #include "d3d12_shader_translator.h"
 
+#include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -335,7 +337,8 @@ static uint32_t to_bindings(const BeerD3D12TranslatedShader *shader,
             .binding = d->binding,
             .bindless = d->bindless,
             .push_word = d->push_word,
-            .heap_class = d->heap_class
+            .heap_class = d->heap_class,
+            .is_ssbo = d->ssbo
         };
     }
     return shader->descriptor_count;
@@ -565,12 +568,68 @@ static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDe
 
 /* Clone ---------------------------------------------------------------------- */
 
+/* Shader bytecode shared between pipeline descriptions. Engines create tens of thousands of pipelines from a few
+ * thousand shaders (Onimusha's first-run shader compilation stores ~40000); a private copy per pipeline held
+ * several GiB until each pipeline compiled. One reference-counted copy per distinct shader. */
+typedef struct ShaderBytes {
+    struct ShaderBytes *next;
+    uint64_t hash;
+    size_t size;
+    uint32_t refs;
+    uint8_t data[];
+} ShaderBytes;
+#define SHADER_BUCKETS 8192u
+static ShaderBytes *g_shader_buckets[SHADER_BUCKETS];
+static pthread_mutex_t g_shader_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t shader_hash(const uint8_t *p, size_t n)
+{
+    uint64_t h = 1469598103934665603ull ^ n;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static const uint8_t *shader_intern(const uint8_t *bytes, size_t size)
+{
+    const uint64_t hash = shader_hash(bytes, size);
+    ShaderBytes **bucket = &g_shader_buckets[hash % SHADER_BUCKETS];
+    pthread_mutex_lock(&g_shader_lock);
+    for (ShaderBytes *e = *bucket; e; e = e->next)
+        if (e->hash == hash && e->size == size && !memcmp(e->data, bytes, size)) {
+            ++e->refs;
+            pthread_mutex_unlock(&g_shader_lock);
+            return e->data;
+        }
+    ShaderBytes *e = malloc(sizeof(*e) + size);
+    if (e) {
+        e->hash = hash;
+        e->size = size;
+        e->refs = 1;
+        memcpy(e->data, bytes, size);
+        e->next = *bucket;
+        *bucket = e;
+    }
+    pthread_mutex_unlock(&g_shader_lock);
+    return e ? e->data : NULL;
+}
+
+static void shader_release(const uint8_t *data)
+{
+    if (!data) return;
+    ShaderBytes *e = (ShaderBytes *)(void *)(data - offsetof(ShaderBytes, data));
+    pthread_mutex_lock(&g_shader_lock);
+    if (--e->refs == 0) {
+        for (ShaderBytes **link = &g_shader_buckets[e->hash % SHADER_BUCKETS]; *link; link = &(*link)->next)
+            if (*link == e) { *link = e->next; break; }
+        free(e);
+    }
+    pthread_mutex_unlock(&g_shader_lock);
+}
+
 int bd12_pso_clone(const BD12PsoDesc *src, BD12PsoDesc *dst)
 {
     *dst = *src;
-    size_t total = src->vs_size + src->ps_size + src->cs_size +
-                   src->hs_size + src->ds_size + src->gs_size +
-                   (size_t)src->input_count * 32;
+    size_t total = (size_t)src->input_count * 32;
     for (uint32_t i = 0; i < src->input_count; ++i) {
         const char *name = NULL;
         memcpy(&name, src->input_elements + (size_t)i * 32, sizeof(name));
@@ -578,31 +637,18 @@ int bd12_pso_clone(const BD12PsoDesc *src, BD12PsoDesc *dst)
     }
     uint8_t *blob = malloc(total ? total : 1);
     if (!blob) return 0;
+    const uint8_t **stages[6] = { &dst->vs, &dst->ps, &dst->cs, &dst->hs, &dst->ds, &dst->gs };
+    const size_t sizes[6] = { src->vs_size, src->ps_size, src->cs_size, src->hs_size, src->ds_size, src->gs_size };
+    for (int i = 0; i < 6; ++i) {
+        if (!sizes[i]) { *stages[i] = NULL; continue; }
+        *stages[i] = shader_intern(*stages[i], sizes[i]);
+        if (!*stages[i]) {
+            for (int j = 0; j < i; ++j) shader_release(*stages[j]);
+            free(blob);
+            return 0;
+        }
+    }
     uint8_t *cursor = blob;
-    if (src->vs_size) {
-        memcpy(cursor, src->vs, src->vs_size);
-        dst->vs = cursor; cursor += src->vs_size;
-    }
-    if (src->ps_size) {
-        memcpy(cursor, src->ps, src->ps_size);
-        dst->ps = cursor; cursor += src->ps_size;
-    }
-    if (src->cs_size) {
-        memcpy(cursor, src->cs, src->cs_size);
-        dst->cs = cursor; cursor += src->cs_size;
-    }
-    if (src->hs_size) {
-        memcpy(cursor, src->hs, src->hs_size);
-        dst->hs = cursor; cursor += src->hs_size;
-    }
-    if (src->ds_size) {
-        memcpy(cursor, src->ds, src->ds_size);
-        dst->ds = cursor; cursor += src->ds_size;
-    }
-    if (src->gs_size) {
-        memcpy(cursor, src->gs, src->gs_size);
-        dst->gs = cursor; cursor += src->gs_size;
-    }
     if (src->input_count) {
         uint8_t *elements = cursor;
         cursor += (size_t)src->input_count * 32;
@@ -619,14 +665,18 @@ int bd12_pso_clone(const BD12PsoDesc *src, BD12PsoDesc *dst)
         }
         dst->input_elements = elements;
     }
-    /* The blob is addressed through whichever pointer comes first; keep the
-     * base in a side field so release can free it. */
+    /* Input layouts live in owned_blob; shader stages are shared references (see shader_intern). */
     dst->owned_blob = blob;
     return 1;
 }
 
 void bd12_pso_release(BD12PsoDesc *pso)
 {
+    if (pso->owned_blob) {
+        const uint8_t **stages[6] = { &pso->vs, &pso->ps, &pso->cs, &pso->hs, &pso->ds, &pso->gs };
+        for (int i = 0; i < 6; ++i) { shader_release(*stages[i]); *stages[i] = NULL; }
+        pso->vs_size = pso->ps_size = pso->cs_size = pso->hs_size = pso->ds_size = pso->gs_size = 0;
+    }
     free(pso->owned_blob);
     pso->owned_blob = NULL;
 }

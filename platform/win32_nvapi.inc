@@ -164,6 +164,98 @@ static int __attribute__((ms_abi)) nvapi_GPU_GetArchInfo(u64 handle, u32 *info)
     return NVAPI_OK;
 }
 
+/* ---- D3D12 CUDA interop (NGX / DLSS): graphics/d3d12v/bd12_cuda.c ---- */
+#include "../graphics/d3d12v/bd12_cuda.h"
+
+/* CUDA compute capability of the architecture GetArchInfo reports (consumer parts of each generation). */
+static int nvapi_cuda_sm(u32 *major, u32 *minor)
+{
+    u32 info[4] = { 16u | (2u << 16) };
+    if (nvapi_GPU_GetArchInfo(NVAPI_GPU_HANDLE, info) != NVAPI_OK) return 0;
+    switch (info[1]) {
+    case 0x1b0: *major = 12; *minor = 0; return 1;   /* Blackwell */
+    case 0x190: *major = 8; *minor = 9; return 1;    /* Ada */
+    case 0x170: *major = 8; *minor = 6; return 1;    /* Ampere */
+    case 0x160: *major = 7; *minor = 5; return 1;    /* Turing */
+    case 0x140: *major = 7; *minor = 0; return 1;    /* Volta */
+    case 0x130: *major = 6; *minor = 1; return 1;    /* Pascal */
+    default: *major = 5; *minor = 2; return 1;       /* Maxwell */
+    }
+}
+
+static int __attribute__((ms_abi))
+nvapi_D3D12_CreateCubinComputeShader(void *device, const void *cubin, u32 size, u32 bx, u32 by, u32 bz, u64 *shader)
+{ return bd12_cuda_create_shader(device, cubin, size, bx, by, bz, 0, "", shader); }
+static int __attribute__((ms_abi))
+nvapi_D3D12_CreateCubinComputeShaderWithName(void *device, const void *cubin, u32 size, u32 bx, u32 by, u32 bz,
+                                             const char *name, u64 *shader)
+{ return bd12_cuda_create_shader(device, cubin, size, bx, by, bz, 0, name, shader); }
+static int __attribute__((ms_abi))
+nvapi_D3D12_CreateCubinComputeShaderEx(void *device, const void *cubin, u32 size, u32 bx, u32 by, u32 bz,
+                                       u32 shared, const char *name, u64 *shader)
+{ return bd12_cuda_create_shader(device, cubin, size, bx, by, bz, shared, name, shader); }
+/* NVAPI_D3D12_CREATE_CUBIN_SHADER_PARAMS: structSizeIn, structSizeOut, pDevice, pCubin, size, blockX/Y/Z,
+ * dynSharedMemBytes, pShaderName, flags, hShader. */
+typedef struct {
+    u64 size_in, size_out;
+    void *device;
+    const void *cubin;
+    u32 size, block_x, block_y, block_z, shared;
+    u32 pad0;
+    const char *name;
+    u32 flags;
+    u32 pad1;
+    u64 shader;
+} NvCubinShaderParams;
+static int __attribute__((ms_abi)) nvapi_D3D12_CreateCubinComputeShaderExV2(NvCubinShaderParams *p)
+{
+    if (!p || p->size_in < sizeof(*p)) return NVAPI_INVALID_ARGUMENT;
+    p->size_out = sizeof(*p);
+    return bd12_cuda_create_shader(p->device, p->cubin, p->size, p->block_x, p->block_y, p->block_z, p->shared,
+                                   p->name, &p->shader);
+}
+static int __attribute__((ms_abi)) nvapi_D3D12_DestroyCubinComputeShader(void *device, u64 shader)
+{ return bd12_cuda_destroy_shader(device, shader); }
+static int __attribute__((ms_abi))
+nvapi_D3D12_LaunchCubinShader(void *list, u64 shader, u32 gx, u32 gy, u32 gz, const void *params, u32 size)
+{ return bd12_cuda_launch(list, shader, gx, gy, gz, params, size); }
+static int __attribute__((ms_abi)) nvapi_D3D12_GetCudaTextureObject(void *device, u64 srv, u64 sampler, u32 *handle)
+{ return bd12_cuda_texture_object(device, srv, sampler, handle); }
+static int __attribute__((ms_abi)) nvapi_D3D12_GetCudaSurfaceObject(void *device, u64 uav, u32 *handle)
+{ return bd12_cuda_surface_object(device, uav, handle); }
+/* NVAPI_D3D12_GET_CUDA_MERGED_TEXTURE_SAMPLER_OBJECT_PARAMS: sizes, pDevice, texDesc, smpDesc, textureHandle (u64). */
+typedef struct { u64 size_in, size_out; void *device; u64 texture, sampler, handle; } NvMergedTextureParams;
+static int __attribute__((ms_abi)) nvapi_D3D12_GetCudaMergedTextureSamplerObject(NvMergedTextureParams *p)
+{
+    if (!p || p->size_in < sizeof(*p)) return NVAPI_INVALID_ARGUMENT;
+    p->size_out = sizeof(*p);
+    u32 handle = 0;
+    const int status = bd12_cuda_texture_object(p->device, p->texture, p->sampler, &handle);
+    p->handle = handle;
+    return status;
+}
+static int __attribute__((ms_abi)) nvapi_D3D12_IsFatbinPTXSupported(void *device, u8 *supported)
+{
+    (void)device;
+    if (!supported) return NVAPI_INVALID_ARGUMENT;
+    *supported = 0;                          /* modules are loaded as SASS cubins; no PTX JIT */
+    return NVAPI_OK;
+}
+/* NV_D3D12_GRAPHICS_CAPS_V1: flags (exclusive scissor, VRS, fast UAV clear), majorSM, minorSM, majorCudaSM,
+ * minorCudaSM (u16 each), reserved[5]. */
+static int __attribute__((ms_abi)) nvapi_D3D12_GetGraphicsCapabilities(void *device, u32 version, u8 *caps)
+{
+    (void)device;
+    if (!caps) return NVAPI_INVALID_ARGUMENT;
+    if (version != (32u | (1u << 16))) return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    u32 major = 0, minor = 0;
+    if (!nvapi_cuda_sm(&major, &minor)) return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+    memset(caps, 0, 32);
+    const u16 sm[4] = { (u16)major, (u16)minor, (u16)major, (u16)minor };
+    memcpy(caps + 4, sm, sizeof(sm));
+    return NVAPI_OK;
+}
+
 static int __attribute__((ms_abi)) nvapi_EnumNvidiaDisplayHandle(u32 index, u64 *handle)
 {
     if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
@@ -219,17 +311,26 @@ nvapi_GetPhysicalGPUsFromLogicalGPU(u64 logical, u64 *physical, u32 *count)
 static int __attribute__((ms_abi))
 nvapi_GPU_GetLogicalGpuInfo(u64 logical, u8 *info)
 {
+    /* NV_LOGICAL_GPU_DATA_V1 (x64): version@0, pOSAdapterId@8 (caller buffer that receives the adapter LUID),
+     * physicalGpuCount@16, physicalGpuHandles[64]@24, reserved[8]. NGX matches the D3D12 adapter to the NVAPI GPU
+     * through that LUID, so it is the one DXGI and ID3D12Device::GetAdapterLuid report. */
     if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
     if (logical != NVAPI_LOGICAL_GPU_HANDLE) return NVAPI_INVALID_HANDLE;
     if (!info) return NVAPI_INVALID_ARGUMENT;
     u32 version = *(u32 *)info;
     u32 size = version & 0xffffu;
-    if (size < 16u + 64u * sizeof(u64))
+    if (size < 24u + 64u * sizeof(u64) || (version >> 16) != 1)
         return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
-    *(u32 *)(info + 4) = 1;
-    *(u64 *)(info + 8) = NVAPI_GPU_HANDLE;
+    u8 *luid = (u8 *)(uintptr_t)*(u64 *)(info + 8);
+    if (luid) {
+        BeerHostGpuInfo gpu;
+        const u64 value = nvapi_gpu(&gpu) ? gpu.luid : 1;
+        memcpy(luid, &value, 8);
+    }
+    *(u32 *)(info + 16) = 1;
+    *(u64 *)(info + 24) = NVAPI_GPU_HANDLE;
     for (u32 index = 1; index < 64; ++index)
-        *(u64 *)(info + 8 + index * sizeof(u64)) = 0;
+        *(u64 *)(info + 24 + index * sizeof(u64)) = 0;
     return NVAPI_OK;
 }
 
@@ -317,12 +418,15 @@ static int nvapi_logical_gpu_self_test(void)
     if (nvapi_GetPhysicalGPUsFromLogicalGPU(logical, physical, &count) != NVAPI_OK ||
         count != 1 || physical[0] != NVAPI_GPU_HANDLE)
         return 0;
-    u8 info[16 + 64 * sizeof(u64)];
+    u8 info[24 + 64 * sizeof(u64) + 32];
+    u64 luid = 0xa5a5a5a5a5a5a5a5ull;
     memset(info, 0xa5, sizeof(info));
     *(u32 *)info = (u32)sizeof(info) | (1u << 16);
+    *(u64 *)(info + 8) = (u64)(uintptr_t)&luid;
     if (nvapi_GPU_GetLogicalGpuInfo(logical, info) != NVAPI_OK ||
-        *(u32 *)(info + 4) != 1 || *(u64 *)(info + 8) != NVAPI_GPU_HANDLE ||
-        *(u64 *)(info + 16) != 0)
+        luid == 0xa5a5a5a5a5a5a5a5ull || *(u64 *)(info + 8) != (u64)(uintptr_t)&luid ||
+        *(u32 *)(info + 16) != 1 || *(u64 *)(info + 24) != NVAPI_GPU_HANDLE ||
+        *(u64 *)(info + 32) != 0)
         return 0;
     if (nvapi_GetLogicalGPUFromPhysicalGPU(0, &logical) != NVAPI_INVALID_HANDLE ||
         nvapi_GetLogicalGPUFromPhysicalGPU(NVAPI_GPU_HANDLE, NULL) != NVAPI_INVALID_ARGUMENT)
@@ -392,9 +496,27 @@ static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
         { 0x842B066Eu, nvapi_GPU_GetLogicalGpuInfo },
         { 0x027E98AEu, nvapi_D3D12_CreateCommittedResource },
         { 0xD8265D24u, nvapi_GPU_GetArchInfo },
+        /* D3D12 CUDA interop, only with the NVX Vulkan extensions (NGX checks for these before using DLSS). */
+        { 0x2A2C79E8u, nvapi_D3D12_CreateCubinComputeShader },
+        { 0x1DC7261Fu, nvapi_D3D12_CreateCubinComputeShaderWithName },
+        { 0x3151211Bu, nvapi_D3D12_CreateCubinComputeShaderEx },
+        { 0x299F5FDCu, nvapi_D3D12_CreateCubinComputeShaderExV2 },
+        { 0x7FB785BAu, nvapi_D3D12_DestroyCubinComputeShader },
+        { 0x5C52BB86u, nvapi_D3D12_LaunchCubinShader },
+        { 0x80403FC9u, nvapi_D3D12_GetCudaTextureObject },
+        { 0x48F5B2EEu, nvapi_D3D12_GetCudaSurfaceObject },
+        { 0x329FE6E0u, nvapi_D3D12_GetCudaMergedTextureSamplerObject },
+        { 0x70C07832u, nvapi_D3D12_IsFatbinPTXSupported },
+        { 0x01E87354u, nvapi_D3D12_GetGraphicsCapabilities },
     };
+    /* The CUDA entries exist only when the device can run CUDA kernels. */
+    const int cuda = bd12_cuda_available();
     for (size_t i = 0; i < sizeof(table) / sizeof(*table); ++i)
-        if (table[i].id == id) return table[i].fn;
+        if (table[i].id == id) {
+            if (!cuda && i >= 20 && table[i].fn != (void *)nvapi_D3D12_GetGraphicsCapabilities) break;
+            if (getenv("BEER_NVAPI_LOG")) fprintf(stderr, "[NVAPI] QueryInterface(0x%08X)\n", id);
+            return table[i].fn;
+        }
     static _Atomic(u32) logged;
     if (atomic_fetch_add(&logged, 1) < 64)
         fprintf(stderr, "[NVAPI] interface 0x%08X is not implemented (called from %p)\n", id, __builtin_return_address(0));

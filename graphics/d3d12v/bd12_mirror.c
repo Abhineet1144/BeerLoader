@@ -204,6 +204,7 @@ static void write_range(BD12DescriptorHeap *heap, uint32_t first, uint32_t count
 
 void bd12_mirror_note(const void *first, uint32_t count)
 {
+    BD12_DESCRIPTORS_WRITTEN();   /* every descriptor write reaches here; resolved sets may be stale */
     if (!first || !count) return;
     BD12DescriptorHeap *found = NULL;
     uint32_t index = 0;

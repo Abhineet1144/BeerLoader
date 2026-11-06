@@ -45,9 +45,10 @@ SOCKET_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/beer-%d" % 
     if os.environ.get("XDG_RUNTIME_DIR") else "/tmp/beer-%d" % os.getuid()
 
 AUDIO_BACKENDS = ["fmod", "compat"]
-# BEER_STEAM_API_MODE choices: (setting, label, description). "auto" picks official for Steam installs.
+# BEER_STEAM_API_MODE choices: (setting, label, description). "auto" picks official for Steam installs and leaves
+# the variable unset otherwise, so the loader runs an application-local steam_api64.dll (guest) or its facade.
 STEAM_API_MODES = [
-    ("auto", "Automatic", "Your Steam session for games installed from Steam, Beer's offline Steam otherwise"),
+    ("auto", "Automatic", "Your Steam session for games installed from Steam; otherwise the game's own Steam DLL when it ships one, Beer's offline Steam if not"),
     ("compat", "Beer offline Steam", "Built-in offline Steam API: local user, local saves, no online services"),
     ("official", "Your Steam session", "Real identity from your signed-in account; ownership and tickets remain limited to owned games"),
     ("guest", "Game's own Steam DLL", "Runs the steam_api64.dll shipped with the game"),

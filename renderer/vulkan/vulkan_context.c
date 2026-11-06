@@ -33,6 +33,7 @@ typedef struct {
     int ray_tracing;
     int timeline_semaphore;
     int texel_buffer_alignment;
+    int nvx_cuda;                 /* VK_NVX_binary_import + VK_NVX_image_view_handle: NVAPI CUDA kernels (DLSS) */
     BeerVulkanModern modern;
     int device_lost;
     VkSemaphore timeline;
@@ -318,8 +319,8 @@ int beer_vulkan_context_initialize(void)
     };
     /* VK_KHR_maintenance1 permits negative viewport heights, which graphics
      * execution uses to preserve D3D's upward-Y clip space. */
-    const char *device_extensions[16] = { "VK_KHR_swapchain" };
-    int rt_ext_as = 0, rt_ext_rtp = 0, rt_ext_rq = 0, rt_ext_dho = 0;
+    const char *device_extensions[24] = { "VK_KHR_swapchain" };
+    int rt_ext_as = 0, rt_ext_rtp = 0, rt_ext_rq = 0, rt_ext_dho = 0, nvx_binary = 0, nvx_view = 0;
     uint32_t device_extension_count = 1;
     {
         uint32_t available_count = 0;
@@ -338,6 +339,8 @@ int beer_vulkan_context_initialize(void)
             rt_ext_rtp |= !strcmp(ext, "VK_KHR_ray_tracing_pipeline");
             rt_ext_rq  |= !strcmp(ext, "VK_KHR_ray_query");
             rt_ext_dho |= !strcmp(ext, "VK_KHR_deferred_host_operations");
+            nvx_binary |= !strcmp(ext, "VK_NVX_binary_import");
+            nvx_view   |= !strcmp(ext, "VK_NVX_image_view_handle");
             if (!g_context.maintenance1 &&
                 strcmp(available[i].extensionName,
                        "VK_KHR_maintenance1") == 0) {
@@ -382,6 +385,13 @@ int beer_vulkan_context_initialize(void)
             }
         }
         free(available);
+    }
+    /* NVIDIA's CUDA-kernel interop (NVAPI D3D12 cubin shaders and CUDA texture/surface objects), used by NGX for
+     * DLSS: loaded binaries and image-view handles. Both or neither; BEER_NO_NVX=1 leaves them off. */
+    if (nvx_binary && nvx_view && !getenv("BEER_NO_NVX")) {
+        device_extensions[device_extension_count++] = "VK_NVX_binary_import";
+        device_extensions[device_extension_count++] = "VK_NVX_image_view_handle";
+        g_context.nvx_cuda = 1;
     }
     /* DXR needs acceleration structures, ray tracing pipelines and ray query
      * together (plus deferred host operations, which acceleration structures
@@ -778,6 +788,11 @@ int beer_vulkan_maintenance1_enabled(void)
 {
     return g_context.maintenance1;
 }
+int beer_vulkan_nvx_cuda_enabled(void)
+{
+    return g_context.nvx_cuda;
+}
+
 int beer_vulkan_ray_tracing_enabled(void)
 {
     return g_context.ray_tracing;

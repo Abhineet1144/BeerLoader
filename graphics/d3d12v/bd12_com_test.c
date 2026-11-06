@@ -111,6 +111,32 @@ int main(void)
                                           com_iid_iunknown, &list) == 0, "list");
     CHECK(((HR(MS *)(void *, uint64_t, uint32_t, const uint8_t *, void **))V(dev, 36))(
               dev, 0, 0, com_iid_iunknown, &fence) == 0, "fence");
+    {   /* Queue A waits on a value that queue B signals later: A's work must be held, not deadlock the GPU. */
+        void *queue_b = NULL, *f_cross = NULL, *g_cross = NULL;
+        typedef HR(MS * FenceOpFn)(void *, void *, uint64_t);
+        typedef uint64_t(MS * CompletedFn)(void *);
+        CHECK(((HR(MS *)(void *, const void *, const uint8_t *, void **))V(dev, 8))(
+                  dev, qdesc, com_iid_iunknown, &queue_b) == 0 && queue_b, "second queue");
+        CHECK(((HR(MS *)(void *, uint64_t, uint32_t, const uint8_t *, void **))V(dev, 36))(
+                  dev, 0, 0, com_iid_iunknown, &f_cross) == 0 && f_cross, "cross-queue fence F");
+        CHECK(((HR(MS *)(void *, uint64_t, uint32_t, const uint8_t *, void **))V(dev, 36))(
+                  dev, 0, 0, com_iid_iunknown, &g_cross) == 0 && g_cross, "cross-queue fence G");
+        if (queue && queue_b && f_cross && g_cross) {
+            CHECK(((FenceOpFn)V(queue, 15))(queue, f_cross, 1) == 0, "queue A Wait(F, 1) before any Signal");
+            CHECK(((FenceOpFn)V(queue, 14))(queue, g_cross, 1) == 0, "queue A Signal(G, 1) behind the wait");
+            CHECK(((CompletedFn)V(g_cross, 8))(g_cross) == 0, "G not signalled while A waits");
+            CHECK(((FenceOpFn)V(queue_b, 14))(queue_b, f_cross, 1) == 0, "queue B Signal(F, 1)");
+            uint64_t g_value = 0;
+            for (int spin = 0; spin < 2000 && g_value < 1; ++spin) {
+                g_value = ((CompletedFn)V(g_cross, 8))(g_cross);
+                if (g_value < 1) { struct timespec ms = {0, 1000000}; nanosleep(&ms, NULL); }
+            }
+            CHECK(g_value == 1, "held Wait released by the later Signal on another queue");
+        }
+        if (g_cross) ((uint32_t(MS *)(void *))V(g_cross, 2))(g_cross);
+        if (f_cross) ((uint32_t(MS *)(void *))V(f_cross, 2))(f_cross);
+        if (queue_b) ((uint32_t(MS *)(void *))V(queue_b, 2))(queue_b);
+    }
     {
         void *resident_fence = NULL;
         CHECK(((HR(MS *)(void *, uint64_t, uint32_t, const uint8_t *, void **))V(dev, 36))(

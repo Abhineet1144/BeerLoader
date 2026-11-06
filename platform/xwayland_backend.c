@@ -486,6 +486,7 @@ static int beer_headless(void)
 static struct { int exists, visible, x, y, width, height, client_width, client_height; } g_virtual = { 0, 0, 0, 0, 2560, 1440, 2560, 1440 };
 int xwayland_headless(void) { return beer_headless(); }
 
+
 int xwayland_window_create(int x, int y, int width, int height,
                            const char *title, int initially_visible)
 {
@@ -628,8 +629,13 @@ int xwayland_window_show(int visible)
         return 0;
     }
     /* ShowWindow(SW_SHOW) on an already visible window must not raise it: games call it repeatedly. */
-    if (visible) { if (!g_x11.visible || !g_x11.viewable) g_x11.MapRaised(g_x11.display, g_x11.window); }
-    else g_x11.UnmapWindow(g_x11.display, g_x11.window);
+    if (visible) {
+        if (!g_x11.visible || !g_x11.viewable) {
+            g_x11.MapRaised(g_x11.display, g_x11.window);
+            /* As at creation: native focus once MapNotify reports the window viewable. */
+            g_x11.focus_requested = 1;
+        }
+    } else g_x11.UnmapWindow(g_x11.display, g_x11.window);
     g_x11.visible = !!visible;
     g_x11.Flush(g_x11.display);
     pthread_mutex_unlock(&g_x11.lock);

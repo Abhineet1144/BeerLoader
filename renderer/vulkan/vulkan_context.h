@@ -46,6 +46,8 @@ int beer_vulkan_sampler_filter_minmax_enabled(void);
 /* Nonzero when acceleration structures, ray tracing pipelines and ray query
  * are enabled on the shared device (disable with BEER_NO_RT=1). */
 int beer_vulkan_ray_tracing_enabled(void);
+/* VK_NVX_binary_import and VK_NVX_image_view_handle are enabled (CUDA kernels through NVAPI, used by DLSS). */
+int beer_vulkan_nvx_cuda_enabled(void);
 /* Maximum sampler anisotropy enabled on the shared device; 1 when unsupported. */
 uint32_t beer_vulkan_max_sampler_anisotropy(void);
 /* Nonzero when VK_EXT_pipeline_robustness is enabled. Graphics pipelines use
