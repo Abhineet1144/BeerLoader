@@ -1,6 +1,453 @@
 # Beer Loader — Active Development Context
 
-RE9 path: /mnt/wwn-0x5000c500c67d4454-part1/Games/Resident Evil Requiem/re9.exe
+## Stellar Blade: Crashpad handler runs; past the splash via a per-HWND window table (2026-11-08, night)
+
+Launched as `SB/Binaries/Win64/SB-Win64-Shipping.exe SB` (the `SB.exe` launcher exits right away). All uncommitted.
+
+**Fixes (all generic Windows contracts)**
+- **Cross-process handle inheritance (`CreateProcess(bInheritHandles=TRUE)`):** the child no longer gets
+  ERROR_NOT_SUPPORTED.
+  - Handles marked inheritable (security attributes, `SetHandleInformation`, `DuplicateHandle`, `OpenProcess`) go
+    to the child at the same values.
+  - Events move to a shared memfd page with cross-process futex waits; files and pipes pass as descriptors (a pipe
+    server also passes its listening socket); process handles pass as a pid.
+  - The list travels in `BEER_INHERITED_HANDLES`; `beer_inherit_install()` in win32_process.inc rebuilds it in the
+    child before the program starts.
+- **Handle values below 0x80000000:** semaphores 0x31…, mutexes 0x32…, threads 0x33…, IOCP 0x34…, processes
+  0x35…, snapshots 0x36…, window station 0x37000000. Windows code round-trips handles through `int`; Crashpad's
+  checked `HandleToInt` int3'd on 0xD1000000. The window station also collided with the first process handle.
+- **`OpenProcess` on the caller's own pid:** returns a real handle (it can be inherited), not 0x7FF0.
+- **`GetFileInformationByHandleEx`:** real FileBasicInfo, FileStandardInfo and FileNameInfo (it was a zero-fill).
+  crs-handler rebuilds the pipe name from the inherited pipe handle with FileNameInfo.
+- **Suspended threads:** the stack is reserved at `CreateThread`. `Get/SetThreadContext` work before the first
+  resume, and `TerminateThread` on a never-started thread ends it. crs-client uses a suspended thread's stack as a
+  buffer: Rsp=0 gave a write to -0x80000.
+- **`TransactNamedPipe`:** added (write, then read). Crashpad's client registers with the handler through it; the
+  missing call marked the handler launch failed, which terminated with 0xFFFF7001.
+- **`GetProcAddress` by ordinal:** resolves through the Windows ordinal table (win32_module_exports.h) for every
+  Beer module. Added d3d12.dll ordinals 95–102. UE looks up `D3D12CreateDevice` as ordinal 101; NULL produced the
+  "DX12 is not supported" message box.
+- **`IIDFromString`, `CLSIDFromString`:** implemented. The stub left the IID as garbage.
+- `tests/native_loader_contract_test.c`: inheritance is now accepted; a missing exe fails with
+  PROCESS_INFORMATION zeroed (`make test-native-loader` passes).
+
+**Later fixes (2026-11-09):**
+- `SetCursorPos` clamps to the screen and the ClipCursor rect, as Windows does. UE's start-up
+  SetCursorPos(CW_USEDEFAULT) parked the virtual pointer at INT_MIN; hover works now.
+- `ActivateAudioInterfaceAsync` (mmdevapi ordinal 17) added in audio/wasapi_compat.c. The focus-change audio
+  reinitialisation delay-loaded it, failed, and Crashpad ended the game. mmdevapi is in the generator's
+  `ORDINAL_DLLS`.
+- Shared (inherited) events no longer unmap their page on close; `shared_event_wait` snapshots the page. This
+  fixed crs-handler's SIGSEGV in a registered wait.
+- The user's Proton save was copied in. Under Beer, UE saves in `SB/Binaries/Win64/SB/Saved` (next to the exe),
+  under Proton in `AppData/Local/SB/Saved`; same SteamID folder 76561197960285355. Open question: why Beer differs
+  (known-folder lookup?).
+- **Pipeline cache file fixed (bd12_device.c):** there was one `pipelines-<vendor>-<device>-<driver>.bin` shared by
+  every game, and it was refused at load once it was >= 256 MB. SB's grew past that, so the next session started
+  empty and its save replaced the file with ~2 MB. Now: one file per program
+  (`...-<exe name>.bin`, from `BEER_GUEST_EXE`, which the loader sets), no read limit, and full saves at most once a
+  minute while compiling (was every 20 s).
+- Translation disk cache (`BEER_SHADER_DISK_CACHE`, d3d12_shader_translator.c) exists but is opt-in. It covers
+  only the non-root-signature path, and its build key includes the loader binary's mtime, so every rebuild
+  invalidates it. Candidate for default-on with a translator-source key (coordinating with the WWM session, which
+  owns that file).
+- **Translation disk cache on by default** (d3d12_shader_translator.c): `BEER_SHADER_DISK_CACHE=0` disables it.
+  The root-signature (`_rs`) path is cached too, keyed by the root layout. Build key = hash of the translator
+  sources (Makefile `BEER_TRANSLATOR_SOURCE_KEY`), not the loader binary. DISK_CACHE_VERSION 2.
+- **Result:** SB second launch: 0 shaders translated, 225 MB per-game pipeline cache loaded, all 25k PSOs created
+  within 30 s of start (was ~90-120 s); the "compiling shaders" screen now shows for ~2 s. (It still appears
+  briefly; check whether Windows/Proton skips it entirely.)
+- ~~TODO (user request): "Compiling shaders" shows on every launch~~ (fixed by the two items above) (faster after the first). Find what the
+  game's check reads: ID3D12PipelineLibrary Serialize/LoadPipeline persistence, GetCachedBlob placeholder, or a
+  driver/GPU signature. Fix so it shows only on the first launch, as on Windows.
+
+**Status:** the D3D12 device, queues and a 2560x1440 swapchain are created; the run was stopped while loading.
+Still open / new:
+- `RegisterWaitForSingleObject` / `UnregisterWait(Ex)` were added (repeat until unregistered, or
+  WT_EXECUTEONLYONCE; slice-polled waits). Untested in a game yet.
+- `XAudio2Create` is missing in the xaudio2_9 module.
+- **WIC added** (`platform/win32_wic.inc`): `CLSID_WICImagingFactory(2)` with CreateDecoderFromFilename (BMP:
+  1/4/8/16/24/32-bit), GetFrame, CreateFormatConverter, CopyPixels (32bpp BGR/BGRA/PBGRA/RGBA/PRGBA, 24bpp
+  BGR/RGB). UE's splash thread used the factory without checking CoCreateInstance and hit an access violation;
+  Crashpad then reported it (once RegisterWait worked) and killed the game. Splash.bmp 720x370 now loads.
+- **Window table added (loader.c "Window table"):** every CreateWindowEx gets its own HWND (0xD0000001, 2, ...)
+  with its own window procedure (from its class), owner thread, styles, rect and user data. The native XWayland
+  surface belongs to the newest top-level window; FAKE_HWND now names that window. PostMessage goes to the
+  window's owner thread, and DispatchMessage/SendMessage/DefWindowProc/DestroyWindow/IsWindow/ShowWindow/window
+  longs/rects work per HWND. PostQuitMessage now posts to the calling thread. Message-only windows (HWND_MESSAGE)
+  get no surface. RegisterClass no longer replaces the live window's procedure (g_last_class_proc).
+  Stellar Blade now gets past the splash: main window 0xd0000002, ~26.6k shaders, steady at 7.8 GB.
+- d3d12 ordinals now come from `tools/gen_module_exports.py` (`ORDINAL_DLLS` += d3d12). A regeneration had
+  dropped the hand-added entries. Also added StringFromCLSID/StringFromIID, and RaiseException logs MSVC
+  delay-load failures (DLL!name).
+- **Previous blocker (fixed by the window table): Beer's single-HWND window model.** Every window is FAKE_HWND, and posted messages go to the
+  one window thread. UE creates "SplashScreenGuard" and "SplashScreen" windows; the splash runs a GetMessage loop
+  on its own thread. Hide() does `PostMessageW(splash, WM_DESTROY)` then `WaitForSingleObject(splash thread,
+  INFINITE)`. The message never reaches the splash thread, so the main thread hangs. Needs a real window table:
+  per-HWND class/wndproc/owner thread/native surface, with PostMessage/SendMessage/DestroyWindow routed by HWND.
+- **BD12 pipeline memory (2026-11-09):**
+  - *Shared layouts* (bd12_graphics.c `bd12_shared_set_layout` / `bd12_shared_pipeline_layout`): identical
+    descriptor-set layouts and pipeline layouts are one device-owned Vulkan object, as vkd3d-proton shares them per
+    root signature. Before, there was one pair per graphics/compute pipeline. The descriptor-set cache keys on the
+    layout plus the full write contents, so sharing is safe.
+  - *Default = keep every compiled pipeline* (Windows behaviour). *Opt-in `BEER_BD12_RELEASE_PIPELINES=1`*:
+    compile at create to warm the VkPipelineCache, destroy the VkPipeline, keep the description (interned
+    shaders), and rebuild from the cache on first bind. Measured with release: Stellar Blade 7.8 -> 6.1 GB (peak
+    6.47); WWM >9 GB OOM -> 7.6 GB, title 150-400 fps (WWM session).
+  - `make test-d3d12v` fails to link (bd12_descriptor_alive, bd12_dxgi_to_vk undefined): its source list is out
+    of date, not related to this work.
+- **Peer finding (WWM session), BD12 memory:** `compile_at_create()` keeps every PSO as a live VkPipeline
+  (~110 KB of driver memory each; WWM: 19.9k PSOs = 2.1 GB, OOM at 9 GB). Option: compile at create to warm the
+  pipeline cache, then destroy the VkPipeline and rebuild on first bind, or default to lazy. This is likely
+  also RE9's ~1.6 GB per-pipeline overhead.
+
+## Where Winds Meet: title video plays (2026-11-09, 01:20)
+
+The title background was black. The game's FFmpeg-based player logs to
+`<prefix>/drive_c/Users/Player/AppData/Roaming/CC/logs/playersdk/CCVideoPlayer64.log`, which is very useful.
+- Every `avformat_open_input` on `cc:videores|...ResourcesNN.mpk$off$size` failed with tag `CPRT`.
+- `ccplayer/ccprotocal.dll` (the FFmpeg "cc:" protocol) prefixes its own folder to the handler name only when
+  SHLWAPI `PathIsRelativeW` says the name is relative. Beer's stub returned FALSE, so it loaded
+  `Win64r\videores.dll` instead of `Win64r\ccplayer\videores.dll`.
+- **Fix:** `PathIsRelativeA/W` and `PathIsDirectoryA/W` implemented (win32_missing_exports.inc).
+- The rain/character login loop now plays at 60 fps. Hardware decoding fails (`init d3d11 hw ret -2`: no
+  ID3D11VideoDevice), and the player falls back to software decoding, which works.
+- **New diagnostics:** explicit-path `LoadLibrary` failures now log the path (they were silent).
+  `BEER_MODULE_LOG=1` logs `GetModuleHandleEx(FROM_ADDRESS)` and `GetModuleFileNameW`.
+- **Memory:** WWM with BD12's default (keep all pipelines) got kernel-OOM-killed at 8.3 GB on the first launch
+  with its new per-game pipeline cache. `BEER_BD12_RELEASE_PIPELINES=1` peaked at 8.2 GB, then settled at 6.3 GB.
+- Cursor confirmed visible and working by the user.
+
+## Where Winds Meet: title screen; cursor and stuck-key fixes (2026-11-09, early)
+
+DX12 WWM reaches the title screen ("Start" / "Exit Game") at 150–400 fps.
+- With abhi-41's `BEER_BD12_RELEASE_PIPELINES=1` (warm the VkPipelineCache, release, rebuild on first bind):
+  7.6 GB. The default keeps all pipelines again, as Windows does.
+
+**Cursor:**
+- **Old rule removed:** `xwayland_backend.c apply_cursor_locked()` hid the host cursor in every fullscreen window
+  (commit 42a9289, for RE8), so WWM's system cursor vanished on entering the window. It's now opt-in:
+  `BEER_HIDE_FULLSCREEN_CURSOR=1`.
+- **The real RE8 bug:** in loader.c, the default `WM_SETCURSOR` handling forced the cursor visible and
+  `SetCursor` showed it for any non-NULL handle, both ignoring the `ShowCursor` display count. RE8's
+  `ShowCursor(FALSE)` was undone on the next mouse move: the stuck arrow.
+- Now all paths use `beer_apply_cursor_visibility()`, which is Win32's rule: count ≥ 0 and cursor ≠ NULL.
+- Verified with `BEER_INPUT_DIAGNOSTICS` (the "[X11] host cursor" lines): RE8 and RE9 end hidden after
+  `ShowCursor(0) -> -1`.
+
+**Stuck Alt (needs a hand test):**
+- WWM reads the keyboard through raw input with `RIDEV_INPUTSINK`. After an Alt-Tab, X sends the Alt release to
+  the other window, so the game kept Alt held, and Enter/Space read as Alt+Enter/Alt+Space.
+- On native focus-out, loader.c `beer_release_held_keys_on_focus_out()` now sends raw-input and DirectInput
+  key-ups for every held key, as the physical release would on Windows.
+
+**Also:**
+- `HidD_GetIndexedString` added (was looked up 16,909 times).
+- The WMI unimplemented-method log prints the caller's call bytes.
+- The intermittent OpenSSL crash at `0x144bc21e9` didn't reproduce in 4 runs. `BEER_CRASH_RANGES` stays armed.
+
+## Where Winds Meet: DX12 reaches the login video; first-run PSO warm-up hits the 9 GB cap (2026-11-08, night)
+
+Game moved to `/mnt/hdd1/Beer-Steam/common/Where Winds Meet` (ext4). Tested with `--commandline-dx12-control=1`.
+All uncommitted.
+
+**Fixes**
+- **Module table (loader.c `MAX_GUEST_DLLS` 32 → 256):** WWM loads ~20 Streamline/DLSS plugins (`sl.*`, `nvngx_*`).
+  The table filled up, so `dxil.dll`/`dxcompiler.dll` then failed with "not found". A full table is now logged.
+- **`lstrlenW`:** was missing, so the splash video player (`mliveccplayer64.dll`) got 0 from a stub, then a host
+  `munmap_chunk(): invalid pointer` abort.
+- **`SHGetMalloc`:** was missing. `pharos.dll` (NetEase network SDK) called `IMalloc::Free` through an uninitialised
+  pointer. Now returns the CoGetMalloc task allocator.
+- **Shader translation cache (`d3d12_shader_translator.c`):** now a 16k-bucket hash table, keyed by the caller's
+  FNV hash plus an independent content hash plus the size. It no longer keeps a copy of every DXIL source (WWM:
+  262 MB). Translation runs outside `g_lock`: lookup, translate, insert, first one wins. `dxil_translate()` locks
+  only around `load_library()`; dxil-spirv converts concurrently with per-thread allocator contexts. Before this,
+  every PSO thread queued behind one translation. The 12k-shader warm-up now finishes in ~60 s instead of ~85 s.
+
+**Where it stands:** splash → patch → hotfix → `play video Video/login_loop_201.mp4` (the login screen video).
+Then the first-run warm-up creates ~19.5k PSOs from ~12k shaders, and RSS reaches the 9 GB scope limit. The
+process stalls under MemoryHigh, or systemd-oomd kills it. The screen stays dark grey (#191919) during warm-up.
+
+**Memory at ~85 s (9.1 GB RSS)**, from `BEER_DUMP_MEMORY` and an LD_PRELOAD caller-tagging malloc tracker:
+
+| Owner | Size |
+|---|---|
+| NVIDIA driver (`libnvidia-glcore`) malloc, compiled pipelines | ~2.15 GB |
+| Guest VirtualAlloc pages (the game's own allocators) | ~3 GB RSS (5.2–6.2 GB reserved) |
+| Guest HeapAlloc (host malloc) | 776 MB in 3.6M blocks |
+| Beer's per-block tracking entries for those | 137 MB |
+| SPIR-V kept by the translation cache | ~506 MB |
+| PSO objects | ~100 MB |
+| Driver mappings (`/dev/nvidiactl`) | ~0.5 GB |
+
+`BEER_PIPELINE_CACHE_OFF=1` (new diagnostic: no VkPipelineCache) saves only ~200–300 MB, so the persisted cache
+isn't the problem.
+
+**The 2.1 GB of driver memory comes from compile-at-create, not a leak.**
+- With `BEER_BD12_PIPELIB_LOG=1`: WWM does LoadPipeline miss → CreatePipelineState → StorePipeline for 19,894
+  PSOs and keeps nearly all of them alive (fewer than 2,000 `pso_free`).
+- Because WWM offers a pipeline library, `compile_at_create()` (bd12_com_list.c) turns every PSO into a live
+  VkPipeline, about 110 KB of NVIDIA-driver malloc each.
+- With `BEER_BD12_COMPILE_AT_CREATE=0`: RSS plateaus at **6.9 GB** instead of passing 9 GB, only 84 shaders are
+  translated, and the game still reaches the login video. On the second run the library loads: 19,863 load hits.
+- Policy is abhi-41's (BD12). Suggested: compile at create to warm the disk VkPipelineCache, then destroy the
+  VkPipeline and rebuild it on first bind from the cache; or default to lazy.
+- That run then hit the known intermittent crash in the game's static OpenSSL at `0x144bc21e9`: `sk_num` on a
+  pointer whose low 32 bits are zero (`0x7ffc00000000`). This is now the next WWM blocker.
+
+**The post-warm-up "stall" is not a hang.**
+- From 60–90 s the cgroup shows no throttling and ~0.2 cores of CPU.
+- A stack dump shows the main thread idle in GQCS on its own task port, and a loader thread inside `pread64`:
+  the game is streaming assets from the HDD.
+- Memory then grows again and reaches MemoryHigh. In one run the *kernel* OOM killer fired at an 8 GB peak,
+  because the whole machine ran out: 4 GB swap full, ~6.7 GB used by browser, VS Code and Steam.
+- BD12 already destroys its VkShaderModules after pipeline creation. The driver's ~2 GB is the compiled pipelines
+  for the PSOs the game keeps alive, and Windows drivers hold those too.
+
+**Next**
+- Possible reductions: drop retained SPIR-V after pipeline creation (reload from the disk cache); store HeapAlloc
+  sizes without a separate malloc'd entry per block.
+- The game may simply need more than 9 GB on first run. Ask before raising the cap.
+
+## SRW-lock memory leak fixed; DX12 Ultimate work for RE9 (2026-11-08, evening)
+
+All uncommitted, on RE9Compat.
+
+- **Leak (all games):** each Windows SRW lock got a host object in a fresh 4 KB `mmap` page, stored in the guest
+  word. SRW locks are never destroyed on Windows, so every freed object leaked its page. RE9 leaked ~12 MB/s on an
+  idle title screen. Condition variables used a fixed 16384-slot table, never freed. Both are now futex words with
+  no host allocation (loader.c `srw_*` and `cv_*`).
+  - RE9 title, libraries off: 2.8 → 4.6 GB in 150 s before the fix; 3.03 GB flat after. Proton: 3.2 GB.
+  - Found with an `LD_PRELOAD` mmap tracer grouped by call site, plus `addr2line`.
+- **Pipeline libraries default on** (`BEER_D3D12_PIPELINE_LIBRARY=0` turns them off). With the leak fixed, RE9 peaks
+  at 5.8 GB during the up-front compile of 40k pipelines, then holds 4.6 GB. Per-pipeline overhead is about 40 KB
+  more than vkd3d-proton.
+- **Windows contracts fixed:**
+  - `HKLM\...\Windows NT\CurrentVersion` and `DirectX` keys (Win10 22H2/19045). Without them RE9 built its
+    DX12U mesh pipelines with no shaders.
+  - SetupAPI lists the display adapter. The driver key has `HardwareInformation.qwMemorySize`, which fixed RE9's
+    "0 GB VRAM". The registry gained `REG_QWORD`/`REG_BINARY`.
+  - CfgMgr32 device IDs for the adapter.
+- **BD12:**
+  - VRS tier 2 (`BEER_BD12_VRS=1`).
+  - Mesh/amplification shaders (`BEER_BD12_MESH=1`): pipelines, `DispatchMesh`, indirect `DISPATCH_MESH`, and
+    task/mesh stages in the mirror set and in barriers.
+  - Pipeline-stream types 24-28.
+  - `CreateCommandList` with List1..6 IIDs.
+  - Vulkan `shaderDrawParameters`, `shaderSubgroupExtendedTypes` and `samplerFilterMinmax` enabled.
+- **Opt-in, untested:** multi-queue (`BEER_BD12_MULTI_QUEUE=1`). Each D3D12 queue type gets its own VkQueue lane,
+  with per-lane retire timelines.
+- **Still open (RE9 DX12U path):** RE9's GPU culling (cs `7f7ad36a…`) passes only 25 meshlets, so 14 of 15
+  `DispatchMesh` argument records have X = 0.
+  - Verified correct: the mesh pipelines, the dispatches and the argument shader.
+  - Ruled out: sync, DirectStorage GPU decompression, SSBO vs texel buffers, root-push vs legacy.
+  - RenderDoc captures need more than 9 GB.
+- **Diagnostics added:**
+  - `BEER_REG_MISS_LOG`, `BEER_READ_FAIL_LOG`, `BEER_DSTORAGE_CPU`, `BEER_DXIL_FORCE_SSBO`;
+  - `BEER_FAKE_OPTIONS7=mesh|feedback`;
+  - mesh dispatch trace and argument capture in traced frames;
+  - shader dumps now also write the source `.dxil`.
+- **ARM64 note:** `slist_swap` (cmpxchg16b inline asm, not from this work) has no ARM64 path.
+
+## Where Winds Meet: DX12 mode runs (first-run shader compile); renderer fixes (2026-11-08, 17:45)
+
+DX12 is selected by Steam's launch entry "Where Winds Meet(DirectX12)": `--commandline-dx12-control=1`
+(=0 is DX11). The manager's Steam sync stores only one launch entry. Fixes in this round, all uncommitted:
+- D3D12CreateDevice(ppDevice == NULL) is a support check: it now returns S_FALSE. It used to return E_INVALIDARG,
+  so the game always fell back to DX11. Feature levels above 12_2 fail; every call is logged as `[D3D12]`.
+- CoGetMalloc (IMalloc on the CoTaskMem heap, vtable through beer_guest_com_entry) is new. dxil.dll's DllMain
+  read through the NULL IMalloc the old stub left.
+- ID3D12PipelineState::GetCachedBlob returns a small Beer blob instead of E_NOTIMPL with NULL; the game used it
+  unchecked. As CachedPSO it is ignored. beer_d3d_blob_create() lives in graphics/d3d12/d3d12_api.c.
+- resolve_windows_host_path: an lstat fast path for the exact spelling, and per-component exact checks before any
+  directory scan. Every CreateFile used to scan each directory of the path (slow on fuseblk NTFS while the game
+  streams assets under its own lock).
+- HeapAlloc size table: 256 lock stripes instead of one global mutex, and its getenv switches are read once (8
+  shader-compiler threads queued on it).
+- D3D11On12CreateDevice still returns E_NOTIMPL (now logged once).
+
+DX12 state: the patch completes and the D3D12 device and swapchain come up. Shaders translate ([DXIL] lines), then
+the game does its first-run shader compile with dxcompiler on 8 threads (IMalloc Alloc/Free, HeapAlloc). Frames
+nearly stop during that phase (~2500 at 70 s and ~2500 at 135 s) and RSS climbs to 5.5 GB. Screenshots are uniform
+dark grey (#191919) in both DX11 and DX12 mode, even during the splash video. Not yet investigated: it may be the
+real output or the screenshot path.
+Unverified: whether the striped heap lock helps. The build broke on another session's in-progress edit
+(graphics/d3d12/d3d12_dxil_translator.c:662, `out->spirv` is uint8_t*) before it could be tested.
+
+## Where Winds Meet: patch stall fixed (lost IOCP completions); now past shader warm-up (2026-11-08, evening)
+
+All uncommitted on RE9Compat. RE9 was checked after these changes: 69 s, 25149 frames, no crash.
+
+Fixed:
+- Patch-stage stall (~35% of runs; frames stopped, no further stage). The game's Boost.Asio io_context shutdown waits
+  in GetQueuedCompletionStatus until every started overlapped operation has posted its packet. closesocket skipped
+  any socket operation the async thread was attempting at that moment (`busy`), then dropped the port association
+  and closed the fd, so that operation's completion found no port and was lost: shutdown hung forever.
+  `wsa_async_cancel_ex(..., settle=1)` now waits for in-flight attempts before closing. Completion-port queues also
+  grow instead of silently dropping packets past 8192 (`Iocp.capacity`), and a post to a closed port is ignored.
+  8/8 runs passed after the fix, against ~35% stalls before.
+  How it was found: SIGUSR1 dumps at a fixed time in good and stalled runs, compared. Only the stalled run had the main
+  thread in GQCS at rva 0x2abaad (asio shutdown drain) and an asio thread in SleepEx(INFINITE) at 0x2abdef (win_thread
+  waiting for join's APC). `[STACKS]` now prints the Windows tid, cv/waiter state, WFMO handles and outstanding I/O
+  per port.
+- LoadLibrary of a DLL that is neither on disk nor a Windows/Beer module now fails with error 126, instead of
+  returning a fake module. The game probes icuuc72..49 and later called the NULL u_cleanup of the fake module it
+  got. The allowed names are Wine's DLL list (platform/win32_system_dll_names.h, generated by
+  tools/gen_system_dll_names.py) plus System32 DLLs Wine lacks and the vendor modules Beer implements (nvapi64 etc.;
+  list in `beer_module_may_be_faked`). `BEER_FAKE_ANY_DLL=1` restores the old behaviour for diagnosis. Module names
+  without an extension get ".dll" appended (lowercase_dll_basename), as Windows does; "kernel32" used to get a fake.
+- Missing kernel32 functions filled in: GetLogicalDriveStringsA (an unresolved import slot was called with (0,0) at exe
+  0x14d5b490d), QueryDosDeviceA, K32EnumProcesses/EnumProcesses, K32EnumDeviceDrivers,
+  K32GetDeviceDriverFileNameA/W, SetProcessPreferredUILanguages, FlsGetValue2.
+- crypt32 system stores: CertOpenSystemStoreA/W, CertOpenStore with CERT_STORE_PROV_SYSTEM_A/W,
+  CertEnumCertificatesInStore, CertDuplicateCertificateContext, CertGetIntendedKeyUsage and CertGetEnhancedKeyUsage
+  (a curl/OpenSSL native-CA loader). ROOT is filled from the host CA bundle (SSL_CERT_FILE, the usual distro
+  bundles, or Android's /system/etc/security/cacerts); other stores open empty.
+
+Current state: patching completes, hotfix loads, then audio, screen, shader warm-up and a WMI Win32_VideoController
+query run. What is on screen after that has not been checked yet.
+
+Open:
+- An intermittent crash in the game's static OpenSSL at exe 0x144bc21e9 (OPENSSL_sk_num-like: `if (!p) return -1;
+  return *(int*)p`) with p = 0x7ffd00000000, a pointer whose low half is zero. It comes from the caller's
+  [rsp+0xb0] at 0x144c48bdc, which sits next to a 0x382-byte buffer, so certificate DER parsing. The same crash
+  happened before the cert-store work. Ruled out: heap zeroing (BEER_HEAP_ZERO=1). One 200 s run passed it.
+- "[WMI] unimplemented method called from 0x1402eaf90" after the Win32_VideoController query.
+
+## Where Winds Meet: patch completes, reaches the game UI load; intermittent stall at patch start (2026-11-08, later)
+
+All uncommitted on RE9Compat. RE9 was not re-checked after this round; re-check before committing, since the BD12 3D-view and lock changes are shared code.
+
+Progress this round:
+- A good run completes the in-game patch: PreCheck, grey info, LoadMpk, MD5, PatchList, Check, then Download.
+  It downloaded the 432 MB repair patch at about 9 MB/s, then Delete, Compact, Finish and "Stage Finished!". After
+  that came the login video, hotfix and UI loading (the map_pic list), with WASAPI audio open.
+- BD11 Map of DYNAMIC (non-staging) textures (graphics/d3d11v/bd11_ctx.c): a per-subresource CPU copy
+  (`B11Texture.map_shadow`) is returned with the tight row and depth pitch; Unmap uploads it through ctx_update,
+  which works on both immediate and deferred contexts. Map used to fail and the game wrote through NULL, then crashed.
+- BD12 views of 3D images (graphics/d3d12v/bd12_image.c bd12_image_view_swizzled): a 2D or 2D-array view of a 3D
+  image addresses depth slices as layers. The old code bounded layers at 1, so RTVs on slices 1..N of a
+  160x90x80 volume failed: 330 "view creation failed (kind 6)" messages. View failures now print the
+  format, dimension and texture description.
+- NormalizeString / IsNormalizedString (kernel32 and normaliz.dll) are new. The game probes icuuc72..49 and then
+  calls normaliz!NormalizeString without a NULL check; Beer crashed at RIP=0. Text below U+0300 is returned
+  unchanged; other text goes through the host GLib g_utf8_normalize (dlopen), or is returned unchanged without it.
+  Note: LoadLibrary of unknown DLLs such as icuuc72.dll returns a fake module, where Windows would fail. Not
+  changed (it affects other games); ask before changing.
+- LockFileEx on read-only handles: Linux needs a writable descriptor for a write lock (EBADF otherwise). Windows
+  grants exclusive locks on any handle. SQLite takes an exclusive lock on PENDING_BYTE (0x40000000) even to read,
+  so read-only SqlSnapshot connections failed ("database is locked", then "files are corrupted, restart").
+  Now a handle whose descriptor isn't O_RDWR keeps all its locks on a private O_RDWR reopen via /proc/self/fd
+  (`g_fh_lock_fd`, closed in fh_close). Verified: no lock failures after the fix.
+- Diagnostics added:
+  - `BEER_LOCK_DIAGNOSTICS` (every byte-range lock).
+  - `BEER_TIMER_DIAGNOSTICS` (SetWaitableTimer/Cancel plus timer-thread fire/sleep).
+  - `BEER_WAIT_TRACE_RVA=<exe rva>` (every WaitForSingleObject returning there).
+  - `BEER_APC_DIAGNOSTICS`.
+  - BEER_NET_DIAGNOSTICS now tracks TLS record framing per socket ("needs N more").
+  - IOCP diagnostics print the port index, tid and caller rva.
+  - The SIGUSR1 `[STACKS]` dump now names each thread's current API, the GQCS port, and the WaitForMultipleObjects
+    handles with event state.
+  - `BEER_NO_DIALOGS=default` answers suppressed dialogs with their default button. `=1` answers cancel, which
+    made the game refuse its repair download and TerminateProcess.
+
+Open issue: an intermittent stall in roughly 40% of runs, right after "start patch" and the second
+swapchain creation (sometimes after stage_fetch_grey_info instead). Frames stop (259 frames at about 17 s, then
+0 fps). No stage logs follow.
+- Ruled out: the main thread is fine. It idles in GetQueuedCompletionStatus on its IOCP (port 8) and keeps getting the 100 ms
+  tick, which comes from waitable timer 0x6000000d. A worker thread waits on that timer and posts key=1 from rva 0x2cdcda.
+- Ruled out: Beer's timer thread keeps firing, and IOCP posts and dequeues are balanced.
+- Ruled out: APCs are rare (3-4) and none are lost.
+- Ruled out: no lock failures after the fix.
+- Still unknown: what the stage machine waits for. Diagnostics that log a lot hide the stall (lock logging gave
+  7/7 good runs before the fix), so it is timing-sensitive.
+- Candidate: the thread in SleepEx(INFINITE, alertable) at exe rva 0x2abdef. Its last wait was the 1 ms periodic
+  timer 0x60000041, armed with SetWaitableTimer(due=1 absolute, period=1) from rva 0x2ab957.
+- BEER_API_TRACE is unusable here: with tracing on, a C++ exception (0xe06d7363) goes unhandled, because the trace
+  wrapper breaks unwinding.
+- Next: compare per-thread wait states between a stalled and a good run at the same point. Find which thread
+  normally presents the splash video and what it waits on at the stall.
+
+Side effects of testing: SIGKILLing runs mid-write damages the game's patch data. The game then asks to
+re-download about 400 MB ("Local files corruption detected"), and answering cancel terminates it. Use
+`BEER_NO_DIALOGS=default` so the repair proceeds. Still unimplemented and seen in logs: GetFinalPathNameByHandleW
+(stub returns 0), CertOpenSystemStoreA (returns NULL), OpenMutexW stub, HidD_GetIndexedString,
+GetAddrInfoExW, FlsGetValue2, ConvertStringSecurityDescriptorToSecurityDescriptorW, UuidToStringW.
+Renderer choice: WWM supports both DX11 and DX12 and normally asks at startup which to use. All runs so far used
+the Steam launch argument `--commandline-dx12-control=0`. No choice dialog appeared, and the game ran on
+BD11, so that argument presumably selects DX11 without asking (not verified). The DX12 path is untested under Beer.
+To try it, launch without that argument (or with another value) and answer the dialog; the BD12 path is then
+exercised.
+Test tooling (scratchpad): run70.sh (bounded run), stallrun.sh (SIGUSR1 dump on stall), stallprobe.sh (plus fps
+probes), sym.py (symbolises [TDUMP] guest frames).
+
+## Where Winds Meet (Steam 3564740): protection, patcher, HTTPS; stalls in the in-game patch stage (2026-11-08)
+
+Exe: `.../Beer-Steam/common/Where Winds Meet/Engine/Binaries/Win64r/wwm.exe --commandline-dx12-control=0`,
+prefix steam-3564740, official Steam mode. Everything below is uncommitted on RE9Compat. RE9 was re-checked after
+each round and still renders.
+
+Where it is now: the game passes the Themida protection and the admin check, loads all its DLLs, opens its window,
+presents through Vulkan, and runs the launcher patcher end to end. That covers HTTPS through the game's own TLS
+over Beer's overlapped sockets, and the SQLite patch DB. It then goes fullscreen, starts "Video/Splash_en.mp4"
+(its own player; there are no MF calls), runs unisdk init and the in-game patch stages. At about 1540 frames it
+stops presenting (0 fps, 0% CPU) after `Stage stage_fetch_grey_info`. The main thread is blocked in
+GetQueuedCompletionStatus(INFINITE) at exe RVA 0x2ab503. IOCP posts and dequeues are balanced.
+The grey-info socket (0x109) shows a TLS handshake and about 4.6 KB received, then an idle recv, which looks like
+keep-alive. Still open: which component should wake the main thread. Next: a BEER_THREAD_DUMP_AT dump at the
+stall, and a check of the threads waiting on thread handle 0xb2000082 and on handle 0xa0000001 (30 s waits).
+Wine is not a valid oracle past the patcher: under Wine WWM ends at a blank window (no Steam environment).
+
+Fixes:
+- Manager: Steam launch options go to a new `game_args` field passed after the exe; they used to go before it, as
+  loader options. Child CreateProcess forwards only loader `--` options.
+- Startup: `init_steam_fake()` runs before DLL initialisation. DllMain runs for DLLs loaded through the
+  guest-hooked VFS path.
+- Themida "debugger detected": NtQueryInformationProcess(ProcessDebugObjectHandle) is called with
+  ReturnLength == the buffer. Windows writes the data first and ReturnLength last. The output pointers are probed
+  like ProbeForWrite (STATUS_DATATYPE_MISALIGNMENT / ACCESS_VIOLATION).
+  ProcessInstrumentationCallback (NtSetInformationProcess 40) is accepted and invoked on syscall-trap return
+  (R10 = return rip). The TEB is 2 pages with more Windows fields; the PEB is filled further (TlsBitmap,
+  CriticalSectionTimeout, heaps, ImageSubsystem, SessionId).
+- Export tables: the protector resolves imports by walking export tables, so synthetic and compat modules now
+  publish the names Beer implements. The list is `platform/win32_module_exports.h`, generated by
+  `tools/gen_module_exports.py` from Wine's PE DLLs, with the real ordinal layout for oleaut32 and ws2_32 (socket
+  used to land on shutdown).
+  Diagnostics: `BEER_EXTRA_EXPORTS=dll!Name,dll!#N` (logging stubs, never a default; in
+  platform/beer_extra_exports.inc) and `BEER_NO_DIALOGS=1` (no message boxes, for unattended discovery loops).
+- About 300 Win32 functions in platform/win32_missing_exports.inc. Several placeholders that returned 0 were
+  replaced with real implementations: SafeArray, VARIANT (platform/win32_variant.c, which needs SSE), VirtualAllocEx
+  and friends, SID/ACL/CheckTokenMembership, mmio/joy/waveIn, SHGet*Location/PIDL, CM_* and others.
+  CheckTokenMembership(Administrators) is TRUE only when the manifest requests requireAdministrator or
+  highestAvailable.
+- msvcrt.dll imports bind to the bundled UCRT (thunks to `__stdio_common_*`), for d3dcompiler.
+- SLIST on the real 16-byte header (cmpxchg16b). The IDXGIAdapter1 IID bytes were wrong and are fixed.
+  MAX_STUBS raised from 8192 to 32768.
+- SSPI/Schannel: platform/win32_schannel.c over dlopen'd libssl, with InitSecurityInterfaceA/W tables (curl's
+  Schannel backend).
+- Winsock:
+  - WSAStartup is process-wide.
+  - Non-blocking connect returns WSAEWOULDBLOCK.
+  - SO_*/IPPROTO option translation; SO_UPDATE_CONNECT_CONTEXT is accepted with a NULL value (Boost.Asio).
+  - WSAPoll and WSAEventSelect/WSAEnumNetworkEvents.
+  - An overlapped socket engine: WSASend/WSARecv pending, ConnectEx/DisconnectEx via WSAIoctl
+    SIO_GET_EXTENSION_FUNCTION_POINTER, IOCP association, CancelIoEx, WSAGetOverlappedResult.
+    `BEER_NET_DIAGNOSTICS` traces it.
+- Files: WriteFile honours OVERLAPPED offsets. Ignoring them corrupted the SQLite Patch.mpkdb, and the bad copy was
+  renamed to .beer-corrupt. LockFileEx/UnlockFileEx use OFD locks (the stub caused SQLITE_BUSY).
+- NtQuerySystemTime and RtlTimeToSecondsSince1970/1980 (missing ones crashed).
+- APCs: QueueUserAPC/NtQueueApcThread/NtTestAlert run a per-thread queue. SleepEx, WaitFor*Ex,
+  MsgWaitForMultipleObjectsEx and alertable NtDelayExecution deliver APCs and return WAIT_IO_COMPLETION; they
+  poll in 10 ms slices. MsgWaitForMultipleObjectsEx had its arguments in the wrong order. A missing QueueUserAPC
+  hung a thread join at shutdown of the splash stage.
+
+Unsupported or placeholders: fibers, AcceptEx, ReadDirectoryChangesW, GDI+ drawing, MF pipelines, WSARecv
+completion routines, OpenMutexW, CertOpenSystemStoreA (returns NULL), GetAddrInfoExW, HidD_GetIndexedString.
+
+Don't retry: Wine-style ntdll stubs with KUSER SystemCall=1 and a dispatcher at 0x7ffe1000. They crash RE9 after
+its TLS callbacks.
+Testing: always bound runs with `timeout -s KILL` and `pkill -KILL -f '[B]eer/loader --audio'`. The process comm
+is "exe", so `pkill -x loader` misses it. Run one game at a time, under the 9G cap.
 
 ## Taskbar icons: PNG icon images and largest-first fallback (2026-11-01)
 
@@ -3869,3 +4316,78 @@ Onimusha (`/mnt/56A4064AA4062CD5/Games/Onimusha - Way of the Sword/OnimushaWotS.
 - **Cause:** the loader created the X11 window already mapped (`xwayland_window_create(..., 1)`) and applied `_MOTIF_WM_HINTS`/size hints afterwards. Mutter framed it through `mutter-x11-frames` (a stale 51x88 frame with `_MUTTER_FRAME_FOR` = the game window) while the window stayed parented to the root. The compositor then gave the window almost no input region.
 - **Fix:** create the window hidden, apply icon, style and size hints, then map it on `WS_VISIBLE` or `ShowWindow` (as Win32 does). The native focus request moved from create to the first map (`xwayland_window_show`). User-confirmed.
 - **Tools used:** a stand-alone harness that links `platform/xwayland_backend.c` with stubbed Vulkan presenter symbols reproduces Beer's X calls without a game. Mutter frames are visible in `xwininfo -root -tree` as `"mutter-x11-frames"`.
+
+### RE9 ray tracing / path tracing options (2026-11-07)
+- **Gate found:** RE9 offers Ray Tracing only on a "DX12 Ultimate" device: DXR 1.1 (OPTIONS5, `BEER_DXR=1`) **and**
+  variable-rate shading (OPTIONS6, feature 30) **and** OPTIONS7 (feature 32: mesh shader tier / sampler feedback).
+  Confirmed with diagnostic fake answers (`BEER_DXR=1 BEER_FAKE_FEATURES=30,32`); each one alone does not show it.
+  BD12 implements neither VRS, mesh shaders nor sampler feedback, so nothing of this is advertised by default.
+  Which OPTIONS7 field matters (mesh shaders or sampler feedback) is not yet split.
+- **With the fake caps** the RT option appears and enabling it renders broken (BD12 DXR is incomplete: no local root
+  signatures, collections, etc.). Path Tracing stays hidden.
+- **0 GB VRAM** in the settings menu is unresolved and probably also hides Path Tracing. Ruled out as its source:
+  DXGI GetDesc*/QueryVideoMemoryInfo (16 GB / 14.7 GB budget reported and read), D3DKMT QueryStatistics/registry,
+  WMI (only `Win32_PnPEntity` is enumerated, no properties read), NVAPI LUIDs.
+- **Under Wine** (vkd3d-proton reports DX Ultimate) the game also needs its `/WineDetectionEnabled:False` argument;
+  Beer is not detected as Wine (the argument changes nothing under Beer).
+- **Fixed along the way (real behaviour, kept):**
+  - `ID3D12Device::GetAdapterLuid` returned 0; now the LUID DXGI reports.
+  - NVAPI: DRS session/profile/setting calls (no profile, no setting found). Non-CUDA entries were hidden until a
+    CUDA-capable device existed (the CUDA gate covered every entry after the CUDA block); now only CUDA entries are.
+    Reflex is deliberately not exposed (no low-latency mode behind it).
+  - WMI `Win32_VideoController` reports the real name/vendor/AdapterRAM/DriverVersion/PNPDeviceID; `Win32_PnPEntity`
+    lists the GPU.
+  - D3DKMT: `D3DKMTEnumAdapters2`, `D3DKMTOpenAdapterFromDeviceName`, `D3DKMTQueryStatistics`; KMTQAITYPE_QUERYREGISTRY
+    reports absent values as absent (NGX asks for `NGXCore\NGXPath` there) instead of an empty success.
+  - DXIL: raw/structured buffers fall back to storage buffers when texel buffers cannot express the shader (64-bit raw
+    load/store), with exact offsets (`ssbo_alignment` 1).
+  - DXR pipelines: no fixed shader/group/entry limits.
+- **Diagnostics added:** `BEER_FEATURE_LOG=1` (every CheckFeatureSupport with input/output words),
+  `BEER_FAKE_FEATURES=<list>` (the `BEER_FAKE_CAPS` answer for those features only), `BEER_NVAPI_LOG`, unimplemented
+  IDXGIAdapter slots and WMI calls are logged.
+- **NVAPI IDs RE9 queries that are undocumented** (dxvk-nvapi does not know them either): 0xAD298D3F, 0x593E8644,
+  0x33C7358C, 0xA782EA46. `0x0DDAC234` = NvAPI_D3D12_GetCudaIndependentDescriptorObject (NGX/DLSS, not implemented).
+
+### RE9 frame rate work (2026-11-07)
+Same gameplay scene, RTX 4070 Ti SUPER: ~12–20 fps -> ~35–37 fps. Render thread is the limit (busy ~75%, main thread
+waits on it, GPU 30–40%); nearly all of it is BD12 descriptor resolve (~3300 per frame).
+- Critical sections: lock-free backend lookup (65536 buckets, recycled never freed). SRW/CS: cached host tid for the
+  diagnostics fields (was a gettid syscall per acquire); SRW release wakes only when someone waits.
+- Resolve: constant-buffer arrays use the single-pass array path (RE9 declares b0..b3 as 256-element arrays); binding
+  candidate lists hold 32 parameters; empty slots share one null entry; per-element diagnostics checked once per set.
+- Partially bound arrays: set-0 layouts mark arrays PARTIALLY_BOUND and draws write elements only up to the last one
+  the root signature supplies (D3D12 leaves the rest undefined too). `BEER_BD12_NO_PARTIAL_ARRAYS=1` turns it off.
+  Changing the layouts invalidates the driver's pipeline cache once (first run recompiles).
+- Resolve cache now keyed on the root parameters the bindings can read; in RE9 it hits <1% (per-draw root arguments
+  really change). The PROF line prints `resolve-cache hit/miss`.
+- Tried and removed: large CBV arrays through the bindless heap mirror broke loading (DirectStorage never finished).
+- Deferred (on-the-fly compiling works well enough; RE8 runs smoothly with it): shader translation is serialized by one global lock, its cache is a linked
+  list, and translations are not kept between runs; pipelines compile on first bind on the render thread. Plan when
+  revisited, behind a switch: on-disk SPIR-V cache keyed by shader bytes + loader/translator build + options; per-entry
+  locking with a hash table; optional compile at CreatePipelineState on worker threads (watch driver memory, RE8).
+- The game-side startup shader compile (ID3D12PipelineLibrary + SHADER_CACHE support, Onimusha's "Game File
+  Optimization" screen) stays opt-in (`BEER_D3D12_PIPELINE_LIBRARY=1`); off, games compile on the fly.
+
+### Onimusha: the game's own shader compile runs (2026-11-07)
+- **Crash cause (Beer bug, all games):** `VirtualAlloc` kept at most 16384 live allocations in a fixed table
+  (scanned linearly). Onimusha's own 640 MB arena fills during its pipeline precompile and it falls back to one
+  `VirtualAlloc(MEM_COMMIT|MEM_RESERVE)` per pipeline (code at 0x144b22930); past 16384 Beer returned NULL and the
+  game copied into it. The table is now a growable array sorted by base with binary search
+  (`platform/win32_virtual_memory.c`); `win32_virtual_memory_test.c` covers 40000 live allocations (also ASan/UBSan).
+- **Real compile:** Beer's CreatePipelineState used to return before building (first-use compilation), so the
+  "compiling shaders" step only recorded ~43000 names in a second. With `BEER_D3D12_PIPELINE_LIBRARY=1` pipelines
+  are now built at creation (`BEER_BD12_COMPILE_AT_CREATE=0` opts out; `=1` forces it without libraries), ~120 per
+  second; library Load*Pipeline stays lazy (stored pipelines are already in the Vulkan pipeline cache). User:
+  gameplay "significantly smoother" afterwards.
+- Spec behaviour: StorePipeline now holds a reference until the library is released (`BEER_BD12_PIPELIB_NO_HOLD=1`
+  for the old way). `CachedPSO` is parsed; `GetCachedBlob` is still E_NOTIMPL.
+- **Open:** memory. One library held all 43314 compiled pipelines (peak ~8.9 GB RSS); the run was OOM-killed under
+  the 9 GB cap ~2.5 min after compiling, before the game wrote `shader.cache2` (so the next launch compiles again).
+  Candidate fix: when a library holds the last reference, drop the compiled VkPipeline (its code stays in the
+  pipeline cache) and rebuild on use. The instant-run library file was moved aside as
+  `shader.cache2.beer-instant-0635`; it had replaced Wine's `shader.cache2`.
+- Also seen: a crash at game exit while Streamline unloads (after `WaitForSingleObject(NULL)` spam), not investigated.
+- `BEER_SHADER_DISK_CACHE=1`: optional on-disk cache of translated SPIR-V (`~/.cache/beer/shaders`,
+  `BEER_SHADER_CACHE_DIR`), keyed by shader bytes + loader/translator builds + SPIR-V options. RE9 second launch:
+  6 fresh translations instead of 693; little effect on title-screen time (driver pipeline build dominates).
+- Diagnostics: `BEER_BD12_PIPELIB_LOG=1` (library/create call counts).

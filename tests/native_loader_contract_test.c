@@ -208,19 +208,19 @@ int main(void)
     assert(file_handle != UINT64_MAX && file_handle == (u64)(int64_t)(int32_t)file_handle);
     assert(fh_get(file_handle) == file_fd && fh_close(file_handle));
     u8 process_info[24];
-    /* Inheriting redirected standard handles (STARTUPINFO.dwFlags = STARTF_USESTDHANDLES) is refused: Beer cannot
-     * copy guest handle objects into the child. */
+    /* Inheriting redirected standard handles (STARTUPINFO.dwFlags = STARTF_USESTDHANDLES) is accepted now (handles
+     * travel to the child); a missing executable still fails cleanly and leaves PROCESS_INFORMATION zeroed. */
     u8 startup[104] = {0};
     *(u32 *)startup = sizeof(startup);
     *(u32 *)(startup + 60) = 0x100u;
     memset(process_info, 0xa5, sizeof(process_info));
     assert(!beer_CreateProcessA("fixture.exe", NULL, NULL, NULL, 1, 0, NULL, NULL, startup, process_info));
-    assert(g_last_error == 50);
+    assert(g_last_error != 0 && g_last_error != 50);
     for (size_t i = 0; i < sizeof(process_info); ++i) assert(!process_info[i]);
     const u16 process_name[] = {'f', 'i', 'x', 't', 'u', 'r', 'e', 0};
     memset(process_info, 0xa5, sizeof(process_info));
     assert(!beer_CreateProcessW(process_name, NULL, NULL, NULL, 1, 0, NULL, NULL, startup, process_info));
-    assert(g_last_error == 50);
+    assert(g_last_error != 0 && g_last_error != 50);
     for (size_t i = 0; i < sizeof(process_info); ++i) assert(!process_info[i]);
     const u16 command[] = {'p', ' ', '"', 'a', ' ', 'b', '"', 0};
     int command_argc = -1;

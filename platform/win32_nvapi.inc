@@ -473,6 +473,53 @@ static int nvapi_logical_gpu_self_test(void)
     return 1;
 }
 
+/* Driver settings (DRS). The session holds no profiles: no application profile and no setting is found, which is
+ * what a driver without a profile for the game reports. */
+#define NVAPI_SETTING_NOT_FOUND ((u32)-160)
+#define NVAPI_PROFILE_NOT_FOUND ((u32)-163)
+#define NVAPI_EXECUTABLE_NOT_FOUND ((u32)-166)
+#define NVAPI_DRS_SESSION 0x4E564453u        /* "NVDS" */
+#define NVAPI_DRS_BASE_PROFILE 0x4E564450u   /* "NVDP" */
+
+static u32 __attribute__((ms_abi)) nvapi_DRS_CreateSession(u64 *session)
+{
+    if (!session) return NVAPI_INVALID_ARGUMENT;
+    *session = NVAPI_DRS_SESSION;
+    return NVAPI_OK;
+}
+static u32 __attribute__((ms_abi)) nvapi_DRS_Session(u64 session)
+{ return session == NVAPI_DRS_SESSION ? (u32)NVAPI_OK : (u32)NVAPI_INVALID_HANDLE; }   /* Destroy, Load, Save */
+static u32 __attribute__((ms_abi)) nvapi_DRS_GetBaseProfile(u64 session, u64 *profile)
+{
+    if (session != NVAPI_DRS_SESSION) return NVAPI_INVALID_HANDLE;
+    if (!profile) return NVAPI_INVALID_ARGUMENT;
+    *profile = NVAPI_DRS_BASE_PROFILE;   /* also the current global profile */
+    return NVAPI_OK;
+}
+static u32 __attribute__((ms_abi)) nvapi_DRS_FindApplicationByName(u64 session, const u16 *name, u64 *profile,
+                                                                   void *application)
+{
+    if (session != NVAPI_DRS_SESSION) return NVAPI_INVALID_HANDLE;
+    if (!name || !profile || !application) return NVAPI_INVALID_ARGUMENT;
+    return NVAPI_EXECUTABLE_NOT_FOUND;
+}
+static u32 __attribute__((ms_abi)) nvapi_DRS_FindProfileByName(u64 session, const u16 *name, u64 *profile)
+{
+    if (session != NVAPI_DRS_SESSION) return NVAPI_INVALID_HANDLE;
+    if (!name || !profile) return NVAPI_INVALID_ARGUMENT;
+    return NVAPI_PROFILE_NOT_FOUND;
+}
+static u32 __attribute__((ms_abi)) nvapi_DRS_GetSetting(u64 session, u64 profile, u32 id, void *setting)
+{
+    (void)id;
+    if (session != NVAPI_DRS_SESSION || !profile) return NVAPI_INVALID_HANDLE;
+    if (!setting) return NVAPI_INVALID_ARGUMENT;
+    return NVAPI_SETTING_NOT_FOUND;
+}
+
+/* Reflex (NvAPI_D3D_SetSleepMode, Sleep, SetLatencyMarker, GetSleepStatus, GetLatency) is not exposed: Beer has no
+ * low-latency mode behind it, and a game offers its Reflex option whenever the entry points exist. */
+
 static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
 {
     static const struct { u32 id; void *fn; } table[] = {
@@ -508,12 +555,31 @@ static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
         { 0x329FE6E0u, nvapi_D3D12_GetCudaMergedTextureSamplerObject },
         { 0x70C07832u, nvapi_D3D12_IsFatbinPTXSupported },
         { 0x01E87354u, nvapi_D3D12_GetGraphicsCapabilities },
+        { 0x0694D52Eu, nvapi_DRS_CreateSession },
+        { 0xDAD9CFF8u, nvapi_DRS_Session },                 /* DestroySession */
+        { 0x375DBD6Bu, nvapi_DRS_Session },                 /* LoadSettings */
+        { 0xFCBC7E14u, nvapi_DRS_Session },                 /* SaveSettings */
+        { 0xDA8466A0u, nvapi_DRS_GetBaseProfile },
+        { 0x617BFF9Fu, nvapi_DRS_GetBaseProfile },          /* GetCurrentGlobalProfile */
+        { 0xEEE566B2u, nvapi_DRS_FindApplicationByName },
+        { 0x7E4A9A0Bu, nvapi_DRS_FindProfileByName },
+        { 0x73BF8338u, nvapi_DRS_GetSetting },
     };
     /* The CUDA entries exist only when the device can run CUDA kernels. */
     const int cuda = bd12_cuda_available();
     for (size_t i = 0; i < sizeof(table) / sizeof(*table); ++i)
         if (table[i].id == id) {
-            if (!cuda && i >= 20 && table[i].fn != (void *)nvapi_D3D12_GetGraphicsCapabilities) break;
+            const int cuda_entry = table[i].fn == (void *)nvapi_D3D12_CreateCubinComputeShader ||
+                table[i].fn == (void *)nvapi_D3D12_CreateCubinComputeShaderWithName ||
+                table[i].fn == (void *)nvapi_D3D12_CreateCubinComputeShaderEx ||
+                table[i].fn == (void *)nvapi_D3D12_CreateCubinComputeShaderExV2 ||
+                table[i].fn == (void *)nvapi_D3D12_DestroyCubinComputeShader ||
+                table[i].fn == (void *)nvapi_D3D12_LaunchCubinShader ||
+                table[i].fn == (void *)nvapi_D3D12_GetCudaTextureObject ||
+                table[i].fn == (void *)nvapi_D3D12_GetCudaSurfaceObject ||
+                table[i].fn == (void *)nvapi_D3D12_GetCudaMergedTextureSamplerObject ||
+                table[i].fn == (void *)nvapi_D3D12_IsFatbinPTXSupported;
+            if (!cuda && cuda_entry) break;
             if (getenv("BEER_NVAPI_LOG")) fprintf(stderr, "[NVAPI] QueryInterface(0x%08X)\n", id);
             return table[i].fn;
         }

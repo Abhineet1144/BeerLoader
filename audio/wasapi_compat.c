@@ -977,6 +977,79 @@ uint64_t beer_wasapi_create_instance(const void *class_id, const void *interface
     return S_OK;
 }
 
+/* ActivateAudioInterfaceAsync: activates an interface (IAudioClient and friends) on the render endpoint, like
+ * IMMDevice::Activate, and reports it through an IActivateAudioInterfaceAsyncOperation passed to the caller's
+ * IActivateAudioInterfaceCompletionHandler::ActivateCompleted. Windows completes on a worker thread; completing
+ * before returning is equivalent for callers, which wait on their handler (Stellar Blade's audio reinitialisation
+ * on focus change imports it by ordinal; missing, its delay-load raised an exception that ended the game). The
+ * device path (default render device or a device id) is not distinguished: Beer has one render endpoint. */
+typedef struct {
+    void **vtbl;
+    atomic_uint refs;
+    uint64_t result;
+    void *object;
+} BeerActivateOperation;
+static const uint8_t iid_activate_operation[16] =   /* {72a22d78-cde4-431d-b8cc-843a71199b6d} */
+    { 0x78,0x2d,0xa2,0x72, 0xe4,0xcd, 0x1d,0x43, 0xb8,0xcc,0x84,0x3a,0x71,0x19,0x9b,0x6d };
+static const uint8_t iid_unknown_wasapi[16] = { 0,0,0,0, 0,0, 0,0, 0xc0,0,0,0,0,0,0,0x46 };
+static const uint8_t iid_agile_object[16] =         /* {94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90} */
+    { 0x94,0x2b,0xea,0x94, 0xcc,0xe9, 0xe0,0x49, 0xc0,0xff,0xee,0x64,0xca,0x8f,0x5b,0x90 };
+typedef uint64_t __attribute__((ms_abi)) (*ComUnaryFn)(void *);
+static uint64_t __attribute__((ms_abi)) activate_op_add_ref(BeerActivateOperation *op)
+{ return atomic_fetch_add(&op->refs, 1) + 1; }
+static uint64_t __attribute__((ms_abi)) activate_op_release(BeerActivateOperation *op)
+{
+    const unsigned left = atomic_fetch_sub(&op->refs, 1) - 1;
+    if (!left) {
+        if (op->object) ((ComUnaryFn)(*(void ***)op->object)[2])(op->object);
+        free(op);
+    }
+    return left;
+}
+static uint64_t __attribute__((ms_abi)) activate_op_query(BeerActivateOperation *op, const void *iid, void **out)
+{
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!guid_equal(iid, iid_unknown_wasapi) && !guid_equal(iid, iid_activate_operation) &&
+        !guid_equal(iid, iid_agile_object))
+        return E_NOINTERFACE;
+    activate_op_add_ref(op);
+    *out = op;
+    return S_OK;
+}
+static uint64_t __attribute__((ms_abi)) activate_op_get_result(BeerActivateOperation *op, uint64_t *hr, void **object)
+{
+    if (!hr || !object) return E_POINTER;
+    *hr = (uint32_t)op->result;
+    *object = op->object;
+    if (op->object) ((ComUnaryFn)(*(void ***)op->object)[1])(op->object);      /* the caller's reference */
+    return S_OK;
+}
+static void *activate_op_vtable[4] = {
+    (void *)activate_op_query, (void *)activate_op_add_ref, (void *)activate_op_release, (void *)activate_op_get_result
+};
+
+uint64_t __attribute__((ms_abi)) beer_ActivateAudioInterfaceAsync(const uint16_t *device_path, const void *iid,
+                                                                  void *parameters, void *completion_handler,
+                                                                  void **operation)
+{
+    (void)device_path;
+    if (!iid || !completion_handler || !operation) return E_POINTER;
+    *operation = NULL;
+    BeerActivateOperation *op = calloc(1, sizeof(*op));
+    if (!op) return E_OUTOFMEMORY;
+    op->vtbl = activate_op_vtable;
+    atomic_init(&op->refs, 2);                         /* the caller's and the completion call's */
+    BeerWasapi *owner = wasapi_owner_new();
+    op->result = owner ? device_activate(&owner->device, iid, 0x17, parameters, &op->object) : E_OUTOFMEMORY;
+    fprintf(stderr, "[WASAPI] ActivateAudioInterfaceAsync -> 0x%llx\n", (unsigned long long)op->result);
+    *operation = op;
+    typedef uint64_t __attribute__((ms_abi)) (*ActivateCompletedFn)(void *, void *);
+    ((ActivateCompletedFn)(*(void ***)completion_handler)[3])(completion_handler, op);
+    activate_op_release(op);
+    return S_OK;
+}
+
 void beer_wasapi_set_event_signaler(BeerWasapiSignalEventFn signal_event)
 {
     g_signal_event = signal_event;

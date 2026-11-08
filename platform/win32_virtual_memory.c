@@ -10,7 +10,6 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-#define BEER_VM_CAPACITY 16384u
 
 /* ---- Bottom-up placement ------------------------------------------------------------------------------------
  * Windows places VirtualAlloc regions, heaps and thread stacks bottom-up: the lowest free range that fits, from
@@ -186,8 +185,47 @@ typedef struct BeerAllocation {
     uint32_t *page_protect; /* Requested guest protection; zero means reserved. */
 } BeerAllocation;
 
-static BeerAllocation g_allocations[BEER_VM_CAPACITY];
+/* Live VirtualAlloc regions, sorted by base and grown on demand: Windows bounds allocations only by address space
+ * (an engine whose own arena fills falls back to one VirtualAlloc per object; Onimusha makes tens of thousands while
+ * precompiling pipelines). The old fixed 16384-entry table failed every allocation past that and was scanned
+ * linearly on each lookup. Entries move on insert/remove, so pointers into it are used only under the lock. */
+static BeerAllocation *g_allocations;
+static size_t g_allocation_count, g_allocation_capacity;
 static pthread_mutex_t g_allocation_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Index of the first allocation whose base is above `value`. */
+static size_t allocation_upper_bound_locked(uintptr_t value)
+{
+    size_t low = 0, high = g_allocation_count;
+    while (low < high) {
+        const size_t mid = low + (high - low) / 2;
+        if ((uintptr_t)g_allocations[mid].base <= value) low = mid + 1; else high = mid;
+    }
+    return low;
+}
+
+static BeerAllocation *insert_allocation_locked(void *base)
+{
+    if (g_allocation_count == g_allocation_capacity) {
+        const size_t capacity = g_allocation_capacity ? g_allocation_capacity * 2 : 1024;
+        BeerAllocation *grown = realloc(g_allocations, capacity * sizeof(*grown));
+        if (!grown) return NULL;
+        g_allocations = grown;
+        g_allocation_capacity = capacity;
+    }
+    const size_t at = allocation_upper_bound_locked((uintptr_t)base);
+    memmove(&g_allocations[at + 1], &g_allocations[at], (g_allocation_count - at) * sizeof(*g_allocations));
+    ++g_allocation_count;
+    memset(&g_allocations[at], 0, sizeof(g_allocations[at]));
+    return &g_allocations[at];
+}
+
+static void remove_allocation_locked(BeerAllocation *allocation)
+{
+    const size_t at = (size_t)(allocation - g_allocations);
+    memmove(&g_allocations[at], &g_allocations[at + 1], (g_allocation_count - at - 1) * sizeof(*g_allocations));
+    --g_allocation_count;
+}
 
 static size_t page_size(void)
 {
@@ -241,13 +279,11 @@ static uint32_t host_to_windows_protection(int read, int write, int execute)
 
 static BeerAllocation *find_allocation_locked(const void *address)
 {
-    uintptr_t value = (uintptr_t)address;
-    for (size_t index = 0; index < BEER_VM_CAPACITY; ++index) {
-        uintptr_t base = (uintptr_t)g_allocations[index].base;
-        if (base && value >= base && value - base < g_allocations[index].size)
-            return &g_allocations[index];
-    }
-    return NULL;
+    const uintptr_t value = (uintptr_t)address;
+    const size_t after = allocation_upper_bound_locked(value);
+    if (!after) return NULL;
+    BeerAllocation *candidate = &g_allocations[after - 1];
+    return value - (uintptr_t)candidate->base < candidate->size ? candidate : NULL;
 }
 
 uint64_t g_beer_vm_live_bytes;   /* mapped by VirtualAlloc, not yet released */
@@ -349,9 +385,7 @@ mapped_done:
     if (allocation_type & BEER_MEM_COMMIT)
         for (size_t i = 0; i < mapped_size / page; ++i) page_protect[i] = protection;
     pthread_mutex_lock(&g_allocation_mutex);
-    BeerAllocation *slot = NULL;
-    for (size_t index = 0; index < BEER_VM_CAPACITY; ++index)
-        if (!g_allocations[index].base) { slot = &g_allocations[index]; break; }
+    BeerAllocation *slot = insert_allocation_locked(mapped);
     if (slot) {
         g_beer_vm_live_bytes += mapped_size;
         slot->base = mapped;
@@ -398,7 +432,7 @@ int beer_virtual_free(void *address, size_t size, uint32_t free_type)
         size_t allocation_size = allocation->size;
         g_beer_vm_live_bytes -= allocation_size;
         free(allocation->page_protect);
-        memset(allocation, 0, sizeof(*allocation));
+        remove_allocation_locked(allocation);
         pthread_mutex_unlock(&g_allocation_mutex);
         beer_vm_unmap_bottom_up(base, allocation_size);
         return 1;
@@ -550,12 +584,11 @@ int beer_virtual_protect(void *address, size_t size, uint32_t new_protection,
 void beer_virtual_memory_reset(void)
 {
     pthread_mutex_lock(&g_allocation_mutex);
-    for (size_t index = 0; index < BEER_VM_CAPACITY; ++index) {
-        if (g_allocations[index].base)
-            munmap(g_allocations[index].base, g_allocations[index].size);
+    for (size_t index = 0; index < g_allocation_count; ++index) {
+        munmap(g_allocations[index].base, g_allocations[index].size);
         free(g_allocations[index].page_protect);
-        memset(&g_allocations[index], 0, sizeof(g_allocations[index]));
     }
+    g_allocation_count = 0;
     g_beer_vm_live_bytes = 0;
     pthread_mutex_unlock(&g_allocation_mutex);
 }

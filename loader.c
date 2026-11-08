@@ -37,6 +37,7 @@
 #include <sys/personality.h>
 #include <sys/ioctl.h>
 #include <poll.h>
+#include <netinet/tcp.h>
 #include <spawn.h>
 #include <netdb.h>
 #include <linux/futex.h>
@@ -73,6 +74,7 @@
 #include "x64_fault_emulation.h"
 #include "win32_environment.h"
 #include "win32_shared_data.h"
+#include "win32_module_exports.h"
 #include "win32_apiset.h"
 #include "win32_kernel32_contract.h"
 #include "win32_bcrypt.h"
@@ -94,6 +96,8 @@
 #include "win32_onexit.h"
 #include "win32_crt_init.h"
 #include "win32_shell_strings.h"
+#include "win32_variant.h"
+#include "win32_schannel.h"
 #include "win32_command_line.h"
 #include "win32_process_parameters.h"
 #include "win32_ip_adapter.h"
@@ -266,7 +270,8 @@ static __thread sigjmp_buf *t_guest_dll_init_jmp;
 static __thread GuestDll *t_guest_dll_init_dll;
 
 
-#define MAX_GUEST_DLLS 32
+/* Windows has no small module limit; Streamline/DLSS titles alone load ~20 plugin DLLs. */
+#define MAX_GUEST_DLLS 256
 static GuestDll g_guest_dlls[MAX_GUEST_DLLS];
 static int g_guest_dll_count;
 static GuestDll *g_loading_guest_dll;
@@ -1107,7 +1112,7 @@ static void cycle_hist_push(u64 rip)
 }
 
 /* ── Stub infrastructure ────────────────────────────────────────── */
-#define MAX_STUBS 8192
+#define MAX_STUBS 32768   /* games with many SDK DLLs (Where Winds Meet) bind well over 8192 imports */
 #define THUNK_SZ  24   /* bytes per trampoline thunk                */
 
 static const char *g_snames[MAX_STUBS];
@@ -1208,8 +1213,28 @@ typedef struct {
     u64 SavedGuestRsp;          /* +0x0A0 for beer_dispatch_trampoline */
     u64 HostCallStackBase;      /* +0x0A8 for beer_dispatch_trampoline */
     u64 HostCallStackTop;       /* +0x0B0 for beer_dispatch_trampoline */
-    u8  _pad4[0x1000 - 0xB8];
+    u8  _pad4[0x108 - 0xB8];
+    u32 CurrentLocale;          /* +0x108 */
+    u8  _pad5[0x290 - 0x10c];
+    u64 ActivationContextStack[5]; /* +0x290 embedded ACTIVATION_CONTEXT_STACK (Wine keeps it here too) */
+    u8  _pad6[0x2c8 - 0x2b8];
+    u64 ActivationContextStackPointer; /* +0x2c8 */
+    u8  _pad7[0x1250 - 0x2d0];
+    u16 StaticUnicodeLength;    /* +0x1250 StaticUnicodeString */
+    u16 StaticUnicodeMaximum;
+    u32 _pad8;
+    u64 StaticUnicodeBuffer;    /* +0x1258 -> StaticUnicodeBuffer below */
+    u16 StaticUnicodeChars[261];/* +0x1260 */
+    u8  _pad9[0x1478 - 0x146a];
+    u64 DeallocationStack;      /* +0x1478 allocation base of the thread's stack */
+    u64 TlsSlots[64];           /* +0x1480 */
+    u64 TlsLinks[2];            /* +0x1680 */
+    u8  _pad10[0x2000 - 0x1690];/* the x64 TEB spans 0x1838 bytes: two pages, as on Windows */
 } WinTEB;
+_Static_assert(sizeof(WinTEB) == 0x2000, "TEB size");
+_Static_assert(__builtin_offsetof(WinTEB, StaticUnicodeLength) == 0x1250, "TEB StaticUnicodeString");
+_Static_assert(__builtin_offsetof(WinTEB, StaticUnicodeChars) == 0x1260, "TEB StaticUnicodeBuffer");
+_Static_assert(__builtin_offsetof(WinTEB, DeallocationStack) == 0x1478, "TEB DeallocationStack");
 
 _Static_assert(offsetof(WinTEB, UniqueProcess) == 0x40, "WinTEB process ID offset");
 _Static_assert(offsetof(WinTEB, UniqueThread) == 0x48, "WinTEB thread ID offset");
@@ -1953,12 +1978,18 @@ typedef struct CsBackend {
     sem_t lock;                   /* 1 = free */
     _Atomic(u64) owner;           /* Windows thread id of the holder, 0 when free */
     s32 recursion;                /* written only by the holder */
-    struct CsBackend *next;
+    struct CsBackend *_Atomic next;
     long owner_tid;               /* host thread holding it (diagnostics: SIGUSR1 stack dump) */
     u64 owner_rip;                /* guest return address of the Enter that acquired it */
 } CsBackend;
 static __thread WIN_CS *g_dbg_cs_wait;   /* critical section this thread is blocked entering */
-static CsBackend *g_cs_backends[256];
+/* Every Enter/Leave looks its section up here, from many threads at once: the buckets are read without a lock.
+ * Insertions and removals take g_cs_backend_lock and publish with release stores. A removed backend is never
+ * freed but kept for reuse, so a reader still walking an old chain only ever sees valid backends; a lookup that
+ * misses retries under the lock before creating one. */
+#define CS_BUCKETS 65536u
+static CsBackend *_Atomic g_cs_backends[CS_BUCKETS];
+static CsBackend *g_cs_backend_free;
 static pthread_mutex_t g_cs_backend_lock = PTHREAD_MUTEX_INITIALIZER;
 static WIN_CS g_loader_critical_section;
 
@@ -1966,6 +1997,13 @@ static CsBackend g_fallback_cs;             /* shared by sections at impossible 
 static pthread_once_t g_fallback_cs_once = PTHREAD_ONCE_INIT;
 static void fallback_cs_init(void) { sem_init(&g_fallback_cs.lock, 0, 1); }
 static __thread u64 g_cached_windows_thread_id;
+/* Host thread id for lock diagnostics fields, without a gettid system call per lock operation. */
+static long srw_host_tid(void)
+{
+    static __thread long tid;
+    if (!tid) tid = syscall(SYS_gettid);
+    return tid;
+}
 /* Set when the guest creates its top-level window. Keeping this near the
  * synchronization core lets focused diagnostics follow the actual UI/main
  * thread instead of being saturated by worker-pool waits. */
@@ -1983,21 +2021,16 @@ static inline u64 current_windows_thread_id(void)
     return g_cached_windows_thread_id = (u64)(u32)syscall(SYS_gettid);
 }
 
-static void *host_alloc(size_t size)
+/* Nonzero when the folder containing host_path exists (a missing file there is ERROR_FILE_NOT_FOUND). */
+static int host_parent_is_directory(const char *host_path)
 {
-    size = (size + 15U) & ~((size_t)15U);
-    size_t map_size = ((size + 4095U) & ~((size_t)4095U));
-    void *p = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) return NULL;
-    return p;
-}
-
-static void host_free(void *p, size_t size)
-{
-    if (!p) return;
-    size_t map_size = ((size + 4095U) & ~((size_t)4095U));
-    munmap(p, map_size);
+    char parent[PATH_MAX];
+    snprintf(parent, sizeof(parent), "%s", host_path);
+    char *slash = strrchr(parent, '/');
+    if (!slash) return 1;                                /* relative name: the current directory */
+    if (slash == parent) slash[1] = 0; else *slash = 0;
+    struct stat st;
+    return stat(parent, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static int cs_ptr_is_valid(const WIN_CS *cs)
@@ -2018,21 +2051,26 @@ static CsBackend *cs_backend(WIN_CS *cs)
         pthread_once(&g_fallback_cs_once, fallback_cs_init);
         return &g_fallback_cs;
     }
-    size_t bucket = ((uintptr_t)cs >> 3) & 255u;
+    const size_t bucket = ((uintptr_t)cs >> 3) & (CS_BUCKETS - 1);
+    for (CsBackend *p = atomic_load_explicit(&g_cs_backends[bucket], memory_order_acquire); p;
+         p = atomic_load_explicit(&p->next, memory_order_acquire))
+        if (__atomic_load_n(&p->section, __ATOMIC_ACQUIRE) == cs) return p;
     pthread_mutex_lock(&g_cs_backend_lock);
-    for (CsBackend *p = g_cs_backends[bucket]; p; p = p->next) {
+    for (CsBackend *p = atomic_load_explicit(&g_cs_backends[bucket], memory_order_relaxed); p;
+         p = atomic_load_explicit(&p->next, memory_order_relaxed))
         if (p->section == cs) {
             pthread_mutex_unlock(&g_cs_backend_lock);
             return p;
         }
-    }
-    CsBackend *p = host_alloc(sizeof(*p));
-    if (!p) die("critical-section backend allocation failed");
+    CsBackend *p = g_cs_backend_free;
+    if (p) g_cs_backend_free = atomic_load_explicit(&p->next, memory_order_relaxed);
+    else if (!(p = malloc(sizeof(*p)))) die("critical-section backend allocation failed");
     memset(p, 0, sizeof(*p));
     if (sem_init(&p->lock, 0, 1) != 0) die("critical-section semaphore initialization failed");
     p->section = cs;
-    p->next = g_cs_backends[bucket];
-    g_cs_backends[bucket] = p;
+    atomic_store_explicit(&p->next, atomic_load_explicit(&g_cs_backends[bucket], memory_order_relaxed),
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_cs_backends[bucket], p, memory_order_release);
     pthread_mutex_unlock(&g_cs_backend_lock);
     return p;
 }
@@ -2050,7 +2088,7 @@ static void cs_take(WIN_CS *cs, CsBackend *b, u64 me)
 {
     atomic_store_explicit(&b->owner, me, memory_order_relaxed);
     b->recursion = 1;
-    b->owner_tid = (long)syscall(SYS_gettid);
+    b->owner_tid = srw_host_tid();
     b->owner_rip = g_dispatch_incoming_return;
     cs_publish(cs, b, 1);
 }
@@ -2083,15 +2121,19 @@ static u64 __attribute__((ms_abi))
 impl_DeleteCriticalSection(WIN_CS *cs)
 {
     if (!cs_ptr_is_valid(cs)) return 0;
-    size_t bucket = ((uintptr_t)cs >> 3) & 255u;
+    const size_t bucket = ((uintptr_t)cs >> 3) & (CS_BUCKETS - 1);
     pthread_mutex_lock(&g_cs_backend_lock);
-    for (CsBackend **slot = &g_cs_backends[bucket]; *slot; slot = &(*slot)->next) {
-        CsBackend *p = *slot;
-        if (p->section != cs) continue;
-        *slot = p->next;
+    for (CsBackend *_Atomic *slot = &g_cs_backends[bucket]; ; ) {
+        CsBackend *p = atomic_load_explicit(slot, memory_order_relaxed);
+        if (!p) break;
+        if (p->section != cs) { slot = &p->next; continue; }
+        /* Unlink, but keep p->next intact for readers still on it; the backend is recycled, never freed. */
+        atomic_store_explicit(slot, atomic_load_explicit(&p->next, memory_order_relaxed), memory_order_release);
+        __atomic_store_n(&p->section, NULL, __ATOMIC_RELEASE);
         sem_destroy(&p->lock);
-        host_free(p, sizeof(*p));
         memset(cs, 0, sizeof(*cs));
+        atomic_store_explicit(&p->next, g_cs_backend_free, memory_order_relaxed);
+        g_cs_backend_free = p;
         break;
     }
     pthread_mutex_unlock(&g_cs_backend_lock);
@@ -2289,6 +2331,43 @@ static void note_inheritable_sa(u64 sa)
     u32 inherit;                                         /* SECURITY_ATTRIBUTES.bInheritHandle at +16 */
     memcpy(&inherit, (const u8 *)(uintptr_t)sa + 16, 4);
     if (inherit) g_inheritable_handles = 1;
+}
+/* The handles marked inheritable (HANDLE_FLAG_INHERIT), which CreateProcess(bInheritHandles=TRUE) hands to the child
+ * under the same values (win32_process.inc). */
+#define BEER_MAX_INHERITABLE 512
+static u64 g_inheritable[BEER_MAX_INHERITABLE];
+static u32 g_inheritable_count;
+static pthread_mutex_t g_inheritable_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void handle_set_inheritable(u64 h, int on)
+{
+    if (!h || h == UINT64_MAX) return;
+    pthread_mutex_lock(&g_inheritable_mtx);
+    u32 i = 0;
+    while (i < g_inheritable_count && g_inheritable[i] != h) ++i;
+    if (on && i == g_inheritable_count && g_inheritable_count < BEER_MAX_INHERITABLE)
+        g_inheritable[g_inheritable_count++] = h;
+    else if (!on && i < g_inheritable_count)
+        g_inheritable[i] = g_inheritable[--g_inheritable_count];
+    pthread_mutex_unlock(&g_inheritable_mtx);
+    if (on) g_inheritable_handles = 1;
+}
+static int handle_is_inheritable(u64 h)
+{
+    pthread_mutex_lock(&g_inheritable_mtx);
+    int found = 0;
+    for (u32 i = 0; i < g_inheritable_count && !found; ++i) found = g_inheritable[i] == h;
+    pthread_mutex_unlock(&g_inheritable_mtx);
+    return found;
+}
+/* The handle created with these SECURITY_ATTRIBUTES, marked inheritable when bInheritHandle says so. */
+static u64 inherit_from_sa(u64 handle, u64 sa)
+{
+    if (sa) {
+        u32 inherit;
+        memcpy(&inherit, (const u8 *)(uintptr_t)sa + 16, 4);
+        if (inherit) handle_set_inheritable(handle, 1);
+    }
+    return handle;
 }
 static char g_exe_path_storage[4096];
 static char g_exe_host_path_storage[4096];
@@ -2708,6 +2787,7 @@ static const char *configure_guest_process_path(const char *exe)
 
     g_exe_host_path = g_exe_host_path_storage;
     g_exe_path = g_exe_path_storage;
+    setenv("BEER_GUEST_EXE", g_exe_host_path, 1);   /* per-program caches (BD12 pipeline cache file name) */
     return g_exe_host_path;
 }
 
@@ -2724,6 +2804,10 @@ static void lowercase_dll_basename(const char *name, char *out, size_t out_size)
         out[i++] = c;
     }
     out[i] = 0;
+    /* LoadLibrary/GetModuleHandle append ".dll" to a name without an extension ("kernel32"); a trailing dot
+     * means the name has no extension and is taken as is. */
+    if (i && out[i - 1] == '.') out[--i] = 0;
+    else if (i && !strchr(out, '.') && i + 4 < out_size) memcpy(out + i, ".dll", 5);
 }
 
 /* Guest modules for the object scanner (platform/beer_objects.c): index 0 is the executable, then each loaded DLL.
@@ -3344,46 +3428,112 @@ static int is_real_kernel32_export(const char *name)
     return 0;
 }
 
-/* Legacy msvcrt.dll resolves into the bundled UCRT; the v*printf entry points that UCRT only
- * provides inline are bridged to __stdio_common_vsprintf with small guest-side thunks. */
-static u64 msvcrt_export(const char *name)
+/* Legacy msvcrt.dll resolves into the bundled UCRT. Entry points UCRT only provides inline (the printf/scanf
+ * families) are bridged to its __stdio_common_* functions with small guest-side thunks; C++ operator new/delete and
+ * terminate map to the UCRT functions behind them. msvcrt internals with no UCRT export (_lock, __dllonexit, ...)
+ * are host implementations (see win32_missing_exports.inc). */
+typedef struct {
+    const char *name, *target;
+    /* Arguments of the target call: 'C' = the constant, 'A' = the caller's argument #n, 'V' = the address of the
+     * caller's argument #n (a va_list over the variable arguments that start there). */
+    struct { char kind; u64 value; } args[7];
+    int count;
+} MsvcrtBridge;
+#define MB_C(v) { 'C', (u64)(v) }
+#define MB_A(n) { 'A', (u64)(n) }
+#define MB_V(n) { 'V', (u64)(n) }
+/* __stdio_common options: 1 legacy vsprintf NUL termination, 2 standard snprintf behaviour, 4 legacy wide specifiers
+ * (%s is a wide string in the wide functions, as in msvcrt). */
+static const MsvcrtBridge g_msvcrt_bridges[] = {
+    { "vsprintf",     "__stdio_common_vsprintf",      { MB_C(1), MB_A(0), MB_C(-1), MB_A(1), MB_C(0), MB_A(2) }, 6 },
+    { "_vsnprintf",   "__stdio_common_vsprintf",      { MB_C(0), MB_A(0), MB_A(1), MB_A(2), MB_C(0), MB_A(3) }, 6 },
+    { "vsnprintf",    "__stdio_common_vsprintf",      { MB_C(2), MB_A(0), MB_A(1), MB_A(2), MB_C(0), MB_A(3) }, 6 },
+    { "_vsnwprintf",  "__stdio_common_vswprintf",     { MB_C(4), MB_A(0), MB_A(1), MB_A(2), MB_C(0), MB_A(3) }, 6 },
+    { "vsprintf_s",   "__stdio_common_vsprintf_s",    { MB_C(0), MB_A(0), MB_A(1), MB_A(2), MB_C(0), MB_A(3) }, 6 },
+    { "vswprintf_s",  "__stdio_common_vswprintf_s",   { MB_C(4), MB_A(0), MB_A(1), MB_A(2), MB_C(0), MB_A(3) }, 6 },
+    { "sprintf",      "__stdio_common_vsprintf",      { MB_C(1), MB_A(0), MB_C(-1), MB_A(1), MB_C(0), MB_V(2) }, 6 },
+    { "_snprintf",    "__stdio_common_vsprintf",      { MB_C(0), MB_A(0), MB_A(1), MB_A(2), MB_C(0), MB_V(3) }, 6 },
+    { "sprintf_s",    "__stdio_common_vsprintf_s",    { MB_C(0), MB_A(0), MB_A(1), MB_A(2), MB_C(0), MB_V(3) }, 6 },
+    { "swprintf_s",   "__stdio_common_vswprintf_s",   { MB_C(4), MB_A(0), MB_A(1), MB_A(2), MB_C(0), MB_V(3) }, 6 },
+    { "_snwprintf",   "__stdio_common_vswprintf",     { MB_C(4), MB_A(0), MB_A(1), MB_A(2), MB_C(0), MB_V(3) }, 6 },
+    { "_snwprintf_s", "__stdio_common_vsnwprintf_s",  { MB_C(4), MB_A(0), MB_A(1), MB_A(2), MB_A(3), MB_C(0), MB_V(4) }, 7 },
+    { "_snprintf_s",  "__stdio_common_vsnprintf_s",   { MB_C(0), MB_A(0), MB_A(1), MB_A(2), MB_A(3), MB_C(0), MB_V(4) }, 7 },
+    { "sscanf",       "__stdio_common_vsscanf",       { MB_C(2), MB_A(0), MB_C(-1), MB_A(1), MB_C(0), MB_V(2) }, 6 },
+    { "swscanf",      "__stdio_common_vswscanf",      { MB_C(2), MB_A(0), MB_C(-1), MB_A(1), MB_C(0), MB_V(2) }, 6 },
+};
+static const char *const g_msvcrt_aliases[][2] = {
+    { "??2@YAPEAX_K@Z", "malloc" }, { "??_U@YAPEAX_K@Z", "malloc" },     /* operator new / new[] */
+    { "??3@YAXPEAX@Z", "free" },    { "??_V@YAXPEAX@Z", "free" },        /* operator delete / delete[] */
+    { "?terminate@@YAXXZ", "terminate" },
+};
+
+/* Emits: spill rcx/rdx/r8/r9 to their home slots (the caller's arguments are then contiguous above the return
+ * address), build the target's arguments, call it and return its result. */
+static u64 msvcrt_bridge_thunk(const MsvcrtBridge *bridge, u64 target)
+{
+    static u8 *page;
+    static size_t used;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (!page) {
+        page = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) page = NULL;
+    }
+    if (!page || used + 256 > 0x4000) { pthread_mutex_unlock(&lock); return 0; }
+    u8 *code = page + used, *w = code;
+    static const u8 spill[] = { 0x48, 0x89, 0x4C, 0x24, 0x08,  0x48, 0x89, 0x54, 0x24, 0x10,
+                                0x4C, 0x89, 0x44, 0x24, 0x18,  0x4C, 0x89, 0x4C, 0x24, 0x20,
+                                0x48, 0x83, 0xEC, 0x48 };                     /* ...; sub rsp, 0x48 */
+    memcpy(w, spill, sizeof(spill)); w += sizeof(spill);
+    static const u8 to_register[4][3] = { { 0x48, 0x89, 0xC1 }, { 0x48, 0x89, 0xC2 },
+                                          { 0x49, 0x89, 0xC0 }, { 0x49, 0x89, 0xC1 } };   /* mov rcx/rdx/r8/r9, rax */
+    for (int j = 0; j < bridge->count; ++j) {
+        const u64 value = bridge->args[j].value;
+        const u32 slot = 0x50u + 8u * (u32)value;                            /* caller argument n after sub rsp */
+        if (bridge->args[j].kind == 'C') { *w++ = 0x48; *w++ = 0xB8; memcpy(w, &value, 8); w += 8; }
+        else { *w++ = 0x48; *w++ = bridge->args[j].kind == 'A' ? 0x8B : 0x8D; *w++ = 0x84; *w++ = 0x24;
+               memcpy(w, &slot, 4); w += 4; }                                /* mov/lea rax, [rsp+slot] */
+        if (j < 4) { memcpy(w, to_register[j], 3); w += 3; }
+        else { *w++ = 0x48; *w++ = 0x89; *w++ = 0x44; *w++ = 0x24; *w++ = (u8)(0x20 + 8 * (j - 4)); }  /* mov [rsp+..], rax */
+    }
+    *w++ = 0x48; *w++ = 0xB8; memcpy(w, &target, 8); w += 8;                  /* mov rax, target */
+    *w++ = 0xFF; *w++ = 0xD0;                                                 /* call rax */
+    *w++ = 0x48; *w++ = 0x83; *w++ = 0xC4; *w++ = 0x48;                       /* add rsp, 0x48 */
+    *w++ = 0xC3;
+    used += ((size_t)(w - code) + 15) & ~(size_t)15;
+    pthread_mutex_unlock(&lock);
+    return (u64)(uintptr_t)code;
+}
+
+static GuestDll *msvcrt_ucrt(void)
 {
     GuestDll *ucrt = guest_dll_find("ucrtbase.dll");
-    if (!ucrt) return 0;
+    if (!ucrt && !g_loading_ucrtbase) {
+        g_loading_ucrtbase = 1;
+        ucrt = guest_dll_load("ucrtbase.dll");
+        g_loading_ucrtbase = 0;
+    }
+    return ucrt;
+}
+
+static u64 msvcrt_export(const char *name)
+{
+    GuestDll *ucrt = msvcrt_ucrt();
+    if (!ucrt || !name) return 0;
+    for (size_t i = 0; i < sizeof(g_msvcrt_aliases) / sizeof(*g_msvcrt_aliases); ++i)
+        if (!strcmp(name, g_msvcrt_aliases[i][0])) return guest_dll_export(ucrt, g_msvcrt_aliases[i][1]);
     u64 direct = guest_dll_export(ucrt, name);
     if (direct) return direct;
-    int sized = !strcmp(name, "_vsnprintf") || !strcmp(name, "vsnprintf");
-    if (!sized && strcmp(name, "vsprintf")) return 0;
-    u64 common = guest_dll_export(ucrt, "__stdio_common_vsprintf");
-    if (!common) return 0;
-    static u8 *page; static size_t used;
-    if (!page) {
-        page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (page == MAP_FAILED) { page = NULL; return 0; }
+    static struct { const char *name; u64 thunk; } made[32];
+    for (size_t i = 0; i < sizeof(g_msvcrt_bridges) / sizeof(*g_msvcrt_bridges); ++i) {
+        if (strcmp(name, g_msvcrt_bridges[i].name)) continue;
+        for (size_t k = 0; k < 32 && made[k].name; ++k) if (!strcmp(made[k].name, name)) return made[k].thunk;
+        u64 target = guest_dll_export(ucrt, g_msvcrt_bridges[i].target);
+        u64 thunk = target ? msvcrt_bridge_thunk(&g_msvcrt_bridges[i], target) : 0;
+        for (size_t k = 0; k < 32; ++k) if (!made[k].name) { made[k].name = name; made[k].thunk = thunk; break; }
+        return thunk;
     }
-    if (used + 96 > 4096) return 0;
-    u8 *c = page + used;
-    u8 *w = c;
-    /* sub rsp,0x38 */ *w++ = 0x48; *w++ = 0x83; *w++ = 0xEC; *w++ = 0x38;
-    if (sized) {                       /* (buffer rcx, count rdx, format r8, arglist r9) */
-        /* mov rax, r9      */ *w++ = 0x4C; *w++ = 0x89; *w++ = 0xC8;
-        /* mov r9, r8       */ *w++ = 0x4D; *w++ = 0x89; *w++ = 0xC1;
-        /* mov r8, rdx      */ *w++ = 0x49; *w++ = 0x89; *w++ = 0xD0;
-    } else {                           /* vsprintf(buffer rcx, format rdx, arglist r8) */
-        /* mov rax, r8      */ *w++ = 0x4C; *w++ = 0x89; *w++ = 0xC0;
-        /* mov r9, rdx      */ *w++ = 0x49; *w++ = 0x89; *w++ = 0xD1;
-        /* mov r8, -1       */ *w++ = 0x49; *w++ = 0xC7; *w++ = 0xC0; *w++ = 0xFF; *w++ = 0xFF; *w++ = 0xFF; *w++ = 0xFF;
-    }
-    /* mov rdx, rcx (buffer) */ *w++ = 0x48; *w++ = 0x89; *w++ = 0xCA;
-    /* mov ecx, options   */ *w++ = 0xB9; u32 options = !sized ? 1u : (name[0] == '_' ? 0u : 2u); memcpy(w, &options, 4); w += 4;
-    /* mov qword [rsp+0x20], 0 */ *w++ = 0x48; *w++ = 0xC7; *w++ = 0x44; *w++ = 0x24; *w++ = 0x20; memset(w, 0, 4); w += 4;
-    /* mov [rsp+0x28], rax */ *w++ = 0x48; *w++ = 0x89; *w++ = 0x44; *w++ = 0x24; *w++ = 0x28;
-    /* mov rax, imm64     */ *w++ = 0x48; *w++ = 0xB8; memcpy(w, &common, 8); w += 8;
-    /* call rax           */ *w++ = 0xFF; *w++ = 0xD0;
-    /* add rsp,0x38       */ *w++ = 0x48; *w++ = 0x83; *w++ = 0xC4; *w++ = 0x38;
-    /* ret                */ *w++ = 0xC3;
-    used += (size_t)(w - c + 15) & ~(size_t)15;
-    return (u64)c;
+    return 0;
 }
 
 static u64 guest_dll_export_by_ordinal(GuestDll *dll, u32 ordinal);
@@ -3432,6 +3582,22 @@ impl_GetProcAddress(u64 hmod, const char *procname)
                     break;
                 }
         }
+        /* Any other Beer module with a Windows ordinal ABI (win32_module_exports.h): the ordinal names an export,
+         * resolved like a lookup by that name. */
+        const char *ordinal_module = NULL;
+        for (int i = 0; !address && !ordinal_module && i < g_fake_dll_count; ++i)
+            if (g_fake_dll_cache[i].handle == hmod) ordinal_module = g_fake_dll_cache[i].name;
+        if (!address && !ordinal_module) {
+            const FakePeModule *pe = fake_pe_module_from_base(hmod);
+            if (pe) ordinal_module = pe->name;
+        }
+        if (ordinal_module)
+            for (size_t e = 0; e < BEER_MODULE_ORDINAL_COUNT; ++e)
+                if (beer_module_ordinals[e].ordinal == ordinal &&
+                    !strcasecmp(beer_module_ordinals[e].module, ordinal_module)) {
+                    address = impl_GetProcAddress(hmod, beer_module_ordinals[e].name);
+                    break;
+                }
         g_last_error = address ? 0 : 127;
         return address;
     }
@@ -3573,7 +3739,10 @@ typedef struct HeapGuardEntry {
 
 #define HEAP_GUARD_BUCKETS 4096
 static HeapGuardEntry *g_heap_guard_table[HEAP_GUARD_BUCKETS];
-static pthread_mutex_t g_heap_guard_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* The size table is striped: one lock per group of buckets, chosen by the pointer's hash, so threads allocating
+ * at the same time do not serialise on one mutex (8 shader-compiler threads did, in Where Winds Meet). */
+#define HEAP_GUARD_LOCKS 256
+static pthread_mutex_t g_heap_guard_locks[HEAP_GUARD_LOCKS] = { [0 ... HEAP_GUARD_LOCKS - 1] = PTHREAD_MUTEX_INITIALIZER };
 
 static size_t heap_guard_hash(void *p)
 {
@@ -3581,6 +3750,7 @@ static size_t heap_guard_hash(void *p)
     v ^= v >> 33; v *= 0xff51afd7ed558ccdULL; v ^= v >> 33;
     return (size_t)(v % HEAP_GUARD_BUCKETS);
 }
+static pthread_mutex_t *heap_guard_lock(void *p) { return &g_heap_guard_locks[heap_guard_hash(p) % HEAP_GUARD_LOCKS]; }
 
 static HeapGuardEntry *heap_guard_find_locked(void *user_ptr)
 {
@@ -3590,25 +3760,28 @@ static HeapGuardEntry *heap_guard_find_locked(void *user_ptr)
     return NULL;
 }
 
+static size_t g_heap_guard_live_bytes, g_heap_guard_live_count;   /* diagnostics (BEER_DUMP_MEMORY) */
 static void heap_guard_insert(void *user_ptr, void *base, size_t total_size, size_t user_size)
 {
     HeapGuardEntry *e = malloc(sizeof(*e));
     if (!e) return;
+    __atomic_add_fetch(&g_heap_guard_live_bytes, user_size, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_heap_guard_live_count, 1, __ATOMIC_RELAXED);
     memset(e, 0, sizeof(*e));
     e->user_ptr = user_ptr;
     e->base = base;
     e->total_size = total_size;
     e->user_size = user_size;
-    pthread_mutex_lock(&g_heap_guard_mutex);
+    pthread_mutex_lock(heap_guard_lock(user_ptr));
     size_t b = heap_guard_hash(user_ptr);
     e->next = g_heap_guard_table[b];
     g_heap_guard_table[b] = e;
-    pthread_mutex_unlock(&g_heap_guard_mutex);
+    pthread_mutex_unlock(heap_guard_lock(user_ptr));
 }
 
 static int heap_guard_remove(void *user_ptr, void **out_base, size_t *out_total, size_t *out_user_size)
 {
-    pthread_mutex_lock(&g_heap_guard_mutex);
+    pthread_mutex_lock(heap_guard_lock(user_ptr));
     size_t b = heap_guard_hash(user_ptr);
     HeapGuardEntry **pp = &g_heap_guard_table[b];
     while (*pp) {
@@ -3618,13 +3791,15 @@ static int heap_guard_remove(void *user_ptr, void **out_base, size_t *out_total,
             if (out_total) *out_total = e->total_size;
             if (out_user_size) *out_user_size = e->user_size;
             *pp = e->next;
-            pthread_mutex_unlock(&g_heap_guard_mutex);
+            pthread_mutex_unlock(heap_guard_lock(user_ptr));
+            __atomic_sub_fetch(&g_heap_guard_live_bytes, e->user_size, __ATOMIC_RELAXED);
+            __atomic_sub_fetch(&g_heap_guard_live_count, 1, __ATOMIC_RELAXED);
             free(e);
             return 1;
         }
         pp = &(*pp)->next;
     }
-    pthread_mutex_unlock(&g_heap_guard_mutex);
+    pthread_mutex_unlock(heap_guard_lock(user_ptr));
     return 0;
 }
 
@@ -3649,7 +3824,9 @@ static void *heap_guard_alloc(size_t size, int zero)
          * host allocator while retaining Beer’s size table; fault-isolation
          * runs can opt back in with BEER_HEAP_GUARDS=1. */
         void *user_ptr;
-        if (getenv("BEER_HEAP_ALIGN") && want >= 65536) {   /* experiment */
+        static int align_experiment = -1;
+        if (align_experiment < 0) align_experiment = getenv("BEER_HEAP_ALIGN") != NULL;
+        if (align_experiment && want >= 65536) {   /* experiment */
             if (posix_memalign(&user_ptr, 65536, want)) user_ptr = NULL;
             if (user_ptr && zero) memset(user_ptr, 0, want);
         } else {
@@ -3688,12 +3865,18 @@ impl_HeapAlloc(u64 heap, u32 flags, u64 size)
         fprintf(stderr, "[IMPL] HeapAlloc huge size=%lu, fallback 4K\n", (unsigned long)size);
         return (u64)heap_guard_alloc(4096, 1);
     }
-    if (getenv("BEER_HOOK_LAZY") && !g_hook_lazy_go) { g_hook_lazy_go = 1; install_hook_logs(); }
+    static int hook_lazy = -1, zero_experiment = -1, vm_log = -1;   /* read once: HeapAlloc is very hot */
+    if (hook_lazy < 0) {
+        hook_lazy = getenv("BEER_HOOK_LAZY") != NULL;
+        zero_experiment = getenv("BEER_HEAP_ZERO") != NULL;
+        vm_log = getenv("BEER_VM_LOG") != NULL;
+    }
+    if (hook_lazy && !g_hook_lazy_go) { g_hook_lazy_go = 1; install_hook_logs(); }
     int zero_mem = (flags & 0x8) != 0; /* HEAP_ZERO_MEMORY */
-    if (getenv("BEER_HEAP_ZERO")) zero_mem = 1;   /* experiment */
+    if (zero_experiment) zero_mem = 1;   /* experiment */
     void *p = heap_guard_alloc((size_t)size, zero_mem);
     if (!p) fprintf(stderr, "[IMPL] HeapAlloc(%lu) OOM/mmap-failed\n", (unsigned long)size);
-    if (getenv("BEER_VM_LOG")) {
+    if (vm_log) {
         static _Atomic(u32) logs;
         if (atomic_fetch_add(&logs, 1) < 300)
             fprintf(stderr, "[VM] HeapAlloc(heap=%lx flags=0x%x size=%lu) -> %p\n",
@@ -3715,12 +3898,12 @@ impl_HeapReAlloc(u64 heap, u32 flags, void *ptr, u64 size)
         return (u64)ptr;
     }
 
-    pthread_mutex_lock(&g_heap_guard_mutex);
+    pthread_mutex_lock(heap_guard_lock(ptr));
     HeapGuardEntry *e = heap_guard_find_locked(ptr);
     void *old_base = e ? e->base : NULL;
     size_t old_total = e ? e->total_size : 0;
     size_t old_user_size = e ? e->user_size : 0;
-    pthread_mutex_unlock(&g_heap_guard_mutex);
+    pthread_mutex_unlock(heap_guard_lock(ptr));
 
     if (!e) {
         fprintf(stderr, "[IMPL] HeapReAlloc(heap=%llx flags=0x%x ptr=%p size=%llu) untracked pointer, caller=0x%llx\n",
@@ -3787,10 +3970,10 @@ impl_HeapSize(u64 heap, u32 flags, void *ptr)
     if (beer_native_heap_contains(heap))
         return beer_native_heap_size(heap, flags, ptr);
     (void)heap; (void)flags;
-    pthread_mutex_lock(&g_heap_guard_mutex);
+    pthread_mutex_lock(heap_guard_lock(ptr));
     HeapGuardEntry *e = heap_guard_find_locked(ptr);
     size_t sz = e ? e->user_size : 0;
-    pthread_mutex_unlock(&g_heap_guard_mutex);
+    pthread_mutex_unlock(heap_guard_lock(ptr));
     return (u64)sz;
 }
 
@@ -3824,9 +4007,9 @@ impl_RtlReAllocateHeap(u64 heap, u32 flags, void *ptr, u64 size)
 {
     if (rtl_legacy_heap(heap)) {
         if (!ptr || size > (1ULL << 31) || (flags & ~0x9u)) return 0;
-        pthread_mutex_lock(&g_heap_guard_mutex);
+        pthread_mutex_lock(heap_guard_lock(ptr));
         int tracked = heap_guard_find_locked(ptr) != NULL;
-        pthread_mutex_unlock(&g_heap_guard_mutex);
+        pthread_mutex_unlock(heap_guard_lock(ptr));
         return tracked ? impl_HeapReAlloc(heap, flags, ptr, size) : 0;
     }
     return (u64)(uintptr_t)beer_native_heap_reallocate(heap, flags, ptr, size);
@@ -3852,10 +4035,10 @@ impl_RtlSizeHeap(u64 heap, u32 flags, void *ptr)
 {
     if (rtl_legacy_heap(heap)) {
         if (!ptr || (flags & ~0x1u)) return UINT64_MAX;
-        pthread_mutex_lock(&g_heap_guard_mutex);
+        pthread_mutex_lock(heap_guard_lock(ptr));
         HeapGuardEntry *entry = heap_guard_find_locked(ptr);
         u64 size = entry ? entry->user_size : UINT64_MAX;
-        pthread_mutex_unlock(&g_heap_guard_mutex);
+        pthread_mutex_unlock(heap_guard_lock(ptr));
         return size;
     }
     return beer_native_heap_size(heap, flags, ptr);
@@ -4393,6 +4576,36 @@ static int beer_native_dll_unsupported(const char *lname)
     return 1;
 }
 
+
+#include "platform/win32_system_dll_names.h"
+/* LoadLibrary's last resort is an inert compatibility module (a minimal PE whose exports Beer implements). Windows
+ * only finds DLLs that exist: a name that is neither in the game's directories nor part of Windows fails with
+ * ERROR_MOD_NOT_FOUND. Programs probe for optional libraries that way and trust a non-NULL handle: Where Winds Meet
+ * loads icuuc72.dll ... icuuc49.dll and later calls the u_cleanup it looked up in the module it got (NULL), so
+ * a fake handle for a DLL Windows would not have turned that probe into a call through NULL. The fallback is kept
+ * for Windows system DLLs (Wine's list), Windows DLLs Wine lacks, and the vendor modules Beer implements. */
+static int beer_module_may_be_faked(const char *lname)
+{
+    static const char *const extra[] = {
+        "nvapi64.dll", "nvcuda.dll", "nvml.dll", "dstorage.dll", "dstoragecore.dll", "steam_api64.dll",
+        "steamclient64.dll", "fmodex64.dll", "fmod_event64.dll", "bink2w64.dll",
+        "icu.dll", "icuuc.dll", "icuin.dll", "gameinput.dll",
+        /* System32 DLLs that Wine does not ship */
+        "cryptbase.dll", "devobj.dll", "drvstore.dll", "windows.storage.dll", "kernel.appcore.dll", "dpapi.dll",
+        "umpdc.dll", "gdi32full.dll", "textinputframework.dll", "ntmarta.dll", "clbcatq.dll", "profext.dll",
+        "wintypes.dll", "coreuicomponents.dll", "dxcore.dll", "nvldumdx.dll", "amdxc64.dll",
+    };
+    for (size_t i = 0; i < sizeof(extra) / sizeof(*extra); ++i) if (!strcmp(lname, extra[i])) return 1;
+    size_t lo = 0, hi = sizeof(g_windows_system_dll_names) / sizeof(*g_windows_system_dll_names);
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        const int c = strcmp(lname, g_windows_system_dll_names[mid]);
+        if (!c) return 1;
+        if (c < 0) hi = mid; else lo = mid + 1;
+    }
+    if (getenv("BEER_FAKE_ANY_DLL")) return 1;    /* diagnostic: the old behaviour */
+    return 0;
+}
 static u64 __attribute__((ms_abi))
 impl_LoadLibraryA(const char *name)
 {
@@ -4422,7 +4635,12 @@ impl_LoadLibraryA(const char *name)
     }
     if (!guest && (!beer_module_is_windows_runtime_dll(lname) || explicit_path)) {
         u64 virtual_module = virtual_fs_load_library(name);
-        if (virtual_module) return virtual_module;
+        if (virtual_module) {
+            /* As for a file-backed DLL below: DLL_PROCESS_ATTACH runs inside LoadLibrary. */
+            guest = guest_dll_from_handle(virtual_module);
+            if (guest) guest_dll_initialize_all();
+            else return virtual_module;
+        }
     }
     if (!guest && explicit_path) {
         guest = guest_dll_load(name);
@@ -4448,7 +4666,17 @@ impl_LoadLibraryA(const char *name)
     }
     if (guest && guest->init_failed) { g_last_error = 1114; return 0; }   /* ERROR_DLL_INIT_FAILED */
     if (guest) return (u64)guest->image;
-    if (explicit_path) { g_last_error = 126; return 0; }
+    if (explicit_path) {
+        char host[PATH_MAX];
+        const int resolved = build_guest_dll_path(name, host, sizeof(host));
+        fprintf(stderr, "[IMPL] LoadLibraryA(\"%s\") -> explicit path not loaded (%s)\n", name,
+                resolved ? host : "path does not resolve");
+        g_last_error = 126; return 0;
+    }
+    if (!beer_module_may_be_faked(lname) && !dll_name_to_handle(lname, 0)) {
+        fprintf(stderr, "[IMPL] LoadLibraryA(\"%s\") -> not found (not a Windows DLL)\n", name);
+        g_last_error = 126; return 0;
+    }
     u64 h = dll_name_to_handle(lname, 1);
     if (h) {
         if (lname[0] != 'k' && lname[0] != 'u' && lname[0] != 'n' && lname[0] != 'a') {
@@ -4492,7 +4720,12 @@ impl_LoadLibraryW(const u16 *name)
     }
     if (!guest && (!beer_module_is_windows_runtime_dll(lname) || explicit_path)) {
         u64 virtual_module = virtual_fs_load_library(narrow);
-        if (virtual_module) return virtual_module;
+        if (virtual_module) {
+            /* As for a file-backed DLL below: DLL_PROCESS_ATTACH runs inside LoadLibrary. */
+            guest = guest_dll_from_handle(virtual_module);
+            if (guest) guest_dll_initialize_all();
+            else return virtual_module;
+        }
     }
     if (!guest && explicit_path) {
         guest = guest_dll_load(narrow);
@@ -4518,7 +4751,17 @@ impl_LoadLibraryW(const u16 *name)
     }
     if (guest && guest->init_failed) { g_last_error = 1114; return 0; }   /* ERROR_DLL_INIT_FAILED */
     if (guest) return (u64)guest->image;
-    if (explicit_path) { g_last_error = 126; return 0; }
+    if (explicit_path) {
+        char host[PATH_MAX];
+        const int resolved = build_guest_dll_path(narrow, host, sizeof(host));
+        fprintf(stderr, "[IMPL] LoadLibraryW(\"%s\") -> explicit path not loaded (%s)\n", narrow,
+                resolved ? host : "path does not resolve");
+        g_last_error = 126; return 0;
+    }
+    if (!beer_module_may_be_faked(lname) && !dll_name_to_handle(lname, 0)) {
+        fprintf(stderr, "[IMPL] LoadLibraryW(\"%s\") -> not found (not a Windows DLL)\n", lname);
+        g_last_error = 126; return 0;
+    }
     u64 h = dll_name_to_handle(lname, 1);
     if (h) {
         if (lname[0] != 'k' && lname[0] != 'u' && lname[0] != 'n' && lname[0] != 'a') {
@@ -5903,9 +6146,18 @@ static u64 __attribute__((ms_abi)) impl_Steam_ReleaseUser(u32 pipe, u32 user)
 static u64 __attribute__((ms_abi)) impl_Steam_SetLocalIPBinding(u32 ip, u16 port)
     { (void)ip; (void)port; return 0; }
 static int steam_client_next_callback(void *message);
+static int steam_event_next_callback(void *message);
+/* Which queue the calling thread's current Steam_BGetCallback message came from: 1 matchmaking, 2 Beer's posted
+ * events (ticket responses and other broadcast callbacks). Steam_FreeLastCallback releases that one. */
+static __thread int t_steam_callback_source;
+static __thread int t_steam_event_pending;
 static u64 __attribute__((ms_abi)) impl_Steam_BGetCallback(u32 pipe, void *message)
 {
-    if (pipe == 1 && steam_client_next_callback(message)) return 1;
+    /* A real steam_api64.dll pumps every callback through this pipe, so Beer's posted events (GetAuthSessionTicket,
+     * GetAuthTicketForWebApi responses, ...) are delivered here as well as through Beer's own RunCallbacks. */
+    if (pipe == 1 && t_steam_event_pending && steam_event_next_callback(message)) { t_steam_callback_source = 2; return 1; }
+    if (pipe == 1 && steam_client_next_callback(message)) { t_steam_callback_source = 1; return 1; }
+    if (pipe == 1 && steam_event_next_callback(message)) { t_steam_callback_source = 2; return 1; }
     static _Atomic(u32) calls;
     u32 call = atomic_fetch_add_explicit(&calls, 1, memory_order_relaxed);
     if (getenv("BEER_STEAM_DIAGNOSTICS") && call < 256)
@@ -5915,7 +6167,9 @@ static u64 __attribute__((ms_abi)) impl_Steam_BGetCallback(u32 pipe, void *messa
 }
 static u64 __attribute__((ms_abi)) impl_Steam_FreeLastCallback(u32 pipe)
 {
-    if (pipe == 1 && beer_mms_ready()) beer_mms_pop_callback();
+    if (pipe == 1 && t_steam_callback_source == 2) t_steam_event_pending = 0;
+    else if (pipe == 1 && beer_mms_ready()) beer_mms_pop_callback();
+    t_steam_callback_source = 0;
     return 1;
 }
 static u64 __attribute__((ms_abi)) impl_Steam_GetAPICallResult(u32 pipe, u64 call, void *buffer, u32 size, u32 id, u8 *failed)
@@ -5981,13 +6235,16 @@ impl_SteamAPI_GetHSteamPipe(void) { return 1; }
 #define BEER_STEAM_MAX_LISTENERS 256
 #define BEER_STEAM_MAX_EVENTS 64
 static struct { u64 object; u32 id; } g_steam_listeners[BEER_STEAM_MAX_LISTENERS];
-static struct { u32 id; u32 size; u8 data[256]; } g_steam_events[BEER_STEAM_MAX_EVENTS];
+/* Large enough for GetTicketForWebApiResponse_t (12 + 2560 bytes), the biggest callback Beer posts. */
+static struct { u32 id; u32 size; u8 data[2600]; } g_steam_events[BEER_STEAM_MAX_EVENTS];
 static u32 g_steam_event_count;
 static pthread_mutex_t g_steam_listener_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void steam_callback_post(u32 id, const void *data, u32 size)
 {
     pthread_mutex_lock(&g_steam_listener_lock);
+    if (size > sizeof(g_steam_events[0].data))
+        fprintf(stderr, "[STEAM] callback %u dropped: %u bytes exceed the event buffer\n", id, size);
     if (g_steam_event_count < BEER_STEAM_MAX_EVENTS && size <= sizeof(g_steam_events[0].data)) {
         g_steam_events[g_steam_event_count].id = id;
         g_steam_events[g_steam_event_count].size = size;
@@ -5995,6 +6252,33 @@ static void steam_callback_post(u32 id, const void *data, u32 size)
         g_steam_event_count++;
     }
     pthread_mutex_unlock(&g_steam_listener_lock);
+}
+
+/* Steam_BGetCallback for Beer's posted events: the oldest one is moved into a per-thread buffer and reported until
+ * Steam_FreeLastCallback, as the Steam client reports one callback until it is freed. */
+static __thread struct { u32 id, size; u8 data[sizeof(g_steam_events[0].data)]; } t_steam_event;
+static int steam_event_next_callback(void *message)
+{
+    if (!message) return 0;
+    if (!t_steam_event_pending) {
+        pthread_mutex_lock(&g_steam_listener_lock);
+        if (!g_steam_event_count) { pthread_mutex_unlock(&g_steam_listener_lock); return 0; }
+        t_steam_event.id = g_steam_events[0].id;
+        t_steam_event.size = g_steam_events[0].size;
+        memcpy(t_steam_event.data, g_steam_events[0].data, g_steam_events[0].size);
+        memmove(&g_steam_events[0], &g_steam_events[1], (size_t)(g_steam_event_count - 1) * sizeof(g_steam_events[0]));
+        g_steam_event_count--;
+        pthread_mutex_unlock(&g_steam_listener_lock);
+        t_steam_event_pending = 1;
+    }
+    u8 *msg = message;
+    const s32 user = 1, id = (s32)t_steam_event.id, size = (s32)t_steam_event.size;
+    const u64 param = (u64)(uintptr_t)t_steam_event.data;
+    memcpy(msg, &user, 4);                                 /* m_hSteamUser */
+    memcpy(msg + 4, &id, 4);                               /* m_iCallback */
+    memcpy(msg + 8, &param, 8);                            /* m_pubParam */
+    memcpy(msg + 16, &size, 4);                            /* m_cubParam */
+    return 1;
 }
 
 static u64 __attribute__((ms_abi))
@@ -7014,12 +7298,25 @@ static u64 __attribute__((ms_abi)) steam_user_begin_auth_session(u64 self, const
     return 1;                                            /* k_EBeginAuthSessionResultInvalidTicket */
 }
 
-static u64 __attribute__((ms_abi)) steam_user_no_web_api_ticket(u64 self, const char *identity)
+/* GetTicketForWebApiResponse_t: k_iSteamUserCallbacks + 68, { HAuthTicket, EResult, int cubTicket,
+ * uint8 rgubTicket[2560] }. The ticket arrives only through this callback; the call returns its handle. */
+#define BEER_STEAM_WEB_API_TICKET_RESPONSE 168u
+static u64 __attribute__((ms_abi)) steam_user_get_auth_ticket_for_web_api(u64 self, const char *identity)
 {
     (void)self;
-    fprintf(stderr, "[STEAM] ISteamUser::GetAuthTicketForWebApi(%s) is not implemented -> invalid ticket\n",
-            identity ? identity : "");
-    return 0;
+    struct { u32 handle, result; s32 size; u8 ticket[2560]; } response;
+    memset(&response, 0, sizeof(response));
+    u32 handle = 0;
+    size_t len = beer_steam_session_web_api_ticket(g_steam_own_appid, identity, response.ticket,
+                                                   sizeof(response.ticket), &handle);
+    if (!len && handle) { beer_steam_session_cancel_auth_ticket(g_steam_own_appid, handle); handle = 0; }
+    response.handle = handle;
+    response.result = len ? 1u : 3u;                     /* k_EResultOK / k_EResultNoConnection */
+    response.size = (s32)len;
+    if (handle) steam_callback_post(BEER_STEAM_WEB_API_TICKET_RESPONSE, &response, sizeof(response));
+    fprintf(stderr, "[STEAM] ISteamUser::GetAuthTicketForWebApi(%s) -> handle %u, %u bytes\n",
+            identity ? identity : "", handle, (u32)len);
+    return handle;                                       /* 0 is k_HAuthTicketInvalid */
 }
 
 static u64 steam_user_interface(const char *lower_version)
@@ -7039,7 +7336,7 @@ static u64 steam_user_interface(const char *lower_version)
         memcpy(cache[i].vtab, g_steam_user_vtab, sizeof(cache[i].vtab));
         cache[i].vtab[13] = (u64)steam_user_get_auth_session_ticket;
         if (version >= 22) {
-            cache[i].vtab[14] = (u64)steam_user_no_web_api_ticket;
+            cache[i].vtab[14] = (u64)steam_user_get_auth_ticket_for_web_api;
             cache[i].vtab[15] = (u64)steam_user_begin_auth_session;
             cache[i].vtab[17] = (u64)steam_user_cancel_auth_ticket;
             cache[i].vtab[18] = (u64)steam_user_has_license_for_app;
@@ -7320,9 +7617,9 @@ static const u8 k_iid_idxgi_adapter[16] = {
     0xe1,0xe7,0x11,0x24,0xac,0x12,0xcf,0x4c,
     0xbd,0x14,0x97,0x98,0xe8,0x53,0x4d,0xc0
 };
-static const u8 k_iid_idxgi_adapter1[16] = {
-    0x05,0xaa,0x00,0x29,0x59,0xc9,0x90,0x4a,
-    0xb8,0x99,0x7f,0x0d,0x56,0x6f,0xb6,0x7a
+static const u8 k_iid_idxgi_adapter1[16] = {  /* 29038F61-3839-4626-91FD-086879011A05 */
+    0x61,0x8f,0x03,0x29,0x39,0x38,0x26,0x46,
+    0x91,0xfd,0x08,0x68,0x79,0x01,0x1a,0x05
 };
 static const u8 k_iid_idxgi_adapter2[16] = {  /* 0AA1AE0A-FA0E-4B84-8644-E05FF8E5ACB5 */
     0x0a,0xae,0xa1,0x0a,0x0e,0xfa,0x84,0x4b,
@@ -7472,7 +7769,8 @@ impl_CreateDXGIFactory2(u32 flags, u64 riid, u64 **ppFactory)
 
 /* ── WS2_32 (Winsock 2) ──────────────────────────────────────────── */
 static __thread s32 g_wsa_last_error;
-static __thread u32 g_wsa_startup_count;
+/* WSAStartup is process-wide: a socket made on any thread works once some thread has started Winsock. */
+static _Atomic u32 g_wsa_startup_count;
 
 /* ---- getaddrinfo family.  Beer runs offline by default, so only addresses that need no resolver are answered:
  * a NULL node (wildcard, or loopback with AI_PASSIVE clear), "localhost" and dotted IPv4; any other name fails with
@@ -7544,7 +7842,21 @@ static int win_getaddrinfo_common(const char *node, const char *service, const W
 }
 static u64 __attribute__((ms_abi))
 impl_getaddrinfo(const char *node, const char *service, const WinAddrInfo *hints, u64 *result)
-    { return (u64)win_getaddrinfo_common(node, service, hints, result); }
+{
+    static int diagnostics = -1;
+    if (diagnostics < 0) diagnostics = getenv("BEER_NET_DIAGNOSTICS") != NULL;
+    struct timespec started, ended;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    if (diagnostics) fprintf(stderr, "[NET] getaddrinfo(%s) t%ld starting\n", node ? node : "(null)", (long)syscall(SYS_gettid));
+    int status = win_getaddrinfo_common(node, service, hints, result);
+    clock_gettime(CLOCK_MONOTONIC, &ended);
+    if (diagnostics)
+        fprintf(stderr, "[NET] getaddrinfo(%s, %s, family=%d socktype=%d flags=%#x) t%ld -> %d after %ld ms\n",
+                node ? node : "(null)", service ? service : "(null)", hints ? hints->family : -1,
+                hints ? hints->socktype : -1, hints ? (unsigned)hints->flags : 0u, (long)syscall(SYS_gettid), status,
+                (long)((ended.tv_sec - started.tv_sec) * 1000 + (ended.tv_nsec - started.tv_nsec) / 1000000));
+    return (u64)status;
+}
 static u64 __attribute__((ms_abi))
 impl_GetAddrInfoW(const u16 *node, const u16 *service, const WinAddrInfo *hints, u64 *result)
 {
@@ -7590,7 +7902,7 @@ impl_WSAStartup(u32 version, u8 *wsadata)
     *(u16 *)(wsadata + 390) = 0; /* iMaxSockets is ignored for Winsock 2 */
     *(u16 *)(wsadata + 392) = 0;
     *(u64 *)(wsadata + 400) = 0;
-    ++g_wsa_startup_count;
+    atomic_fetch_add(&g_wsa_startup_count, 1);
     g_wsa_last_error = 0;
     return 0;
 }
@@ -7602,7 +7914,7 @@ impl_WSACleanup(void)
         g_wsa_last_error = 10093; /* WSANOTINITIALISED */
         return (u32)-1;
     }
-    --g_wsa_startup_count;
+    atomic_fetch_sub(&g_wsa_startup_count, 1);
     return 0;
 }
 
@@ -7675,7 +7987,9 @@ impl_connect(u64 socket_handle, const void *address, s32 address_length)
     }
     if (connect((int)socket_handle, (const struct sockaddr *)address,
                 (socklen_t)address_length) != 0) {
-        g_wsa_last_error = winsock_error_from_errno(errno);
+        /* A non-blocking connect in progress is WSAEWOULDBLOCK on Windows (not WSAEINPROGRESS, which callers such as
+         * libcurl treat as a failed connection). */
+        g_wsa_last_error = errno == EINPROGRESS ? 10035 : winsock_error_from_errno(errno);
         return (u32)-1;
     }
     g_wsa_last_error = 0;
@@ -7721,6 +8035,7 @@ impl_ioctlsocket(u64 socket_handle, u32 command, u32 *argument)
     return 0;
 }
 
+static u64 __attribute__((ms_abi)) impl_GetProcAddress(u64 hmod, const char *procname);
 static u64 __attribute__((ms_abi))
 impl_WSAIoctl(u64 socket_handle, u32 control_code,
               void *input, u32 input_size, void *output, u32 output_size,
@@ -7757,6 +8072,22 @@ impl_WSAIoctl(u64 socket_handle, u32 control_code,
         g_wsa_last_error = 0;
         return 0;
     }
+    /* SIO_GET_EXTENSION_FUNCTION_POINTER: the Microsoft extensions by GUID. */
+    if (control_code == UINT32_C(0xC8000006) && input && input_size >= 16 && output && output_size >= 8) {
+        static const u8 connect_ex[16] = { 0xb9,0x07,0xa2,0x25, 0xf3,0xdd, 0x60,0x46, 0x8e,0xe9,0x76,0xe5,0x8c,0x74,0x06,0x3e };
+        static const u8 accept_ex[16] = { 0xf1,0x7d,0x36,0xb5, 0xac,0xcb, 0xcf,0x11, 0x95,0xca,0x00,0x80,0x5f,0x48,0xa1,0x92 };
+        static const u8 accept_addresses[16] = { 0xf2,0x7d,0x36,0xb5, 0xac,0xcb, 0xcf,0x11, 0x95,0xca,0x00,0x80,0x5f,0x48,0xa1,0x92 };
+        static const u8 disconnect_ex[16] = { 0x11,0x2e,0xda,0x7f, 0x30,0x86, 0x6f,0x43, 0xa0,0x31,0xf5,0x36,0xa6,0xee,0xc1,0x57 };
+        const char *name = !memcmp(input, connect_ex, 16) ? "ConnectEx" : !memcmp(input, accept_ex, 16) ? "AcceptEx"
+                         : !memcmp(input, accept_addresses, 16) ? "GetAcceptExSockaddrs"
+                         : !memcmp(input, disconnect_ex, 16) ? "DisconnectEx" : NULL;
+        u64 function = name ? impl_GetProcAddress(HMOD_K32, name) : 0;
+        if (!function) { g_wsa_last_error = 10022; return (u32)-1; }
+        memcpy(output, &function, 8);
+        if (bytes_returned) *bytes_returned = 8;
+        g_wsa_last_error = 0;
+        return 0;
+    }
     /* Unsupported provider-specific controls fail explicitly rather than
      * reporting success with untouched output. */
     (void)socket_handle;
@@ -7766,6 +8097,8 @@ impl_WSAIoctl(u64 socket_handle, u32 control_code,
     return (u32)-1;
 }
 
+void beer_net_trace_rx(u64 socket, const struct iovec *vectors, int count, u64 bytes, const char *path);
+void beer_net_trace_reset(u64 socket);
 /* recv/recvfrom: MSG_OOB (1) and MSG_PEEK (2) share their values with Linux. A non-blocking socket with
  * no datagram fails with WSAEWOULDBLOCK, as on Windows; 0 means an orderly shutdown only. */
 static u64 __attribute__((ms_abi))
@@ -7781,6 +8114,7 @@ impl_recvfrom(u64 socket_handle, void *buffer, s32 length, s32 flags, void *from
         return (u32)-1;
     }
     if (from_length && from) *from_length = (s32)address_length;
+    if (!(flags & 2)) { struct iovec v = { buffer, (size_t)length }; beer_net_trace_rx(socket_handle, &v, 1, (u64)got, "recv"); }
     g_wsa_last_error = 0;
     return (u32)got;
 }
@@ -7926,22 +8260,184 @@ impl_select(s32 ignored_nfds, WinFdSet *read_set, WinFdSet *write_set,
     return ready;
 }
 
+/* Winsock socket options in host terms. Windows' SOL_SOCKET is 0xffff with its own option numbers, and several
+ * IPPROTO_TCP/IP/IPV6 options are numbered differently. kind: 0 plain value, 1 timeout (DWORD milliseconds against
+ * struct timeval), 2 SO_ERROR (errno against a WSA error code), 3 LINGER (two u_short against two int), 4 accepted and
+ * ignored (Windows-only behaviour with no host equivalent). Returns 0 for an option Beer cannot express. */
+static int winsock_socket_option(s32 level, s32 option, int *host_level, int *host_option, int *kind)
+{
+    *kind = 0;
+    switch (level) {
+    case 0xffff:                                                 /* SOL_SOCKET */
+        *host_level = SOL_SOCKET;
+        switch ((u32)option) {
+        case 0x0001: *host_option = SO_DEBUG; return 1;
+        case 0x0004: *host_option = SO_REUSEADDR; return 1;
+        case 0x0008: *host_option = SO_KEEPALIVE; return 1;
+        case 0x0010: *host_option = SO_DONTROUTE; return 1;
+        case 0x0020: *host_option = SO_BROADCAST; return 1;
+        case 0x0080: *host_option = SO_LINGER; *kind = 3; return 1;
+        case 0x0100: *host_option = SO_OOBINLINE; return 1;
+        case 0x1001: *host_option = SO_SNDBUF; return 1;
+        case 0x1002: *host_option = SO_RCVBUF; return 1;
+        case 0x1003: *host_option = SO_SNDLOWAT; return 1;
+        case 0x1004: *host_option = SO_RCVLOWAT; return 1;
+        case 0x1005: *host_option = SO_SNDTIMEO; *kind = 1; return 1;
+        case 0x1006: *host_option = SO_RCVTIMEO; *kind = 1; return 1;
+        case 0x1007: *host_option = SO_ERROR; *kind = 2; return 1;
+        case 0x1008: *host_option = SO_TYPE; return 1;
+        case 0xfffffffbu:                                        /* SO_EXCLUSIVEADDRUSE */
+        case 0x3002:                                             /* SO_CONDITIONAL_ACCEPT */
+        case 0x700b: case 0x7010:                                /* SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT */
+            *kind = 4; return 1;
+        default: return 0;
+        }
+    case 6:                                                      /* IPPROTO_TCP */
+        *host_level = IPPROTO_TCP;
+        switch (option) {
+        case 1: *host_option = TCP_NODELAY; return 1;
+        case 3: *host_option = TCP_KEEPIDLE; return 1;           /* TCP_KEEPALIVE (seconds) */
+        case 16: *host_option = TCP_KEEPCNT; return 1;
+        case 17: *host_option = TCP_KEEPINTVL; return 1;
+        default: return 0;
+        }
+    case 0:                                                      /* IPPROTO_IP */
+        *host_level = IPPROTO_IP;
+        switch (option) {
+        case 3: *host_option = IP_TOS; return 1;
+        case 4: *host_option = IP_TTL; return 1;
+        case 9: *host_option = IP_MULTICAST_IF; return 1;
+        case 10: *host_option = IP_MULTICAST_TTL; return 1;
+        case 11: *host_option = IP_MULTICAST_LOOP; return 1;
+        case 12: *host_option = IP_ADD_MEMBERSHIP; return 1;     /* ip_mreq has the same layout */
+        case 13: *host_option = IP_DROP_MEMBERSHIP; return 1;
+        case 14: *kind = 4; return 1;                            /* IP_DONTFRAGMENT */
+        default: return 0;
+        }
+    case 41:                                                     /* IPPROTO_IPV6 */
+        *host_level = IPPROTO_IPV6;
+        switch (option) {
+        case 4: *host_option = IPV6_UNICAST_HOPS; return 1;
+        case 27: *host_option = IPV6_V6ONLY; return 1;
+        default: return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
 static u64 __attribute__((ms_abi))
 impl_setsockopt(u64 socket_handle, s32 level, s32 option,
                 const void *value, s32 value_length)
 {
     if (!winsock_ready()) return (u32)-1;
+    int host_level, host_option, kind, result;
+    if (!winsock_socket_option(level, option, &host_level, &host_option, &kind)) {
+        g_wsa_last_error = 10042;                                /* WSAENOPROTOOPT */
+        return (u32)-1;
+    }
+    /* SO_UPDATE_CONNECT_CONTEXT and friends take no value (Boost.Asio passes NULL/0 and treats a failure as a failed
+     * connect), so they are accepted before the value is checked. */
+    if (kind == 4) { g_wsa_last_error = 0; return 0; }
     if (!value || value_length < 0) {
         g_wsa_last_error = 10014;
         return (u32)-1;
     }
-    if (setsockopt((int)socket_handle, level, option, value,
-                   (socklen_t)value_length) != 0) {
+    if (kind == 1) {                                             /* milliseconds -> timeval */
+        if (value_length < 4) { g_wsa_last_error = 10014; return (u32)-1; }
+        u32 ms = *(const u32 *)value;
+        struct timeval tv = { (time_t)(ms / 1000u), (suseconds_t)((ms % 1000u) * 1000u) };
+        result = setsockopt((int)socket_handle, host_level, host_option, &tv, sizeof(tv));
+    } else if (kind == 3) {                                      /* LINGER { u_short onoff; u_short seconds } */
+        if (value_length < 4) { g_wsa_last_error = 10014; return (u32)-1; }
+        struct linger l = { ((const u16 *)value)[0] != 0, ((const u16 *)value)[1] };
+        result = setsockopt((int)socket_handle, host_level, host_option, &l, sizeof(l));
+    } else {
+        int small = 0;                                           /* BOOL/DWORD options may be passed as 1 byte */
+        const void *data = value;
+        socklen_t length = (socklen_t)value_length;
+        if (value_length < (s32)sizeof(int) && host_level != IPPROTO_IP) {
+            memcpy(&small, value, (size_t)value_length);
+            data = &small;
+            length = sizeof(small);
+        }
+        result = setsockopt((int)socket_handle, host_level, host_option, data, length);
+    }
+    if (result != 0) {
         g_wsa_last_error = winsock_error_from_errno(errno);
         return (u32)-1;
     }
     g_wsa_last_error = 0;
     return 0;
+}
+
+static u64 __attribute__((ms_abi))
+impl_getsockopt(u64 socket_handle, s32 level, s32 option, void *value, s32 *value_length)
+{
+    if (!winsock_ready()) return (u32)-1;
+    if (!value || !value_length || *value_length < 0) { g_wsa_last_error = 10014; return (u32)-1; }
+    int host_level, host_option, kind;
+    if (!winsock_socket_option(level, option, &host_level, &host_option, &kind)) {
+        g_wsa_last_error = 10042;
+        return (u32)-1;
+    }
+    if (kind == 4) {                                             /* report the Windows default: off */
+        if (*value_length < 4) { g_wsa_last_error = 10014; return (u32)-1; }
+        *(u32 *)value = 0;
+        *value_length = 4;
+        g_wsa_last_error = 0;
+        return 0;
+    }
+    union { int i; struct timeval tv; struct linger l; u8 raw[64]; } host;
+    memset(&host, 0, sizeof(host));
+    socklen_t length = kind == 1 ? sizeof(host.tv) : kind == 3 ? sizeof(host.l)
+                     : (socklen_t)(*value_length < (s32)sizeof(host) ? (*value_length < (s32)sizeof(int) ? sizeof(int) : (size_t)*value_length) : sizeof(host));
+    if (getsockopt((int)socket_handle, host_level, host_option, &host, &length) != 0) {
+        g_wsa_last_error = winsock_error_from_errno(errno);
+        return (u32)-1;
+    }
+    if (kind == 1 || kind == 2 || kind == 3) {
+        if (*value_length < 4) { g_wsa_last_error = 10014; return (u32)-1; }
+        if (kind == 1) *(u32 *)value = (u32)(host.tv.tv_sec * 1000 + host.tv.tv_usec / 1000);
+        else if (kind == 2) *(u32 *)value = host.i ? (u32)winsock_error_from_errno(host.i) : 0;
+        else { ((u16 *)value)[0] = (u16)(host.l.l_onoff != 0); ((u16 *)value)[1] = (u16)host.l.l_linger; }
+        *value_length = 4;
+    } else {
+        if ((s32)length > *value_length) length = (socklen_t)*value_length;
+        memcpy(value, &host, length);
+        *value_length = (s32)length;
+    }
+    g_wsa_last_error = 0;
+    return 0;
+}
+
+/* WSAPoll: WSAPOLLFD { SOCKET fd; SHORT events; SHORT revents } with Windows' flag values. */
+static u64 __attribute__((ms_abi)) impl_WSAPoll(u8 *descriptors, u32 count, s32 timeout)
+{
+    if (!winsock_ready()) return (u32)-1;
+    if (!descriptors || count > 1024) { g_wsa_last_error = 10022; return (u32)-1; }
+    struct pollfd host[1024];
+    for (u32 i = 0; i < count; ++i) {
+        u16 events = *(u16 *)(descriptors + i * 16 + 8);
+        host[i].fd = (int)*(u64 *)(descriptors + i * 16);
+        host[i].events = (short)(((events & 0x0300) ? POLLIN : 0) | ((events & 0x0400) ? POLLPRI : 0) |
+                                 ((events & 0x0030) ? POLLOUT : 0));
+        host[i].revents = 0;
+    }
+    int ready = poll(host, count, timeout);
+    if (ready < 0) { g_wsa_last_error = winsock_error_from_errno(errno); return (u32)-1; }
+    for (u32 i = 0; i < count; ++i) {
+        u16 events = *(u16 *)(descriptors + i * 16 + 8), r = 0;
+        if (host[i].revents & POLLIN) r |= events & 0x0300 ? (events & 0x0300) : 0x0100;
+        if (host[i].revents & POLLPRI) r |= 0x0400;
+        if (host[i].revents & POLLOUT) r |= events & 0x0030 ? (events & 0x0030) : 0x0010;
+        if (host[i].revents & POLLERR) r |= 0x0001;
+        if (host[i].revents & POLLHUP) r |= 0x0002;
+        if (host[i].revents & POLLNVAL) r |= 0x0004;
+        *(u16 *)(descriptors + i * 16 + 10) = r;
+    }
+    g_wsa_last_error = 0;
+    return (u64)(u32)ready;
 }
 
 static u64 __attribute__((ms_abi))
@@ -7997,10 +8493,18 @@ static u64 __attribute__((ms_abi)) impl_ntohl(u32 value)
 static u64 __attribute__((ms_abi)) impl_ntohs(u32 value)
     { return (u64)ntohs((u16)value); }
 
+static void wsa_selection_forget(int fd);
+static int wsa_async_cancel(u64 socket, u64 *overlapped);
+static int wsa_async_cancel_ex(u64 socket, u64 *overlapped, int settle);
+static void iocp_forget_file(u64 h);
 static u64 __attribute__((ms_abi))
 impl_closesocket(u64 socket_handle)
 {
     if (!winsock_ready()) return (u32)-1;
+    wsa_selection_forget((int)socket_handle);
+    wsa_async_cancel_ex(socket_handle, NULL, 1);
+    iocp_forget_file(socket_handle);           /* the descriptor number is reused by the next socket or file */
+    beer_net_trace_reset(socket_handle);
     if (close((int)socket_handle) != 0) {
         g_wsa_last_error = winsock_error_from_errno(errno);
         return (u32)-1;
@@ -8231,10 +8735,14 @@ static ImplFn winsock_ordinal_impl(u16 ordinal)
     case 2: return (ImplFn)impl_bind;
     case 3: return (ImplFn)impl_closesocket;
     case 4: return (ImplFn)impl_connect;
+    case 5: return find_impl("getpeername");
     case 6: return (ImplFn)impl_getsockname;
+    case 7: return (ImplFn)impl_getsockopt;
     case 8: return (ImplFn)impl_htonl;
     case 9: return (ImplFn)impl_htons;
     case 10: return (ImplFn)impl_ioctlsocket;
+    case 11: return find_impl("inet_addr");
+    case 12: return find_impl("inet_ntoa");
     case 13: return (ImplFn)impl_listen;
     case 14: return (ImplFn)impl_ntohl;
     case 15: return (ImplFn)impl_ntohs;
@@ -8266,10 +8774,14 @@ static const char *winsock_ordinal_name(u16 ordinal)
     case 2: return "bind";
     case 3: return "closesocket";
     case 4: return "connect";
+    case 5: return "getpeername";
     case 6: return "getsockname";
+    case 7: return "getsockopt";
     case 8: return "htonl";
     case 9: return "htons";
     case 10: return "ioctlsocket";
+    case 11: return "inet_addr";
+    case 12: return "inet_ntoa";
     case 13: return "listen";
     case 14: return "ntohl";
     case 15: return "ntohs";
@@ -9046,6 +9558,17 @@ static u64 __attribute__((ms_abi)) impl_ShellExecuteExW(u8 *info)
     return r > 32;
 }
 
+/* Beer has no Shell namespace objects (IShellItem): report that no item exists for the name, as shell32 does
+ * for a path it cannot parse, with the documented NULL output. */
+static u64 __attribute__((ms_abi))
+impl_SHCreateItemFromParsingName(const u16 *path, u64 bind_context, const void *iid, u64 *out)
+{
+    (void)path; (void)bind_context; (void)iid;
+    if (!out) return 0x80004003u;                   /* E_POINTER */
+    *out = 0;
+    return 0x80070002u;                             /* HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) */
+}
+
 static u64 __attribute__((ms_abi))
 impl_SHGetKnownFolderPath(const void *rfid, u32 flags, u64 tok, u64 *out)
 {
@@ -9215,6 +9738,7 @@ impl_CoInitializeSecurity(void *security_descriptor, s32 authentication_services
     return atomic_exchange(&initialized, 1) ? UINT64_C(0x80010119) : 0;
 }
 #include "platform/win32_wmi.inc"
+#include "platform/win32_wic.inc"
 #include "platform/win32_tsf.h"
 static u64 __attribute__((ms_abi))
 impl_CoCreateInstance(const u8 *rclsid, u64 outer, u32 ctx,
@@ -9235,6 +9759,12 @@ impl_CoCreateInstance(const u8 *rclsid, u64 outer, u32 ctx,
     if (ppv && beer_fw_create_instance(rclsid, riid, ppv)) {
         fprintf(stderr, "[COM] CoCreateInstance HNetCfg.FwMgr -> %p\n", *ppv);
         return 0;
+    }
+    const u64 wic_result = beer_wic_create_instance(rclsid, riid, ppv);
+    if (wic_result != 1) {
+        fprintf(stderr, "[COM] CoCreateInstance WICImagingFactory -> %p hr=0x%llx\n", ppv ? *ppv : NULL,
+                (unsigned long long)wic_result);
+        return wic_result;
     }
     u64 wasapi_result = beer_wasapi_create_instance(rclsid, riid, ppv);
     if (wasapi_result == 0) {
@@ -9656,6 +10186,7 @@ dxgi_adapter_GetDesc2(u64 *obj, u8 *desc)
     if (!desc) return E_FAIL;
     memset(desc, 0, 320);
     dxgi_fill_adapter_desc(desc, 1);
+    { static u32 logs; if (logs++ < 2) fprintf(stderr, "[DXGI] GetDesc2/3 vram=%llu MiB\n", (unsigned long long)(*(u64 *)(desc + 272) >> 20)); }
     *(u32 *)(desc + 308) = 3;  /* DXGI_GRAPHICS_PREEMPTION_PIXEL_BOUNDARY */
     *(u32 *)(desc + 312) = 4;  /* DXGI_COMPUTE_PREEMPTION_INSTRUCTION_BOUNDARY */
     return S_OK;
@@ -9688,6 +10219,9 @@ dxgi_adapter_QueryVideoMemoryInfo(u64 *obj, u32 node, u32 group, u64 *info)
     info[1] = usage;                          /* CurrentUsage */
     info[2] = budget / 2;                     /* AvailableForReservation */
     info[3] = g_dxgi_reservation[group];      /* CurrentReservation */
+    { static u32 logs[2]; if (logs[group]++ < 2)
+        fprintf(stderr, "[DXGI] QueryVideoMemoryInfo group=%u budget=%llu MiB usage=%llu MiB\n", group,
+                (unsigned long long)(budget >> 20), (unsigned long long)(usage >> 20)); }
     return S_OK;
 }
 
@@ -9923,8 +10457,80 @@ dxgi_adapter_CheckInterfaceSupport(u64 *obj, const void *guid, u64 *umd_version)
     return S_OK;
 }
 
+/* Unimplemented IDXGIAdapter slots: E_FAIL, logged once per slot so a method an application relies on shows up. */
+#define DXGI_ADAPTER_SLOT(n) static u64 __attribute__((ms_abi)) dxgi_adapter_slot_##n(u64 a, u64 b, u64 c, u64 d) \
+    { static int logged; (void)a; (void)b; (void)c; (void)d; \
+      if (!logged++) fprintf(stderr, "[DXGI] IDXGIAdapter method %d is not implemented (E_FAIL)\n", n); return (u64)E_FAIL; }
+DXGI_ADAPTER_SLOT(0)
+DXGI_ADAPTER_SLOT(1)
+DXGI_ADAPTER_SLOT(2)
+DXGI_ADAPTER_SLOT(3)
+DXGI_ADAPTER_SLOT(4)
+DXGI_ADAPTER_SLOT(5)
+DXGI_ADAPTER_SLOT(6)
+DXGI_ADAPTER_SLOT(7)
+DXGI_ADAPTER_SLOT(8)
+DXGI_ADAPTER_SLOT(9)
+DXGI_ADAPTER_SLOT(10)
+DXGI_ADAPTER_SLOT(11)
+DXGI_ADAPTER_SLOT(12)
+DXGI_ADAPTER_SLOT(13)
+DXGI_ADAPTER_SLOT(14)
+DXGI_ADAPTER_SLOT(15)
+DXGI_ADAPTER_SLOT(16)
+DXGI_ADAPTER_SLOT(17)
+DXGI_ADAPTER_SLOT(18)
+DXGI_ADAPTER_SLOT(19)
+DXGI_ADAPTER_SLOT(20)
+DXGI_ADAPTER_SLOT(21)
+DXGI_ADAPTER_SLOT(22)
+DXGI_ADAPTER_SLOT(23)
+DXGI_ADAPTER_SLOT(24)
+DXGI_ADAPTER_SLOT(25)
+DXGI_ADAPTER_SLOT(26)
+DXGI_ADAPTER_SLOT(27)
+DXGI_ADAPTER_SLOT(28)
+DXGI_ADAPTER_SLOT(29)
+DXGI_ADAPTER_SLOT(30)
+DXGI_ADAPTER_SLOT(31)
+DXGI_ADAPTER_SLOT(32)
+DXGI_ADAPTER_SLOT(33)
+DXGI_ADAPTER_SLOT(34)
+DXGI_ADAPTER_SLOT(35)
+DXGI_ADAPTER_SLOT(36)
+DXGI_ADAPTER_SLOT(37)
+DXGI_ADAPTER_SLOT(38)
+DXGI_ADAPTER_SLOT(39)
+DXGI_ADAPTER_SLOT(40)
+DXGI_ADAPTER_SLOT(41)
+DXGI_ADAPTER_SLOT(42)
+DXGI_ADAPTER_SLOT(43)
+DXGI_ADAPTER_SLOT(44)
+DXGI_ADAPTER_SLOT(45)
+DXGI_ADAPTER_SLOT(46)
+DXGI_ADAPTER_SLOT(47)
+DXGI_ADAPTER_SLOT(48)
+DXGI_ADAPTER_SLOT(49)
+DXGI_ADAPTER_SLOT(50)
+DXGI_ADAPTER_SLOT(51)
+DXGI_ADAPTER_SLOT(52)
+DXGI_ADAPTER_SLOT(53)
+DXGI_ADAPTER_SLOT(54)
+DXGI_ADAPTER_SLOT(55)
+DXGI_ADAPTER_SLOT(56)
+DXGI_ADAPTER_SLOT(57)
+DXGI_ADAPTER_SLOT(58)
+DXGI_ADAPTER_SLOT(59)
+DXGI_ADAPTER_SLOT(60)
+DXGI_ADAPTER_SLOT(61)
+DXGI_ADAPTER_SLOT(62)
+DXGI_ADAPTER_SLOT(63)
+#undef DXGI_ADAPTER_SLOT
 static void init_dxgi_adapter_fake(void) {
-    for (int i = 0; i < DXGI_VTAB2_SZ; i++) g_dxgi_vtab2[i] = (u64)dxgi_generic_fail;
+    static const void *const slots[64] = {
+(void *)dxgi_adapter_slot_0, (void *)dxgi_adapter_slot_1, (void *)dxgi_adapter_slot_2, (void *)dxgi_adapter_slot_3, (void *)dxgi_adapter_slot_4, (void *)dxgi_adapter_slot_5, (void *)dxgi_adapter_slot_6, (void *)dxgi_adapter_slot_7, (void *)dxgi_adapter_slot_8, (void *)dxgi_adapter_slot_9, (void *)dxgi_adapter_slot_10, (void *)dxgi_adapter_slot_11, (void *)dxgi_adapter_slot_12, (void *)dxgi_adapter_slot_13, (void *)dxgi_adapter_slot_14, (void *)dxgi_adapter_slot_15, (void *)dxgi_adapter_slot_16, (void *)dxgi_adapter_slot_17, (void *)dxgi_adapter_slot_18, (void *)dxgi_adapter_slot_19, (void *)dxgi_adapter_slot_20, (void *)dxgi_adapter_slot_21, (void *)dxgi_adapter_slot_22, (void *)dxgi_adapter_slot_23, (void *)dxgi_adapter_slot_24, (void *)dxgi_adapter_slot_25, (void *)dxgi_adapter_slot_26, (void *)dxgi_adapter_slot_27, (void *)dxgi_adapter_slot_28, (void *)dxgi_adapter_slot_29, (void *)dxgi_adapter_slot_30, (void *)dxgi_adapter_slot_31, (void *)dxgi_adapter_slot_32, (void *)dxgi_adapter_slot_33, (void *)dxgi_adapter_slot_34, (void *)dxgi_adapter_slot_35, (void *)dxgi_adapter_slot_36, (void *)dxgi_adapter_slot_37, (void *)dxgi_adapter_slot_38, (void *)dxgi_adapter_slot_39, (void *)dxgi_adapter_slot_40, (void *)dxgi_adapter_slot_41, (void *)dxgi_adapter_slot_42, (void *)dxgi_adapter_slot_43, (void *)dxgi_adapter_slot_44, (void *)dxgi_adapter_slot_45, (void *)dxgi_adapter_slot_46, (void *)dxgi_adapter_slot_47, (void *)dxgi_adapter_slot_48, (void *)dxgi_adapter_slot_49, (void *)dxgi_adapter_slot_50, (void *)dxgi_adapter_slot_51, (void *)dxgi_adapter_slot_52, (void *)dxgi_adapter_slot_53, (void *)dxgi_adapter_slot_54, (void *)dxgi_adapter_slot_55, (void *)dxgi_adapter_slot_56, (void *)dxgi_adapter_slot_57, (void *)dxgi_adapter_slot_58, (void *)dxgi_adapter_slot_59, (void *)dxgi_adapter_slot_60, (void *)dxgi_adapter_slot_61, (void *)dxgi_adapter_slot_62, (void *)dxgi_adapter_slot_63
+    };
+    for (int i = 0; i < DXGI_VTAB2_SZ; i++) g_dxgi_vtab2[i] = (u64)slots[i];
     for (int i = 0; i < 32; i++) g_dxgi_output_vtab[i] = (u64)dxgi_generic_fail;
     g_dxgi_vtab2[0] = (u64)dxgi_adapter_QueryInterface;
     g_dxgi_vtab2[1] = (u64)dxgi_AddRef;
@@ -10285,17 +10891,82 @@ static u64 __attribute__((ms_abi))
 impl_GetModuleFileNameW(u64 hmod, u16 *buf, u32 size) {
     if (!buf || !size) return 0;
     const char *p = module_file_name(hmod);
+    if (getenv("BEER_MODULE_LOG"))
+        fprintf(stderr, "[MODULE] GetModuleFileNameW(%#llx) -> %s\n", (unsigned long long)hmod, p);
     u32 i;
     for (i = 0; i < size - 1 && p[i]; i++) buf[i] = (u8)p[i];
     buf[i] = 0;
     return i;
 }
 
-/* ---- SLIST (single-linked list, used by heap internals) ---- */
+/* ---- SLIST (interlocked singly linked lists) ----
+ * The x64 SLIST_HEADER is 16 bytes: the low quadword holds Depth (bits 0-15) and Sequence (bits 16-63), the high
+ * quadword the 16-byte aligned address of the first entry. Each entry starts with its Next pointer. Every update
+ * swaps the whole header with CMPXCHG16B, as Windows does, so concurrent callers and inline readers agree. */
+static int slist_swap(volatile u64 *head, u64 *expected_low, u64 *expected_high, u64 low, u64 high)
+{
+    u8 swapped;
+    __asm__ volatile("lock cmpxchg16b %1\n\tsete %0"
+                     : "=q"(swapped), "+m"(*(volatile unsigned __int128 *)head), "+a"(*expected_low), "+d"(*expected_high)
+                     : "b"(low), "c"(high) : "memory", "cc");
+    return swapped;
+}
+static void slist_read(volatile u64 *head, u64 *low, u64 *high)
+{
+    *low = head[0]; *high = head[1];
+    u64 l = *low, h = *high;
+    (void)slist_swap(head, &l, &h, l, h);          /* atomic 16-byte read: the compare loads the current value */
+    *low = l; *high = h;
+}
+static u64 slist_next_header(u64 low, s32 depth_change)
+{
+    u64 depth = (low + (u64)(s64)depth_change) & 0xffff;
+    u64 sequence = ((low >> 16) + 1) & 0xffffffffffffull;
+    return depth | (sequence << 16);
+}
 static u64 __attribute__((ms_abi)) impl_InitializeSListHead(u64 *head)
-    { if (head) head[0] = 0; return 0; }
-static u64 __attribute__((ms_abi)) impl_InterlockedFlushSList(u64 *head)
-    { if (head) { u64 r = head[0]; head[0] = 0; return r; } return 0; }
+    { if (head) { head[0] = 0; head[1] = 0; } return 0; }
+static u64 __attribute__((ms_abi)) impl_InterlockedPushEntrySList(volatile u64 *head, u64 *entry)
+{
+    u64 low, high;
+    slist_read(head, &low, &high);
+    for (;;) {
+        *entry = high & ~0xfull;
+        if (slist_swap(head, &low, &high, slist_next_header(low, 1), (u64)(uintptr_t)entry)) return high & ~0xfull;
+    }
+}
+static u64 __attribute__((ms_abi)) impl_InterlockedPushListSListEx(volatile u64 *head, u64 *list, u64 *list_end, u32 count)
+{
+    u64 low, high;
+    slist_read(head, &low, &high);
+    for (;;) {
+        *list_end = high & ~0xfull;
+        if (slist_swap(head, &low, &high, slist_next_header(low, (s32)count), (u64)(uintptr_t)list)) return high & ~0xfull;
+    }
+}
+static u64 __attribute__((ms_abi)) impl_InterlockedPopEntrySList(volatile u64 *head)
+{
+    u64 low, high;
+    slist_read(head, &low, &high);
+    for (;;) {
+        u64 first = high & ~0xfull;
+        if (!first) return 0;
+        u64 next = *(volatile u64 *)(uintptr_t)first;
+        if (slist_swap(head, &low, &high, slist_next_header(low, -1), next)) return first;
+    }
+}
+static u64 __attribute__((ms_abi)) impl_InterlockedFlushSList(volatile u64 *head)
+{
+    if (!head) return 0;
+    u64 low, high;
+    slist_read(head, &low, &high);
+    for (;;) {
+        if (!(high & ~0xfull)) return 0;
+        if (slist_swap(head, &low, &high, slist_next_header(low, 0) & ~0xffffull, 0)) return high & ~0xfull;
+    }
+}
+static u64 __attribute__((ms_abi)) impl_QueryDepthSList(volatile u64 *head) { return head ? (u16)head[0] : 0; }
+static u64 __attribute__((ms_abi)) impl_RtlFirstEntrySList(volatile u64 *head) { return head ? head[1] & ~0xfull : 0; }
 
 /* ---- Interlocked ops ---- */
 static u64 __attribute__((ms_abi)) impl_InterlockedIncrement(volatile u32 *p)
@@ -10327,6 +10998,10 @@ typedef struct {
     u64 last_signaler_rip;
     pthread_mutex_t mtx;
     pthread_cond_t  cv;
+    /* Shared with other processes (inherited by or from a child): the state lives in a shared page, [0] signaled and
+     * [1] a wake sequence for futex waits across processes; `signaled` above is then unused. */
+    volatile u32 *shared;
+    int shared_fd;
 } WinEvent;
 
 static WinEvent g_events[MAX_EVENTS];
@@ -10344,6 +11019,13 @@ static struct { int id; char name[260]; } g_event_names[MAX_EVENT_NAMES];
 static void event_release_id_locked(int id)
 {
     if (!g_events[id].used) return;
+    if (g_events[id].shared) {
+        /* The page stays mapped: another thread may still be inside a wait on it (closing a handle that is being
+         * waited on is the program's race, but it must not fault Beer; crs-handler's registered waits did).
+         * Shared events are only the inherited ones, so this keeps a few pages. */
+        close(g_events[id].shared_fd);
+        g_events[id].shared = NULL;
+    }
     for (int i = 0; i < MAX_EVENT_NAMES; i++)
         if (g_event_names[i].id == id) g_event_names[i].id = 0;
     g_events[id].used = 0;
@@ -10369,11 +11051,15 @@ static int event_id_from_handle(u64 h)
     return id;
 }
 
+/* Kernel-object handle values stay below 0x80000000: Windows handles round-trip through a 32-bit int (HandleToLong /
+ * LongToHandle, Crashpad's checked HandleToInt), which sign-extends anything at or above 0x80000000. */
+#define SEM_HANDLE_BASE   0x31000000u
+#define MUTEX_HANDLE_BASE 0x32000000u
 static int sem_id_from_handle(u64 h)
 {
     u32 hv = (u32)h;
-    if ((hv & 0xF0000000u) != 0xC0000000u) return -1;
-    int id = (int)(hv - 0xC0000000u);
+    if ((hv & 0xFF000000u) != SEM_HANDLE_BASE) return -1;
+    int id = (int)(hv - SEM_HANDLE_BASE);
     if (id <= 0 || id >= g_sem_cnt || !g_sem_used[id]) return -1;
     return id;
 }
@@ -10439,7 +11125,7 @@ static u64 sem_alloc(u32 init, u32 max)
     pthread_mutex_init(&g_sem_mtx[id], NULL);
     pthread_cond_init(&g_sem_cv[id], NULL);
     pthread_mutex_unlock(&g_sem_table_mtx);
-    return (u64)(0xC0000000u + (u32)id);
+    return (u64)(SEM_HANDLE_BASE + (u32)id);
 }
 
 /* Thread-handle wait helper (implemented in thread section below).
@@ -10502,24 +11188,31 @@ static u64 named_event_open(const char *name, u32 inherit)
 
 static u64 __attribute__((ms_abi))
 impl_CreateEventA(u64 sa, u32 manual, u32 initial, const char *name)
-    { note_inheritable_sa(sa); return named_event_create(name, (int)manual, (int)initial); }
+    { note_inheritable_sa(sa); return inherit_from_sa(named_event_create(name, (int)manual, (int)initial), sa); }
 static u64 __attribute__((ms_abi))
 impl_CreateEventW(u64 sa, u32 manual, u32 initial, u64 name)
 {
     note_inheritable_sa(sa);
     char narrow[260];
     event_name_narrow((const u16 *)(uintptr_t)name, narrow, sizeof(narrow));
-    return named_event_create(name ? narrow : NULL, (int)manual, (int)initial);
+    return inherit_from_sa(named_event_create(name ? narrow : NULL, (int)manual, (int)initial), sa);
 }
 /* OpenEvent(DWORD access, BOOL inherit, LPCSTR/LPCWSTR name). */
 static u64 __attribute__((ms_abi)) impl_OpenEventA(u32 access, u32 inherit, const char *name)
-    { (void)access; return named_event_open(name, inherit); }
+{
+    (void)access;
+    const u64 h = named_event_open(name, inherit);
+    if (h && inherit) handle_set_inheritable(h, 1);
+    return h;
+}
 static u64 __attribute__((ms_abi)) impl_OpenEventW(u32 access, u32 inherit, const u16 *name)
 {
     (void)access;
     char narrow[260];
     event_name_narrow(name, narrow, sizeof(narrow));
-    return named_event_open(name ? narrow : NULL, inherit);
+    const u64 h = named_event_open(name ? narrow : NULL, inherit);
+    if (h && inherit) handle_set_inheritable(h, 1);
+    return h;
 }
 
 /* Multiple-object waits poll their handles. Instead of sleeping a fixed 1 ms between polls (which added up to a
@@ -10536,13 +11229,173 @@ static void wait_multi_notify(void)
         syscall(SYS_futex, (u32 *)&g_wait_wake_seq, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
 }
 
-static u64 __attribute__((ms_abi))
-impl_SetEvent(u64 h)
+/* Per-object wakeups for WaitForMultipleObjects. A waiter registers its own wake word on each event or semaphore it
+ * waits on (keyed by the object, so duplicated handles match) and sleeps on that word; signalling an object bumps
+ * and wakes only the words registered on it, and costs nothing when nobody waits on it. Before, every SetEvent /
+ * ReleaseSemaphore woke every multi-object waiter in the process (and paid a futex call whenever one existed), and
+ * waiters re-polled every 1 ms; that kept a game's main thread in system calls. Handles that are not events or
+ * semaphores (threads, processes) still poll every 1 ms.
+ * OPT-IN (BEER_WAIT_PER_OBJECT=1): in Onimusha it cut CPU use by a quarter but gave a stutter every few seconds and no
+ * frame-rate gain, with no missed wake-up detected (BEER_WAIT_DIAGNOSTICS); the global wake stays the default. */
+#define WAIT_OBJECT_EVENT (UINT64_C(1) << 32)
+#define WAIT_OBJECT_SEMAPHORE (UINT64_C(2) << 32)
+#define WAIT_BUCKETS 256u
+typedef struct WaitWord { _Atomic u32 word; } WaitWord;
+typedef struct WaitNode { u64 key; WaitWord *waiter; struct WaitNode *next; } WaitNode;
+static struct { pthread_mutex_t lock; _Atomic u32 count; WaitNode *head; } g_wait_buckets[WAIT_BUCKETS];
+
+static int wait_global_wake(void)
+{
+    static int value = -1;
+    if (value < 0) value = getenv("BEER_WAIT_PER_OBJECT") == NULL || getenv("BEER_WAIT_GLOBAL_WAKE") != NULL;
+    return value;
+}
+
+static u32 wait_bucket_of(u64 key) { return (u32)((key * UINT64_C(0x9e3779b97f4a7c15)) >> 56) & (WAIT_BUCKETS - 1); }
+
+static void wait_object_notify(u64 key)
+{
+    if (wait_global_wake()) { wait_multi_notify(); return; }
+    const u32 b = wait_bucket_of(key);
+    if (!atomic_load_explicit(&g_wait_buckets[b].count, memory_order_acquire)) return;
+    pthread_mutex_lock(&g_wait_buckets[b].lock);
+    for (WaitNode *node = g_wait_buckets[b].head; node; node = node->next)
+        if (node->key == key) {
+            atomic_fetch_add_explicit(&node->waiter->word, 1, memory_order_release);
+            syscall(SYS_futex, (u32 *)&node->waiter->word, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+        }
+    pthread_mutex_unlock(&g_wait_buckets[b].lock);
+}
+
+static void wait_register(WaitNode *node, u64 key, WaitWord *waiter)
+{
+    const u32 b = wait_bucket_of(key);
+    node->key = key;
+    node->waiter = waiter;
+    pthread_mutex_lock(&g_wait_buckets[b].lock);
+    node->next = g_wait_buckets[b].head;
+    g_wait_buckets[b].head = node;
+    atomic_fetch_add_explicit(&g_wait_buckets[b].count, 1, memory_order_release);
+    pthread_mutex_unlock(&g_wait_buckets[b].lock);
+}
+
+static void wait_unregister(WaitNode *node)
+{
+    const u32 b = wait_bucket_of(node->key);
+    pthread_mutex_lock(&g_wait_buckets[b].lock);
+    for (WaitNode **link = &g_wait_buckets[b].head; *link; link = &(*link)->next)
+        if (*link == node) { *link = node->next; break; }
+    atomic_fetch_sub_explicit(&g_wait_buckets[b].count, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&g_wait_buckets[b].lock);
+}
+
+/* ---- Events shared between processes ---- */
+static long shared_futex(volatile u32 *word, int op, u32 value, const struct timespec *relative)
+{
+    return syscall(SYS_futex, (u32 *)word, op, value, relative, NULL, 0);   /* not FUTEX_PRIVATE: shared memory */
+}
+static void shared_event_set(WinEvent *ev, int pulse)
+{
+    __atomic_store_n(&ev->shared[0], 1u, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&ev->shared[1], 1u, __ATOMIC_SEQ_CST);
+    shared_futex(&ev->shared[1], FUTEX_WAKE, ev->manual_reset ? 0x7fffffff : 1, NULL);
+    if (pulse) __atomic_store_n(&ev->shared[0], 0u, __ATOMIC_SEQ_CST);
+}
+/* Takes the event if signalled (auto-reset events are consumed when `consume`); 1 when it was signalled. */
+static int shared_event_try(WinEvent *ev, int consume)
+{
+    if (!consume || ev->manual_reset) return __atomic_load_n(&ev->shared[0], __ATOMIC_SEQ_CST) != 0;
+    u32 expected = 1;
+    return __atomic_compare_exchange_n(&ev->shared[0], &expected, 0u, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+/* WaitForSingleObject on a shared event: 0 signalled, 0x102 timeout. */
+static u64 shared_event_wait(WinEvent *ev, u32 ms)
+{
+    /* The page and reset mode are read once: a concurrent CloseHandle may clear ev->shared (the page stays mapped). */
+    volatile u32 *page = ev->shared;
+    const int manual = ev->manual_reset;
+    if (!page) return 0xFFFFFFFFu;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        const u32 seq = __atomic_load_n(&page[1], __ATOMIC_SEQ_CST);
+        u32 expected = 1;
+        if (manual ? __atomic_load_n(&page[0], __ATOMIC_SEQ_CST) != 0
+                   : __atomic_compare_exchange_n(&page[0], &expected, 0u, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return 0;
+        if (ms == 0) return 0x102u;
+        struct timespec relative, *timeout = NULL;
+        if (ms != 0xFFFFFFFFu) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const s64 elapsed = (s64)(now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+            if (elapsed >= (s64)ms) return 0x102u;
+            const s64 left = (s64)ms - elapsed;
+            relative.tv_sec = (time_t)(left / 1000);
+            relative.tv_nsec = (long)(left % 1000) * 1000000L;
+            timeout = &relative;
+        }
+        shared_futex(&page[1], FUTEX_WAIT, seq, timeout);
+    }
+}
+/* Moves an event's state into a shared page so another process can map it; returns the page's descriptor. */
+static int event_make_shared(int eid)
+{
+    WinEvent *ev = &g_events[eid];
+    pthread_mutex_lock(&ev->mtx);
+    if (!ev->shared) {
+        int fd = (int)syscall(SYS_memfd_create, "beer-event", 1u /* MFD_CLOEXEC */);
+        void *page = MAP_FAILED;
+        if (fd >= 0 && ftruncate(fd, 4096) == 0)
+            page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (page == MAP_FAILED) {
+            if (fd >= 0) close(fd);
+            pthread_mutex_unlock(&ev->mtx);
+            return -1;
+        }
+        ev->shared = page;
+        ev->shared_fd = fd;
+        ev->shared[0] = ev->signaled ? 1u : 0u;
+        pthread_cond_broadcast(&ev->cv);                /* local waiters re-check through the shared state */
+    }
+    const int fd = ev->shared_fd;
+    pthread_mutex_unlock(&ev->mtx);
+    return fd;
+}
+/* Child side: installs an inherited event at its parent's handle value. */
+static int event_install_shared(u64 handle, int fd, int manual)
+{
+    const int id = event_id_from_handle(handle) >= 0 ? -1 : (int)((u32)handle - 0x60000000u);
+    if (((u32)handle & 0xF0000000u) != 0x60000000u || id <= 0 || id >= MAX_EVENTS) return 0;
+    void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (page == MAP_FAILED) return 0;
+    pthread_mutex_lock(&g_event_table_mtx);
+    WinEvent *ev = &g_events[id];
+    memset(ev, 0, sizeof(*ev));
+    ev->used = 1;
+    ev->manual_reset = manual;
+    pthread_mutex_init(&ev->mtx, NULL);
+    pthread_cond_init(&ev->cv, NULL);
+    ev->shared = page;
+    ev->shared_fd = fd;
+    if (g_event_cnt <= id) g_event_cnt = id + 1;
+    pthread_mutex_unlock(&g_event_table_mtx);
+    return 1;
+}
+
+static u64 event_set_with_previous(u64 h, s32 *previous)
 {
     int eid = event_id_from_handle(h);
     if (eid < 0) return 0;
     WinEvent *ev = &g_events[eid];
+    if (ev->shared) {
+        if (previous) *previous = __atomic_load_n(&ev->shared[0], __ATOMIC_SEQ_CST) != 0;
+        shared_event_set(ev, 0);
+        wait_object_notify(WAIT_OBJECT_EVENT | (u32)eid);
+        return 1;
+    }
     pthread_mutex_lock(&ev->mtx);
+    if (previous) *previous = ev->signaled != 0;
     ev->signaled = 1;
     ev->last_signaler_rip = g_dispatch_incoming_return;
     if (getenv("BEER_EVENT_DIAGNOSTICS") && ev->waiter_count)
@@ -10554,8 +11407,13 @@ impl_SetEvent(u64 h)
     if (ev->manual_reset) pthread_cond_broadcast(&ev->cv);
     else pthread_cond_signal(&ev->cv);
     pthread_mutex_unlock(&ev->mtx);
-    wait_multi_notify();
+    wait_object_notify(WAIT_OBJECT_EVENT | (u32)eid);
     return 1;
+}
+
+static u64 __attribute__((ms_abi)) impl_SetEvent(u64 h)
+{
+    return event_set_with_previous(h, NULL);
 }
 
 static void beer_signal_guest_event(uint64_t event_handle)
@@ -10636,11 +11494,156 @@ impl_ResetEvent(u64 h)
     int eid = event_id_from_handle(h);
     if (eid < 0) return 0;
     WinEvent *ev = &g_events[eid];
+    if (ev->shared) { __atomic_store_n(&ev->shared[0], 0u, __ATOMIC_SEQ_CST); return 1; }
     pthread_mutex_lock(&ev->mtx);
     ev->signaled = 0;
     pthread_mutex_unlock(&ev->mtx);
     return 1;
 }
+
+/* ---- WSAEventSelect / WSAEnumNetworkEvents ----
+ * A socket registered with an event and a network-event mask gets those events signalled by a watcher thread that
+ * polls the registered sockets. Conditions are level checks re-evaluated at every registration: FD_READ (readable),
+ * FD_WRITE (writable, once connected), FD_OOB, FD_ACCEPT (listening socket readable), FD_CONNECT (a connect finished;
+ * its error code comes from SO_ERROR) and FD_CLOSE (peer hung up). A recorded event stays pending until
+ * WSAEnumNetworkEvents reports it; as on Windows, registering makes the socket non-blocking. */
+typedef struct { int fd; u64 event; u32 mask, pending, reported, connected; s32 errors[10]; } WsaSelection;
+static WsaSelection g_wsa_selections[256];
+static int g_wsa_selection_count;
+static pthread_mutex_t g_wsa_selection_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_wsa_wake[2] = { -1, -1 };
+
+static void wsa_selection_wake(void)
+{
+    if (g_wsa_wake[1] >= 0) { char c = 1; (void)!write(g_wsa_wake[1], &c, 1); }
+}
+
+static void *wsa_selection_thread(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        struct pollfd fds[257];
+        int indices[257], n = 0;
+        pthread_mutex_lock(&g_wsa_selection_lock);
+        fds[n].fd = g_wsa_wake[0]; fds[n].events = POLLIN; indices[n++] = -1;
+        for (int i = 0; i < g_wsa_selection_count; ++i) {
+            WsaSelection *s = &g_wsa_selections[i];
+            u32 wanted = s->mask & ~(s->pending | s->reported);
+            if (s->fd < 0 || !wanted) continue;
+            short events = 0;
+            if (wanted & (0x01 | 0x08)) events |= POLLIN;             /* FD_READ, FD_ACCEPT */
+            if (wanted & 0x04) events |= POLLPRI;                     /* FD_OOB */
+            if (wanted & (0x02 | 0x10)) events |= POLLOUT;            /* FD_WRITE, FD_CONNECT */
+            fds[n].fd = s->fd; fds[n].events = (short)(events | POLLRDHUP); indices[n++] = i;
+        }
+        pthread_mutex_unlock(&g_wsa_selection_lock);
+        int ready = poll(fds, (nfds_t)n, 1000);
+        if (ready <= 0) continue;
+        if (fds[0].revents & POLLIN) { char drain[64]; (void)!read(g_wsa_wake[0], drain, sizeof(drain)); }
+        pthread_mutex_lock(&g_wsa_selection_lock);
+        for (int k = 1; k < n; ++k) {
+            if (!fds[k].revents || indices[k] >= g_wsa_selection_count) continue;
+            WsaSelection *s = &g_wsa_selections[indices[k]];
+            if (s->fd != fds[k].fd) continue;                         /* re-registered meanwhile */
+            u32 found = 0;
+            short r = fds[k].revents;
+            if ((r & (POLLOUT | POLLERR | POLLHUP)) && (s->mask & 0x10) && !s->connected) {
+                int error = 0; socklen_t length = sizeof(error);
+                getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &error, &length);
+                s->errors[4] = error ? winsock_error_from_errno(error) : 0;
+                s->connected = 1;
+                found |= 0x10;
+            }
+            if ((r & POLLOUT) && (s->mask & 0x02) && (s->connected || !(s->mask & 0x10))) found |= 0x02;
+            if ((r & POLLIN) && (s->mask & 0x01)) found |= 0x01;
+            if ((r & POLLIN) && (s->mask & 0x08)) found |= 0x08;
+            if ((r & POLLPRI) && (s->mask & 0x04)) found |= 0x04;
+            if ((r & (POLLRDHUP | POLLHUP)) && (s->mask & 0x20)) { found |= 0x20; s->errors[5] = 0; }
+            found &= ~(s->pending | s->reported);
+            if (found) {
+                s->pending |= found;
+                s->reported |= found;                                  /* not again until re-registration or Enum */
+                if (s->event) impl_SetEvent(s->event);
+            }
+        }
+        pthread_mutex_unlock(&g_wsa_selection_lock);
+    }
+    return NULL;
+}
+
+static WsaSelection *wsa_selection_find(int fd)
+{
+    for (int i = 0; i < g_wsa_selection_count; ++i) if (g_wsa_selections[i].fd == fd) return &g_wsa_selections[i];
+    return NULL;
+}
+
+static void wsa_selection_forget(int fd)
+{
+    pthread_mutex_lock(&g_wsa_selection_lock);
+    WsaSelection *s = wsa_selection_find(fd);
+    if (s) s->fd = -1, s->mask = 0, s->event = 0;
+    pthread_mutex_unlock(&g_wsa_selection_lock);
+}
+
+static u64 __attribute__((ms_abi)) impl_WSAEventSelect(u64 socket_handle, u64 event, s32 mask)
+{
+    if (!g_wsa_startup_count) { g_wsa_last_error = 10093; return (u32)-1; }
+    const int fd = (int)socket_handle;
+    if (fcntl(fd, F_GETFL) < 0) { g_wsa_last_error = 10038; return (u32)-1; }   /* WSAENOTSOCK */
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    void wsa_selection_start(void);
+    pthread_once(&once, wsa_selection_start);
+    pthread_mutex_lock(&g_wsa_selection_lock);
+    WsaSelection *s = wsa_selection_find(fd);
+    if (!s) {
+        for (int i = 0; i < g_wsa_selection_count && !s; ++i) if (g_wsa_selections[i].fd < 0) s = &g_wsa_selections[i];
+        if (!s && g_wsa_selection_count < 256) s = &g_wsa_selections[g_wsa_selection_count++];
+        if (!s) { pthread_mutex_unlock(&g_wsa_selection_lock); g_wsa_last_error = 10055; return (u32)-1; }
+        memset(s, 0, sizeof(*s));
+        s->fd = fd;
+        /* A socket that is already connected must not report FD_CONNECT again. */
+        struct sockaddr_storage peer; socklen_t peer_length = sizeof(peer);
+        s->connected = getpeername(fd, (struct sockaddr *)&peer, &peer_length) == 0;
+    }
+    s->event = mask ? event : 0;
+    s->mask = (u32)mask;
+    s->reported &= 0x10;                                               /* re-evaluate everything except FD_CONNECT */
+    s->pending &= s->mask;
+    pthread_mutex_unlock(&g_wsa_selection_lock);
+    if (mask) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    wsa_selection_wake();
+    g_wsa_last_error = 0;
+    return 0;
+}
+
+static u64 __attribute__((ms_abi)) impl_WSAEnumNetworkEvents(u64 socket_handle, u64 event, u8 *events)
+{
+    if (!g_wsa_startup_count) { g_wsa_last_error = 10093; return (u32)-1; }
+    if (!events) { g_wsa_last_error = 10014; return (u32)-1; }
+    memset(events, 0, 44);                                            /* WSANETWORKEVENTS { long; int iErrorCode[10] } */
+    pthread_mutex_lock(&g_wsa_selection_lock);
+    WsaSelection *s = wsa_selection_find((int)socket_handle);
+    if (s) {
+        *(s32 *)events = (s32)s->pending;
+        memcpy(events + 4, s->errors, sizeof(s->errors));
+        s->reported &= ~(s->pending & ~0x10u);                        /* level conditions may be reported again */
+        s->pending = 0;
+        memset(s->errors, 0, sizeof(s->errors));
+    }
+    pthread_mutex_unlock(&g_wsa_selection_lock);
+    if (event) impl_ResetEvent(event);
+    wsa_selection_wake();
+    g_wsa_last_error = 0;
+    return 0;
+}
+
+void wsa_selection_start(void)
+{
+    if (pipe2(g_wsa_wake, O_CLOEXEC | O_NONBLOCK) != 0) { g_wsa_wake[0] = g_wsa_wake[1] = -1; return; }
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, wsa_selection_thread, NULL) == 0) pthread_detach(thread);
+}
+
 
 static u64 __attribute__((ms_abi))
 impl_PulseEvent(u64 h)
@@ -10648,6 +11651,11 @@ impl_PulseEvent(u64 h)
     int eid = event_id_from_handle(h);
     if (eid < 0) return 0;
     WinEvent *ev = &g_events[eid];
+    if (ev->shared) {
+        shared_event_set(ev, 1);
+        wait_object_notify(WAIT_OBJECT_EVENT | (u32)eid);
+        return 1;
+    }
     pthread_mutex_lock(&ev->mtx);
     /* PulseEvent releases only threads already waiting and resets the event
      * before returning. It is inherently racy on Windows, but it is not an
@@ -10657,7 +11665,7 @@ impl_PulseEvent(u64 h)
     else pthread_cond_signal(&ev->cv);
     ev->signaled = 0;
     pthread_mutex_unlock(&ev->mtx);
-    wait_multi_notify();
+    wait_object_notify(WAIT_OBJECT_EVENT | (u32)eid);
     return 1;
 }
 
@@ -10684,12 +11692,15 @@ static u64 timer_now_ns(void)
 static void *timer_thread_main(void *unused)
 {
     (void)unused;
+    const int timer_diag = getenv("BEER_TIMER_DIAGNOSTICS") != NULL;
     pthread_mutex_lock(&g_timer_mtx);
     for (;;) {
         u64 now = timer_now_ns(), next = 0;
         for (int i = 0; i < BEER_MAX_TIMERS; ++i) {
             if (!g_timers[i].handle || !g_timers[i].due_ns) continue;
             if (g_timers[i].due_ns <= now) {
+                if (timer_diag) fprintf(stderr, "[TIMER] fire 0x%llx late %lld us\n", (unsigned long long)g_timers[i].handle,
+                                        (long long)(now - g_timers[i].due_ns) / 1000);
                 /* Under g_timer_mtx, so CloseHandle (which forgets the timer first) never races a late signal. */
                 impl_SetEvent(g_timers[i].handle);
                 if (g_timers[i].period_ns) {
@@ -10701,11 +11712,13 @@ static void *timer_thread_main(void *unused)
             }
             if (g_timers[i].due_ns && (!next || g_timers[i].due_ns < next)) next = g_timers[i].due_ns;
         }
+        if (timer_diag) fprintf(stderr, "[TIMER] sleep %lld us\n", next ? (long long)(next - timer_now_ns()) / 1000 : -1ll);
         if (!next) {
             pthread_cond_wait(&g_timer_cv, &g_timer_mtx);
         } else {
             struct timespec ts = { (time_t)(next / 1000000000ull), (long)(next % 1000000000ull) };
-            pthread_cond_timedwait(&g_timer_cv, &g_timer_mtx, &ts);
+            int rc = pthread_cond_timedwait(&g_timer_cv, &g_timer_mtx, &ts);
+            if (timer_diag) fprintf(stderr, "[TIMER] woke rc=%d\n", rc);
         }
     }
     return NULL;
@@ -10787,6 +11800,14 @@ impl_SetWaitableTimer(u64 h, const s64 *due, s32 period, u64 routine, u64 arg, u
         const s64 now_100ns = (s64)rt.tv_sec * 10000000ll + rt.tv_nsec / 100;
         when = unix_100ns > now_100ns ? now + (u64)(unix_100ns - now_100ns) * 100u : now;
     }
+    {
+        static int diag = -1;                  /* BEER_TIMER_DIAGNOSTICS=1: every SetWaitableTimer */
+        if (diag < 0) diag = getenv("BEER_TIMER_DIAGNOSTICS") != NULL;
+        if (diag)
+            fprintf(stderr, "[TIMER] tid %ld SetWaitableTimer(0x%llx, due=%lld, period=%d) fires in %lld us (caller rva 0x%llx)\n",
+                    (long)syscall(SYS_gettid), (unsigned long long)h, (long long)*due, period,
+                    (long long)((s64)(when - now) / 1000), (unsigned long long)(g_dispatch_incoming_return - (u64)g_img));
+    }
     pthread_mutex_lock(&g_timer_mtx);
     int slot = timer_slot_locked(h);
     if (slot < 0) { pthread_mutex_unlock(&g_timer_mtx); g_last_error = 6; return 0; }
@@ -10808,6 +11829,8 @@ impl_SetWaitableTimerEx(u64 h, const s64 *due, s32 period, u64 routine, u64 arg,
 static u64 __attribute__((ms_abi))
 impl_CancelWaitableTimer(u64 h)
 {
+    if (getenv("BEER_TIMER_DIAGNOSTICS"))
+        fprintf(stderr, "[TIMER] tid %ld CancelWaitableTimer(0x%llx)\n", (long)syscall(SYS_gettid), (unsigned long long)h);
     pthread_mutex_lock(&g_timer_mtx);
     int slot = timer_slot_locked(h);
     if (slot >= 0) g_timers[slot].due_ns = 0;
@@ -10826,8 +11849,8 @@ static pthread_mutex_t g_win_mutex_table = PTHREAD_MUTEX_INITIALIZER;
 static int win_mutex_id(u64 h)
 {
     u32 hv = (u32)h;
-    if ((hv & 0xF0000000u) != 0xA0000000u) return -1;
-    int id = (int)(hv - 0xA0000000u);
+    if ((hv & 0xFF000000u) != MUTEX_HANDLE_BASE) return -1;
+    int id = (int)(hv - MUTEX_HANDLE_BASE);
     if (id <= 0 || id >= g_win_mutex_cnt || !g_win_mutexes[id].used) return -1;
     return id;
 }
@@ -10850,7 +11873,7 @@ static u64 win_mutex_alloc(int initial_owner)
     m->used = 1;
     pthread_mutex_unlock(&g_win_mutex_table);
     if (getenv("BEER_MUTEX_LOG")) fprintf(stderr, "[MUTEX] create id=%d caller=0x%llx\n", id, (unsigned long long)g_dispatch_incoming_return);
-    return 0xA0000000u + (u32)id;
+    return MUTEX_HANDLE_BASE + (u32)id;
 }
 static u64 win_mutex_wait(int id, u32 ms)
 {
@@ -10898,6 +11921,11 @@ beer_wait_single_raw(u64 h, u32 ms)
     if (mid >= 0) { u64 r = win_mutex_wait(mid, ms); g_dbg_wait_kind = 0; return r; }
 
     int eid = event_id_from_handle(h);
+    if (eid >= 0 && g_events[eid].shared) {
+        const u64 r = shared_event_wait(&g_events[eid], ms);
+        g_dbg_wait_kind = 0;
+        return r;
+    }
     if (eid >= 0) {
         WinEvent *ev = &g_events[eid];
         int rc = 0;
@@ -10996,7 +12024,21 @@ static u64 __attribute__((ms_abi))
 impl_WaitForSingleObject(u64 h, u32 ms)
 {
     static int diag = -1;
-    if (diag < 0) diag = getenv("BEER_WAIT_DIAGNOSTICS") != NULL;
+    static u64 trace_rva;                 /* BEER_WAIT_TRACE_RVA=<exe rva>: every wait returning there (diagnostic) */
+    if (diag < 0) {
+        diag = getenv("BEER_WAIT_DIAGNOSTICS") != NULL;
+        const char *rva = getenv("BEER_WAIT_TRACE_RVA");
+        trace_rva = rva ? strtoull(rva, NULL, 0) : 0;
+    }
+    if (trace_rva && g_dispatch_incoming_return - (u64)g_img == trace_rva) {
+        const u64 caller = g_dispatch_incoming_return, t0 = beer_wait_now_ms();
+        const u64 r0 = beer_wait_single_raw(h, ms);
+        g_dbg_wait_kind = 0;
+        fprintf(stderr, "[WAITTRACE] tid %ld handle=0x%llx timeout=%u -> %llu after %llu ms (caller 0x%llx)\n",
+                (long)syscall(SYS_gettid), (unsigned long long)h, ms, (unsigned long long)r0,
+                (unsigned long long)(beer_wait_now_ms() - t0), (unsigned long long)caller);
+        return r0;
+    }
     if (!diag) { const u64 r0 = beer_wait_single_raw(h, ms); g_dbg_wait_kind = 0; return r0; }
     u64 t0 = beer_wait_now_ms();
     u64 r = beer_wait_single_raw(h, ms);
@@ -11013,12 +12055,18 @@ impl_WaitForSingleObject(u64 h, u32 ms)
     return r;
 }
 
+static int beer_apc_pending(void);
+static int beer_apc_run(void);
+typedef u64 (*BeerWaitSlice)(void *context, u32 slice_ms);
+static u64 beer_alertable_wait(u32 ms, BeerWaitSlice wait, void *context, u64 timeout_result, u64 apc_result);
 static u64 __attribute__((ms_abi))
 impl_WaitForSingleObjectEx(u64 h, u32 ms, u32 alertable)
 {
-    (void)alertable;
-    return impl_WaitForSingleObject(h, ms);
+    u64 beer_wait_single_slice(void *context, u32 slice);
+    if (!alertable) return impl_WaitForSingleObject(h, ms);
+    return beer_alertable_wait(ms, beer_wait_single_slice, &h, 0x102, 0xC0);
 }
+u64 beer_wait_single_slice(void *context, u32 slice) { return impl_WaitForSingleObject(*(u64 *)context, slice); }
 
 static u64 __attribute__((ms_abi))
 impl_WaitForMultipleObjects(u32 n, const u64 *handles, u32 all, u32 ms);
@@ -11094,6 +12142,7 @@ static int wait_handle_poll(u64 handle, int consume)
         return thread_result == 0 ? 1 : (thread_result == 0x102u ? 0 : -1);
 
     int eid = event_id_from_handle(handle);
+    if (eid >= 0 && g_events[eid].shared) return shared_event_try(&g_events[eid], consume);
     if (eid >= 0) {
         WinEvent *event = &g_events[eid];
         pthread_mutex_lock(&event->mtx);
@@ -11119,8 +12168,19 @@ static int wait_handle_poll(u64 handle, int consume)
     return -1;
 }
 
+static __thread const u64 *g_dbg_wait_handles;   /* WaitForMultipleObjects in progress (SIGUSR1 stack dump) */
+static __thread u32 g_dbg_wait_count;
+static u64 __attribute__((ms_abi)) beer_wait_multiple_raw_inner(u32 n, const u64 *handles, u32 all, u32 ms);
 static u64 __attribute__((ms_abi))
 beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
+{
+    g_dbg_wait_handles = handles; g_dbg_wait_count = n;
+    u64 result = beer_wait_multiple_raw_inner(n, handles, all, ms);
+    g_dbg_wait_count = 0;
+    return result;
+}
+static u64 __attribute__((ms_abi))
+beer_wait_multiple_raw_inner(u32 n, const u64 *handles, u32 all, u32 ms)
 {
     /* MAXIMUM_WAIT_OBJECTS is 64. Windows rejects invalid parameters before
      * inspecting or consuming any object. */
@@ -11143,11 +12203,32 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
     struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
     int traced = 0;
-    atomic_fetch_add(&g_wait_multi_waiters, 1);
+    /* Register on every event/semaphore (see wait_object_notify); anything else is polled every 1 ms. */
+    const int global = wait_global_wake();
+    WaitWord waiter = { 0 };
+    WaitNode nodes[64];
+    u32 registered = 0;
+    int needs_poll = global;
+    for (u32 i = 0; i < n && !global; ++i) {
+        u64 key = 0;
+        if (thread_wait_handle(handles[i], 0) == (u64)-2) {
+            const int eid = event_id_from_handle(handles[i]);
+            const int sid = eid < 0 ? sem_id_from_handle(handles[i]) : -1;
+            if (eid >= 0) key = WAIT_OBJECT_EVENT | (u32)eid;
+            else if (sid >= 0) key = WAIT_OBJECT_SEMAPHORE | (u32)sid;
+            if (eid >= 0 && g_events[eid].shared) needs_poll = 1;   /* set by another process: poll */
+        }
+        if (!key) { needs_poll = 1; continue; }
+        int seen = 0;
+        for (u32 k = 0; k < registered; ++k) seen |= nodes[k].key == key;
+        if (!seen) wait_register(&nodes[registered++], key, &waiter);
+    }
+    if (global) atomic_fetch_add(&g_wait_multi_waiters, 1);
     u64 result;
     for (;;) {
         /* Read the wake counter before polling: a signal after the poll changes it and ends the futex wait. */
-        const u32 seq = atomic_load(&g_wait_wake_seq);
+        const u32 seq = global ? atomic_load(&g_wait_wake_seq)
+                               : atomic_load_explicit(&waiter.word, memory_order_acquire);
         if (all) {
             int ready = 1;
             for (u32 i = 0; i < n; ++i) {
@@ -11189,11 +12270,31 @@ beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms)
                     (unsigned long long)g_dispatch_incoming_return,
                     (unsigned)impl_GetCurrentThreadId());
         }
-        struct timespec delay = {0, 1000000L};
-        syscall(SYS_futex, (u32 *)&g_wait_wake_seq, FUTEX_WAIT_PRIVATE, seq, &delay, NULL, 0);
+        if (global) {
+            struct timespec delay = {0, 1000000L};
+            syscall(SYS_futex, (u32 *)&g_wait_wake_seq, FUTEX_WAIT_PRIVATE, seq, &delay, NULL, 0);
+        } else {
+            /* Sleep until a registered object is signalled, the timeout, the 1 ms poll of other handle kinds, or a
+             * 4 ms safety re-check (BEER_WAIT_DIAGNOSTICS reports objects found signalled without a wake-up). */
+            u64 sleep_ms = needs_poll ? 1 : 4;
+            if (ms != 0xFFFFFFFFu && ms - elapsed_ms < sleep_ms) sleep_ms = ms - elapsed_ms ? ms - elapsed_ms : 1;
+            struct timespec delay = { 0, (long)sleep_ms * 1000000L };
+            const long woke = syscall(SYS_futex, (u32 *)&waiter.word, FUTEX_WAIT_PRIVATE, seq, &delay, NULL, 0);
+            if (woke != 0 && errno == ETIMEDOUT && !needs_poll && atomic_load(&waiter.word) == seq &&
+                getenv("BEER_WAIT_DIAGNOSTICS")) {
+                for (u32 i = 0; i < n; ++i)
+                    if (wait_handle_poll(handles[i], 0) > 0) {
+                        static _Atomic u32 reports;
+                        if (atomic_fetch_add(&reports, 1) < 40)
+                            fprintf(stderr, "[WAIT] handle 0x%llx was signalled without a wake-up (waiter caller=0x%llx)\n",
+                                    (unsigned long long)handles[i], (unsigned long long)g_dispatch_incoming_return);
+                    }
+            }
+        }
     }
 done:
-    atomic_fetch_sub(&g_wait_multi_waiters, 1);
+    for (u32 k = 0; k < registered; ++k) wait_unregister(&nodes[k]);
+    if (global) atomic_fetch_sub(&g_wait_multi_waiters, 1);
     return result;
 }
 
@@ -11217,15 +12318,19 @@ impl_WaitForMultipleObjects(u32 n, const u64 *handles, u32 all, u32 ms)
     return r;
 }
 
+typedef struct { u32 count; const u64 *handles; u32 all; } BeerMultiWait;
+static u64 beer_wait_multiple_slice(void *context, u32 slice)
+{
+    BeerMultiWait *w = context;
+    return impl_WaitForMultipleObjects(w->count, w->handles, w->all, slice);
+}
 static u64 __attribute__((ms_abi))
 impl_WaitForMultipleObjectsEx(u32 n, const u64 *handles, u32 all, u32 ms,
                               u32 alertable)
 {
-    /* Beer has no user APC queue yet. In its absence an alertable wait has the
-     * same completion outcomes as the non-alertable form; it must not be an
-     * unresolved import or a fabricated WAIT_IO_COMPLETION. */
-    (void)alertable;
-    return impl_WaitForMultipleObjects(n, handles, all, ms);
+    if (!alertable) return impl_WaitForMultipleObjects(n, handles, all, ms);
+    BeerMultiWait w = { n, handles, all };
+    return beer_alertable_wait(ms, beer_wait_multiple_slice, &w, 0x102, 0xC0);
 }
 
 /* ---- CreateMutex ---- */
@@ -11303,11 +12408,8 @@ static u64 __attribute__((ms_abi)) impl_Sleep_inner(u32 ms) {
     return 0;
 }
 static u64 __attribute__((ms_abi)) impl_SleepEx(u32 ms, u32 alertable) {
-    /* There is currently no guest APC queue. Preserve elapsed-time behavior
-     * without inventing WAIT_IO_COMPLETION (0xc0). */
-    (void)alertable;
-    impl_Sleep(ms);
-    return 0;
+    if (!alertable) { impl_Sleep(ms); return 0; }
+    return beer_alertable_wait(ms, NULL, NULL, 0, 0xC0);       /* WAIT_IO_COMPLETION after running APCs */
 }
 static u64 __attribute__((ms_abi)) impl_GetTickCount(void) {
     return beer_time_monotonic_ns_for(BEER_CLOCK_TICK) / 1000000u;
@@ -11686,14 +12788,71 @@ impl_FormatMessageW(u32 flags, u64 src, u32 msgid, u32 langid,
 
 /* ---- RegisterClassEx / CreateWindow ---- */
 #define FAKE_DESKTOP_HWND ((u64)0xD0000000u)
-#define FAKE_HWND         ((u64)0xD0000001u)
 #define FAKE_HDC          ((u64)0xDC000001u)
+
+/* ---- Window table ----
+ * Every CreateWindowEx gets its own HWND (0xD0000001, 0xD0000002, ...), with its own window procedure, owner
+ * thread, styles, rectangle and user data. Beer has one native (XWayland) surface: it belongs to the most recently
+ * created top-level window (as before, each new top-level window takes it over). That window's live state is kept
+ * in the g_window_* globals; the table entry of every other window holds its own state. FAKE_HWND names the window
+ * that owns the native surface (the first window's value when there is none), so code that deals with the native
+ * window keeps comparing against it, while messages, window procedures, DestroyWindow and window longs work per HWND.
+ * UE's splash screen needs this: its window lives on its own thread, and WM_DESTROY posted to it must reach that
+ * thread and that window's procedure. Message-only windows (parent HWND_MESSAGE) never take the native surface. */
+#define BEER_MAX_WINDOWS 64
+typedef struct {
+    int used, visible;
+    u64 hwnd, proc, userdata, instance, parent;
+    u32 owner_tid, style, exstyle;
+    s32 x, y, w, h;
+} BeerWindow;
+static BeerWindow g_beer_windows[BEER_MAX_WINDOWS];
+static u64 g_native_hwnd;                       /* window owning the native surface; 0 = none */
+static u32 g_window_serial;
+static pthread_mutex_t g_beer_windows_mtx = PTHREAD_MUTEX_INITIALIZER;
+static inline u64 beer_native_hwnd(void) { return g_native_hwnd ? g_native_hwnd : (u64)0xD0000001u; }
+#define FAKE_HWND (beer_native_hwnd())
+static BeerWindow *beer_window_find(u64 hwnd)
+{
+    if (!hwnd) return NULL;
+    for (int i = 0; i < BEER_MAX_WINDOWS; ++i)
+        if (g_beer_windows[i].used && g_beer_windows[i].hwnd == hwnd) return &g_beer_windows[i];
+    return NULL;
+}
+/* A live window other than the native one (those keep their state in the table), or NULL. */
+static BeerWindow *beer_window_other(u64 hwnd)
+{
+    if (!hwnd || hwnd == g_native_hwnd) return NULL;
+    return beer_window_find(hwnd);
+}
+static BeerWindow *beer_window_new(void)
+{
+    pthread_mutex_lock(&g_beer_windows_mtx);
+    BeerWindow *w = NULL;
+    for (int i = 0; i < BEER_MAX_WINDOWS && !w; ++i)
+        if (!g_beer_windows[i].used) w = &g_beer_windows[i];
+    if (w) {
+        memset(w, 0, sizeof(*w));
+        w->used = 1;
+        w->hwnd = 0xD0000000u + (++g_window_serial & 0x0fffffffu);
+    }
+    pthread_mutex_unlock(&g_beer_windows_mtx);
+    return w;
+}
+static void beer_window_free(u64 hwnd)
+{
+    pthread_mutex_lock(&g_beer_windows_mtx);
+    BeerWindow *w = beer_window_find(hwnd);
+    if (w) w->used = 0;
+    pthread_mutex_unlock(&g_beer_windows_mtx);
+}
 
 /* Forward declarations — these functions are defined later in the file but
  * are needed by impl_ShowWindow, impl_InvalidateRect, etc. which appear
  * earlier in the translation unit. */
 static u64 call_guest_wndproc(u32 message, u64 wparam, u64 lparam);
 static int queue_window_message(u32 message, u64 wparam, u64 lparam);
+static u64 call_window_proc(u64 hwnd, u32 message, u64 wparam, u64 lparam);
 
 static volatile int g_win_quit = 0;
 static u32 g_win_quit_code = 0;
@@ -11702,7 +12861,8 @@ static u32 g_win_quit_code = 0;
  * Prevents unbounded WM_PAINT pile-up when the compositor keeps sending expose
  * events faster than the game's message loop can drain them. */
 static _Atomic(int) g_paint_pending;
-static u64 g_window_proc;
+static u64 g_window_proc;          /* the native window's procedure */
+static u64 g_last_class_proc;      /* the most recently registered class's procedure */
 static u64 g_window_userdata;
 static u64 g_window_style;
 static u64 g_window_exstyle;
@@ -11793,13 +12953,14 @@ static u64 register_window_class(const WIN_WNDCLASSEX *window_class, const char 
         }
         pthread_mutex_unlock(&g_window_class_lock);
     }
-    g_window_proc = window_class->lpfnWndProc;
+    g_last_class_proc = window_class->lpfnWndProc;
+    if (!g_native_hwnd) g_window_proc = window_class->lpfnWndProc;   /* no window yet: as before */
     g_window_instance = window_class->hInstance;
     g_window_icon = window_class->hIcon;
     g_window_small_icon = window_class->hIconSm;
     if (!g_api_registerclass) {
         g_api_registerclass = 1;
-        fprintf(stderr, "[PROGRESS] %s retained WndProc=0x%lx\n", api, g_window_proc);
+        fprintf(stderr, "[PROGRESS] %s retained WndProc=0x%lx\n", api, g_last_class_proc);
     }
     return 1; /* stable class atom */
 }
@@ -11887,8 +13048,9 @@ impl_GetDesktopWindow(void) { return FAKE_DESKTOP_HWND; }
  * compatibility modules query UOI_NAME during process attach; returning a
  * truthful stable name is sufficient without pretending to support station
  * ACLs, flags, or desktop switching. */
+#define BEER_WINSTA_HANDLE 0x37000000u   /* the process window station "WinSta0" */
 static u64 __attribute__((ms_abi))
-impl_GetProcessWindowStation(void) { return (u64)0xD1000000u; }
+impl_GetProcessWindowStation(void) { return (u64)BEER_WINSTA_HANDLE; }
 static u64 __attribute__((ms_abi))
 impl_GetThreadDesktop(u32 thread_id)
 {
@@ -11899,7 +13061,7 @@ static u64 __attribute__((ms_abi))
 impl_GetUserObjectInformationW(u64 object, s32 index, void *information,
                                u32 length, u32 *needed)
 {
-    const char *name = object == (u64)0xD1000000u ? "WinSta0" :
+    const char *name = object == (u64)BEER_WINSTA_HANDLE ? "WinSta0" :
                        object == (u64)0xD1000001u ? "Default" : NULL;
     if (!name) { g_last_error = 6; return 0; } /* ERROR_INVALID_HANDLE */
     if (index != 2) { g_last_error = 87; return 0; } /* UOI_NAME only */
@@ -11918,6 +13080,13 @@ static u64 __attribute__((ms_abi))
 impl_GetForegroundWindow(void) { return xwayland_window_exists() ? FAKE_HWND : FAKE_DESKTOP_HWND; }
 static u64 __attribute__((ms_abi))
 impl_ShowWindow(u64 hw, u32 cmd) {
+    BeerWindow *other = beer_window_other(hw);
+    if (other) {                         /* no native surface: visibility is state, WM_SHOWWINDOW on change */
+        const int was_visible = other->visible, visible = cmd != 0;
+        other->visible = visible;
+        if (was_visible != visible) call_window_proc(hw, 0x0018, (u64)visible, 0);
+        return (u64)was_visible;
+    }
     if (hw != FAKE_HWND || !xwayland_window_exists()) {
         g_last_error = 1400; /* ERROR_INVALID_WINDOW_HANDLE */
         return 0;
@@ -11989,6 +13158,7 @@ impl_ShowWindow(u64 hw, u32 cmd) {
 static u64 __attribute__((ms_abi))
 impl_IsWindowEnabled(u64 hwnd)
 {
+    if (beer_window_other(hwnd)) return 1;
     return hwnd == FAKE_HWND && xwayland_window_exists();
 }
 
@@ -11996,6 +13166,8 @@ static u64 __attribute__((ms_abi))
 impl_IsWindowVisible(u64 hwnd)
 {
     XwaylandWindowState state;
+    BeerWindow *other = beer_window_other(hwnd);
+    if (other) return (u64)other->visible;
     return hwnd == FAKE_HWND && xwayland_window_get_state(&state) && state.visible;
 }
 
@@ -12158,6 +13330,19 @@ impl_UnregisterDeviceNotification(u64 handle)
  * identifies its root with HTREE\ROOT\0; lengths exclude the trailing NUL. */
 #define BEER_ROOT_DEVINST 1u
 #define BEER_ROOT_DEVICE_ID_A "HTREE\\ROOT\\0"
+#define BEER_DISPLAY_DEVINST 2u   /* the display adapter (SetupAPI's display device set) */
+/* The device-instance ID of a devnode Beer knows: the root, or the display adapter's PCI ID. 0 when unknown. */
+static int cm_device_id(u32 devinst, char *out, size_t cap)
+{
+    if (devinst == BEER_ROOT_DEVINST) { snprintf(out, cap, "%s", BEER_ROOT_DEVICE_ID_A); return 1; }
+    BeerHostGpuInfo gpu;
+    if (devinst == BEER_DISPLAY_DEVINST && beer_vulkan_host_gpu_info(&gpu)) {
+        snprintf(out, cap, "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_%02X\\3&BEER&0&10",
+                 gpu.vendor_id, gpu.device_id, gpu.revision);
+        return 1;
+    }
+    return 0;
+}
 #define BEER_CR_SUCCESS 0u
 #define BEER_CR_OUT_OF_MEMORY 0x02u
 #define BEER_CR_INVALID_POINTER 0x03u
@@ -12210,8 +13395,9 @@ impl_CM_Get_Device_ID_Size(u32 *length, u32 devinst, u32 flags)
     (void)flags;
     if (!length) return BEER_CR_INVALID_POINTER;
     *length = 0;
-    if (devinst != BEER_ROOT_DEVINST) return BEER_CR_INVALID_DEVNODE;
-    *length = (u32)strlen(BEER_ROOT_DEVICE_ID_A);
+    char id[160];
+    if (!cm_device_id(devinst, id, sizeof(id))) return BEER_CR_INVALID_DEVNODE;
+    *length = (u32)strlen(id);
     return BEER_CR_SUCCESS;
 }
 static u64 __attribute__((ms_abi))
@@ -12221,10 +13407,11 @@ impl_CM_Get_Device_IDA(u32 devinst, char *buffer, u32 buffer_length, u32 flags)
         fprintf(stderr, "[CFGMGR] CM_Get_Device_IDA(devinst=%u, size=%u, flags=0x%x)\n",
                 devinst, buffer_length, flags);
     if (!buffer) return BEER_CR_INVALID_POINTER;
-    if (devinst != BEER_ROOT_DEVINST) return BEER_CR_INVALID_DEVNODE;
-    size_t required = strlen(BEER_ROOT_DEVICE_ID_A) + 1u;
+    char id[160];
+    if (!cm_device_id(devinst, id, sizeof(id))) return BEER_CR_INVALID_DEVNODE;
+    size_t required = strlen(id) + 1u;
     if (buffer_length < required) return BEER_CR_BUFFER_SMALL;
-    memcpy(buffer, BEER_ROOT_DEVICE_ID_A, required);
+    memcpy(buffer, id, required);
     return BEER_CR_SUCCESS;
 }
 static u64 __attribute__((ms_abi))
@@ -12232,10 +13419,11 @@ impl_CM_Get_Device_IDW(u32 devinst, u16 *buffer, u32 buffer_length, u32 flags)
 {
     (void)flags;
     if (!buffer) return BEER_CR_INVALID_POINTER;
-    if (devinst != BEER_ROOT_DEVINST) return BEER_CR_INVALID_DEVNODE;
-    size_t length = strlen(BEER_ROOT_DEVICE_ID_A);
+    char id[160];
+    if (!cm_device_id(devinst, id, sizeof(id))) return BEER_CR_INVALID_DEVNODE;
+    size_t length = strlen(id);
     if (buffer_length < length + 1u) return BEER_CR_BUFFER_SMALL;
-    for (size_t i = 0; i <= length; ++i) buffer[i] = (u8)BEER_ROOT_DEVICE_ID_A[i];
+    for (size_t i = 0; i <= length; ++i) buffer[i] = (u8)id[i];
     return BEER_CR_SUCCESS;
 }
 
@@ -12358,62 +13546,286 @@ impl_StringFromGUID2(const u8 *guid, u16 *buffer, s32 capacity)
     return 39;
 }
 
+/* "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" (UTF-16, braces required, either case) -> GUID; 0 when malformed. */
+static int guid_from_wide_string(const u16 *text, u8 *guid)
+{
+    static const int digit_at[32] = { 1,3,5,7, 10,12, 15,17, 20,22, 25,27,29,31,33,35,
+                                      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 };
+    if (text[0] != '{' || text[37] != '}' || text[38] != 0) return 0;
+    if (text[9] != '-' || text[14] != '-' || text[19] != '-' || text[24] != '-') return 0;
+    u8 bytes[16];
+    for (int i = 0; i < 16; ++i) {
+        int value = 0;
+        for (int k = 0; k < 2; ++k) {
+            const u16 c = text[digit_at[i] + k];
+            const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                          c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) return 0;
+            value = value * 16 + d;
+        }
+        bytes[i] = (u8)value;
+    }
+    /* The string is written big-endian; Data1..Data3 are stored little-endian. */
+    const u8 order[16] = { 3,2,1,0, 5,4, 7,6, 8,9,10,11,12,13,14,15 };
+    for (int i = 0; i < 16; ++i) guid[i] = bytes[order[i]];
+    return 1;
+}
+/* IIDFromString: S_OK, or E_INVALIDARG for a malformed string; a NULL string is GUID_NULL. */
+static u64 __attribute__((ms_abi)) impl_IIDFromString(const u16 *text, u8 *iid)
+{
+    if (!iid) return 0x80070057u;
+    if (!text) { memset(iid, 0, 16); return 0; }
+    return guid_from_wide_string(text, iid) ? 0 : 0x80070057u;
+}
+/* CLSIDFromString: the braced GUID form (ProgIDs are not registered in Beer): S_OK or CO_E_CLASSSTRING. */
+static u64 __attribute__((ms_abi)) impl_CLSIDFromString(const u16 *text, u8 *clsid)
+{
+    if (!clsid) return 0x80070057u;
+    if (!text) { memset(clsid, 0, 16); return 0; }
+    if (guid_from_wide_string(text, clsid)) return 0;
+    memset(clsid, 0, 16);
+    return 0x800401F3u;
+}
+
+/* StringFromCLSID / StringFromIID: the braced GUID string in a CoTaskMemAlloc buffer (freed with CoTaskMemFree,
+ * which is free()). */
+static u64 __attribute__((ms_abi)) impl_StringFromCLSID(const u8 *guid, u16 **out)
+{
+    if (!out) return 0x80070057u;
+    *out = NULL;
+    if (!guid) return 0x80070057u;
+    u16 *text = malloc(39 * sizeof(u16));
+    if (!text) return 0x8007000Eu;
+    impl_StringFromGUID2(guid, text, 39);
+    *out = text;
+    return 0;
+}
+
+/* SetupAPI device sets. Beer's device tree has one enumerable device: the display adapter it renders on, as the
+ * PCI device EnumDisplayDevices and CM_Get_Device_ID_List report. A set asked for the display class
+ * {4d36e968-e325-11ce-bfc1-08002be10318}, for a display-adapter device interface, or for all classes contains it;
+ * any other set is empty (end-of-list at index 0). Its properties lead to the display driver key
+ * HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-...}\0000, where games read the adapter's video memory
+ * (HardwareInformation.qwMemorySize); with an empty set they saw no adapter (RE9 reported 0 GB). */
+#define BEER_DEVICE_INFO_SET_DISPLAY     UINT64_C(0xd0030003)
+static const u8 g_guid_devclass_display[16] = { 0x68,0xe9,0x36,0x4d, 0x25,0xe3, 0xce,0x11, 0xbf,0xc1,0x08,0x00,0x2b,0xe1,0x03,0x18 };
+/* GUID_DEVINTERFACE_DISPLAY_ADAPTER {5b45201d-f2f2-4f3b-85bb-30ff1f953599} and GUID_DISPLAY_DEVICE_ARRIVAL
+ * {1ca05180-a699-450a-9a0c-de4fbe3ddd89}: Windows registers both interfaces for every display adapter. */
+static const u8 g_guid_display_adapter[16] = { 0x1d,0x20,0x45,0x5b, 0xf2,0xf2, 0x3b,0x4f, 0x85,0xbb,0x30,0xff,0x1f,0x95,0x35,0x99 };
+static const u8 g_guid_display_arrival[16] = { 0x80,0x51,0xa0,0x1c, 0x99,0xa6, 0x0a,0x45, 0x9a,0x0c,0xde,0x4f,0xbe,0x3d,0xdd,0x89 };
+#define BEER_DIGCF_ALLCLASSES      0x4u
+#define BEER_DIGCF_DEVICEINTERFACE 0x10u
+
+static int setupapi_set_valid(u64 set) { return set == BEER_DEVICE_INFO_SET_HANDLE || set == BEER_DEVICE_INFO_SET_DISPLAY; }
+static int setupapi_display_interface(const void *guid)
+{
+    return guid && (!memcmp(guid, g_guid_display_adapter, 16) || !memcmp(guid, g_guid_display_arrival, 16));
+}
+/* The adapter's identity; 0 when Vulkan has no device (then every set is empty). */
+static int setupapi_gpu(BeerHostGpuInfo *gpu) { return beer_vulkan_host_gpu_info(gpu); }
+static const char *setupapi_provider(u32 vendor)
+{
+    return vendor == 0x8086u ? "Intel Corporation" : vendor == 0x10deu ? "NVIDIA"
+         : vendor == 0x1002u ? "Advanced Micro Devices, Inc." : "Beer";
+}
+
 static u64 __attribute__((ms_abi))
 impl_SetupDiGetClassDevsW(const void *class_guid, const u16 *enumerator,
                          u64 parent, u32 flags)
 {
-    (void)class_guid; (void)enumerator; (void)parent; (void)flags;
+    (void)parent;
+    BeerHostGpuInfo gpu;
+    int display;
+    if (flags & BEER_DIGCF_DEVICEINTERFACE)
+        display = (flags & BEER_DIGCF_ALLCLASSES) || setupapi_display_interface(class_guid);
+    else
+        display = (flags & BEER_DIGCF_ALLCLASSES) || (class_guid && !memcmp(class_guid, g_guid_devclass_display, 16));
+    /* An enumerator other than PCI names a bus the adapter is not on. */
+    if (display && enumerator && enumerator[0]) {
+        const char pci[] = "pci";
+        for (int i = 0; i < 4; ++i) {
+            u16 c = enumerator[i];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (i < 3 ? (u16)pci[i] : 0)) { display = 0; break; }
+        }
+    }
     g_last_error = 0;
-    return BEER_DEVICE_INFO_SET_HANDLE;
+    return display && setupapi_gpu(&gpu) ? BEER_DEVICE_INFO_SET_DISPLAY : BEER_DEVICE_INFO_SET_HANDLE;
 }
 static u64 __attribute__((ms_abi))
 impl_SetupDiGetClassDevsA(const void *class_guid, const char *enumerator,
                          u64 parent, u32 flags)
 {
-    (void)enumerator;
-    return impl_SetupDiGetClassDevsW(class_guid, NULL, parent, flags);
+    u16 wide[64];
+    size_t i = 0;
+    for (; enumerator && enumerator[i] && i + 1 < 64; ++i) wide[i] = (u8)enumerator[i];
+    wide[i] = 0;
+    return impl_SetupDiGetClassDevsW(class_guid, enumerator ? wide : NULL, parent, flags);
 }
-/* SetupDiGetClassDevsEx: the same (empty) local device set; an existing set given in DeviceInfoSet must be
- * Beer's, and remote machines are unsupported, failing with INVALID_HANDLE_VALUE like the real API. */
+/* SetupDiGetClassDevsEx: the same local device sets; an existing set given in DeviceInfoSet must be Beer's, and
+ * remote machines are unsupported, failing with INVALID_HANDLE_VALUE like the real API. */
 static u64 __attribute__((ms_abi))
 impl_SetupDiGetClassDevsExW(const void *class_guid, const u16 *enumerator, u64 parent, u32 flags,
                             u64 existing_set, const u16 *machine, void *reserved)
 {
     if (reserved) { g_last_error = 87; return ~0ull; }                          /* ERROR_INVALID_PARAMETER */
     if (machine && machine[0]) { g_last_error = 50; return ~0ull; }             /* ERROR_NOT_SUPPORTED */
-    if (existing_set && existing_set != BEER_DEVICE_INFO_SET_HANDLE) { g_last_error = 6; return ~0ull; }
-    return impl_SetupDiGetClassDevsW(class_guid, enumerator, parent, flags);
+    if (existing_set && !setupapi_set_valid(existing_set)) { g_last_error = 6; return ~0ull; }
+    const u64 set = impl_SetupDiGetClassDevsW(class_guid, enumerator, parent, flags);
+    return existing_set == BEER_DEVICE_INFO_SET_DISPLAY ? BEER_DEVICE_INFO_SET_DISPLAY : set;
 }
 static u64 __attribute__((ms_abi))
 impl_SetupDiGetClassDevsExA(const void *class_guid, const char *enumerator, u64 parent, u32 flags,
                             u64 existing_set, const char *machine, void *reserved)
 {
-    (void)enumerator;
+    u16 wide[64];
+    size_t i = 0;
+    for (; enumerator && enumerator[i] && i + 1 < 64; ++i) wide[i] = (u8)enumerator[i];
+    wide[i] = 0;
     static const u16 remote[] = { '?', 0 };
-    return impl_SetupDiGetClassDevsExW(class_guid, NULL, parent, flags, existing_set,
+    return impl_SetupDiGetClassDevsExW(class_guid, enumerator ? wide : NULL, parent, flags, existing_set,
                                        machine && machine[0] ? remote : NULL, reserved);
+}
+/* SP_DEVINFO_DATA (x64): cbSize 32, ClassGuid at 4, DevInst at 20, Reserved at 24. */
+static void setupapi_fill_devinfo(void *device_info)
+{
+    u8 *d = device_info;
+    memcpy(d + 4, g_guid_devclass_display, 16);
+    const u32 devinst = BEER_DISPLAY_DEVINST;
+    memcpy(d + 20, &devinst, 4);
+    memset(d + 24, 0, 8);
 }
 static u64 __attribute__((ms_abi))
 impl_SetupDiEnumDeviceInfo(u64 set, u32 index, void *device_info)
 {
-    (void)index; (void)device_info;
-    if (set != BEER_DEVICE_INFO_SET_HANDLE) { g_last_error = 6; return 0; }
-    g_last_error = ERROR_NO_MORE_ITEMS;
-    return 0;
+    if (!setupapi_set_valid(set)) { g_last_error = 6; return 0; }
+    if (set != BEER_DEVICE_INFO_SET_DISPLAY || index > 0) { g_last_error = ERROR_NO_MORE_ITEMS; return 0; }
+    if (!device_info || *(const u32 *)device_info != 32) { g_last_error = 1784; return 0; }   /* ERROR_INVALID_USER_BUFFER */
+    setupapi_fill_devinfo(device_info);
+    g_last_error = 0;
+    return 1;
 }
+/* SP_DEVICE_INTERFACE_DATA (x64): cbSize 32, InterfaceClassGuid at 4, Flags at 20 (SPINT_ACTIVE 1), Reserved at 24.
+ * The adapter has the two display-adapter interfaces; the Reserved field carries which one (1 or 2). */
 static u64 __attribute__((ms_abi))
 impl_SetupDiEnumDeviceInterfaces(u64 set, const void *device_info,
                                  const void *interface_class_guid, u32 index,
                                  void *interface_data)
 {
-    (void)device_info; (void)interface_class_guid; (void)index;
-    (void)interface_data;
-    if (set != BEER_DEVICE_INFO_SET_HANDLE) { g_last_error = 6; return 0; }
-    /* Beer currently exposes no host HID/device interfaces through SetupAPI.
-     * An empty set is a valid result and must be reported as end-of-list, not
-     * as generic false success with untouched output memory. */
-    g_last_error = ERROR_NO_MORE_ITEMS;
-    return 0;
+    (void)device_info;
+    if (!setupapi_set_valid(set)) { g_last_error = 6; return 0; }
+    if (set != BEER_DEVICE_INFO_SET_DISPLAY || !setupapi_display_interface(interface_class_guid) || index > 0) {
+        g_last_error = ERROR_NO_MORE_ITEMS;
+        return 0;
+    }
+    if (!interface_data || *(const u32 *)interface_data != 32) { g_last_error = 1784; return 0; }
+    u8 *d = interface_data;
+    memcpy(d + 4, interface_class_guid, 16);
+    const u32 active = 1;
+    memcpy(d + 20, &active, 4);
+    const u64 which = !memcmp(interface_class_guid, g_guid_display_adapter, 16) ? 1u : 2u;
+    memcpy(d + 24, &which, 8);
+    g_last_error = 0;
+    return 1;
+}
+/* SetupDiGetDeviceInterfaceDetail: SP_DEVICE_INTERFACE_DETAIL_DATA_W/A (x64: cbSize 8, DevicePath at 4). The path
+ * is the symbolic link Windows gives the interface: \\?\pci#ven_..&dev_..&subsys_..&rev_..#3&beer&0&10#{guid}. */
+u64 beer_setupapi_interface_detail(u64 set, const void *interface_data, void *detail, u32 detail_size,
+                                   u32 *required, void *device_info, int wide)
+{
+    if (!setupapi_set_valid(set)) { g_last_error = 6; return 0; }
+    BeerHostGpuInfo gpu;
+    if (set != BEER_DEVICE_INFO_SET_DISPLAY || !interface_data || !setupapi_gpu(&gpu)) {
+        g_last_error = 87;                                                     /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+    u64 which = 0;
+    memcpy(&which, (const u8 *)interface_data + 24, 8);
+    const char *guid = which == 2 ? "{1ca05180-a699-450a-9a0c-de4fbe3ddd89}" : "{5b45201d-f2f2-4f3b-85bb-30ff1f953599}";
+    char path[192];
+    snprintf(path, sizeof(path), "\\\\?\\pci#ven_%04x&dev_%04x&subsys_00000000&rev_%02x#3&beer&0&10#%s",
+             gpu.vendor_id, gpu.device_id, gpu.revision, guid);
+    const u32 chars = (u32)strlen(path) + 1;
+    const u32 need = 4u + chars * (wide ? 2u : 1u);
+    if (required) *required = need;
+    if (device_info) {
+        if (*(const u32 *)device_info != 32) { g_last_error = 1784; return 0; }
+        setupapi_fill_devinfo(device_info);
+    }
+    if (!detail) {
+        if (detail_size) { g_last_error = 1784; return 0; }
+        g_last_error = 122;                                                    /* ERROR_INSUFFICIENT_BUFFER */
+        return 0;
+    }
+    if (*(const u32 *)detail != 8) { g_last_error = 1784; return 0; }
+    if (detail_size < need) { g_last_error = 122; return 0; }
+    u8 *out = (u8 *)detail + 4;
+    for (u32 c = 0; c < chars; ++c) {
+        if (wide) ((u16 *)out)[c] = (u8)path[c];
+        else out[c] = (u8)path[c];
+    }
+    g_last_error = 0;
+    return 1;
+}
+/* SetupDiGetDeviceRegistryProperty for the display adapter (SPDRP_*). REG_SZ / REG_MULTI_SZ / REG_DWORD values as a
+ * Windows display device has them; a property the device lacks fails with ERROR_INVALID_DATA. */
+static u64 setupapi_property(u64 set, const void *device_info, u32 property, u32 *property_type,
+                             u8 *buffer, u32 buffer_size, u32 *required_size, int wide)
+{
+    if (property_type) *property_type = 0;
+    if (required_size) *required_size = 0;
+    if (!setupapi_set_valid(set)) { g_last_error = 6; return 0; }
+    BeerHostGpuInfo gpu;
+    if (set != BEER_DEVICE_INFO_SET_DISPLAY || !device_info || !setupapi_gpu(&gpu)) {
+        g_last_error = 13;                                                     /* ERROR_INVALID_DATA */
+        return 0;
+    }
+    if (*(const u32 *)device_info != 32) { g_last_error = 1784; return 0; }
+    char text[512];
+    size_t length = 0;          /* bytes of text including the terminator(s) */
+    u32 type = 1, dword = 0;
+    const u32 v = gpu.vendor_id, d = gpu.device_id, r = gpu.revision;
+#define SZ(...) (length = (size_t)snprintf(text, sizeof(text), __VA_ARGS__) + 1)
+    switch (property) {
+    case 0:  SZ("%s", gpu.name); break;                                            /* SPDRP_DEVICEDESC */
+    case 1: case 2: {                                                              /* SPDRP_HARDWAREID / COMPATIBLEIDS */
+        type = 7;                                                                  /* REG_MULTI_SZ */
+        const int n = property == 1 ?
+            snprintf(text, sizeof(text), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_%02X|PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000|"
+                     "PCI\\VEN_%04X&DEV_%04X&CC_030000|PCI\\VEN_%04X&DEV_%04X&CC_0300|", v, d, r, v, d, v, d, v, d) :
+            snprintf(text, sizeof(text), "PCI\\VEN_%04X&DEV_%04X&REV_%02X|PCI\\VEN_%04X&DEV_%04X|PCI\\VEN_%04X&CC_030000|"
+                     "PCI\\VEN_%04X&CC_0300|PCI\\VEN_%04X|PCI\\CC_030000|PCI\\CC_0300|", v, d, r, v, d, v, v, v);
+        for (int i = 0; i < n; ++i) if (text[i] == '|') text[i] = 0;
+        text[n] = 0;
+        length = (size_t)n + 1;
+        break;
+    }
+    case 4:                                                                        /* SPDRP_SERVICE */
+        if (v == 0x10deu) SZ("nvlddmkm"); else if (v == 0x1002u) SZ("amdkmdag"); else if (v == 0x8086u) SZ("igfx");
+        else SZ("BasicDisplay");
+        break;
+    case 7:  SZ("Display"); break;                                                 /* SPDRP_CLASS */
+    case 8:  SZ("{4d36e968-e325-11ce-bfc1-08002be10318}"); break;                  /* SPDRP_CLASSGUID */
+    case 9:  SZ("{4d36e968-e325-11ce-bfc1-08002be10318}\\0000"); break;            /* SPDRP_DRIVER */
+    case 11: SZ("%s", setupapi_provider(v)); break;                                /* SPDRP_MFG */
+    case 13: SZ("PCI bus 1, device 0, function 0"); break;                         /* SPDRP_LOCATION_INFORMATION */
+    case 14: SZ("\\Device\\NTPNP_PCI0001"); break;                                 /* SPDRP_PHYSICAL_DEVICE_OBJECT_NAME */
+    case 21: type = 4; dword = 1; break;                                           /* SPDRP_BUSNUMBER */
+    case 28: type = 4; dword = 0; break;                                           /* SPDRP_ADDRESS: device 0, function 0 */
+    default: g_last_error = 13; return 0;
+    }
+#undef SZ
+    const u32 need = type == 4 ? 4u : (u32)length * (wide ? 2u : 1u);
+    if (property_type) *property_type = type;
+    if (required_size) *required_size = need;
+    if (!buffer || buffer_size < need) { g_last_error = 122; return 0; }           /* ERROR_INSUFFICIENT_BUFFER */
+    if (type == 4) memcpy(buffer, &dword, 4);
+    else for (size_t c = 0; c < length; ++c) {
+        if (wide) ((u16 *)buffer)[c] = (u8)text[c];
+        else buffer[c] = (u8)text[c];
+    }
+    g_last_error = 0;
+    return 1;
 }
 static u64 __attribute__((ms_abi))
 impl_SetupDiGetDeviceRegistryPropertyW(u64 set, const void *device_info,
@@ -12421,12 +13833,7 @@ impl_SetupDiGetDeviceRegistryPropertyW(u64 set, const void *device_info,
                                        u8 *buffer, u32 buffer_size,
                                        u32 *required_size)
 {
-    (void)device_info; (void)property; (void)buffer; (void)buffer_size;
-    if (property_type) *property_type = 0;
-    if (required_size) *required_size = 0;
-    if (set != BEER_DEVICE_INFO_SET_HANDLE) { g_last_error = 6; return 0; }
-    g_last_error = 13; /* ERROR_INVALID_DATA: no enumerated device/property. */
-    return 0;
+    return setupapi_property(set, device_info, property, property_type, buffer, buffer_size, required_size, 1);
 }
 static u64 __attribute__((ms_abi))
 impl_SetupDiGetDeviceRegistryPropertyA(u64 set, const void *device_info,
@@ -12434,14 +13841,12 @@ impl_SetupDiGetDeviceRegistryPropertyA(u64 set, const void *device_info,
                                        u8 *buffer, u32 buffer_size,
                                        u32 *required_size)
 {
-    return impl_SetupDiGetDeviceRegistryPropertyW(set, device_info, property,
-                                                   property_type, buffer,
-                                                   buffer_size, required_size);
+    return setupapi_property(set, device_info, property, property_type, buffer, buffer_size, required_size, 0);
 }
 static u64 __attribute__((ms_abi))
 impl_SetupDiDestroyDeviceInfoList(u64 set)
 {
-    if (set != BEER_DEVICE_INFO_SET_HANDLE) { g_last_error = 6; return 0; }
+    if (!setupapi_set_valid(set)) { g_last_error = 6; return 0; }
     g_last_error = 0;
     return 1;
 }
@@ -12502,6 +13907,7 @@ impl_ImmGetDefaultIMEWnd(u64 hwnd)
 
 static u64 __attribute__((ms_abi))
 impl_UpdateWindow(u64 hw) {
+    if (beer_window_other(hw)) return 1;
     if (hw != FAKE_HWND || !xwayland_window_exists()) {
         g_last_error = 1400;
         return 0;
@@ -12533,7 +13939,12 @@ static u64 __attribute__((ms_abi))
 impl_GetModuleHandleExW(u32 flags, u64 name, u64 *out)
 {
     u64 module;
-    if (flags & 4u) module = module_from_address(name);                 /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */
+    if (flags & 4u) {
+        module = module_from_address(name);                             /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */
+        if (getenv("BEER_MODULE_LOG"))
+            fprintf(stderr, "[MODULE] GetModuleHandleExW(from address %#llx) -> %#llx\n",
+                    (unsigned long long)name, (unsigned long long)module);
+    }
     else if (!name) module = (u64)g_img;
     else {
         const u16 *w = (const u16 *)(uintptr_t)name;
@@ -12556,29 +13967,11 @@ impl_GetModuleHandleExA(u32 flags, u64 name, u64 *out)
     return module ? 1 : 0;
 }
 
-/* ---- Condition variables (CONDITION_VARIABLE = pointer-sized opaque) ----
- * Windows stores condition-variable state in one pointer-sized word. Keep the
- * guest word zero-compatible and associate host pthread state by its address.
- * The old implementation returned immediately for INFINITE sleeps, turning
- * producer/consumer waits into busy loops and losing every wake notification. */
-#define MAX_CONDITION_VARIABLES 16384
-
-typedef struct {
-    u64 *guest_address;
-    pthread_mutex_t mutex;
-    pthread_cond_t condition;
-    u64 generation;
-    u32 waiters;
-    u64 creator_rip;
-    u64 last_waker_rip;
-    int used;
-} WinConditionVariable;
-
-static WinConditionVariable g_condition_variables[MAX_CONDITION_VARIABLES];
-static pthread_mutex_t g_condition_table_mutex = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic(u32) g_condition_count;
-static _Atomic(u32) g_condition_trace_count;
-
+/* ---- Condition variables and SRW locks: state in the guest word, blocking on futexes ----
+ * Windows CONDITION_VARIABLE and SRWLOCK are pointer-sized, zero-initialized words that are never destroyed: code
+ * embeds them in objects and frees the memory. Any host object associated with one therefore leaks when the guest
+ * frees it (one page per SRW lock leaked ~12 MB/s in RE9) and any fixed table of them fills up. All state lives in
+ * the word itself; threads block with a futex on its low 32 bits. Both words read 0 when idle, as on Windows. */
 static int sync_diagnostics_enabled(void)
 {
     static int initialized;
@@ -12590,46 +13983,51 @@ static int sync_diagnostics_enabled(void)
     }
     return enabled;
 }
-
-static WinConditionVariable *condition_variable_get(u64 *address, int create)
+static long sync_futex_wait(u32 *word, u32 expected, const struct timespec *relative)
 {
-    if (!address) return NULL;
-    pthread_mutex_lock(&g_condition_table_mutex);
-    WinConditionVariable *free_slot = NULL;
-    for (size_t i = 0; i < MAX_CONDITION_VARIABLES; ++i) {
-        WinConditionVariable *entry = &g_condition_variables[i];
-        if (entry->used && entry->guest_address == address) {
-            pthread_mutex_unlock(&g_condition_table_mutex);
-            return entry;
-        }
-        if (!entry->used && !free_slot) free_slot = entry;
+    return syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, expected, relative, NULL, 0);
+}
+static void sync_futex_wake(u32 *word, int count)
+{
+    syscall(SYS_futex, word, FUTEX_WAKE_PRIVATE, count, NULL, NULL, 0);
+}
+static __thread u64 *g_dbg_cv_wait;    /* condition variable this thread sleeps on (SIGUSR1 dump) */
+
+/* CONDITION_VARIABLE: low 32 bits a wake sequence, high 32 bits the number of sleepers. A sleeper reads the sequence
+ * before releasing its lock, so a wake that lands in between changes the word and the futex wait returns at once.
+ * Windows permits spurious wake-ups; callers re-check their predicate. */
+static u32 cv_prepare(u64 *cv)
+{
+    __atomic_add_fetch((u32 *)cv + 1, 1, __ATOMIC_SEQ_CST);
+    return __atomic_load_n((u32 *)cv, __ATOMIC_SEQ_CST);
+}
+/* Returns 0 when woken (or spuriously), ETIMEDOUT when the timeout elapsed. */
+static int cv_wait(u64 *cv, u32 sequence, u32 ms)
+{
+    int rc = 0;
+    g_dbg_cv_wait = cv;
+    if (ms == 0) {
+        rc = ETIMEDOUT;
+    } else if (ms == 0xFFFFFFFFu) {
+        sync_futex_wait((u32 *)cv, sequence, NULL);
+    } else {
+        struct timespec relative = { (time_t)(ms / 1000u), (long)(ms % 1000u) * 1000000L };
+        if (sync_futex_wait((u32 *)cv, sequence, &relative) != 0 && errno == ETIMEDOUT) rc = ETIMEDOUT;
     }
-    if (create && free_slot) {
-        memset(free_slot, 0, sizeof(*free_slot));
-        free_slot->guest_address = address;
-        free_slot->creator_rip = g_dispatch_incoming_return;
-        pthread_mutex_init(&free_slot->mutex, NULL);
-        pthread_cond_init(&free_slot->condition, NULL);
-        free_slot->used = 1;
-        atomic_fetch_add(&g_condition_count, 1);
-    } else if (create && !free_slot) {
-        static _Atomic(u32) exhaustion_logs;
-        if (atomic_fetch_add(&exhaustion_logs, 1) == 0)
-            fprintf(stderr,
-                    "[SYNC] condition-variable table exhausted at %u entries "
-                    "guest-return=0x%llx\n",
-                    MAX_CONDITION_VARIABLES,
-                    (unsigned long long)g_dispatch_incoming_return);
-    }
-    pthread_mutex_unlock(&g_condition_table_mutex);
-    return create ? free_slot : NULL;
+    g_dbg_cv_wait = NULL;
+    __atomic_sub_fetch((u32 *)cv + 1, 1, __ATOMIC_SEQ_CST);
+    return rc;
+}
+static void cv_wake(u64 *cv, int all)
+{
+    __atomic_add_fetch((u32 *)cv, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n((u32 *)cv + 1, __ATOMIC_SEQ_CST)) sync_futex_wake((u32 *)cv, all ? 0x7fffffff : 1);
 }
 
 static u64 __attribute__((ms_abi)) impl_InitializeConditionVariable(u64 *cv)
 {
-    if (!cv) return 0;
-    *cv = 0;
-    return condition_variable_get(cv, 1) ? 1 : 0;
+    if (cv) *cv = 0;
+    return 0;
 }
 
 static u64 __attribute__((ms_abi))
@@ -12663,98 +14061,32 @@ static u64 __attribute__((ms_abi)) impl_WakeByAddressAll(const void *address)
 
 static u64 __attribute__((ms_abi)) impl_WakeConditionVariable(u64 *cv)
 {
-    WinConditionVariable *entry = condition_variable_get(cv, 0);
-    if (!entry) return 0;
-    pthread_mutex_lock(&entry->mutex);
-    ++entry->generation;
-    entry->last_waker_rip = g_dispatch_incoming_return;
-    u32 waiters = entry->waiters;
-    pthread_cond_signal(&entry->condition);
-    pthread_mutex_unlock(&entry->mutex);
-    if (sync_diagnostics_enabled() && waiters) {
-        u32 trace = atomic_fetch_add(&g_condition_trace_count, 1);
-        if (trace < 256)
-            fprintf(stderr,
-                    "[SYNC] WakeConditionVariable cv=%p waiters=%u "
-                    "creator=0x%llx waker=0x%llx\n",
-                    (void *)cv, waiters,
-                    (unsigned long long)entry->creator_rip,
-                    (unsigned long long)entry->last_waker_rip);
-    }
+    if (cv) cv_wake(cv, 0);
     return 0;
 }
 
 static u64 __attribute__((ms_abi)) impl_WakeAllConditionVariable(u64 *cv)
 {
-    WinConditionVariable *entry = condition_variable_get(cv, 0);
-    if (!entry) return 0;
-    pthread_mutex_lock(&entry->mutex);
-    ++entry->generation;
-    entry->last_waker_rip = g_dispatch_incoming_return;
-    u32 waiters = entry->waiters;
-    pthread_cond_broadcast(&entry->condition);
-    pthread_mutex_unlock(&entry->mutex);
-    if (sync_diagnostics_enabled() && waiters) {
-        u32 trace = atomic_fetch_add(&g_condition_trace_count, 1);
-        if (trace < 256)
-            fprintf(stderr,
-                    "[SYNC] WakeAllConditionVariable cv=%p waiters=%u "
-                    "creator=0x%llx waker=0x%llx\n",
-                    (void *)cv, waiters,
-                    (unsigned long long)entry->creator_rip,
-                    (unsigned long long)entry->last_waker_rip);
-    }
+    if (cv) cv_wake(cv, 1);
     return 0;
 }
 
 static u64 __attribute__((ms_abi))
 beer_sleep_cv_cs(u64 *cv, WIN_CS *cs, u32 ms)
 {
-    WinConditionVariable *entry = condition_variable_get(cv, 1);
-    if (!entry || !cs) {
+    if (!cv || !cs) {
         g_last_error = 87; /* ERROR_INVALID_PARAMETER */
         return 0;
     }
-
-    pthread_mutex_lock(&entry->mutex);
-    u64 generation = entry->generation;
-    ++entry->waiters;
-    if (sync_diagnostics_enabled() && ms == 0xFFFFFFFFu) {
-        u32 trace = atomic_fetch_add(&g_condition_trace_count, 1);
-        if (trace < 256)
-            fprintf(stderr,
-                    "[SYNC] SleepConditionVariableCS cv=%p waiters=%u "
-                    "creator=0x%llx waiter=0x%llx last-waker=0x%llx\n",
-                    (void *)cv, entry->waiters,
-                    (unsigned long long)entry->creator_rip,
-                    (unsigned long long)g_dispatch_incoming_return,
-                    (unsigned long long)entry->last_waker_rip);
-    }
+    if (sync_diagnostics_enabled() && ms == 0xFFFFFFFFu)
+        fprintf(stderr, "[SYNC] SleepConditionVariableCS cv=%p value=0x%llx waiter=0x%llx\n", (void *)cv,
+                (unsigned long long)*cv, (unsigned long long)g_dispatch_incoming_return);
+    const u32 sequence = cv_prepare(cv);
     impl_LeaveCriticalSection(cs);
-
-    int rc = 0;
-    if (ms == 0) {
-        rc = ETIMEDOUT;
-    } else if (ms == 0xFFFFFFFFu) {
-        while (entry->generation == generation && rc == 0)
-            rc = pthread_cond_wait(&entry->condition, &entry->mutex);
-    } else {
-        struct timespec deadline;
-        if (calc_abs_deadline(&deadline, ms) != 0) rc = ETIMEDOUT;
-        while (entry->generation == generation && rc == 0)
-            rc = pthread_cond_timedwait(&entry->condition, &entry->mutex,
-                                        &deadline);
-    }
-    --entry->waiters;
-    pthread_mutex_unlock(&entry->mutex);
+    const int rc = cv_wait(cv, sequence, ms);
     impl_EnterCriticalSection(cs);
-
     if (rc == ETIMEDOUT) {
         g_last_error = 1460; /* ERROR_TIMEOUT */
-        return 0;
-    }
-    if (rc != 0) {
-        g_last_error = 1;
         return 0;
     }
     return 1;
@@ -12778,223 +14110,158 @@ impl_SleepConditionVariableCS(u64 *cv, WIN_CS *cs, u32 ms)
 }
 
 /* ---- SRWLOCK ----
- * Like Windows SRWLOCK, the guest-visible object is one pointer-sized word.
- * Host pthread state is associated by address so PE objects can remain
- * zero-initialized and retain their Windows layout. */
+ * Low 32 bits (the futex word): bit 0 held (any mode), bit 1 sleepers present, bit 2 exclusive, bits 4.. the shared
+ * hold count. High 32 bits: writers waiting, so new shared acquisitions wait behind them (writers are not starved;
+ * recursive shared acquisition can then deadlock, as it can on Windows). Windows does not tie an SRW lock to the
+ * acquiring thread, and code releases locks acquired on other threads (RE9's job system), so no owner is recorded. */
 #define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1u
+#define SRW_HELD       0x1u
+#define SRW_SLEEPERS   0x2u
+#define SRW_EXCLUSIVE  0x4u
+#define SRW_SHARE_ONE  0x10u
+#define SRW_SHARE_MASK 0xfffffff0u
+__thread u64 *g_dbg_srw_wait;   /* lock this thread is blocked acquiring (SIGUSR1 dump) */
 
-/* The lock state is kept explicitly (writer flag, reader count) under a short-held mutex instead of in a
- * pthread_rwlock. Windows does not tie an SRW lock to the thread that acquired it, and code releases locks
- * acquired on other threads; glibc decides "writer unlock" by comparing the caller with the recorded writer, so
- * such a release was taken as a reader unlock, corrupted the lock and left waiters blocked for good (RE9's job
- * system). Waiting writers are served before new readers. */
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t changed;
-    int writer;                     /* an exclusive hold is active */
-    int writers_waiting;
-    volatile long owner_tid;        /* diagnostics (kill -USR1): exclusive holder and where it acquired */
-    volatile u64 owner_rip;
-    volatile int readers;           /* shared holds */
-    volatile u64 reader_rip;
-} WinSrwLock;
-__thread WinSrwLock *g_dbg_srw_wait;   /* lock this thread is blocked acquiring */
-
-static void srw_wrlock_dbg(WinSrwLock *e)
+static void srw_acquire_exclusive(u64 *lock)
 {
-    pthread_mutex_lock(&e->mutex);
-    if (e->writer || e->readers) {
-        g_dbg_srw_wait = e;
-        ++e->writers_waiting;
-        while (e->writer || e->readers) pthread_cond_wait(&e->changed, &e->mutex);
-        --e->writers_waiting;
-        g_dbg_srw_wait = NULL;
+    u32 *state = (u32 *)lock, *writers = state + 1;
+    int announced = 0;
+    for (;;) {
+        u32 s = __atomic_load_n(state, __ATOMIC_ACQUIRE);
+        if (!(s & (SRW_EXCLUSIVE | SRW_SHARE_MASK))) {
+            if (__atomic_compare_exchange_n(state, &s, s | SRW_HELD | SRW_EXCLUSIVE, 1, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_RELAXED)) {
+                if (announced) __atomic_sub_fetch(writers, 1, __ATOMIC_RELEASE);
+                g_dbg_srw_wait = NULL;
+                return;
+            }
+            continue;
+        }
+        if (!announced) {                     /* hold off new readers, then look again */
+            __atomic_add_fetch(writers, 1, __ATOMIC_SEQ_CST);
+            announced = 1;
+            continue;
+        }
+        if (!(s & SRW_SLEEPERS) &&
+            !__atomic_compare_exchange_n(state, &s, s | SRW_SLEEPERS, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            continue;
+        g_dbg_srw_wait = lock;
+        sync_futex_wait(state, s | SRW_SLEEPERS, NULL);
     }
-    e->writer = 1;
-    e->owner_tid = syscall(SYS_gettid);
-    e->owner_rip = g_dispatch_incoming_return;
-    pthread_mutex_unlock(&e->mutex);
 }
-static void srw_rdlock_dbg(WinSrwLock *e)
+static void srw_acquire_shared(u64 *lock)
 {
-    pthread_mutex_lock(&e->mutex);
-    if (e->writer || e->writers_waiting) {
-        g_dbg_srw_wait = e;
-        while (e->writer || e->writers_waiting) pthread_cond_wait(&e->changed, &e->mutex);
-        g_dbg_srw_wait = NULL;
+    u32 *state = (u32 *)lock, *writers = state + 1;
+    for (;;) {
+        u32 s = __atomic_load_n(state, __ATOMIC_ACQUIRE);
+        if (!(s & SRW_EXCLUSIVE) && !__atomic_load_n(writers, __ATOMIC_ACQUIRE)) {
+            if (__atomic_compare_exchange_n(state, &s, (s + SRW_SHARE_ONE) | SRW_HELD, 1, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_RELAXED)) {
+                g_dbg_srw_wait = NULL;
+                return;
+            }
+            continue;
+        }
+        if (!(s & SRW_SLEEPERS) &&
+            !__atomic_compare_exchange_n(state, &s, s | SRW_SLEEPERS, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            continue;
+        g_dbg_srw_wait = lock;
+        sync_futex_wait(state, s | SRW_SLEEPERS, NULL);
     }
-    ++e->readers;
-    e->reader_rip = g_dispatch_incoming_return;
-    pthread_mutex_unlock(&e->mutex);
 }
-static void srw_unlock_dbg(WinSrwLock *e, int exclusive)
+static void srw_release_exclusive(u64 *lock)
 {
-    pthread_mutex_lock(&e->mutex);
-    if (exclusive) {
-        e->writer = 0;
-        e->owner_tid = 0;
-    } else if (e->readers > 0) {
-        --e->readers;
-    }
-    if (!e->writer && !e->readers) pthread_cond_broadcast(&e->changed);
-    pthread_mutex_unlock(&e->mutex);
+    u32 *state = (u32 *)lock;
+    const u32 s = __atomic_fetch_and(state, ~(SRW_HELD | SRW_EXCLUSIVE | SRW_SLEEPERS), __ATOMIC_RELEASE);
+    if (s & SRW_SLEEPERS) sync_futex_wake(state, 0x7fffffff);
 }
-static int srw_trylock(WinSrwLock *e, int exclusive)
+static void srw_release_shared(u64 *lock)
 {
-    pthread_mutex_lock(&e->mutex);
-    const int ok = exclusive ? !e->writer && !e->readers : !e->writer && !e->writers_waiting;
-    if (ok && exclusive) {
-        e->writer = 1;
-        e->owner_tid = syscall(SYS_gettid);
-        e->owner_rip = g_dispatch_incoming_return;
-    } else if (ok) {
-        ++e->readers;
-        e->reader_rip = g_dispatch_incoming_return;
+    u32 *state = (u32 *)lock;
+    u32 s = __atomic_load_n(state, __ATOMIC_RELAXED);
+    for (;;) {
+        if (!(s & SRW_SHARE_MASK)) return;                 /* not held shared: nothing to release */
+        u32 n = s - SRW_SHARE_ONE;
+        if (!(n & SRW_SHARE_MASK)) n &= ~(SRW_HELD | SRW_SLEEPERS);
+        if (__atomic_compare_exchange_n(state, &s, n, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            if ((s & SRW_SLEEPERS) && !(n & SRW_SHARE_MASK)) sync_futex_wake(state, 0x7fffffff);
+            return;
+        }
     }
-    pthread_mutex_unlock(&e->mutex);
-    return ok;
 }
-
-static WinSrwLock *srw_lock_get(u64 *address, int create)
+static int srw_try_exclusive(u64 *lock)
 {
-    if (!address) return NULL;
-
-    /* SRWLOCK is an opaque pointer-sized value. Store Beer's host object in
-     * that word instead of keying an ever-growing address side table. RE8
-     * constructs and frees many short-lived objects; retaining every historical
-     * address exhausted the old table and silently turned later locks into
-     * no-ops. Compare/exchange also makes lazy initialization thread-safe for
-     * statically zero-initialized locks. */
-    u64 value = __atomic_load_n(address, __ATOMIC_ACQUIRE);
-    if (value || !create) return (WinSrwLock *)(uintptr_t)value;
-
-    WinSrwLock *candidate = host_alloc(sizeof(*candidate));
-    if (!candidate) return NULL;
-    memset(candidate, 0, sizeof(*candidate));
-    if (pthread_mutex_init(&candidate->mutex, NULL) != 0) {
-        host_free(candidate, sizeof(*candidate));
-        return NULL;
-    }
-    pthread_cond_init(&candidate->changed, NULL);
-
-    u64 expected = 0;
-    if (!__atomic_compare_exchange_n(address, &expected,
-                                     (u64)(uintptr_t)candidate, 0,
-                                     __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
-        pthread_cond_destroy(&candidate->changed);
-        pthread_mutex_destroy(&candidate->mutex);
-        host_free(candidate, sizeof(*candidate));
-        return (WinSrwLock *)(uintptr_t)expected;
-    }
-    return candidate;
+    u32 *state = (u32 *)lock;
+    u32 s = __atomic_load_n(state, __ATOMIC_ACQUIRE);
+    while (!(s & (SRW_EXCLUSIVE | SRW_SHARE_MASK)))
+        if (__atomic_compare_exchange_n(state, &s, s | SRW_HELD | SRW_EXCLUSIVE, 1, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED))
+            return 1;
+    return 0;
+}
+static int srw_try_shared(u64 *lock)
+{
+    u32 *state = (u32 *)lock, *writers = state + 1;
+    u32 s = __atomic_load_n(state, __ATOMIC_ACQUIRE);
+    while (!(s & SRW_EXCLUSIVE) && !__atomic_load_n(writers, __ATOMIC_ACQUIRE))
+        if (__atomic_compare_exchange_n(state, &s, (s + SRW_SHARE_ONE) | SRW_HELD, 1, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED))
+            return 1;
+    return 0;
 }
 
 static u64 __attribute__((ms_abi)) impl_InitializeSRWLock(u64 *lock)
 {
-    if (!lock) return 0;
-    *lock = 0;
-    (void)srw_lock_get(lock, 1);
+    if (lock) *lock = 0;
     return 0;
 }
-
 static u64 __attribute__((ms_abi)) impl_AcquireSRWLockExclusive(u64 *lock)
 {
-    WinSrwLock *entry = srw_lock_get(lock, 1);
-    if (entry) srw_wrlock_dbg(entry);
+    if (lock) srw_acquire_exclusive(lock);
     return 0;
 }
-
 static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockExclusive(u64 *lock)
 {
-    WinSrwLock *entry = srw_lock_get(lock, 1);
-    return entry && srw_trylock(entry, 1);
+    return lock && srw_try_exclusive(lock) ? 1 : 0;
 }
-
 static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockExclusive(u64 *lock)
 {
-    WinSrwLock *entry = srw_lock_get(lock, 0);
-    if (entry) srw_unlock_dbg(entry, 1);
+    if (lock) srw_release_exclusive(lock);
     return 0;
 }
-
 static u64 __attribute__((ms_abi)) impl_AcquireSRWLockShared(u64 *lock)
 {
-    WinSrwLock *entry = srw_lock_get(lock, 1);
-    if (entry) srw_rdlock_dbg(entry);
+    if (lock) srw_acquire_shared(lock);
     return 0;
 }
-
 static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockShared(u64 *lock)
 {
-    WinSrwLock *entry = srw_lock_get(lock, 1);
-    return entry && srw_trylock(entry, 0);
+    return lock && srw_try_shared(lock) ? 1 : 0;
 }
-
 static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockShared(u64 *lock)
 {
-    WinSrwLock *entry = srw_lock_get(lock, 0);
-    if (entry) srw_unlock_dbg(entry, 0);
+    if (lock) srw_release_shared(lock);
     return 0;
 }
 
 static u64 __attribute__((ms_abi))
 beer_sleep_cv_srw(u64 *cv, u64 *lock, u32 ms, u32 flags)
 {
-    if (flags & ~CONDITION_VARIABLE_LOCKMODE_SHARED) {
+    if (!cv || !lock || (flags & ~CONDITION_VARIABLE_LOCKMODE_SHARED)) {
         g_last_error = 87; /* ERROR_INVALID_PARAMETER */
         return 0;
     }
-    WinConditionVariable *condition = condition_variable_get(cv, 1);
-    WinSrwLock *srw = srw_lock_get(lock, 1);
-    if (!condition || !srw) {
-        g_last_error = 87;
-        return 0;
-    }
-
-    pthread_mutex_lock(&condition->mutex);
-    u64 generation = condition->generation;
-    ++condition->waiters;
-    if (sync_diagnostics_enabled() && ms == 0xFFFFFFFFu) {
-        u32 trace = atomic_fetch_add(&g_condition_trace_count, 1);
-        if (trace < 256)
-            fprintf(stderr,
-                    "[SYNC] SleepConditionVariableSRW cv=%p lock=%p "
-                    "waiters=%u flags=%u creator=0x%llx waiter=0x%llx "
-                    "last-waker=0x%llx\n",
-                    (void *)cv, (void *)lock, condition->waiters, flags,
-                    (unsigned long long)condition->creator_rip,
-                    (unsigned long long)g_dispatch_incoming_return,
-                    (unsigned long long)condition->last_waker_rip);
-    }
-    srw_unlock_dbg(srw, !(flags & CONDITION_VARIABLE_LOCKMODE_SHARED));
-
-    int rc = 0;
-    if (ms == 0) {
-        rc = ETIMEDOUT;
-    } else if (ms == 0xFFFFFFFFu) {
-        while (condition->generation == generation && rc == 0)
-            rc = pthread_cond_wait(&condition->condition, &condition->mutex);
-    } else {
-        struct timespec deadline;
-        if (calc_abs_deadline(&deadline, ms) != 0) rc = ETIMEDOUT;
-        while (condition->generation == generation && rc == 0)
-            rc = pthread_cond_timedwait(&condition->condition,
-                                        &condition->mutex, &deadline);
-    }
-    --condition->waiters;
-    pthread_mutex_unlock(&condition->mutex);
-
-    if (flags & CONDITION_VARIABLE_LOCKMODE_SHARED)
-        srw_rdlock_dbg(srw);
-    else
-        srw_wrlock_dbg(srw);
-
+    const int shared = (flags & CONDITION_VARIABLE_LOCKMODE_SHARED) != 0;
+    if (sync_diagnostics_enabled() && ms == 0xFFFFFFFFu)
+        fprintf(stderr, "[SYNC] SleepConditionVariableSRW cv=%p lock=%p value=0x%llx flags=%u waiter=0x%llx\n",
+                (void *)cv, (void *)lock, (unsigned long long)*cv, flags,
+                (unsigned long long)g_dispatch_incoming_return);
+    const u32 sequence = cv_prepare(cv);
+    if (shared) srw_release_shared(lock); else srw_release_exclusive(lock);
+    const int rc = cv_wait(cv, sequence, ms);
+    if (shared) srw_acquire_shared(lock); else srw_acquire_exclusive(lock);
     if (rc == ETIMEDOUT) {
         g_last_error = 1460; /* ERROR_TIMEOUT */
-        return 0;
-    }
-    if (rc != 0) {
-        g_last_error = 1;
         return 0;
     }
     return 1;
@@ -13023,7 +14290,7 @@ impl_InitializeCriticalSectionEx(WIN_CS *cs, u32 spin, u32 flags)
 
 /* ---- Threads (real pthread implementation) ---- */
 #define MAX_THREADS 512
-#define THREAD_HANDLE_BASE 0xB2000000u
+#define THREAD_HANDLE_BASE 0x33000000u   /* below 0x80000000: see SEM_HANDLE_BASE */
 
 #define INVALID_HANDLE_VALUE64 UINT64_MAX
 
@@ -13043,6 +14310,8 @@ typedef struct {
     u64 fn;
     u64 arg;
     u64 creator_rip;
+    int context_set;               /* SetThreadContext before the first resume: start at ctx_rip (see below) */
+    u64 ctx_rip, ctx_rcx, ctx_rdx;
     pthread_mutex_t mtx;
     pthread_cond_t  cv;
 } WinThread;
@@ -13082,6 +14351,110 @@ static int thread_id_from_handle(u64 h)
     if (id <= 0 || id >= g_thread_cnt) return -1;
     if (!g_threads[id].used) return -1;
     return id;
+}
+
+/* ---- Asynchronous procedure calls (QueueUserAPC, NtQueueApcThread) ----
+ * Each queued APC belongs to a Windows thread ID. It runs on that thread, in queue order, the next time the thread is
+ * in an alertable wait (SleepEx, WaitFor*ObjectsEx, MsgWaitForMultipleObjectsEx with MWMO_ALERTABLE,
+ * NtDelayExecution) or calls NtTestAlert; the wait then returns WAIT_IO_COMPLETION / STATUS_USER_APC. Alertable waits
+ * check for APCs between short wait slices. */
+typedef struct { u32 tid; u64 routine, argument1, argument2, argument3; int native; } BeerApc;
+static BeerApc g_apcs[1024];
+static int g_apc_count;
+static pthread_mutex_t g_apc_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef u64 (__attribute__((ms_abi)) *BeerGuestCall)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+static u64 call_guest_nested(BeerGuestCall fn, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
+                             u64 a6, u64 a7, u64 a8, u64 a9, u64 a10);
+
+static u32 beer_apc_thread_tid(u64 thread)
+{
+    if (thread == (u64)-2) return (u32)current_windows_thread_id();       /* GetCurrentThread() */
+    int id = thread_id_from_handle(thread);
+    return id > 0 ? g_threads[id].tid : 0;
+}
+
+/* native: NtQueueApcThread's routine(argument1, argument2, argument3); otherwise QueueUserAPC's routine(argument1). */
+static int beer_apc_queue(u64 thread, u64 routine, u64 argument1, u64 argument2, u64 argument3, int native)
+{
+    u32 tid = beer_apc_thread_tid(thread);
+    static int diag = -1;                          /* BEER_APC_DIAGNOSTICS=1: every queued APC */
+    if (diag < 0) diag = getenv("BEER_APC_DIAGNOSTICS") != NULL;
+    if (diag || !tid)
+        fprintf(stderr, "[APC] queue thread handle 0x%llx -> tid %u routine 0x%llx arg 0x%llx from tid %u (caller rva 0x%llx)%s\n",
+                (unsigned long long)thread, tid, (unsigned long long)routine, (unsigned long long)argument1,
+                (unsigned)current_windows_thread_id(), (unsigned long long)(g_dispatch_incoming_return - (u64)g_img),
+                tid ? "" : " -- unknown thread handle, not queued");
+    if (!tid || !routine) return 0;
+    pthread_mutex_lock(&g_apc_lock);
+    int ok = g_apc_count < (int)(sizeof(g_apcs) / sizeof(*g_apcs));
+    if (ok) g_apcs[g_apc_count++] = (BeerApc){ tid, routine, argument1, argument2, argument3, native };
+    pthread_mutex_unlock(&g_apc_lock);
+    return ok;
+}
+
+static int beer_apc_pending(void)
+{
+    u32 tid = (u32)current_windows_thread_id();
+    int pending = 0;
+    pthread_mutex_lock(&g_apc_lock);
+    for (int i = 0; i < g_apc_count && !pending; ++i) pending = g_apcs[i].tid == tid;
+    pthread_mutex_unlock(&g_apc_lock);
+    return pending;
+}
+
+/* Runs this thread's queued APCs in order; returns how many ran. */
+static int beer_apc_run(void)
+{
+    u32 tid = (u32)current_windows_thread_id();
+    int ran = 0;
+    for (;;) {
+        BeerApc apc;
+        int found = 0;
+        pthread_mutex_lock(&g_apc_lock);
+        for (int i = 0; i < g_apc_count; ++i)
+            if (g_apcs[i].tid == tid) {
+                apc = g_apcs[i];
+                memmove(&g_apcs[i], &g_apcs[i + 1], (size_t)(g_apc_count - i - 1) * sizeof(*g_apcs));
+                --g_apc_count;
+                found = 1;
+                break;
+            }
+        pthread_mutex_unlock(&g_apc_lock);
+        if (!found) break;
+        if (getenv("BEER_APC_DIAGNOSTICS"))
+            fprintf(stderr, "[APC] deliver to tid %u (host %ld) routine 0x%llx arg 0x%llx\n", tid, (long)syscall(SYS_gettid),
+                    (unsigned long long)apc.routine, (unsigned long long)apc.argument1);
+        call_guest_nested((BeerGuestCall)(uintptr_t)apc.routine, apc.argument1, apc.argument2, apc.argument3,
+                          0, 0, 0, 0, 0, 0, 0, 0);
+        ++ran;
+    }
+    return ran;
+}
+
+/* An alertable wait: `wait` is tried in slices of at most 10 ms; between slices this thread's APCs are delivered.
+ * Returns the wait's own result, the timeout result when `ms` elapses, or `apc_result` after running APCs. */
+static u64 beer_alertable_wait(u32 ms, BeerWaitSlice wait, void *context, u64 timeout_result, u64 apc_result)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (beer_apc_pending()) { beer_apc_run(); return apc_result; }
+        u32 slice = 10;
+        if (ms != 0xFFFFFFFFu) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            u64 elapsed = (u64)(now.tv_sec - start.tv_sec) * 1000u + (u64)((now.tv_nsec - start.tv_nsec) / 1000000);
+            if (elapsed >= ms) { if (wait) { u64 r = wait(context, 0); if (r != timeout_result) return r; } return timeout_result; }
+            if (ms - elapsed < slice) slice = (u32)(ms - elapsed);
+        }
+        if (wait) {
+            u64 r = wait(context, slice);
+            if (r != timeout_result) return r;
+        } else {
+            struct timespec ts = { 0, (long)slice * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+    }
 }
 
 
@@ -13277,6 +14650,22 @@ static size_t guest_thread_stack_reserve(size_t requested)
     return (reserve + 0xffff) & ~(size_t)0xffff;
 }
 
+/* The thread's guest stack, reserved once: at CreateThread for a suspended thread (Windows allocates the stack
+ * before the thread first runs, and GetThreadContext reports it), otherwise when it starts. Returns 1 when the guest
+ * runs on the pthread stack placed inside the reservation (BEER_THREAD_STACK_LEGACY=1). */
+static int thread_reserve_stack(WinThread *t)
+{
+    const int legacy_stack = getenv("BEER_THREAD_STACK_LEGACY") != NULL;
+    if (t->stack) return legacy_stack;
+    const size_t stack_size = guest_thread_stack_reserve(t->stack_request) + (legacy_stack ? 0x1000u : 0u);
+    void *stack = beer_vm_map_bottom_up(stack_size, 65536, PROT_READ | PROT_WRITE, MAP_NORESERVE);
+    if (stack != MAP_FAILED) {
+        mprotect(stack, 0x1000, PROT_NONE);
+        t->stack = stack; t->stack_size = stack_size; t->guest_stack_own = !legacy_stack;
+    }
+    return legacy_stack;
+}
+
 static int thread_start_locked(int id)
 {
     WinThread *t = &g_threads[id];
@@ -13288,13 +14677,15 @@ static int thread_start_locked(int id)
     /* The guest stack is the reservation alone (its lowest page the guard); the pthread runs Beer's host code on
      * its own glibc stack and switches to the guest stack for the entry (beer_call_thread_entry).
      * BEER_THREAD_STACK_LEGACY=1 runs the guest on the pthread stack inside the reservation, as before. */
-    const int legacy_stack = getenv("BEER_THREAD_STACK_LEGACY") != NULL;
-    const size_t stack_size = guest_thread_stack_reserve(t->stack_request) + (legacy_stack ? 0x1000u : 0u);
-    void *stack = beer_vm_map_bottom_up(stack_size, 65536, PROT_READ | PROT_WRITE, MAP_NORESERVE);
-    if (stack != MAP_FAILED) {
-        mprotect(stack, 0x1000, PROT_NONE);
-        if (legacy_stack) pthread_attr_setstack(&attr, (u8 *)stack + 0x1000, stack_size - 0x1000);
-        t->stack = stack; t->stack_size = stack_size; t->guest_stack_own = !legacy_stack;
+    const int legacy_stack = thread_reserve_stack(t);
+    void *stack = t->stack ? t->stack : MAP_FAILED;
+    const size_t stack_size = t->stack_size;
+    if (stack != MAP_FAILED && legacy_stack) pthread_attr_setstack(&attr, (u8 *)stack + 0x1000, stack_size - 0x1000);
+    if (t->context_set) {
+        /* The context was changed while the thread was suspended at creation. A new thread starts in
+         * RtlUserThreadStart(start = Rcx, parameter = Rdx); a moved Rip runs that code with Rcx as its argument. */
+        if (t->ctx_rip != t->fn) { t->fn = t->ctx_rip; t->arg = t->ctx_rcx; }
+        else { t->fn = t->ctx_rcx; t->arg = t->ctx_rdx; }
     }
     const int created = pthread_create(&t->pt, &attr, win_thread_trampoline, (void *)(intptr_t)id);
     pthread_attr_destroy(&attr);
@@ -13380,6 +14771,7 @@ impl_CreateThread(u64 attr, u64 stack, u64 fn, u64 arg, u32 flags, u32 *tid)
     pthread_mutex_init(&t->mtx, NULL);
     pthread_cond_init(&t->cv, NULL);
 
+    if (t->suspended) thread_reserve_stack(t);
     if (!t->suspended && thread_start_locked(id) != 0) {
         pthread_mutex_destroy(&t->mtx);
         pthread_cond_destroy(&t->cv);
@@ -13465,17 +14857,29 @@ impl_GetExitCodeThread(u64 h, u32 *exit_code)
     return 1;
 }
 
+static u64 duplicate_handle_local(u64 source, u64 *target, u32 options);
+static u64 beer_proc_alloc(pid_t pid, int child);   /* win32_process.inc */
+static int beer_proc_handle_pid(u64 handle);        /* win32_process.inc: the process a handle names, or -1 */
 static u64 __attribute__((ms_abi))
 impl_DuplicateHandle(u64 source_process, u64 source, u64 target_process,
                      u64 *target, u32 access, u32 inherit, u32 options)
 {
     (void)access;
     if (inherit) g_inheritable_handles = 1;
+    /* GetCurrentProcess() (-1) and OpenProcess(own pid) (0x7FF0) both name this process. */
+    if (source_process == 0x7FF0ull) source_process = (u64)-1;
+    if (target_process == 0x7FF0ull) target_process = (u64)-1;
     if (!target || (source_process != (u64)-1 && source_process != (u64)-2) ||
         (target_process != (u64)-1 && target_process != (u64)-2)) {
         g_last_error = 6;
         return 0;
     }
+    const u64 result = duplicate_handle_local(source, target, options);
+    if (result && inherit) handle_set_inheritable(*target, 1);
+    return result;
+}
+static u64 duplicate_handle_local(u64 source, u64 *target, u32 options)
+{
     int tid = thread_id_from_handle(source);
     if (tid >= 0) {
         pthread_mutex_lock(&g_threads[tid].mtx);
@@ -13502,8 +14906,19 @@ impl_DuplicateHandle(u64 source_process, u64 source, u64 target_process,
         g_last_error = 0;
         return 1;
     }
-    if (source == (u64)-1) {
-        *target = source;
+    /* Duplicating the current process (pseudo or OpenProcess handle) yields a real process handle. */
+    if (source == (u64)-1 || source == 0x7FF0ull) {
+        const u64 handle = beer_proc_alloc(getpid(), 0);
+        if (!handle) { g_last_error = 8; return 0; }
+        *target = handle;
+        g_last_error = 0;
+        return 1;
+    }
+    if (beer_proc_handle_pid(source) > 0) {
+        const u64 handle = beer_proc_alloc((pid_t)beer_proc_handle_pid(source), 0);
+        if (!handle) { g_last_error = 8; return 0; }
+        *target = handle;
+        g_last_error = 0;
         return 1;
     }
     g_last_error = 6;
@@ -13582,6 +14997,58 @@ impl_TerminateThread(u64 h, u32 code)
         pthread_cancel(t->pt);
         t->done = 1;
         pthread_cond_broadcast(&t->cv);
+    } else if (!t->started && !t->done) {          /* never resumed: it ends without running */
+        t->exit_code = code;
+        t->done = 1;
+        t->suspended = 0;
+        pthread_cond_broadcast(&t->cv);
+    }
+    pthread_mutex_unlock(&t->mtx);
+    return 1;
+}
+
+/* x64 CONTEXT offsets used below. */
+#define CTX_FLAGS 0x30
+#define CTX_RCX 0x80
+#define CTX_RDX 0x88
+#define CTX_RSP 0x98
+#define CTX_RIP 0xf8
+/* Get/SetThreadContext for a thread still suspended at creation: its registers are the initial ones Windows gives
+ * a new thread (Rip at the start routine, Rcx = start, Rdx = parameter, Rsp near the top of its stack), and changes
+ * take effect when it is first resumed. Returns -1 when the handle is not such a thread. */
+static int thread_unstarted_context(u64 handle, u8 *context, int set)
+{
+    const int id = thread_id_from_handle(handle);
+    if (id < 0) return -1;
+    WinThread *t = &g_threads[id];
+    pthread_mutex_lock(&t->mtx);
+    if (t->started || t->done || !t->stack) { pthread_mutex_unlock(&t->mtx); return -1; }
+    const u32 flags = *(u32 *)(context + CTX_FLAGS);
+    const u64 rsp = ((u64)(uintptr_t)t->stack + t->stack_size - 0x28) & ~0xfull;
+    if (set) {
+        if (!t->context_set) { t->ctx_rip = t->fn; t->ctx_rcx = t->fn; t->ctx_rdx = t->arg; }
+        if ((flags & 0x100001u) == 0x100001u) memcpy(&t->ctx_rip, context + CTX_RIP, 8);
+        if ((flags & 0x100002u) == 0x100002u) { memcpy(&t->ctx_rcx, context + CTX_RCX, 8); memcpy(&t->ctx_rdx, context + CTX_RDX, 8); }
+        t->context_set = 1;
+    } else {
+        const u64 rip = t->context_set ? t->ctx_rip : t->fn;
+        const u64 rcx = t->context_set ? t->ctx_rcx : t->fn, rdx = t->context_set ? t->ctx_rdx : t->arg;
+        if ((flags & 0x100001u) == 0x100001u) {          /* CONTEXT_CONTROL */
+            const u16 cs = 0x33, ss = 0x2b;
+            const u32 eflags = 0x200;
+            memcpy(context + 0x38, &cs, 2);
+            memcpy(context + 0x42, &ss, 2);
+            memcpy(context + 0x44, &eflags, 4);
+            memcpy(context + CTX_RSP, &rsp, 8);
+            memcpy(context + CTX_RIP, &rip, 8);
+        }
+        if ((flags & 0x100002u) == 0x100002u) {          /* CONTEXT_INTEGER */
+            memset(context + 0x78, 0, 0x80);              /* Rax..R15 */
+            memcpy(context + 0x98, &rsp, 8);              /* Rsp sits in the integer block's range; keep it valid */
+            memcpy(context + CTX_RCX, &rcx, 8);
+            memcpy(context + CTX_RDX, &rdx, 8);
+        }
+        if ((flags & 0x100010u) == 0x100010u) memset(context + 0x48, 0, 0x30);   /* no debug registers */
     }
     pthread_mutex_unlock(&t->mtx);
     return 1;
@@ -13763,6 +15230,9 @@ impl_GetFullPathNameA(const char *path, u32 sz, char *buf, char **part)
 #define MAX_FHANDLES 4096
 static int g_fh_fd[MAX_FHANDLES];
 static u8 g_fh_used[MAX_FHANDLES];
+/* Byte-range locks of a handle whose descriptor is not read-write go through a private read-write descriptor of the
+ * same file (descriptor + 1, 0 = none); see beer_file_lock. */
+static int g_fh_lock_fd[MAX_FHANDLES];
 static char g_fh_guest_path[MAX_FHANDLES][PATH_MAX];
 static char g_fh_host_path[MAX_FHANDLES][PATH_MAX];
 static pthread_mutex_t g_fh_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -13849,14 +15319,18 @@ static int fh_close(u64 h) {
     u32 id = (u32)(h - 0x70000000ULL);
     pthread_mutex_lock(&g_fh_mtx);
     int fd = g_fh_used[id] ? g_fh_fd[id] : -1;
+    int lock_fd = -1;
     if (fd >= 0) {
         g_fh_used[id] = 0;
         g_fh_fd[id] = -1;
         g_fh_guest_path[id][0] = 0;
         g_fh_host_path[id][0] = 0;
+        lock_fd = g_fh_lock_fd[id] - 1;
+        g_fh_lock_fd[id] = 0;
     }
     pthread_mutex_unlock(&g_fh_mtx);
     if (fd < 0) return 0;
+    if (lock_fd >= 0) close(lock_fd);       /* releases the handle's byte-range locks, as closing it does on Windows */
     beer_pipe_released(id);
     close(fd);
     iocp_forget_file(h);
@@ -13923,6 +15397,29 @@ static int resolve_windows_host_path(const char *name, char *output,
         resolved[0] = 0;
     }
 
+    /* Fast path: the path exists with exactly this spelling (the usual case), so no directory needs scanning.
+     * Scanning every component's directory for a case-insensitive match on every CreateFile cost whole seconds
+     * on FUSE-mounted NTFS while games stream assets. */
+    {
+        char exact[PATH_MAX];
+        const size_t rest = strlen(input);
+        if (used + 1 + rest < sizeof(exact)) {
+            memcpy(exact, resolved, used);
+            size_t at = used;
+            if (at && exact[at - 1] != '/' && rest) exact[at++] = '/';
+            memcpy(exact + at, input, rest + 1);
+            struct stat exact_status;
+            const int plain = rest && input[rest - 1] != '/' && !strstr(input, "./") && strcmp(input, ".") &&
+                              strcmp(input, "..") && !(rest >= 2 && !strcmp(input + rest - 2, "/.")) &&
+                              !(rest >= 3 && !strcmp(input + rest - 3, "/.."));
+            if (plain && !strstr(exact, "//") && lstat(exact, &exact_status) == 0) {
+                if (at + rest + 1 > output_size) return 0;
+                memcpy(output, exact, at + rest + 1);
+                return 1;
+            }
+        }
+    }
+
     while (*input) {
         const char *separator = strchr(input, '/');
         size_t component_length = separator ? (size_t)(separator - input)
@@ -13944,7 +15441,12 @@ static int resolve_windows_host_path(const char *name, char *output,
             directory_path[used] = 0;
         }
 
-        DIR *directory = opendir(directory_path);
+        char exact_component[PATH_MAX];
+        struct stat component_status;
+        const int exact_exists =
+            snprintf(exact_component, sizeof(exact_component), "%s/%s", directory_path, component) < (int)sizeof(exact_component) &&
+            lstat(exact_component, &component_status) == 0;
+        DIR *directory = exact_exists ? NULL : opendir(directory_path);   /* scan only for a differently-cased name */
         if (directory) {
             struct dirent *entry;
             while ((entry = readdir(directory)) != NULL) {
@@ -14333,9 +15835,14 @@ static u64 synthetic_system_module_file(const char *name)
     return handle;
 }
 
+static u64 create_file_a(const char *name, u32 access, u32 share, u64 sa, u32 creation, u32 attrs, u64 tmpl);
 static u64 __attribute__((ms_abi))
 impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
                   u32 creation, u32 attrs, u64 tmpl)
+{
+    return inherit_from_sa(create_file_a(name, access, share, sa, creation, attrs, tmpl), sa);
+}
+static u64 create_file_a(const char *name, u32 access, u32 share, u64 sa, u32 creation, u32 attrs, u64 tmpl)
 {
     note_inheritable_sa(sa); (void)attrs; (void)tmpl; (void)share;
     if (!name) return INVALID_HANDLE_VALUE64;
@@ -14391,7 +15898,11 @@ impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
         switch (errno) {
         case EACCES: case EPERM: case EROFS: g_last_error = 5; break;
         case EEXIST: g_last_error = 80; break;
-        case ENOENT: case ENOTDIR: g_last_error = 3; break;
+        /* Windows: ERROR_FILE_NOT_FOUND when the folder exists but the file does not, ERROR_PATH_NOT_FOUND only when
+         * a folder on the way is missing. Games create a file after TRUNCATE_EXISTING/OPEN_EXISTING reports 2 (Onimusha
+         * never wrote its shader.cache2 because it got 3). */
+        case ENOENT: g_last_error = host_parent_is_directory(host_path) ? 2 : 3; break;
+        case ENOTDIR: g_last_error = 3; break;
         case EMFILE: case ENFILE: g_last_error = 4; break;
         default: g_last_error = 1; break;
         }
@@ -14539,10 +16050,10 @@ static u64 __attribute__((ms_abi)) impl_NCryptUnsupported(u64 a, u64 b, u64 c, u
  * a packet for every OVERLAPPED read (Beer performs those reads synchronously, which on Windows still queues a
  * packet unless the caller set the event's low bit). DirectStorage drives its worker threads from this. */
 #define IOCP_MAX 64
-#define IOCP_QUEUE 8192
-#define IOCP_HANDLE_BASE 0xC4000000u
+#define IOCP_QUEUE 8192                     /* initial ring size; grows when full */
+#define IOCP_HANDLE_BASE 0x34000000u
 typedef struct { u64 key, overlapped; u32 bytes, status; } IocpPacket;
-typedef struct { int used; pthread_mutex_t mtx; pthread_cond_t cv; IocpPacket *queue; u32 head, count; } Iocp;
+typedef struct { int used; pthread_mutex_t mtx; pthread_cond_t cv; IocpPacket *queue; u32 head, count, capacity; } Iocp;
 static Iocp g_iocps[IOCP_MAX];
 static pthread_mutex_t g_iocp_table_mtx = PTHREAD_MUTEX_INITIALIZER;
 #define IOCP_ASSOC_MAX 1024
@@ -14562,8 +16073,19 @@ static void iocp_post(int idx, u64 key, u64 overlapped, u32 bytes, u32 status)
 {
     Iocp *p = &g_iocps[idx];
     pthread_mutex_lock(&p->mtx);
-    if (p->count < IOCP_QUEUE) {
-        IocpPacket *k = &p->queue[(p->head + p->count) % IOCP_QUEUE];
+    if (!p->used || !p->queue) { pthread_mutex_unlock(&p->mtx); return; }   /* the port was closed */
+    if (p->count == p->capacity) {
+        /* A Windows completion port has no size limit, and a dropped packet is a lost completion (Boost.Asio's
+         * shutdown then waits for it forever), so the ring grows instead of discarding. */
+        IocpPacket *grown = malloc((size_t)p->capacity * 2 * sizeof(IocpPacket));
+        if (grown) {
+            for (u32 i = 0; i < p->count; ++i) grown[i] = p->queue[(p->head + i) % p->capacity];
+            free(p->queue);
+            p->queue = grown; p->head = 0; p->capacity *= 2;
+        }
+    }
+    if (p->count < p->capacity) {
+        IocpPacket *k = &p->queue[(p->head + p->count) % p->capacity];
         k->key = key; k->overlapped = overlapped; k->bytes = bytes; k->status = status;
         ++p->count;
         pthread_cond_signal(&p->cv);
@@ -14591,6 +16113,7 @@ static void iocp_file_completed(u64 file, u64 overlapped, u32 bytes, u32 status)
     if (port >= 0) iocp_post(port, key, overlapped, bytes, status);
 }
 
+int beer_is_socket(u64 handle);
 static u64 __attribute__((ms_abi))
 impl_CreateIoCompletionPort(u64 file, u64 existing, u64 key, u32 threads)
 {
@@ -14607,6 +16130,7 @@ impl_CreateIoCompletionPort(u64 file, u64 existing, u64 key, u32 threads)
                 memset(p, 0, sizeof(*p));
                 p->queue = calloc(IOCP_QUEUE, sizeof(IocpPacket));
                 if (!p->queue) break;
+                p->capacity = IOCP_QUEUE;
                 pthread_mutex_init(&p->mtx, NULL);
                 pthread_cond_init(&p->cv, NULL);
                 p->used = 1;
@@ -14616,7 +16140,7 @@ impl_CreateIoCompletionPort(u64 file, u64 existing, u64 key, u32 threads)
     }
     int ok = idx >= 0;
     if (ok && file != UINT64_MAX && file != 0) {
-        if (fh_get(file) < 0 || g_iocp_assoc_count >= IOCP_ASSOC_MAX) {
+        if ((fh_get(file) < 0 && !beer_is_socket(file)) || g_iocp_assoc_count >= IOCP_ASSOC_MAX) {
             ok = 0;
         } else {
             g_iocp_assoc[g_iocp_assoc_count].handle = file;
@@ -14652,7 +16176,7 @@ static int iocp_take(Iocp *p, u32 ms, IocpPacket *out)
     }
     if (!rc && p->count) {
         *out = p->queue[p->head];
-        p->head = (p->head + 1) % IOCP_QUEUE;
+        p->head = (p->head + 1) % p->capacity;
         --p->count;
     } else rc = rc ? rc : ETIMEDOUT;
     pthread_mutex_unlock(&p->mtx);
@@ -14665,6 +16189,7 @@ impl_GetQueuedCompletionStatus(u64 port, u32 *bytes, u64 *key, u64 *overlapped, 
     int idx = iocp_from_handle(port);
     if (idx < 0) { g_last_error = 6; if (overlapped) *overlapped = 0; return 0; }
     IocpPacket pkt;
+    g_dbg_wait_handle = port;                     /* SIGUSR1 stack dump: the port this thread waits on */
     if (iocp_take(&g_iocps[idx], ms, &pkt) != 0) {
         if (overlapped) *overlapped = 0;
         g_last_error = 258;                       /* WAIT_TIMEOUT */
@@ -14675,8 +16200,8 @@ impl_GetQueuedCompletionStatus(u64 port, u32 *bytes, u64 *key, u64 *overlapped, 
     if (overlapped) *overlapped = pkt.overlapped;
     g_last_error = pkt.status;
     if (getenv("BEER_IOCP_DIAGNOSTICS"))
-        fprintf(stderr, "[IOCP] dequeued packet key=%llx overlapped=%llx bytes=%u status=%u\n",
-                (unsigned long long)pkt.key, (unsigned long long)pkt.overlapped, pkt.bytes, pkt.status);
+        fprintf(stderr, "[IOCP] port %d tid %ld dequeued packet key=%llx overlapped=%llx bytes=%u status=%u\n", idx,
+                (long)syscall(SYS_gettid), (unsigned long long)pkt.key, (unsigned long long)pkt.overlapped, pkt.bytes, pkt.status);
     return pkt.status == 0;
 }
 
@@ -14714,8 +16239,9 @@ impl_PostQueuedCompletionStatus(u64 port, u32 bytes, u64 key, u64 overlapped)
     int idx = iocp_from_handle(port);
     if (idx < 0) { g_last_error = 6; return 0; }
     if (getenv("BEER_IOCP_DIAGNOSTICS"))
-        fprintf(stderr, "[IOCP] PostQueuedCompletionStatus key=%llx overlapped=%llx bytes=%u\n",
-                (unsigned long long)key, (unsigned long long)overlapped, bytes);
+        fprintf(stderr, "[IOCP] port %d tid %ld PostQueuedCompletionStatus key=%llx overlapped=%llx bytes=%u from rva 0x%llx\n", idx,
+                (long)syscall(SYS_gettid), (unsigned long long)key, (unsigned long long)overlapped, bytes,
+                (unsigned long long)(g_dispatch_incoming_return - (u64)g_img));
     iocp_post(idx, key, overlapped, bytes, 0);
     g_last_error = 0;
     return 1;
@@ -14761,7 +16287,7 @@ static u64 __attribute__((ms_abi)) impl_SetFileCompletionNotificationModes(u64 f
     if (getenv("BEER_IOCP_DIAGNOSTICS"))
         fprintf(stderr, "[IOCP] SetFileCompletionNotificationModes file=0x%llx flags=0x%x known=%d\n",
                 (unsigned long long)file, flags, fh_get(file) >= 0);
-    if (fh_get(file) < 0) { g_last_error = 6; return 0; }
+    if (fh_get(file) < 0 && !beer_is_socket(file)) { g_last_error = 6; return 0; }
     pthread_mutex_lock(&g_iocp_table_mtx);
     int i = 0;
     for (; i < g_notify_modes_count; ++i) if (g_notify_modes[i].handle == file) break;
@@ -14772,14 +16298,389 @@ static u64 __attribute__((ms_abi)) impl_SetFileCompletionNotificationModes(u64 f
     return 1;
 }
 
+/* ---- Overlapped socket I/O ----
+ * Sockets are host descriptors. An overlapped WSARecv/WSASend/ConnectEx is attempted at once; if the socket is not
+ * ready the call returns WSA_IO_PENDING and the operation waits here: a thread polls the waiting sockets, performs each
+ * operation when its socket is ready and completes it as Windows does. OVERLAPPED.Internal/InternalHigh get the
+ * NTSTATUS and byte count, hEvent is signalled, and unless hEvent's low bit is set a packet goes to the completion
+ * port the socket is associated with; GetQueuedCompletionStatus then reports the Win32 error. closesocket and
+ * CancelIoEx complete the socket's waiting operations with ERROR_OPERATION_ABORTED. */
+enum { WSA_ASYNC_RECV = 1, WSA_ASYNC_SEND, WSA_ASYNC_CONNECT };
+typedef struct {
+    int used, busy, kind, flags;
+    u64 socket;
+    struct iovec vectors[16];
+    int vector_count;
+    void *address;                     /* recvfrom: where the source goes; sendto: the destination */
+    s32 *address_length;
+    struct sockaddr_storage destination;
+    socklen_t destination_length;
+    u64 *overlapped;
+    u32 *flags_out;
+} WsaAsyncOp;
+static WsaAsyncOp g_wsa_async[1024];
+static pthread_mutex_t g_wsa_async_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_wsa_async_wake[2] = { -1, -1 };
+
+int beer_is_socket(u64 handle)
+{
+    if (handle >= 0x10000) return 0;
+    int type = 0;
+    socklen_t length = sizeof(type);
+    return getsockopt((int)handle, SOL_SOCKET, SO_TYPE, &type, &length) == 0;
+}
+
+static u32 wsa_win32_error(int error)
+{
+    switch (error) {
+    case 0: return 0;
+    case ECONNREFUSED: return 1225;                 /* ERROR_CONNECTION_REFUSED */
+    case ECONNRESET: case EPIPE: return 64;         /* ERROR_NETNAME_DELETED */
+    case ETIMEDOUT: return 121;                     /* ERROR_SEM_TIMEOUT */
+    case ENETUNREACH: return 1231;                  /* ERROR_NETWORK_UNREACHABLE */
+    case EHOSTUNREACH: return 1232;                 /* ERROR_HOST_UNREACHABLE */
+    case ECONNABORTED: return 1236;                 /* ERROR_CONNECTION_ABORTED */
+    case ECANCELED: return 995;                     /* ERROR_OPERATION_ABORTED */
+    default: return (u32)winsock_error_from_errno(error);
+    }
+}
+
+static u32 wsa_ntstatus(int error)
+{
+    switch (error) {
+    case 0: return 0;
+    case ECONNREFUSED: return 0xC0000236u;          /* STATUS_CONNECTION_REFUSED */
+    case ECONNRESET: case EPIPE: return 0xC000020Du;/* STATUS_CONNECTION_RESET */
+    case ETIMEDOUT: return 0xC00000B5u;             /* STATUS_IO_TIMEOUT */
+    case ENETUNREACH: return 0xC000023Cu;           /* STATUS_NETWORK_UNREACHABLE */
+    case EHOSTUNREACH: return 0xC000023Du;          /* STATUS_HOST_UNREACHABLE */
+    case ECONNABORTED: return 0xC0000241u;          /* STATUS_CONNECTION_ABORTED */
+    case ECANCELED: return 0xC0000120u;             /* STATUS_CANCELLED */
+    default: return 0xC0000001u;                    /* STATUS_UNSUCCESSFUL */
+    }
+}
+
+/* BEER_NET_DIAGNOSTICS: follows the TLS record framing of each socket's received bytes across every receive path, so
+ * a stream that stops mid-record (lost or misdelivered bytes) shows as "needs N more". */
+static struct { int fd; u32 header_have; u8 header[5]; u32 body_left; u64 total; } g_net_rx[256];
+static pthread_mutex_t g_net_rx_lock = PTHREAD_MUTEX_INITIALIZER;
+void beer_net_trace_rx(u64 socket, const struct iovec *vectors, int count, u64 bytes, const char *path)
+{
+    static int diagnostics = -1;
+    if (diagnostics < 0) diagnostics = getenv("BEER_NET_DIAGNOSTICS") != NULL;
+    if (!diagnostics) return;
+    pthread_mutex_lock(&g_net_rx_lock);
+    int slot = -1;
+    for (int i = 0; i < 256; ++i) if (g_net_rx[i].fd == (int)socket + 1) { slot = i; break; }
+    if (slot < 0) for (int i = 0; i < 256; ++i) if (!g_net_rx[i].fd) { slot = i; g_net_rx[i].fd = (int)socket + 1; break; }
+    char records[256]; size_t rn = 0; records[0] = 0;
+    if (slot >= 0) {
+        u64 left = bytes;
+        for (int v = 0; v < count && left; ++v) {
+            const u8 *p = vectors[v].iov_base;
+            u64 n = vectors[v].iov_len < left ? vectors[v].iov_len : left;
+            left -= n;
+            g_net_rx[slot].total += n;
+            for (u64 k = 0; k < n;) {
+                if (g_net_rx[slot].body_left) {
+                    u64 take = n - k < g_net_rx[slot].body_left ? n - k : g_net_rx[slot].body_left;
+                    g_net_rx[slot].body_left -= (u32)take; k += take; continue;
+                }
+                g_net_rx[slot].header[g_net_rx[slot].header_have++] = p[k++];
+                if (g_net_rx[slot].header_have == 5) {
+                    const u8 *h = g_net_rx[slot].header;
+                    g_net_rx[slot].header_have = 0;
+                    g_net_rx[slot].body_left = (u32)h[3] << 8 | h[4];
+                    if (rn + 24 < sizeof(records))
+                        rn += (size_t)snprintf(records + rn, sizeof(records) - rn, " %u:%u", h[0], g_net_rx[slot].body_left);
+                    if (h[0] < 20 || h[0] > 24) {
+                        if (rn + 12 < sizeof(records)) rn += (size_t)snprintf(records + rn, sizeof(records) - rn, " (not TLS)");
+                        g_net_rx[slot].body_left = 0;
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "[NET] rx socket 0x%llx %s %llu bytes (total %llu) records%s; needs %u more%s\n",
+                (unsigned long long)socket, path, (unsigned long long)bytes, (unsigned long long)g_net_rx[slot].total,
+                records, g_net_rx[slot].body_left + (g_net_rx[slot].header_have ? 5 - g_net_rx[slot].header_have : 0),
+                g_net_rx[slot].header_have ? " (inside a header)" : "");
+    }
+    pthread_mutex_unlock(&g_net_rx_lock);
+}
+void beer_net_trace_reset(u64 socket)
+{
+    pthread_mutex_lock(&g_net_rx_lock);
+    for (int i = 0; i < 256; ++i) if (g_net_rx[i].fd == (int)socket + 1) memset(&g_net_rx[i], 0, sizeof(g_net_rx[i]));
+    pthread_mutex_unlock(&g_net_rx_lock);
+}
+
+/* Completes an overlapped socket operation. `pending` operations always post to the port; one that completed inside
+ * the call follows FILE_SKIP_COMPLETION_PORT_ON_SUCCESS. */
+static void wsa_complete(u64 socket, u64 *overlapped, int error, u64 bytes, int pending)
+{
+    static int diagnostics = -1;
+    if (diagnostics < 0) diagnostics = getenv("BEER_NET_DIAGNOSTICS") != NULL;
+    if (diagnostics)
+        fprintf(stderr, "[NET] socket 0x%llx overlapped %p completed: error=%d bytes=%llu %s event=%#llx\n",
+                (unsigned long long)socket, (void *)overlapped, error, (unsigned long long)bytes,
+                pending ? "pending" : "inline", (unsigned long long)overlapped[3]);
+    overlapped[1] = bytes;
+    __atomic_store_n(&overlapped[0], (u64)wsa_ntstatus(error), __ATOMIC_RELEASE);
+    u64 event = overlapped[3];
+    if (event & ~1ull) impl_SetEvent(event & ~1ull);
+    if (event & 1) return;                          /* the caller asked for no completion-port packet */
+    if (!pending) { iocp_file_completed(socket, (u64)(uintptr_t)overlapped, (u32)bytes, wsa_win32_error(error)); return; }
+    int port = -1;
+    u64 key = 0;
+    pthread_mutex_lock(&g_iocp_table_mtx);
+    for (int i = 0; i < g_iocp_assoc_count; ++i)
+        if (g_iocp_assoc[i].handle == socket && g_iocp_assoc[i].port >= 0) { port = g_iocp_assoc[i].port; key = g_iocp_assoc[i].key; break; }
+    pthread_mutex_unlock(&g_iocp_table_mtx);
+    if (port >= 0) iocp_post(port, key, (u64)(uintptr_t)overlapped, (u32)bytes, wsa_win32_error(error));
+}
+
+/* Performs the operation without blocking: 1 done (error/bytes set), 0 would block. */
+static int wsa_async_attempt(WsaAsyncOp *op, int *error, u64 *bytes)
+{
+    const int fd = (int)op->socket;
+    *error = 0; *bytes = 0;
+    if (op->kind == WSA_ASYNC_CONNECT) {
+        struct pollfd p = { fd, POLLOUT, 0 };
+        if (poll(&p, 1, 0) <= 0) return 0;
+        int result = 0; socklen_t length = sizeof(result);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &result, &length);
+        *error = result;
+        if (!result && op->vector_count && op->vectors[0].iov_len) {     /* ConnectEx's optional first data */
+            ssize_t sent = send(fd, op->vectors[0].iov_base, op->vectors[0].iov_len, MSG_NOSIGNAL);
+            *bytes = sent > 0 ? (u64)sent : 0;
+        }
+        return 1;
+    }
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = op->vectors;
+    message.msg_iovlen = (size_t)op->vector_count;
+    ssize_t done;
+    if (op->kind == WSA_ASYNC_RECV) {
+        message.msg_name = op->address;
+        message.msg_namelen = op->address && op->address_length ? (socklen_t)*op->address_length : 0;
+        done = recvmsg(fd, &message, (op->flags & 0x3) | MSG_DONTWAIT);
+        if (done >= 0 && !(op->flags & 2)) beer_net_trace_rx(op->socket, op->vectors, op->vector_count, (u64)done, "async");
+        if (done >= 0) {
+            if (op->address && op->address_length) *op->address_length = (s32)message.msg_namelen;
+            if (op->flags_out) *op->flags_out = (message.msg_flags & MSG_TRUNC) ? 0x2 : 0;
+        }
+    } else {
+        message.msg_name = op->destination_length ? &op->destination : NULL;
+        message.msg_namelen = op->destination_length;
+        done = sendmsg(fd, &message, (op->flags & 0x3) | MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+    if (done < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        *error = errno;
+        return 1;
+    }
+    *bytes = (u64)done;
+    return 1;
+}
+
+static void *wsa_async_thread(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        struct pollfd fds[1025];
+        int index[1025], n = 0;
+        pthread_mutex_lock(&g_wsa_async_lock);
+        fds[n].fd = g_wsa_async_wake[0]; fds[n].events = POLLIN; index[n++] = -1;
+        for (int i = 0; i < 1024 && n < 1025; ++i) {
+            WsaAsyncOp *op = &g_wsa_async[i];
+            if (!op->used || op->busy) continue;
+            fds[n].fd = (int)op->socket;
+            fds[n].events = op->kind == WSA_ASYNC_RECV ? POLLIN : POLLOUT;
+            index[n++] = i;
+        }
+        pthread_mutex_unlock(&g_wsa_async_lock);
+        if (poll(fds, (nfds_t)n, 1000) <= 0) continue;
+        if (fds[0].revents) { char drain[64]; (void)!read(g_wsa_async_wake[0], drain, sizeof(drain)); }
+        for (int k = 1; k < n; ++k) {
+            if (!fds[k].revents) continue;
+            pthread_mutex_lock(&g_wsa_async_lock);
+            WsaAsyncOp *op = &g_wsa_async[index[k]];
+            int mine = op->used && !op->busy && (int)op->socket == fds[k].fd;
+            if (mine) op->busy = 1;
+            pthread_mutex_unlock(&g_wsa_async_lock);
+            if (!mine) continue;
+            int error; u64 bytes;
+            int done = wsa_async_attempt(op, &error, &bytes);
+            if (!done && (fds[k].revents & (POLLERR | POLLHUP | POLLNVAL)) && op->kind != WSA_ASYNC_CONNECT) {
+                done = 1; error = ECONNRESET; bytes = 0;
+            }
+            if (done) wsa_complete(op->socket, op->overlapped, error, bytes, 1);
+            pthread_mutex_lock(&g_wsa_async_lock);
+            op->busy = 0;
+            if (done) op->used = 0;
+            pthread_mutex_unlock(&g_wsa_async_lock);
+        }
+    }
+    return NULL;
+}
+
+static void wsa_async_start(void)
+{
+    if (pipe2(g_wsa_async_wake, O_CLOEXEC | O_NONBLOCK) != 0) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, wsa_async_thread, NULL) == 0) pthread_detach(thread);
+}
+
+/* Starts an overlapped operation. Returns 0 when it completed inside the call, SOCKET_ERROR with WSA_IO_PENDING when
+ * it waits, or SOCKET_ERROR with the error. */
+u64 beer_wsa_overlapped(WsaAsyncOp *request, u64 *transferred)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, wsa_async_start);
+    u64 *overlapped = request->overlapped;
+    overlapped[0] = 0x103;                                   /* STATUS_PENDING */
+    overlapped[1] = 0;
+    int error; u64 bytes;
+    if (wsa_async_attempt(request, &error, &bytes)) {
+        if (error) { overlapped[0] = wsa_ntstatus(error); g_wsa_last_error = (s32)winsock_error_from_errno(error); return (u32)-1; }
+        if (transferred) *transferred = bytes;
+        wsa_complete(request->socket, overlapped, 0, bytes, 0);
+        g_wsa_last_error = 0;
+        return 0;
+    }
+    {
+        static int diagnostics = -1;
+        if (diagnostics < 0) diagnostics = getenv("BEER_NET_DIAGNOSTICS") != NULL;
+        if (diagnostics) fprintf(stderr, "[NET] socket 0x%llx overlapped %p kind %d waits\n",
+                                 (unsigned long long)request->socket, (void *)overlapped, request->kind);
+    }
+    pthread_mutex_lock(&g_wsa_async_lock);
+    WsaAsyncOp *slot = NULL;
+    for (int i = 0; i < 1024 && !slot; ++i) if (!g_wsa_async[i].used) slot = &g_wsa_async[i];
+    if (slot) { *slot = *request; slot->used = 1; slot->busy = 0; }
+    pthread_mutex_unlock(&g_wsa_async_lock);
+    if (!slot) { overlapped[0] = 0xC000009Au; g_wsa_last_error = 10055; return (u32)-1; }   /* WSAENOBUFS */
+    if (g_wsa_async_wake[1] >= 0) { char c = 1; (void)!write(g_wsa_async_wake[1], &c, 1); }
+    g_wsa_last_error = 997;                                   /* WSA_IO_PENDING */
+    return (u32)-1;
+}
+
+/* Completes the socket's waiting operations (all, or the one for `overlapped`) with ERROR_OPERATION_ABORTED.
+ * An operation the async thread is attempting at that moment (busy) completes there instead. With `settle`
+ * (closesocket) this waits for such attempts to finish, so every operation has posted its completion while the
+ * socket is still associated with its port: Windows completes each pending operation of a closed socket, and
+ * Boost.Asio's io_context shutdown waits for every started operation's packet. Dropping one hung the shutdown. */
+static int wsa_async_cancel_ex(u64 socket, u64 *overlapped, int settle)
+{
+    int cancelled = 0;
+    for (;;) {
+        WsaAsyncOp *found = NULL;
+        int busy = 0;
+        pthread_mutex_lock(&g_wsa_async_lock);
+        for (int i = 0; i < 1024 && !found; ++i) {
+            WsaAsyncOp *op = &g_wsa_async[i];
+            if (op->used && op->socket == socket && (!overlapped || op->overlapped == overlapped)) {
+                if (op->busy) { busy = 1; continue; }
+                op->busy = 1;
+                found = op;
+            }
+        }
+        pthread_mutex_unlock(&g_wsa_async_lock);
+        if (!found && busy && settle) {
+            struct timespec pause = { 0, 100000 };          /* the attempt is non-blocking: microseconds */
+            nanosleep(&pause, NULL);
+            continue;
+        }
+        if (!found) break;
+        wsa_complete(found->socket, found->overlapped, ECANCELED, 0, 1);
+        pthread_mutex_lock(&g_wsa_async_lock);
+        found->used = 0; found->busy = 0;
+        pthread_mutex_unlock(&g_wsa_async_lock);
+        ++cancelled;
+    }
+    return cancelled;
+}
+static int wsa_async_cancel(u64 socket, u64 *overlapped) { return wsa_async_cancel_ex(socket, overlapped, 0); }
+
+/* ConnectEx (via WSAIoctl SIO_GET_EXTENSION_FUNCTION_POINTER): an overlapped connect, then the optional first data. */
+static u64 __attribute__((ms_abi)) impl_ConnectEx(u64 socket, const void *name, s32 name_length, void *send_buffer,
+                                                  u32 send_length, u32 *bytes_sent, u64 *overlapped)
+{
+    if (!overlapped || !name || name_length <= 0) { g_wsa_last_error = 10014; return 0; }
+    const int fd = (int)socket;
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    if (getenv("BEER_NET_DIAGNOSTICS")) {           /* which server an overlapped connect goes to */
+        char address[INET6_ADDRSTRLEN] = "?";
+        unsigned port = 0;
+        const struct sockaddr *sa = (const struct sockaddr *)name;
+        if (sa->sa_family == AF_INET) {
+            inet_ntop(AF_INET, &((const struct sockaddr_in *)sa)->sin_addr, address, sizeof(address));
+            port = ntohs(((const struct sockaddr_in *)sa)->sin_port);
+        } else if (sa->sa_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)sa)->sin6_addr, address, sizeof(address));
+            port = ntohs(((const struct sockaddr_in6 *)sa)->sin6_port);
+        }
+        fprintf(stderr, "[NET] socket 0x%llx ConnectEx %s:%u\n", (unsigned long long)socket, address, port);
+    }
+    if (connect(fd, (const struct sockaddr *)name, (socklen_t)name_length) != 0 && errno != EINPROGRESS) {
+        g_wsa_last_error = winsock_error_from_errno(errno);
+        return 0;
+    }
+    WsaAsyncOp request;
+    memset(&request, 0, sizeof(request));
+    request.kind = WSA_ASYNC_CONNECT;
+    request.socket = socket;
+    request.overlapped = overlapped;
+    if (send_buffer && send_length) {
+        request.vectors[0].iov_base = send_buffer;
+        request.vectors[0].iov_len = send_length;
+        request.vector_count = 1;
+    }
+    u64 transferred = 0;
+    u64 result = beer_wsa_overlapped(&request, &transferred);
+    if ((u32)result == 0) { if (bytes_sent) *bytes_sent = (u32)transferred; return 1; }
+    return 0;                                                 /* WSAGetLastError: WSA_IO_PENDING or the failure */
+}
+
+/* DisconnectEx: Beer does not reuse sockets; the connection is shut down and the call completes at once. */
+static u64 __attribute__((ms_abi)) impl_DisconnectEx(u64 socket, u64 *overlapped, u32 flags, u32 reserved)
+{
+    (void)flags; (void)reserved;
+    shutdown((int)socket, SHUT_RDWR);
+    if (overlapped) wsa_complete(socket, overlapped, 0, 0, 0);
+    g_wsa_last_error = 0;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi)) impl_WSAGetOverlappedResult(u64 socket, u64 *overlapped, u32 *bytes, u32 wait, u32 *flags)
+{
+    (void)socket;
+    if (!overlapped) { g_wsa_last_error = 10014; return 0; }
+    while (__atomic_load_n(&overlapped[0], __ATOMIC_ACQUIRE) == 0x103) {
+        if (!wait) { g_wsa_last_error = 996; return 0; }     /* WSA_IO_INCOMPLETE */
+        usleep(1000);
+    }
+    if (bytes) *bytes = (u32)overlapped[1];
+    if (flags) *flags = 0;
+    u32 status = (u32)overlapped[0];
+    if (status) { g_wsa_last_error = status == 0xC0000120u ? 995 : 10054; return 0; }
+    g_wsa_last_error = 0;
+    return 1;
+}
+
+
 static void iocp_close(int idx)
 {
     pthread_mutex_lock(&g_iocp_table_mtx);
     for (int i = 0; i < g_iocp_assoc_count; ++i)
         if (g_iocp_assoc[i].port == idx) g_iocp_assoc[i].port = -1;
+    pthread_mutex_lock(&g_iocps[idx].mtx);
     free(g_iocps[idx].queue);
     g_iocps[idx].queue = NULL;
+    g_iocps[idx].count = g_iocps[idx].capacity = 0;
     g_iocps[idx].used = 0;
+    pthread_mutex_unlock(&g_iocps[idx].mtx);
     pthread_mutex_unlock(&g_iocp_table_mtx);
 }
 
@@ -15148,7 +17049,7 @@ impl_GetOverlappedResult(u64 h, WIN_OVERLAPPED *ov, u32 *transferred, u32 wait)
 static u64 __attribute__((ms_abi))
 impl_CancelIoEx(u64 h, WIN_OVERLAPPED *ov)
 {
-    int any = 0;
+    int any = beer_is_socket(h) ? wsa_async_cancel(h, (u64 *)ov) : 0;
     pthread_mutex_lock(&g_pending_mtx);
     for (size_t i = 0; i < 64; ++i)
         if (g_pending_reads[i].overlapped && g_pending_reads[i].handle == h && (!ov || g_pending_reads[i].overlapped == ov)) {
@@ -15161,6 +17062,92 @@ impl_CancelIoEx(u64 h, WIN_OVERLAPPED *ov)
     return 1;
 }
 static u64 __attribute__((ms_abi)) impl_CancelIo(u64 h) { return impl_CancelIoEx(h, NULL); }
+
+/* Byte-range locks (LockFile[Ex]/UnlockFile[Ex]) as Linux open-file-description locks: like Windows locks they belong
+ * to the handle, so two handles of one process conflict. Exclusive locks are write locks, shared ones read locks;
+ * LOCKFILE_FAIL_IMMEDIATELY chooses a non-blocking attempt. Windows locks are also mandatory for other handles' reads
+ * and writes; these are advisory, which is enough for cooperating lockers such as SQLite.
+ * Windows grants either kind of lock on any handle with read or write access, but Linux needs a writable descriptor
+ * for a write lock and a readable one for a read lock (EBADF otherwise). SQLite takes an exclusive lock on its
+ * PENDING byte even to read, so a read-only connection failed every lock and reported "database is locked". A handle
+ * whose descriptor is not read-write therefore keeps all its locks on a private read-write descriptor of the same
+ * file (a new open file description, so its locks still belong to this handle alone). */
+static int beer_file_lock_fd(u64 handle)
+{
+    if (handle < 0x70000001ULL || handle >= 0x70000000ULL + MAX_FHANDLES) return -1;
+    const u32 id = (u32)(handle - 0x70000000ULL);
+    pthread_mutex_lock(&g_fh_mtx);
+    int fd = g_fh_used[id] ? g_fh_fd[id] : -1;
+    if (fd >= 0 && g_fh_lock_fd[id]) {
+        fd = g_fh_lock_fd[id] - 1;
+    } else if (fd >= 0 && (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDWR) {
+        char self[64];
+        snprintf(self, sizeof(self), "/proc/self/fd/%d", fd);
+        const int lock_fd = open(self, O_RDWR | O_CLOEXEC | O_NOCTTY);
+        if (lock_fd >= 0) { g_fh_lock_fd[id] = lock_fd + 1; fd = lock_fd; }
+    }
+    pthread_mutex_unlock(&g_fh_mtx);
+    return fd;
+}
+static int beer_file_lock(u64 handle, u64 offset, u64 length, short type, int wait)
+{
+    int fd = beer_file_lock_fd(handle);
+    if (fd < 0) { g_last_error = 6; return 0; }
+    if (!length) { g_last_error = 87; return 0; }
+    struct flock lock;
+    memset(&lock, 0, sizeof(lock));
+    lock.l_type = type;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = (off_t)offset;
+    lock.l_len = length > (u64)INT64_MAX - offset ? 0 : (off_t)length;   /* 0 = to the end of all offsets */
+    int rc = fcntl(fd, wait ? F_OFD_SETLKW : F_OFD_SETLK, &lock), lock_errno = errno;
+    static int diag = -1;                                 /* BEER_LOCK_DIAGNOSTICS=1: every byte-range lock call */
+    if (diag < 0) diag = getenv("BEER_LOCK_DIAGNOSTICS") != NULL;
+    if (diag)
+        fprintf(stderr, "[LOCK] handle=0x%llx fd=%d %s off=0x%llx len=0x%llx wait=%d -> %s (access=%d)\n",
+                (unsigned long long)handle, fd, type == F_UNLCK ? "unlock" : type == F_WRLCK ? "excl" : "shared",
+                (unsigned long long)offset, (unsigned long long)length, wait, rc ? strerror(lock_errno) : "ok",
+                fcntl(fd, F_GETFL) & O_ACCMODE);
+    if (rc != 0) {
+        g_last_error = type == F_UNLCK ? 158u                           /* ERROR_NOT_LOCKED */
+                     : (lock_errno == EAGAIN || lock_errno == EACCES) ? 33u : 5u;  /* LOCK_VIOLATION / ACCESS_DENIED */
+        return 0;
+    }
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi))
+impl_LockFileEx(u64 handle, u32 flags, u32 reserved, u32 length_low, u32 length_high, WIN_OVERLAPPED *overlapped)
+{
+    (void)reserved;
+    if (!overlapped) { g_last_error = 87; return 0; }
+    u64 offset = ((u64)overlapped->OffsetHigh << 32) | overlapped->Offset;
+    u64 length = ((u64)length_high << 32) | length_low;
+    int ok = beer_file_lock(handle, offset, length, (flags & 2) ? F_WRLCK : F_RDLCK, !(flags & 1));
+    overlapped->Internal = ok ? 0 : 0xC0000054u;                          /* STATUS_LOCK_NOT_GRANTED */
+    if (ok && overlapped->hEvent && !(overlapped->hEvent & 1)) impl_SetEvent(overlapped->hEvent);
+    return (u64)ok;
+}
+static u64 __attribute__((ms_abi))
+impl_UnlockFileEx(u64 handle, u32 reserved, u32 length_low, u32 length_high, WIN_OVERLAPPED *overlapped)
+{
+    (void)reserved;
+    if (!overlapped) { g_last_error = 87; return 0; }
+    u64 offset = ((u64)overlapped->OffsetHigh << 32) | overlapped->Offset;
+    return (u64)beer_file_lock(handle, offset, ((u64)length_high << 32) | length_low, F_UNLCK, 0);
+}
+static u64 __attribute__((ms_abi))
+impl_LockFile(u64 handle, u32 offset_low, u32 offset_high, u32 length_low, u32 length_high)
+{
+    return (u64)beer_file_lock(handle, ((u64)offset_high << 32) | offset_low, ((u64)length_high << 32) | length_low,
+                               F_WRLCK, 0);
+}
+static u64 __attribute__((ms_abi))
+impl_UnlockFile(u64 handle, u32 offset_low, u32 offset_high, u32 length_low, u32 length_high)
+{
+    return (u64)beer_file_lock(handle, ((u64)offset_high << 32) | offset_low, ((u64)length_high << 32) | length_low,
+                               F_UNLCK, 0);
+}
 
 /* BEER_PIPE_DIAGNOSTICS=1: hex-dumps the first bytes of every named-pipe transfer. */
 static void beer_pipe_dump(const char *dir, u64 h, const void *buf, ssize_t n)
@@ -15265,6 +17252,23 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
     }
 
     if (done) *done = (u32)(received < 0 ? 0 : received);
+    if (getenv("BEER_READ_FAIL_LOG") && (received < 0 || (u64)received < n)) {
+        /* Diagnostic: failed reads, and short reads that end before the end of the file. */
+        struct stat st;
+        const u64 at = overlapped ? (((u64)overlapped->OffsetHigh << 32) | overlapped->Offset) : (u64)-1;
+        const int regular = fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+        const int early = regular && received >= 0 && at != (u64)-1 && at + (u64)received < (u64)st.st_size;
+        if (received < 0 || early) {
+            static _Atomic(u32) logs;
+            if (atomic_fetch_add(&logs, 1) < 200) {
+                char guest_path[PATH_MAX] = {0}, host_path[PATH_MAX] = {0};
+                fh_paths(h, guest_path, sizeof(guest_path), host_path, sizeof(host_path));
+                fprintf(stderr, "[READ FAIL] %s offset=%lld requested=%u received=%lld errno=%d size=%lld\n",
+                        host_path[0] ? host_path : guest_path, (long long)at, n, (long long)received,
+                        received < 0 ? errno : 0, regular ? (long long)st.st_size : -1LL);
+            }
+        }
+    }
     if (received < 0) {
         g_last_error = (u32)errno;
         return 0;
@@ -16001,6 +18005,11 @@ impl_GetWindowRect(u64 hwnd, WIN_RECT *rect) {
         return 1;
     }
     XwaylandWindowState state;
+    BeerWindow *other = beer_window_other(hwnd);
+    if (other) {
+        rect->left = other->x; rect->top = other->y; rect->right = other->x + other->w; rect->bottom = other->y + other->h;
+        return 1;
+    }
     if (hwnd != FAKE_HWND || !xwayland_window_get_state(&state)) {
         g_last_error = 1400;
         return 0;
@@ -16014,6 +18023,8 @@ impl_GetWindowRect(u64 hwnd, WIN_RECT *rect) {
 static u64 __attribute__((ms_abi))
 impl_GetClientRect(u64 hwnd, WIN_RECT *rect) {
     if (!rect) { g_last_error = 87; return 0; }
+    BeerWindow *other = beer_window_other(hwnd);
+    if (other) { rect->left = 0; rect->top = 0; rect->right = other->w; rect->bottom = other->h; return 1; }
     XwaylandWindowState state;
     if (hwnd != FAKE_HWND || !xwayland_window_get_state(&state)) {
         g_last_error = 1400;
@@ -16153,6 +18164,7 @@ static u64 __attribute__((ms_abi)) impl_AdjustTokenPrivileges(u64 token, u32 dis
 { (void)token; (void)disable_all; (void)new_state; (void)len; (void)old; if (ret) *ret = 0; g_last_error = 0; return 1; }
 static u64 __attribute__((ms_abi)) impl_EventRegister(const void *provider, void *callback, void *context, u64 *handle)
 { (void)provider; (void)callback; (void)context; if (handle) *handle = 0x7E0E0001ull; return 0; }
+#include "platform/win32_sddl.h"
 #include "platform/win32_advapi_misc.inc"
 
 /* Per-monitor DPI APIs (Windows 10): the desktop runs at 96 dpi, so scaling is the identity. */
@@ -16269,11 +18281,80 @@ static u64 call_guest_wndproc(u32 message, u64 wparam, u64 lparam)
     return result;
 }
 
+/* Calls the window procedure of any window: the native one through call_guest_wndproc, others from the table. */
+static u64 call_window_proc(u64 hwnd, u32 message, u64 wparam, u64 lparam)
+{
+    BeerWindow *w = beer_window_other(hwnd);
+    if (!w) return call_guest_wndproc(message, wparam, lparam);
+    if (!w->proc) return message == 0x0081 ? 1 : 0;
+    return ((GuestWndProc)(uintptr_t)w->proc)(hwnd, message, wparam, lparam);
+}
+/* The registered procedure of a window class (name as wide or narrow string, or an atom); 0 when unknown. */
+static u64 window_class_proc(u64 classname)
+{
+    if (!classname || classname <= 0xffffu) return 0;
+    const u8 *raw = (const u8 *)(uintptr_t)classname;
+    const int wide = raw[0] && !raw[1];
+    char key[128];
+    window_class_key(classname, wide, key, sizeof(key));
+    u64 proc = 0;
+    pthread_mutex_lock(&g_window_class_lock);
+    for (int i = 0; i < g_window_class_count && !proc; i++)
+        if (!strcmp(g_window_classes[i].name, key)) proc = g_window_classes[i].info.lpfnWndProc;
+    pthread_mutex_unlock(&g_window_class_lock);
+    return proc;
+}
+/* The native window's live state (g_window_*) into its table entry, before another window takes the surface. */
+static void beer_window_save_native(void)
+{
+    BeerWindow *w = beer_window_find(g_native_hwnd);
+    if (!w) return;
+    XwaylandWindowState state;
+    w->proc = g_window_proc; w->userdata = g_window_userdata; w->instance = g_window_instance;
+    w->style = (u32)g_window_style; w->exstyle = (u32)g_window_exstyle; w->owner_tid = g_window_thread_id;
+    w->x = g_window_outer_x; w->y = g_window_outer_y; w->w = g_window_outer_width; w->h = g_window_outer_height;
+    w->visible = xwayland_window_get_state(&state) && state.visible;
+}
+/* A window that has no native surface (message-only windows): table entry plus WM_NCCREATE/WM_CREATE. */
+static u64 create_surfaceless_window(u32 exstyle, u64 classname, u64 title, u32 style, s32 x, s32 y, s32 width,
+                                     s32 height, u64 parent, u64 menu, u64 inst, u64 param, u64 proc)
+{
+    BeerWindow *w = beer_window_new();
+    if (!w) { g_last_error = 1158; return 0; }       /* ERROR_NO_MORE_USER_HANDLES */
+    w->proc = proc; w->instance = inst; w->parent = parent; w->style = style; w->exstyle = exstyle;
+    w->owner_tid = (u32)current_windows_thread_id();
+    w->x = (u32)x == 0x80000000u ? 0 : x; w->y = (u32)y == 0x80000000u ? 0 : y;
+    w->w = (u32)width == 0x80000000u ? 0 : width; w->h = (u32)height == 0x80000000u ? 0 : height;
+    WIN_CREATESTRUCT create = {
+        .lpCreateParams = param, .hInstance = inst, .hMenu = menu, .hwndParent = parent,
+        .cy = w->h, .cx = w->w, .y = w->y, .x = w->x, .style = (s32)style,
+        .lpszName = title, .lpszClass = classname, .dwExStyle = exstyle
+    };
+    const u64 hwnd = w->hwnd;
+    const u64 nccreate = call_window_proc(hwnd, 0x0081, 0, (u64)(uintptr_t)&create);
+    const u64 created = nccreate ? call_window_proc(hwnd, 0x0001, 0, (u64)(uintptr_t)&create) : 0;
+    if (getenv("BEER_WINDOW_DIAGNOSTICS"))
+        fprintf(stderr, "[WIN]   surfaceless 0x%llx proc=0x%llx NCCREATE->0x%llx CREATE->0x%llx\n",
+                (unsigned long long)hwnd, (unsigned long long)proc, (unsigned long long)nccreate,
+                (unsigned long long)created);
+    if (!nccreate || (s64)created == -1) {
+        call_window_proc(hwnd, 0x0082, 0, 0);
+        beer_window_free(hwnd);
+        return 0;
+    }
+    return hwnd;
+}
+
 static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
                                s32 x, s32 y, s32 w, s32 h, u64 parent,
                                u64 menu, u64 inst, u64 param, const char *native_title)
 {
-    if (!g_window_proc) { g_last_error = 1407; return 0; }
+    u64 class_proc = window_class_proc(classname);
+    if (!class_proc) class_proc = g_last_class_proc ? g_last_class_proc : g_window_proc;
+    if (!class_proc) { g_last_error = 1407; return 0; }
+    if (parent == (u64)-3)                                            /* HWND_MESSAGE */
+        return create_surfaceless_window(exstyle, classname, title, style, x, y, w, h, parent, menu, inst,
+                                         param, class_proc);
 
     /* Built-in USER32 child controls occupy rectangles in their parent's
      * client area. They must not replace or resize the process's native
@@ -16288,6 +18369,14 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
             return FAKE_HWND;
     }
 
+    BeerWindow *window = beer_window_new();
+    if (!window) { g_last_error = 1158; return 0; }                  /* ERROR_NO_MORE_USER_HANDLES */
+    window->parent = parent;
+    window->owner_tid = (u32)current_windows_thread_id();
+    beer_window_save_native();                                        /* the previous owner keeps its own state */
+    g_native_hwnd = window->hwnd;
+    g_window_proc = class_proc;
+    g_window_userdata = 0;
     g_window_style = style; g_window_exstyle = exstyle;
     g_window_instance = inst ? inst : g_window_instance;
     g_window_thread_id = (u32)current_windows_thread_id();
@@ -16327,7 +18416,7 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
     /* X11 window dimensions are drawable client dimensions. Keep the Win32
      * outer rectangle separately for GetWindowRect and WINDOWPOS messages. */
     u64 hwnd = create_native_window(x, y, client_w, client_h, native_title);
-    if (!hwnd) return 0;
+    if (!hwnd) { beer_window_free(g_native_hwnd); g_native_hwnd = 0; return 0; }
     if (g_app_icon_pixels)
         (void)xwayland_window_set_icon_argb(g_app_icon_pixels,
                                              g_app_icon_width,
@@ -16381,7 +18470,7 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
     }
 
     if (!call_guest_wndproc(0x0081, 0, (u64)(uintptr_t)&create)) {
-        xwayland_window_destroy(); return 0;
+        xwayland_window_destroy(); beer_window_free(g_native_hwnd); g_native_hwnd = 0; return 0;
     }
 
     /* WM_NCCALCSIZE (0x0083) — send the proposed outer rectangle. The guest
@@ -16392,7 +18481,8 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
     }
 
     if ((s64)call_guest_wndproc(0x0001, 0, (u64)(uintptr_t)&create) == -1) {
-        call_guest_wndproc(0x0082, 0, 0); xwayland_window_destroy(); return 0;
+        call_guest_wndproc(0x0082, 0, 0); xwayland_window_destroy();
+        beer_window_free(g_native_hwnd); g_native_hwnd = 0; return 0;
     }
     /* WM_MOVE carries the client area's screen origin, inside the frame of a decorated window. */
     const s32 client_origin_x = x + (beer_window_style_is_decorated(style) ? BEER_WINDOW_FRAME_LEFT : 0);
@@ -16481,8 +18571,12 @@ impl_CreateWindowExW(u32 exstyle, u64 classname, u64 title, u32 style,
         fprintf(stderr, "[WIN]   exstyle=0x%x style=0x%x pos=%d,%d parent=0x%lx menu=0x%lx inst=0x%lx param=0x%lx caller=%p\n",
                 exstyle, style, x, y, (unsigned long)parent, (unsigned long)menu, (unsigned long)inst,
                 (unsigned long)param, (void *)g_dispatch_incoming_return);
-    return create_guest_window(exstyle, classname, title, style, x, y, w, h,
-                               parent, menu, inst, param, utf8_title);
+    const u64 hwnd = create_guest_window(exstyle, classname, title, style, x, y, w, h,
+                                         parent, menu, inst, param, utf8_title);
+    fprintf(stderr, "[WIN]   -> hwnd=0x%llx parent=0x%llx style=0x%x thread=%u native=0x%llx\n",
+            (unsigned long long)hwnd, (unsigned long long)parent, style, (unsigned)current_windows_thread_id(),
+            (unsigned long long)g_native_hwnd);
+    return hwnd;
 }
 static u64 __attribute__((ms_abi))
 impl_CreateWindowExA(u32 exstyle, u64 classname, u64 title, u32 style,
@@ -16496,18 +18590,27 @@ impl_CreateWindowExA(u32 exstyle, u64 classname, u64 title, u32 style,
 }
 static u64 __attribute__((ms_abi))
 impl_DestroyWindow(u64 hw) {
+    if (beer_window_other(hw)) {
+        call_window_proc(hw, 0x0002, 0, 0);                            /* WM_DESTROY */
+        call_window_proc(hw, 0x0082, 0, 0);                            /* WM_NCDESTROY */
+        beer_window_free(hw);
+        return 1;
+    }
     if (hw != FAKE_HWND || !xwayland_window_exists()) { g_last_error = 1400; return 0; }
     call_guest_wndproc(0x0002, 0, 0);
     call_guest_wndproc(0x0082, 0, 0);
     xwayland_window_destroy();
     g_window_focused = 0;
     g_window_activated = 0;
+    beer_window_free(g_native_hwnd);
+    g_native_hwnd = 0;
     return 1;
 }
 static u64 __attribute__((ms_abi))
-impl_IsWindow(u64 hw) { return hw == FAKE_HWND && xwayland_window_exists(); }
+impl_IsWindow(u64 hw) { return beer_window_other(hw) != NULL || (hw == FAKE_HWND && xwayland_window_exists()); }
 static u64 __attribute__((ms_abi))
 impl_SetWindowTextW(u64 hw, u64 txt) {
+    if (beer_window_other(hw)) return 1;
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     char title[512];
     window_title_from_wide((const u16 *)(uintptr_t)txt, title, sizeof(title));
@@ -16515,6 +18618,7 @@ impl_SetWindowTextW(u64 hw, u64 txt) {
 }
 static u64 __attribute__((ms_abi))
 impl_SetWindowTextA(u64 hw, u64 txt) {
+    if (beer_window_other(hw)) return 1;
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     return xwayland_window_set_title((const char *)(uintptr_t)txt);
 }
@@ -16537,12 +18641,22 @@ static int resize_native_from_outer(s32 x, s32 y, s32 w, s32 h,
 static u64 __attribute__((ms_abi))
 impl_MoveWindow(u64 hw, s32 x, s32 y, s32 w, s32 h, u32 rep) {
     (void)rep;
+    BeerWindow *other = beer_window_other(hw);
+    if (other) { other->x = x; other->y = y; other->w = w; other->h = h; return 1; }
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     return resize_native_from_outer(x, y, w, h, 1, 1);
 }
 static u64 __attribute__((ms_abi))
 impl_SetWindowPos(u64 hw, u64 ins, s32 x, s32 y, s32 w, s32 h, u32 flags) {
     (void)ins;
+    BeerWindow *other = beer_window_other(hw);
+    if (other) {
+        if (!(flags & 0x0002)) { other->x = x; other->y = y; }                     /* SWP_NOMOVE */
+        if (!(flags & 0x0001)) { other->w = w; other->h = h; }                     /* SWP_NOSIZE */
+        if (flags & 0x0040) other->visible = 1;                                     /* SWP_SHOWWINDOW */
+        if (flags & 0x0080) other->visible = 0;                                     /* SWP_HIDEWINDOW */
+        return 1;
+    }
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     fprintf(stderr, "[WIN] SetWindowPos(%d,%d %dx%d flags=0x%x)\n", x, y, w, h, flags);
     return resize_native_from_outer(x, y, w, h,
@@ -16562,6 +18676,14 @@ impl_GetDC(u64 hw) { (void)hw; return FAKE_HDC; }
 static u64 __attribute__((ms_abi))
 impl_ReleaseDC(u64 hw, u64 dc) { (void)hw; if (dc == FAKE_HDC) beer_gdi_flush_window(); return 1; }
 static _Atomic(u64) g_current_cursor = 0x20000001;
+/* Win32's process-wide ShowCursor display counter. The cursor is visible when the counter is nonnegative AND the
+ * current cursor is non-NULL; SetCursor and the WM_SETCURSOR default change only the cursor, never the counter. */
+static _Atomic(s32) g_cursor_display_count;
+static void beer_apply_cursor_visibility(void)
+{
+    xwayland_window_set_cursor_visible(atomic_load(&g_cursor_display_count) >= 0 &&
+                                       atomic_load(&g_current_cursor) != 0);
+}
 
 static u64 __attribute__((ms_abi))
 impl_SetCursor(u64 cursor)
@@ -16573,8 +18695,9 @@ impl_SetCursor(u64 cursor)
     }
     u64 previous = atomic_exchange(&g_current_cursor, cursor);
     /* Stock cursor handles loaded by Beer map to the compositor's default
-     * pointer. A null handle hides it, matching Win32 SetCursor semantics. */
-    xwayland_window_set_cursor_visible(cursor != 0);
+     * pointer. A null handle hides it; a non-null one shows it only while the
+     * ShowCursor counter is nonnegative, matching Win32 SetCursor semantics. */
+    beer_apply_cursor_visibility();
     return previous;
 }
 
@@ -16674,12 +18797,10 @@ impl_ShowCursor(s32 show)
     /* Win32 maintains a process-wide signed display counter. The cursor is
      * visible when the counter is nonnegative, and callers commonly loop
      * until the returned value crosses zero. Return the updated count. */
-    static _Atomic(s32) display_count;
     s32 value = show
-        ? atomic_fetch_add(&display_count, 1) + 1
-        : atomic_fetch_sub(&display_count, 1) - 1;
-    xwayland_window_set_cursor_visible(value >= 0 &&
-                                       atomic_load(&g_current_cursor) != 0);
+        ? atomic_fetch_add(&g_cursor_display_count, 1) + 1
+        : atomic_fetch_sub(&g_cursor_display_count, 1) - 1;
+    beer_apply_cursor_visibility();
     static _Atomic(u32) logs;
     u32 log = atomic_fetch_add(&logs, 1);
     if (log < 16 || (getenv("BEER_INPUT_DIAGNOSTICS") && value < 2 && log < 400))
@@ -16984,9 +19105,33 @@ static u64 __attribute__((ms_abi)) impl_GetCursorInfo(u32 *info)
     return 1;
 }
 
+/* ClipCursor state, defined with ClipCursor below (tentative definitions). */
+static pthread_mutex_t g_clip_cursor_lock;
+static int g_clip_cursor_active;
+static WIN_RECT g_clip_cursor_rect;
 static u64 __attribute__((ms_abi))
 impl_SetCursorPos(s32 x, s32 y)
 {
+    /* Windows clamps the position to the screen and to the ClipCursor rectangle (right/bottom exclusive). UE sets
+     * (CW_USEDEFAULT, CW_USEDEFAULT) = INT_MIN at start-up; kept unclamped, Beer's virtual pointer stayed far
+     * off-screen, so the menu never saw the pointer over a button (no hover; clicks still landed). */
+    {
+        int screen_w = 1920, screen_h = 1080;
+        xwayland_get_screen_size(&screen_w, &screen_h);
+        s32 left = 0, top = 0, right = screen_w, bottom = screen_h;
+        pthread_mutex_lock(&g_clip_cursor_lock);
+        if (g_clip_cursor_active) {
+            if (g_clip_cursor_rect.left > left) left = g_clip_cursor_rect.left;
+            if (g_clip_cursor_rect.top > top) top = g_clip_cursor_rect.top;
+            if (g_clip_cursor_rect.right < right) right = g_clip_cursor_rect.right;
+            if (g_clip_cursor_rect.bottom < bottom) bottom = g_clip_cursor_rect.bottom;
+        }
+        pthread_mutex_unlock(&g_clip_cursor_lock);
+        if (right <= left) right = left + 1;
+        if (bottom <= top) bottom = top + 1;
+        if (x < left) x = left; else if (x >= right) x = right - 1;
+        if (y < top) y = top; else if (y >= bottom) y = bottom - 1;
+    }
     int result = xwayland_window_set_cursor_position(x, y);
     {
         XwaylandWindowState ws = {0};
@@ -17898,6 +20043,42 @@ static void beer_deliver_key(u32 vk, u8 dik, int extended, int down, int top_lev
         }
     }
 }
+/* Focus leaves the window while keys are down (Alt-Tab: Alt is pressed here, released in another window). X sends the
+ * release to the new focus owner, never to us. On Windows a game that registered raw input with RIDEV_INPUTSINK, or
+ * DirectInput in background mode, still sees that release; without it the game's own key table keeps the key held,
+ * and every later key reads as Alt+key (WWM: Enter became Alt+Enter, Space did nothing). Deliver a raw-input and a
+ * DirectInput release for each held key, as the physical release would. Window messages are not sent: Windows
+ * delivers WM_KEYUP only to the focused window. */
+static void beer_release_held_keys_on_focus_out(int top_level)
+{
+    if (!top_level) return;
+    u8 held_vk[256], held_dik[256];
+    unsigned vk_count = 0, dik_count = 0;
+    pthread_mutex_lock(&g_input_mutex);
+    for (u32 vk = 8; vk < 256; ++vk) {                      /* below 8: mouse buttons, not keyboard */
+        if (vk == 0x10 || vk == 0x11 || vk == 0x12) continue; /* generic modifiers: their L/R keys are listed */
+        if (g_input.keys[vk] & 0x80) held_vk[vk_count++] = (u8)vk;
+    }
+    for (u32 dik = 1; dik < 256; ++dik) {
+        if (!(g_input.dik[dik] & 0x80)) continue;
+        held_dik[dik_count++] = (u8)dik;
+        queue_dinput_event_locked(2, dik, 0);
+    }
+    pthread_mutex_unlock(&g_input_mutex);
+    for (unsigned i = 0; i < vk_count; ++i) {
+        const u32 vk = held_vk[i];
+        const u32 scan = (u32)impl_MapVirtualKeyW(vk, 0) & 0x7f;   /* MAPVK_VK_TO_VSC */
+        BeerRawInput raw = beer_raw_keyboard_input(vk, scan, 0);
+        const int extended = vk == 0xa3 || vk == 0xa5 || (vk >= 0x21 && vk <= 0x28) || vk == 0x2d || vk == 0x2e ||
+                             vk == 0x5b || vk == 0x5c || vk == 0x5d || vk == 0x6f;
+        if (extended) raw.data.keyboard.flags |= 2;             /* RI_KEY_E0 */
+        queue_raw_input(&raw, 1);
+    }
+    if ((vk_count || dik_count) && getenv("BEER_INPUT_DIAGNOSTICS"))
+        fprintf(stderr, "[INPUT] focus out: released %u held key(s) (%u DirectInput)%s%02x\n", vk_count, dik_count,
+                vk_count ? ", first vk=0x" : "", vk_count ? held_vk[0] : 0);
+}
+
 void beer_control_inject_key(unsigned vk, unsigned dik, int extended, int down)
 {
     beer_deliver_key(vk, (u8)dik, extended, down, 1);
@@ -18189,6 +20370,7 @@ static void collect_native_window_events(void)
                     fprintf(stderr, "[INPUT] native focus out (was %d)\n", g_window_focused);
                 g_window_focused = 0;
                 g_window_activated = 0;
+                beer_release_held_keys_on_focus_out(top_level);
                 pthread_mutex_lock(&g_input_mutex);
                 memset(g_input.keys, 0, sizeof(g_input.keys));
                 memset(g_input.dik, 0, sizeof(g_input.dik));
@@ -18431,7 +20613,7 @@ static int take_window_message(WIN_MSG *message, u32 min, u32 max, int remove)
 static u64 __attribute__((ms_abi))
 impl_PeekMessageW(WIN_MSG *msg, u64 hw, u32 min, u32 max, u32 remove)
 {
-    if (hw && hw != FAKE_HWND) return 0;
+    if (hw && hw != FAKE_HWND && !beer_window_other(hw)) return 0;
     collect_native_window_events();
     collect_window_timers();
     return take_window_message(msg, min, max, (remove & 1) != 0);
@@ -18439,7 +20621,7 @@ impl_PeekMessageW(WIN_MSG *msg, u64 hw, u32 min, u32 max, u32 remove)
 static u64 __attribute__((ms_abi))
 impl_GetMessageW(WIN_MSG *msg, u64 hw, u32 min, u32 max)
 {
-    if (!msg || (hw && hw != FAKE_HWND)) { g_last_error = 87; return (u64)-1; }
+    if (!msg || (hw && hw != FAKE_HWND && !beer_window_other(hw))) { g_last_error = 87; return (u64)-1; }
     if (getenv("BEER_MESSAGE_DIAGNOSTICS"))
         fprintf(stderr,
                 "[MESSAGE] GetMessage enter hwnd=0x%llx range=0x%x..0x%x "
@@ -18547,12 +20729,14 @@ impl_DispatchMessageW(const WIN_MSG *msg)
     if (!msg->hwnd) return 0;
     /* WM_SETCURSOR (0x0020) and WM_NCHITTEST (0x0084): handled by DefWindowProc
      * if the WndProc returns 0, but we let the game's WndProc decide first. */
+    if (beer_window_other(msg->hwnd)) return call_window_proc(msg->hwnd, msg->message, msg->wParam, msg->lParam);
     u64 result = call_guest_wndproc(msg->message, msg->wParam, msg->lParam);
     if (msg->message == 0x0020 && !result) {
-        /* Unhandled: DefWindowProc applies the class cursor (the arrow). */
-        xwayland_window_set_cursor_visible(1);
+        /* Unhandled: DefWindowProc applies the class cursor (the arrow). That is a SetCursor: it does not
+         * override a negative ShowCursor counter (RE8 hides the arrow that way and draws its own cursor). */
         atomic_store(&g_current_cursor, atomic_load(&g_current_cursor) ?
                      atomic_load(&g_current_cursor) : 1);
+        beer_apply_cursor_visibility();
     }
     return result;
 }
@@ -18619,6 +20803,21 @@ impl_MsgWaitForMultipleObjects(u32 count, const u64 *handles,
         if (has_msg) return count;
     }
 }
+
+/* MsgWaitForMultipleObjectsEx(count, handles, timeout, wake mask, flags): MWMO_WAITALL 1, MWMO_ALERTABLE 2. */
+typedef struct { u32 count; const u64 *handles; u32 all, mask; } BeerMsgWait;
+static u64 beer_msg_wait_slice(void *context, u32 slice)
+{
+    BeerMsgWait *w = context;
+    return impl_MsgWaitForMultipleObjects(w->count, w->handles, w->all, slice, w->mask);
+}
+static u64 __attribute__((ms_abi))
+impl_MsgWaitForMultipleObjectsEx(u32 count, const u64 *handles, u32 timeout_ms, u32 wake_mask, u32 flags)
+{
+    if (!(flags & 2)) return impl_MsgWaitForMultipleObjects(count, handles, flags & 1, timeout_ms, wake_mask);
+    BeerMsgWait w = { count, handles, flags & 1, wake_mask };
+    return beer_alertable_wait(timeout_ms, beer_msg_wait_slice, &w, 0x102, 0xC0);
+}
 /* WaitMessage — blocks until at least one message is in the calling thread's
  * queue.  Equivalent to MsgWaitForMultipleObjects(0, NULL, FALSE,
  * INFINITE, QS_ALLINPUT) without the handle-wait component. */
@@ -18648,13 +20847,16 @@ impl_WaitMessage(void)
 static u64 __attribute__((ms_abi))
 impl_PostQuitMessage(u32 code)
 {
-    g_win_quit = 1; g_win_quit_code = code;
-    queue_window_message(0x0012, code, 0);
+    /* WM_QUIT goes to the calling thread's queue (a window on another thread quits that thread's loop). */
+    const u32 tid = (u32)current_windows_thread_id();
+    if (!g_window_thread_id || tid == g_window_thread_id) { g_win_quit = 1; g_win_quit_code = code; }
+    queue_message_for_thread(tid, 0, 0x0012, code, 0);
     return 0;
 }
 static u64 __attribute__((ms_abi))
 impl_SendMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
 {
+    if (beer_window_other(hw)) return call_window_proc(hw, msg, wp, lp);
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     if (msg == 0x0080) { /* WM_SETICON */
         u64 *slot = wp ? &g_window_icon : &g_window_small_icon;
@@ -18671,6 +20873,8 @@ impl_SendMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
 static u64 __attribute__((ms_abi))
 impl_PostMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
 {
+    BeerWindow *other = beer_window_other(hw);
+    if (other) return queue_message_for_thread(other->owner_tid, hw, msg, wp, lp);
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     /* PostMessage targets the window's owning thread, not the calling thread. */
     return queue_window_message(msg, wp, lp);
@@ -18686,6 +20890,11 @@ impl_PostThreadMessageW(u32 thread_id, u32 msg, u64 wp, u64 lp)
 static u64 __attribute__((ms_abi))
 impl_DefWindowProcW(u64 hw, u32 msg, u64 wp, u64 lp)
 {
+    if (beer_window_other(hw)) {
+        (void)wp; (void)lp;
+        if (msg == 0x0010) return impl_DestroyWindow(hw);             /* WM_CLOSE */
+        return msg == 0x0081 || msg == 0x0014 || msg == 0x0086 ? 1 : 0; /* NCCREATE, ERASEBKGND, NCACTIVATE */
+    }
     if (hw != FAKE_HWND) return 0;
     switch (msg) {
         case 0x0010: /* WM_CLOSE */
@@ -18745,8 +20954,31 @@ static u64 window_long_value(s32 index)
     if (index == -20) return g_window_exstyle;
     return 0;
 }
+static u64 *other_window_long(BeerWindow *w, s32 index)
+{
+    static u64 scratch;
+    switch (index) {
+    case -4: return &w->proc;
+    case -21: return &w->userdata;
+    case -6: return &w->instance;
+    case -8: return &w->parent;                                       /* GWLP_HWNDPARENT */
+    case -16: scratch = w->style; return &scratch;
+    case -20: scratch = w->exstyle; return &scratch;
+    default: return NULL;
+    }
+}
 static u64 set_window_long_value(u64 hw, s32 index, u64 value)
 {
+    BeerWindow *other = beer_window_other(hw);
+    if (other) {
+        u64 *slot = other_window_long(other, index);
+        if (!slot) { g_last_error = 87; return 0; }
+        const u64 old = *slot;
+        if (index == -16) other->style = (u32)value;
+        else if (index == -20) other->exstyle = (u32)value;
+        else *slot = value;
+        return old;
+    }
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     u64 old = window_long_value(index);
     if (index == -4) g_window_proc = value;
@@ -18770,7 +21002,12 @@ impl_SetWindowLongPtrW(u64 hw, s32 idx, u64 new_value)
     { return set_window_long_value(hw, idx, new_value); }
 static u64 __attribute__((ms_abi))
 impl_GetWindowLongPtrW(u64 hw, s32 idx)
-    { if (hw != FAKE_HWND) { g_last_error = 1400; return 0; } return window_long_value(idx); }
+    {
+        BeerWindow *other = beer_window_other(hw);
+        if (other) { u64 *slot = other_window_long(other, idx); return slot ? *slot : 0; }
+        if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+        return window_long_value(idx);
+    }
 static u64 __attribute__((ms_abi))
 impl_GetWindowLongPtrA(u64 hw, s32 idx)
     { return impl_GetWindowLongPtrW(hw, idx); }
@@ -18911,6 +21148,8 @@ impl_GetWindow(u64 hwnd, u32 command)
 static u64 __attribute__((ms_abi))
 impl_GetWindowThreadProcessId(u64 hwnd, u32 *process_id)
 {
+    BeerWindow *other = beer_window_other(hwnd);
+    if (other) { if (process_id) *process_id = (u32)getpid(); return other->owner_tid; }
     if (hwnd != FAKE_HWND || !xwayland_window_exists()) {
         g_last_error = 1400;
         if (process_id) *process_id = 0;
@@ -19247,7 +21486,7 @@ impl_ReleaseSemaphore(u64 h, u32 n, u32 *prev)
     g_sem_val[sid] = (u32)nv;
     if (n) pthread_cond_broadcast(&g_sem_cv[sid]);
     pthread_mutex_unlock(&g_sem_mtx[sid]);
-    if (n) wait_multi_notify();
+    if (n) wait_object_notify(WAIT_OBJECT_SEMAPHORE | (u32)sid);
     return 1;
 }
 
@@ -19483,10 +21722,42 @@ static u64 __attribute__((ms_abi)) impl_lstrcmpiW(const u16 *left, const u16 *ri
     { return (u64)(s64)compare_wide_strings(left, right, 1); }
 static u64 __attribute__((ms_abi)) impl_lstrlenA(const char *value)
     { return value ? strlen(value) : 0; }
+static u64 __attribute__((ms_abi)) impl_lstrlenW(const u16 *value)
+{
+    u64 length = 0;
+    if (value) while (value[length]) ++length;
+    return length;
+}
 static u64 __attribute__((ms_abi)) impl_lstrcpyA(char *destination, const char *source)
 {
     if (!destination || !source) return 0;
     strcpy(destination, source);
+    return (u64)(uintptr_t)destination;
+}
+/* Wide lstrcpy/lstrcat/lstrcpyn: return the destination (lstrcpyn: NULL on bad arguments), as KERNEL32 does. The
+ * old stubs returned 0 and copied nothing, leaving the caller's buffer as it was. */
+static u64 __attribute__((ms_abi)) impl_lstrcpyW(u16 *destination, const u16 *source)
+{
+    if (!destination || !source) return 0;
+    size_t i = 0;
+    do destination[i] = source[i]; while (source[i++]);
+    return (u64)(uintptr_t)destination;
+}
+static u64 __attribute__((ms_abi)) impl_lstrcatW(u16 *destination, const u16 *source)
+{
+    if (!destination || !source) return 0;
+    size_t end = 0;
+    while (destination[end]) ++end;
+    size_t i = 0;
+    do destination[end + i] = source[i]; while (source[i++]);
+    return (u64)(uintptr_t)destination;
+}
+static u64 __attribute__((ms_abi)) impl_lstrcpynW(u16 *destination, const u16 *source, s32 count)
+{
+    if (!destination || !source || count <= 0) return 0;
+    s32 i = 0;
+    for (; i + 1 < count && source[i]; ++i) destination[i] = source[i];
+    destination[i] = 0;
     return (u64)(uintptr_t)destination;
 }
 static u64 __attribute__((ms_abi)) impl_lstrcatA(char *destination, const char *source)
@@ -19853,7 +22124,6 @@ impl_GetStartupInfoA(u8 *si) { return impl_GetStartupInfoW(si); }
 static u64 __attribute__((ms_abi))
 impl_WriteFile(u64 h, const void *buf, u32 n, u32 *written, u64 ov)
 {
-    (void)ov;
     /* STD_OUTPUT_HANDLE=-11 (0xFFFFFFF5), STD_ERROR_HANDLE=-12 (0xFFFFFFF4) */
     int fd = -1;
     if      (h == (u64)(int64_t)-11 || h == (u64)(int64_t)-0xB) fd = STDOUT_FILENO;
@@ -19863,6 +22133,34 @@ impl_WriteFile(u64 h, const void *buf, u32 n, u32 *written, u64 ov)
     if (beer_pipe_is_pipe(h)) {
         if (!beer_pipe_ensure_connected(h)) { if (written) *written = 0; return 0; }
         fd = fh_get(h);
+    }
+    if (ov && !beer_pipe_is_pipe(h) && fd != STDOUT_FILENO && fd != STDERR_FILENO) {
+        /* An OVERLAPPED write has its own absolute file position (all ones: append), on synchronous handles too.
+         * SQLite writes its pages this way; writing them at the descriptor position instead corrupted databases.
+         * As on Windows, the file pointer of the handle moves past the data written. */
+        WIN_OVERLAPPED *overlapped = (WIN_OVERLAPPED *)(uintptr_t)ov;
+        u64 offset = ((u64)overlapped->OffsetHigh << 32) | overlapped->Offset;
+        ssize_t r;
+        if (offset == UINT64_MAX) {
+            off_t end = lseek(fd, 0, SEEK_END);
+            r = end < 0 ? -1 : write(fd, buf, n);
+        } else {
+            r = offset <= (u64)INT64_MAX ? pwrite(fd, buf, n, (off_t)offset) : -1;
+            if (r >= 0) lseek(fd, (off_t)(offset + (u64)r), SEEK_SET);
+        }
+        int error = r < 0 ? errno : 0;
+        overlapped->Internal = r < 0 ? (u64)(u32)error : 0;
+        overlapped->InternalHigh = r < 0 ? 0 : (u64)r;
+        if (written) *written = (u32)(r < 0 ? 0 : r);
+        if (r >= 0 && (overlapped->hEvent & ~1ull)) impl_SetEvent(overlapped->hEvent & ~1ull);
+        if (!(overlapped->hEvent & 1))
+            iocp_file_completed(h, ov, r < 0 ? 0 : (u32)r, r < 0 ? (u32)error : 0);
+        if (r < 0) { g_last_error = error == ENOSPC ? 112u : 29u; return 0; }   /* DISK_FULL / WRITE_FAULT */
+        if (file_has_iocp(h) && !(file_notify_flags(h) & 1u) && !overlapped->hEvent) {
+            g_last_error = 997;                                                  /* ERROR_IO_PENDING, as for ReadFile */
+            return 0;
+        }
+        return 1;
     }
     ssize_t r = write(fd, buf, n);
     if (beer_pipe_is_pipe(h)) beer_pipe_dump("write", h, buf, r);
@@ -20246,6 +22544,101 @@ impl_SetThreadpoolWait(WinTPWait *w, u64 handle, s64 *timeout)
     return 0;
 }
 
+/* RegisterWaitForSingleObject: a thread-pool wait that calls WAITORTIMERCALLBACK(context, timed_out) when the
+ * object is signalled or the timeout passes, then waits again unless WT_EXECUTEONLYONCE (0x8). UnregisterWait(Ex)
+ * stops it; UnregisterWaitEx with INVALID_HANDLE_VALUE also waits for a running callback, and with an event it
+ * signals that event once the wait is gone. */
+typedef struct {
+    u64 handle, cb, ctx;
+    u32 timeout_ms, flags;
+    volatile int cancel, running;
+    u64 done_event;                 /* UnregisterWaitEx completion event (0 = none) */
+    pthread_mutex_t mtx;
+    pthread_cond_t cv;
+} WinRegisteredWait;
+
+static void *registered_wait_thread(void *arg)
+{
+    WinRegisteredWait *w = arg;
+    void *teb = alloc_teb_for_thread();
+    if (teb) syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)teb);
+    guest_dll_notify_thread(2 /* DLL_THREAD_ATTACH */);
+    typedef void __attribute__((ms_abi)) (*WaitOrTimerCallback)(u64, u32);
+    for (;;) {
+        u32 elapsed = 0;
+        u64 result = 0x102u;
+        while (!w->cancel) {
+            const u32 slice = w->timeout_ms == 0xFFFFFFFFu ? 10u :
+                              (w->timeout_ms - elapsed < 10u ? w->timeout_ms - elapsed : 10u);
+            result = impl_WaitForSingleObject(w->handle, slice);
+            if (result != 0x102u) break;
+            elapsed += slice;
+            if (w->timeout_ms != 0xFFFFFFFFu && elapsed >= w->timeout_ms) break;
+        }
+        pthread_mutex_lock(&w->mtx);
+        const int stop = w->cancel || result == 0xFFFFFFFFu;
+        if (!stop) w->running = 1;
+        pthread_mutex_unlock(&w->mtx);
+        if (stop) break;
+        ((WaitOrTimerCallback)w->cb)(w->ctx, result == 0x102u ? 1u : 0u);
+        pthread_mutex_lock(&w->mtx);
+        w->running = 0;
+        pthread_cond_broadcast(&w->cv);
+        pthread_mutex_unlock(&w->mtx);
+        if (w->flags & 0x8u) break;                                    /* WT_EXECUTEONLYONCE */
+    }
+    pthread_mutex_lock(&w->mtx);
+    while (!w->cancel) pthread_cond_wait(&w->cv, &w->mtx);            /* the handle lives until unregistered */
+    const u64 done_event = w->done_event;
+    pthread_mutex_unlock(&w->mtx);
+    if (done_event && done_event != UINT64_MAX) impl_SetEvent(done_event);
+    guest_dll_notify_thread(3 /* DLL_THREAD_DETACH */);
+    pthread_mutex_destroy(&w->mtx);
+    pthread_cond_destroy(&w->cv);
+    free(w);
+    return NULL;
+}
+
+static u64 __attribute__((ms_abi))
+impl_RegisterWaitForSingleObject(u64 *wait_object, u64 handle, u64 callback, u64 context, u32 ms, u32 flags)
+{
+    if (!wait_object || !callback) { g_last_error = 87; return 0; }
+    WinRegisteredWait *w = calloc(1, sizeof(*w));
+    if (!w) { g_last_error = 8; return 0; }
+    w->handle = handle; w->cb = callback; w->ctx = context; w->timeout_ms = ms; w->flags = flags;
+    pthread_mutex_init(&w->mtx, NULL);
+    pthread_cond_init(&w->cv, NULL);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, registered_wait_thread, w) != 0) {
+        pthread_mutex_destroy(&w->mtx); pthread_cond_destroy(&w->cv); free(w);
+        g_last_error = 8;
+        return 0;
+    }
+    pthread_detach(thread);
+    *wait_object = (u64)(uintptr_t)w;
+    g_last_error = 0;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi)) impl_UnregisterWaitEx(u64 wait_object, u64 completion_event)
+{
+    WinRegisteredWait *w = (WinRegisteredWait *)(uintptr_t)wait_object;
+    if (!w) { g_last_error = 6; return 0; }
+    pthread_mutex_lock(&w->mtx);
+    const int running = w->running;
+    if (completion_event == UINT64_MAX)                                /* wait for a callback in progress */
+        while (w->running) pthread_cond_wait(&w->cv, &w->mtx);
+    w->done_event = completion_event;
+    w->cancel = 1;
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mtx);
+    /* Without a completion wait, a callback still running is reported as ERROR_IO_PENDING (997). */
+    if (running && completion_event != UINT64_MAX) { g_last_error = 997; return completion_event ? 1 : 0; }
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_UnregisterWait(u64 wait_object) { return impl_UnregisterWaitEx(wait_object, 0); }
+
 static u64 __attribute__((ms_abi))
 impl_WaitForThreadpoolWaitCallbacks(WinTPWait *w, u32 cancel)
 {
@@ -20304,7 +22697,66 @@ impl_GetFileInformationByHandleEx(u64 handle, u32 cls, void *info, u32 sz)
 {
     int fd = fh_get(handle);
     if (fd < 0) { g_last_error = 6; return 0; }
-    if (info) memset(info, 0, sz);
+    if (!info) { g_last_error = 87; return 0; }
+    u8 *out = info;
+    struct stat st;
+    const int have_stat = fstat(fd, &st) == 0;
+    switch (cls) {
+    case 0: {   /* FileBasicInfo: creation, access, write, change times; attributes */
+        if (sz < 40) { g_last_error = 24; return 0; }
+        memset(out, 0, 40);
+        if (!have_stat) break;
+        u64 times[4] = {
+            unix_time_to_filetime(st.st_ctim.tv_sec, st.st_ctim.tv_nsec),
+            unix_time_to_filetime(st.st_atim.tv_sec, st.st_atim.tv_nsec),
+            unix_time_to_filetime(st.st_mtim.tv_sec, st.st_mtim.tv_nsec),
+            unix_time_to_filetime(st.st_ctim.tv_sec, st.st_ctim.tv_nsec),
+        };
+        memcpy(out, times, sizeof(times));
+        u32 attributes = S_ISDIR(st.st_mode) ? 0x10u : 0x80u;
+        if (!(st.st_mode & S_IWUSR)) attributes = (attributes & ~0x80u) | 0x1u;
+        memcpy(out + 32, &attributes, 4);
+        break;
+    }
+    case 1: {   /* FileStandardInfo: allocation size, end of file, links, delete pending, directory */
+        if (sz < 24) { g_last_error = 24; return 0; }
+        memset(out, 0, 24);
+        if (!have_stat) break;
+        const u64 allocation = (u64)st.st_blocks * 512u, end = (u64)st.st_size;
+        const u32 links = (u32)st.st_nlink;
+        memcpy(out, &allocation, 8);
+        memcpy(out + 8, &end, 8);
+        memcpy(out + 16, &links, 4);
+        out[21] = S_ISDIR(st.st_mode) ? 1 : 0;
+        break;
+    }
+    case 2: {   /* FileNameInfo: the name below the volume / pipe device ("\dir\file", "\pipename") */
+        if (sz < 4) { g_last_error = 24; return 0; }
+        char guest[sizeof(g_fh_guest_path[0])];
+        const u32 id = (u32)(handle - 0x70000000ULL);
+        pthread_mutex_lock(&g_fh_mtx);
+        snprintf(guest, sizeof(guest), "%s", g_fh_guest_path[id]);
+        pthread_mutex_unlock(&g_fh_mtx);
+        const char *name = guest;
+        if (!strncmp(name, "\\\\?\\", 4) || !strncmp(name, "\\??\\", 4)) name += 4;
+        if (!strncasecmp(name, "\\\\.\\pipe", 8)) name += 8;            /* pipe: name below \Device\NamedPipe */
+        else if (name[0] && name[1] == ':') name += 2;                        /* file: drop the drive */
+        const size_t length = strlen(name);
+        const u32 bytes = (u32)(length * 2);
+        memcpy(out, &bytes, 4);
+        const size_t room = (sz - 4) / 2;
+        for (size_t i = 0; i < length && i < room; ++i) {
+            const u16 c = (u8)(name[i] == '/' ? '\\' : name[i]);
+            memcpy(out + 4 + i * 2, &c, 2);
+        }
+        if (length > room) { g_last_error = 234; return 0; }                 /* ERROR_MORE_DATA */
+        break;
+    }
+    default:
+        memset(out, 0, sz);
+        break;
+    }
+    g_last_error = 0;
     return 1;
 }
 static u64 __attribute__((ms_abi))
@@ -23175,6 +25627,13 @@ impl___acrt_iob_func(u32 index)
 #include "platform/win32_d3dkmt.inc"
 #include "platform/win32_file_search.inc"
 #include "platform/win32_missing_exports.inc"
+static u64 __attribute__((ms_abi)) beer_QISearch(u8 *object, const u8 *table, const u8 *iid, u64 *out);
+static u64 __attribute__((ms_abi)) impl_InitSecurityInterfaceA(void);
+static u64 __attribute__((ms_abi)) impl_InitSecurityInterfaceW(void);
+/* Exports Windows publishes by ordinal only. A module's named exports take ordinals 1..n; these keep their own. */
+static const struct { const char *module; u16 ordinal; const char *implementation; } g_ordinal_only_exports[] = {
+    { "shlwapi.dll", 219, "QISearch" },
+};
 static u64 __attribute__((ms_abi))
 impl_RegGetValueA(u64 key, const char *subkey, const char *value, u32 flags, u32 *type, void *data, u32 *size)
 {
@@ -23189,6 +25648,7 @@ impl_RegGetValueW(u64 key, const u16 *subkey, const u16 *value, u32 flags, u32 *
     return reg_get_value(key, subkey ? sk : NULL, value ? vn : NULL, flags, type, data, size, 1);
 }
 #include "platform/win32_native_info.inc"
+#include "platform/win32_native_sync.inc"
 #include "platform/win32_uxtheme.inc"
 #include "platform/win32_user_misc.inc"
 #include "platform/win32_crypt32.inc"
@@ -23315,6 +25775,9 @@ static ImplEntry g_impls[] = {
     {"D3DKMTOpenAdapterFromHdc",                (ImplFn)impl_D3DKMTOpenAdapterFromHdc},
     {"D3DKMTCloseAdapter",                      (ImplFn)impl_D3DKMTCloseAdapter},
     {"D3DKMTQueryAdapterInfo",                  (ImplFn)impl_D3DKMTQueryAdapterInfo},
+    {"D3DKMTEnumAdapters2",                     (ImplFn)impl_D3DKMTEnumAdapters2},
+    {"D3DKMTOpenAdapterFromDeviceName",         (ImplFn)impl_D3DKMTOpenAdapterFromDeviceName},
+    {"D3DKMTQueryStatistics",                   (ImplFn)impl_D3DKMTQueryStatistics},
     /* Critical sections */
     {"InitializeCriticalSectionAndSpinCount", (ImplFn)impl_InitializeCriticalSectionAndSpinCount},
     {"InitializeCriticalSection",             (ImplFn)impl_InitializeCriticalSection},
@@ -23534,6 +25997,8 @@ static ImplEntry g_impls[] = {
     {"CreateDXGIFactory2",                    (ImplFn)impl_CreateDXGIFactory2},
     /* WS2_32 */
     {"WSAStartup",                            (ImplFn)impl_WSAStartup},
+    {"getsockopt",                            (ImplFn)impl_getsockopt},
+    {"WSAPoll",                               (ImplFn)impl_WSAPoll},
     {"getaddrinfo",                           (ImplFn)impl_getaddrinfo},
     {"GetAddrInfoW",                          (ImplFn)impl_GetAddrInfoW},
     {"freeaddrinfo",                          (ImplFn)impl_freeaddrinfo},
@@ -23548,6 +26013,11 @@ static ImplEntry g_impls[] = {
     {"WSASetEvent",                           (ImplFn)impl_WSASetEvent},
     {"WSAResetEvent",                         (ImplFn)impl_WSAResetEvent},
     {"WSAWaitForMultipleEvents",              (ImplFn)impl_WSAWaitForMultipleEvents},
+    {"WSAEventSelect",                        (ImplFn)impl_WSAEventSelect},
+    {"WSAEnumNetworkEvents",                  (ImplFn)impl_WSAEnumNetworkEvents},
+    {"ConnectEx",                             (ImplFn)impl_ConnectEx},
+    {"DisconnectEx",                          (ImplFn)impl_DisconnectEx},
+    {"WSAGetOverlappedResult",                (ImplFn)impl_WSAGetOverlappedResult},
     {"socket",                                  (ImplFn)impl_socket},
     {"recv",                                    (ImplFn)impl_recv},
     {"accept",                                  (ImplFn)impl_accept},
@@ -23606,6 +26076,16 @@ static ImplEntry g_impls[] = {
     {"ZwSetInformationProcess",               (ImplFn)impl_NtSetInformationProcess},
     {"NtQueryInformationThread",              (ImplFn)impl_NtQueryInformationThread},
     {"ZwQueryInformationThread",              (ImplFn)impl_NtQueryInformationThread},
+    {"NtCreateEvent",                         (ImplFn)impl_NtCreateEvent},
+    {"ZwCreateEvent",                         (ImplFn)impl_NtCreateEvent},
+    {"NtSetEvent",                            (ImplFn)impl_NtSetEvent},
+    {"ZwSetEvent",                            (ImplFn)impl_NtSetEvent},
+    {"NtResetEvent",                          (ImplFn)impl_NtResetEvent},
+    {"ZwResetEvent",                          (ImplFn)impl_NtResetEvent},
+    {"NtClearEvent",                          (ImplFn)impl_NtClearEvent},
+    {"ZwClearEvent",                          (ImplFn)impl_NtClearEvent},
+    {"NtCreateThreadEx",                      (ImplFn)impl_NtCreateThreadEx},
+    {"ZwCreateThreadEx",                      (ImplFn)impl_NtCreateThreadEx},
     {"NtQueryVirtualMemory",                  (ImplFn)impl_NtQueryVirtualMemory},
     {"ZwQueryVirtualMemory",                  (ImplFn)impl_NtQueryVirtualMemory},
     {"NtDelayExecution",                      (ImplFn)impl_NtDelayExecution},
@@ -23693,6 +26173,12 @@ static ImplEntry g_impls[] = {
     {"CryptMsgUpdate",                        (ImplFn)impl_CryptMsgUpdate},
     {"CryptMsgClose",                         (ImplFn)impl_CryptMsgClose},
     {"CertOpenStore",                         (ImplFn)impl_CertOpenStore},
+    {"CertOpenSystemStoreA",                  (ImplFn)impl_CertOpenSystemStoreA},
+    {"CertOpenSystemStoreW",                  (ImplFn)impl_CertOpenSystemStoreW},
+    {"CertEnumCertificatesInStore",           (ImplFn)impl_CertEnumCertificatesInStore},
+    {"CertDuplicateCertificateContext",       (ImplFn)impl_CertDuplicateCertificateContext},
+    {"CertGetIntendedKeyUsage",               (ImplFn)impl_CertGetIntendedKeyUsage},
+    {"CertGetEnhancedKeyUsage",               (ImplFn)impl_CertGetEnhancedKeyUsage},
     {"CertCloseStore",                        (ImplFn)impl_CertCloseStore},
     {"CertFindCertificateInStore",            (ImplFn)impl_CertFindCertificateInStore},
     {"CertGetNameStringA",                    (ImplFn)impl_CertGetNameStringA},
@@ -23724,6 +26210,10 @@ static ImplEntry g_impls[] = {
     {"CM_Get_Device_ID_ListW",               (ImplFn)impl_CM_Get_Device_ID_ListW},
     {"CM_Get_Device_ID_ListA",               (ImplFn)impl_CM_Get_Device_ID_ListA},
     {"StringFromGUID2",                      (ImplFn)impl_StringFromGUID2},
+    {"IIDFromString",                        (ImplFn)impl_IIDFromString},
+    {"StringFromCLSID",                      (ImplFn)impl_StringFromCLSID},
+    {"StringFromIID",                        (ImplFn)impl_StringFromCLSID},
+    {"CLSIDFromString",                      (ImplFn)impl_CLSIDFromString},
     {"CM_MapCrToWin32Err",                   (ImplFn)impl_CM_MapCrToWin32Err},
     {"CM_Get_DevNode_PropertyW",             (ImplFn)impl_CM_Get_DevNode_PropertyW},
     {"SetupDiGetClassDevsA",                  (ImplFn)impl_SetupDiGetClassDevsA},
@@ -23776,6 +26266,8 @@ static ImplEntry g_impls[] = {
     {"WaitNamedPipeW",                        (ImplFn)beer_WaitNamedPipeW},
     {"PeekNamedPipe",                         (ImplFn)beer_PeekNamedPipe},
     {"SetNamedPipeHandleState",               (ImplFn)beer_SetNamedPipeHandleState},
+    {"TransactNamedPipe",                     (ImplFn)beer_TransactNamedPipe},
+    {"ActivateAudioInterfaceAsync",           (ImplFn)beer_ActivateAudioInterfaceAsync},
     {"GetPhysicallyInstalledSystemMemory",    (ImplFn)impl_GetPhysicallyInstalledSystemMemory},
     {"GetTimeZoneInformation",               (ImplFn)impl_GetTimeZoneInformation},
     /* Time */
@@ -23800,6 +26292,7 @@ static ImplEntry g_impls[] = {
     {"SHGetSpecialFolderPathW",               (ImplFn)impl_SHGetSpecialFolderPathW},
     {"SHGetSpecialFolderPathA",               (ImplFn)impl_SHGetSpecialFolderPathA},
     {"SHGetKnownFolderPath",                  (ImplFn)impl_SHGetKnownFolderPath},
+    {"SHCreateItemFromParsingName",           (ImplFn)impl_SHCreateItemFromParsingName},
     {"WinVerifyTrust",                        (ImplFn)impl_WinVerifyTrust},
     {"ShellExecuteA",                             (ImplFn)impl_ShellExecuteA},
     {"ShellExecuteW",                             (ImplFn)impl_ShellExecuteW},
@@ -23947,6 +26440,17 @@ static ImplEntry g_impls[] = {
     {"GetModuleFileNameW",                    (ImplFn)impl_GetModuleFileNameW},
     /* SLIST */
     {"InitializeSListHead",                   (ImplFn)impl_InitializeSListHead},
+    {"RtlInitializeSListHead",                (ImplFn)impl_InitializeSListHead},
+    {"InterlockedPushEntrySList",             (ImplFn)impl_InterlockedPushEntrySList},
+    {"RtlInterlockedPushEntrySList",          (ImplFn)impl_InterlockedPushEntrySList},
+    {"InterlockedPushListSListEx",            (ImplFn)impl_InterlockedPushListSListEx},
+    {"RtlInterlockedPushListSListEx",         (ImplFn)impl_InterlockedPushListSListEx},
+    {"InterlockedPopEntrySList",              (ImplFn)impl_InterlockedPopEntrySList},
+    {"RtlInterlockedPopEntrySList",           (ImplFn)impl_InterlockedPopEntrySList},
+    {"RtlInterlockedFlushSList",              (ImplFn)impl_InterlockedFlushSList},
+    {"QueryDepthSList",                       (ImplFn)impl_QueryDepthSList},
+    {"RtlQueryDepthSList",                    (ImplFn)impl_QueryDepthSList},
+    {"RtlFirstEntrySList",                    (ImplFn)impl_RtlFirstEntrySList},
     {"InterlockedFlushSList",                 (ImplFn)impl_InterlockedFlushSList},
     /* Interlocked */
     {"InterlockedIncrement",                  (ImplFn)impl_InterlockedIncrement},
@@ -24046,6 +26550,9 @@ static ImplEntry g_impls[] = {
     /* Threads */
     {"CreateThread",                          (ImplFn)impl_CreateThread},
     {"QueueUserWorkItem",                     (ImplFn)impl_QueueUserWorkItem},
+    {"RegisterWaitForSingleObject",           (ImplFn)impl_RegisterWaitForSingleObject},
+    {"UnregisterWait",                        (ImplFn)impl_UnregisterWait},
+    {"UnregisterWaitEx",                      (ImplFn)impl_UnregisterWaitEx},
     {"GetCurrentThread",                      (ImplFn)impl_GetCurrentThread},
     {"GetExitCodeThread",                     (ImplFn)impl_GetExitCodeThread},
     {"DuplicateHandle",                       (ImplFn)impl_DuplicateHandle},
@@ -24115,6 +26622,10 @@ static ImplEntry g_impls[] = {
     {"PostQueuedCompletionStatus",            (ImplFn)impl_PostQueuedCompletionStatus},
     {"SetFileCompletionNotificationModes",    (ImplFn)impl_SetFileCompletionNotificationModes},
     {"CancelIoEx",                            (ImplFn)impl_CancelIoEx},
+    {"LockFileEx",                            (ImplFn)impl_LockFileEx},
+    {"UnlockFileEx",                          (ImplFn)impl_UnlockFileEx},
+    {"LockFile",                              (ImplFn)impl_LockFile},
+    {"UnlockFile",                            (ImplFn)impl_UnlockFile},
     {"GetOverlappedResult",                   (ImplFn)impl_GetOverlappedResult},
     {"RtlInitAnsiString",                     (ImplFn)impl_RtlInitAnsiString},
     {"RtlInitUnicodeString",                  (ImplFn)impl_RtlInitUnicodeString},
@@ -24139,6 +26650,12 @@ static ImplEntry g_impls[] = {
     {"DuplicateToken",                            (ImplFn)impl_DuplicateToken},
     {"DuplicateTokenEx",                          (ImplFn)impl_DuplicateTokenEx},
     {"GetFileSecurityW",                          (ImplFn)impl_GetFileSecurityW},
+    {"ConvertStringSecurityDescriptorToSecurityDescriptorW", (ImplFn)impl_ConvertStringSecurityDescriptorToSecurityDescriptorW},
+    {"ConvertStringSecurityDescriptorToSecurityDescriptorA", (ImplFn)impl_ConvertStringSecurityDescriptorToSecurityDescriptorA},
+    {"BuildExplicitAccessWithNameW",              (ImplFn)impl_BuildExplicitAccessWithNameW},
+    {"BuildExplicitAccessWithNameA",              (ImplFn)impl_BuildExplicitAccessWithNameA},
+    {"BuildSecurityDescriptorW",                  (ImplFn)impl_BuildSecurityDescriptorW},
+    {"BuildSecurityDescriptorA",                  (ImplFn)impl_BuildSecurityDescriptorA},
     {"GetFileSecurityA",                          (ImplFn)impl_GetFileSecurityA},
     {"AccessCheck",                               (ImplFn)impl_AccessCheck},
     {"PrivilegeCheck",                            (ImplFn)impl_PrivilegeCheck},
@@ -24421,7 +26938,7 @@ static ImplEntry g_impls[] = {
     {"GetMonitorInfoW",                       (ImplFn)impl_GetMonitorInfoW},
     {"GetMonitorInfoA",                       (ImplFn)impl_GetMonitorInfoW},
     {"MsgWaitForMultipleObjects",             (ImplFn)impl_MsgWaitForMultipleObjects},
-    {"MsgWaitForMultipleObjectsEx",           (ImplFn)impl_MsgWaitForMultipleObjects},
+    {"MsgWaitForMultipleObjectsEx",           (ImplFn)impl_MsgWaitForMultipleObjectsEx},
     {"CallWindowProcA",                       (ImplFn)impl_CallWindowProcW},
     {"WaitMessage",                           (ImplFn)impl_WaitMessage},
     /* Misc sync */
@@ -24463,7 +26980,11 @@ static ImplEntry g_impls[] = {
     {"lstrcmpiA",                             (ImplFn)impl_lstrcmpiA},
     {"lstrcmpiW",                             (ImplFn)impl_lstrcmpiW},
     {"lstrcpyA",                              (ImplFn)impl_lstrcpyA},
+    {"lstrcpyW",                              (ImplFn)impl_lstrcpyW},
+    {"lstrcatW",                              (ImplFn)impl_lstrcatW},
+    {"lstrcpynW",                             (ImplFn)impl_lstrcpynW},
     {"lstrlenA",                              (ImplFn)impl_lstrlenA},
+    {"lstrlenW",                              (ImplFn)impl_lstrlenW},
     /* Thread Pool API (Vista+) — required by Dantelion2 job system */
     {"CreateThreadpoolWork",                  (ImplFn)impl_CreateThreadpoolWork},
     {"SubmitThreadpoolWork",                  (ImplFn)impl_SubmitThreadpoolWork},
@@ -24537,12 +27058,46 @@ void beer_report_clobber(unsigned mask, unsigned import_index)
     fprintf(stderr, "[ABI] %s returned with changed nonvolatile registers: %s(restored)\n", api, list);
 }
 
+#include "platform/beer_extra_exports.inc"
+
+/* InitSecurityInterfaceA/W: SSPI's function table (SECURITY_FUNCTION_TABLE_A/W, x64 slot = index * 8). The entries
+ * are the guest-callable thunks of the Schannel provider in win32_schannel.c; unused slots stay NULL. */
+static u64 __attribute__((ms_abi)) impl_GetProcAddress(u64 hmod, const char *procname);
+static u64 *beer_sspi_table(int wide)
+{
+    static u64 tables[2][32];
+    static int built[2];
+    u64 *table = tables[wide ? 1 : 0];
+    if (built[wide ? 1 : 0]) return table;
+    static const struct { int slot; const char *a, *w; } entries[] = {
+        { 1, "EnumerateSecurityPackagesA", "EnumerateSecurityPackagesW" },
+        { 3, "AcquireCredentialsHandleA", "AcquireCredentialsHandleW" },
+        { 4, "FreeCredentialsHandle", "FreeCredentialsHandle" },
+        { 6, "InitializeSecurityContextA", "InitializeSecurityContextW" },
+        { 8, "CompleteAuthToken", "CompleteAuthToken" },
+        { 9, "DeleteSecurityContext", "DeleteSecurityContext" },
+        { 10, "ApplyControlToken", "ApplyControlToken" },
+        { 11, "QueryContextAttributesA", "QueryContextAttributesW" },
+        { 16, "FreeContextBuffer", "FreeContextBuffer" },
+        { 17, "QuerySecurityPackageInfoA", "QuerySecurityPackageInfoW" },
+        { 25, "EncryptMessage", "EncryptMessage" },
+        { 26, "DecryptMessage", "DecryptMessage" },
+    };
+    table[0] = 1;                                             /* SECURITY_SUPPORT_PROVIDER_INTERFACE_VERSION */
+    for (size_t i = 0; i < sizeof(entries) / sizeof(*entries); ++i)
+        table[entries[i].slot] = impl_GetProcAddress(HMOD_K32, wide ? entries[i].w : entries[i].a);
+    built[wide ? 1 : 0] = 1;
+    return table;
+}
+static u64 __attribute__((ms_abi)) impl_InitSecurityInterfaceA(void) { return (u64)(uintptr_t)beer_sspi_table(0); }
+static u64 __attribute__((ms_abi)) impl_InitSecurityInterfaceW(void) { return (u64)(uintptr_t)beer_sspi_table(1); }
+
 static ImplFn find_impl(const char *fn_name)
 {
     for (int i = 0; g_impls[i].name; i++)
         if (strcmp(g_impls[i].name, fn_name) == 0)
             return g_impls[i].fn;
-    return NULL;
+    return beer_extra_export_impl(fn_name);
 }
 
 static int beer_oleaut32_ordinal_self_test(void)
@@ -24699,6 +27254,7 @@ static const char *const g_compat_module_exports[][2] = {
     /* shell32: documented entry points Beer implements, for code that walks the export table. */
     { "shell32.dll", "CommandLineToArgvW" },
     { "shell32.dll", "SHCreateDirectoryExW" },
+    { "shell32.dll", "SHCreateItemFromParsingName" },
     { "shell32.dll", "SHGetFolderPathA" },
     { "shell32.dll", "SHGetFolderPathW" },
     { "shell32.dll", "SHGetKnownFolderPath" },
@@ -24731,6 +27287,14 @@ static void compat_module_exports_build(u64 base, const char *module)
         if (!strcmp(g_compat_module_exports[i][0], module) && find_impl(g_compat_module_exports[i][1]) &&
             count < MAX_COMPAT_EXPORTS)
             names[count++] = g_compat_module_exports[i][1];
+    for (size_t i = 0; i < BEER_MODULE_EXPORT_COUNT; ++i)   /* the Windows DLL's implemented surface */
+        if (!strcasecmp(beer_module_exports[i][0], module) && find_impl(beer_module_exports[i][1]) &&
+            count < MAX_COMPAT_EXPORTS)
+            names[count++] = beer_module_exports[i][1];
+    beer_extra_exports_load();
+    for (int i = 0; i < g_extra_export_count && count < MAX_COMPAT_EXPORTS; ++i)
+        if (!strcasecmp(g_extra_exports[i].dll, module) && g_extra_exports[i].name[0] != '#')
+            names[count++] = g_extra_exports[i].name;
     /* Keep WS2_32's named and ordinal export surfaces derived from the same
      * canonical ABI table.  Maintaining a second hand-written name list made
      * direct PE walkers disagree with import/GetProcAddress resolution. */
@@ -24750,8 +27314,21 @@ static void compat_module_exports_build(u64 base, const char *module)
     u32 funcs = FAKE_PE_EDATA_RVA + 0x200;
     /* Modules with public ordinal ABIs need their complete sparse function
      * table reserved before the sorted name/ordinal arrays. */
-    u32 function_slots = !strcmp(module, "ws2_32.dll") ? 151u :
-                         !strcmp(module, "wldap32.dll") ? 292u : (u32)count;
+    u32 function_slots = !strcmp(module, "wldap32.dll") ? 292u : (u32)count;
+    u32 known_ordinal_max = 0;                     /* modules with a Windows ordinal ABI (win32_module_exports.h) */
+    for (size_t e = 0; e < BEER_MODULE_ORDINAL_COUNT; ++e)
+        if (!strcasecmp(beer_module_ordinals[e].module, module) && beer_module_ordinals[e].ordinal > known_ordinal_max)
+            known_ordinal_max = beer_module_ordinals[e].ordinal;
+    if (known_ordinal_max) function_slots = known_ordinal_max + (u32)count;
+    if (strcmp(module, "wldap32.dll")) {   /* room for ordinal-only exports */
+        for (size_t e = 0; e < sizeof(g_ordinal_only_exports) / sizeof(*g_ordinal_only_exports); ++e)
+            if (!strcasecmp(g_ordinal_only_exports[e].module, module) && g_ordinal_only_exports[e].ordinal > function_slots)
+                function_slots = g_ordinal_only_exports[e].ordinal;
+        for (int e = 0; e < g_extra_export_count; ++e)
+            if (!strcasecmp(g_extra_exports[e].dll, module) && g_extra_exports[e].name[0] == '#' &&
+                (u32)atoi(g_extra_exports[e].name + 1) > function_slots)
+                function_slots = (u32)atoi(g_extra_exports[e].name + 1);
+    }
     u32 name_rvas = funcs + function_slots * 4;
     u32 ordinals = name_rvas + (u32)(count * 4);
     u32 strings = (ordinals + (u32)(count * 2) + 15) & ~15u;
@@ -24772,31 +27349,7 @@ static void compat_module_exports_build(u64 base, const char *module)
     }
     u8 *directory = p + FAKE_PE_EDATA_RVA;
     u32 ordinal_base = 1;
-    if (!strcmp(module, "ws2_32.dll")) {
-        u32 maximum_ordinal = (u32)count;
-        /* A PE export's function index is ordinal - Base. Preserve Winsock's
-         * documented sparse ordinal ABI while keeping its name table sorted. */
-        for (size_t i = 0; i < count; ++i)
-            for (u32 ordinal = 1; ordinal <= UINT16_MAX; ++ordinal) {
-                const char *ordinal_name = winsock_ordinal_name((u16)ordinal);
-                if (ordinal_name && !strcmp(names[i], ordinal_name)) {
-                    *(u16 *)(p + ordinals + i * 2) = (u16)(ordinal - ordinal_base);
-                    if (ordinal > maximum_ordinal) maximum_ordinal = ordinal;
-                    break;
-                }
-            }
-        /* Move each emitted target to its native ordinal slot. Unnamed holes
-         * stay zero, exactly as in a normal sparse PE export table. */
-        u32 direct_targets[MAX_COMPAT_EXPORTS];
-        for (size_t i = 0; i < count; ++i)
-            direct_targets[i] = *(u32 *)(p + funcs + i * 4);
-        memset(p + funcs, 0, (size_t)maximum_ordinal * sizeof(u32));
-        for (size_t i = 0; i < count; ++i) {
-            u16 index = *(u16 *)(p + ordinals + i * 2);
-            *(u32 *)(p + funcs + (size_t)index * 4) = direct_targets[i];
-        }
-        *(u32 *)(directory + 20) = maximum_ordinal;
-    } else if (!strcmp(module, "wldap32.dll")) {
+    if (!strcmp(module, "wldap32.dll")) {
         /* WLDAP32 uses ordinal base 10. Keep the sparse public ordinals in the
          * same implementation-backed table used by import and dynamic lookup. */
         ordinal_base = 10;
@@ -24829,7 +27382,49 @@ static void compat_module_exports_build(u64 base, const char *module)
         }
         *(u32 *)(directory + 20) = 292;
     } else {
-        *(u32 *)(directory + 20) = (u32)count;
+        /* Ordinal-only exports (g_ordinal_only_exports, and "dll!#N" diagnostic stubs): their function slot is
+         * ordinal - 1, after the named exports' slots 0..count-1; their stubs follow the named stubs. */
+        u32 slots = (u32)count;
+        size_t stub_index = count;
+        if (known_ordinal_max) {
+            /* Named exports at their Windows ordinals; names without a known ordinal after the highest one. */
+            u32 direct_targets[MAX_COMPAT_EXPORTS];
+            for (size_t i = 0; i < count; ++i) direct_targets[i] = *(u32 *)(p + funcs + i * 4);
+            memset(p + funcs, 0, (size_t)function_slots * sizeof(u32));
+            u32 next_free = known_ordinal_max;
+            for (size_t i = 0; i < count; ++i) {
+                u32 ordinal = 0;
+                for (size_t e = 0; e < BEER_MODULE_ORDINAL_COUNT && !ordinal; ++e)
+                    if (!strcasecmp(beer_module_ordinals[e].module, module) && !strcmp(beer_module_ordinals[e].name, names[i]))
+                        ordinal = beer_module_ordinals[e].ordinal;
+                u32 index = ordinal ? ordinal - 1 : next_free++;
+                *(u32 *)(p + funcs + (size_t)index * 4) = direct_targets[i];
+                *(u16 *)(p + ordinals + i * 2) = (u16)index;
+                if (index + 1 > slots) slots = index + 1;
+            }
+        }
+        for (int pass = 0; pass < 2; ++pass) {
+            size_t entries = pass ? (size_t)(g_extra_export_count > 0 ? g_extra_export_count : 0)
+                                  : sizeof(g_ordinal_only_exports) / sizeof(*g_ordinal_only_exports);
+            for (size_t e = 0; e < entries; ++e) {
+                const char *owner = pass ? g_extra_exports[e].dll : g_ordinal_only_exports[e].module;
+                const char *implementation = pass ? g_extra_exports[e].name : g_ordinal_only_exports[e].implementation;
+                u32 ordinal = pass ? (implementation[0] == '#' ? (u32)atoi(implementation + 1) : 0)
+                                   : g_ordinal_only_exports[e].ordinal;
+                if (strcasecmp(owner, module) || !ordinal || (!known_ordinal_max && ordinal <= count) ||
+                    *(u32 *)(p + funcs + (ordinal - 1) * 4) || !find_impl(implementation)) continue;
+                if (FAKE_PE_TEXT_RVA + (stub_index + 1) * FAKE_PE_STUB_SLOT > FAKE_PE_SIZE) break;
+                u8 *stub = p + FAKE_PE_TEXT_RVA + stub_index * FAKE_PE_STUB_SLOT;
+                memset(stub, 0xCC, FAKE_PE_STUB_SLOT);
+                u64 target = impl_GetProcAddress(base, implementation);
+                stub[0] = 0x48; stub[1] = 0xB8; memcpy(stub + 2, &target, 8);
+                stub[10] = 0xFF; stub[11] = 0xE0;
+                *(u32 *)(p + funcs + (ordinal - 1) * 4) = FAKE_PE_TEXT_RVA + (u32)(stub_index * FAKE_PE_STUB_SLOT);
+                ++stub_index;
+                if (ordinal > slots) slots = ordinal;
+            }
+        }
+        *(u32 *)(directory + 20) = slots;
     }
     *(u32 *)(directory + 16) = ordinal_base;
     *(u32 *)(directory + 24) = (u32)count;
@@ -24935,6 +27530,19 @@ static void fake_pe_exports_build(void)
     for (size_t i = 0; i < sizeof(user_object_exports) / sizeof(*user_object_exports); ++i)
         if (find_impl(user_object_exports[i]))
             fake_pe_add_export(user32, user_object_exports[i], capacity);
+
+    /* Each synthetic system module also publishes the implemented functions that its Windows counterpart exports
+     * (platform/win32_module_exports.h): code that resolves imports by walking export tables must find them. */
+    for (size_t i = 0; i < BEER_MODULE_EXPORT_COUNT; ++i) {
+        FakePeModule *owner = fake_pe_module_for_import(beer_module_exports[i][0]);
+        if (owner && find_impl(beer_module_exports[i][1]))
+            fake_pe_add_export(owner, beer_module_exports[i][1], capacity);
+    }
+    beer_extra_exports_load();
+    for (int i = 0; i < g_extra_export_count; ++i) {
+        FakePeModule *owner = fake_pe_module_for_import(g_extra_exports[i].dll);
+        if (owner) fake_pe_add_export(owner, g_extra_exports[i].name, capacity);
+    }
 
     /* ntdll is the direct home of Beer's implemented native NT/Rtl/Ldr entry
      * points, including names that the executable imports through Kernel32. */
@@ -25693,6 +28301,10 @@ static void guest_dll_resolve_imports(GuestDll *dll)
             if (!implementation && !function &&
                 !strcmp(dependency_lower, "wldap32.dll"))
                 implementation = wldap_ordinal_impl((u16)(ilt[i] & 0xffff));
+            for (size_t e = 0; !implementation && !function && e < BEER_MODULE_ORDINAL_COUNT; ++e)
+                if (beer_module_ordinals[e].ordinal == (u16)(ilt[i] & 0xffff) &&
+                    !strcmp(beer_module_ordinals[e].module, dependency_lower))
+                    implementation = find_impl(beer_module_ordinals[e].name);   /* Windows ordinal ABI */
             int api_set_contract = !strncmp(dependency_lower, "api-ms-", 7) ||
                                    !strncmp(dependency_lower, "ext-ms-", 7);
             /* API-set DLLs are contracts forwarded into the Windows runtime,
@@ -25713,13 +28325,19 @@ static void guest_dll_resolve_imports(GuestDll *dll)
                         g_loading_ucrtbase = 0;
                     }
                 }
+            } else if (!strcmp(dependency_lower, "msvcrt.dll") && !guest_dll_find(dependency)) {
+                /* No private msvcrt.dll: the legacy CRT resolves into the bundled UCRT (msvcrt_export). */
+                dependency_dll = msvcrt_ucrt();
             } else {
                 dependency_dll = guest_dll_find(dependency);
                 if (!dependency_dll)
                     dependency_dll = guest_dll_load(dependency);
             }
-            u64 dependency_export = dependency_dll && function
-                                  ? guest_dll_export(dependency_dll, function) : 0;
+            const int msvcrt_via_ucrt = !strcmp(dependency_lower, "msvcrt.dll") && dependency_dll &&
+                                        !strcmp(dependency_dll->name, "ucrtbase.dll");
+            u64 dependency_export = !dependency_dll || !function ? 0
+                                  : msvcrt_via_ucrt ? msvcrt_export(function)
+                                  : guest_dll_export(dependency_dll, function);
             /* Binding an import also loads its owning module before the
              * dependent DLL receives DLL_PROCESS_ATTACH. This matters for
              * compatibility modules too: DllMain may immediately query its
@@ -25733,9 +28351,9 @@ static void guest_dll_resolve_imports(GuestDll *dll)
              * executes constructors on the dispatcher stack and breaks normal
              * guest CALL/RET semantics. Host implementations remain the
              * fallback when no bundled UCRT export is available. */
-            int prefer_crt_export = api_set_contract && dependency_export &&
-                                    !strncmp(dependency_lower,
-                                             "api-ms-win-crt-", 15);
+            int prefer_crt_export = (api_set_contract && dependency_export &&
+                                     !strncmp(dependency_lower, "api-ms-win-crt-", 15)) ||
+                                    (msvcrt_via_ucrt && dependency_export);
             int prefer_guest_dstorage = dependency_export &&
                                           !strcasecmp(dependency, "dstorage.v38");
             if (prefer_crt_export || prefer_guest_dstorage) {
@@ -25767,7 +28385,11 @@ static GuestDll *guest_dll_load(const char *name)
 {
     GuestDll *existing = guest_dll_find(name);
     if (existing) return existing;
-    if (g_guest_dll_count >= MAX_GUEST_DLLS || !g_tramp) return NULL;
+    if (!g_tramp) return NULL;
+    if (g_guest_dll_count >= MAX_GUEST_DLLS) {
+        fprintf(stderr, "[PE DLL] module table full (%d), cannot load %s\n", MAX_GUEST_DLLS, name);
+        return NULL;
+    }
     {   /* API-set contracts forward into the runtime; never map their stub images (fixed-base collisions).
          * Identity-only compatibility modules likewise cannot execute as a second guest runtime. */
         char lower_name[64];
@@ -25956,6 +28578,26 @@ static u64 call_guest_nested(GuestNtCall fn, u64 a0, u64 a1, u64 a2, u64 a3, u64
     u64 result = fn(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
     __asm__ volatile("mov %0, %%fs:g_host_call_stack_top@tpoff\n\tmov %1, %%fs:g_saved_guest_rsp@tpoff" :: "r"(saved_top), "r"(saved_guest) : "memory");
     return result;
+}
+
+/* shlwapi QISearch (ordinal 219 only): table-driven QueryInterface. QITAB is { const IID *piid; DWORD dwOffset; },
+ * ended by a NULL piid; IID_IUnknown answers with the first entry. The returned interface is AddRef'ed. */
+static u64 __attribute__((ms_abi)) beer_QISearch(u8 *object, const u8 *table, const u8 *iid, u64 *out)
+{
+    static const u8 iid_iunknown[16] = { 0,0,0,0, 0,0, 0,0, 0xC0,0,0,0,0,0,0,0x46 };
+    if (!out) return 0x80004003u;                                          /* E_POINTER */
+    *out = 0;
+    if (!object || !table || !iid) return 0x80004002u;                     /* E_NOINTERFACE */
+    const u8 *match = NULL;
+    for (const u8 *entry = table; *(const u64 *)entry; entry += 16)
+        if (!memcmp((const void *)(uintptr_t)*(const u64 *)entry, iid, 16)) { match = entry; break; }
+    if (!match && !memcmp(iid, iid_iunknown, 16)) match = table;
+    if (!match) return 0x80004002u;
+    u8 *interface = object + *(const u32 *)(match + 8);
+    const u64 *vtable = *(const u64 *const *)interface;
+    call_guest_nested((GuestNtCall)(uintptr_t)vtable[1], (u64)(uintptr_t)interface, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    *out = (u64)(uintptr_t)interface;
+    return 0;
 }
 
 static GuestNtCall hooked_ntdll(const char *name)
@@ -26236,6 +28878,8 @@ static volatile int g_exe_tls_attached;   /* set once the process-attach pass ov
 /* slot is what RAX holds at entry: for a TLS callback, the address of its entry in AddressOfCallBacks (the
  * loader walks that array; Wine leaves RAX there and the callback in R10, and RE9's protection consumes RAX). */
 extern u64 beer_call_init_routine(void *fn, void *image, u32 reason, u64 slot);
+/* ntdll code "jmp [rip+0]; dq beer_call_init_routine_return": the routine returns through it, so its return
+ * address lies in ntdll as when the Windows loader (LdrpCallInitRoutine) calls it. Zero until ntdll is built. */
 __asm__(
     ".text\n"
     ".global beer_call_init_routine\n"
@@ -26292,6 +28936,8 @@ __asm__(
  * opt-in after RDR2's Arxan thread callback left a worker spinning in Sleep(0); at that time these callbacks ran
  * with guest system calls passed straight to Linux (the syscall selector was not set for direct guest calls).
  * On by default now; BEER_EXE_THREAD_TLS=0 turns them off. */
+static void touch_trace_arm(void);
+static void cpuid_trace_arm(void);
 static void exe_tls_notify_thread(u32 reason)
 {
     const char *enabled = getenv("BEER_EXE_THREAD_TLS");
@@ -26945,15 +29591,45 @@ static u64 __attribute__((ms_abi))
 impl_NtQueryInformationProcess(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned)
 {
     u64 status = beer_nt_query_information_process(process, info_class, buffer, length, returned);
-    if (getenv("BEER_NT_DIAGNOSTICS")) {
+    if (info_class == 30) {   /* BEER_TOUCH_TRACE=debugobject: trace what protection code reads after this probe */
+        static int armed;
+        const char *touch = getenv("BEER_TOUCH_TRACE");
+        if (!armed && touch && !strcmp(touch, "debugobject")) { armed = 1; touch_trace_arm(); }
+    }
+    static int diagnostics = -1;
+    if (diagnostics < 0) diagnostics = getenv("BEER_NT_DIAGNOSTICS") != NULL;
+    if (diagnostics) {
         static _Atomic(u32) logged;
         if (atomic_fetch_add(&logged, 1) < 400)
             fprintf(stderr, "[NT] NtQueryInformationProcess(class=%u len=%u) t%ld -> 0x%x\n", info_class, length, (long)syscall(SYS_gettid), (u32)status);
     }
     return status;
 }
+/* ProbeForWrite as Windows system services apply it to caller buffers before using them: a misaligned buffer
+ * fails with STATUS_DATATYPE_MISALIGNMENT and an inaccessible one with STATUS_ACCESS_VIOLATION, instead of the
+ * service faulting. Protection code passes bad pointers on purpose to tell the kernel from a hook. */
+static u64 beer_nt_probe_for_write(const void *address, u64 size, u32 alignment)
+{
+    const u64 start = (u64)(uintptr_t)address;
+    if (!size) return 0;
+    if (alignment > 1 && (start & (alignment - 1))) return 0x80000002u;         /* STATUS_DATATYPE_MISALIGNMENT */
+    if (start + size < start || start + size > 0x00007FFFFFFF0000ull) return 0xC0000005u;
+    for (u64 page = start & ~0xfffull; page < start + size; page += 0x1000) {
+        const u64 at = page < start ? start : page;
+        u8 byte;
+        struct iovec local = { &byte, 1 }, remote = { (void *)(uintptr_t)at, 1 };
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 1 ||
+            process_vm_writev(getpid(), &local, 1, &remote, 1, 0) != 1)
+            return 0xC0000005u;                                                  /* STATUS_ACCESS_VIOLATION */
+    }
+    return 0;
+}
+
 static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *buffer, u32 length, u32 *returned)
 {
+    u64 probe = beer_nt_probe_for_write(buffer, length, sizeof(u32));
+    if (!probe && returned) probe = beer_nt_probe_for_write(returned, sizeof(*returned), 1);
+    if (probe) return probe;
     if (!native_is_current_process(process)) return 0xC0000008u;    /* STATUS_INVALID_HANDLE */
     u32 needed = 0;
     switch (info_class) {
@@ -26971,8 +29647,13 @@ static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *
     case 43: needed = 4;  break;                 /* ProcessTokenVirtualizationEnabled */
     default: return STATUS_INVALID_INFO_CLASS;
     }
-    if (returned) *returned = needed;
-    if (length < needed || !buffer) return STATUS_INFO_LENGTH_MISMATCH;
+    if (length < needed || !buffer) {
+        if (returned) *returned = needed;
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    /* Windows stores the information first and ReturnLength after it. Protection code passes the same address
+     * for both (Where Winds Meet's Themida, ProcessDebugObjectHandle): on Windows the buffer then reads 8, and a
+     * debugger-hiding hook that only zeroes the handle is caught. */
     memset(buffer, 0, needed);
     switch (info_class) {
     case 0: {
@@ -27012,10 +29693,13 @@ static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *
     }
     case 21: *(u64 *)buffer = win_processor_mask(); break;
     case 37: *(u16 *)((u8 *)buffer + 20) = 0x8664; break;   /* Machine */
-    case 30: return STATUS_PORT_NOT_SET;
+    case 30:                                      /* ProcessDebugObjectHandle: NULL handle, no debugger */
+        if (returned) *returned = needed;
+        return STATUS_PORT_NOT_SET;
     case 31: *(u32 *)buffer = 1; break;           /* NoDebugInherit clear => 1 */
     default: break;
     }
+    if (returned) *returned = needed;
     return 0;
 }
 
@@ -27058,6 +29742,14 @@ static void *alloc_teb_for_thread(void)
     teb->UniqueProcess = (u64)(u32)getpid();
     teb->UniqueThread = (u64)(u32)syscall(SYS_gettid);
     g_cached_windows_thread_id = teb->UniqueThread;
+    /* Fields the Windows thread creation path fills before any user code runs. */
+    teb->CurrentLocale = 0x409;
+    teb->ActivationContextStack[1] = teb->ActivationContextStack[2] =
+        (u64)(uintptr_t)&teb->ActivationContextStack[1];      /* empty FrameListCache */
+    teb->ActivationContextStackPointer = (u64)(uintptr_t)teb->ActivationContextStack;
+    teb->StaticUnicodeMaximum = sizeof(teb->StaticUnicodeChars);
+    teb->StaticUnicodeBuffer = (u64)(uintptr_t)teb->StaticUnicodeChars;
+    teb->TlsLinks[0] = teb->TlsLinks[1] = (u64)(uintptr_t)teb->TlsLinks;
 
     /* Keep dispatcher bookkeeping in ELF thread-local storage. Offsets
      * 0xa0..0xb8 in the TEB are Windows-owned fields and must remain guest
@@ -27139,6 +29831,7 @@ static void *alloc_teb_for_thread(void)
         if (stackaddr && stacksize) {
             teb->StackBase  = (u64)stackaddr + (u64)stacksize; /* high addr */
             teb->StackLimit = (u64)stackaddr;                  /* low addr  */
+            teb->DeallocationStack = (u64)stackaddr;
             g_current_guest_stack_low = (u64)stackaddr;
             g_current_guest_stack_high = (u64)stackaddr + (u64)stacksize;
         }
@@ -27154,6 +29847,7 @@ static void set_teb_stack_bounds(u64 stack_low, u64 stack_high)
     WinTEB *teb = (WinTEB *)gs_base;
     teb->StackLimit = stack_low;
     teb->StackBase  = stack_high;
+    teb->DeallocationStack = stack_low;
 }
 
 static u16 *win16_dup_ascii(const char *text, u16 *byte_length)
@@ -27484,6 +30178,31 @@ static void setup_teb_peb(void)
     peb->OSMinorVersion = 0;
     peb->OSBuildNumber = 19045;
     peb->OSPlatformId = 2; /* VER_PLATFORM_WIN32_NT */
+    {
+        /* Further fields the Windows process creation path fills before any user code runs (Wine sets them
+         * too). Protection code compares parts of this state with what a normally started process has. */
+        u8 *raw = (u8 *)peb;
+        const OptHdr64 *opt = &((NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew))->opt;
+        static u32 tls_bitmap_bits[2];
+        static struct { u32 size; u32 pad; u64 buffer; } tls_bitmap;
+        tls_bitmap.size = 64;
+        tls_bitmap.buffer = (u64)(uintptr_t)tls_bitmap_bits;
+        *(u64 *)(raw + 0x078) = (u64)(uintptr_t)&tls_bitmap;              /* TlsBitmap */
+        *(s64 *)(raw + 0x0c0) = -25920000000000LL;                         /* CriticalSectionTimeout: 30 days */
+        *(u64 *)(raw + 0x0c8) = opt->heap_reserve ? opt->heap_reserve : 0x100000;   /* HeapSegmentReserve */
+        *(u64 *)(raw + 0x0d0) = opt->heap_commit ? opt->heap_commit : 0x2000;       /* HeapSegmentCommit */
+        *(u64 *)(raw + 0x0d8) = 0x10000;                                    /* HeapDeCommitTotalFreeThreshold */
+        *(u64 *)(raw + 0x0e0) = 0x1000;                                     /* HeapDeCommitFreeBlockThreshold */
+        static u64 process_heaps[16];
+        process_heaps[0] = peb->ProcessHeap;
+        *(u32 *)(raw + 0x0e8) = 1;                                          /* NumberOfHeaps */
+        *(u32 *)(raw + 0x0ec) = 16;                                         /* MaximumNumberOfHeaps */
+        *(u64 *)(raw + 0x0f0) = (u64)(uintptr_t)process_heaps;            /* ProcessHeaps */
+        *(u32 *)(raw + 0x128) = opt->subsystem;                             /* ImageSubsystem */
+        *(u32 *)(raw + 0x12c) = opt->sub_maj;                               /* ImageSubsystemMajorVersion */
+        *(u32 *)(raw + 0x130) = opt->sub_min;                               /* ImageSubsystemMinorVersion */
+        *(u32 *)(raw + 0x2c0) = 1;                                          /* SessionId */
+    }
 
     /* Zero the TLS index variable in the module (shared; done once here) */
     NtHdrs64 *nt2    = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
@@ -27611,6 +30330,12 @@ static void __attribute__((ms_abi)) executable_tls_process_attach(void)
         }
         fprintf(stderr, "[TLS] executable process-attach callback[%zu]=0x%lx (RVA 0x%lx)\n",
                 index, address, address - (u64)g_img);
+        if (index == 0) {   /* BEER_TOUCH_TRACE=entry: trace from the executable's first code (its protection) */
+            const char *touch = getenv("BEER_TOUCH_TRACE");
+            if (touch && (!strcmp(touch, "entry") || !strcmp(touch, "entrycode"))) touch_trace_arm();
+            const char *cpuid = getenv("BEER_CPUID_TRACE");
+            if (cpuid && !strcmp(cpuid, "entry")) cpuid_trace_arm();
+        }
 
         g_executable_tls_callback_index = (sig_atomic_t)index;
         g_executable_tls_fault_signal = 0;
@@ -29335,6 +32060,21 @@ beer_raise_exception_helper(u8 *ctx_in, u32 code, u32 flags, u32 nargs,
     if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
         fprintf(stderr, "[IMPL] RaiseException(code=0x%08x flags=0x%x nargs=%u)\n",
                 code, flags, nargs);
+    /* MSVC delay-load failures (VcppException(ERROR_SEVERITY_ERROR, ERROR_MOD_NOT_FOUND / ERROR_PROC_NOT_FOUND)):
+     * the argument is a DelayLoadInfo { cb; pidd; ppfn; szDll; dlp { fImportByName; szProcName|dwOrdinal }; ... }.
+     * Name the missing DLL or export, since the program's own report is usually a crash later on. */
+    if ((code == 0xC06D007Eu || code == 0xC06D007Fu) && nargs >= 1 && args && args[0]) {
+        const u8 *info = (const u8 *)(uintptr_t)args[0];
+        const char *dll = *(const char *const *)(info + 24);
+        const int by_name = *(const s32 *)(info + 32);
+        const u64 proc = *(const u64 *)(info + 40);
+        if (by_name)
+            fprintf(stderr, "[IMPL] delay-load failed: %s %s!%s\n", code == 0xC06D007Eu ? "module" : "export",
+                    dll ? dll : "?", proc ? (const char *)(uintptr_t)proc : "?");
+        else
+            fprintf(stderr, "[IMPL] delay-load failed: %s %s!#%u\n", code == 0xC06D007Eu ? "module" : "export",
+                    dll ? dll : "?", (unsigned)proc);
+    }
     if (beer_raise_regs_clobbered) {
         beer_raise_regs_clobbered = 0;
         fprintf(stderr, "[SEH] a previous RaiseException dispatch clobbered nonvolatile registers (restored)\n");
@@ -29793,6 +32533,7 @@ static volatile int g_touch_armed;
 static __thread int t_touch_pending[4];
 static __thread int t_touch_pending_count;
 static u64 g_touch_seen[1 << 16];
+static int g_touch_every;   /* read at arm time: the fault handler must not call getenv (it takes a lock) */
 
 static int touch_page_index(u64 page)
 {
@@ -29838,7 +32579,12 @@ static void touch_trace_arm(void)
     u64 teb = 0;
     if (syscall(SYS_arch_prctl, ARCH_GET_GS, &teb) != 0 || !teb) return;
     g_touch_page_count = 0;
-    touch_add_range(teb, 0x2000);
+    /* "entry" arms before the guest's first code: Beer's own fault handling (which runs with SIGSEGV blocked)
+     * reads the TEB and runs the synthetic modules' code, so those pages are left out there. */
+    const char *mode = getenv("BEER_TOUCH_TRACE");
+    const int from_entry = mode && !strcmp(mode, "entry");   /* "entrycode": also the synthetic modules' code */
+    g_touch_every = getenv("BEER_TOUCH_ALL") != NULL;
+    if (!from_entry) touch_add_range(teb, 0x2000);
     u64 peb = *(u64 *)(uintptr_t)(teb + 0x60);
     touch_add_range(peb, 0x1000);
     u64 ldr = peb ? *(u64 *)(uintptr_t)(peb + 0x18) : 0;
@@ -29861,7 +32607,7 @@ static void touch_trace_arm(void)
     static const u64 modules[] = { HMOD_WINTRUST, HMOD_STEAM, HMOD_KBASE, HMOD_K32,
                                    HMOD_USER32, HMOD_NTDLL, HMOD_ADVAPI, HMOD_WIN32U };
     for (size_t i = 0; i < sizeof(modules) / sizeof(*modules); ++i)
-        touch_add_range(modules[i], FAKE_PE_SIZE);
+        touch_add_range(modules[i], from_entry ? FAKE_PE_TEXT_RVA : FAKE_PE_SIZE);
     touch_add_range((u64)(uintptr_t)g_img, 0x1000);
     fprintf(stderr, "[TOUCH] armed: %d pages (teb=0x%llx peb=0x%llx ldr=0x%llx params=0x%llx)\n",
             g_touch_page_count, (unsigned long long)teb, (unsigned long long)peb,
@@ -29908,8 +32654,11 @@ static void touch_trace_maybe_arm(void)
  * executed for real on the host and its results returned unchanged; unique CPUID leaves and the RDTSC
  * count are logged as "[CPUID] ..." and "[RDTSC] ...". */
 static __thread int t_cpuid_trace;
+/* BEER_RDTSC_STEP=<n> (diagnostic): traced RDTSC returns a counter advancing n per read, without logging. */
+static long g_rdtsc_step = -1;
 static void cpuid_trace_arm(void)
 {
+    g_rdtsc_step = getenv("BEER_RDTSC_STEP") ? strtol(getenv("BEER_RDTSC_STEP"), NULL, 0) : -1;
     t_cpuid_trace = 1;
     if (syscall(SYS_arch_prctl, 0x1012 /* ARCH_SET_CPUID */, 0) != 0)
         fprintf(stderr, "[CPUID] CPUID faulting unavailable: %s\n", strerror(errno));
@@ -29954,7 +32703,14 @@ static int cpuid_trace_signal(int sig, ucontext_t *uc)
         static u32 count;
         static u64 previous;
         u64 now = ((u64)hi << 32) | lo;
-        if (++count <= 96 || (count & (count - 1)) == 0)
+        const long step = g_rdtsc_step;
+        if (step >= 0) {
+            static u64 virtual_tsc;
+            virtual_tsc = virtual_tsc ? virtual_tsc + (u64)step : now;
+            now = virtual_tsc;
+            lo = (u32)now; hi = (u32)(now >> 32);
+            ++count;
+        } else if (++count <= 96 || (count & (count - 1)) == 0)
             fprintf(stderr, "[RDTSC] #%u rip=0x%llx delta=%llu%s\n", count, (unsigned long long)rip,
                     (unsigned long long)(previous ? now - previous : 0), rdtscp ? " (rdtscp)" : "");
         previous = now;
@@ -29985,8 +32741,7 @@ static int touch_trace_signal(int sig, siginfo_t *si, ucontext_t *uc)
     u64 err = (u64)uc->uc_mcontext.gregs[REG_ERR];
     u64 key = rip * 0x9e3779b97f4a7c15ull ^ addr;
     u32 slot = (u32)(key >> 48);
-    static int every = -1;   /* BEER_TOUCH_ALL=1: log every access, in order (no per-site dedup) */
-    if (every < 0) every = getenv("BEER_TOUCH_ALL") != NULL;
+    const int every = g_touch_every;   /* BEER_TOUCH_ALL=1: log every access, in order (no per-site dedup) */
     for (u32 probe = 0; probe < 64; ++probe, slot = (slot + 1) & 0xffff) {
         if (g_touch_seen[slot] == key && !every) break;
         if (every) g_touch_seen[slot] = 0;
@@ -32676,6 +35431,34 @@ generic_alloc_skip:
  * decision was invalid — stop immediately with a diagnostic instead of
  * letting it cycle further.
  */
+/* Overlapped operations still in flight and the completion port each would complete to (hang diagnostics). */
+static void beer_dump_outstanding_io(void)
+{
+    for (int i = 0; i < 1024; ++i) {
+        const WsaAsyncOp *op = &g_wsa_async[i];
+        if (!op->used) continue;
+        int port = -1;
+        for (int k = 0; k < g_iocp_assoc_count; ++k)
+            if (g_iocp_assoc[k].handle == op->socket) { port = g_iocp_assoc[k].port; break; }
+        fprintf(stderr, "[STACKS] outstanding socket 0x%llx overlapped %p kind %d busy %d port %d\n",
+                (unsigned long long)op->socket, (void *)op->overlapped, op->kind, op->busy, port);
+    }
+    for (size_t i = 0; i < 64; ++i) {
+        if (!g_pending_reads[i].overlapped) continue;
+        int port = -1;
+        for (int k = 0; k < g_iocp_assoc_count; ++k)
+            if (g_iocp_assoc[k].handle == g_pending_reads[i].handle) { port = g_iocp_assoc[k].port; break; }
+        fprintf(stderr, "[STACKS] outstanding read handle 0x%llx overlapped %p port %d\n",
+                (unsigned long long)g_pending_reads[i].handle, (void *)g_pending_reads[i].overlapped, port);
+    }
+    for (int k = 0; k < IOCP_MAX; ++k) {
+        if (!g_iocps[k].used) continue;
+        char handles[512]; size_t n = 0; handles[0] = 0;
+        for (int a = 0; a < g_iocp_assoc_count && n + 24 < sizeof(handles); ++a)
+            if (g_iocp_assoc[a].port == k) n += (size_t)snprintf(handles + n, sizeof(handles) - n, " 0x%llx", (unsigned long long)g_iocp_assoc[a].handle);
+        fprintf(stderr, "[STACKS] port %d queued %u handles:%s\n", k, g_iocps[k].count, handles);
+    }
+}
 /* Hang diagnostics: `kill -USR1 <pid>` makes every thread print its host call chain (module offsets, resolve with
  * `addr2line -f -e loader <offset>`) and the guest address of its last API call (RVA inside the exe). */
 extern void bd12_ckpt_dump(void);
@@ -32684,6 +35467,14 @@ static void on_dump_stacks(int sig, siginfo_t *info, void *uctx)
     (void)sig; (void)uctx;
     if (info && info->si_code == SI_USER) {   /* from outside: fan out to every thread */
         bd12_ckpt_dump();                       /* last GPU checkpoints (BEER_VK_CHECKPOINTS=1) */
+        beer_dump_outstanding_io();
+        if (getenv("BEER_DUMP_MEMORY")) {   /* host allocator and shader-cache totals (not async-signal-safe; diagnostic) */
+            beer_d3d12_translator_stats();
+            fprintf(stderr, "[MEM] guest HeapAlloc (host malloc): %zu live blocks, %zu MB\n",
+                    __atomic_load_n(&g_heap_guard_live_count, __ATOMIC_RELAXED),
+                    __atomic_load_n(&g_heap_guard_live_bytes, __ATOMIC_RELAXED) >> 20);
+            malloc_stats();
+        }
         DIR *dir = opendir("/proc/self/task");
         struct dirent *entry;
         while (dir && (entry = readdir(dir))) {
@@ -32696,7 +35487,9 @@ static void on_dump_stacks(int sig, siginfo_t *info, void *uctx)
     char out[4096];
     size_t used = 0;
     const u64 ret = g_dispatch_incoming_return;
-    used += (size_t)snprintf(out + used, sizeof(out) - used, "[STACKS] tid=%ld guest-ret=0x%llx rva=0x%llx wait=%s handle=0x%llx ms=%u\n", (long)syscall(SYS_gettid),
+    const u64 api = g_dispatch_import_index;
+    used += (size_t)snprintf(out + used, sizeof(out) - used, "[STACKS] wtid=%u tid=%ld api=%s guest-ret=0x%llx rva=0x%llx wait=%s handle=0x%llx ms=%u\n", (unsigned)g_cached_windows_thread_id, (long)syscall(SYS_gettid),
+                             api < (u64)g_nstubs && g_snames[api] ? g_snames[api] : "-",
                              (unsigned long long)ret, (unsigned long long)(g_img && ret >= (u64)g_img ? ret - (u64)g_img : 0),
                              g_dbg_wait_kind == 1 ? "Sleep" : g_dbg_wait_kind == 2 ? "WaitForSingleObject" : "-",
                              (unsigned long long)g_dbg_wait_handle, g_dbg_wait_ms);
@@ -32712,6 +35505,20 @@ static void on_dump_stacks(int sig, siginfo_t *info, void *uctx)
                                      (unsigned long long)(ev->last_signaler_rip >= base ? ev->last_signaler_rip - base : 0));
         }
     }
+    for (u32 i = 0; i < g_dbg_wait_count && i < 16 && used + 160 < sizeof(out); ++i) {
+        const u64 h = g_dbg_wait_handles[i];
+        const int eid = event_id_from_handle(h);
+        if (eid > 0)
+            used += (size_t)snprintf(out + used, sizeof(out) - used, "[STACKS]   [%u] 0x%llx event%d %s signaled=%d created@rva=0x%llx last-set@rva=0x%llx\n",
+                                     i, (unsigned long long)h, eid, g_events[eid].manual_reset ? "manual" : "auto", (int)g_events[eid].signaled,
+                                     (unsigned long long)(g_events[eid].creator_rip >= (u64)g_img ? g_events[eid].creator_rip - (u64)g_img : 0),
+                                     (unsigned long long)(g_events[eid].last_signaler_rip >= (u64)g_img ? g_events[eid].last_signaler_rip - (u64)g_img : 0));
+        else used += (size_t)snprintf(out + used, sizeof(out) - used, "[STACKS]   [%u] 0x%llx\n", i, (unsigned long long)h);
+    }
+    if (g_dbg_cv_wait)
+        used += (size_t)snprintf(out + used, sizeof(out) - used,
+                                 "[STACKS]   cv %p sequence=%u sleepers=%u\n", (void *)g_dbg_cv_wait,
+                                 ((const u32 *)g_dbg_cv_wait)[0], ((const u32 *)g_dbg_cv_wait)[1]);
     if (g_dbg_cs_wait) {
         WIN_CS *cs = g_dbg_cs_wait;
         const CsBackend *backend = cs_backend(cs);
@@ -32722,11 +35529,10 @@ static void on_dump_stacks(int sig, siginfo_t *info, void *uctx)
                                  (unsigned long long)(backend && backend->owner_rip >= (u64)g_img ? backend->owner_rip - (u64)g_img : 0));
     }
     if (g_dbg_srw_wait)
-        used += (size_t)snprintf(out + used, sizeof(out) - used, "[STACKS]   blocked on SRWLOCK %p: exclusive owner tid=%ld (acquired from rva=0x%llx), readers=%d (last reader rva=0x%llx)\n",
-                                 (void *)g_dbg_srw_wait, (long)g_dbg_srw_wait->owner_tid,
-                                 (unsigned long long)(g_dbg_srw_wait->owner_rip >= (u64)g_img ? g_dbg_srw_wait->owner_rip - (u64)g_img : 0),
-                                 g_dbg_srw_wait->readers,
-                                 (unsigned long long)(g_dbg_srw_wait->reader_rip >= (u64)g_img ? g_dbg_srw_wait->reader_rip - (u64)g_img : 0));
+        used += (size_t)snprintf(out + used, sizeof(out) - used,
+                                 "[STACKS]   blocked on SRWLOCK %p: state=0x%x (bit0 held, bit2 exclusive, shared=%u) "
+                                 "writers waiting=%u\n", (void *)g_dbg_srw_wait, ((const u32 *)g_dbg_srw_wait)[0],
+                                 ((const u32 *)g_dbg_srw_wait)[0] >> 4, ((const u32 *)g_dbg_srw_wait)[1]);
     void *frames[20];
     const int depth = backtrace(frames, 20);
     for (int f = 0; f < depth && used + 100 < sizeof(out); ++f) {
@@ -32742,8 +35548,17 @@ static void on_dump_stacks(int sig, siginfo_t *info, void *uctx)
 
 static void on_crash(int sig, siginfo_t *si, void *uctx)
 {
-    if (sig == SIGSEGV && g_beer_lazy_fault_hook && g_beer_lazy_fault_hook(si->si_addr)) return;
+    if ((g_touch_armed || t_cpuid_trace) && touch_trace_signal(sig, si, (ucontext_t *)uctx)) return;   /* diagnostic */
+    /* With RDTSC trapped (BEER_CPUID_TRACE), host clock reads in the handler below would fault while SIGSEGV is
+     * blocked, which kills the process: let them run untrapped until the handler returns. */
+    const int tsc_trapped = t_cpuid_trace;
+    if (tsc_trapped) prctl(PR_SET_TSC, PR_TSC_ENABLE, 0, 0, 0);
+    if (sig == SIGSEGV && g_beer_lazy_fault_hook && g_beer_lazy_fault_hook(si->si_addr)) {
+        if (tsc_trapped) prctl(PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0, 0);
+        return;
+    }
     on_crash_impl(sig, si, uctx);
+    if (tsc_trapped) prctl(PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0, 0);
 
     ucontext_t *uc  = (ucontext_t *)uctx;
     u64         rsp = (u64)uc->uc_mcontext.gregs[REG_RSP];
@@ -32807,14 +35622,20 @@ static int beer_present_bd12_image(uint64_t image, uint32_t layout,
     beer_control_note_frame();
     beer_control_frame_limit_wait();
     if (beer_mf_composite_pending_frame()) return 1;
-    static uint64_t window_start_ns;
-    static uint32_t window_frames;
+    static uint64_t window_start_ns, last_frame_ns, worst_ns;
+    static uint32_t window_frames, hitches;
     static int fps_log = -1;
     if (fps_log < 0) fps_log = getenv("BEER_BD12_FPS") != NULL;
     int ok = xwayland_window_present_image(image, layout, (int)width,
                                            (int)height, direct_blit);
     if (fps_log) {
         uint64_t now = beer_monotonic_nanoseconds();
+        if (last_frame_ns) {   /* worst frame and frames over 50 ms: averages hide hitches */
+            const uint64_t frame = now - last_frame_ns;
+            if (frame > worst_ns) worst_ns = frame;
+            if (frame > 50000000ull) ++hitches;
+        }
+        last_frame_ns = now;
         if (!window_start_ns) {
             window_start_ns = now;
             window_frames = 0;
@@ -32826,14 +35647,17 @@ static int beer_present_bd12_image(uint64_t image, uint32_t layout,
                 const uint64_t fps_x10 = (uint64_t)window_frames * 10000000000ull / ns;
                 const uint64_t us = ns / 1000u / window_frames;
                 fprintf(stderr,
-                        "[BD12 FPS] %llu.%llu fps (%llu.%03llu ms/frame, %u frames)\n",
+                        "[BD12 FPS] %llu.%llu fps (%llu.%03llu ms/frame, %u frames, worst %llu ms, %u over 50 ms)\n",
                         (unsigned long long)(fps_x10 / 10),
                         (unsigned long long)(fps_x10 % 10),
                         (unsigned long long)(us / 1000),
-                        (unsigned long long)(us % 1000), window_frames);
+                        (unsigned long long)(us % 1000), window_frames,
+                        (unsigned long long)(worst_ns / 1000000), hitches);
             }
             window_start_ns = now;
             window_frames = 0;
+            worst_ns = 0;
+            hitches = 0;
         }
     }
     return ok;
@@ -33045,6 +35869,7 @@ int main(int argc, char **argv)
         g_crash_recovery_limit = (u32)parsed;
     }
 
+    beer_variant_set_bstr_allocator((BeerBstrAlloc)impl_SysAllocStringLen, (BeerBstrFree)impl_SysFreeString);
     beer_wasapi_set_event_signaler(beer_signal_guest_event);
     beer_d3d12_set_event_signaler(beer_signal_guest_event);
 
@@ -33243,6 +36068,7 @@ int main(int argc, char **argv)
     }
     pe_load(exe);
     beer_proc_register();
+    beer_inherit_install();
     beer_overlay_init();
     beer_post_init(exe_arg);
     beer_control_start(exe_arg);
@@ -33319,12 +36145,15 @@ int main(int argc, char **argv)
      * VirtualProtect and expect that protection to survive its DllMain return.
      * Applying PE section permissions after DllMain silently undid such changes. */
     apply_section_perms();
+    /* Steamworks may start inside a dependency's DllMain (Where Winds Meet's SDK DLLs call SteamAPI_Init
+     * there), so the Steam interface objects must be complete before any process-attach callback runs. */
+    init_steam_fake();
+    beer_win32_syscall_refresh_ranges();   /* the executable and its DLLs are mapped now */
     guest_dll_initialize_all();
     patch_known_bad_targets();
     /* Executable TLS callbacks need the final image protections and a valid
      * Windows loader stack. They are invoked immediately before entry below. */
 
-    init_steam_fake();
     init_dxgi_fake();
     init_d3d11_fake();
     init_dxgi_adapter_fake();

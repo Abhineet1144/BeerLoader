@@ -86,6 +86,25 @@ BD12Device *bd12_device_create(void)
     }
 #include "bd12_vk_functions.h"
 #undef BD12_VK_FN
+    if (modern->mesh_shader_tier) {
+        device->CmdDrawMeshTasksEXT = (PFN_vkCmdDrawMeshTasksEXT)get_device(device->device, "vkCmdDrawMeshTasksEXT");
+        device->CmdDrawMeshTasksIndirectEXT = (PFN_vkCmdDrawMeshTasksIndirectEXT)
+            get_device(device->device, "vkCmdDrawMeshTasksIndirectEXT");
+        device->CmdDrawMeshTasksIndirectCountEXT = (PFN_vkCmdDrawMeshTasksIndirectCountEXT)
+            get_device(device->device, "vkCmdDrawMeshTasksIndirectCountEXT");
+        if (!device->CmdDrawMeshTasksEXT || !device->CmdDrawMeshTasksIndirectEXT ||
+            !device->CmdDrawMeshTasksIndirectCountEXT)
+            device->CmdDrawMeshTasksEXT = NULL;
+        else
+            fprintf(stderr, "[BD12] mesh shaders (tier 1, SV_ShadingRate %d)\n", modern->mesh_shading_rate);
+    }
+    if (modern->vrs_tier) {
+        device->CmdSetFragmentShadingRateKHR = (PFN_vkCmdSetFragmentShadingRateKHR)
+            get_device(device->device, "vkCmdSetFragmentShadingRateKHR");
+        if (device->CmdSetFragmentShadingRateKHR)
+            fprintf(stderr, "[BD12] variable-rate shading tier %d (tile %u, 4x4 rates %d, sum combiner %d)\n",
+                    modern->vrs_tier, modern->vrs_tile, modern->vrs_additional_rates, modern->vrs_sum_combiner);
+    }
 
     PFN_vkGetPhysicalDeviceMemoryProperties get_memory =
         (PFN_vkGetPhysicalDeviceMemoryProperties)get_instance(
@@ -121,6 +140,7 @@ BD12Device *bd12_device_create(void)
         modern->uniform_texel_buffer_offset_alignment ?
         modern->uniform_texel_buffer_offset_alignment :
         properties.limits.minTexelBufferOffsetAlignment;
+    device->max_push_constants = properties.limits.maxPushConstantsSize;
     device->min_storage_buffer_alignment = properties.limits.minStorageBufferOffsetAlignment ?
         properties.limits.minStorageBufferOffsetAlignment : 1;
     device->min_storage_texel_alignment =
@@ -133,15 +153,41 @@ BD12Device *bd12_device_create(void)
         modern->storage_texel_buffer_offset_single_texel;
 
 
-    /* Persistent pipeline cache: driver pipeline compiles dominate first-run loading. */
-    {
+    /* Persistent pipeline cache: driver pipeline compiles dominate first-run loading.
+     * BEER_PIPELINE_CACHE_OFF=1 (diagnostic): no VkPipelineCache at all, to measure what it holds in memory. */
+    if (!getenv("BEER_PIPELINE_CACHE_OFF")) {
         const char *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
         char dir[400];
         if (xdg && *xdg) snprintf(dir, sizeof(dir), "%s/beer", xdg);
         else snprintf(dir, sizeof(dir), "%s/.cache/beer", home ? home : "/tmp");
         mkdir(dir, 0700);
-        snprintf(device->pipeline_cache_path, sizeof(device->pipeline_cache_path), "%s/pipelines-%04x-%04x-%08x.bin",
-                 dir, properties.vendorID, properties.deviceID, properties.driverVersion);
+        /* One file per program (its executable name) and GPU/driver, as vkd3d-proton keeps one per application: a
+         * single file shared by every game grew past the old 256 MB read limit, was then skipped at load, and the
+         * next save replaced it with that session's few MB (Stellar Blade recompiled everything on every launch). */
+        char program[96] = "unknown";
+        {
+            char exe[512];
+            const char *guest = getenv("BEER_GUEST_EXE");
+            const char *name = guest && *guest ? guest : NULL;
+            if (!name) {
+                const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+                if (n > 0) { exe[n] = 0; name = exe; }
+            }
+            if (name) {
+                const char *base = name;
+                for (const char *c = name; *c; ++c) if (*c == '/' || *c == '\\') base = c + 1;
+                size_t k = 0;
+                for (; base[k] && k + 1 < sizeof(program); ++k) {
+                    const char ch = base[k];
+                    program[k] = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+                                 ch == '-' || ch == '_' || ch == '.' ? ch : '_';
+                }
+                program[k] = 0;
+            }
+        }
+        snprintf(device->pipeline_cache_path, sizeof(device->pipeline_cache_path),
+                 "%s/pipelines-%04x-%04x-%08x-%s.bin", dir, properties.vendorID, properties.deviceID,
+                 properties.driverVersion, program);
         memcpy(device->pipeline_identity, &properties.vendorID, 4);
         memcpy(device->pipeline_identity + 4, &properties.deviceID, 4);
         memcpy(device->pipeline_identity + 8, &properties.driverVersion, 4);
@@ -153,7 +199,7 @@ BD12Device *bd12_device_create(void)
             fseek(f, 0, SEEK_END);
             long n = ftell(f);
             fseek(f, 0, SEEK_SET);
-            if (n > 0 && n < (256l << 20) && (blob = malloc((size_t)n)) && fread(blob, 1, (size_t)n, f) == (size_t)n) blob_size = (size_t)n;
+            if (n > 0 && (blob = malloc((size_t)n)) && fread(blob, 1, (size_t)n, f) == (size_t)n) blob_size = (size_t)n;
             else { free(blob); blob = NULL; }
             fclose(f);
         }
@@ -224,6 +270,7 @@ BD12Device *bd12_device_create(void)
     bd12_rt_load(device);
     fprintf(stderr, "[BD12] ray tracing %s\n", device->rt_enabled ? "available" : "unavailable");
     bd12_canary_arm(device);
+    bd12_db_init(device);
     return device;
 }
 
@@ -264,7 +311,8 @@ void bd12_pipeline_cache_note_new(BD12Device *device)
 {
     if (!device || !device->pipeline_cache) return;
     const uint32_t fresh = __atomic_add_fetch(&device->pipeline_cache_new, 1, __ATOMIC_RELAXED);
-    if (fresh >= 25 && pc_now_ms() - device->pipeline_cache_saved_ms > 20000) bd12_pipeline_cache_save(device);
+    /* Each save writes the whole cache (hundreds of MB for big games): at most once a minute while compiling. */
+    if (fresh >= 25 && pc_now_ms() - device->pipeline_cache_saved_ms > 60000) bd12_pipeline_cache_save(device);
 }
 
 void bd12_device_destroy(BD12Device *device)
@@ -286,13 +334,275 @@ void bd12_device_destroy(BD12Device *device)
 
 /* Heaps ----------------------------------------------------------------- */
 
+/* Heap sub-allocation ------------------------------------------------------------------------------------------
+ * Engines stream resources by creating and releasing thousands of committed resources and small heaps per second.
+ * One Vulkan allocation each made every one a driver call pair (allocate + map, unmap + free), and the driver's
+ * per-submit cost grows with the number of live allocations. Like vkd3d-proton and Windows drivers, heaps below
+ * SUBALLOC_MAX are carved from large blocks, each allocated and mapped once with one buffer over it for zero
+ * fills; bigger heaps keep dedicated memory. Freed ranges are reused once the heap is destroyed, which happens
+ * only after the GPU finished with it. BEER_BD12_NO_SUBALLOC=1 gives every heap its own allocation. */
+#define SUBALLOC_MAX ((VkDeviceSize)32 << 20)
+#define BLOCK_DEFAULT ((VkDeviceSize)256 << 20)
+#define BLOCK_HOST ((VkDeviceSize)128 << 20)
+#define SUBALLOC_MIN_ALIGN ((VkDeviceSize)64 << 10)
+
+typedef struct { VkDeviceSize offset, size; } MemRange;
+
+typedef struct BD12MemBlock {
+    VkDeviceMemory memory;
+    void *mapped;
+    VkBuffer fill_buffer;         /* whole block, TRANSFER_DST: zero fills of DEFAULT heaps */
+    VkDeviceSize size, used;
+    VkDeviceSize fresh;           /* [fresh, size) never handed out: still as the driver allocated it */
+    MemRange *free;               /* sorted by offset, coalesced */
+    uint32_t free_count, free_capacity;
+} BD12MemBlock;
+
+typedef struct BD12MemPool {
+    pthread_mutex_t lock;
+    BD12MemBlock **blocks;
+    size_t count, capacity;
+} BD12MemPool;
+
+static int suballoc_enabled(void)
+{
+    static int value = -1;
+    if (value < 0) value = getenv("BEER_BD12_NO_SUBALLOC") == NULL;
+    return value;
+}
+
+static VkDeviceSize suballoc_alignment(VkDeviceSize size)
+{
+    /* The largest power of two not above the size (at most 4 MiB, the D3D12 MSAA placement alignment), so a
+     * committed resource bound at the heap start meets its own alignment, which never exceeds its size. */
+    VkDeviceSize a = SUBALLOC_MIN_ALIGN;
+    while (a < ((VkDeviceSize)4 << 20) && a * 2 <= size) a *= 2;
+    return a;
+}
+
+static int range_insert(BD12MemBlock *b, uint32_t at, MemRange r)
+{
+    if (b->free_count == b->free_capacity) {
+        const uint32_t capacity = b->free_capacity ? b->free_capacity * 2 : 16;
+        MemRange *grown = realloc(b->free, capacity * sizeof(*grown));
+        if (!grown) return 0;
+        b->free = grown;
+        b->free_capacity = capacity;
+    }
+    memmove(b->free + at + 1, b->free + at, (b->free_count - at) * sizeof(*b->free));
+    b->free[at] = r;
+    ++b->free_count;
+    return 1;
+}
+
+static void range_remove(BD12MemBlock *b, uint32_t at)
+{
+    memmove(b->free + at, b->free + at + 1, (b->free_count - at - 1) * sizeof(*b->free));
+    --b->free_count;
+}
+
+/* First fit in `b`; returns the offset or UINT64_MAX. */
+static VkDeviceSize block_take(BD12MemBlock *b, VkDeviceSize size, VkDeviceSize align)
+{
+    for (uint32_t i = 0; i < b->free_count; ++i) {
+        const MemRange r = b->free[i];
+        const VkDeviceSize start = (r.offset + align - 1) & ~(align - 1);
+        if (start + size > r.offset + r.size) continue;
+        const VkDeviceSize head = start - r.offset, tail = r.offset + r.size - (start + size);
+        if (head && tail) {
+            b->free[i].size = head;
+            if (!range_insert(b, i + 1, (MemRange){ start + size, tail })) { b->free[i] = r; return UINT64_MAX; }
+        } else if (head) {
+            b->free[i].size = head;
+        } else if (tail) {
+            b->free[i] = (MemRange){ start + size, tail };
+        } else {
+            range_remove(b, i);
+        }
+        b->used += size;
+        return start;
+    }
+    return UINT64_MAX;
+}
+
+static void block_give(BD12MemBlock *b, VkDeviceSize offset, VkDeviceSize size)
+{
+    uint32_t at = 0;
+    while (at < b->free_count && b->free[at].offset < offset) ++at;
+    b->used -= size;
+    const int join_prev = at > 0 && b->free[at - 1].offset + b->free[at - 1].size == offset;
+    const int join_next = at < b->free_count && offset + size == b->free[at].offset;
+    if (join_prev && join_next) {
+        b->free[at - 1].size += size + b->free[at].size;
+        range_remove(b, at);
+    } else if (join_prev) {
+        b->free[at - 1].size += size;
+    } else if (join_next) {
+        b->free[at].offset = offset;
+        b->free[at].size += size;
+    } else if (!range_insert(b, at, (MemRange){ offset, size })) {
+        static int warned;
+        if (!warned++) fprintf(stderr, "[BD12] heap sub-allocator: free-list growth failed, range leaked\n");
+    }
+}
+
+static BD12MemBlock *block_create(BD12Device *device, BD12HeapType type)
+{
+    const VkDeviceSize size = type == BD12_HEAP_DEFAULT ? BLOCK_DEFAULT : BLOCK_HOST;
+    BD12MemBlock *b = calloc(1, sizeof(*b));
+    if (!b) return NULL;
+    VkMemoryAllocateFlagsInfo flags = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+    VkMemoryAllocateInfo allocate = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &flags,
+        .allocationSize = size,
+        .memoryTypeIndex = (uint32_t)device->memory_type[type]
+    };
+    if (device->vk.AllocateMemory(device->device, &allocate, NULL, &b->memory) != VK_SUCCESS) goto fail;
+    if (type != BD12_HEAP_DEFAULT &&
+        device->vk.MapMemory(device->device, b->memory, 0, VK_WHOLE_SIZE, 0, &b->mapped) != VK_SUCCESS)
+        goto fail_memory;
+    if (type == BD12_HEAP_DEFAULT) {
+        VkBufferCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = size,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+        };
+        VkMemoryRequirements req;
+        if (device->vk.CreateBuffer(device->device, &info, NULL, &b->fill_buffer) != VK_SUCCESS) goto fail_memory;
+        device->vk.GetBufferMemoryRequirements(device->device, b->fill_buffer, &req);
+        if (req.size > size || !(req.memoryTypeBits & (1u << device->memory_type[type])) ||
+            device->vk.BindBufferMemory(device->device, b->fill_buffer, b->memory, 0) != VK_SUCCESS) {
+            device->vk.DestroyBuffer(device->device, b->fill_buffer, NULL);
+            goto fail_memory;
+        }
+    }
+    b->size = size;
+    b->fresh = 0;
+    if (!range_insert(b, 0, (MemRange){ 0, size })) goto fail_buffer;
+    return b;
+fail_buffer:
+    if (b->fill_buffer) device->vk.DestroyBuffer(device->device, b->fill_buffer, NULL);
+fail_memory:
+    device->vk.FreeMemory(device->device, b->memory, NULL);
+fail:
+    free(b);
+    return NULL;
+}
+
+static void block_destroy(BD12Device *device, BD12MemBlock *b)
+{
+    if (b->fill_buffer) device->vk.DestroyBuffer(device->device, b->fill_buffer, NULL);
+    if (b->mapped) device->vk.UnmapMemory(device->device, b->memory);
+    device->vk.FreeMemory(device->device, b->memory, NULL);
+    free(b->free);
+    free(b);
+}
+
+static BD12MemPool *mem_pools(BD12Device *device)
+{
+    BD12MemPool *pools = __atomic_load_n(&device->mem_pools, __ATOMIC_ACQUIRE);
+    if (pools) return pools;
+    pools = calloc(4, sizeof(*pools));
+    if (!pools) return NULL;
+    for (int i = 0; i < 4; ++i) pthread_mutex_init(&pools[i].lock, NULL);
+    BD12MemPool *expected = NULL;
+    if (!__atomic_compare_exchange_n(&device->mem_pools, &expected, pools, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        free(pools);
+        return expected;
+    }
+    return pools;
+}
+
+/* Carves `size` bytes for `heap`; 0 when it must get dedicated memory. *reused: the range was handed out before. */
+static int suballoc(BD12Heap *heap, int *reused)
+{
+    BD12Device *device = heap->device;
+    BD12MemPool *pool = mem_pools(device);
+    if (!pool) return 0;
+    pool += heap->type;
+    const VkDeviceSize align = suballoc_alignment(heap->size);
+    pthread_mutex_lock(&pool->lock);
+    BD12MemBlock *block = NULL;
+    VkDeviceSize offset = UINT64_MAX;
+    for (size_t i = 0; i < pool->count && offset == UINT64_MAX; ++i)
+        if (pool->blocks[i]->size - pool->blocks[i]->used >= heap->size &&
+            (offset = block_take(pool->blocks[i], heap->size, align)) != UINT64_MAX)
+            block = pool->blocks[i];
+    if (!block) {
+        if (pool->count == pool->capacity) {
+            const size_t capacity = pool->capacity ? pool->capacity * 2 : 8;
+            BD12MemBlock **grown = realloc(pool->blocks, capacity * sizeof(*grown));
+            if (!grown) { pthread_mutex_unlock(&pool->lock); return 0; }
+            pool->blocks = grown;
+            pool->capacity = capacity;
+        }
+        block = block_create(device, heap->type);
+        if (!block || (offset = block_take(block, heap->size, align)) == UINT64_MAX) {
+            if (block) block_destroy(device, block);
+            pthread_mutex_unlock(&pool->lock);
+            return 0;
+        }
+        pool->blocks[pool->count++] = block;
+    }
+    *reused = offset < block->fresh;
+    if (offset + heap->size > block->fresh) block->fresh = offset + heap->size;
+    pthread_mutex_unlock(&pool->lock);
+    heap->block = block;
+    heap->base = offset;
+    heap->memory = block->memory;
+    heap->mapped = block->mapped ? (char *)block->mapped + offset : NULL;
+    return 1;
+}
+
+static void suballoc_release(BD12Heap *heap)
+{
+    BD12Device *device = heap->device;
+    BD12MemPool *pool = device->mem_pools + heap->type;
+    BD12MemBlock *empty = NULL;
+    pthread_mutex_lock(&pool->lock);
+    block_give(heap->block, heap->base, heap->size);
+    if (!heap->block->used) {
+        /* Keep one empty block per type for the next burst; release any other. */
+        size_t empties = 0;
+        for (size_t i = 0; i < pool->count; ++i) empties += !pool->blocks[i]->used;
+        if (empties > 1) {
+            for (size_t i = 0; i < pool->count; ++i)
+                if (pool->blocks[i] == heap->block) { pool->blocks[i] = pool->blocks[--pool->count]; break; }
+            empty = heap->block;
+        }
+    }
+    pthread_mutex_unlock(&pool->lock);
+    if (empty) {
+        /* Zero fills recorded into its buffer must have run before the buffer goes. */
+        bd12_zero_flush(device);
+        uint64_t value = __atomic_load_n(&device->zero_submitted, __ATOMIC_ACQUIRE);
+        if (value && device->zero_sem) {
+            VkSemaphoreWaitInfo wait = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                         .pSemaphores = &device->zero_sem, .pValues = &value };
+            device->vk.WaitSemaphores(device->device, &wait, UINT64_C(10000000000));
+        }
+        block_destroy(device, empty);
+    }
+}
+
 /* D3D12 heaps are zero-initialised; Vulkan memory is not. Shaders that read
  * counters or loop bounds from never-written buffers would otherwise run on
  * recycled garbage (GPU hang). The fill is queued ahead of every later submit
  * and its resources are released with the heap (already GPU-deferred). */
+static void record_zero_fill(BD12Heap *heap, VkBuffer buffer, VkDeviceSize offset);
+
 static void heap_zero_fill(BD12Heap *heap)
 {
     BD12Device *device = heap->device;
+    if (heap->block) {   /* sub-allocated: fill the range through the block's buffer */
+        record_zero_fill(heap, heap->block->fill_buffer, heap->base);
+        return;
+    }
     VkBufferCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = heap->size,
@@ -312,7 +622,14 @@ static void heap_zero_fill(BD12Heap *heap)
         device->vk.BindBufferMemory(device->device, heap->zero_buffer,
                                     heap->memory, 0) != VK_SUCCESS)
         return;
-    /* Recorded into the shared batch; bd12_zero_flush submits it before the next queue submit. */
+    record_zero_fill(heap, heap->zero_buffer, 0);
+}
+
+/* Records a zero fill of `heap` (at `offset` in `buffer`) into the shared batch; bd12_zero_flush submits it before
+ * the next queue submit. */
+static void record_zero_fill(BD12Heap *heap, VkBuffer buffer, VkDeviceSize offset)
+{
+    BD12Device *device = heap->device;
     pthread_mutex_lock(&device->zero_lock);
     if (!device->zero_pool) {
         VkCommandPoolCreateInfo pool = {
@@ -368,7 +685,7 @@ static void heap_zero_fill(BD12Heap *heap)
         device->vk.BeginCommandBuffer(device->zero_cb, &begin);
         device->zero_recorded = device->zero_submitted + 1;
     }
-    device->vk.CmdFillBuffer(device->zero_cb, heap->zero_buffer, 0, heap->size & ~(VkDeviceSize)3, 0);
+    device->vk.CmdFillBuffer(device->zero_cb, buffer, offset, heap->size & ~(VkDeviceSize)3, 0);
     heap->zero_value = device->zero_recorded;
     pthread_mutex_unlock(&device->zero_lock);
 }
@@ -409,6 +726,7 @@ void bd12_zero_flush(BD12Device *device)
 
 uint64_t g_bd12_heap_live[4], g_bd12_heap_bytes[4];
 
+
 static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
                                   VkDeviceSize size, int zero);
 
@@ -443,6 +761,16 @@ static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
     heap->device = device;
     heap->size = size;
     heap->type = type;
+    int reused = 0;
+    if (size <= SUBALLOC_MAX && suballoc_enabled() && suballoc(heap, &reused)) {
+        /* D3D12 heaps start zeroed. A range handed out before is cleared again: on the GPU for DEFAULT heaps (as
+         * every DEFAULT heap is), on the CPU for mapped ones (fresh driver memory is already zero). */
+        if (type == BD12_HEAP_DEFAULT) { if (zero) heap_zero_fill(heap); }
+        else if (reused) memset(heap->mapped, 0, size);
+        __atomic_add_fetch(&g_bd12_heap_live[type], 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_bd12_heap_bytes[type], size, __ATOMIC_RELAXED);
+        return heap;
+    }
     VkMemoryAllocateFlagsInfo flags = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
         .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
@@ -484,6 +812,13 @@ void bd12_heap_destroy(BD12Heap *heap)
 static void heap_destroy_impl(BD12Heap *heap)
 {
     if (!heap) return;
+    if (heap->block) {   /* the range returns to its block; a later fill of it is ordered after this one's */
+        suballoc_release(heap);
+        __atomic_sub_fetch(&g_bd12_heap_live[heap->type], 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&g_bd12_heap_bytes[heap->type], heap->size, __ATOMIC_RELAXED);
+        free(heap);
+        return;
+    }
     /* The zero fill runs on its own timeline; it must finish before the buffer and the heap memory are released. */
     if (heap->zero_value) {
         BD12Device *device = heap->device;
@@ -604,8 +939,9 @@ BD12Buffer *bd12_buffer_create_placed(BD12Heap *heap, VkDeviceSize offset,
         !(requirements.memoryTypeBits &
           (1u << device->memory_type[heap->type])))
         goto fail_buffer;
-    if (device->vk.BindBufferMemory(device->device, buffer->buffer,
-                                    heap->memory, offset) != VK_SUCCESS)
+    if (((heap->base + offset) % requirements.alignment) ||
+        device->vk.BindBufferMemory(device->device, buffer->buffer,
+                                    heap->memory, heap->base + offset) != VK_SUCCESS)
         goto fail_buffer;
     VkBufferDeviceAddressInfo address = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
@@ -743,14 +1079,18 @@ int bd12_fence_wait(BD12Fence *fence, uint64_t value, uint64_t timeout_ns)
 
 /* Queue ----------------------------------------------------------------- */
 
-BD12Queue *bd12_queue_create(BD12Device *device)
+BD12Queue *bd12_queue_create_at(BD12Device *device, uint32_t index)
 {
     BD12Queue *queue = calloc(1, sizeof(*queue));
     if (!queue) return NULL;
+    if (index >= beer_vulkan_queue_count()) index = 0;
     queue->device = device;
-    queue->queue = device->queue;
+    queue->index = index;
+    queue->queue = index ? beer_vulkan_queue_at(index) : device->queue;
     return queue;
 }
+
+BD12Queue *bd12_queue_create(BD12Device *device) { return bd12_queue_create_at(device, 0); }
 
 void bd12_queue_destroy(BD12Queue *queue)
 {
@@ -776,10 +1116,24 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
     for (uint32_t i = 0; i < list_count; ++i)
         command_count += lists[i]->command_buffer_count ?
                          lists[i]->command_buffer_count : 1u;
-    const uint32_t total = command_count + wait_count + signal_count;
+    /* Heap zero fills go to the main queue (bd12_zero_flush above). Another queue is not ordered after them, so
+     * it waits for the newest submitted batch before touching memory. */
+    uint64_t zero_wait = 0;
+    if (queue->index) {
+        pthread_mutex_lock(&device->zero_lock);
+        zero_wait = device->zero_submitted;
+        pthread_mutex_unlock(&device->zero_lock);
+        if (zero_wait) {
+            uint64_t done = 0;
+            device->vk.GetSemaphoreCounterValue(device->device, device->zero_sem, &done);
+            if (done >= zero_wait) zero_wait = 0;
+        }
+    }
+    const uint32_t extra_waits = zero_wait ? 1u : 0u;
+    const uint32_t total = command_count + wait_count + extra_waits + signal_count;
     /* One allocation holds all three info arrays. */
     size_t bytes = command_count * sizeof(VkCommandBufferSubmitInfo) +
-                   (wait_count + signal_count) * sizeof(VkSemaphoreSubmitInfo);
+                   (wait_count + extra_waits + signal_count) * sizeof(VkSemaphoreSubmitInfo);
     VkCommandBufferSubmitInfo stack_storage[16];
     void *storage = total <= 5 ? (void *)stack_storage :
                     malloc(bytes ? bytes : 1);
@@ -787,7 +1141,7 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
     VkCommandBufferSubmitInfo *command_infos = storage;
     VkSemaphoreSubmitInfo *wait_infos = (VkSemaphoreSubmitInfo *)
         (command_infos + command_count);
-    VkSemaphoreSubmitInfo *signal_infos = wait_infos + wait_count;
+    VkSemaphoreSubmitInfo *signal_infos = wait_infos + wait_count + extra_waits;
     uint32_t at = 0;
     for (uint32_t i = 0; i < list_count; ++i) {
         const BD12CmdList *list = lists[i];
@@ -812,6 +1166,13 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
             .value = waits[i].value,
             .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
         };
+    if (zero_wait)
+        wait_infos[wait_count] = (VkSemaphoreSubmitInfo){
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = device->zero_sem,
+            .value = zero_wait,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+        };
     for (uint32_t i = 0; i < signal_count; ++i)
         signal_infos[i] = (VkSemaphoreSubmitInfo){
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -821,7 +1182,7 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
         };
     VkSubmitInfo2 submit = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .waitSemaphoreInfoCount = wait_count,
+        .waitSemaphoreInfoCount = wait_count + extra_waits,
         .pWaitSemaphoreInfos = wait_infos,
         .commandBufferInfoCount = command_count,
         .pCommandBufferInfos = command_infos,
@@ -829,10 +1190,10 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
         .signalSemaphoreInfoCount = signal_count,
         .pSignalSemaphoreInfos = signal_infos
     };
-    beer_vulkan_queue_lock();
+    beer_vulkan_queue_lock_at(queue->index);
     VkResult result = device->vk.QueueSubmit2(queue->queue, 1, &submit,
                                               VK_NULL_HANDLE);
-    beer_vulkan_queue_unlock();
+    beer_vulkan_queue_unlock_at(queue->index);
     __atomic_add_fetch(&queue->submit_count, 1, __ATOMIC_RELAXED);
     beer_vulkan_record_result(result, "BD12 queue submit");
     if (result == VK_ERROR_DEVICE_LOST) {
@@ -1009,8 +1370,11 @@ void bd12_prof_report(void)
         g_bd12_prof_ns[i] = g_bd12_prof_calls[i] = 0;
     }
     fprintf(stderr, " heaps(default/upload/readback)=%llu/%llu/%llu live, %llu/%llu/%llu MiB",
-            (unsigned long long)g_bd12_heap_live[0], (unsigned long long)g_bd12_heap_live[1], (unsigned long long)g_bd12_heap_live[2],
-            (unsigned long long)(g_bd12_heap_bytes[0] >> 20), (unsigned long long)(g_bd12_heap_bytes[1] >> 20), (unsigned long long)(g_bd12_heap_bytes[2] >> 20));
+            (unsigned long long)g_bd12_heap_live[BD12_HEAP_DEFAULT], (unsigned long long)g_bd12_heap_live[BD12_HEAP_UPLOAD],
+            (unsigned long long)g_bd12_heap_live[BD12_HEAP_READBACK],
+            (unsigned long long)(g_bd12_heap_bytes[BD12_HEAP_DEFAULT] >> 20),
+            (unsigned long long)(g_bd12_heap_bytes[BD12_HEAP_UPLOAD] >> 20),
+            (unsigned long long)(g_bd12_heap_bytes[BD12_HEAP_READBACK] >> 20));
     {
         extern uint64_t g_beer_vm_live_bytes;
         struct mallinfo2 mi = mallinfo2();
@@ -1018,6 +1382,27 @@ void bd12_prof_report(void)
                 (unsigned long long)(g_beer_vm_live_bytes >> 20),
                 (unsigned long long)((unsigned long long)mi.arena >> 20),
                 (unsigned long long)((unsigned long long)mi.hblkhd >> 20));
+    }
+    {
+        fprintf(stderr, " root-changes gfx(const=%llu va=%llu table=%llu) cs(const=%llu va=%llu table=%llu)",
+                (unsigned long long)__atomic_exchange_n(&g_bd12_root_changes[0][0], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_root_changes[0][1], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_root_changes[0][2], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_root_changes[1][0], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_root_changes[1][1], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_root_changes[1][2], 0, __ATOMIC_RELAXED));
+        extern uint64_t g_bd12_dheap_stats[4];
+        fprintf(stderr, " descriptor-heaps(created=%llu visible=%llu destroyed=%llu %llums)",
+                (unsigned long long)__atomic_exchange_n(&g_bd12_dheap_stats[0], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_dheap_stats[1], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_dheap_stats[2], 0, __ATOMIC_RELAXED),
+                (unsigned long long)(__atomic_exchange_n(&g_bd12_dheap_stats[3], 0, __ATOMIC_RELAXED) / 1000000));
+        extern uint64_t g_bd12_resolve_cache_stats[4];
+        fprintf(stderr, " resolve-cache hit=%llu miss(new=%llu state=%llu descriptors=%llu)",
+                (unsigned long long)__atomic_exchange_n(&g_bd12_resolve_cache_stats[0], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_resolve_cache_stats[1], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_resolve_cache_stats[2], 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_exchange_n(&g_bd12_resolve_cache_stats[3], 0, __ATOMIC_RELAXED));
     }
     fputc('\n', stderr);
     if (sampling) sample_report();

@@ -49,7 +49,17 @@ static u64 __attribute__((ms_abi)) wmi_Release(BeerWmiObject *o)
     if (!left) free(o);
     return left;
 }
-static u64 __attribute__((ms_abi)) wmi_NotImpl(void) { return WMI_E_NOTIMPL; }
+static u64 __attribute__((ms_abi)) wmi_NotImpl(void)
+{
+    static int logs;
+    if (logs++ < 16) {
+        const u8 *ret = __builtin_return_address(0);
+        /* The bytes before the return address are the caller's `call [reg+disp]`: disp / 8 is the vtable slot. */
+        fprintf(stderr, "[WMI] unimplemented method called from %p (call bytes %02x %02x %02x %02x %02x %02x)\n",
+                (const void *)ret, ret[-6], ret[-5], ret[-4], ret[-3], ret[-2], ret[-1]);
+    }
+    return WMI_E_NOTIMPL;
+}
 
 static u64 __attribute__((ms_abi)) wmi_obj_QI(BeerWmiObject *o, const u8 *iid, void **out)
 {
@@ -96,6 +106,53 @@ static int beer_wmi_cpu_mhz(void)
     if (f) { if (fscanf(f, "%ld", &khz) != 1) khz = 0; fclose(f); }
     return khz > 0 ? (int)(khz / 1000) : 3000;
 }
+/* Win32_VideoController describes the GPU Beer renders on, as Windows does: its name, vendor, memory (AdapterRAM is a
+ * 32-bit byte count, so it saturates at 4 GiB on cards with more), the user-mode driver version D3DKMT reports and a
+ * PCI device id. Games read the name, memory and driver version to decide what graphics features they offer. */
+static u32 nvapi_driver_version(void);
+static void beer_wmi_string(u8 *value, u32 *type, const char *text)
+{ *(u16 *)value = 8; *(u16 **)(value + 8) = beer_bstr_from_ascii(text); if (type) *type = 8; }
+static void beer_wmi_u32(u8 *value, u32 *type, u32 number, u32 cim_type)
+{ *(u16 *)value = 3; *(u32 *)(value + 8) = number; if (type) *type = cim_type; }
+static int beer_wmi_video_property(const char *key, u8 *value, u32 *type)
+{
+    BeerHostGpuInfo gpu;
+    if (!beer_vulkan_host_gpu_info(&gpu)) return 0;
+    char text[160];
+    if (!strcmp(key, "Name") || !strcmp(key, "Caption") || !strcmp(key, "Description") || !strcmp(key, "VideoProcessor")) {
+        beer_wmi_string(value, type, gpu.name);
+        return 1;
+    }
+    if (!strcmp(key, "AdapterCompatibility")) {
+        beer_wmi_string(value, type, gpu.vendor_id == 0x10de ? "NVIDIA" : gpu.vendor_id == 0x1002 ? "Advanced Micro Devices, Inc." :
+                                     gpu.vendor_id == 0x8086 ? "Intel Corporation" : "Unknown");
+        return 1;
+    }
+    if (!strcmp(key, "AdapterRAM")) {
+        beer_wmi_u32(value, type, gpu.dedicated_video_memory > 0xffffffffull ? 0xffffffffu : (u32)gpu.dedicated_video_memory, 19);
+        return 1;
+    }
+    if (!strcmp(key, "DriverVersion")) {
+        u32 build = 7200, minor = 15;   /* other vendors: a recent generic version, as D3DKMT reports */
+        if (gpu.vendor_id == 0x10de) { const u32 v = nvapi_driver_version(); minor = 10 + v / 10000; build = v % 10000; }
+        snprintf(text, sizeof(text), "32.0.%u.%u", minor, build);
+        beer_wmi_string(value, type, text);
+        return 1;
+    }
+    if (!strcmp(key, "PNPDeviceID")) {
+        snprintf(text, sizeof(text), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_%02X", gpu.vendor_id, gpu.device_id, gpu.revision & 0xff);
+        beer_wmi_string(value, type, text);
+        return 1;
+    }
+    if (!strcmp(key, "DeviceID")) { beer_wmi_string(value, type, "VideoController1"); return 1; }
+    if (!strcmp(key, "Status")) { beer_wmi_string(value, type, "OK"); return 1; }
+    if (!strcmp(key, "AdapterDACType")) { beer_wmi_string(value, type, "Integrated RAMDAC"); return 1; }
+    if (!strcmp(key, "Availability")) { beer_wmi_u32(value, type, 3, 18); return 1; }               /* running, full power */
+    if (!strcmp(key, "ConfigManagerErrorCode")) { beer_wmi_u32(value, type, 0, 19); return 1; }
+    if (!strcmp(key, "CurrentBitsPerPixel")) { beer_wmi_u32(value, type, 32, 19); return 1; }
+    return 0;
+}
+
 static u64 __attribute__((ms_abi)) wmi_class_Get(BeerWmiObject *o, const u16 *name, s32 flags, u8 *value, u32 *type, s32 *flavor)
 {
     (void)flags;
@@ -110,11 +167,31 @@ static u64 __attribute__((ms_abi)) wmi_class_Get(BeerWmiObject *o, const u16 *na
     if (processor && !strcmp(key, "NumberOfLogicalProcessors")) { *(u16 *)value = 3; *(s32 *)(value + 8) = (s32)sysconf(_SC_NPROCESSORS_ONLN); if (type) *type = 19; return 0; }
     if (processor && !strcmp(key, "NumberOfCores")) { *(u16 *)value = 3; *(s32 *)(value + 8) = (s32)sysconf(_SC_NPROCESSORS_ONLN); if (type) *type = 19; return 0; }
     if (processor && !strcmp(key, "MaxClockSpeed")) { *(u16 *)value = 3; *(s32 *)(value + 8) = beer_wmi_cpu_mhz(); if (type) *type = 19; return 0; }
-    if ((processor && (!strcmp(key, "Name") || !strcmp(key, "Caption"))) || (!processor && !strcmp(key, "Name"))) {
-        const char *text = processor ? beer_wmi_cpu_name() : "Beer Display Adapter";
-        *(u16 *)value = 8; *(u16 **)(value + 8) = beer_bstr_from_ascii(text); if (type) *type = 8; return 0;
+    {   /* Which properties games read (once each). */
+        static char seen[32][64];
+        static int seen_count;
+        int known = 0;
+        for (int i = 0; i < seen_count; ++i) known |= !strcmp(seen[i], key);
+        if (!known && seen_count < 32) {
+            snprintf(seen[seen_count++], 64, "%s", key);
+            fprintf(stderr, "[WMI] %s.%s\n", o->cls, key);
+        }
     }
-    if (!processor && (!strcmp(key, "AdapterCompatibility"))) { *(u16 *)value = 8; *(u16 **)(value + 8) = beer_bstr_from_ascii("Beer"); if (type) *type = 8; return 0; }
+    if (processor && (!strcmp(key, "Name") || !strcmp(key, "Caption"))) {
+        *(u16 *)value = 8; *(u16 **)(value + 8) = beer_bstr_from_ascii(beer_wmi_cpu_name()); if (type) *type = 8; return 0;
+    }
+    if (!strcasecmp(o->cls, "Win32_PnPEntity")) {
+        if (!strcmp(key, "PNPClass")) { beer_wmi_string(value, type, "Display"); return 0; }
+        if (!strcmp(key, "ClassGuid")) { beer_wmi_string(value, type, "{4d36e968-e325-11ce-bfc1-08002be10318}"); return 0; }
+        if (!strcmp(key, "Service")) {
+            BeerHostGpuInfo gpu;
+            if (beer_vulkan_host_gpu_info(&gpu) && gpu.vendor_id == 0x10de) { beer_wmi_string(value, type, "nvlddmkm"); return 0; }
+        }
+        if (!strcmp(key, "Manufacturer")) key[0] = 0, snprintf(key, sizeof(key), "AdapterCompatibility");
+        if (!strcmp(key, "DeviceID")) snprintf(key, sizeof(key), "PNPDeviceID");
+        if (!strcmp(key, "HardwareID")) { *(u16 *)value = 1; return 0; }   /* string array: not provided */
+    }
+    if (!processor && beer_wmi_video_property(key, value, type)) return 0;
     *(u16 *)value = 1;                                     /* VT_NULL: property exists but has no value */
     return 0;
 }
@@ -159,7 +236,9 @@ static void beer_wmi_class_from_query(const u16 *query, char *cls, size_t size)
     while (from[k] && from[k] != ' ' && k + 1 < size) { cls[k] = from[k]; ++k; }
     cls[k] = 0;
 }
-static int beer_wmi_class_has_rows(const char *cls) { return !strcasecmp(cls, "Win32_Processor") || !strcasecmp(cls, "Win32_VideoController"); }
+/* Win32_PnPEntity lists the GPU (its display device), the device the PnP manager would report for it. */
+static int beer_wmi_class_has_rows(const char *cls)
+{ return !strcasecmp(cls, "Win32_Processor") || !strcasecmp(cls, "Win32_VideoController") || !strcasecmp(cls, "Win32_PnPEntity"); }
 static u64 beer_wmi_make_enum(const char *cls, void **out)
 {
     if (!out) return WMI_E_POINTER;
@@ -184,6 +263,7 @@ static u64 __attribute__((ms_abi)) wmi_services_CreateInstanceEnum(BeerWmiObject
     char name[48]; size_t n = 0;
     for (; cls && cls[n] && n < sizeof(name) - 1; ++n) name[n] = (char)cls[n];
     name[n] = 0;
+    {   static int logs; if (logs++ < 16) fprintf(stderr, "[WMI] CreateInstanceEnum %s\n", name); }
     return beer_wmi_make_enum(name, out);
 }
 static u64 __attribute__((ms_abi)) wmi_services_ExecQuery(BeerWmiObject *o, const u16 *lang, const u16 *query, s32 flags, void *ctx, void **out)
@@ -191,6 +271,9 @@ static u64 __attribute__((ms_abi)) wmi_services_ExecQuery(BeerWmiObject *o, cons
     (void)o; (void)lang; (void)flags; (void)ctx;
     char cls[48];
     beer_wmi_class_from_query(query, cls, sizeof(cls));
+    {   static int logs; if (logs++ < 16) { char text[160]; size_t n = 0;
+            for (; query && query[n] && n < sizeof(text) - 1; ++n) text[n] = (char)query[n];
+            text[n] = 0; fprintf(stderr, "[WMI] ExecQuery \"%s\" -> class %s, %d row(s)\n", text, cls, beer_wmi_class_has_rows(cls)); } }
     return beer_wmi_make_enum(cls, out);
 }
 static void *g_wmi_services_vtbl[] = {
@@ -207,6 +290,9 @@ static u64 __attribute__((ms_abi)) wmi_locator_ConnectServer(BeerWmiObject *o, c
 {
     (void)o; (void)network; (void)user; (void)password; (void)locale; (void)flags; (void)authority; (void)ctx;
     if (!out) return WMI_E_POINTER;
+    {   static int logs; if (logs++ < 8) { char text[128]; size_t n = 0;
+            for (; network && network[n] && n < sizeof(text) - 1; ++n) text[n] = (char)network[n];
+            text[n] = 0; fprintf(stderr, "[WMI] ConnectServer \"%s\"\n", text); } }
     BeerWmiObject *services = beer_wmi_new(WMI_SERVICES, g_wmi_services_vtbl, "", 0);
     if (!services) return UINT64_C(0x8007000e);
     *out = services;

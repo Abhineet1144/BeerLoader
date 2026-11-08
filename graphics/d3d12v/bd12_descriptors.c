@@ -234,10 +234,16 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
 
 /* Descriptor heaps -------------------------------------------------------------- */
 
+uint64_t bd12_heap_next_gpu_base(void)
+{
+    static uint64_t next_id;
+    /* Disjoint 2^36-byte windows: a GPU handle identifies its heap. */
+    return (__atomic_add_fetch(&next_id, 1, __ATOMIC_RELAXED) + 1) << 36;
+}
+
 BD12DescriptorHeap *bd12_descriptor_heap_create(BD12Device *device,
                                                 uint32_t type, uint32_t count)
 {
-    static uint64_t next_id;
     if (!count) return NULL;
     BD12DescriptorHeap *heap = calloc(1, sizeof(*heap));
     if (!heap) return NULL;
@@ -249,18 +255,15 @@ BD12DescriptorHeap *bd12_descriptor_heap_create(BD12Device *device,
     heap->device = device;
     heap->type = type;
     heap->count = count;
-    /* Disjoint 2^36-byte windows: a GPU handle identifies its heap. */
-    heap->gpu_base = (__atomic_add_fetch(&next_id, 1, __ATOMIC_RELAXED) + 1)
-                     << 36;
-    if (type == 0) bd12_mirror_heap_register(heap);
+    heap->gpu_base = bd12_heap_next_gpu_base();
     return heap;
 }
 
 void bd12_descriptor_heap_destroy(BD12DescriptorHeap *heap)
 {
     if (!heap) return;
-    if (heap->type == 0) bd12_mirror_heap_unregister(heap);
-    free(heap->descriptors);
+    bd12_mirror_heap_release(heap);
+    if (!bd12_heapdb_heap_destroy(heap)) free(heap->descriptors);
     free(heap);
 }
 
@@ -383,6 +386,8 @@ void bd12_root_signature_destroy(BD12RootSignature *signature)
     for (uint32_t i = 0; i < signature->parameter_count; ++i)
         free(signature->parameters[i].ranges);
     free(signature->statics);
+    free(signature->root_layout);
+    free(signature->root_ranges);
     free(signature);
 }
 

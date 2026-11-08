@@ -187,7 +187,7 @@ void bd12_capture_indirect(BD12CmdList *list, uint64_t pso, uint32_t type,
                            uint32_t max_count, uint32_t stride)
 {
     if (!getenv("BEER_BD12_CAPTURE_DIR") || !getenv("BEER_BD12_CAPTURE_DRAWS") ||
-        !bd12_trace_active() || !args || type > 1) return;
+        !bd12_trace_active() || !args || (type > 1 && type != 10)) return;   /* draws and DISPATCH_MESH */
     BD12Device *device = list->device;
     static uint32_t ordinal;
     const uint32_t n = __atomic_add_fetch(&ordinal, 1, __ATOMIC_RELAXED);

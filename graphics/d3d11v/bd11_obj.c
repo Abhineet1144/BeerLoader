@@ -366,6 +366,11 @@ static void texture_destroy(B11Obj *o)
     if (t->image) b11_defer(o->dev, free_image_fn, t->image);
     if (t->staging) b11_defer(o->dev, free_buffer_fn, t->staging);
     free(t->sub_offset); free(t->sub_pitch); free(t->sub_slice);
+    if (t->map_shadow) {
+        const uint32_t count = t->desc.mips * (t->desc.dimension == 3 ? 1 : t->desc.array_size);
+        for (uint32_t i = 0; i < count; ++i) free(t->map_shadow[i]);
+        free(t->map_shadow);
+    }
     free(t);
 }
 
@@ -756,7 +761,17 @@ static B11HR create_view(B11Device *dev, uint32_t kind, B11Obj *res, const uint3
         }
         v->dimension = dim; v->format = format;
     }
-    if (!ok) { view_destroy(&v->obj); fprintf(stderr, "[BD11] view creation failed (kind %u)\n", kind); return B11_E_FAIL; }
+    if (!ok) {
+        if (res->kind == B11_TEXTURE) {
+            const B11Texture *t = (const B11Texture *)res;
+            fprintf(stderr, "[BD11] view creation failed (kind %u): view format %u dim %u mip %u layers %u+%u; texture %ux%ux%u "
+                    "array %u mips %u format %u bind 0x%x usage %u\n", kind, v->format, v->dimension, v->base_mip,
+                    v->base_layer, v->layer_count, t->desc.width, t->desc.height, t->desc.depth, t->desc.array_size,
+                    t->desc.mips, t->desc.format, t->desc.bind, t->desc.usage);
+        } else fprintf(stderr, "[BD11] view creation failed (kind %u)\n", kind);
+        view_destroy(&v->obj);
+        return B11_E_FAIL;
+    }
     *out = v;
     return B11_S_OK;
 }

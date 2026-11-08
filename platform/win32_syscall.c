@@ -39,6 +39,27 @@ __asm__(
 );
 
 static BeerWin32ContinueFn g_continue;
+static _Atomic uint64_t g_instrumentation_callback;
+
+void beer_win32_syscall_set_instrumentation_callback(uint64_t callback)
+{
+    atomic_store(&g_instrumentation_callback, callback);
+}
+
+/* The return to user mode at the end of a system service: with a process instrumentation callback set, Windows
+ * resumes at the callback instead, with R10 holding the address the thread would have resumed at (the callback
+ * ends with jmp r10). SYSRET takes the new RIP from RCX, so RCX holds the callback. */
+static void resume_guest(greg_t *regs, uint64_t rip)
+{
+    const uint64_t callback = atomic_load_explicit(&g_instrumentation_callback, memory_order_relaxed);
+    if (callback) {
+        regs[REG_R10] = (greg_t)rip;
+        regs[REG_RCX] = (greg_t)callback;
+        rip = callback;
+    }
+    beer_win32_syscall_resume_rip = rip;
+    regs[REG_RIP] = (greg_t)(uintptr_t)beer_win32_syscall_resume;
+}
 
 void beer_win32_syscall_set_continue(BeerWin32ContinueFn fn) { g_continue = fn; }
 
@@ -441,10 +462,23 @@ static void beer_win32_syscall_signal(int sig, siginfo_t *info, void *context)
     /* Stack arguments five onwards follow the return address and the 32-byte
      * home area. Read them without trusting the guest RSP. */
     uint64_t stack[8] = {0};
-    struct iovec local = { stack, sizeof(stack) };
-    struct iovec remote = { (void *)(uintptr_t)(regs[REG_RSP] + 0x28), sizeof(stack) };
-    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(stack))
-        memset(stack, 0, sizeof(stack));
+    const uint64_t arguments = (uint64_t)regs[REG_RSP] + 0x28;
+    uint64_t stack_base = 0, stack_limit = 0;      /* the thread's TEB: NT_TIB StackBase / StackLimit */
+    uint64_t teb = 0;
+    __asm__ volatile("rdgsbase %0" : "=r"(teb));
+    if (teb) {
+        stack_base = ((const volatile uint64_t *)(uintptr_t)teb)[1];
+        stack_limit = ((const volatile uint64_t *)(uintptr_t)teb)[2];
+    }
+    if (stack_limit < stack_base && arguments >= stack_limit && arguments + sizeof(stack) <= stack_base) {
+        /* Committed stack between RSP and the stack base: a plain copy, without a system call. */
+        memcpy(stack, (const void *)(uintptr_t)arguments, sizeof(stack));
+    } else {
+        struct iovec local = { stack, sizeof(stack) };
+        struct iovec remote = { (void *)(uintptr_t)arguments, sizeof(stack) };
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(stack))
+            memset(stack, 0, sizeof(stack));
+    }
 
     if (service && g_continue && !strcmp(service->name, "NtContinue")) {
         const uint64_t context = (uint64_t)regs[REG_R10];
@@ -458,8 +492,7 @@ static void beer_win32_syscall_signal(int sig, siginfo_t *info, void *context)
             if (length > 0) (void)!write(2, line, (size_t)length);
         }
         if (status == 0) {                  /* the frame now holds the CONTEXT's registers */
-            beer_win32_syscall_resume_rip = (uint64_t)regs[REG_RIP];
-            regs[REG_RIP] = (greg_t)(uintptr_t)beer_win32_syscall_resume;
+            resume_guest(regs, (uint64_t)regs[REG_RIP]);
             return;
         }
     } else if (service && service->fn) {
@@ -479,11 +512,11 @@ static void beer_win32_syscall_signal(int sig, siginfo_t *info, void *context)
         if (g_trace || first) {
             char line[256];
             int length = snprintf(line, sizeof(line),
-                                  "[SYSCALL] 0x%x %s(%llx, %llx, %llx, %llx) rip=%llx -> 0x%llx%s\n",
+                                  "[SYSCALL] 0x%x %s(%llx, %llx, %llx, %llx, [%llx]) rip=%llx -> 0x%llx%s\n",
                                   number, service ? service->name : "<no Beer service>",
                                   (unsigned long long)regs[REG_R10], (unsigned long long)regs[REG_RDX],
                                   (unsigned long long)regs[REG_R8], (unsigned long long)regs[REG_R9],
-                                  (unsigned long long)rip, (unsigned long long)status,
+                                  (unsigned long long)stack[0], (unsigned long long)rip, (unsigned long long)status,
                                   service && !service->fn ? " (not implemented)" : "");
             if (length > 0) (void)!write(2, line, (size_t)length);
             if (service) {
@@ -498,8 +531,7 @@ static void beer_win32_syscall_signal(int sig, siginfo_t *info, void *context)
      * would see its old RCX/R11; code that checks them after a direct system call (protectors) diverges. */
     regs[REG_RCX] = (greg_t)rip;
     regs[REG_R11] = regs[REG_EFL];
-    beer_win32_syscall_resume_rip = rip;
-    regs[REG_RIP] = (greg_t)(uintptr_t)beer_win32_syscall_resume;
+    resume_guest(regs, rip);
 }
 
 void beer_win32_syscall_thread_init(void)
@@ -514,6 +546,11 @@ void beer_win32_syscall_thread_init(void)
 }
 
 int beer_win32_syscall_active(void) { return g_installed; }
+
+void beer_win32_syscall_refresh_ranges(void)
+{
+    if (g_installed) ranges_refresh();
+}
 
 int beer_win32_syscall_install(void)
 {

@@ -987,14 +987,16 @@ int xwayland_window_request_focus(void)
 
 static void apply_pointer_confine_locked(void);
 
-/* Applies the effective host cursor state: the guest's request, except that a
- * fullscreen (desktop-covering) window never shows the host cursor because the
- * games that run this way draw their own. BEER_HOST_CURSOR=1 disables that
- * rule. Called with the lock held. */
+/* Applies the guest's requested cursor state (SetCursor handle, ShowCursor count), fullscreen or not, as Windows
+ * does: games that draw their own cursor hide the system one themselves, and games with a system cursor (Where
+ * Winds Meet) need it shown. BEER_HIDE_FULLSCREEN_CURSOR=1 restores the old diagnostic rule that a desktop-covering
+ * window never shows the host cursor. Called with the lock held. */
 static int apply_cursor_locked(void)
 {
     int visible = g_x11.cursor_requested_visible;
-    if (g_x11.fullscreen_applied && !getenv("BEER_HOST_CURSOR")) visible = 0;
+    static int hide_fullscreen = -1;
+    if (hide_fullscreen < 0) hide_fullscreen = getenv("BEER_HIDE_FULLSCREEN_CURSOR") != NULL;
+    if (g_x11.fullscreen_applied && hide_fullscreen) visible = 0;
     int ok = g_x11.display && g_x11.window;
     if (ok && !!visible != g_x11.cursor_visible) {
         if (visible) {
@@ -1022,6 +1024,9 @@ static int apply_cursor_locked(void)
         }
         if (ok) {
             g_x11.cursor_visible = !!visible;
+            if (getenv("BEER_INPUT_DIAGNOSTICS"))
+                fprintf(stderr, "[X11] host cursor %s (guest requested %s, fullscreen %d)\n", visible ? "shown" : "hidden",
+                        g_x11.cursor_requested_visible ? "visible" : "hidden", g_x11.fullscreen_applied);
             apply_pointer_confine_locked();
             g_x11.Flush(g_x11.display);
         }

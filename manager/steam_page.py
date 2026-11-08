@@ -415,7 +415,7 @@ class SteamPage(Gtk.Box):
         progress.append(row.pause)
         cancel = Gtk.Button(icon_name="process-stop-symbolic", tooltip_text="Cancel", valign=Gtk.Align.CENTER)
         cancel.add_css_class("flat")
-        cancel.connect("clicked", lambda _b, i=appid: self.client.send("cancel", appid=str(i)))
+        cancel.connect("clicked", lambda _b, i=appid: self._cancel(i))
         progress.append(cancel)
         row.side.add_named(progress, "progress")
 
@@ -482,7 +482,12 @@ class SteamPage(Gtk.Box):
                 paused = state == "paused"
                 row.pause.set_icon_name("media-playback-start-symbolic" if paused else "media-playback-pause-symbolic")
                 row.pause.set_tooltip_text("Resume" if paused else "Pause")
-                if state in ("downloading", "verifying") and total:
+                if job.get("restored"):
+                    row.bar.set_fraction(0)
+                    chunks = job.get("chunks_done", 0)
+                    details.append("Paused · %s chunks already downloaded · resume to continue" % format(chunks, ",")
+                                   if chunks else "Paused · resume to continue")
+                elif state in ("downloading", "verifying") and total:
                     row.bar.set_fraction(min(1.0, done / total))
                     text = "%d%% · %s of %s" % (int(100 * done / total), fmt_bytes(done), fmt_bytes(total))
                     rate = job.get("rate", 0)
@@ -655,8 +660,22 @@ class SteamPage(Gtk.Box):
 
     def _toggle_pause(self, appid):
         job = self.jobs.get(appid)
-        if job:
+        if not job:
+            return
+        if job.get("restored"):
+            # The provider no longer holds this job (it restarted): queue the install again, which
+            # continues from the chunks already on disk (staging/<appid>.done).
+            self._job("install", appid)
+        else:
             self.client.send("resume" if job["state"] == "paused" else "pause", appid=str(appid))
+
+    def _cancel(self, appid):
+        job = self.jobs.get(appid) or {}
+        record = self.installs.get(appid) or {}
+        if job.get("restored") and record.get("folder"):
+            self.client.send("cancel", appid=str(appid), folder=record["folder"])
+        else:
+            self.client.send("cancel", appid=str(appid))
 
     def _installed_action(self, action, appid):
         record = self.installs.get(appid)
@@ -715,6 +734,13 @@ class SteamPage(Gtk.Box):
 
     def _show_installs(self, event):
         self.installs = {a["appid"]: a for a in event.get("apps", [])}
+        # A download the provider no longer tracks (paused or interrupted before it restarted) is shown
+        # as paused so it can be resumed; a real job from the "downloads" reply replaces this entry.
+        for appid, record in self.installs.items():
+            if record.get("state") == "downloading" and appid not in self.jobs:
+                self.jobs[appid] = {"appid": appid, "name": record.get("name", ""), "state": "paused",
+                                    "action": "install", "done": 0, "total": 0, "restored": True,
+                                    "chunks_done": record.get("chunks_done", 0)}
         for appid in list(self.rows):
             self._update_row(appid)
         self.app.sync_steam_installs(list(self.installs.values()))

@@ -17,6 +17,27 @@ BD12ComputePipeline *bd12_compute_pipeline_create(BD12Device *device,
                                        VK_NULL_HANDLE, 0);
 }
 
+int bd12_partial_arrays_enabled(BD12Device *device)
+{
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("BEER_BD12_NO_PARTIAL_ARRAYS") != NULL;
+    return !disabled && device->modern && device->modern->descriptor_indexing;
+}
+
+const void *bd12_layout_partial_arrays(BD12Device *device, const VkDescriptorSetLayoutBinding *bindings,
+                                       uint32_t count, VkDescriptorBindingFlags *flags,
+                                       VkDescriptorSetLayoutBindingFlagsCreateInfo *info)
+{
+    if (!bd12_partial_arrays_enabled(device)) return NULL;
+    for (uint32_t i = 0; i < count; ++i)
+        flags[i] = bindings[i].descriptorCount > 1 ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0;
+    *info = (VkDescriptorSetLayoutBindingFlagsCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+        .bindingCount = count, .pBindingFlags = flags,
+    };
+    return info;
+}
+
 int bd12_binding_descriptor_type(const BD12ShaderBinding *b,
                                    VkDescriptorType *type)
 {
@@ -112,20 +133,21 @@ BD12ComputePipeline *bd12_compute_pipeline_create_bound(
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
         };
     }
+    VkDescriptorBindingFlags *binding_flags = calloc(binding_count ? binding_count : 1, sizeof(*binding_flags));
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info;
     VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = binding_flags ? bd12_layout_partial_arrays(device, layout_bindings, binding_count, binding_flags,
+                                                            &flags_info) : NULL,
         .bindingCount = binding_count,
         .pBindings = layout_bindings
     };
-    if (device->vk.CreateDescriptorSetLayout(device->device, &layout_info, NULL,
-                                             &set_layout) != VK_SUCCESS)
-        goto done;
+    set_layout = bd12_shared_set_layout(device, &layout_info);          /* shared: never destroyed */
+    free(binding_flags);
+    if (!set_layout) goto done;
     pipeline = bd12_compute_pipeline_build(device, spirv, spirv_bytes, 0,
                                            set_layout, bindless_words);
-    if (!pipeline) {
-        device->vk.DestroyDescriptorSetLayout(device->device, set_layout, NULL);
-        goto done;
-    }
+    if (!pipeline) goto done;
     pipeline->bindings = copy;
     pipeline->binding_types = types;
     pipeline->binding_count = binding_count;
@@ -294,6 +316,7 @@ void bd12_cmd_set_compute_root_constants(BD12CmdList *list, uint32_t parameter,
     memcpy(&arg->constants[dest_offset], data, count * sizeof(uint32_t));
     arg->cbv_valid = 0;
     ++list->compute.epoch;
+    BD12_ROOT_CHANGED(1, 0);
 }
 
 void bd12_cmd_set_compute_root_va(BD12CmdList *list, uint32_t parameter,
@@ -302,6 +325,7 @@ void bd12_cmd_set_compute_root_va(BD12CmdList *list, uint32_t parameter,
     if (parameter < BD12_MAX_ROOT_PARAMETERS && list->compute.arguments[parameter].value != gpu_va) {
         list->compute.arguments[parameter].value = gpu_va;
         ++list->compute.epoch;
+        BD12_ROOT_CHANGED(1, 1);
     }
 }
 
@@ -311,6 +335,7 @@ void bd12_cmd_set_compute_root_table(BD12CmdList *list, uint32_t parameter,
     if (parameter < BD12_MAX_ROOT_PARAMETERS && list->compute.arguments[parameter].value != gpu_handle) {
         list->compute.arguments[parameter].value = gpu_handle;
         ++list->compute.epoch;
+        BD12_ROOT_CHANGED(1, 2);
     }
 }
 
@@ -379,6 +404,8 @@ static int visibility_matches(uint32_t visibility, uint32_t stage)
     case 5: return visibility == 4;                    /* GEOMETRY */
     case 6: return visibility == 2;                    /* HULL */
     case 7: return visibility == 3;                    /* DOMAIN */
+    case 3: return visibility == 6;                    /* AMPLIFICATION */
+    case 4: return visibility == 7;                    /* MESH */
     default: return 1;
     }
 }
@@ -388,7 +415,7 @@ static int visibility_matches(uint32_t visibility, uint32_t stage)
  * rescan every parameter. */
 static void build_candidates(BD12ShaderBinding *b, const BD12RootSignature *rs)
 {
-    uint32_t found[12], n = 0, overflow = 0;
+    uint32_t found[32], n = 0, overflow = 0;
     const uint32_t first = b->reg, last = b->reg + (b->count ? b->count - 1 : 0);
     for (uint32_t i = 0; i < rs->parameter_count; ++i) {
         const BD12RootParameter *p = &rs->parameters[i];
@@ -417,7 +444,7 @@ static void build_candidates(BD12ShaderBinding *b, const BD12RootSignature *rs)
         default: match = 1; break;
         }
         if (!match) continue;
-        if (n == 12) { overflow = 1; break; }
+        if (n == 32) { overflow = 1; break; }
         found[n++] = i;
     }
     b->cand_count = overflow ? 0xff : n;
@@ -578,14 +605,18 @@ static int resolve_one(BD12CmdList *list, BD12BindState *state,
  * that no earlier parameter filled, straight from the heap; registers named by a root descriptor go through
  * resolve_one; anything left is a null descriptor. Same results as resolving every element, without searching the
  * root signature again per element. Returns 0 to fall back to per-element resolution. */
-static int resolve_array(BD12CmdList *list, BD12BindState *state, const BD12ShaderBinding *b, Resolved *out)
+/* filled[e] (caller's array, b->count entries) says which elements were written; the others are null and their
+ * Resolved entries are left untouched (zeroing ~1000 112-byte entries per draw was a large part of the cost). */
+static int resolve_array(BD12CmdList *list, BD12BindState *state, const BD12ShaderBinding *b, Resolved *out,
+                         uint8_t *filled)
 {
     const BD12RootSignature *rs = state->root_signature;
-    if (b->count <= 1 || b->type == BD12_RANGE_SAMPLER || b->type == BD12_RANGE_CBV) return 0;
+    /* Constant-buffer arrays too: engines declare b0..b3 as large arrays (RE9: 256 each) of which a root table
+     * fills a few, so per-element resolution searched the root signature ~1000 times per draw for empty slots. */
+    if (b->count <= 1 || b->type == BD12_RANGE_SAMPLER) return 0;
     if (__atomic_load_n(&b->cand_serial, __ATOMIC_ACQUIRE) != rs->serial) build_candidates((BD12ShaderBinding *)b, rs);
     if (b->cand_serial != rs->serial || b->cand_count == 0xff) return 0;
-    uint8_t filled[256];
-    if (b->count > sizeof(filled)) return 0;
+    if (b->count > 256) return 0;
     memset(filled, 0, b->count);
     const uint32_t first = b->reg, last = b->reg + b->count - 1;
     for (uint32_t ci = 0; ci < b->cand_count; ++ci) {
@@ -626,8 +657,6 @@ static int resolve_array(BD12CmdList *list, BD12BindState *state, const BD12Shad
             }
         }
     }
-    for (uint32_t e = 0; e < b->count; ++e)
-        if (!filled[e]) memset(&out[e], 0, sizeof(out[e]));
     return 1;
 }
 
@@ -653,6 +682,10 @@ static VkDescriptorSet resolve_set_impl(
     VkWriteDescriptorSetAccelerationStructureKHR as_writes[MAX_WRITES];
     uint32_t write_count = 0, info_count = 0;
     const int capture = bd12_capture_enabled();   /* diagnostic capture: read once, not per element */
+    const int partial_arrays = bd12_partial_arrays_enabled(device);
+    /* Per-element diagnostics (bind logs, captures, constant-buffer tweaks), decided once per set: draws resolve
+     * hundreds of array elements each. */
+    const int diagnostics = capture || bd12_trace_active() || __atomic_load_n(&g_bd12_cbt_active, __ATOMIC_RELAXED);
     for (uint32_t i = 0; i < binding_count; ++i) {
         const BD12ShaderBinding *b = &bindings[i];
         const VkDescriptorType type = types[i];
@@ -675,11 +708,25 @@ static VkDescriptorSet resolve_set_impl(
         };
         /* Array bindings are resolved in one pass (resolve_array); single descriptors one at a time. */
         static __thread Resolved array_out[MAX_INFOS];
-        const int batched = resolve_array(list, state, b, array_out);
-        for (uint32_t e = 0; e < b->count; ++e) {
-            Resolved r;
-            if (batched) r = array_out[e];
-            else if (!resolve_one(list, state, b, b->reg + e, &r, NULL, NULL)) return VK_NULL_HANDLE;
+        static __thread uint8_t array_filled[MAX_INFOS];
+        static const Resolved null_resolved;
+        const int batched = resolve_array(list, state, b, array_out, array_filled);
+        /* Partially bound arrays (bd12_layout_partial_arrays): write only up to the last element the root signature
+         * supplies, nothing when it supplies none. Engines declare large arrays and fill a few slots. */
+        uint32_t element_count = b->count;
+        if (batched && partial_arrays) {
+            while (element_count && !array_filled[element_count - 1]) --element_count;
+            if (!element_count) { --write_count; continue; }
+            w->descriptorCount = element_count;
+        }
+        for (uint32_t e = 0; e < element_count; ++e) {
+            Resolved single;
+            const Resolved *rp = &single;
+            if (batched) rp = array_filled[e] ? &array_out[e] : &null_resolved;
+            else if (!resolve_one(list, state, b, b->reg + e, &single, NULL, NULL)) return VK_NULL_HANDLE;
+            if (diagnostics) {
+            const Resolved r_ = *rp;
+#define r r_
             if (state == &list->graphics && bd12_trace_active() && getenv("BEER_BD12_BIND_LOG") &&
                 list->gfx.pipeline && r.kind == BD12_DESC_UAV_BUFFER && r.source_buffer)
                 fprintf(stderr, "[BINDG] pso=%016llx u%u va=%llx range=%llu\n",
@@ -718,6 +765,9 @@ static VkDescriptorSet resolve_set_impl(
                     bd12_capture_note(r.kind == BD12_DESC_SRV_BUFFER ? 1 : 2, b->space,
                                       b->reg + e, r.source_buffer->buffer, r.offset, r.range);
             }
+            }
+#undef r
+#define r (*rp)
             if (type == VK_DESCRIPTOR_TYPE_SAMPLER) {
                 VkSampler sampler = r.sampler;
                 if (!sampler) {
@@ -770,6 +820,7 @@ static VkDescriptorSet resolve_set_impl(
             } else {
                 views[info_count + e] = r.view;
             }
+#undef r
         }
         if (type == VK_DESCRIPTOR_TYPE_SAMPLER ||
             type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
@@ -779,7 +830,7 @@ static VkDescriptorSet resolve_set_impl(
             VkWriteDescriptorSetAccelerationStructureKHR *aw = &as_writes[write_count - 1];
             *aw = (VkWriteDescriptorSetAccelerationStructureKHR){
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
-                .accelerationStructureCount = b->count,
+                .accelerationStructureCount = element_count,
                 .pAccelerationStructures = &as_handles[info_count]
             };
             w->pNext = aw;
@@ -787,7 +838,7 @@ static VkDescriptorSet resolve_set_impl(
             w->pBufferInfo = &buffer_infos[info_count];
         else
             w->pTexelBufferView = &views[info_count];
-        info_count += b->count;
+        info_count += element_count;
     }
     const uint64_t t_update = bd12_prof_now();
     if (!set) {
@@ -863,9 +914,58 @@ VkDescriptorSet bd12_allocate_descriptor_set(BD12CmdAllocator *allocator,
 }
 
 uint64_t g_bd12_descriptor_epoch;
+
+/* What a root argument contributes to a resolved set: the table handle or VA, and for root constants the scratch
+ * copy the set points at (cbv_valid drops when the constants change). */
+static void resolve_cache_arg(const BD12BindState *state, uint32_t i, uint64_t *value, uint64_t *extra)
+{
+    const BD12RootArgument *arg = &state->arguments[i];
+    if (state->root_signature->parameters[i].type == BD12_ROOT_CONSTANTS) {
+        *value = arg->cbv_valid ? (uint64_t)(uintptr_t)arg->cbv_buffer : 0;
+        *extra = arg->cbv_valid ? (uint64_t)arg->cbv_offset : UINT64_MAX;
+    } else {
+        *value = arg->value;
+        *extra = 0;
+    }
+}
+
+static void resolve_cache_record_args(BD12ResolveCacheEntry *e, const BD12BindState *state,
+                                      const BD12ShaderBinding *bindings, uint32_t binding_count)
+{
+    const BD12RootSignature *rs = state->root_signature;
+    e->root_signature = rs;
+    e->nrel = 0xff;
+    if (!rs) return;
+    uint8_t n = 0;
+    for (uint32_t i = 0; i < binding_count; ++i) {
+        const BD12ShaderBinding *b = &bindings[i];
+        if (b->cand_serial != rs->serial || b->cand_count == 0xff) return;   /* unknown: fall back to the epoch */
+        for (uint32_t c = 0; c < b->cand_count; ++c) {
+            const uint8_t p = b->cand[c];
+            int seen = 0;
+            for (uint8_t k = 0; k < n; ++k) seen |= e->rel[k] == p;
+            if (seen) continue;
+            if (n == 16) return;
+            e->rel[n++] = p;
+        }
+    }
+    for (uint8_t k = 0; k < n; ++k) resolve_cache_arg(state, e->rel[k], &e->rel_value[k], &e->rel_extra[k]);
+    e->nrel = n;
+}
+
+static int resolve_cache_args_match(const BD12ResolveCacheEntry *e, const BD12BindState *state)
+{
+    for (uint8_t k = 0; k < e->nrel; ++k) {
+        uint64_t value, extra;
+        resolve_cache_arg(state, e->rel[k], &value, &extra);
+        if (value != e->rel_value[k] || extra != e->rel_extra[k]) return 0;
+    }
+    return 1;
+}
 /* Resolve-cache outcomes for BEER_BD12_PROF: hit, miss with no entry for the layout, miss because the bind state
  * changed, miss because descriptors were written (state unchanged). */
 uint64_t g_bd12_resolve_cache_stats[4];
+uint64_t g_bd12_root_changes[2][3];
 
 VkDescriptorSet bd12_resolve_descriptor_set(
     BD12CmdList *list, BD12BindState *state, const BD12ShaderBinding *bindings,
@@ -881,7 +981,16 @@ VkDescriptorSet bd12_resolve_descriptor_set(
     static int cache_off = -1;
     if (cache_off < 0) cache_off = getenv("BEER_BD12_NO_RESOLVE_CACHE") != NULL;
     const int which = state == &list->compute;
-    const uint64_t descriptor_epoch = __atomic_load_n(&g_bd12_descriptor_epoch, __ATOMIC_RELAXED);
+    /* Descriptor changes: resource destruction (global) and writes to the bound heaps, which count writes once
+     * they are marked as read here. Every counter only grows, so the sum changes whenever one of them does. */
+    uint64_t descriptor_epoch = __atomic_load_n(&g_bd12_descriptor_epoch, __ATOMIC_RELAXED);
+    for (int h = 0; h < 2; ++h) {
+        BD12DescriptorHeap *heap = list->heaps[h];
+        if (!heap) continue;
+        if (!__atomic_load_n(&heap->legacy_reads, __ATOMIC_RELAXED))
+            __atomic_store_n(&heap->legacy_reads, 1, __ATOMIC_SEQ_CST);
+        descriptor_epoch += __atomic_load_n(&heap->write_epoch, __ATOMIC_ACQUIRE);
+    }
     if (!cache_off) {
         int reason = 1;
         for (uint32_t i = 0; i < BD12_RESOLVE_CACHE; ++i) {
@@ -889,7 +998,11 @@ VkDescriptorSet bd12_resolve_descriptor_set(
             if (!e->set || e->layout != set_layout || e->bindings != bindings || e->binding_count != binding_count ||
                 e->heaps[0] != list->heaps[0] || e->heaps[1] != list->heaps[1])
                 continue;
-            if (e->state_epoch != state->epoch) { if (reason < 2) reason = 2; continue; }
+            if (e->root_signature != state->root_signature) { if (reason < 2) reason = 2; continue; }
+            if (e->nrel == 0xff ? e->state_epoch != state->epoch : !resolve_cache_args_match(e, state)) {
+                if (reason < 2) reason = 2;
+                continue;
+            }
             if (e->descriptor_epoch != descriptor_epoch) { reason = 3; continue; }
             __atomic_add_fetch(&g_bd12_resolve_cache_stats[0], 1, __ATOMIC_RELAXED);
             return e->set;
@@ -904,14 +1017,36 @@ VkDescriptorSet bd12_resolve_descriptor_set(
         BD12ResolveCacheEntry *e = &list->resolve_cache[which][list->resolve_cache_next[which]++ % BD12_RESOLVE_CACHE];
         *e = (BD12ResolveCacheEntry){ set_layout, bindings, binding_count, state->epoch, descriptor_epoch,
                                       { list->heaps[0], list->heaps[1] }, set };
+        resolve_cache_record_args(e, state, bindings, binding_count);
     }
     return set;
+}
+
+/* Descriptor-buffer compute pipeline: heaps bound once, root arguments pushed (bd12_heapdb.c). */
+static int bind_compute_db(BD12CmdList *list, BD12ComputePipeline *pso)
+{
+    if (!bd12_db_prepare(list)) return 0;
+    list->device->vk.CmdBindPipeline(list->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pso->pipeline);
+    return bd12_cmd_push_root_arguments(list, &list->compute, VK_PIPELINE_BIND_POINT_COMPUTE, pso->layout,
+                                        VK_SHADER_STAGE_COMPUTE_BIT, pso->root_push_bytes, pso->root_layout_hash,
+                                        pso->db_layout);
 }
 
 int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
                             uint32_t z)
 {
     BD12ComputePipeline *pso = list->compute_pipeline;
+    if (pso && pso->db_layout && list->compute.root_signature) {
+        if (bd12_debug_sync_all()) bd12_cmd_global_barrier(list);
+        bd12_cmd_end_rendering(list);
+        if (!bind_compute_db(list, pso)) {
+            BD12_DROP(BD12_DROP_DISPATCH_NO_DESCRIPTORS);
+            return 0;
+        }
+        record_dispatch(list, x, y, z, 0);
+        list->device->vk.CmdDispatch(list->command_buffer, x, y, z);
+        return 1;
+    }
     if (!pso || !pso->set_layout || (!list->compute.root_signature && !list->resolve_hook)) {
         BD12_DROP(BD12_DROP_DISPATCH_NO_STATE);
         return 0;
@@ -927,7 +1062,7 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
         list, &list->compute, pso->bindings, pso->binding_types,
         pso->binding_count, pso->set_layout);
     if (capture) bd12_capture_record(list, 0, pso->shader_hash, x, y, z);
-    if (!set || (pso->bindless_words && !bd12_mirror_prepare(list))) {
+    if (!set || ((pso->bindless_words || pso->root_push_bytes) && !bd12_mirror_prepare(list))) {
         if (capture) bd12_capture_end();
         BD12_DROP(BD12_DROP_DISPATCH_NO_DESCRIPTORS);
         return 0;
@@ -941,7 +1076,13 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
     device->vk.CmdBindDescriptorSets(list->command_buffer,
                                      VK_PIPELINE_BIND_POINT_COMPUTE,
                                      pso->layout, 0, 1, &set, 0, NULL);
-    if (pso->bindless_words)
+    bd12_cmd_note_set_binding(list, 1);
+    if (pso->root_push_bytes) {
+        if (!bd12_cmd_push_root_arguments(list, &list->compute, VK_PIPELINE_BIND_POINT_COMPUTE, pso->layout,
+                                          VK_SHADER_STAGE_COMPUTE_BIT, pso->root_push_bytes, pso->root_layout_hash,
+                                          NULL))
+            return 0;
+    } else if (pso->bindless_words)
         bd12_cmd_bind_bindless(list, &list->compute, VK_PIPELINE_BIND_POINT_COMPUTE,
                                pso->layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                pso->bindless, pso->bindless_count,
@@ -964,20 +1105,33 @@ int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
                                      VkDeviceSize offset)
 {
     BD12ComputePipeline *pso = list->compute_pipeline;
+    if (pso && pso->db_layout && list->compute.root_signature) {
+        bd12_cmd_end_rendering(list);
+        if (!bind_compute_db(list, pso)) return 0;
+        record_dispatch(list, 0, 0, 0, 1);
+        list->device->vk.CmdDispatchIndirect(list->command_buffer, args->buffer, offset);
+        return 1;
+    }
     if (!pso || !pso->set_layout || (!list->compute.root_signature && !list->resolve_hook)) return 0;
     BD12Device *device = list->device;
     bd12_cmd_end_rendering(list);
     VkDescriptorSet set = bd12_resolve_descriptor_set(
         list, &list->compute, pso->bindings, pso->binding_types,
         pso->binding_count, pso->set_layout);
-    if (!set || (pso->bindless_words && !bd12_mirror_prepare(list))) return 0;
+    if (!set || ((pso->bindless_words || pso->root_push_bytes) && !bd12_mirror_prepare(list))) return 0;
     record_dispatch(list, 0, 0, 0, 1);
     device->vk.CmdBindPipeline(list->command_buffer,
                                VK_PIPELINE_BIND_POINT_COMPUTE, pso->pipeline);
     device->vk.CmdBindDescriptorSets(list->command_buffer,
                                      VK_PIPELINE_BIND_POINT_COMPUTE,
                                      pso->layout, 0, 1, &set, 0, NULL);
-    if (pso->bindless_words)
+    bd12_cmd_note_set_binding(list, 1);
+    if (pso->root_push_bytes) {
+        if (!bd12_cmd_push_root_arguments(list, &list->compute, VK_PIPELINE_BIND_POINT_COMPUTE, pso->layout,
+                                          VK_SHADER_STAGE_COMPUTE_BIT, pso->root_push_bytes, pso->root_layout_hash,
+                                          NULL))
+            return 0;
+    } else if (pso->bindless_words)
         bd12_cmd_bind_bindless(list, &list->compute, VK_PIPELINE_BIND_POINT_COMPUTE,
                                pso->layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                pso->bindless, pso->bindless_count,

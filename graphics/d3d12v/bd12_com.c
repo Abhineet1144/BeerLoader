@@ -102,9 +102,10 @@ HR com_obj_query(ComObj *self, const uint8_t *riid, void **out,
         !com_iid_equal(riid, own_iid) &&
         !(extra_iid && com_iid_equal(riid, extra_iid))) {
         if (getenv("BEER_COM_DIAGNOSTICS")) {
-            fprintf(stderr, "[BD12 QI] refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+            fprintf(stderr, "[BD12 QI] refused %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x"
+                    " (object kind %u)\n",
                     riid[3], riid[2], riid[1], riid[0], riid[5], riid[4], riid[7], riid[6],
-                    riid[8], riid[9], riid[10], riid[11], riid[12], riid[13], riid[14], riid[15]);
+                    riid[8], riid[9], riid[10], riid[11], riid[12], riid[13], riid[14], riid[15], self->kind);
         }
         return HR_E_NOINTERFACE;
     }
@@ -176,9 +177,34 @@ static void presenter_sync(void)
     if (vulkan_presenter_wait_source) vulkan_presenter_wait_source();
 }
 
+/* A lane whose timeline has reached its newest submission is idle and bounds nothing. A busy lane has completed
+ * everything up to its timeline value, and its pending work all has larger serials, so the minimum over busy
+ * lanes (capped by the device serial read first) is a safe global completion point. */
+uint64_t com_completed(ComDevice *dev)
+{
+    uint64_t done = __atomic_load_n(&dev->serial, __ATOMIC_ACQUIRE);
+    for (uint32_t l = 0; l < dev->lane_count; ++l) {
+        const uint64_t submitted = __atomic_load_n(&dev->lanes[l].submitted, __ATOMIC_ACQUIRE);
+        const uint64_t lane_done = bd12_fence_completed(dev->lanes[l].retire);
+        if (lane_done < submitted && lane_done < done) done = lane_done;
+    }
+    return done;
+}
+
+void com_wait_serial(ComDevice *dev, uint64_t serial)
+{
+    for (uint32_t l = 0; l < dev->lane_count; ++l) {
+        const uint64_t submitted = __atomic_load_n(&dev->lanes[l].submitted, __ATOMIC_ACQUIRE);
+        /* The lane's timeline reaches `serial` once its first submission at or after `serial` completes; that
+         * submission exists when submitted >= serial, otherwise the newest one is the target. */
+        const uint64_t target = submitted < serial ? submitted : serial;
+        if (target) bd12_fence_wait(dev->lanes[l].retire, target, UINT64_MAX);
+    }
+}
+
 void com_reap(ComDevice *dev)
 {
-    uint64_t done = bd12_fence_completed(dev->retire);
+    uint64_t done = com_completed(dev);
     for (;;) {
         pthread_mutex_lock(&dev->grave_lock);
         ComGrave *grave = dev->grave_head;
@@ -200,7 +226,7 @@ void com_defer(ComDevice *dev, void (*fn)(ComDevice *, void *), void *ptr)
     pthread_mutex_lock(&dev->submit_lock);
     uint64_t serial = dev->serial;
     pthread_mutex_unlock(&dev->submit_lock);
-    if (serial <= bd12_fence_completed(dev->retire)) {
+    if (serial <= com_completed(dev)) {
         presenter_sync();
         fn(dev, ptr);
         return;
@@ -267,7 +293,7 @@ static void dump_dispatch_flight(ComDevice *dev, uint64_t serial,
     snprintf(temporary, sizeof(temporary), "%s.tmp", path);
     FILE *out = fopen(temporary, "w");
     if (!out) return;
-    const uint64_t completed = bd12_fence_completed(dev->retire);
+    const uint64_t completed = com_completed(dev);
     fprintf(out, "latest=%llu completed=%llu history=%u\n",
             (unsigned long long)serial, (unsigned long long)completed,
             COM_FLIGHT_SUBMISSIONS);
@@ -286,10 +312,10 @@ static void dump_dispatch_flight(ComDevice *dev, uint64_t serial,
                 (unsigned long long)submission->total_op_count);
         for (uint32_t w = 0; w < submission->wait_count; ++w)
             fprintf(out, " submit=%llu wait fence=%p value=%llu%s\n", (unsigned long long)s, (void *)submission->waits[w].fence,
-                    (unsigned long long)submission->waits[w].value, submission->waits[w].fence == dev->retire ? " (retire)" : "");
+                    (unsigned long long)submission->waits[w].value, submission->waits[w].fence == dev->lanes[0].retire ? " (retire)" : "");
         for (uint32_t w = 0; w < submission->signal_count; ++w)
             fprintf(out, " submit=%llu signal fence=%p value=%llu%s\n", (unsigned long long)s, (void *)submission->signals[w].fence,
-                    (unsigned long long)submission->signals[w].value, submission->signals[w].fence == dev->retire ? " (retire)" : "");
+                    (unsigned long long)submission->signals[w].value, submission->signals[w].fence == dev->lanes[0].retire ? " (retire)" : "");
         for (uint32_t d = 0; d < submission->dispatch_count; ++d) {
             const BD12DispatchFlight *entry = &submission->dispatches[d];
             fprintf(out,
@@ -323,10 +349,12 @@ static void dump_dispatch_flight(ComDevice *dev, uint64_t serial,
     else remove(temporary);
 }
 
-VkResult com_submit(ComDevice *dev, BD12CmdList *const *lists, uint32_t count,
+VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, uint32_t count,
                     const BD12FenceOp *waits, uint32_t wait_count,
                     const BD12FenceOp *signals, uint32_t signal_count)
 {
+    if (lane >= dev->lane_count) lane = 0;
+    ComLane *const l = &dev->lanes[lane];
     BD12FenceOp all_waits[9], all_signals[8];
     uint32_t total_waits = wait_count;
     uint32_t total_signals = signal_count;
@@ -341,21 +369,31 @@ VkResult com_submit(ComDevice *dev, BD12CmdList *const *lists, uint32_t count,
             all_signals[total_signals++] = signals[i];
     const uint64_t previous = dev->serial;
     const uint64_t serial = previous + 1;
-    if (previous)
-        all_waits[total_waits++] = (BD12FenceOp){ dev->retire, previous };
-    all_signals[total_signals++] = (BD12FenceOp){ dev->retire, serial };
+    /* Submissions on one lane are ordered by its Vulkan queue, so no submission waits for the previous one (that
+     * drained the GPU between every submission). Memory ordering across ExecuteCommandLists on a queue comes from
+     * the barrier each list starts with (bd12_cmd_list_begin); across D3D12 queues, from the game's fences, as in
+     * D3D12. BEER_BD12_CHAIN_SUBMITS=1 restores a wait on the lane's previous submission, for comparison. */
+    static int chain = -1;
+    if (chain < 0) chain = getenv("BEER_BD12_CHAIN_SUBMITS") != NULL;
+    (void)previous;
+    if (l->submitted && chain)
+        all_waits[total_waits++] = (BD12FenceOp){ l->retire, l->submitted };
+    all_signals[total_signals++] = (BD12FenceOp){ l->retire, serial };
     for (uint32_t i = 0; i < total_waits; ++i) __atomic_store_n(&all_waits[i].fence->last_use, serial, __ATOMIC_RELEASE);
     for (uint32_t i = 0; i < total_signals; ++i) __atomic_store_n(&all_signals[i].fence->last_use, serial, __ATOMIC_RELEASE);
     dump_dispatch_flight(dev, serial, lists, count, all_waits, total_waits, all_signals, total_signals);
-    VkResult result = bd12_queue_submit(dev->queue, lists, count, all_waits,
+    VkResult result = bd12_queue_submit(l->queue, lists, count, all_waits,
                                         total_waits, all_signals,
                                         total_signals);
-    if (result == VK_SUCCESS) ++dev->serial;
+    if (result == VK_SUCCESS) {
+        __atomic_store_n(&l->submitted, serial, __ATOMIC_RELEASE);   /* before the serial: see com_completed */
+        __atomic_store_n(&dev->serial, serial, __ATOMIC_RELEASE);
+    }
     pthread_mutex_unlock(&dev->submit_lock);
     { /* Diagnostic: BEER_BD12_SYNC_SUBMIT=1 drains the GPU after every submit. */
         static int drain = -1;
         if (drain < 0) drain = getenv("BEER_BD12_SYNC_SUBMIT") != NULL;
-        if (drain && result == VK_SUCCESS) bd12_fence_wait(dev->retire, serial, UINT64_MAX);
+        if (drain && result == VK_SUCCESS) bd12_fence_wait(l->retire, serial, UINT64_MAX);
     }
     com_reap(dev);
     BD12_PROF_END(BD12_PROF_SUBMIT);
@@ -438,10 +476,10 @@ static void fence_free(ComDevice *dev, void *ptr)
     /* The semaphore must outlive every submission that signals or waits on it; a GPU signal into a destroyed
      * semaphore faults (NVIDIA Xid 31, write to address 0) and hangs the game. */
     const uint64_t use = __atomic_load_n(&f->fence->last_use, __ATOMIC_ACQUIRE);
-    if (use > bd12_fence_completed(dev->retire)) {
+    if (use > com_completed(dev)) {
         fprintf(stderr, "[BD12] fence %p released while submission %llu still uses it (completed %llu); waiting\n",
-                (void *)f->fence, (unsigned long long)use, (unsigned long long)bd12_fence_completed(dev->retire));
-        bd12_fence_wait(dev->retire, use, UINT64_MAX);
+                (void *)f->fence, (unsigned long long)use, (unsigned long long)com_completed(dev));
+        com_wait_serial(dev, use);
     }
     bd12_fence_destroy(f->fence);
     free(f);
@@ -519,6 +557,7 @@ typedef struct ComQueue {
     ComObj obj;
     struct { void **vtable; } downlevel;
     uint32_t desc[4];
+    uint32_t lane;                /* ComDevice.lanes index this queue submits to */
     QueueOp *held;                /* in submission order; guarded by dev->defer_lock */
     uint32_t held_count, held_capacity;
     struct ComQueue *next_deferred;
@@ -580,16 +619,16 @@ static HR queue_run_op(ComQueue *q, QueueOp *op)
     case QUEUE_OP_EXECUTE:
         for (uint32_t done = 0; done < op->count; done += 64) {
             const uint32_t n = op->count - done < 64 ? op->count - done : 64;
-            if (com_submit(dev, op->lists + done, n, NULL, 0, NULL, 0) != VK_SUCCESS) return HR_E_FAIL;
+            if (com_submit(dev, q->lane, op->lists + done, n, NULL, 0, NULL, 0) != VK_SUCCESS) return HR_E_FAIL;
         }
         return HR_OK;
     case QUEUE_OP_SIGNAL: {
         BD12FenceOp signal = { op->fence->fence, op->value };
-        return com_submit(dev, NULL, 0, NULL, 0, &signal, 1) == VK_SUCCESS ? HR_OK : HR_E_FAIL;
+        return com_submit(dev, q->lane, NULL, 0, NULL, 0, &signal, 1) == VK_SUCCESS ? HR_OK : HR_E_FAIL;
     }
     case QUEUE_OP_WAIT: {
         BD12FenceOp wait = { op->fence->fence, op->value };
-        return com_submit(dev, NULL, 0, &wait, 1, NULL, 0) == VK_SUCCESS ? HR_OK : HR_E_FAIL;
+        return com_submit(dev, q->lane, NULL, 0, &wait, 1, NULL, 0) == VK_SUCCESS ? HR_OK : HR_E_FAIL;
     }
     case QUEUE_OP_PRESENT:
         return present_epilogue(q, op->texture);
@@ -801,7 +840,7 @@ static HR present_epilogue(ComQueue *q, ComResource *texture)
         extern BD12Buffer *g_ts_dst; extern VkDeviceSize g_ts_offset; extern uint32_t g_ts_count;
         static unsigned frame;
         if (g_ts_dst && g_ts_dst->cpu && (++frame % 30) == 0) {
-            bd12_fence_wait(dev->retire, dev->serial, UINT64_MAX);
+            com_wait_serial(dev, dev->serial);
             const uint64_t *t = (const uint64_t *)((char *)g_ts_dst->cpu + g_ts_offset);
             fprintf(stderr, "[TS] count=%u t0=%llu t1=%llu delta_ns=%lld\n", g_ts_count,
                     (unsigned long long)t[0], (unsigned long long)(g_ts_count > 1 ? t[1] : 0),
@@ -810,11 +849,11 @@ static HR present_epilogue(ComQueue *q, ComResource *texture)
     }
     bd12_device_advance_epoch(dev->bd);
     if (bd12_capture_rb_pending()) {
-        bd12_fence_wait(dev->retire, dev->serial, UINT64_MAX);
+        com_wait_serial(dev, dev->serial);
         bd12_capture_rb_flush();
     }
     if (bd12_capture_pending()) {      /* traced frame: drain, then write files */
-        bd12_fence_wait(dev->retire, dev->serial, UINT64_MAX);
+        com_wait_serial(dev, dev->serial);
         bd12_capture_flush();
     }
     bd12_trace_frame_advance();
@@ -1000,6 +1039,11 @@ static void resource_parse(ComResource *r, const uint8_t *desc)
     r->depth_or_layers = depth ? depth : 1;
     r->mips = mips;
     r->dxgi_format = rd32(desc + 32);
+    if (r->dxgi_format == 189 || r->dxgi_format == 190) {   /* DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP / MIP_REGION_USED */
+        static unsigned logged;
+        if (logged++ < 5) fprintf(stderr, "[BD12] sampler-feedback resource (format %u, %llux%u)\n", r->dxgi_format,
+                                  (unsigned long long)rd64(desc + 16), rd32(desc + 24));
+    }
     r->flags = rd32(desc + 48);
     if (r->dimension != 1 && !r->mips)
         r->mips = full_mip_count(r->width, r->height,
@@ -1403,6 +1447,16 @@ static HR MS dev_create_queue(ComDevice *self, const uint32_t *desc,
     com_obj_init(&q->obj, COM_QUEUE, queue_vtable, self, queue_destroy);
     q->downlevel.vtable = downlevel_vtable;
     if (desc) memcpy(q->desc, desc, sizeof(q->desc));
+    /* D3D12_COMMAND_LIST_TYPE: 0 DIRECT, 2 COMPUTE, 3 COPY. Each type gets its own Vulkan queue when there are
+     * enough lanes, so async compute and copies run beside graphics as on Windows. Queues of one type share a
+     * lane (their work stays ordered, which D3D12 allows). */
+    const uint32_t type = desc ? desc[0] : 0;
+    q->lane = 0;
+    if (type == 2 && self->lane_count > 1) q->lane = 1;
+    else if (type == 3 && self->lane_count > 2) q->lane = 2;
+    else if (type == 3 && self->lane_count > 1) q->lane = 1;
+    fprintf(stderr, "[BD12] CreateCommandQueue type=%u priority=%u flags=0x%x -> Vulkan queue %u\n", type,
+            desc ? desc[1] : 0, desc ? desc[2] : 0, q->lane);
     *out = q;
     return HR_OK;
 }
@@ -1495,7 +1549,16 @@ static int fake_feature(ComDevice *self, uint32_t feature, void *data, uint32_t 
     case 27: FILL(12, 1, 2, 11);                    /* OPTIONS5: SRV-only tiled tier 3, render passes tier 2, DXR 1.1 */
     case 28: FILL(8, 1, 2);                         /* DISPLAYABLE */
     case 30: FILL(20, 1, 1, 2, 16, 1);              /* OPTIONS6: VRS tier 2, 16px tiles, background processing */
-    case 32: FILL(8, 10, 100);                      /* OPTIONS7: mesh shader tier 1, sampler feedback 1.0 */
+    case 32:                                        /* OPTIONS7: mesh shader tier 1, sampler feedback 1.0 */
+        /* BEER_FAKE_OPTIONS7=mesh|feedback: only that half (diagnostic: which one a game's path depends on). */
+        {
+            const char *half = getenv("BEER_FAKE_OPTIONS7");
+            if (half && !strcmp(half, "mesh")) FILL(8, 10, 0);
+            /* feedback: fake sampler feedback beside the real mesh-shader tier (0 when mesh shaders are off). */
+            if (half && !strcmp(half, "feedback"))
+                FILL(8, self->bd->CmdDrawMeshTasksEXT ? (uint32_t)self->bd->modern->mesh_shader_tier : 0u, 100);
+        }
+        FILL(8, 10, 100);
     case 36: FILL(4, 1);                            /* OPTIONS8: unaligned block textures */
     case 37: FILL(24, 1, 1, 1, 1, 1, 10);           /* OPTIONS9: mesh stats/RT index, int64 atomics, WaveMMA tier 1 */
     case 39: FILL(8, 1, 1);                         /* OPTIONS10: VRS sum combiner, per-primitive rate in MS */
@@ -1523,12 +1586,57 @@ static uint32_t shader_model_limit(uint32_t highest)
     return limit < highest ? limit : highest;
 }
 
-static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
-                               uint32_t size)
+static HR dev_check_feature_impl(ComDevice *self, uint32_t feature, void *data, uint32_t size);
+/* BEER_FEATURE_LOG=1: every CheckFeatureSupport with the words the caller passed in and the words returned. */
+static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data, uint32_t size)
+{
+    static int log = -1;
+    if (log < 0) log = getenv("BEER_FEATURE_LOG") != NULL;
+    uint32_t in[16] = { 0 };
+    const uint32_t words = data ? (size / 4 < 16 ? size / 4 : 16) : 0;
+    if (log && words) memcpy(in, data, words * 4);
+    const HR hr = dev_check_feature_impl(self, feature, data, size);
+    if (log) {
+        char text[512];
+        int n = snprintf(text, sizeof(text), "[FEATURE] %u size=%u hr=0x%x in:", feature, size, (unsigned)hr);
+        for (uint32_t i = 0; i < words && n < (int)sizeof(text) - 12; ++i) n += snprintf(text + n, sizeof(text) - n, " %x", in[i]);
+        n += snprintf(text + n, sizeof(text) - n, " out:");
+        for (uint32_t i = 0; i < words && n < (int)sizeof(text) - 12; ++i)
+            n += snprintf(text + n, sizeof(text) - n, " %x", ((const uint32_t *)data)[i]);
+        fprintf(stderr, "%s\n", text);
+    }
+    return hr;
+}
+
+/* Pipeline libraries and shader caches are offered unless BEER_D3D12_PIPELINE_LIBRARY=0. */
+int bd12_pipeline_library_enabled(void)
+{
+    static int value = -1;
+    if (value < 0) {
+        const char *library = getenv("BEER_D3D12_PIPELINE_LIBRARY");
+        value = !(library && !strcmp(library, "0"));
+    }
+    return value;
+}
+
+static HR dev_check_feature_impl(ComDevice *self, uint32_t feature, void *data, uint32_t size)
 {
     (void)self;
     if (!data || !size) return HR_E_INVALIDARG;
-    if (beer_fake_caps()) {
+    /* BEER_FAKE_FEATURES=0,21,32: the BEER_FAKE_CAPS answer for these features only (diagnostic bisection). */
+    const char *only = getenv("BEER_FAKE_FEATURES");
+    int fake_this = beer_fake_caps();
+    if (only && *only) {
+        fake_this = 0;
+        for (const char *p = only; *p; ) {
+            char *end;
+            const unsigned long v = strtoul(p, &end, 10);
+            if (end == p) break;
+            if (v == feature) fake_this = 1;
+            p = *end ? end + 1 : end;
+        }
+    }
+    if (fake_this) {
         HR hr;
         if (fake_feature(self, feature, data, size, &hr)) return hr;
     }
@@ -1713,18 +1821,36 @@ static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data,
         return HR_E_INVALIDARG;
     case 19:                                        /* SHADER_CACHE */
         if (size < 4) return HR_E_INVALIDARG;
-        /* BEER_D3D12_PIPELINE_LIBRARY=1 offers LIBRARY (bd12_pipelib.c) with the automatic in-process and on-disk
-         * caches (one VkPipelineCache saved under ~/.cache/beer). Off by default: Onimusha then runs its
-         * first-run shader compilation, which fills the game's 640 MB block arena about 20 s in and crashes
-         * (not yet understood; vkd3d-proton completes it). SINGLE_PSO is not offered: GetCachedBlob and CachedPSO
-         * are not implemented. CreatePipelineLibrary itself always works. */
-        {
-            const char *library = getenv("BEER_D3D12_PIPELINE_LIBRARY");
-            *(uint32_t *)data = library && *library && strcmp(library, "0") ? 0x2u | 0x4u | 0x8u : 0u;
+        /* LIBRARY (bd12_pipelib.c) with the automatic in-process and on-disk caches (one VkPipelineCache saved under
+         * ~/.cache/beer), as a driver offers them. BEER_D3D12_PIPELINE_LIBRARY=0 reports none. SINGLE_PSO is not
+         * offered: GetCachedBlob and CachedPSO are not implemented. CreatePipelineLibrary itself always works. */
+        *(uint32_t *)data = bd12_pipeline_library_enabled() ? 0x2u | 0x4u | 0x8u : 0u;
+        return HR_OK;
+    case 30:                                        /* OPTIONS6: variable-rate shading */
+    case 39: {                                      /* OPTIONS10: VRS sum combiner, mesh per-primitive rate */
+        memset(data, 0, size);
+        const BeerVulkanModern *m = self->bd->modern;
+        if (!self->bd->CmdSetFragmentShadingRateKHR || !m->vrs_tier) return HR_OK;
+        uint32_t *f = data;
+        if (feature == 30 && size >= 20) {
+            f[0] = (uint32_t)m->vrs_additional_rates;          /* AdditionalShadingRatesSupported */
+            f[1] = (uint32_t)m->vrs_primitive_multi_viewport;  /* PerPrimitiveShadingRateSupportedWithViewportIndexing */
+            f[2] = (uint32_t)m->vrs_tier;                      /* VariableShadingRateTier */
+            f[3] = m->vrs_tile;                                /* ShadingRateImageTileSize */
+            f[4] = 0;                                          /* BackgroundProcessingSupported */
+        } else if (feature == 39 && size >= 8) {
+            f[0] = m->vrs_tier >= 2 && m->vrs_sum_combiner;    /* VariableRateShadingSumCombinerSupported */
+            f[1] = self->bd->CmdDrawMeshTasksEXT && m->mesh_shading_rate;   /* MeshShaderPerPrimitiveShadingRate */
         }
         return HR_OK;
+    }
+    case 32:                                        /* OPTIONS7: mesh shaders; no sampler feedback yet */
+        memset(data, 0, size);
+        if (size >= 8 && self->bd->CmdDrawMeshTasksEXT)
+            ((uint32_t *)data)[0] = (uint32_t)self->bd->modern->mesh_shader_tier;
+        return HR_OK;
     case 7: case 12: case 18:
-    case 21: case 23: case 27: case 30: case 32:
+    case 21: case 23: case 27:
         memset(data, 0, size);
         return HR_OK;
     default:
@@ -1759,8 +1885,9 @@ static HR MS dev_create_descriptor_heap(ComDevice *self, const uint32_t *desc,
     if (!h) return HR_E_OUTOFMEMORY;
     /* CBV_SRV_UAV=0, SAMPLER=1 share one descriptor layout; RTV/DSV heaps
      * reuse the same host array (type 0). */
-    h->heap = bd12_descriptor_heap_create(self->bd, type == 1 ? 1 : 0,
-                                          count ? count : 1);
+    h->heap = bd12_descriptor_heap_create_ex(self->bd, type == 1 ? 1 : 0, count ? count : 1,
+                                             (type >= 2 ? BD12_HEAP_FLAG_NO_PAYLOAD : 0) |
+                                             (type < 2 && (desc[2] & 1) ? BD12_HEAP_FLAG_SHADER_VISIBLE : 0));
     if (!h->heap) { free(h); return HR_E_OUTOFMEMORY; }
     /* Shader-visible CBV/SRV/UAV heaps get a bindless mirror up front when
      * shader model 6 is exposed (BEER_DXR_PROBE_SM), so every later write is
@@ -1803,7 +1930,13 @@ static void clear_descriptor(uint64_t handle)
     memset((void *)(uintptr_t)handle, 0, sizeof(BD12Descriptor));
 }
 
-static void MS dev_create_cbv(ComDevice *self, const uint8_t *desc,
+static void MS dev_create_cbv_impl(ComDevice *self, const uint8_t *desc, uint64_t dest);
+static void MS dev_create_cbv(ComDevice *self, const uint8_t *desc, uint64_t dest)
+{
+    dev_create_cbv_impl(self, desc, dest);
+    if (dest) bd12_heap_written((const void *)(uintptr_t)dest, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+}
+static void MS dev_create_cbv_impl(ComDevice *self, const uint8_t *desc,
                               uint64_t dest)
 {
     if (!dest) return;
@@ -1816,7 +1949,6 @@ static void MS dev_create_cbv(ComDevice *self, const uint8_t *desc,
     if (!buffer) return;
     BD12DescriptorHeap heap = temp_heap(self, dest);
     bd12_descriptor_write_cbv(&heap, 0, buffer, offset, size);
-    bd12_mirror_note((const void *)(uintptr_t)dest, 1);
 }
 
 static VkFormat view_format(const ComResource *r, uint32_t dxgi)
@@ -1974,18 +2106,28 @@ static void MS dev_create_uav_impl(ComDevice *self, ComResource *r, ComResource 
                                     count);
 }
 
-/* Descriptor writes also refresh the bindless heap mirror, if one exists. */
+/* A view's null descriptor type: a buffer view or an image view, by the view dimension (or the resource). */
+static int view_is_buffer(const ComResource *r, const uint8_t *desc)
+{
+    return desc ? rd32(desc + 4) == 1 : r && r->buffer;
+}
+
+/* Descriptor writes also produce the heap's Vulkan descriptors (bd12_heapdb.c) and refresh its mirror. */
 static void MS dev_create_srv(ComDevice *self, ComResource *r,
                               const uint8_t *desc, uint64_t dest)
 {
     dev_create_srv_impl(self, r, desc, dest);
-    bd12_mirror_note((const void *)(uintptr_t)dest, 1);
+    if (dest) bd12_heap_written((const void *)(uintptr_t)dest, 1,
+                                view_is_buffer(r, desc) ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+                                                        : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
 }
 static void MS dev_create_uav(ComDevice *self, ComResource *r, ComResource *counter,
                               const uint8_t *desc, uint64_t dest)
 {
     dev_create_uav_impl(self, r, counter, desc, dest);
-    bd12_mirror_note((const void *)(uintptr_t)dest, 1);
+    if (dest) bd12_heap_written((const void *)(uintptr_t)dest, 1,
+                                view_is_buffer(r, desc) ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+                                                        : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 }
 
 static void MS dev_create_rtv(ComDevice *self, ComResource *r,
@@ -2047,7 +2189,7 @@ static void MS dev_create_sampler(ComDevice *self, const uint8_t *desc,
     VkSamplerCreateInfo info = sampler_from_desc(desc, 0);
     BD12DescriptorHeap heap = temp_heap(self, dest);
     bd12_descriptor_write_sampler(&heap, 0, &info);
-    BD12_DESCRIPTORS_WRITTEN();
+    bd12_heap_written((const void *)(uintptr_t)dest, 1, VK_DESCRIPTOR_TYPE_SAMPLER);
 }
 
 static void MS dev_copy_descriptors_simple(ComDevice *self, uint32_t count,
@@ -2058,7 +2200,7 @@ static void MS dev_copy_descriptors_simple(ComDevice *self, uint32_t count,
     if (!count || !dest || !src) return;
     memmove((void *)(uintptr_t)dest, (const void *)(uintptr_t)src,
             (size_t)count * sizeof(BD12Descriptor));
-    bd12_mirror_note((const void *)(uintptr_t)dest, count);
+    bd12_heap_copied((const void *)(uintptr_t)dest, (const void *)(uintptr_t)src, count);
 }
 
 static void MS dev_copy_descriptors(ComDevice *self, uint32_t dest_ranges,
@@ -2081,7 +2223,8 @@ static void MS dev_copy_descriptors(ComDevice *self, uint32_t dest_ranges,
         memmove((BD12Descriptor *)(uintptr_t)dest_starts[dr] + doff,
                 (const BD12Descriptor *)(uintptr_t)src_starts[sr] + soff,
                 (size_t)n * sizeof(BD12Descriptor));
-        bd12_mirror_note((BD12Descriptor *)(uintptr_t)dest_starts[dr] + doff, n);
+        bd12_heap_copied((BD12Descriptor *)(uintptr_t)dest_starts[dr] + doff,
+                         (const BD12Descriptor *)(uintptr_t)src_starts[sr] + soff, n);
         doff += n;
         soff += n;
     }
@@ -2441,10 +2584,15 @@ static void MS dev_get_resource_tiling(ComDevice *self, ComResource *r, uint32_t
     }
     *subresource_count = written;
 }
+/* The adapter LUID, identical to the one DXGI reports for the GPU (dxgi_fill_adapter_desc): applications find the
+ * device's IDXGIAdapter by it (IDXGIFactory4::EnumAdapterByLuid, or by matching DXGI_ADAPTER_DESC::AdapterLuid) to
+ * read its memory and decide which features to offer. A zero LUID matched no adapter: RE Engine then showed 0 GB of
+ * video memory and hid ray tracing. */
 static uint64_t *MS dev_get_luid(ComDevice *self, uint64_t *result)
 {
     (void)self;
-    *result = 0;
+    BeerHostGpuInfo gpu;
+    *result = beer_vulkan_host_gpu_info(&gpu) ? gpu.luid : 1;   /* DXGI's fallback LUID is 1 as well */
     return result;
 }
 
@@ -2808,7 +2956,11 @@ static void MS dev_get_footprints1(ComDevice *self, const uint8_t *desc1, uint32
                                    uint64_t base, uint8_t *layouts, uint32_t *rows, uint64_t *row_sizes,
                                    uint64_t *total)
 { dev_get_footprints(self, desc1, first, count, base, layouts, rows, row_sizes, total); }
-static void MS dev_create_feedback_uav(void) {}
+static void MS dev_create_feedback_uav(void)
+{
+    static unsigned logged;
+    if (logged++ < 5) fprintf(stderr, "[BD12] CreateSamplerFeedbackUnorderedAccessView (not implemented)\n");
+}
 
 /* Device9: queues ignore the creator id; driver shader caches are not offered (as on drivers without them). */
 static HR MS dev_create_queue1(ComDevice *self, const uint32_t *desc, const uint8_t *creator, const uint8_t *riid,
@@ -3273,11 +3425,21 @@ uint64_t MS beer_bd12_create_device(const uint8_t *riid, void **out)
         ComDevice *dev = calloc(1, sizeof(*dev));
         if (dev) {
             dev->bd = bd12_device_create();
+            int lanes_ok = dev->bd != NULL;
             if (dev->bd) {
-                dev->queue = bd12_queue_create(dev->bd);
-                dev->retire = bd12_fence_create(dev->bd, 0);
+                uint32_t want = beer_vulkan_queue_count();
+                if (want > COM_MAX_LANES) want = COM_MAX_LANES;
+                for (uint32_t l = 0; l < want; ++l) {
+                    dev->lanes[l].queue = bd12_queue_create_at(dev->bd, l);
+                    dev->lanes[l].retire = bd12_fence_create(dev->bd, 0);
+                    if (!dev->lanes[l].queue || !dev->lanes[l].retire) { lanes_ok = l > 0; break; }
+                    dev->lane_count = l + 1;
+                }
+                if (dev->lane_count > 1)
+                    fprintf(stderr, "[BD12] %u Vulkan queues: direct on 0, compute on 1, copy on %u\n",
+                            dev->lane_count, dev->lane_count > 2 ? 2u : 1u);
             }
-            if (!dev->bd || !dev->queue || !dev->retire) {
+            if (!lanes_ok || !dev->lane_count) {
                 fprintf(stderr, "[BD12] device creation failed\n");
                 free(dev);
                 dev = NULL;

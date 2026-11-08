@@ -70,13 +70,24 @@ typedef struct ComWaiter {
     uint64_t event;
 } ComWaiter;
 
+/* One Vulkan queue with its own retire timeline. Every submission takes the next device-wide serial and signals
+ * it on its lane's timeline, so each lane's timeline rises monotonically but lanes complete independently. */
+#define COM_MAX_LANES 3
+typedef struct ComLane {
+    BD12Queue *queue;
+    BD12Fence *retire;
+    uint64_t submitted;           /* serial of the lane's newest submission (atomic) */
+} ComLane;
+
 struct ComDevice {
     ComObj obj;
     BD12Device *bd;
-    BD12Queue *queue;             /* shared by every D3D12 queue */
-    pthread_mutex_t submit_lock;  /* orders retire serials with submissions */
-    BD12Fence *retire;
-    uint64_t serial;              /* last submitted retire value */
+    /* Lane 0 is the main Vulkan queue (direct queues, presenter). With BEER_BD12_MULTI_QUEUE=1, D3D12 compute
+     * queues use lane 1 and copy queues lane 2; otherwise every D3D12 queue uses lane 0. */
+    ComLane lanes[COM_MAX_LANES];
+    uint32_t lane_count;
+    pthread_mutex_t submit_lock;  /* orders serials with submissions */
+    uint64_t serial;              /* last submitted serial, any lane (atomic) */
     ComFlightSubmission flight[COM_FLIGHT_SUBMISSIONS];
     pthread_mutex_t grave_lock;
     ComGrave *grave_head, *grave_tail;
@@ -109,11 +120,17 @@ void com_obj_init(ComObj *obj, uint32_t kind, void **vtable, ComDevice *dev,
 uint32_t MS com_add_ref(ComObj *obj);
 uint32_t MS com_release(ComObj *obj);
 int com_iid_equal(const uint8_t *a, const uint8_t *b);
+/* ID3D12PipelineLibrary and SHADER_CACHE support are offered (default; BEER_D3D12_PIPELINE_LIBRARY=0 turns off). */
+int bd12_pipeline_library_enabled(void);
 /* Frees ptr through fn once all GPU work submitted so far has completed. */
 void com_defer(ComDevice *dev, void (*fn)(ComDevice *, void *), void *ptr);
 void com_reap(ComDevice *dev);
-/* One vkQueueSubmit2 that also advances the retire timeline. */
-VkResult com_submit(ComDevice *dev, BD12CmdList *const *lists, uint32_t count,
+/* Highest serial S such that every submission with serial <= S, on every lane, has completed. */
+uint64_t com_completed(ComDevice *dev);
+/* Waits until every submission with serial <= `serial` has completed. */
+void com_wait_serial(ComDevice *dev, uint64_t serial);
+/* One vkQueueSubmit2 on `lane` that also advances the serial and that lane's retire timeline. */
+VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, uint32_t count,
                     const BD12FenceOp *waits, uint32_t wait_count,
                     const BD12FenceOp *signals, uint32_t signal_count);
 

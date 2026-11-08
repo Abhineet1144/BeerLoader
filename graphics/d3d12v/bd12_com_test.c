@@ -331,7 +331,7 @@ int main(void)
                          .writes_3d_storage_image = 1 }}
     };
     g_com_device->serial = 16;
-    CHECK(com_submit(g_com_device, NULL, 0, NULL, 0, NULL, 0) == VK_SUCCESS,
+    CHECK(com_submit(g_com_device, 0, NULL, 0, NULL, 0, NULL, 0) == VK_SUCCESS,
           "flight recorder signal-only submit");
     FILE *flight = fopen("/tmp/beer-bd12-flight-1.log", "r");
     char flight_text[8192] = { 0 };
@@ -357,7 +357,7 @@ int main(void)
         .ops = { flight_list.op_flight[0] }
     };
     g_com_device->serial = 18;
-    CHECK(com_submit(g_com_device, NULL, 0, NULL, 0, NULL, 0) == VK_SUCCESS,
+    CHECK(com_submit(g_com_device, 0, NULL, 0, NULL, 0, NULL, 0) == VK_SUCCESS,
           "flight recorder graphics submit");
     flight = fopen("/tmp/beer-bd12-flight-1.log", "r");
     memset(flight_text, 0, sizeof(flight_text));

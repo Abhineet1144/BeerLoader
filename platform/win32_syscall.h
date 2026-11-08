@@ -78,6 +78,9 @@ size_t beer_win32_syscall_write_stub(uint8_t *out, size_t capacity, uint32_t num
  * and leaves the frame unchanged. */
 typedef uint32_t (*BeerWin32ContinueFn)(void *ucontext, uint64_t context, uint64_t test_alert);
 void beer_win32_syscall_set_continue(BeerWin32ContinueFn fn);
+/* ProcessInstrumentationCallback: when nonzero, every serviced guest system call returns to this address with
+ * R10 = the real return address, as the Windows kernel does. Zero removes it. */
+void beer_win32_syscall_set_instrumentation_callback(uint64_t callback);
 
 /* Installs the SIGSYS handler and enables dispatch on the calling thread.
  * Returns 1 on success and 0 if the host lacks Syscall User Dispatch. */
@@ -86,6 +89,10 @@ int beer_win32_syscall_install(void);
 /* True once install succeeded: guest SYSCALL instructions are then trapped and served. Native stubs that
  * execute SYSCALL themselves are only emitted then; otherwise exports jump to Beer directly. */
 int beer_win32_syscall_active(void);
+/* Re-reads which executable mappings are host code. Call it once the guest images are mapped: a trapped call from
+ * an address the table does not know re-reads /proc/self/maps, which is slow enough for protection code that
+ * times its system calls to notice. */
+void beer_win32_syscall_refresh_ranges(void);
 
 /* Enables dispatch on the calling thread (selector ALLOW). Call it on every
  * thread that will run guest code. It does nothing if install failed. */

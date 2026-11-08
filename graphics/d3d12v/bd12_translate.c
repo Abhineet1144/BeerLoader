@@ -11,10 +11,33 @@
 
 /* Bridge: DXBC compute shader -> translated SPIR-V + reflection ->
  * BD12 compute pipeline with a record-time-resolved set-0 layout. */
+__thread uint32_t g_bd12_compute_root_push_bytes;   /* read by bd12_compute_pipeline_build */
+
+static BD12ComputePipeline *create_dxbc(BD12Device *device, const uint8_t *dxbc, size_t dxbc_size, uint64_t hash,
+                                        const BD12RootSignature *rs);
+
 BD12ComputePipeline *bd12_compute_pipeline_create_dxbc(
     BD12Device *device, const uint8_t *dxbc, size_t dxbc_size, uint64_t hash)
 {
-    const BeerD3D12TranslatedShader *shader =
+    return create_dxbc(device, dxbc, dxbc_size, hash, NULL);
+}
+
+BD12ComputePipeline *bd12_compute_pipeline_create_dxbc_rs(
+    BD12Device *device, const uint8_t *dxbc, size_t dxbc_size, uint64_t hash, BD12RootSignature *root_signature)
+{
+    if (root_signature && bd12_root_push_enabled(device) && bd12_root_layout(root_signature)) {
+        BD12ComputePipeline *pipeline = create_dxbc(device, dxbc, dxbc_size, hash, root_signature);
+        bd12_root_push_count(0, pipeline != NULL);
+        if (pipeline) return pipeline;   /* otherwise: per-dispatch descriptors */
+    }
+    return create_dxbc(device, dxbc, dxbc_size, hash, NULL);
+}
+
+static BD12ComputePipeline *create_dxbc(BD12Device *device, const uint8_t *dxbc, size_t dxbc_size, uint64_t hash,
+                                        const BD12RootSignature *rs)
+{
+    const BeerD3D12TranslatedShader *shader = rs ?
+        beer_d3d12_translate_shader_rs(dxbc, dxbc_size, hash, rs->root_layout) :
         beer_d3d12_translate_shader(dxbc, dxbc_size, hash);
     if (!shader) return NULL;
     BD12ShaderBinding bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
@@ -34,9 +57,20 @@ BD12ComputePipeline *bd12_compute_pipeline_create_dxbc(
             .is_ssbo = d->ssbo
         };
     }
-    BD12ComputePipeline *pipeline = bd12_compute_pipeline_create_bound(
-        device, (const uint32_t *)shader->spirv, shader->spirv_size, bindings,
-        shader->descriptor_count);
+    BD12ComputePipeline *pipeline;
+    if (rs && rs->root_layout->heap_model == BEER_HEAP_MODEL_MUTABLE) {
+        const BD12DbLayout *db_layout = bd12_db_layout(rs);
+        pipeline = db_layout ? bd12_compute_pipeline_build_db(device, (const uint32_t *)shader->spirv,
+                                                              shader->spirv_size, db_layout, rs->root_push_bytes,
+                                                              rs->root_layout->hash)
+                             : NULL;
+    } else {
+        g_bd12_compute_root_push_bytes = rs ? rs->root_push_bytes : 0;
+        pipeline = bd12_compute_pipeline_create_bound(device, (const uint32_t *)shader->spirv, shader->spirv_size,
+                                                      bindings, shader->descriptor_count);
+        g_bd12_compute_root_push_bytes = 0;
+        if (pipeline && rs) pipeline->root_layout_hash = rs->root_layout->hash;
+    }
     if (!pipeline) return NULL;
     pipeline->shader_hash = shader->shader_hash;
     const char *dump_dir = getenv("BEER_BD12_DUMP_SPIRV");

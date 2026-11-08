@@ -3,6 +3,7 @@
 
 #include "bd12_formats.h"
 #include "d3d12_shader_translator.h"
+#include "bd12_com.h"
 
 #include <pthread.h>
 #include <stddef.h>
@@ -119,6 +120,8 @@ void bd12_pso_parse_graphics(const uint8_t *desc, BD12PsoDesc *pso)
     for (int i = 0; i < 8; ++i) pso->rt_formats[i] = rd32(desc + 580 + i * 4);
     pso->ds_format = rd32(desc + 612);
     pso->samples = rd32(desc + 616) ? rd32(desc + 616) : 1;
+    memcpy(&pso->cached_pso, desc + 632, sizeof(void *));      /* after SampleDesc (616) and NodeMask (624) */
+    memcpy(&pso->cached_pso_size, desc + 640, sizeof(size_t));
 }
 
 void bd12_pso_parse_compute(const uint8_t *desc, BD12PsoDesc *pso)
@@ -126,6 +129,8 @@ void bd12_pso_parse_compute(const uint8_t *desc, BD12PsoDesc *pso)
     bd12_pso_defaults(pso);
     memcpy(&pso->root_signature, desc, sizeof(void *));
     shader_at(desc, 8, &pso->cs, &pso->cs_size);
+    memcpy(&pso->cached_pso, desc + 32, sizeof(void *));       /* after NodeMask (24) */
+    memcpy(&pso->cached_pso_size, desc + 40, sizeof(size_t));
 }
 
 void bd12_pso_parse_stream(const uint8_t *stream, size_t size, BD12PsoDesc *pso)
@@ -137,12 +142,16 @@ void bd12_pso_parse_stream(const uint8_t *stream, size_t size, BD12PsoDesc *pso)
         [8] = {4, 0},   [9] = {4, 4},   [10] = {4, 44}, [11] = {4, 52},
         [12] = {8, 16}, [13] = {4, 4},  [14] = {4, 4},  [15] = {4, 36},
         [16] = {4, 4},  [17] = {4, 8},  [18] = {4, 4},  [19] = {8, 16},
-        [20] = {4, 4},  [21] = {4, 56}, [22] = {8, 24}
+        [20] = {4, 4},  [21] = {4, 56}, [22] = {8, 24},
+        /* 23 is not a subobject type. 24 AS and 25 MS are shader bytecode; 26 DEPTH_STENCIL2, 27 RASTERIZER1 and
+         * 28 RASTERIZER2 are stepped over by size (their contents are not read yet). */
+        [24] = {8, 16}, [25] = {8, 16}, [26] = {4, 60}, [27] = {4, 44}, [28] = {4, 40}
     };
     size_t offset = 0;
     while (offset + 8 <= size) {
         const uint32_t type = rd32(stream + offset);
         if (type >= sizeof(layout) / sizeof(layout[0])) return;
+        if (!layout[type].align) return;               /* not a subobject type */
         const size_t align = layout[type].align;
         const size_t length = type == 8 ? 328 : layout[type].size;
         const size_t payload = (offset + 4 + align - 1) & ~(align - 1);
@@ -156,6 +165,8 @@ void bd12_pso_parse_stream(const uint8_t *stream, size_t size, BD12PsoDesc *pso)
         case 4: shader_at(d, 0, &pso->hs, &pso->hs_size); break;
         case 5: shader_at(d, 0, &pso->gs, &pso->gs_size); break;
         case 6: shader_at(d, 0, &pso->cs, &pso->cs_size); break;
+        case 24: shader_at(d, 0, &pso->as, &pso->as_size); break;   /* D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS */
+        case 25: shader_at(d, 0, &pso->ms, &pso->ms_size); break;   /* D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS */
         case 8: parse_blend(pso, d); break;
         case 9: pso->sample_mask = rd32(d); break;
         case 10: parse_rasterizer(pso, d); break;
@@ -172,6 +183,10 @@ void bd12_pso_parse_stream(const uint8_t *stream, size_t size, BD12PsoDesc *pso)
             break;
         case 16: pso->ds_format = rd32(d); break;
         case 17: pso->samples = rd32(d) ? rd32(d) : 1; break;
+        case 19:
+            memcpy(&pso->cached_pso, d, sizeof(void *));
+            memcpy(&pso->cached_pso_size, d + 8, sizeof(size_t));
+            break;
         default: break;
         }
         offset = (payload + length + 7) & ~(size_t)7;
@@ -386,26 +401,55 @@ static const BeerD3D12TranslatedShader *translate_stage(const char *name,
 }
 
 static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDesc *pso,
-                                             int no_extra_stages);
+                                             int no_extra_stages, const BD12RootSignature *rs);
+static void fixed_state(BD12GraphicsPipelineDesc *desc, const BD12PsoDesc *pso);
+static BD12GraphicsPipeline *create_mesh(BD12Device *device, const BD12PsoDesc *pso, const BD12RootSignature *rs);
+
+/* The root signature a pipeline description names, when root-signature translation applies to it. */
+static BD12RootSignature *root_push_signature(BD12Device *device, const BD12PsoDesc *pso)
+{
+    const ComRootSig *crs = pso->root_signature;
+    if (!crs || !crs->rs || !bd12_root_push_enabled(device)) return NULL;
+    return bd12_root_layout(crs->rs) ? crs->rs : NULL;
+}
 
 BD12GraphicsPipeline *bd12_pso_create_graphics(BD12Device *device,
                                                const BD12PsoDesc *pso)
 {
-    BD12GraphicsPipeline *pipeline = create_graphics(device, pso, 0);
+    BD12RootSignature *rs = root_push_signature(device, pso);
+    if (rs) {
+        BD12GraphicsPipeline *pipeline = create_graphics(device, pso, 0, rs);
+        bd12_root_push_count(1, pipeline != NULL);
+        if (pipeline) return pipeline;   /* otherwise: per-draw descriptors */
+    }
+    BD12GraphicsPipeline *pipeline = create_graphics(device, pso, 0, NULL);
     if (!pipeline && (pso->hs || pso->gs)) {
         fprintf(stderr, "[BD12] pipeline with hull/domain/geometry stages failed: retrying with VS/PS only\n");
-        pipeline = create_graphics(device, pso, 1);
+        pipeline = create_graphics(device, pso, 1, NULL);
     }
     return pipeline;
 }
 
+/* With `rs`, every stage must translate for its layout (no stage is dropped); NULL then means "use the per-draw
+ * path", not a failure. */
 static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDesc *pso,
-                                             int no_extra_stages)
+                                             int no_extra_stages, const BD12RootSignature *rs)
 {
+    if (pso->ms) return create_mesh(device, pso, rs);
     if (!pso->vs) return NULL;
-    const BeerD3D12TranslatedShader *vs =
-        beer_d3d12_translate_shader(pso->vs, pso->vs_size,
-                                    fnv(pso->vs, pso->vs_size));
+    const BeerD3D12RootLayout *layout = rs ? rs->root_layout : NULL;
+    if (layout) {
+        if (!beer_d3d12_translate_shader_rs(pso->vs, pso->vs_size, fnv(pso->vs, pso->vs_size), layout) ||
+            (pso->ps && !beer_d3d12_translate_shader_rs(pso->ps, pso->ps_size, fnv(pso->ps, pso->ps_size), layout)) ||
+            (pso->hs && !beer_d3d12_translate_shader_rs(pso->hs, pso->hs_size, fnv(pso->hs, pso->hs_size), layout)) ||
+            (pso->ds && !beer_d3d12_translate_shader_rs(pso->ds, pso->ds_size, fnv(pso->ds, pso->ds_size), layout)) ||
+            (pso->gs && !beer_d3d12_translate_shader_rs(pso->gs, pso->gs_size, fnv(pso->gs, pso->gs_size), layout)) ||
+            (!pso->hs != !pso->ds))
+            return NULL;
+    }
+#define TRANSLATE(code, size) (layout ? beer_d3d12_translate_shader_rs((code), (size), fnv((code), (size)), layout) \
+                                      : beer_d3d12_translate_shader((code), (size), fnv((code), (size))))
+    const BeerD3D12TranslatedShader *vs = TRANSLATE(pso->vs, pso->vs_size);
     if (!vs) {
         fprintf(stderr, "[BD12] VS translation failed: %s\n",
                 beer_d3d12_shader_translation_error());
@@ -413,8 +457,7 @@ static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDe
     }
     const BeerD3D12TranslatedShader *ps = NULL;
     if (pso->ps) {
-        ps = beer_d3d12_translate_shader(pso->ps, pso->ps_size,
-                                        fnv(pso->ps, pso->ps_size));
+        ps = TRANSLATE(pso->ps, pso->ps_size);
         if (!ps) {
             fprintf(stderr, "[BD12] PS translation failed: %s\n",
                     beer_d3d12_shader_translation_error());
@@ -438,11 +481,17 @@ static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDe
     /* Hull and domain shaders only work as a pair. A stage that does not translate is left out, so the draw
      * still renders untessellated / without its geometry shader as it did before BD12 had these stages. */
     const BeerD3D12TranslatedShader *hs = NULL, *ds = NULL, *gs = NULL;
-    if (pso->hs && pso->ds && !no_extra_stages &&
-        (!(hs = translate_stage("HS", pso->hs, pso->hs_size)) ||
-         !(ds = translate_stage("DS", pso->ds, pso->ds_size))))
-        hs = ds = NULL;
-    if (pso->gs && !no_extra_stages) gs = translate_stage("GS", pso->gs, pso->gs_size);
+    if (layout) {   /* all stages translated above */
+        if (pso->hs) { hs = TRANSLATE(pso->hs, pso->hs_size); ds = TRANSLATE(pso->ds, pso->ds_size); }
+        if (pso->gs) gs = TRANSLATE(pso->gs, pso->gs_size);
+    } else {
+        if (pso->hs && pso->ds && !no_extra_stages &&
+            (!(hs = translate_stage("HS", pso->hs, pso->hs_size)) ||
+             !(ds = translate_stage("DS", pso->ds, pso->ds_size))))
+            hs = ds = NULL;
+        if (pso->gs && !no_extra_stages) gs = translate_stage("GS", pso->gs, pso->gs_size);
+    }
+#undef TRANSLATE
     const int tessellated = hs != NULL;
 
     BD12ShaderBinding hs_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
@@ -452,6 +501,11 @@ static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDe
     BD12ShaderBinding ps_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
     BD12GraphicsPipelineDesc desc;
     memset(&desc, 0, sizeof(desc));
+    desc.root_push_bytes = layout ? rs->root_push_bytes : 0;
+    desc.root_layout_hash = layout ? layout->hash : 0;
+    if (layout && layout->heap_model == BEER_HEAP_MODEL_MUTABLE &&
+        !(desc.db_layout = bd12_db_layout(rs)))
+        return NULL;   /* no descriptor-buffer layout: per-draw descriptors */
     desc.vs = (BD12ShaderCode){ (const uint32_t *)vs->spirv, vs->spirv_size,
                                 vs_bindings, to_bindings(vs, vs_bindings) };
     if (ps)
@@ -512,32 +566,47 @@ static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDe
                     pso->topology_type == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
                     pso->topology_type == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST :
                     VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    desc.fill_mode = pso->fill_mode == 2 ? VK_POLYGON_MODE_LINE :
+    fixed_state(&desc, pso);
+    {
+        BD12GraphicsPipeline *created = bd12_graphics_pipeline_create(device, &desc);
+        if (created && getenv("BEER_BD12_PSO_LOG"))
+            fprintf(stderr, "[PSOSHADERS] %016llx vs=%016llx ps=%016llx\n",
+                    (unsigned long long)created->shader_hash,
+                    (unsigned long long)vs->shader_hash,
+                    (unsigned long long)(ps ? ps->shader_hash : 0));
+        return created;
+    }
+}
+
+/* Rasterizer, depth/stencil, blend and render-target state shared by vertex and mesh pipelines. */
+static void fixed_state(BD12GraphicsPipelineDesc *desc, const BD12PsoDesc *pso)
+{
+    desc->fill_mode = pso->fill_mode == 2 ? VK_POLYGON_MODE_LINE :
                                            VK_POLYGON_MODE_FILL;
-    desc.cull_mode = pso->cull_mode == 1 ? VK_CULL_MODE_NONE :
+    desc->cull_mode = pso->cull_mode == 1 ? VK_CULL_MODE_NONE :
                      pso->cull_mode == 2 ? VK_CULL_MODE_FRONT_BIT :
                                            VK_CULL_MODE_BACK_BIT;
-    desc.front_ccw = pso->front_ccw;
-    desc.depth_clip_enable = pso->depth_clip;
-    desc.depth_bias_enable = pso->depth_bias != 0 || pso->slope_bias != 0.0f;
-    desc.depth_bias = (float)pso->depth_bias;
-    desc.depth_bias_clamp = pso->depth_bias_clamp;
-    desc.slope_scaled_bias = pso->slope_bias;
-    desc.depth_test = pso->depth_enable;
-    desc.depth_write = pso->depth_enable && pso->depth_write_mask;
-    desc.depth_func = compare_op(pso->depth_func);
-    desc.stencil_test = pso->stencil_enable;
-    desc.stencil_front = stencil_state(&pso->stencil_front,
+    desc->front_ccw = pso->front_ccw;
+    desc->depth_clip_enable = pso->depth_clip;
+    desc->depth_bias_enable = pso->depth_bias != 0 || pso->slope_bias != 0.0f;
+    desc->depth_bias = (float)pso->depth_bias;
+    desc->depth_bias_clamp = pso->depth_bias_clamp;
+    desc->slope_scaled_bias = pso->slope_bias;
+    desc->depth_test = pso->depth_enable;
+    desc->depth_write = pso->depth_enable && pso->depth_write_mask;
+    desc->depth_func = compare_op(pso->depth_func);
+    desc->stencil_test = pso->stencil_enable;
+    desc->stencil_front = stencil_state(&pso->stencil_front,
                                        pso->stencil_read_mask,
                                        pso->stencil_write_mask);
-    desc.stencil_back = stencil_state(&pso->stencil_back,
+    desc->stencil_back = stencil_state(&pso->stencil_back,
                                       pso->stencil_read_mask,
                                       pso->stencil_write_mask);
-    desc.rt_count = pso->rt_count > 8 ? 8 : pso->rt_count;
-    for (uint32_t i = 0; i < desc.rt_count; ++i) {
-        desc.rt_formats[i] = bd12_dxgi_to_vk(pso->rt_formats[i]);
+    desc->rt_count = pso->rt_count > 8 ? 8 : pso->rt_count;
+    for (uint32_t i = 0; i < desc->rt_count; ++i) {
+        desc->rt_formats[i] = bd12_dxgi_to_vk(pso->rt_formats[i]);
         const BD12PsoBlend *b = &pso->blend[pso->independent_blend ? i : 0];
-        desc.blend[i] = (BD12BlendTarget){
+        desc->blend[i] = (BD12BlendTarget){
             .blend_enable = b->enable,
             .src_color = blend_factor(b->src),
             .dst_color = blend_factor(b->dst),
@@ -550,20 +619,57 @@ static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDe
             .logic_op = logic_op(b->logic_op)
         };
     }
-    desc.ds_format = bd12_dxgi_resource_to_vk(pso->ds_format, 1);
-    if (pso->ds_format == 0) desc.ds_format = VK_FORMAT_UNDEFINED;
-    desc.samples = pso->samples;
-    desc.alpha_to_coverage = pso->alpha_to_coverage;
-    desc.primitive_restart = pso->strip_cut != 0;
-    {
-        BD12GraphicsPipeline *created = bd12_graphics_pipeline_create(device, &desc);
-        if (created && getenv("BEER_BD12_PSO_LOG"))
-            fprintf(stderr, "[PSOSHADERS] %016llx vs=%016llx ps=%016llx\n",
-                    (unsigned long long)created->shader_hash,
-                    (unsigned long long)vs->shader_hash,
-                    (unsigned long long)(ps ? ps->shader_hash : 0));
-        return created;
+    desc->ds_format = bd12_dxgi_resource_to_vk(pso->ds_format, 1);
+    if (pso->ds_format == 0) desc->ds_format = VK_FORMAT_UNDEFINED;
+    desc->samples = pso->samples;
+    desc->alpha_to_coverage = pso->alpha_to_coverage;
+    desc->primitive_restart = pso->strip_cut != 0;
+}
+
+/* Mesh pipeline: an optional amplification shader, a mesh shader and the pixel shader; no input layout or topology.
+ * With a root-signature layout every stage must translate for it, as for vertex pipelines. */
+static BD12GraphicsPipeline *create_mesh(BD12Device *device, const BD12PsoDesc *pso, const BD12RootSignature *rs)
+{
+    if (!device->CmdDrawMeshTasksEXT) return NULL;
+    const BeerD3D12RootLayout *layout = rs ? rs->root_layout : NULL;
+#define TRANSLATE(code, size) (layout ? beer_d3d12_translate_shader_rs((code), (size), fnv((code), (size)), layout) \
+                                      : beer_d3d12_translate_shader((code), (size), fnv((code), (size))))
+    const BeerD3D12TranslatedShader *ms = TRANSLATE(pso->ms, pso->ms_size);
+    const BeerD3D12TranslatedShader *as = pso->as ? TRANSLATE(pso->as, pso->as_size) : NULL;
+    const BeerD3D12TranslatedShader *ps = pso->ps ? TRANSLATE(pso->ps, pso->ps_size) : NULL;
+#undef TRANSLATE
+    if (!ms || (pso->as && !as) || (pso->ps && !ps)) {
+        if (!layout)
+            fprintf(stderr, "[BD12] mesh pipeline: %s translation failed: %s\n",
+                    !ms ? "MS" : (pso->as && !as) ? "AS" : "PS", beer_d3d12_shader_translation_error());
+        return NULL;
     }
+    BD12ShaderBinding ms_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
+    BD12ShaderBinding as_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
+    BD12ShaderBinding ps_bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
+    BD12GraphicsPipelineDesc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.root_push_bytes = layout ? rs->root_push_bytes : 0;
+    desc.root_layout_hash = layout ? layout->hash : 0;
+    if (layout && layout->heap_model == BEER_HEAP_MODEL_MUTABLE && !(desc.db_layout = bd12_db_layout(rs)))
+        return NULL;
+    desc.ms = (BD12ShaderCode){ (const uint32_t *)ms->spirv, ms->spirv_size, ms_bindings, to_bindings(ms, ms_bindings) };
+    if (as)
+        desc.as = (BD12ShaderCode){ (const uint32_t *)as->spirv, as->spirv_size, as_bindings,
+                                    to_bindings(as, as_bindings) };
+    if (ps)
+        desc.ps = (BD12ShaderCode){ (const uint32_t *)ps->spirv, ps->spirv_size, ps_bindings,
+                                    to_bindings(ps, ps_bindings) };
+    desc.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   /* unused by mesh pipelines */
+    fixed_state(&desc, pso);
+    BD12GraphicsPipeline *created = bd12_graphics_pipeline_create(device, &desc);
+    if (!created && !layout) fprintf(stderr, "[BD12] mesh pipeline creation failed\n");
+    if (created) {
+        static uint32_t count;
+        const uint32_t n = __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED);
+        if (n == 1 || n % 100 == 0) fprintf(stderr, "[BD12] mesh pipelines created: %u (amplification %d)\n", n, as != NULL);
+    }
+    return created;
 }
 
 /* Clone ---------------------------------------------------------------------- */
@@ -637,9 +743,10 @@ int bd12_pso_clone(const BD12PsoDesc *src, BD12PsoDesc *dst)
     }
     uint8_t *blob = malloc(total ? total : 1);
     if (!blob) return 0;
-    const uint8_t **stages[6] = { &dst->vs, &dst->ps, &dst->cs, &dst->hs, &dst->ds, &dst->gs };
-    const size_t sizes[6] = { src->vs_size, src->ps_size, src->cs_size, src->hs_size, src->ds_size, src->gs_size };
-    for (int i = 0; i < 6; ++i) {
+    const uint8_t **stages[8] = { &dst->vs, &dst->ps, &dst->cs, &dst->hs, &dst->ds, &dst->gs, &dst->as, &dst->ms };
+    const size_t sizes[8] = { src->vs_size, src->ps_size, src->cs_size, src->hs_size, src->ds_size, src->gs_size,
+                              src->as_size, src->ms_size };
+    for (int i = 0; i < 8; ++i) {
         if (!sizes[i]) { *stages[i] = NULL; continue; }
         *stages[i] = shader_intern(*stages[i], sizes[i]);
         if (!*stages[i]) {
@@ -673,9 +780,10 @@ int bd12_pso_clone(const BD12PsoDesc *src, BD12PsoDesc *dst)
 void bd12_pso_release(BD12PsoDesc *pso)
 {
     if (pso->owned_blob) {
-        const uint8_t **stages[6] = { &pso->vs, &pso->ps, &pso->cs, &pso->hs, &pso->ds, &pso->gs };
-        for (int i = 0; i < 6; ++i) { shader_release(*stages[i]); *stages[i] = NULL; }
+        const uint8_t **stages[8] = { &pso->vs, &pso->ps, &pso->cs, &pso->hs, &pso->ds, &pso->gs, &pso->as, &pso->ms };
+        for (int i = 0; i < 8; ++i) { shader_release(*stages[i]); *stages[i] = NULL; }
         pso->vs_size = pso->ps_size = pso->cs_size = pso->hs_size = pso->ds_size = pso->gs_size = 0;
+        pso->as_size = pso->ms_size = 0;
     }
     free(pso->owned_blob);
     pso->owned_blob = NULL;

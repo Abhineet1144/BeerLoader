@@ -17,6 +17,271 @@ static u64 __attribute__((ms_abi)) impl_DuplicateTokenEx(u64 token, u32 access, 
     (void)access; (void)attributes; (void)level; (void)type;
     return impl_DuplicateToken(token, 0, out);
 }
+/* ConvertStringSecurityDescriptorToSecurityDescriptor(sddl, revision, &descriptor, &size): the SDDL parsed into a
+ * self-relative SECURITY_DESCRIPTOR (platform/win32_sddl.c) in LocalAlloc memory the caller frees with LocalFree.
+ * Beer does not enforce object security, but callers build named pipes, events and files from the result and read
+ * the descriptor back, so it must be real. Revision must be SDDL_REVISION_1. */
+static u64 sddl_convert(const void *sddl, int narrow, u32 revision, u64 *descriptor, u32 *size)
+{
+    if (descriptor) *descriptor = 0;
+    if (!sddl || !descriptor) { g_last_error = 87; return 0; }
+    if (revision != 1) { g_last_error = 1305; return 0; }                    /* ERROR_UNKNOWN_REVISION */
+    size_t needed = 0;
+    u32 rc = beer_sddl_to_descriptor(sddl, narrow, NULL, 0, &needed);
+    if (rc) { g_last_error = rc; return 0; }
+    u8 *out = (u8 *)(uintptr_t)impl_LocalAlloc(0x40, needed);               /* LPTR */
+    if (!out) { g_last_error = 8; return 0; }
+    rc = beer_sddl_to_descriptor(sddl, narrow, out, needed, &needed);
+    if (rc) { impl_LocalFree(out); g_last_error = rc; return 0; }
+    *descriptor = (u64)(uintptr_t)out;
+    if (size) *size = (u32)needed;
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi))
+impl_ConvertStringSecurityDescriptorToSecurityDescriptorW(const u16 *sddl, u32 revision, u64 *descriptor, u32 *size)
+    { return sddl_convert(sddl, 0, revision, descriptor, size); }
+static u64 __attribute__((ms_abi))
+impl_ConvertStringSecurityDescriptorToSecurityDescriptorA(const char *sddl, u32 revision, u64 *descriptor, u32 *size)
+    { return sddl_convert(sddl, 1, revision, descriptor, size); }
+
+/* ---- EXPLICIT_ACCESS / TRUSTEE -> security descriptor ----
+ * EXPLICIT_ACCESS (x64, 48 bytes): grfAccessPermissions 0, grfAccessMode 4, grfInheritance 8, TRUSTEE at 16.
+ * TRUSTEE (x64, 32 bytes): pMultipleTrustee 0, MultipleTrusteeOperation 8, TrusteeForm 12, TrusteeType 16,
+ * ptstrName 24 (a name string, or a SID pointer for TRUSTEE_IS_SID). The A and W forms differ only in the string
+ * type. The current user is Beer's single account, S-1-5-21-1000-1000-1000-1001 (its HKCU registry key). */
+#define BEER_USER_SID_TEXT "S-1-5-21-1000-1000-1000-1001"
+static void sid_to_text(const u8 *sid, char *out, size_t cap)
+{
+    u64 authority = 0;
+    for (int i = 0; i < 6; ++i) authority = (authority << 8) | sid[2 + i];
+    int n = snprintf(out, cap, "S-%u-%llu", sid[0], (unsigned long long)authority);
+    for (u8 i = 0; i < sid[1] && i < 15 && n > 0 && (size_t)n < cap; ++i) {
+        u32 sub;
+        memcpy(&sub, sid + 8 + 4u * i, 4);
+        n += snprintf(out + n, cap - (size_t)n, "-%u", sub);
+    }
+}
+/* The SDDL form of a trustee, or 0 (error code in *error). */
+static int trustee_sddl(const u8 *trustee, int wide, char *out, size_t cap, u32 *error)
+{
+    u32 form;
+    const void *name;
+    memcpy(&form, trustee + 12, 4);
+    memcpy(&name, trustee + 24, sizeof(name));
+    if (!name) { *error = 87; return 0; }
+    if (form == 0) {                                                     /* TRUSTEE_IS_SID */
+        sid_to_text(name, out, cap);
+        return 1;
+    }
+    if (form != 1) { *error = 87; return 0; }                            /* only TRUSTEE_IS_NAME besides SIDs */
+    char text[128];
+    size_t n = 0;
+    for (; n + 1 < sizeof(text); ++n) {
+        unsigned c = wide ? ((const u16 *)name)[n] : ((const unsigned char *)name)[n];
+        if (!c) break;
+        text[n] = (char)(c >= 'a' && c <= 'z' ? c - 32 : c);
+    }
+    text[n] = 0;
+    static const struct { const char *name; const char *sddl; } known[] = {
+        { "EVERYONE", "WD" }, { "CURRENT_USER", BEER_USER_SID_TEXT }, { "CREATOR OWNER", "CO" },
+        { "CREATOR GROUP", "CG" }, { "SYSTEM", "SY" }, { "NT AUTHORITY\\SYSTEM", "SY" },
+        { "AUTHENTICATED USERS", "AU" }, { "NT AUTHORITY\\AUTHENTICATED USERS", "AU" },
+        { "ADMINISTRATORS", "BA" }, { "BUILTIN\\ADMINISTRATORS", "BA" }, { "USERS", "BU" }, { "BUILTIN\\USERS", "BU" },
+        { "GUESTS", "BG" }, { "BUILTIN\\GUESTS", "BG" }, { "INTERACTIVE", "IU" }, { "NT AUTHORITY\\INTERACTIVE", "IU" },
+        { "PLAYER", BEER_USER_SID_TEXT },
+    };
+    for (size_t i = 0; i < sizeof(known) / sizeof(*known); ++i)
+        if (!strcmp(text, known[i].name)) { snprintf(out, cap, "%s", known[i].sddl); return 1; }
+    *error = 1332;                                                       /* ERROR_NONE_MAPPED */
+    return 0;
+}
+static void explicit_access_build(u8 *entry, const void *name, u32 permissions, u32 mode, u32 inheritance)
+{
+    if (!entry) return;
+    memset(entry, 0, 48);
+    memcpy(entry + 0, &permissions, 4);
+    memcpy(entry + 4, &mode, 4);
+    memcpy(entry + 8, &inheritance, 4);
+    const u32 form = 1;                                                  /* TRUSTEE_IS_NAME, TRUSTEE_IS_UNKNOWN */
+    memcpy(entry + 16 + 12, &form, 4);
+    memcpy(entry + 16 + 24, &name, sizeof(name));
+}
+static u64 __attribute__((ms_abi))
+impl_BuildExplicitAccessWithNameW(u8 *entry, const u16 *name, u32 permissions, u32 mode, u32 inheritance)
+    { explicit_access_build(entry, name, permissions, mode, inheritance); return 0; }
+static u64 __attribute__((ms_abi))
+impl_BuildExplicitAccessWithNameA(u8 *entry, const char *name, u32 permissions, u32 mode, u32 inheritance)
+    { explicit_access_build(entry, name, permissions, mode, inheritance); return 0; }
+
+/* Appends one ACE "(type;flags;0xmask;;;sid)" for an entry; returns 0 on success or an error code. */
+static u32 explicit_access_ace(const u8 *entry, int wide, int audit, int deny_pass, char *out, size_t cap, size_t *used)
+{
+    u32 permissions, mode, inheritance;
+    memcpy(&permissions, entry, 4);
+    memcpy(&mode, entry + 4, 4);
+    memcpy(&inheritance, entry + 8, 4);
+    const char *type;
+    char flags[24] = "";
+    if (audit) {
+        if (deny_pass) return 0;
+        if (mode != 5 && mode != 6) return 0;                            /* SET_AUDIT_SUCCESS / SET_AUDIT_FAILURE */
+        type = "AU";
+        strcat(flags, mode == 5 ? "SA" : "FA");
+    } else if (mode == 3) {                                              /* DENY_ACCESS */
+        if (!deny_pass) return 0;
+        type = "D";
+    } else if (mode == 1 || mode == 2) {                                 /* GRANT_ACCESS, SET_ACCESS */
+        if (deny_pass) return 0;
+        type = "A";
+    } else {
+        return 0;                                                        /* REVOKE_ACCESS, NOT_USED_ACCESS */
+    }
+    if (inheritance & 1) strcat(flags, "OI");
+    if (inheritance & 2) strcat(flags, "CI");
+    if (inheritance & 4) strcat(flags, "NP");
+    if (inheritance & 8) strcat(flags, "IO");
+    char sid[96];
+    u32 error = 0;
+    if (!trustee_sddl(entry + 16, wide, sid, sizeof(sid), &error)) return error;
+    const int n = snprintf(out + *used, cap - *used, "(%s;%s;0x%x;;;%s)", type, flags, permissions, sid);
+    if (n < 0 || (size_t)n >= cap - *used) return 87;
+    *used += (size_t)n;
+    return 0;
+}
+/* A security descriptor's owner, group, SACL or DACL (index 0..3), self-relative (offsets) or absolute (pointers). */
+static const u8 *sd_component(const u8 *sd, int index)
+{
+    u16 control;
+    memcpy(&control, sd + 2, 2);
+    if (control & 0x8000) {                                             /* SE_SELF_RELATIVE */
+        u32 offset;
+        memcpy(&offset, sd + 4 + 4 * index, 4);
+        return offset ? sd + offset : NULL;
+    }
+    const u8 *pointer;
+    memcpy(&pointer, sd + 8 + 8 * index, sizeof(pointer));
+    return pointer;
+}
+static int sid_equal(const u8 *a, const u8 *b) { return a[1] == b[1] && !memcmp(a, b, 8u + 4u * a[1]); }
+/* Appends the ACEs of acl as SDDL. kind: 0 deny ACEs, 1 the rest. ACEs whose SID equals one in `drop` are skipped. */
+static u32 acl_to_sddl(const u8 *acl, int kind, const u8 *const *drop, u32 drop_count, char *out, size_t cap,
+                       size_t *used)
+{
+    if (!acl) return 0;
+    u16 count;
+    memcpy(&count, acl + 4, 2);
+    const u8 *ace = acl + 8;
+    for (u16 i = 0; i < count; ++i) {
+        u16 size;
+        u32 mask;
+        memcpy(&size, ace + 2, 2);
+        memcpy(&mask, ace + 4, 4);
+        const u8 type = ace[0], flags = ace[1];
+        const u8 *sid = ace + 8;
+        const char *name = type == 0 ? "A" : type == 1 ? "D" : type == 2 ? "AU" : type == 3 ? "AL" :
+                           type == 0x11 ? "ML" : NULL;
+        if (!name || size < 8) return 87;                               /* object/callback ACEs not handled */
+        int skip = (type == 1) != (kind == 0);
+        for (u32 d = 0; d < drop_count && !skip; ++d) skip = sid_equal(sid, drop[d]);
+        if (!skip) {
+            char flag_text[24] = "", sid_text[96];
+            static const struct { u8 bit; const char *code; } bits[] = {
+                { 0x01, "OI" }, { 0x02, "CI" }, { 0x04, "NP" }, { 0x08, "IO" }, { 0x10, "ID" }, { 0x40, "SA" }, { 0x80, "FA" } };
+            for (size_t b = 0; b < sizeof(bits) / sizeof(*bits); ++b) if (flags & bits[b].bit) strcat(flag_text, bits[b].code);
+            sid_to_text(sid, sid_text, sizeof(sid_text));
+            const int n = snprintf(out + *used, cap - *used, "(%s;%s;0x%x;;;%s)", name, flag_text, mask, sid_text);
+            if (n < 0 || (size_t)n >= cap - *used) return 87;
+            *used += (size_t)n;
+        }
+        ace += size;
+    }
+    return 0;
+}
+
+/* BuildSecurityDescriptor(owner, group, access count, access entries, audit count, audit entries, old descriptor,
+ * &size, &descriptor) -> Win32 error code. Deny entries are placed before grants (canonical order). */
+static u32 build_security_descriptor(const u8 *owner, const u8 *group, u32 access_count, const u8 *access,
+                                     u32 audit_count, const u8 *audit, const void *old_descriptor, u32 *size,
+                                     u64 *descriptor, int wide)
+{
+    if (descriptor) *descriptor = 0;
+    if (!size || !descriptor || (access_count && !access) || (audit_count && !audit)) return 87;
+    /* Merging into old_descriptor: its owner/group stay unless replaced; its ACEs are kept except for trustees that
+     * a new SET_ACCESS or REVOKE_ACCESS entry names. Canonical order: new denies, old denies, new grants, old grants. */
+    const u8 *old_owner = old_descriptor ? sd_component(old_descriptor, 0) : NULL;
+    const u8 *old_group = old_descriptor ? sd_component(old_descriptor, 1) : NULL;
+    const u8 *old_sacl = old_descriptor ? sd_component(old_descriptor, 2) : NULL;
+    const u8 *old_dacl = old_descriptor ? sd_component(old_descriptor, 3) : NULL;
+    u16 old_control = 0;
+    if (old_descriptor) memcpy(&old_control, (const u8 *)old_descriptor + 2, 2);
+    char sddl[4096];
+    size_t used = 0;
+    u32 error = 0;
+    char sid[96];
+    if (owner) {
+        if (!trustee_sddl(owner, wide, sid, sizeof(sid), &error)) return error;
+        used += (size_t)snprintf(sddl + used, sizeof(sddl) - used, "O:%s", sid);
+    } else if (old_owner) {
+        sid_to_text(old_owner, sid, sizeof(sid));
+        used += (size_t)snprintf(sddl + used, sizeof(sddl) - used, "O:%s", sid);
+    }
+    if (group) {
+        if (!trustee_sddl(group, wide, sid, sizeof(sid), &error)) return error;
+        used += (size_t)snprintf(sddl + used, sizeof(sddl) - used, "G:%s", sid);
+    } else if (old_group) {
+        sid_to_text(old_group, sid, sizeof(sid));
+        used += (size_t)snprintf(sddl + used, sizeof(sddl) - used, "G:%s", sid);
+    }
+    /* Trustees whose old ACEs a SET_ACCESS/REVOKE_ACCESS replaces (only SID-form trustees can be compared). */
+    const u8 *drop[64];
+    u32 drop_count = 0;
+    for (u32 i = 0; i < access_count && drop_count < 64; ++i) {
+        u32 mode, form;
+        const u8 *entry = access + 48u * i;
+        memcpy(&mode, entry + 4, 4);
+        memcpy(&form, entry + 16 + 12, 4);
+        const u8 *trustee_sid;
+        memcpy(&trustee_sid, entry + 16 + 24, sizeof(trustee_sid));
+        if ((mode == 2 || mode == 4) && form == 0 && trustee_sid) drop[drop_count++] = trustee_sid;
+    }
+    const int old_dacl_present = old_descriptor && (old_control & 0x0004) && old_dacl;
+    if (access_count || old_dacl_present) {
+        used += (size_t)snprintf(sddl + used, sizeof(sddl) - used, "D:%s", (old_control & 0x1000) ? "P" : "");
+        for (u32 i = 0; i < access_count; ++i)
+            if ((error = explicit_access_ace(access + 48u * i, wide, 0, 1, sddl, sizeof(sddl), &used))) return error;
+        if ((error = acl_to_sddl(old_dacl, 0, drop, drop_count, sddl, sizeof(sddl), &used))) return error;
+        for (u32 i = 0; i < access_count; ++i)
+            if ((error = explicit_access_ace(access + 48u * i, wide, 0, 0, sddl, sizeof(sddl), &used))) return error;
+        if ((error = acl_to_sddl(old_dacl, 1, drop, drop_count, sddl, sizeof(sddl), &used))) return error;
+    }
+    if (audit_count || (old_descriptor && (old_control & 0x0010) && old_sacl)) {
+        used += (size_t)snprintf(sddl + used, sizeof(sddl) - used, "S:");
+        for (u32 i = 0; i < audit_count; ++i)
+            if ((error = explicit_access_ace(audit + 48u * i, wide, 1, 0, sddl, sizeof(sddl), &used))) return error;
+        if ((error = acl_to_sddl(old_sacl, 1, NULL, 0, sddl, sizeof(sddl), &used))) return error;
+    }
+    if (used >= sizeof(sddl)) return 87;
+    size_t needed = 0;
+    if ((error = beer_sddl_to_descriptor(sddl, 1, NULL, 0, &needed))) return error;
+    u8 *out = (u8 *)(uintptr_t)impl_LocalAlloc(0x40, needed);
+    if (!out) return 8;
+    if ((error = beer_sddl_to_descriptor(sddl, 1, out, needed, &needed))) { impl_LocalFree(out); return error; }
+    *descriptor = (u64)(uintptr_t)out;
+    *size = (u32)needed;
+    return 0;
+}
+static u64 __attribute__((ms_abi))
+impl_BuildSecurityDescriptorW(const u8 *owner, const u8 *group, u32 access_count, const u8 *access, u32 audit_count,
+                              const u8 *audit, const void *old_descriptor, u32 *size, u64 *descriptor)
+    { return build_security_descriptor(owner, group, access_count, access, audit_count, audit, old_descriptor,
+                                       size, descriptor, 1); }
+static u64 __attribute__((ms_abi))
+impl_BuildSecurityDescriptorA(const u8 *owner, const u8 *group, u32 access_count, const u8 *access, u32 audit_count,
+                              const u8 *audit, const void *old_descriptor, u32 *size, u64 *descriptor)
+    { return build_security_descriptor(owner, group, access_count, access, audit_count, audit, old_descriptor,
+                                       size, descriptor, 0); }
+
 /* A self-relative SECURITY_DESCRIPTOR with no owner/group/DACL (everybody allowed). */
 static u64 __attribute__((ms_abi)) impl_GetFileSecurityW(const u16 *path, u32 info, u8 *descriptor, u32 length, u32 *needed)
 {
@@ -77,13 +342,14 @@ static u64 __attribute__((ms_abi)) impl_CreatePipe(u64 *read_handle, u64 *write_
     u64 w = fh_alloc(fds[1], "<anonymous pipe>", "");
     if (r == INVALID_HANDLE_VALUE64 || w == INVALID_HANDLE_VALUE64) { close(fds[0]); close(fds[1]); return 0; }
     *read_handle = r; *write_handle = w;
+    inherit_from_sa(r, (u64)(uintptr_t)attributes);
+    inherit_from_sa(w, (u64)(uintptr_t)attributes);
     g_last_error = 0;
     return 1;
 }
 static u64 __attribute__((ms_abi)) impl_SetHandleInformation(u64 handle, u32 mask, u32 flags)
 {
-    (void)handle;
-    if ((mask & flags) & 1u) g_inheritable_handles = 1;    /* HANDLE_FLAG_INHERIT */
+    if (mask & 1u) handle_set_inheritable(handle, (flags & 1u) != 0);   /* HANDLE_FLAG_INHERIT */
     return 1;
 }
 

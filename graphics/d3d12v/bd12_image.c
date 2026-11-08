@@ -118,6 +118,12 @@ static VkImageUsageFlags image_usage_for(const BD12ImageDesc *desc)
     if (desc->allow_depth_stencil)
         usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if (desc->allow_uav) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    /* D3D12 needs no flag for a shading-rate image: any single-sampled 2D R8_UINT texture may be bound with
+     * RSSetShadingRateImage. Vulkan requires the usage at creation. */
+    const BeerVulkanModern *m = beer_vulkan_modern();
+    if (m && m->vrs_tier >= 2 && desc->format == VK_FORMAT_R8_UINT && desc->type == VK_IMAGE_TYPE_2D &&
+        desc->samples <= 1)
+        usage |= VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
     return usage;
 }
 
@@ -220,8 +226,9 @@ static BD12Image *image_create(BD12Device *device, BD12Heap *heap,
     }
     image->heap = heap;
     image->heap_offset = offset;
-    if (device->vk.BindImageMemory(device->device, image->image, heap->memory,
-                                   offset) != VK_SUCCESS)
+    if (((heap->base + offset) % requirements.alignment) ||
+        device->vk.BindImageMemory(device->device, image->image, heap->memory,
+                                   heap->base + offset) != VK_SUCCESS)
         goto fail;
     image->serial = bd12_live_serial();
     bd12_live_add(image);
@@ -255,6 +262,7 @@ void bd12_image_destroy(BD12Image *image)
     BD12Device *device = image->device;
     bd12_live_remove(image);
     bd12_mirror_forget_image(image);
+    bd12_db_forget_image(image);
     for (uint32_t i = 0; i < image->view_count; ++i)
         device->vk.DestroyImageView(device->device, image->views[i].view, NULL);
     free(image->views);
@@ -282,8 +290,16 @@ VkImageView bd12_image_view_swizzled(BD12Image *image, VkImageViewType type,
 {
     BD12Device *device = image->device;
     const uint32_t mips = image->desc.mip_levels;
-    const uint32_t layers = image->desc.type == VK_IMAGE_TYPE_3D ? 1 :
+    /* A 2D or 2D-array view of a 3D image (created 2D_ARRAY_COMPATIBLE, e.g. a render target on one W slice)
+     * addresses the depth slices of its single mip level as array layers. */
+    const int slices_as_layers = image->desc.type == VK_IMAGE_TYPE_3D &&
+        (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+    const uint32_t slice_count = (image->desc.depth_or_layers >> base_mip) ?
+                                 (image->desc.depth_or_layers >> base_mip) : 1;
+    const uint32_t layers = slices_as_layers ? slice_count :
+                            image->desc.type == VK_IMAGE_TYPE_3D ? 1 :
                             image->desc.depth_or_layers;
+    if (slices_as_layers) mip_count = 1;
     if (format == VK_FORMAT_UNDEFINED) format = image->desc.format;
     /* D3D12 depth SRVs use colour-typed formats (R32_FLOAT, R16_UNORM, ...);
      * Vulkan requires the image's own depth format with a depth aspect. A
@@ -366,7 +382,6 @@ static void image_barrier(BD12CmdList *list, BD12Image *image,
                           VkPipelineStageFlags2 dst_stage,
                           VkAccessFlags2 dst_access, VkImageLayout new_layout)
 {
-    bd12_cmd_end_rendering(list);
     VkImageMemoryBarrier2 barrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask = src_stage,
@@ -380,13 +395,7 @@ static void image_barrier(BD12CmdList *list, BD12Image *image,
         .image = image->image,
         .subresourceRange = *range
     };
-    VkDependencyInfo dependency = {
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &barrier
-    };
-    g_bd12_cmd_counts[BD12_COUNT_BARRIER]++;
-    list->device->vk.CmdPipelineBarrier2(list->command_buffer, &dependency);
+    bd12_cmd_add_image_barrier(list, &barrier);
 }
 
 static VkImageSubresourceRange whole_range(const BD12Image *image)
@@ -408,11 +417,15 @@ void bd12_image_ensure_initialized(BD12CmdList *list, BD12Image *image)
     VkPipelineStageFlags2 stage;
     VkAccessFlags2 access;
     bd12_state_sync(image->initial_state, 0, &stage, &access);
+    /* The first-use transition must come before any batched transition of this image: record it on its own. */
+    const int batching = list->barrier_batching;
+    if (batching) { bd12_cmd_barrier_flush(list); list->barrier_batching = 0; }
     const VkImageSubresourceRange range = whole_range(image);
     image_barrier(list, image, &range, VK_PIPELINE_STAGE_2_NONE, 0,
                   VK_IMAGE_LAYOUT_UNDEFINED, stage, access,
                   bd12_layout_for_state(image->initial_state,
                                         image_is_ds(image)));
+    list->barrier_batching = batching;
 }
 
 typedef struct {

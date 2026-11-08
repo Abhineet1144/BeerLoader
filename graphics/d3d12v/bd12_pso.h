@@ -19,6 +19,8 @@ typedef struct {
     void *root_signature;                       /* guest COM pointer */
     const uint8_t *vs, *ps, *cs, *hs, *ds, *gs;
     size_t vs_size, ps_size, cs_size, hs_size, ds_size, gs_size;
+    const uint8_t *as, *ms;                     /* amplification / mesh shaders (pipeline streams only) */
+    size_t as_size, ms_size;
     const uint8_t *input_elements;              /* D3D12_INPUT_ELEMENT_DESC[] */
     uint32_t input_count;
     uint32_t alpha_to_coverage, independent_blend;
@@ -34,6 +36,8 @@ typedef struct {
     uint32_t strip_cut, topology_type;
     uint32_t rt_count, rt_formats[8], ds_format;
     uint32_t samples;
+    const uint8_t *cached_pso;                  /* D3D12_CACHED_PIPELINE_STATE offered by the caller */
+    size_t cached_pso_size;
     void *owned_blob;                           /* set by bd12_pso_clone */
 } BD12PsoDesc;
 

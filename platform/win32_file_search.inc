@@ -677,12 +677,12 @@ static u64 __attribute__((ms_abi)) beer_LdrGetDllHandle(const void *path, u32 *f
 #define BEER_OWN_PROCESS_HANDLE 0x7FF0ull
 static u64 __attribute__((ms_abi)) beer_OpenProcess(u32 access, u32 inherit, u32 pid)
 {
-    (void)access; (void)inherit;
-    if (pid == (u32)impl_GetCurrentProcessId()) return BEER_OWN_PROCESS_HANDLE;
-    if (pid && kill((pid_t)pid, 0) == 0) {                  /* another live process (guest children included) */
+    (void)access;
+    /* A real handle, also for this process: it can be inherited by a child and names this process there. */
+    if (pid && (pid == (u32)impl_GetCurrentProcessId() || kill((pid_t)pid, 0) == 0)) {
         u64 handle = beer_proc_alloc((pid_t)pid, 0);
-        if (handle) return handle;
-        return 0;
+        if (handle && inherit) handle_set_inheritable(handle, 1);
+        return handle;
     }
     g_last_error = 87;                                      /* ERROR_INVALID_PARAMETER: no such process */
     return 0;
@@ -906,6 +906,17 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxW(u64 owner, const u16 *text, 
     beer_log_guest_stack("MSGBOX");
     int chosen = beer_message_box_dialog(t, c, type);
     return chosen >= 0 ? (u64)chosen : beer_message_box_result(type);
+}
+/* The Ex forms add a language for the button captions; Beer's dialog has one set of captions. */
+static u64 __attribute__((ms_abi)) beer_MessageBoxExA(u64 owner, const char *text, const char *title, u32 type, u16 language)
+{
+    (void)language;
+    return beer_MessageBoxA(owner, text, title, type);
+}
+static u64 __attribute__((ms_abi)) beer_MessageBoxExW(u64 owner, const u16 *text, const u16 *title, u32 type, u16 language)
+{
+    (void)language;
+    return beer_MessageBoxW(owner, text, title, type);
 }
 
 /* ---- NtQueryAttributesFile / NtQueryFullAttributesFile (existence probes of NT-level VFS layers) ---- */

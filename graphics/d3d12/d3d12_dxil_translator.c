@@ -38,6 +38,7 @@ static struct {
     dxil_spv_shader_stage (*parsed_blob_get_shader_stage_for_entry)(dxil_spv_parsed_blob, const char *);
     void (*converter_set_entry_point)(dxil_spv_converter, const char *);
     void (*converter_set_root_constant_word_count)(dxil_spv_converter, unsigned);
+    void (*converter_set_root_descriptor_count)(dxil_spv_converter, unsigned);
     void (*converter_set_srv_remapper)(dxil_spv_converter, dxil_spv_srv_remapper_cb, void *);
     void (*converter_set_sampler_remapper)(dxil_spv_converter, dxil_spv_sampler_remapper_cb, void *);
     void (*converter_set_uav_remapper)(dxil_spv_converter, dxil_spv_uav_remapper_cb, void *);
@@ -64,6 +65,7 @@ static int load_symbols(void)
     LOAD(parsed_blob_get_shader_stage_for_entry);
     LOAD(converter_set_entry_point);
     LOAD(converter_set_root_constant_word_count);
+    LOAD(converter_set_root_descriptor_count);
     LOAD(converter_set_srv_remapper);
     LOAD(converter_set_sampler_remapper);
     LOAD(converter_set_uav_remapper);
@@ -137,6 +139,7 @@ typedef struct {
     uint32_t words_per_stage;    /* push words available to this collection (RT pipelines share a wider block) */
     int accel_ok;                /* ray tracing acceleration structures are allowed */
     int ssbo;                    /* raw/structured buffers become storage buffers (second attempt) */
+    const BeerD3D12RootLayout *rl;   /* root-signature translation (beer_d3d12_dxil_translate_rs) */
 } Collect;
 
 #define PUSH_WORDS_PER_STAGE 4u
@@ -300,9 +303,112 @@ static void fill(Collect *c, uint32_t type, dxil_spv_vulkan_binding *out, const 
                 c->shader->descriptors[i].ssbo = 1;
 }
 
+/* ---- root-signature translation ----
+ * Each resource is looked up in the root signature: a table range becomes a heap-mirror access through the table's
+ * push word (set 1, mirror binding by class, static offset inside the table), a root CBV/SRV/UAV a buffer device
+ * address in the push block, root constants push-constant words, a static sampler a set-0 binding. Anything that
+ * does not fit fails the translation (the pipeline then uses the per-draw descriptor path). */
+static uint32_t stage_visibility(uint32_t stage)
+{
+    switch (stage) {
+    case 1: return 1;   /* vertex */
+    case 2: return 5;   /* pixel */
+    case 5: return 4;   /* geometry */
+    case 6: return 2;   /* hull */
+    case 7: return 3;   /* domain */
+    case 3: return 6;   /* amplification */
+    case 4: return 7;   /* mesh */
+    default: return 0;  /* compute: ALL only */
+    }
+}
+
+/* The root parameter supplying register `d` of descriptor class `type`; *range set for tables. */
+static const BeerD3D12RootParam *rs_find(const Collect *c, uint32_t type, const dxil_spv_d3d_binding *d,
+                                         const BeerD3D12RootRange **range)
+{
+    const BeerD3D12RootLayout *rl = c->rl;
+    const uint32_t vis = stage_visibility(c->stage);
+    *range = NULL;
+    for (uint32_t i = 0; i < rl->param_count; ++i) {
+        const BeerD3D12RootParam *p = &rl->params[i];
+        if (p->visibility != 0 && p->visibility != vis) continue;
+        if (p->type == BEER_ROOT_TABLE) {
+            for (uint32_t r = 0; r < p->range_count; ++r) {
+                const BeerD3D12RootRange *rr = &p->ranges[r];
+                if (rr->type != type || rr->space != d->register_space || d->register_index < rr->base_register)
+                    continue;
+                if (rr->count != UINT32_MAX && d->register_index - rr->base_register >= rr->count) continue;
+                *range = rr;
+                return p;
+            }
+            continue;
+        }
+        const uint32_t want = p->type == BEER_ROOT_CBV || p->type == BEER_ROOT_CONSTANTS ? BEER_D3D12_SHADER_DESCRIPTOR_CBV :
+                              p->type == BEER_ROOT_SRV ? BEER_D3D12_SHADER_DESCRIPTOR_SRV : BEER_D3D12_SHADER_DESCRIPTOR_UAV;
+        if (want == type && p->shader_register == d->register_index && p->space == d->register_space) return p;
+    }
+    return NULL;
+}
+
+/* A heap-mirror access: binding `heap_class` of set 1, index = push word `word` + `offset` (+ the shader's index). */
+static void rs_heap(const Collect *c, dxil_spv_vulkan_binding *out, uint32_t heap_class, uint32_t word,
+                    uint32_t offset, dxil_spv_vulkan_descriptor_type type)
+{
+    memset(out, 0, sizeof(*out));
+    if (c->rl->heap_model == BEER_HEAP_MODEL_MUTABLE) {
+        /* Every resource class aliases the one mutable array; samplers are their own heap. */
+        out->set = heap_class == HEAP_CLASS_SAMPLER ? 1 : 0;
+        out->binding = 0;
+    } else {
+        out->set = 1;
+        out->binding = heap_class;
+    }
+    out->root_constant_index = word;
+    out->bindless.use_heap = DXIL_SPV_TRUE;
+    out->bindless.heap_root_offset = offset;
+    out->descriptor_type = type;
+}
+
+static int untyped_buffer(const dxil_spv_d3d_binding *d)
+{
+    return d->kind == DXIL_SPV_RESOURCE_KIND_RAW_BUFFER || d->kind == DXIL_SPV_RESOURCE_KIND_STRUCTURED_BUFFER;
+}
+
+static int is_buffer_kind(const dxil_spv_d3d_binding *d)
+{
+    return untyped_buffer(d) || d->kind == DXIL_SPV_RESOURCE_KIND_TYPED_BUFFER;
+}
+
+/* SRV (uav = 0) or UAV (uav = 1) in root-signature mode. */
+static dxil_spv_bool rs_resource(Collect *c, const dxil_spv_d3d_binding *d, int uav, dxil_spv_vulkan_binding *out)
+{
+    if (d->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE) { c->failed = 1; return DXIL_SPV_FALSE; }
+    const uint32_t heap_class = (is_buffer_kind(d) ? 2u : 0u) + (uav ? 1u : 0u);
+    const dxil_spv_vulkan_descriptor_type type = untyped_buffer(d) ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER
+                                                                   : DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
+    if (is_heap_access(d)) { rs_heap(c, out, heap_class, c->rl->zero_word, 0, type); return DXIL_SPV_TRUE; }
+    const BeerD3D12RootRange *range;
+    const BeerD3D12RootParam *p = rs_find(c, uav ? BEER_D3D12_SHADER_DESCRIPTOR_UAV : BEER_D3D12_SHADER_DESCRIPTOR_SRV,
+                                          d, &range);
+    if (!p) { c->failed = 1; return DXIL_SPV_FALSE; }
+    if (p->type == BEER_ROOT_TABLE) {
+        rs_heap(c, out, heap_class, p->push_index, range->offset + (d->register_index - range->base_register), type);
+        return DXIL_SPV_TRUE;
+    }
+    if (!untyped_buffer(d)) { c->failed = 1; return DXIL_SPV_FALSE; }   /* root SRV/UAV: raw or structured only */
+    memset(out, 0, sizeof(*out));
+    out->root_constant_index = p->push_index;
+    out->descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_BUFFER_DEVICE_ADDRESS;
+    return DXIL_SPV_TRUE;
+}
+
 static dxil_spv_bool srv_cb(void *user, const dxil_spv_d3d_binding *d,
                             dxil_spv_srv_vulkan_binding *out)
 {
+    if (((Collect *)user)->rl) {
+        memset(out, 0, sizeof(*out));
+        return rs_resource(user, d, 0, &out->buffer_binding);
+    }
     Collect *c = user;
     memset(out, 0, sizeof(*out));
     if (d->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE) {
@@ -322,6 +428,29 @@ static dxil_spv_bool sampler_cb(void *user, const dxil_spv_d3d_binding *d,
                                 dxil_spv_vulkan_binding *out)
 {
     Collect *c = user;
+    if (c->rl) {
+        if (is_heap_access(d)) {
+            rs_heap(c, out, HEAP_CLASS_SAMPLER, c->rl->zero_word, 0, DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY);
+            return DXIL_SPV_TRUE;
+        }
+        for (uint32_t i = 0; i < c->rl->static_count; ++i)
+            if (c->rl->static_register[i] == d->register_index && c->rl->static_space[i] == d->register_space) {
+                if (c->rl->heap_model == BEER_HEAP_MODEL_MUTABLE) {   /* immutable sampler i of set 2 */
+                    memset(out, 0, sizeof(*out));
+                    out->set = 2;
+                    out->binding = i;
+                    return DXIL_SPV_TRUE;
+                }
+                fill(c, BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER, out, d);   /* static sampler: set 0 */
+                return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
+            }
+        const BeerD3D12RootRange *range;
+        const BeerD3D12RootParam *p = rs_find(c, BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER, d, &range);
+        if (!p || p->type != BEER_ROOT_TABLE) { c->failed = 1; return DXIL_SPV_FALSE; }
+        rs_heap(c, out, HEAP_CLASS_SAMPLER, p->push_index, range->offset + (d->register_index - range->base_register),
+                DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY);
+        return DXIL_SPV_TRUE;
+    }
     if (is_heap_access(d)) {
         assign_bindless_class(c, BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER, d, out, HEAP_CLASS_SAMPLER);
         return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
@@ -335,6 +464,10 @@ static dxil_spv_bool uav_cb(void *user, const dxil_spv_uav_d3d_binding *d,
 {
     Collect *c = user;
     memset(out, 0, sizeof(*out));
+    if (c->rl) {
+        if (d->has_counter) { c->failed = 1; return DXIL_SPV_FALSE; }   /* hidden counter buffers: per-draw path */
+        return rs_resource(c, &d->d3d_binding, 1, &out->buffer_binding);
+    }
     if (wants_bindless(&d->d3d_binding, BEER_D3D12_SHADER_DESCRIPTOR_UAV)) {
         assign_bindless(c, BEER_D3D12_SHADER_DESCRIPTOR_UAV, &d->d3d_binding,
                         &out->buffer_binding);
@@ -358,6 +491,27 @@ static dxil_spv_bool cbv_cb(void *user, const dxil_spv_d3d_binding *d,
     Collect *c = user;
     memset(out, 0, sizeof(*out));
     out->push_constant = DXIL_SPV_FALSE;
+    if (c->rl) {
+        if (is_heap_access(d)) {
+            rs_heap(c, &out->vulkan.uniform_binding, HEAP_CLASS_CBV, c->rl->zero_word, 0,
+                    DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_UBO);
+            return DXIL_SPV_TRUE;
+        }
+        const BeerD3D12RootRange *range;
+        const BeerD3D12RootParam *p = rs_find(c, BEER_D3D12_SHADER_DESCRIPTOR_CBV, d, &range);
+        if (!p) { c->failed = 1; return DXIL_SPV_FALSE; }
+        if (p->type == BEER_ROOT_CONSTANTS) {
+            out->push_constant = DXIL_SPV_TRUE;
+            out->vulkan.push_constant.offset_in_words = p->push_index;
+        } else if (p->type == BEER_ROOT_CBV) {
+            out->vulkan.uniform_binding.root_constant_index = p->push_index;
+            out->vulkan.uniform_binding.descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_BUFFER_DEVICE_ADDRESS;
+        } else {
+            rs_heap(c, &out->vulkan.uniform_binding, HEAP_CLASS_CBV, p->push_index,
+                    range->offset + (d->register_index - range->base_register), DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_UBO);
+        }
+        return DXIL_SPV_TRUE;
+    }
     if (is_heap_access(d)) {
         assign_bindless_class(c, BEER_D3D12_SHADER_DESCRIPTOR_CBV, d, &out->vulkan.uniform_binding, HEAP_CLASS_CBV);
         return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
@@ -385,6 +539,18 @@ static void add_bool_option(dxil_spv_converter c, dxil_spv_option type, int enab
     g.converter_add_option(c, &opt.base);
 }
 
+const char *beer_d3d12_dxil_library_path(void)
+{
+    static char path[PATH_MAX];
+    pthread_mutex_lock(&g_lock);
+    const int ok = load_library();
+    pthread_mutex_unlock(&g_lock);
+    Dl_info info;
+    if (!ok || !dladdr((void *)g.converter_run, &info) || !info.dli_fname) return NULL;
+    snprintf(path, sizeof(path), "%s", info.dli_fname);
+    return path;
+}
+
 int beer_d3d12_dxil_available(void)
 {
     pthread_mutex_lock(&g_lock);
@@ -393,15 +559,31 @@ int beer_d3d12_dxil_available(void)
     return ok;
 }
 
+static int dxil_translate(const uint8_t *container, size_t size, uint32_t stage_namespace,
+                          const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out);
+
 int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
                               uint32_t stage_namespace,
                               BeerD3D12TranslatedShader *out)
 {
+    return dxil_translate(container, size, stage_namespace, NULL, out);
+}
+
+int beer_d3d12_dxil_translate_rs(const uint8_t *container, size_t size, uint32_t stage_namespace,
+                                 const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out)
+{
+    return layout ? dxil_translate(container, size, stage_namespace, layout, out) : 0;
+}
+
+static int dxil_translate(const uint8_t *container, size_t size, uint32_t stage_namespace,
+                          const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out)
+{
+    /* The lock covers loading the library only. dxil-spirv converts concurrently (per-thread allocator contexts and
+     * log callbacks; parsed blobs and converters are per call), and pipeline warm-ups translate on many threads. */
     pthread_mutex_lock(&g_lock);
-    if (!load_library()) {
-        pthread_mutex_unlock(&g_lock);
-        return 0;
-    }
+    const int loaded = load_library();
+    pthread_mutex_unlock(&g_lock);
+    if (!loaded) return 0;
     int ok = 0;
     g.begin_thread_allocator_context();
     g.set_thread_log_callback(log_cb, NULL);
@@ -409,7 +591,10 @@ int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
     dxil_spv_converter converter = NULL;
     /* accel_ok: inline ray queries (DXR 1.1) in ordinary compute/pixel shaders bind an acceleration structure SRV too;
      * refusing it dropped RE8's ray-traced shadow/AO passes, which left the lighting black. */
-    Collect collect = { out, stage_namespace, 0, 0, 0, PUSH_WORDS_PER_STAGE, 1, 0 };
+    Collect collect = { out, stage_namespace, 0, 0, 0, PUSH_WORDS_PER_STAGE, 1, 0, layout };
+    /* Diagnostic BEER_DXIL_FORCE_SSBO=1: raw/structured buffers as storage buffers from the start (the retry mode
+     * below), as vkd3d-proton translates them on NVIDIA; isolates texel-buffer view problems. */
+    if (!layout && getenv("BEER_DXIL_FORCE_SSBO")) collect.ssbo = 1;
     if (g.parse_dxil_blob(container, size, &blob) != DXIL_SPV_SUCCESS) {
         fprintf(stderr, "[DXIL] failed to parse DXIL blob\n");
         goto done;
@@ -421,14 +606,24 @@ int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
         case DXIL_SPV_STAGE_GEOMETRY: collect.stage = 5; break;
         case DXIL_SPV_STAGE_HULL: collect.stage = 6; break;
         case DXIL_SPV_STAGE_DOMAIN: collect.stage = 7; break;
+        case DXIL_SPV_STAGE_AMPLIFICATION: collect.stage = 3; break;
+        case DXIL_SPV_STAGE_MESH: collect.stage = 4; break;
         default: collect.stage = 0; break;
         }
     }
 retry:
     if (g.create_converter(blob, &converter) != DXIL_SPV_SUCCESS) goto done;
-    /* Push block covering this stage's word window. */
-    g.converter_set_root_constant_word_count(converter,
-        (collect.stage + 1) * collect.words_per_stage);
+    if (layout) {
+        /* Root-signature translation: the push block holds the root arguments (BeerD3D12RootLayout). */
+        g.converter_set_root_descriptor_count(converter, layout->descriptor_count);
+        g.converter_set_root_constant_word_count(converter, layout->word_count);
+        dxil_spv_option_physical_storage_buffer bda = { { DXIL_SPV_OPTION_PHYSICAL_STORAGE_BUFFER }, DXIL_SPV_TRUE };
+        g.converter_add_option(converter, &bda.base);
+    } else {
+        /* Push block covering this stage's word window. */
+        g.converter_set_root_constant_word_count(converter,
+            (collect.stage + 1) * collect.words_per_stage);
+    }
     g.converter_set_srv_remapper(converter, srv_cb, &collect);
     g.converter_set_sampler_remapper(converter, sampler_cb, &collect);
     g.converter_set_uav_remapper(converter, uav_cb, &collect);
@@ -442,7 +637,7 @@ retry:
         g.converter_add_option(converter, &align.base);
     }
     if (g.converter_run(converter) != DXIL_SPV_SUCCESS || collect.failed) {
-        if (!collect.failed && !collect.ssbo) {
+        if (!collect.failed && !collect.ssbo && !layout) {
             /* Texel buffers cannot express everything raw/structured buffers allow (64-bit raw loads and stores):
              * translate again with those buffers as storage buffers. */
             g.converter_free(converter);
@@ -453,8 +648,9 @@ retry:
             fprintf(stderr, "[DXIL] retrying with raw/structured buffers as storage buffers\n");
             goto retry;
         }
-        fprintf(stderr, "[DXIL] conversion failed%s\n",
-                collect.failed ? " (unsupported resource)" : "");
+        if (!layout || getenv("BEER_DXIL_VERBOSE"))
+            fprintf(stderr, "[DXIL] conversion failed%s%s\n", collect.failed ? " (unsupported resource)" : "",
+                    layout ? " for root-signature translation (per-draw descriptors instead)" : "");
         goto done;
     }
     dxil_spv_compiled_spirv spirv = { 0 };
@@ -466,11 +662,24 @@ retry:
     memcpy(out->spirv, spirv.data, spirv.size);
     out->spirv_size = spirv.size;
     ok = 1;
+    if (getenv("BEER_DXR_PROBE")) {          /* diagnostic: shaders using inline ray queries (OpCapability RayQueryKHR) */
+        const uint32_t *w = (const uint32_t *)out->spirv;
+        for (size_t i = 5; i + 1 < spirv.size / 4; ) {
+            const uint32_t count = w[i] >> 16, op = w[i] & 0xffff;
+            if (!count) break;
+            if (op == 17 && w[i + 1] == 4472) {
+                static unsigned n;
+                if (++n <= 5 || !(n % 50)) fprintf(stderr, "[BD12 RT] ray-query shader #%u (stage %u)\n", n, collect.stage);
+                break;
+            }
+            if (op == 14) break;              /* OpMemoryModel: capabilities are over */
+            i += count;
+        }
+    }
 done:
     if (converter) g.converter_free(converter);
     if (blob) g.parsed_blob_free(blob);
     g.end_thread_allocator_context();
-    pthread_mutex_unlock(&g_lock);
     if (!ok) out->descriptor_count = 0;
     return ok;
 }
@@ -489,7 +698,7 @@ int beer_d3d12_dxil_translate_library(const uint8_t *container, size_t size, Bee
     g.begin_thread_allocator_context();
     g.set_thread_log_callback(log_cb, NULL);
     dxil_spv_parsed_blob blob = NULL;
-    Collect collect = { shared, 0, 0, 0, 0, RT_PUSH_WORDS, 1, 0 };
+    Collect collect = { shared, 0, 0, 0, 0, RT_PUSH_WORDS, 1, 0, NULL };
     unsigned entries = 0;
     if (g.parse_dxil_blob(container, size, &blob) != DXIL_SPV_SUCCESS ||
         g.parsed_blob_get_num_entry_points(blob, &entries) != DXIL_SPV_SUCCESS) {

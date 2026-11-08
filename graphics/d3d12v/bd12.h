@@ -17,6 +17,7 @@
  * on top in a later milestone. */
 
 #include "vulkan_context.h"
+#include "d3d12_shader_translator.h"
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -42,6 +43,7 @@ enum {
     BD12_STATE_RESOLVE_SOURCE = 0x2000,
     BD12_STATE_DEPTH_READ_STENCIL_WRITE = 0x4000,   /* BD11: read-only depth (sampleable) with a writable stencil */
     BD12_STATE_GENERIC_READ = 0xac3,
+    BD12_STATE_SHADING_RATE_SOURCE = 0x1000000,     /* VRS image read by the rasterizer */
     BD12_STATE_PRESENT = 0
 };
 
@@ -75,6 +77,12 @@ struct BD12Device {
     uint32_t pipeline_cache_new;         /* pipelines built since the last save */
     uint64_t pipeline_cache_saved_ms;
     const BeerVulkanModern *modern;
+    /* D3D12 variable-rate shading (modern->vrs_tier > 0): vkCmdSetFragmentShadingRateKHR. */
+    PFN_vkCmdSetFragmentShadingRateKHR CmdSetFragmentShadingRateKHR;
+    /* D3D12 mesh shaders (modern->mesh_shader_tier > 0): VK_EXT_mesh_shader draws. */
+    PFN_vkCmdDrawMeshTasksEXT CmdDrawMeshTasksEXT;
+    PFN_vkCmdDrawMeshTasksIndirectEXT CmdDrawMeshTasksIndirectEXT;
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT CmdDrawMeshTasksIndirectCountEXT;
     VkPhysicalDeviceMemoryProperties memory;
     char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     uint32_t buffer_memory_bits;
@@ -87,6 +95,7 @@ struct BD12Device {
     VkDeviceSize min_uniform_texel_alignment;
     VkDeviceSize min_storage_texel_alignment;
     VkDeviceSize min_storage_buffer_alignment;
+    uint32_t max_push_constants;  /* VkPhysicalDeviceLimits::maxPushConstantsSize */
     int uniform_texel_single_alignment;
     int storage_texel_single_alignment;
 
@@ -114,6 +123,8 @@ struct BD12Device {
     VkCommandBuffer zero_inflight[16];
     uint64_t zero_inflight_value[16];
     uint32_t zero_inflight_count;
+    struct BD12DescriptorBuffers *db; /* descriptor heaps as descriptor buffers (bd12_heapdb.c); NULL = unavailable */
+    struct BD12MemPool *mem_pools;    /* sub-allocation blocks per BD12HeapType (bd12_device.c) */
     int rt_enabled;               /* acceleration structures usable */
     uint32_t rt_handle_size, rt_base_alignment, rt_handle_alignment, rt_max_recursion, rt_max_stride;
     struct {
@@ -125,12 +136,14 @@ struct BD12Device {
 
 typedef struct {
     BD12Device *device;
-    VkDeviceMemory memory;
+    VkDeviceMemory memory;        /* bind at `base` + the resource's heap offset */
     VkDeviceSize size;
     BD12HeapType type;
-    void *mapped;                 /* persistent mapping for UPLOAD/READBACK */
+    void *mapped;                 /* persistent mapping for UPLOAD/READBACK (already at `base`) */
     VkBuffer zero_buffer;         /* DEFAULT heap zero-fill, freed with heap */
     uint64_t zero_value;          /* device zero-fill timeline value that covers this heap (0 = none) */
+    struct BD12MemBlock *block;   /* sub-allocated from this block (bd12_heap_create), else dedicated memory */
+    VkDeviceSize base;            /* offset of the heap in `memory` */
 } BD12Heap;
 
 /* Cached typed views over a buffer range (texel-buffer SRV/UAV descriptors).
@@ -229,6 +242,7 @@ typedef struct {
 typedef struct {
     BD12Device *device;
     VkQueue queue;
+    uint32_t index;               /* queue index in the shared family (beer_vulkan_queue_at); 0 = main queue */
     uint64_t submit_count;        /* vkQueueSubmit2 calls, for diagnostics */
 } BD12Queue;
 
@@ -255,7 +269,8 @@ typedef enum {
 } BD12DescriptorKind;
 
 /* One D3D12 descriptor. The heap is plain host memory: descriptors are
- * resolved into Vulkan descriptor sets at record time. */
+ * resolved into Vulkan descriptor sets at record time, or (descriptor
+ * buffers, bd12_heapdb.c) also encoded into the heap's payload on write. */
 typedef struct {
     uint32_t kind;
     VkBuffer buffer;              /* CBV */
@@ -286,7 +301,34 @@ typedef struct {
     uint64_t gpu_base;            /* fake GPU handle range, unique per heap */
     struct BD12HeapMirror *mirror;/* Vulkan mirror for bindless access, lazily */
     uint32_t sampler_gen;         /* sampler heaps: bumped on every descriptor write/copy */
+    uint32_t flags;               /* BD12_HEAP_FLAG_* */
+    void *region;                 /* mapping holding `descriptors` (bd12_heapdb.c) */
+    size_t region_bytes;
+    /* Vulkan descriptor bytes, one `payload_stride` record per descriptor (NULL without descriptor buffers).
+     * Shader-visible heaps point into their mapped descriptor buffer, so a descriptor write is the GPU write. */
+    uint8_t *payload;
+    uint32_t payload_stride;
+    VkBuffer db_buffer;
+    VkDeviceMemory db_memory;
+    VkDeviceAddress db_address;
+    /* Per-draw descriptor resolving (bd12_resolve_descriptor_set) has read this heap: from then on every write
+     * advances write_epoch, which its set cache checks. Heaps it never reads (CPU-only heaps, heaps only read
+     * through descriptor buffers) cost writers nothing. */
+    uint32_t legacy_reads;
+    uint64_t write_epoch;
 } BD12DescriptorHeap;
+
+/* A write to `heap`'s descriptors. A plain load and store, not an atomic add: concurrent writers may advance the
+ * epoch only once, which still marks the change, and descriptor writes on many threads do not serialize on it. */
+static inline void bd12_heap_note_write(BD12DescriptorHeap *heap)
+{
+    if (__atomic_load_n(&heap->legacy_reads, __ATOMIC_RELAXED))
+        __atomic_store_n(&heap->write_epoch, __atomic_load_n(&heap->write_epoch, __ATOMIC_RELAXED) + 1,
+                         __ATOMIC_RELEASE);
+}
+
+#define BD12_HEAP_FLAG_SHADER_VISIBLE 1u
+#define BD12_HEAP_FLAG_NO_PAYLOAD 2u   /* RTV/DSV heaps: never read by shaders */
 
 typedef enum {
     BD12_ROOT_TABLE = 0,
@@ -329,6 +371,12 @@ typedef struct {
     BD12StaticSampler *statics;
     uint32_t static_count;
     uint32_t serial;              /* unique per root signature (binding candidate caches key on it) */
+    /* Root-argument push layout (bd12_root_layout), built on first use; root_layout_state 1 = built, -1 = none. */
+    BeerD3D12RootLayout *root_layout;
+    BeerD3D12RootRange *root_ranges;
+    int root_layout_state;
+    uint32_t root_push_bytes;
+    const struct BD12DbLayout *db_layout;   /* descriptor-buffer pipeline layout (bd12_db_layout), lazily */
 } BD12RootSignature;
 
 /* A shader descriptor declaration with its Vulkan binding in set 0; this is
@@ -350,7 +398,7 @@ typedef struct {
     /* Root parameters that can satisfy this binding, found once per root signature (resolve_one). */
     uint32_t cand_serial;         /* root signature serial the list below was built for (0 = none) */
     uint32_t cand_count;          /* 0xff = too many, scan every parameter */
-    uint8_t cand[12];
+    uint8_t cand[32];
 } BD12ShaderBinding;
 
 /* The translator numbers bindings stage*0x10000 + class*0x2000 + register, up
@@ -379,6 +427,9 @@ typedef struct {
     uint32_t loop_count;
     uint32_t control_barrier_count;
     int writes_3d_storage_image;
+    uint32_t root_push_bytes;         /* nonzero: root arguments as push constants (bd12_rootpush.c) */
+    uint64_t root_layout_hash;        /* root-signature layout the shader was translated for */
+    const struct BD12DbLayout *db_layout; /* descriptor-buffer pipeline (layout owned by the device) */
 } BD12ComputePipeline;
 
 typedef struct {
@@ -397,6 +448,10 @@ typedef struct {
 
 /* Every write into a descriptor (view creation, copies): resolved descriptor sets built before it may be stale. */
 extern uint64_t g_bd12_descriptor_epoch;
+/* BEER_BD12_PROF: root-argument changes that actually change a value, [graphics, compute] x [constants, address,
+ * table]. */
+extern uint64_t g_bd12_root_changes[2][3];
+#define BD12_ROOT_CHANGED(compute, kind) __atomic_add_fetch(&g_bd12_root_changes[compute][kind], 1, __ATOMIC_RELAXED)
 #define BD12_DESCRIPTORS_WRITTEN() __atomic_add_fetch(&g_bd12_descriptor_epoch, 1, __ATOMIC_RELAXED)
 
 /* Per-list cache of resolved set-0 descriptor sets (bd12_resolve_descriptor_set). */
@@ -408,6 +463,12 @@ typedef struct {
     uint64_t state_epoch, descriptor_epoch;
     const void *heaps[2];
     VkDescriptorSet set;
+    /* The root parameters the bindings can read (their candidate lists) and the values they had: the set stays
+     * valid while those are unchanged, whatever else the bind state did. nrel == 0xff: compare state_epoch. */
+    const void *root_signature;
+    uint8_t nrel;
+    uint8_t rel[16];
+    uint64_t rel_value[16], rel_extra[16];
 } BD12ResolveCacheEntry;
 
 /* Per-allocator record-time storage: descriptor pools and constant scratch.
@@ -451,6 +512,7 @@ typedef struct {
 typedef struct {
     BD12ShaderCode vs, ps;        /* ps.spirv may be NULL (depth-only) */
     BD12ShaderCode hs, ds, gs;    /* optional; hs and ds come together */
+    BD12ShaderCode as, ms;        /* mesh pipeline: ms (and optional as) replace vs/hs/ds/gs and vertex input */
     uint32_t patch_control_points; /* tessellation input patch size */
     const BD12VertexAttribute *attributes;
     uint32_t attribute_count;
@@ -472,6 +534,9 @@ typedef struct {
     uint32_t samples;
     int alpha_to_coverage;
     int primitive_restart;        /* strip topologies only */
+    uint32_t root_push_bytes;     /* nonzero: shaders translated for the root signature (bd12_rootpush.c) */
+    uint64_t root_layout_hash;
+    const struct BD12DbLayout *db_layout; /* descriptor-buffer pipeline: use this layout, no set 0 */
 } BD12GraphicsPipelineDesc;
 
 typedef struct {
@@ -488,6 +553,10 @@ typedef struct {
     uint64_t shader_hash;         /* combined SPIR-V hash for diagnostics */
     VkShaderStageFlags stages;    /* every stage the pipeline carries */
     int tessellated;              /* draws must use a patch list */
+    int mesh;                     /* mesh/amplification pipeline: DispatchMesh only, no vertex input */
+    uint32_t root_push_bytes;     /* nonzero: root arguments as push constants (bd12_rootpush.c) */
+    uint64_t root_layout_hash;
+    const struct BD12DbLayout *db_layout; /* descriptor-buffer pipeline (layout owned by the device) */
 } BD12GraphicsPipeline;
 
 #define BD12_MAX_VERTEX_BUFFERS 16
@@ -510,7 +579,8 @@ enum {
     BD12_DIRTY_BLEND = 1u << 5,
     BD12_DIRTY_STENCIL = 1u << 6,
     BD12_DIRTY_PIPELINE = 1u << 7,
-    BD12_DIRTY_ALL = 0xffu
+    BD12_DIRTY_SHADING_RATE = 1u << 8,
+    BD12_DIRTY_ALL = 0x1ffu
 };
 
 typedef struct {
@@ -534,6 +604,11 @@ typedef struct {
     VkDescriptorSet bound_set;    /* set 0 last bound; valid while the pipeline is not dirty */
     float blend_constants[4];
     uint32_t stencil_ref;
+    /* RSSetShadingRate / RSSetShadingRateImage (zero = 1x1, passthrough, no image). */
+    uint32_t shading_rate;        /* D3D12_SHADING_RATE: (log2 width << 2) | log2 height */
+    uint32_t shading_combiners[2];/* D3D12_SHADING_RATE_COMBINER for per-primitive and image rates */
+    struct BD12Image *shading_rate_image;
+    VkImageView shading_rate_view;
     uint32_t dirty;
     BD12Descriptor cap_rtv[BD12_MAX_RENDER_TARGETS]; /* render-target dump (diagnostic) */
     uint32_t cap_rtv_count;
@@ -591,6 +666,19 @@ typedef struct BD12CmdList {
 
     int recording;
     BD12ResolveCacheEntry resolve_cache[2][BD12_RESOLVE_CACHE];   /* [graphics, compute] */
+    /* Root arguments last pushed per bind point (bd12_cmd_push_root_arguments), [graphics, compute]. */
+    uint64_t root_push_key[2];    /* 0 = nothing valid; else the push-constant compatibility class pushed */
+    uint32_t root_push_size[2];
+    uint8_t root_push_last[2][256];
+    /* Descriptor-buffer binding state (bd12_heapdb.c), [graphics, compute] where indexed. */
+    const BD12DescriptorHeap *db_heaps[2];  /* heaps whose buffers are bound; NULL = none bound */
+    uint8_t db_offsets_valid[2];
+    const struct BD12DbLayout *db_static[2]; /* layout whose immutable samplers (set 2) are bound */
+    /* Barrier batching (bd12_cmd_barrier_batch_begin): one ResourceBarrier call becomes one vkCmdPipelineBarrier2. */
+    int barrier_batching;
+    uint32_t batch_image_count;
+    VkImageMemoryBarrier2 batch_images[32];
+    VkMemoryBarrier2 batch_memory;            /* buffer and UAV barriers merged; srcStageMask 0 = none */
     uint32_t resolve_cache_next[2];
     /* Optional descriptor-set resolver (BD11): when set, draws and dispatches ask it for the
      * set-0 descriptor set instead of resolving against a root signature. */
@@ -646,6 +734,8 @@ int bd12_fence_claim(BD12Fence *fence, uint64_t value);
 int bd12_fence_wait(BD12Fence *fence, uint64_t value, uint64_t timeout_ns);
 
 BD12Queue *bd12_queue_create(BD12Device *device);
+/* A queue on Vulkan queue `index` of the shared family (falls back to the main queue past the count). */
+BD12Queue *bd12_queue_create_at(BD12Device *device, uint32_t index);
 void bd12_queue_destroy(BD12Queue *queue);
 /* One vkQueueSubmit2 carrying every command buffer, wait and signal. */
 VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
@@ -741,6 +831,25 @@ BD12ComputePipeline *bd12_compute_pipeline_create_bound(
 /* Same, from DXBC through the shared vkd3d-shader translator (bd12_translate.c). */
 BD12ComputePipeline *bd12_compute_pipeline_create_dxbc(
     BD12Device *device, const uint8_t *dxbc, size_t dxbc_size, uint64_t hash);
+/* The same for `root_signature` (may be NULL): with BEER_BD12_ROOT_PUSH a DXIL shader is translated for its root
+ * signature (root arguments as push constants, tables through the heap mirror), else as above. */
+BD12ComputePipeline *bd12_compute_pipeline_create_dxbc_rs(
+    BD12Device *device, const uint8_t *dxbc, size_t dxbc_size, uint64_t hash, BD12RootSignature *root_signature);
+
+/* Root arguments as push constants (bd12_rootpush.c) ------------------------------------------------------- */
+/* Nonzero when BEER_BD12_ROOT_PUSH is on and the device supports it. */
+int bd12_root_push_enabled(BD12Device *device);
+void bd12_root_push_count(int graphics, int used);
+/* The signature's push layout, or NULL when it does not fit the device's push-constant space. */
+const BeerD3D12RootLayout *bd12_root_layout(BD12RootSignature *signature);
+/* Binds the heaps (descriptor buffers when `db_layout` is set, else the mirror as set 1) and pushes the root
+ * arguments of `state` when they changed since the last push on this bind point. 0 when the bound root signature
+ * is not the layout the pipeline was translated for (`layout_hash`) or the heap is unavailable. */
+int bd12_cmd_push_root_arguments(BD12CmdList *list, BD12BindState *state, VkPipelineBindPoint point,
+                                 VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t push_bytes,
+                                 uint64_t layout_hash, const struct BD12DbLayout *db_layout);
+/* Binds the heap mirror set (set 1) with the sampler heap the list has bound. */
+int bd12_mirror_bind(BD12CmdList *list, VkPipelineBindPoint point, VkPipelineLayout layout);
 void bd12_compute_pipeline_destroy(BD12ComputePipeline *pipeline);
 void bd12_cmd_dispatch(BD12CmdList *list, BD12ComputePipeline *pipeline,
                        const void *push, uint32_t x, uint32_t y, uint32_t z);
@@ -771,8 +880,20 @@ int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
 BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     BD12Device *device, const BD12GraphicsPipelineDesc *desc);
 void bd12_graphics_pipeline_destroy(BD12GraphicsPipeline *pipeline);
+/* Shared layouts (bd12_graphics.c): identical descriptor-set and pipeline layouts are one Vulkan object owned by the
+ * device, as vkd3d-proton shares them per root signature, instead of one pair per pipeline. Callers never destroy
+ * them. Returns VK_NULL_HANDLE on failure. */
+VkDescriptorSetLayout bd12_shared_set_layout(BD12Device *device, const VkDescriptorSetLayoutCreateInfo *info);
+VkPipelineLayout bd12_shared_pipeline_layout(BD12Device *device, const VkPipelineLayoutCreateInfo *info);
 /* Closes an open vkCmdBeginRendering; every non-draw command calls this. */
 void bd12_cmd_end_rendering(BD12CmdList *list);
+/* Set-0 layouts mark array bindings PARTIALLY_BOUND (descriptor indexing) so a draw writes array elements only up
+ * to the last one its root signature supplies. Fills flags[] (one per binding) and *info, and returns the pNext to
+ * chain into VkDescriptorSetLayoutCreateInfo, or NULL when unsupported or disabled (BEER_BD12_NO_PARTIAL_ARRAYS=1). */
+const void *bd12_layout_partial_arrays(BD12Device *device, const VkDescriptorSetLayoutBinding *bindings,
+                                       uint32_t count, VkDescriptorBindingFlags *flags,
+                                       VkDescriptorSetLayoutBindingFlagsCreateInfo *info);
+int bd12_partial_arrays_enabled(BD12Device *device);
 int bd12_binding_descriptor_type(const BD12ShaderBinding *binding,
                                  VkDescriptorType *type);
 /* Allocates a descriptor set from the allocator's record-time pools (valid until it is reset). */
@@ -829,6 +950,14 @@ void bd12_cmd_set_index_buffer(BD12CmdList *list, uint64_t gpu_va,
                                uint32_t size, VkIndexType type);
 void bd12_cmd_set_blend_constants(BD12CmdList *list, const float rgba[4]);
 void bd12_cmd_set_stencil_ref(BD12CmdList *list, uint32_t ref);
+/* ID3D12GraphicsCommandList5::RSSetShadingRate (combiners may be NULL) and RSSetShadingRateImage (NULL clears). */
+void bd12_cmd_set_shading_rate(BD12CmdList *list, uint32_t rate, const uint32_t *combiners);
+void bd12_cmd_set_shading_rate_image(BD12CmdList *list, struct BD12Image *image);
+/* ID3D12GraphicsCommandList6::DispatchMesh and ExecuteIndirect DISPATCH_MESH arguments (count_buffer may be NULL). */
+int bd12_cmd_dispatch_mesh(BD12CmdList *list, uint32_t x, uint32_t y, uint32_t z);
+int bd12_cmd_dispatch_mesh_indirect(BD12CmdList *list, BD12Buffer *args, VkDeviceSize offset,
+                                    BD12Buffer *count_buffer, VkDeviceSize count_offset,
+                                    uint32_t max_count, uint32_t stride);
 
 int bd12_cmd_draw(BD12CmdList *list, uint32_t vertex_count,
                   uint32_t instance_count, uint32_t first_vertex,
@@ -1047,13 +1176,57 @@ void bd12_rt_load(BD12Device *device);
  * can index the whole heap. */
 #define BD12_MIRROR_COUNT 1000000u
 VkDescriptorSetLayout bd12_mirror_layout(BD12Device *device);
-void bd12_mirror_heap_register(BD12DescriptorHeap *heap);
 void bd12_mirror_forget_image(struct BD12Image *image);
 /* Creates the mirror now (call right after creating a shader-visible heap). */
 void bd12_mirror_enable(BD12DescriptorHeap *heap);
-void bd12_mirror_heap_unregister(BD12DescriptorHeap *heap);
-/* A descriptor array starting at `first` was (re)written. */
-void bd12_mirror_note(const void *first, uint32_t count);
+/* Heap slots [first, first+count) were (re)written; updates the heap's mirror if it has one. */
+void bd12_mirror_write(BD12DescriptorHeap *heap, uint32_t first, uint32_t count);
+void bd12_mirror_heap_release(BD12DescriptorHeap *heap);
+/* Unique GPU-handle window base for a new heap. */
+uint64_t bd12_heap_next_gpu_base(void);
+
+/* Descriptor heaps as descriptor buffers (bd12_heapdb.c). */
+typedef struct BD12DbLayout BD12DbLayout;
+void bd12_db_init(BD12Device *device);
+/* Heap with a registered descriptor mapping, so CPU handles into it resolve through bd12_heap_from_cpu; it also
+ * gets Vulkan descriptor storage when descriptor buffers are in use. flags: BD12_HEAP_FLAG_*. */
+BD12DescriptorHeap *bd12_descriptor_heap_create_ex(BD12Device *device, uint32_t type, uint32_t count, uint32_t flags);
+int bd12_heapdb_heap_destroy(BD12DescriptorHeap *heap);
+BD12DescriptorHeap *bd12_heap_from_cpu(const void *handle);
+/* After writing `count` descriptor records at CPU handle `first`: encodes their Vulkan descriptors (null ones as
+ * `null_type`, VK_DESCRIPTOR_TYPE_MAX_ENUM if unknown) and updates the mirror. */
+void bd12_heap_written(const void *first, uint32_t count, VkDescriptorType null_type);
+/* After copying `count` records from `src` to `dst`: copies their Vulkan descriptors too. */
+void bd12_heap_copied(const void *dst, const void *src, uint32_t count);
+void bd12_db_forget_image(struct BD12Image *image);
+/* Pipeline layout for root-signature pipelines of `rs` (NULL without descriptor buffers). */
+const BD12DbLayout *bd12_db_layout(const BD12RootSignature *rs);
+VkPipelineLayout bd12_db_pipeline_layout(const BD12DbLayout *layout);
+BD12ComputePipeline *bd12_compute_pipeline_build_db(BD12Device *device, const uint32_t *spirv, size_t spirv_bytes,
+                                                    const BD12DbLayout *db_layout, uint32_t root_push_bytes,
+                                                    uint64_t root_layout_hash);
+uint32_t bd12_db_push_size(const BD12Device *device);
+VkShaderStageFlags bd12_db_push_stages(const BD12Device *device);
+int bd12_db_prepare(BD12CmdList *list);
+void bd12_db_bind(BD12CmdList *list, VkPipelineBindPoint point, const BD12DbLayout *layout);
+/* Binding-state invalidation: `which` 0 = graphics, 1 = compute. */
+void bd12_cmd_invalidate_point(BD12CmdList *list, int which);
+void bd12_cmd_invalidate_bindings(BD12CmdList *list);
+/* Barrier batching: between begin and end, image, buffer and global barriers are collected and recorded as one
+ * dependency (ending rendering once). Outside a batch they are recorded immediately. */
+void bd12_cmd_barrier_batch_begin(BD12CmdList *list);
+void bd12_cmd_barrier_batch_end(BD12CmdList *list);
+void bd12_cmd_barrier_flush(BD12CmdList *list);
+void bd12_cmd_add_image_barrier(BD12CmdList *list, const VkImageMemoryBarrier2 *barrier);
+void bd12_cmd_add_memory_barrier(BD12CmdList *list, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                                 VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access);
+/* A draw/dispatch bound descriptor sets or push constants of a non-descriptor-buffer pipeline layout. */
+static inline void bd12_cmd_note_set_binding(BD12CmdList *list, int which)
+{
+    list->db_offsets_valid[which] = 0;
+    list->db_static[which] = NULL;
+    if (list->root_push_key[which] == 1) list->root_push_key[which] = 0;
+}
 /* Before a draw/dispatch outside rendering: creates the bound heap's mirror
  * and initializes images it exposes. Returns 0 if bindless is unavailable. */
 int bd12_mirror_prepare(BD12CmdList *list);

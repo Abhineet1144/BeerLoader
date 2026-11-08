@@ -127,11 +127,15 @@ static int build(BD12RtPipeline *p)
     BD12Device *device = p->device;
     BD12RtDesc *d = &p->desc;
     BeerD3D12TranslatedShader *shared = calloc(1, sizeof(*shared));
-    RtShader shaders[64];
-    uint32_t shader_count = 0;
-    memset(shaders, 0, sizeof(shaders));
-    VkPipelineShaderStageCreateInfo stages[64];
-    VkRayTracingShaderGroupCreateInfoKHR groups[96];
+    /* No fixed limits: path-tracing state objects carry hundreds of hit groups, and a group left out has no
+     * identifier, so its records would trace nothing. */
+    RtShader *shaders = NULL;
+    uint32_t shader_count = 0, shader_capacity = 0;
+    VkPipelineShaderStageCreateInfo *stages = NULL;
+    VkRayTracingShaderGroupCreateInfoKHR *groups = NULL;
+    uint32_t group_capacity = 0;
+    enum { LIBRARY_ENTRIES = 4096 };
+    BeerD3D12RtShader *translated = calloc(LIBRARY_ENTRIES, sizeof(*translated));
     BD12ShaderBinding bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
     BD12ShaderBinding *copy = NULL, *bindless = NULL;
     VkDescriptorType *types = NULL;
@@ -141,14 +145,13 @@ static int build(BD12RtPipeline *p)
     VkPipeline pipeline = VK_NULL_HANDLE;
     uint32_t group_count = 0, set_count = 0, bindless_count = 0, bindless_words = 0, copy_count = 0;
     int ok = 0;
-    if (!shared) return 0;
+    if (!shared || !translated) { free(shared); free(translated); return 0; }
 
     /* 1. translate every library, keeping the exported entry points */
     for (uint32_t l = 0; l < d->library_count; ++l) {
-        BeerD3D12RtShader translated[48];
         uint32_t count = 0;
         const BD12RtLibrary *lib = &d->libraries[l];
-        if (!beer_d3d12_dxil_translate_library(lib->code, lib->size, shared, translated, 48, &count)) {
+        if (!beer_d3d12_dxil_translate_library(lib->code, lib->size, shared, translated, LIBRARY_ENTRIES, &count)) {
             fprintf(stderr, "[BD12 RT] DXIL library %u could not be translated\n", l);
             goto done;
         }
@@ -159,7 +162,18 @@ static int build(BD12RtPipeline *p)
                 const char *from = lib->exports[e].rename_from[0] ? lib->exports[e].rename_from : lib->exports[e].name;
                 if (!strcmp(from, translated[i].name)) export_name = lib->exports[e].name;
             }
-            if (!export_name || shader_count == 64 || find_shader(shaders, shader_count, export_name) >= 0) { free(translated[i].spirv); continue; }
+            if (!export_name || find_shader(shaders, shader_count, export_name) >= 0) { free(translated[i].spirv); continue; }
+            if (shader_count == shader_capacity) {
+                const uint32_t capacity = shader_capacity ? shader_capacity * 2 : 64;
+                RtShader *grown = realloc(shaders, capacity * sizeof(*grown));
+                if (!grown) {
+                    for (uint32_t k = i; k < count; ++k) free(translated[k].spirv);
+                    goto done;
+                }
+                memset(grown + shader_capacity, 0, (capacity - shader_capacity) * sizeof(*grown));
+                shaders = grown;
+                shader_capacity = capacity;
+            }
             RtShader *s = &shaders[shader_count++];
             snprintf(s->name, sizeof(s->name), "%s", export_name);
             s->stage = translated[i].stage;
@@ -213,9 +227,15 @@ static int build(BD12RtPipeline *p)
         };
     }
     {
+        VkDescriptorBindingFlags *binding_flags = calloc(copy_count ? copy_count : 1, sizeof(*binding_flags));
+        VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info;
         VkDescriptorSetLayoutCreateInfo info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                                 .pNext = binding_flags ? bd12_layout_partial_arrays(device, layout_bindings,
+                                                          copy_count, binding_flags, &flags_info) : NULL,
                                                  .bindingCount = copy_count, .pBindings = layout_bindings };
-        if (device->vk.CreateDescriptorSetLayout(device->device, &info, NULL, &set_layout) != VK_SUCCESS) goto done;
+        const VkResult layout_result = device->vk.CreateDescriptorSetLayout(device->device, &info, NULL, &set_layout);
+        free(binding_flags);
+        if (layout_result != VK_SUCCESS) goto done;
     }
     {
         VkDescriptorSetLayout set_layouts[2] = { set_layout, VK_NULL_HANDLE };
@@ -233,6 +253,10 @@ static int build(BD12RtPipeline *p)
     }
 
     /* 3. modules, stages and groups */
+    group_capacity = shader_count + d->hit_group_count;
+    stages = calloc(shader_count, sizeof(*stages));
+    groups = calloc(group_capacity ? group_capacity : 1, sizeof(*groups));
+    if (!stages || !groups) goto done;
     for (uint32_t i = 0; i < shader_count; ++i) {
         VkShaderModuleCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                           .codeSize = shaders[i].spirv_size, .pCode = (const uint32_t *)shaders[i].spirv };
@@ -243,9 +267,9 @@ static int build(BD12RtPipeline *p)
         stages[i] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                        .stage = vk_stage(shaders[i].stage), .module = shaders[i].module, .pName = "main" };
     }
-    p->group_names = calloc(96, sizeof(*p->group_names));
+    p->group_names = calloc(group_capacity ? group_capacity : 1, sizeof(*p->group_names));
     if (!p->group_names) goto done;
-    for (uint32_t i = 0; i < shader_count && group_count < 96; ++i) {
+    for (uint32_t i = 0; i < shader_count && group_count < group_capacity; ++i) {
         const uint32_t st = shaders[i].stage;
         if (st != 9 && st != 11 && st != 12) continue;       /* general groups: miss, raygen, callable */
         groups[group_count] = (VkRayTracingShaderGroupCreateInfoKHR){
@@ -254,7 +278,7 @@ static int build(BD12RtPipeline *p)
             .intersectionShader = VK_SHADER_UNUSED_KHR };
         snprintf(p->group_names[group_count++], 128, "%s", shaders[i].name);
     }
-    for (uint32_t h = 0; h < d->hit_group_count && group_count < 96; ++h) {
+    for (uint32_t h = 0; h < d->hit_group_count && group_count < group_capacity; ++h) {
         const BD12RtHitGroup *hg = &d->hit_groups[h];
         groups[group_count] = (VkRayTracingShaderGroupCreateInfoKHR){
             .sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,
@@ -315,6 +339,7 @@ done:
     if (layout) device->vk.DestroyPipelineLayout(device->device, layout, NULL);
     if (set_layout) device->vk.DestroyDescriptorSetLayout(device->device, set_layout, NULL);
     free(copy); free(bindless); free(types); free(layout_bindings);
+    free(shaders); free(stages); free(groups); free(translated);
     free(shared);
     return ok;
 }

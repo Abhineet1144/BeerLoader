@@ -251,12 +251,22 @@ static size_t ticket_request(const char *op, uint32_t appid, const void *userdat
     return len;
 }
 
-size_t beer_steam_session_auth_ticket(uint32_t appid, uint8_t *out, size_t cap, uint32_t *handle)
+/* Auth session or Web API ticket from the provider: op "auth_ticket" or "web_api_ticket". */
+static size_t session_ticket(const char *op, uint32_t appid, const char *identity, uint8_t *out, size_t cap,
+                             uint32_t *handle)
 {
-    char fields[64];
-    snprintf(fields, sizeof(fields), "\"appid\":\"%u\"", appid);
+    char fields[400], escaped[260];
+    size_t e = 0;
+    for (const char *c = identity ? identity : ""; *c && e + 7 < sizeof(escaped); ++c) {
+        const unsigned char ch = (unsigned char)*c;
+        if (ch == '"' || ch == '\\') { escaped[e++] = '\\'; escaped[e++] = (char)ch; }
+        else if (ch >= 0x20) escaped[e++] = (char)ch;
+    }
+    escaped[e] = 0;
+    if (identity) snprintf(fields, sizeof(fields), "\"appid\":\"%u\",\"identity\":\"%s\"", appid, escaped);
+    else snprintf(fields, sizeof(fields), "\"appid\":\"%u\"", appid);
     pthread_mutex_lock(&g.lock);
-    char *reply = g.active ? request("auth_ticket", fields) : NULL;
+    char *reply = g.active ? request(op, fields) : NULL;
     pthread_mutex_unlock(&g.lock);
     char err[256], text[32] = "";
     size_t len = 0;
@@ -272,10 +282,21 @@ size_t beer_steam_session_auth_ticket(uint32_t appid, uint8_t *out, size_t cap, 
         }
         if (!hex || *hex != '"' || !*handle) len = 0;
     } else {
-        fprintf(stderr, "[STEAM] auth_ticket for app %u failed: %s\n", appid, err);
+        fprintf(stderr, "[STEAM] %s for app %u failed: %s\n", op, appid, err);
     }
     free(reply);
     return len;
+}
+
+size_t beer_steam_session_auth_ticket(uint32_t appid, uint8_t *out, size_t cap, uint32_t *handle)
+{
+    return session_ticket("auth_ticket", appid, NULL, out, cap, handle);
+}
+
+size_t beer_steam_session_web_api_ticket(uint32_t appid, const char *identity, uint8_t *out, size_t cap,
+                                         uint32_t *handle)
+{
+    return session_ticket("web_api_ticket", appid, identity ? identity : "", out, cap, handle);
 }
 
 void beer_steam_session_cancel_auth_ticket(uint32_t appid, uint32_t handle)

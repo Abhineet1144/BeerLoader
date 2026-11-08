@@ -1945,9 +1945,29 @@ static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t t
             row_pitch = t->sub_pitch[sub];
             depth_pitch = t->sub_slice[sub];
         } else {
-            static int warned;
-            if (!warned++) fprintf(stderr, "[BD11] Map of a GPU-only texture (usage %u) not implemented\n", t->desc.usage);
-            return B11_E_FAIL;
+            /* DYNAMIC (and CPU-writable DEFAULT) textures: the game writes a CPU copy of the subresource in the
+             * tight layout reported through RowPitch/DepthPitch; Unmap uploads it like UpdateSubresource. The copy
+             * persists between maps, so NO_OVERWRITE/WRITE keep the bytes the game wrote before. Reads of
+             * GPU-written contents are not supported. */
+            const uint32_t count = t->desc.mips * (t->desc.dimension == 3 ? 1 : t->desc.array_size);
+            if (sub >= count) return B11_E_INVALIDARG;
+            if (type == B11_MAP_READ || type == B11_MAP_READ_WRITE) {
+                static int warned;
+                if (!warned++) fprintf(stderr, "[BD11] Map for reading of a GPU texture (usage %u) not supported\n", t->desc.usage);
+            }
+            uint32_t w, h, d, bw = 1, bh = 1, bytes = 4;
+            texture_extent(t, sub % t->desc.mips, &w, &h, &d);
+            const VkFormat f = b11_vk_format(t->desc.format);
+            if (f != VK_FORMAT_UNDEFINED) bd12_format_block(f, VK_IMAGE_ASPECT_COLOR_BIT, &bw, &bh, &bytes);
+            row_pitch = ((w + bw - 1) / bw) * bytes;
+            depth_pitch = row_pitch * ((h + bh - 1) / bh);
+            map_size = (size_t)depth_pitch * (d ? d : 1);
+            pthread_mutex_lock(&dev->lock);
+            if (!t->map_shadow) t->map_shadow = calloc(count, sizeof(*t->map_shadow));
+            if (t->map_shadow && !t->map_shadow[sub]) t->map_shadow[sub] = calloc(1, map_size);
+            data = t->map_shadow ? t->map_shadow[sub] : NULL;
+            pthread_mutex_unlock(&dev->lock);
+            if (!data) return B11_E_OUTOFMEMORY;
         }
     } else return B11_E_INVALIDARG;
     int slot = -1;
@@ -2031,6 +2051,16 @@ static void B11_MS ctx_unmap(B11Context *c, B11Obj *res, uint32_t sub)
                 if (op.data) { memcpy(op.data, data + first, op.data_size); ctx_emit(c, &op); }
             }
             free(data);
+        } else if (res->kind == B11_TEXTURE && !((B11Texture *)res)->staging &&
+                   (c->mapped[i].map_type & (B11_MAP_WRITE | B11_MAP_WRITE_DISCARD | B11_MAP_WRITE_NO_OVERWRITE))) {
+            /* the texture's CPU copy (see ctx_map) goes to the GPU as a whole-subresource update */
+            const B11Texture *t = (const B11Texture *)res;
+            uint32_t w, h, d, bw = 1, bh = 1, bytes = 4;
+            texture_extent(t, sub % t->desc.mips, &w, &h, &d);
+            const VkFormat f = b11_vk_format(t->desc.format);
+            if (f != VK_FORMAT_UNDEFINED) bd12_format_block(f, VK_IMAGE_ASPECT_COLOR_BIT, &bw, &bh, &bytes);
+            const uint32_t row_pitch = ((w + bw - 1) / bw) * bytes;
+            ctx_update(c, res, sub, NULL, c->mapped[i].data, row_pitch, row_pitch * ((h + bh - 1) / bh));
         }
         memset(&c->mapped[i], 0, sizeof(c->mapped[i]));
         return;

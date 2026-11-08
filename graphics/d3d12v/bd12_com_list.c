@@ -26,8 +26,8 @@ static const uint8_t iid_list3[16] = { 0xa7, 0x83, 0xda, 0x6f, 0x4c, 0xb8, 0x38,
     0x4e, 0x9a, 0xc8, 0xc7, 0xbd, 0x22, 0x01, 0x6b, 0x3d };
 static const uint8_t iid_list4[16] = { 0x8e, 0x31, 0x54, 0x87, 0xa9, 0xd3, 0x41,
     0x45, 0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74 };
-/* ID3D12GraphicsCommandList5 (RSSetShadingRate[Image]) and 6 (DispatchMesh): exposed only with BEER_FAKE_CAPS,
- * where those commands do nothing. */
+/* ID3D12GraphicsCommandList5 (RSSetShadingRate[Image]): exposed when variable-rate shading is enabled
+ * (BEER_BD12_VRS=1) or with BEER_FAKE_CAPS. List6 (DispatchMesh): BEER_FAKE_CAPS only, where it does nothing. */
 static const uint8_t iid_list5[16] = { 0x59, 0x08, 0x05, 0x55, 0x24, 0x40, 0x4c,
     0x47, 0x87, 0xf5, 0x64, 0x72, 0xea, 0xee, 0x44, 0xea };
 static const uint8_t iid_list6[16] = { 0x90, 0x78, 0x82, 0xc3, 0x48, 0xe5, 0xfa,
@@ -58,6 +58,7 @@ typedef struct ComPso {
     const void *last_alloc;
     uint64_t last_gen;
     struct ComPso *job_next;
+    ComObj *root_signature;       /* held while the pipeline lives: compilation may come later (first use) */
 } ComPso;
 
 static pthread_mutex_t g_job_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -87,8 +88,8 @@ static void pso_compile(ComPso *p)
     BD12_PROF_BEGIN();
     BD12Device *bd = p->obj.dev->bd;
     if (p->compute)
-        p->cmp = bd12_compute_pipeline_create_dxbc(bd, p->desc.cs,
-                                                   p->desc.cs_size, p->hash);
+        p->cmp = bd12_compute_pipeline_create_dxbc_rs(bd, p->desc.cs, p->desc.cs_size, p->hash,
+            p->desc.root_signature ? ((ComRootSig *)p->desc.root_signature)->rs : NULL);
     else
         p->gfx = bd12_pso_create_graphics(bd, &p->desc);
     bd12_pso_release(&p->desc);
@@ -96,6 +97,50 @@ static void pso_compile(ComPso *p)
     p->state = (p->gfx || p->cmp) ? 2 : 3;
     pthread_cond_broadcast(&p->cond);
     pthread_mutex_unlock(&p->lock);
+    BD12_PROF_END(BD12_PROF_PSO);
+}
+
+/* Compile-at-create warms the pipeline cache without keeping the pipeline: build it (the driver stores the result
+ * in the VkPipelineCache, which is saved to disk), destroy the VkPipeline at once, and keep the description (its
+ * shaders are interned and shared) so the first bind rebuilds it as a cache hit. A live VkPipeline costs ~110 KB of
+ * driver memory; engines create tens of thousands at their "compiling shaders" step and bind a fraction of them
+ * (Where Winds Meet: 19.9k pipelines = 2.1 GB, killed at 9 GB; Stellar Blade 7.8 GB; RE9 ~1.6 GB more than Proton).
+ * By default every compiled pipeline stays alive, as on Windows (layouts are shared, so each costs only its
+ * VkPipeline). BEER_BD12_RELEASE_PIPELINES=1 opts into warm-and-release when memory is tight. */
+static int keep_pipelines(void)
+{
+    static int value = -1;
+    if (value < 0) {
+        const char *release = getenv("BEER_BD12_RELEASE_PIPELINES");
+        value = !(release && *release && strcmp(release, "0") != 0);
+    }
+    return value;
+}
+static void pso_warm(ComPso *p)
+{
+    BD12_PROF_BEGIN();
+    BD12Device *bd = p->obj.dev->bd;
+    int ok;
+    if (p->compute) {
+        BD12ComputePipeline *c = bd12_compute_pipeline_create_dxbc_rs(bd, p->desc.cs, p->desc.cs_size, p->hash,
+            p->desc.root_signature ? ((ComRootSig *)p->desc.root_signature)->rs : NULL);
+        ok = c != NULL;
+        if (c) bd12_compute_pipeline_destroy(c);
+    } else {
+        BD12GraphicsPipeline *g = bd12_pso_create_graphics(bd, &p->desc);
+        ok = g != NULL;
+        if (g) bd12_graphics_pipeline_destroy(g);
+    }
+    pthread_mutex_lock(&p->lock);
+    p->state = ok ? 0 : 3;            /* pending again: the first bind rebuilds it from the cache */
+    pthread_cond_broadcast(&p->cond);
+    pthread_mutex_unlock(&p->lock);
+    if (!ok) bd12_pso_release(&p->desc);
+    {   static uint64_t warmed;
+        const uint64_t n = __atomic_add_fetch(&warmed, 1, __ATOMIC_RELAXED);
+        if (getenv("BEER_BD12_PIPELIB_LOG") && (n == 1 || n % 2000 == 0))
+            fprintf(stderr, "[PIPELIB] pipelines warmed into the cache and released=%llu\n", (unsigned long long)n);
+    }
     BD12_PROF_END(BD12_PROF_PSO);
 }
 
@@ -200,6 +245,12 @@ static void pso_free(ComDevice *dev, void *ptr)
 {
     (void)dev;
     ComPso *p = ptr;
+    if (p->root_signature) com_release(p->root_signature);
+    {   static uint64_t freed;
+        const uint64_t n = __atomic_add_fetch(&freed, 1, __ATOMIC_RELAXED);
+        if (getenv("BEER_BD12_PIPELIB_LOG") && (n == 1 || n % 2000 == 0))
+            fprintf(stderr, "[PIPELIB] pipelines destroyed=%llu\n", (unsigned long long)n);
+    }
     if (p->gfx) bd12_graphics_pipeline_destroy(p->gfx);
     if (p->cmp) bd12_compute_pipeline_destroy(p->cmp);
     pthread_mutex_destroy(&p->lock);
@@ -212,8 +263,20 @@ static HR MS pso_query(ComObj *s, const uint8_t *r, void **o)
 static HR MS pso_cached_blob(ComObj *s, void **blob)
 {
     (void)s;
-    if (blob) *blob = NULL;
-    return HR_E_NOTIMPL;
+    {   static uint64_t calls;
+        const uint64_t n = __atomic_add_fetch(&calls, 1, __ATOMIC_RELAXED);
+        if (getenv("BEER_BD12_PIPELIB_LOG") && (n == 1 || n % 500 == 0))
+            fprintf(stderr, "[PIPELIB] GetCachedBlob calls=%llu\n", (unsigned long long)n);
+    }
+    /* Windows always returns a blob here, and games use it without checking the result (Where Winds Meet read
+     * through the NULL blob). BD12 cannot serialise a pipeline, so the blob only identifies its producer; given back
+     * as CachedPSO it is ignored and the pipeline is built from its description (the persistent VkPipelineCache
+     * keeps that cheap). */
+    extern void *beer_d3d_blob_create(const void *data, size_t size);
+    static const char header[16] = "BEER-BD12-PSO-1";
+    if (!blob) return HR_E_INVALIDARG;
+    *blob = beer_d3d_blob_create(header, sizeof(header));
+    return *blob ? HR_OK : HR_E_OUTOFMEMORY;
 }
 /* ID3D12PipelineLibrary records whether a stored pipeline is a compute pipeline. */
 int com_pso_is_compute(ComObj *pso)
@@ -226,6 +289,27 @@ static void *pso_vtable[9] = {
     [5] = com_obj_set_private_iface, [6] = com_obj_set_name,
     [7] = com_obj_get_device, [8] = pso_cached_blob,
 };
+
+/* Set while ID3D12PipelineLibrary::Load*Pipeline creates a pipeline. Such pipelines are built at load, on the
+ * game's calling thread, like any other with compile-at-create: compiling them at first use put driver compiles
+ * (or at best pipeline-cache lookups) on the render thread mid-frame. BEER_BD12_LAZY_LIBRARY_LOADS=1 restores
+ * first-use compilation for library loads (for comparison). */
+__thread int g_bd12_pso_from_library;
+
+static int compile_at_create(void)
+{
+    if (g_bd12_pso_from_library) {
+        static int lazy = -1;
+        if (lazy < 0) lazy = getenv("BEER_BD12_LAZY_LIBRARY_LOADS") != NULL;
+        if (lazy) return 0;
+    }
+    static int value = -1;
+    if (value < 0) {
+        const char *set = getenv("BEER_BD12_COMPILE_AT_CREATE");
+        value = set && *set ? strcmp(set, "0") != 0 : bd12_pipeline_library_enabled();
+    }
+    return value;
+}
 
 HR com_create_pso(ComDevice *dev, const void *desc, int kind,
                   const uint8_t *riid, void **out)
@@ -247,7 +331,22 @@ HR com_create_pso(ComDevice *dev, const void *desc, int kind,
     ComPso *p = calloc(1, sizeof(*p));
     if (!p) return HR_E_OUTOFMEMORY;
     p->compute = tmp.cs_size != 0;
-    if (!p->compute && (!tmp.vs_size)) {
+    if (!p->compute && !tmp.vs_size && !(tmp.ms_size && dev->bd->CmdDrawMeshTasksEXT)) {
+        static unsigned logged, total;
+        ++total;
+        if (logged++ < 2 || !(total % 500)) {
+            fprintf(stderr, "[BD12] graphics PSO without VS rejected #%u (kind %d, ms %zu, as %zu, ps %zu)\n",
+                    total, kind, tmp.ms_size, tmp.as_size, tmp.ps_size);
+            if (kind == 2 && logged <= 2) {         /* the raw stream, 8 bytes per word */
+                const uint8_t *d = desc, *stream = rdptr(d + 8);
+                const size_t size = (size_t)rd64(d);
+                fprintf(stderr, "[BD12]   stream %p size %zu:", (const void *)stream, size);
+                for (size_t off = 0; off + 8 <= size && off < 1024; off += 8)
+                    fprintf(stderr, "%s%zu:%016llx", (off % 64) ? " " : "\n[BD12]    ", off,
+                            (unsigned long long)rd64(stream + off));
+                fprintf(stderr, "\n");
+            }
+        }
         if (!beer_fake_caps()) {
             free(p);
             return HR_E_INVALIDARG;
@@ -261,11 +360,22 @@ HR com_create_pso(ComDevice *dev, const void *desc, int kind,
         *out = p;
         return HR_OK;
     }
+    {   static uint64_t creates, cached;   /* CachedPSO blobs offered with the description */
+        const uint64_t n = __atomic_add_fetch(&creates, 1, __ATOMIC_RELAXED);
+        if (tmp.cached_pso_size) __atomic_add_fetch(&cached, 1, __ATOMIC_RELAXED);
+        if (getenv("BEER_BD12_PIPELIB_LOG") && (n == 1 || n % 500 == 0))
+            fprintf(stderr, "[PIPELIB] CreatePipelineState=%llu (with CachedPSO %llu)\n",
+                    (unsigned long long)n, (unsigned long long)cached);
+    }
     if (!bd12_pso_clone(&tmp, &p->desc)) {
         free(p);
         return HR_E_OUTOFMEMORY;
     }
     p->hash = p->compute ? fnv(p->desc.cs, p->desc.cs_size) : 0;
+    if (p->desc.root_signature && ((ComObj *)p->desc.root_signature)->kind == COM_ROOT_SIG) {
+        p->root_signature = p->desc.root_signature;
+        com_add_ref(p->root_signature);
+    }
     pthread_mutex_init(&p->lock, NULL);
     pthread_cond_init(&p->cond, NULL);
     com_obj_init(&p->obj, COM_PSO, pso_vtable, dev, pso_destroy);
@@ -274,6 +384,15 @@ HR com_create_pso(ComDevice *dev, const void *desc, int kind,
      * the entire library eagerly made the NVIDIA driver retain multiple GiB.
      * Keep asynchronous eager compilation available only for profiling. */
     if (getenv("BEER_BD12_ASYNC_PSO") && !pso_enqueue(p)) pso_compile(p);
+    /* Compile at creation, on the creating thread, as a Windows driver does: BEER_BD12_COMPILE_AT_CREATE=1, and by
+     * default whenever pipeline libraries are offered (unless BEER_D3D12_PIPELINE_LIBRARY=0). An engine's "compiling
+     * shaders" step then really builds every pipeline into the on-disk Vulkan pipeline cache, so gameplay builds
+     * come from the cache instead of stalling frames. BEER_BD12_COMPILE_AT_CREATE=0 keeps first-use compilation. */
+    else if (compile_at_create()) {
+        p->state = 1;
+        if (keep_pipelines()) pso_compile(p);
+        else pso_warm(p);
+    }
     *out = p;
     return HR_OK;
 }
@@ -401,6 +520,16 @@ static HR MS list_query(ComObj *s, const uint8_t *r, void **o)
         return com_obj_query(s, r, o, r, NULL);
     if (r && beer_fake_caps() && (com_iid_equal(r, iid_list5) || com_iid_equal(r, iid_list6)))
         return com_obj_query(s, r, o, r, NULL);
+    /* List6 (DispatchMesh, and everything before it) whenever mesh shaders are real. */
+    if (r && s->dev->bd->CmdDrawMeshTasksEXT &&
+        (com_iid_equal(r, iid_list1) || com_iid_equal(r, iid_list2) || com_iid_equal(r, iid_list3) ||
+         com_iid_equal(r, iid_list4) || com_iid_equal(r, iid_list5) || com_iid_equal(r, iid_list6)))
+        return com_obj_query(s, r, o, r, NULL);
+    /* List5 (and the List1..4 it derives from) whenever variable-rate shading is real. */
+    if (r && s->dev->bd->CmdSetFragmentShadingRateKHR &&
+        (com_iid_equal(r, iid_list1) || com_iid_equal(r, iid_list2) || com_iid_equal(r, iid_list3) ||
+         com_iid_equal(r, iid_list4) || com_iid_equal(r, iid_list5)))
+        return com_obj_query(s, r, o, r, NULL);
     return com_obj_query(s, r, o, iid_list, NULL);
 }
 
@@ -497,9 +626,23 @@ HR com_create_list(ComDevice *dev, uint32_t type, ComObj *allocator,
 {
     if (!allocator || !riid || !out) return HR_E_INVALIDARG;
     *out = NULL;
-    if (!com_iid_equal(riid, iid_list) && !com_iid_equal(riid, iid_command_list) &&
-        !com_iid_equal(riid, com_iid_iunknown))
-        return HR_E_NOINTERFACE;
+    /* CreateCommandList may name any interface the list implements (games ask for ID3D12GraphicsCommandList4/6
+     * directly); the list answers it exactly as QueryInterface would. Refusing every newer interface here left
+     * those lists uncreated. */
+    const int base = com_iid_equal(riid, iid_list) || com_iid_equal(riid, iid_command_list) ||
+                     com_iid_equal(riid, com_iid_iunknown);
+    if (!base) {
+        static const uint8_t *const newer[] = { iid_list1, iid_list2, iid_list3, iid_list4, iid_list5, iid_list6 };
+        int known = 0;
+        for (size_t i = 0; i < sizeof(newer) / sizeof(newer[0]); ++i)
+            if (com_iid_equal(riid, newer[i])) {
+                static unsigned logged_mask;
+                if (!(__atomic_fetch_or(&logged_mask, 1u << i, __ATOMIC_RELAXED) & (1u << i)))
+                    fprintf(stderr, "[BD12] CreateCommandList asks for ID3D12GraphicsCommandList%u\n", (unsigned)i + 1);
+                known = 1;
+            }
+        if (!known) return HR_E_NOINTERFACE;
+    }
     ComList *l = calloc(1, sizeof(*l));
     if (!l) return HR_E_OUTOFMEMORY;
     l->type = type;
@@ -509,6 +652,18 @@ HR com_create_list(ComDevice *dev, uint32_t type, ComObj *allocator,
     if (!list_start(l, (ComAllocator *)allocator, (ComPso *)pso)) {
         com_release(&l->obj);
         return HR_E_FAIL;
+    }
+    if (!base) {
+        void *iface = NULL;
+        const HR hr = list_query(&l->obj, riid, &iface);
+        com_release(&l->obj);       /* the query holds the reference now, or the list is gone */
+        if (hr != HR_OK) {
+            static int logged;
+            if (logged++ < 3) fprintf(stderr, "[BD12] CreateCommandList for a newer list interface refused (not enabled)\n");
+            return hr;
+        }
+        *out = iface;
+        return HR_OK;
     }
     *out = l;
     return HR_OK;
@@ -783,6 +938,25 @@ static void MS cl_set_stencil_ref(ComList *l, uint32_t ref)
     bd12_cmd_set_stencil_ref(c, ref);
 }
 
+/* ID3D12GraphicsCommandList5 */
+static void MS cl_set_shading_rate(ComList *l, uint32_t rate, const uint32_t *combiners)
+{
+    LIST_CUR(l);
+    bd12_cmd_set_shading_rate(c, rate, combiners);
+}
+static void MS cl_set_shading_rate_image(ComList *l, ComResource *r)
+{
+    LIST_CUR(l);
+    bd12_cmd_set_shading_rate_image(c, r ? r->image : NULL);
+}
+
+/* ID3D12GraphicsCommandList6 */
+static void MS cl_dispatch_mesh(ComList *l, uint32_t x, uint32_t y, uint32_t z)
+{
+    LIST_CUR(l);
+    bd12_cmd_dispatch_mesh(c, x, y, z);
+}
+
 static void MS cl_set_pso(ComList *l, ComPso *p)
 {
     LIST_CUR(l);
@@ -792,6 +966,8 @@ static void MS cl_set_pso(ComList *l, ComPso *p)
 static void MS cl_barrier(ComList *l, uint32_t n, const uint8_t *barriers)
 {
     LIST_CUR(l);
+    /* One D3D12 ResourceBarrier call: one Vulkan dependency (see bd12_cmd_barrier_batch_begin). */
+    bd12_cmd_barrier_batch_begin(c);
     for (uint32_t i = 0; i < n; ++i) {
         const uint8_t *b = barriers + (size_t)i * 32;
         uint32_t type = rd32(b), flags = rd32(b + 4);
@@ -820,6 +996,7 @@ static void MS cl_barrier(ComList *l, uint32_t n, const uint8_t *barriers)
             else bd12_cmd_global_barrier(c);
         }
     }
+    bd12_cmd_barrier_batch_end(c);
 }
 
 static void MS cl_set_descriptor_heaps(ComList *l, uint32_t n, ComDescHeap *const *heaps)
@@ -1193,6 +1370,14 @@ static void MS cl_execute_indirect(ComList *l, ComSignature *sig,
         else bd12_cmd_draw_indexed_indirect(c, args->buffer, arg_off, max_count,
                                             stride);
         break;
+    case 10:                                       /* D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH */
+        if (bd12_trace_active() && !c->gfx.pipeline)
+            fprintf(stderr, "[TRACE] mesh-indirect with no pipeline bound\n");
+        if (c->gfx.pipeline)
+            bd12_capture_indirect(c, c->gfx.pipeline->shader_hash, 10, args->buffer, arg_off, cb, count_off,
+                                  max_count, stride);
+        bd12_cmd_dispatch_mesh_indirect(c, args->buffer, arg_off, cb, count_off, max_count, stride);
+        break;
     case 2:
         if (cb) BD12_DROP(BD12_DROP_INDIRECT_DISPATCH_COUNT);
         for (uint32_t i = 0; i < max_count; ++i)
@@ -1289,6 +1474,7 @@ void *com_list_vtable_[80] = {
     /* List4 */ [68] = cl_noop, [69] = cl_noop, [70] = cl_noop, [71] = cl_noop,
     [72] = cl_rt_build, [73] = cl_rt_emit, [74] = cl_rt_copy,
     [75] = cl_rt_set_pso1, [76] = cl_rt_dispatch_rays,
-    /* List5: RSSetShadingRate, RSSetShadingRateImage; List6: DispatchMesh (BEER_FAKE_CAPS only: no-ops) */
-    [77] = cl_noop, [78] = cl_noop, [79] = cl_noop,
+    /* List5: RSSetShadingRate, RSSetShadingRateImage (VRS, BEER_BD12_VRS=1); List6: DispatchMesh (BEER_FAKE_CAPS
+     * only: no-op) */
+    [77] = cl_set_shading_rate, [78] = cl_set_shading_rate_image, [79] = cl_dispatch_mesh,
 };

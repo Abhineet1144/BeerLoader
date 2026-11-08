@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 /* Runtime-compatible subset of vkd3d_shader.h. Beer loads the translator
  * dynamically so it does not acquire a build-time or loader-path dependency on
@@ -107,15 +110,86 @@ typedef struct TranslatorApi {
     int attempted;
 } TranslatorApi;
 
+/* The translation cache: one entry per (shader bytes, root layout), alive for the whole process (callers keep
+ * pointers to entry->shader). Keyed by the caller's shader hash plus an independent content hash and the size, so
+ * the shader bytes themselves are not kept (WWM: 11k shaders, ~260 MB of DXIL). A hash table, not a list: lookups
+ * stay O(1) through a warm-up that creates tens of thousands of pipelines. */
 typedef struct TranslationCacheEntry {
     BeerD3D12TranslatedShader shader;
-    uint8_t *dxbc;
+    uint64_t content_hash;
     size_t dxbc_size;
     struct TranslationCacheEntry *next;
 } TranslationCacheEntry;
 
+#define CACHE_BUCKETS 16384u
 static TranslatorApi g_api;
-static TranslationCacheEntry *g_cache;
+static TranslationCacheEntry *g_cache[CACHE_BUCKETS];
+
+/* 64-bit multiply-xorshift over the bytes, independent of the FNV-1a shader hash callers pass. */
+static uint64_t content_hash(const uint8_t *p, size_t n)
+{
+    uint64_t h = 0x243f6a8885a308d3ull ^ (n * 0x9e3779b97f4a7c15ull);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdull;
+        h ^= h >> 32;
+    }
+    uint64_t tail = 0;
+    for (size_t k = 0; i + k < n; ++k) tail |= (uint64_t)p[i + k] << (8 * k);
+    h = (h ^ tail) * 0xc4ceb9fe1a85ec53ull;
+    return h ^ (h >> 29);
+}
+
+static TranslationCacheEntry **cache_bucket(uint64_t shader_hash, uint64_t layout_hash)
+{
+    const uint64_t k = (shader_hash ^ (layout_hash * 0x9e3779b97f4a7c15ull));
+    return &g_cache[(k ^ (k >> 29)) & (CACHE_BUCKETS - 1)];
+}
+
+/* Caller holds g_lock. */
+static TranslationCacheEntry *cache_find_locked(uint64_t shader_hash, uint64_t chash, size_t size, uint64_t layout_hash)
+{
+    for (TranslationCacheEntry *e = *cache_bucket(shader_hash, layout_hash); e; e = e->next)
+        if (e->shader.shader_hash == shader_hash && e->content_hash == chash && e->dxbc_size == size &&
+            e->shader.root_layout_hash == layout_hash)
+            return e;
+    return NULL;
+}
+
+static void cache_entry_free(TranslationCacheEntry *e)
+{
+    if (!e) return;
+    free(e->shader.spirv);
+    free(e);
+}
+
+/* Caller holds g_lock. Translation runs without the lock, so another thread may have finished the same shader first:
+ * then the existing entry wins and `e` is discarded. */
+static TranslationCacheEntry *cache_insert_locked(TranslationCacheEntry *e)
+{
+    TranslationCacheEntry *existing =
+        cache_find_locked(e->shader.shader_hash, e->content_hash, e->dxbc_size, e->shader.root_layout_hash);
+    if (existing) { cache_entry_free(e); return existing; }
+    TranslationCacheEntry **bucket = cache_bucket(e->shader.shader_hash, e->shader.root_layout_hash);
+    e->next = *bucket;
+    __atomic_store_n(bucket, e, __ATOMIC_RELEASE);
+    return e;
+}
+
+/* Diagnostic (SIGUSR1 dump with BEER_DUMP_MEMORY): what the translation cache holds. Entries are only ever
+ * prepended, so walking the chains without the lock sees a consistent prefix. */
+void beer_d3d12_translator_stats(void)
+{
+    size_t count = 0, dxbc = 0, spirv = 0;
+    for (size_t b = 0; b < CACHE_BUCKETS; ++b)
+        for (const TranslationCacheEntry *entry = __atomic_load_n(&g_cache[b], __ATOMIC_ACQUIRE); entry; entry = entry->next) {
+            ++count; dxbc += entry->dxbc_size; spirv += entry->shader.spirv_size;
+        }
+    fprintf(stderr, "[MEM] shader translation cache: %zu entries (sources %zu MB, not retained), spirv %zu MB\n",
+            count, dxbc >> 20, spirv >> 20);
+}
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local char g_error[512];
 
@@ -496,30 +570,209 @@ static int spirv_invariant_position_enabled(void)
     return !e || atoi(e);
 }
 
-static const BeerD3D12TranslatedShader *translate_locked(
+/* ---- optional on-disk cache of translations (BEER_SHADER_DISK_CACHE=1) ----
+ * Each translated shader is stored as ~/.cache/beer/shaders/<fnv64 of the bytes>-<size>.bin (BEER_SHADER_CACHE_DIR
+ * overrides the folder): a header, the descriptor table and the SPIR-V. The header carries a build key covering
+ * everything that changes the output (the loader binary, the dxil-spirv and vkd3d-shader libraries, and the SPIR-V
+ * options); a file written by another build is ignored and rewritten. A second hash of the bytes guards the name. */
+#define DISK_CACHE_MAGIC 0x56505342u   /* "BSPV" */
+#define DISK_CACHE_VERSION 2u   /* 2: root-layout key in the header */
+
+typedef struct {
+    uint32_t magic, version;
+    uint64_t build_key, check_hash, dxbc_size;
+    uint32_t descriptor_count, reserved;
+    uint64_t spirv_size;
+    uint64_t layout_key;          /* root-signature translations: the root layout; 0 for plain translations */
+} DiskCacheHeader;
+
+static uint64_t fnv64_seed(const uint8_t *p, size_t n, uint64_t h)
+{
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static uint64_t file_key(uint64_t h, const char *path)
+{
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return fnv64_seed((const uint8_t *)"-", 1, h);
+    const uint64_t fields[3] = { (uint64_t)st.st_size, (uint64_t)st.st_mtim.tv_sec, (uint64_t)st.st_mtim.tv_nsec };
+    return fnv64_seed((const uint8_t *)fields, sizeof(fields), h);
+}
+
+static const char *disk_cache_dir(void)
+{
+    static int state = -1;
+    static char dir[512];
+    if (state >= 0) return state ? dir : NULL;
+    state = 0;
+    const char *on = getenv("BEER_SHADER_DISK_CACHE");          /* on by default; BEER_SHADER_DISK_CACHE=0 disables */
+    if (on && (!*on || !strcmp(on, "0"))) return NULL;
+    const char *custom = getenv("BEER_SHADER_CACHE_DIR"), *home = getenv("HOME"), *xdg = getenv("XDG_CACHE_HOME");
+    if (custom && *custom) snprintf(dir, sizeof(dir), "%s", custom);
+    else if (xdg && *xdg) snprintf(dir, sizeof(dir), "%s/beer/shaders", xdg);
+    else if (home && *home) snprintf(dir, sizeof(dir), "%s/.cache/beer/shaders", home);
+    else return NULL;
+    char partial[512];
+    for (size_t i = 1; dir[i]; ++i)                  /* mkdir -p */
+        if (dir[i] == '/') { memcpy(partial, dir, i); partial[i] = 0; mkdir(partial, 0755); }
+    mkdir(dir, 0755);
+    state = 1;
+    fprintf(stderr, "[SHADER-CACHE] on-disk translation cache: %s\n", dir);
+    return dir;
+}
+
+static uint64_t disk_cache_build_key(void)
+{
+    static uint64_t key;
+    if (key) return key;
+    uint64_t h = 1469598103934665603ull ^ DISK_CACHE_VERSION;
+#ifdef BEER_TRANSLATOR_SOURCE_KEY
+    {   /* the translator's sources (Makefile): unrelated loader rebuilds keep the cache */
+        const uint64_t source_key = BEER_TRANSLATOR_SOURCE_KEY;
+        h = fnv64_seed((const uint8_t *)&source_key, sizeof(source_key), h);
+    }
+#else
+    char exe[512];
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) { exe[n] = 0; h = file_key(h, exe); }
+#endif
+    h = file_key(h, beer_d3d12_dxil_library_path());
+    {
+        Dl_info info;   /* vkd3d-shader (DXBC), wherever it was found */
+        h = file_key(h, load_api() && dladdr((void *)g_api.compile, &info) ? info.dli_fname : NULL);
+    }
+    const char *opts[] = { "BEER_SPV_FLOAT_CONTROLS", "BEER_SPV_INVARIANT_POSITION", "BEER_SPV_SYNC" };
+    for (size_t i = 0; i < sizeof(opts) / sizeof(*opts); ++i) {
+        const char *v = getenv(opts[i]);
+        h = fnv64_seed((const uint8_t *)(v ? v : "<unset>"), strlen(v ? v : "<unset>") + 1, h);
+    }
+    return key = h ? h : 1;
+}
+
+static void disk_cache_path(char *path, size_t size, const char *dir, const uint8_t *dxbc, size_t dxbc_size,
+                            uint64_t layout_key)
+{
+    if (layout_key)
+        snprintf(path, size, "%s/%016llx-%zx-%016llx.bin", dir,
+                 (unsigned long long)fnv64_seed(dxbc, dxbc_size, 1469598103934665603ull), dxbc_size,
+                 (unsigned long long)layout_key);
+    else
+        snprintf(path, size, "%s/%016llx-%zx.bin", dir,
+                 (unsigned long long)fnv64_seed(dxbc, dxbc_size, 1469598103934665603ull), dxbc_size);
+}
+/* Everything about a root layout that changes a root-signature translation. */
+static uint64_t disk_layout_key(const BeerD3D12RootLayout *layout)
+{
+    const uint32_t words[5] = { layout->heap_model, layout->descriptor_count, layout->word_count, layout->zero_word,
+                                layout->static_count };
+    uint64_t h = fnv64_seed((const uint8_t *)&layout->hash, sizeof(layout->hash), 0x51a7e5c0ffee1234ull);
+    h = fnv64_seed((const uint8_t *)words, sizeof(words), h);
+    return h ? h : 1;
+}
+
+/* Loads a translation into a new cache entry (not yet linked), or returns NULL. */
+static TranslationCacheEntry *disk_cache_load(const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash,
+                                              uint64_t layout_key)
+{
+    const char *dir = disk_cache_dir();
+    if (!dir) return NULL;
+    char path[600];
+    disk_cache_path(path, sizeof(path), dir, dxbc, dxbc_size, layout_key);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    DiskCacheHeader h;
+    TranslationCacheEntry *entry = NULL;
+    if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != DISK_CACHE_MAGIC || h.version != DISK_CACHE_VERSION ||
+        h.build_key != disk_cache_build_key() || h.dxbc_size != dxbc_size || h.layout_key != layout_key ||
+        h.check_hash != fnv64_seed(dxbc, dxbc_size, 0x9e3779b97f4a7c15ull) ||
+        h.descriptor_count > BEER_D3D12_MAX_SHADER_DESCRIPTORS || !h.spirv_size || (h.spirv_size & 3u) ||
+        h.spirv_size > (64u << 20))
+        goto fail;
+    entry = calloc(1, sizeof(*entry));
+    if (!entry || !(entry->shader.spirv = malloc(h.spirv_size))) goto fail;
+    if (fread(entry->shader.descriptors, sizeof(entry->shader.descriptors[0]), h.descriptor_count, f) !=
+            h.descriptor_count ||
+        fread(entry->shader.spirv, 1, h.spirv_size, f) != h.spirv_size)
+        goto fail;
+    fclose(f);
+    entry->content_hash = content_hash(dxbc, dxbc_size);
+    entry->dxbc_size = dxbc_size;
+    entry->shader.descriptor_count = h.descriptor_count;
+    entry->shader.spirv_size = h.spirv_size;
+    entry->shader.shader_hash = shader_hash;
+    return entry;
+fail:
+    fclose(f);
+    cache_entry_free(entry);
+    return NULL;
+}
+
+static void disk_cache_store(const uint8_t *dxbc, size_t dxbc_size, const BeerD3D12TranslatedShader *shader,
+                             uint64_t layout_key)
+{
+    const char *dir = disk_cache_dir();
+    if (!dir || !shader || !shader->spirv || !shader->spirv_size) return;
+    char path[600], tmp[640];
+    disk_cache_path(path, sizeof(path), dir, dxbc, dxbc_size, layout_key);
+    snprintf(tmp, sizeof(tmp), "%s.%d.%ld.tmp", path, (int)getpid(), (long)syscall(SYS_gettid));   /* threads translate concurrently */
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    const DiskCacheHeader h = {
+        .magic = DISK_CACHE_MAGIC, .version = DISK_CACHE_VERSION, .build_key = disk_cache_build_key(),
+        .check_hash = fnv64_seed(dxbc, dxbc_size, 0x9e3779b97f4a7c15ull), .dxbc_size = dxbc_size,
+        .descriptor_count = shader->descriptor_count, .spirv_size = shader->spirv_size, .layout_key = layout_key,
+    };
+    const int ok = fwrite(&h, sizeof(h), 1, f) == 1 &&
+                   fwrite(shader->descriptors, sizeof(shader->descriptors[0]), shader->descriptor_count, f) ==
+                       shader->descriptor_count &&
+                   fwrite(shader->spirv, 1, shader->spirv_size, f) == shader->spirv_size;
+    if (fclose(f) != 0 || !ok) { unlink(tmp); return; }
+    if (rename(tmp, path) != 0) unlink(tmp);   /* atomic: readers see the old file or the complete new one */
+}
+
+static TranslationCacheEntry *translate_fresh(const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash);
+
+/* Lookup under g_lock; disk-cache load or translation without it (the game compiles pipelines on many threads, and
+ * one translation can take tens of milliseconds); insert under g_lock again. */
+static const BeerD3D12TranslatedShader *translate_cached(
     const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash)
 {
-    for (TranslationCacheEntry *entry = g_cache; entry; entry = entry->next) {
-        if (entry->shader.shader_hash == shader_hash &&
-            entry->dxbc_size == dxbc_size &&
-            memcmp(entry->dxbc, dxbc, dxbc_size) == 0)
-            return &entry->shader;
+    const uint64_t chash = content_hash(dxbc, dxbc_size);
+    pthread_mutex_lock(&g_lock);
+    TranslationCacheEntry *found = cache_find_locked(shader_hash, chash, dxbc_size, 0);
+    pthread_mutex_unlock(&g_lock);
+    if (found) return &found->shader;
+    TranslationCacheEntry *entry = disk_cache_load(dxbc, dxbc_size, shader_hash, 0);
+    if (!entry) {
+        entry = translate_fresh(dxbc, dxbc_size, shader_hash);
+        if (!entry) return NULL;
+        disk_cache_store(dxbc, dxbc_size, &entry->shader, 0);
     }
+    entry->content_hash = chash;
+    entry->dxbc_size = dxbc_size;
+    entry->shader.shader_hash = shader_hash;
+    pthread_mutex_lock(&g_lock);
+    entry = cache_insert_locked(entry);
+    pthread_mutex_unlock(&g_lock);
+    g_error[0] = '\0';
+    return &entry->shader;
+}
+
+static TranslationCacheEntry *translate_fresh(const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash)
+{
     if (beer_d3d12_is_dxil(dxbc, dxbc_size)) {
         uint32_t stage = ~0u;
         TranslationCacheEntry *entry = calloc(1, sizeof(*entry));
-        if (!entry || !(entry->dxbc = malloc(dxbc_size))) {
-            free(entry);
+        if (!entry) {
             set_error("out of memory while caching translated shader");
             return NULL;
         }
         if (!beer_d3d12_dxil_translate(dxbc, dxbc_size, stage, &entry->shader)) {
-            free(entry->dxbc);
             free(entry);
             set_error("DXIL to SPIR-V translation failed");
             return NULL;
         }
-        memcpy(entry->dxbc, dxbc, dxbc_size);
         entry->dxbc_size = dxbc_size;
         entry->shader.shader_hash = shader_hash;
         if (!getenv("BEER_SPV_FLOAT_CONTROLS") || atoi(getenv("BEER_SPV_FLOAT_CONTROLS"))) {
@@ -542,6 +795,10 @@ static const BeerD3D12TranslatedShader *translate_locked(
                      (unsigned long long)shader_hash);
             FILE *f = fopen(path, "wb");
             if (f) { fwrite(entry->shader.spirv, 1, entry->shader.spirv_size, f); fclose(f); }
+            snprintf(path, sizeof(path), "%s/%016llx.dxil", getenv("BEER_DUMP_SHADERS"),   /* the source container */
+                     (unsigned long long)shader_hash);
+            f = fopen(path, "wb");
+            if (f) { fwrite(dxbc, 1, dxbc_size, f); fclose(f); }
         }
         unsigned accel = 0;
         for (uint32_t d = 0; d < entry->shader.descriptor_count; ++d)
@@ -549,12 +806,12 @@ static const BeerD3D12TranslatedShader *translate_locked(
         fprintf(stderr, "[DXIL] translated shader %016llx descriptors=%u spirv=%zu%s\n",
                 (unsigned long long)shader_hash, entry->shader.descriptor_count,
                 entry->shader.spirv_size, accel ? " RAY-QUERY" : "");
-        entry->next = g_cache;
-        g_cache = entry;
-        g_error[0] = '\0';
-        return &entry->shader;
+        return entry;
     }
-    if (!load_api()) return NULL;
+    pthread_mutex_lock(&g_lock);
+    const int api = load_api();
+    pthread_mutex_unlock(&g_lock);
+    if (!api) return NULL;
     {   /* Diagnostic: BEER_DUMP_SHADERS=<dir> writes every distinct DXBC blob. */
         const char *dir = getenv("BEER_DUMP_SHADERS");
         if (dir) {
@@ -651,19 +908,13 @@ static const BeerD3D12TranslatedShader *translate_locked(
     if (messages) g_api.free_messages(messages);
 
     TranslationCacheEntry *entry = calloc(1, sizeof(*entry));
-    if (!entry || !(entry->dxbc = malloc(dxbc_size)) ||
-        !(entry->shader.spirv = malloc(spirv.size))) {
+    if (!entry || !(entry->shader.spirv = malloc(spirv.size))) {
         set_error("out of memory while caching translated shader");
-        if (entry) {
-            free(entry->shader.spirv);
-            free(entry->dxbc);
-        }
-        free(entry);
+        cache_entry_free(entry);
         g_api.free_code(&spirv);
         g_api.free_scan(&scan);
         return NULL;
     }
-    memcpy(entry->dxbc, dxbc, dxbc_size);
     memcpy(entry->shader.spirv, spirv.code, spirv.size);
     size_t final_size = spirv.size;
     if (!getenv("BEER_SPV_FLOAT_CONTROLS") || atoi(getenv("BEER_SPV_FLOAT_CONTROLS"))) {
@@ -718,18 +969,67 @@ static const BeerD3D12TranslatedShader *translate_locked(
         (void)semantic_binding(source, binding_stage,
                                &destination->binding);
     }
-    entry->next = g_cache;
-    g_cache = entry;
     g_api.free_code(&spirv);
     g_api.free_scan(&scan);
-    g_error[0] = '\0';
     if (getenv("BEER_D3D12_DIAGNOSTICS"))
         fprintf(stderr,
                 "[SHADER-TRANSLATOR] translated hash=%016llx stage=%u "
                 "descriptors=%u spirv=%zu bytes\n",
                 (unsigned long long)shader_hash, binding_stage,
                 entry->shader.descriptor_count, entry->shader.spirv_size);
-    return &entry->shader;
+    return entry;
+}
+
+/* Root-signature translations (see the header). Entries carry the layout hash; a failed translation is cached too
+ * (spirv NULL) so the shader is not retried for every pipeline that uses it. */
+const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
+    const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash, const BeerD3D12RootLayout *layout)
+{
+    if (!dxbc || !layout || !layout->hash || !beer_d3d12_is_dxil(dxbc, dxbc_size)) return NULL;
+    const uint64_t chash = content_hash(dxbc, dxbc_size);
+    pthread_mutex_lock(&g_lock);
+    TranslationCacheEntry *found = cache_find_locked(shader_hash, chash, dxbc_size, layout->hash);
+    pthread_mutex_unlock(&g_lock);
+    if (found) return found->shader.spirv ? &found->shader : NULL;
+    const uint64_t layout_key = disk_layout_key(layout);
+    TranslationCacheEntry *entry = disk_cache_load(dxbc, dxbc_size, shader_hash, layout_key);
+    if (entry) {                                                       /* translated by an earlier run */
+        entry->shader.root_layout_hash = layout->hash;
+        pthread_mutex_lock(&g_lock);
+        entry = cache_insert_locked(entry);
+        pthread_mutex_unlock(&g_lock);
+        return &entry->shader;
+    }
+    entry = calloc(1, sizeof(*entry));
+    if (!entry) return NULL;
+    entry->content_hash = chash;
+    entry->dxbc_size = dxbc_size;
+    if (beer_d3d12_dxil_translate_rs(dxbc, dxbc_size, ~0u, layout, &entry->shader)) {
+        if (!getenv("BEER_SPV_FLOAT_CONTROLS") || atoi(getenv("BEER_SPV_FLOAT_CONTROLS"))) {
+            size_t size = 0;
+            uint32_t *patched = spirv_preserve_inf_nan((const uint32_t *)entry->shader.spirv,
+                                                       entry->shader.spirv_size, &size);
+            if (patched) { free(entry->shader.spirv); entry->shader.spirv = (void *)patched; entry->shader.spirv_size = size; }
+        }
+        if (spirv_invariant_position_enabled()) {
+            size_t size = 0;
+            uint32_t *patched = spirv_invariant_position((const uint32_t *)entry->shader.spirv,
+                                                         entry->shader.spirv_size, &size);
+            if (patched) { free(entry->shader.spirv); entry->shader.spirv = (void *)patched; entry->shader.spirv_size = size; }
+        }
+        disk_cache_store(dxbc, dxbc_size, &entry->shader, layout_key);
+    } else {
+        free(entry->shader.spirv);
+        entry->shader.spirv = NULL;
+        entry->shader.spirv_size = 0;
+        entry->shader.descriptor_count = 0;
+    }
+    entry->shader.shader_hash = shader_hash;
+    entry->shader.root_layout_hash = layout->hash;
+    pthread_mutex_lock(&g_lock);
+    entry = cache_insert_locked(entry);
+    pthread_mutex_unlock(&g_lock);
+    return entry->shader.spirv ? &entry->shader : NULL;
 }
 
 const BeerD3D12TranslatedShader *beer_d3d12_translate_shader(
@@ -739,11 +1039,13 @@ const BeerD3D12TranslatedShader *beer_d3d12_translate_shader(
         set_error("shader is not a valid DXBC container");
         return NULL;
     }
-    pthread_mutex_lock(&g_lock);
-    const BeerD3D12TranslatedShader *result =
-        translate_locked(dxbc, dxbc_size, shader_hash);
-    pthread_mutex_unlock(&g_lock);
-    return result;
+    {   /* one-time lazy state (cache directory, build key) is set up under the lock, before any unlocked use */
+        static int ready;
+        pthread_mutex_lock(&g_lock);
+        if (!ready) { if (disk_cache_dir()) (void)disk_cache_build_key(); ready = 1; }
+        pthread_mutex_unlock(&g_lock);
+    }
+    return translate_cached(dxbc, dxbc_size, shader_hash);
 }
 
 const char *beer_d3d12_shader_translation_error(void)
@@ -754,13 +1056,12 @@ const char *beer_d3d12_shader_translation_error(void)
 void beer_d3d12_shader_translator_destroy(void)
 {
     pthread_mutex_lock(&g_lock);
-    while (g_cache) {
-        TranslationCacheEntry *next = g_cache->next;
-        free(g_cache->shader.spirv);
-        free(g_cache->dxbc);
-        free(g_cache);
-        g_cache = next;
-    }
+    for (size_t b = 0; b < CACHE_BUCKETS; ++b)
+        while (g_cache[b]) {
+            TranslationCacheEntry *next = g_cache[b]->next;
+            cache_entry_free(g_cache[b]);
+            g_cache[b] = next;
+        }
     if (g_api.library) dlclose(g_api.library);
     memset(&g_api, 0, sizeof(g_api));
     pthread_mutex_unlock(&g_lock);

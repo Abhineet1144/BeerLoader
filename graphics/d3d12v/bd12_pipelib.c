@@ -147,6 +147,10 @@ typedef struct {
                                * pipeline objects are not kept (a BD12 pipeline holds its shader bytecode, and
                                * engines store tens of thousands) */
     uint32_t loads, misses;
+    /* Stored pipeline objects: the library holds a reference to each until it is released, as D3D12 specifies
+     * (a pipeline that was not compiled yet costs only its description; shader bytecode is shared). */
+    ComObj **held;
+    uint32_t held_count, held_capacity;
 } ComPipelib;
 
 static void pipelib_destroy(ComObj *o)
@@ -155,6 +159,8 @@ static void pipelib_destroy(ComObj *o)
     fprintf(stderr, "[BD12] pipeline library released: %u pipelines, %u loads, %u misses\n",
             self->lib.count, self->loads, self->misses);
     bd12_pipelib_clear(&self->lib);
+    for (uint32_t i = 0; i < self->held_count; ++i) com_release(self->held[i]);
+    free(self->held);
     pthread_mutex_destroy(&self->lock);
     free(self);
 }
@@ -162,11 +168,37 @@ static void pipelib_destroy(ComObj *o)
 static HR MS pipelib_query(ComObj *s, const uint8_t *riid, void **out)
 { return com_obj_query(s, riid, out, iid_pipeline_library, iid_pipeline_library1); }
 
+/* BEER_BD12_PIPELIB_LOG=1: every 500th call of each method, with totals (what an engine's precompile step does). */
+static uint64_t g_pipelib_calls[5];   /* store, load hit, load miss, serialized-size, serialize */
+static void pipelib_count(int which)
+{
+    static int log = -1;
+    if (log < 0) log = getenv("BEER_BD12_PIPELIB_LOG") != NULL;
+    const uint64_t n = __atomic_add_fetch(&g_pipelib_calls[which], 1, __ATOMIC_RELAXED);
+    if (log && (n == 1 || n % 500 == 0))
+        fprintf(stderr, "[PIPELIB] store=%llu load-hit=%llu load-miss=%llu size=%llu serialize=%llu\n",
+                (unsigned long long)g_pipelib_calls[0], (unsigned long long)g_pipelib_calls[1],
+                (unsigned long long)g_pipelib_calls[2], (unsigned long long)g_pipelib_calls[3],
+                (unsigned long long)g_pipelib_calls[4]);
+}
+
 static HR MS pipelib_store(ComPipelib *self, const uint16_t *name, ComObj *pso)
 {
+    pipelib_count(0);
     if (!name || !pso) return HR_E_INVALIDARG;
     pthread_mutex_lock(&self->lock);
-    const int result = bd12_pipelib_add(&self->lib, name, com_pso_is_compute(pso) ? 1u : 0u);
+    int result = bd12_pipelib_add(&self->lib, name, com_pso_is_compute(pso) ? 1u : 0u);
+    if (!result && !getenv("BEER_BD12_PIPELIB_NO_HOLD")) {
+        if (self->held_count == self->held_capacity) {
+            const uint32_t capacity = self->held_capacity ? self->held_capacity * 2 : 256;
+            ComObj **grown = realloc(self->held, capacity * sizeof(*grown));
+            if (grown) { self->held = grown; self->held_capacity = capacity; }
+        }
+        if (self->held_count < self->held_capacity) {
+            com_add_ref(pso);
+            self->held[self->held_count++] = pso;
+        }
+    }
     pthread_mutex_unlock(&self->lock);
     return result == -1 ? HR_E_INVALIDARG                       /* the name is taken */
          : result ? HR_E_OUTOFMEMORY : HR_OK;
@@ -184,8 +216,13 @@ static HR load(ComPipelib *self, const uint16_t *name, const void *desc, int kin
                                      self->lib.entries[index].kind == (uint32_t)kind);
     if (found) ++self->loads; else ++self->misses;
     pthread_mutex_unlock(&self->lock);
+    pipelib_count(found ? 1 : 2);
     if (!found) return HR_E_INVALIDARG;                         /* not in the library: the caller compiles */
-    return com_create_pso(self->obj.dev, desc, kind, riid, out);
+    extern __thread int g_bd12_pso_from_library;   /* bd12_com_list.c: see compile_at_create */
+    g_bd12_pso_from_library = 1;
+    const HR hr = com_create_pso(self->obj.dev, desc, kind, riid, out);
+    g_bd12_pso_from_library = 0;
+    return hr;
 }
 
 static HR MS pipelib_load_graphics(ComPipelib *self, const uint16_t *name, const void *desc, const uint8_t *riid,
@@ -200,6 +237,7 @@ static HR MS pipelib_load_stream(ComPipelib *self, const uint16_t *name, const v
 
 static uint64_t MS pipelib_serialized_size(ComPipelib *self)
 {
+    pipelib_count(3);
     pthread_mutex_lock(&self->lock);
     const size_t size = bd12_pipelib_serialized_size(&self->lib);
     pthread_mutex_unlock(&self->lock);
@@ -208,6 +246,7 @@ static uint64_t MS pipelib_serialized_size(ComPipelib *self)
 
 static HR MS pipelib_serialize(ComPipelib *self, void *data, uint64_t size)
 {
+    pipelib_count(4);
     pthread_mutex_lock(&self->lock);
     const int ok = bd12_pipelib_serialize(&self->lib, data, (size_t)size);
     const uint32_t count = self->lib.count;

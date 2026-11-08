@@ -68,6 +68,28 @@ impl_NtSetInformationProcess(u64 process, u32 info_class, const void *buffer, u3
     case 29:    /* ProcessBreakOnTermination requires SeDebugPrivilege, which this process does not hold */
         if (length != sizeof(u32)) return NT_STATUS_INFO_LENGTH_MISMATCH;
         return NT_STATUS_PRIVILEGE_NOT_HELD;
+    case 40: {  /* ProcessInstrumentationCallback */
+        /* x64 takes either the bare callback pointer or PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION
+         * { ULONG Version (0); ULONG Reserved (0); PVOID Callback }. A process may set it on itself without
+         * SeDebugPrivilege. The kernel then returns to it from every system service (R10 = the real return address);
+         * Beer does the same for system calls the guest executes (win32_syscall.c), as Wine's dispatcher does.
+         * Protectors check that the callback runs, and treat a refusal as tampering. */
+        if (length != sizeof(u64) && length != 2 * sizeof(u64)) return NT_STATUS_INFO_LENGTH_MISMATCH;
+        if (!buffer) return NT_STATUS_ACCESS_VIOLATION;
+        u64 callback;
+        if (length == 2 * sizeof(u64)) {
+            const u32 *header = buffer;
+            if (header[0] || header[1]) return NT_STATUS_INVALID_PARAMETER;
+            callback = ((const u64 *)buffer)[1];
+        } else {
+            callback = *(const u64 *)buffer;
+        }
+        static _Atomic(u64) instrumentation_callback;
+        if (atomic_exchange(&instrumentation_callback, callback) != callback)
+            fprintf(stderr, "[NTINFO] instrumentation callback set: %#llx\n", (unsigned long long)callback);
+        beer_win32_syscall_set_instrumentation_callback(callback);
+        return NT_STATUS_SUCCESS;
+    }
     default:
         native_info_unsupported("NtSetInformationProcess", info_class);
         return NT_STATUS_INVALID_INFO_CLASS;
@@ -162,9 +184,12 @@ impl_NtSetInformationThreadNative(u64 thread, u32 info_class, const void *info, 
 static u64 __attribute__((ms_abi))
 impl_NtDelayExecution(u32 alertable, const s64 *interval)
 {
-    (void)alertable;            /* Beer has no guest APC queue to deliver while waiting */
     if (!interval) return NT_STATUS_ACCESS_VIOLATION;
     s64 value = *interval;
+    if (alertable && value <= 0) {   /* relative delay: deliver this thread's APCs (STATUS_USER_APC) */
+        u64 ms = value ? ((u64)(-value) + 9999u) / 10000u : 0;
+        return beer_alertable_wait(ms >= 0xFFFFFFFFu ? 0xFFFFFFFEu : (u32)ms, NULL, NULL, 0, 0xC0);
+    }
     if (value < 0) {            /* relative, in 100 ns units */
         u64 ns = (u64)(-value) * 100u;
         struct timespec ts = { (time_t)(ns / 1000000000u), (long)(ns % 1000000000u) };

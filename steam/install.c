@@ -528,7 +528,7 @@ typedef struct {
     size_t next;                 /* next unique chunk to take */
     uint8_t *done_shas;          /* sorted SHA-1s finished in an earlier run */
     size_t done_count;
-    FILE *progress;
+    int progress;                /* staging/<appid>.done, O_APPEND: one 20-byte SHA-1 per write */
     pthread_mutex_t lock;
     int server_seed;
     int exited;                  /* workers that have finished */
@@ -641,9 +641,10 @@ static void *download_worker(void *arg)
             pthread_mutex_unlock(&d->lock);
             break;
         }
-        pthread_mutex_lock(&d->lock);
-        fwrite(p->sha, 1, 20, d->progress);
-        pthread_mutex_unlock(&d->lock);
+        /* One write per record: an exit at any point leaves whole records (a buffered FILE lost its tail
+           mid-record, and later appends then sat 1-19 bytes off the record grid). */
+        ssize_t wrote = write(d->progress, p->sha, 20); /* a failed record only costs a re-download */
+        (void)wrote;
         pthread_mutex_lock(&d->in->lock);
         d->job->done += p->compressed;
         pthread_mutex_unlock(&d->in->lock);
@@ -657,7 +658,10 @@ static void *download_worker(void *arg)
     return NULL;
 }
 
-static uint8_t *load_done(const char *path, size_t *count)
+/* Reads the finished-chunk journal and rewrites it compactly. Older builds could leave a partial record
+   followed by appended ones at a shifted alignment, so every byte phase is scanned; only SHA-1s this plan
+   needs (`wanted`, sorted) are kept, which also drops the garbage windows. */
+static uint8_t *load_done(const char *path, const uint8_t *wanted, size_t wanted_count, size_t *count)
 {
     *count = 0;
     FILE *f = fopen(path, "rb");
@@ -665,16 +669,41 @@ static uint8_t *load_done(const char *path, size_t *count)
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    size_t n = size > 0 ? (size_t)size / 20 : 0;
-    uint8_t *shas = n ? malloc(n * 20) : NULL;
-    if (shas && fread(shas, 20, n, f) == n) {
-        qsort(shas, n, 20, cmp_sha);
-        *count = n;
-    } else {
-        free(shas);
-        shas = NULL;
-    }
+    uint8_t *raw = size > 0 ? malloc((size_t)size) : NULL;
+    int read_ok = raw && fread(raw, 1, (size_t)size, f) == (size_t)size;
     fclose(f);
+    if (!read_ok || !wanted_count) { free(raw); return NULL; }
+    size_t cap = (size_t)size / 20 + 1, n = 0;
+    if (cap > wanted_count) cap = wanted_count;
+    uint8_t *shas = malloc(cap * 20);
+    for (size_t phase = 0; shas && phase < 20; phase++)
+        for (size_t off = phase; off + 20 <= (size_t)size; off += 20) {
+            if (!bsearch(raw + off, wanted, wanted_count, 20, cmp_sha)) continue;
+            if (n == cap) {
+                uint8_t *grown = realloc(shas, cap * 2 * 20);
+                if (!grown) { free(shas); shas = NULL; break; }
+                shas = grown;
+                cap *= 2;
+            }
+            memcpy(shas + n++ * 20, raw + off, 20);
+        }
+    free(raw);
+    if (!shas || !n) { free(shas); return NULL; }
+    qsort(shas, n, 20, cmp_sha);
+    size_t unique = 0;
+    for (size_t i = 0; i < n; i++)
+        if (!unique || memcmp(shas + i * 20, shas + (unique - 1) * 20, 20))
+            memmove(shas + unique++ * 20, shas + i * 20, 20);
+    /* Replace the journal with the clean set (the old one stays if any step fails). */
+    char tmp[4200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        int ok = write(fd, shas, unique * 20) == (ssize_t)(unique * 20) && !fsync(fd);
+        close(fd);
+        if (!ok || rename(tmp, path)) unlink(tmp);
+    }
+    *count = unique;
     return shas;
 }
 
@@ -989,11 +1018,16 @@ static int run_job(Installer *in, Job *job)
     d.server_count = server_count;
     d.starts = starts;
     d.unique = unique;
-    d.done_shas = load_done(done_path, &d.done_count);
-    d.progress = fopen(done_path, "ab");
+    uint8_t *wanted = malloc((unique ? unique : 1) * 20);
+    if (!wanted) { free(starts); job_fail(in, job, "out of memory"); goto out; }
+    for (size_t i = 0; i < unique; i++) memcpy(wanted + i * 20, plan.places[starts[i]].sha, 20);
+    qsort(wanted, unique, 20, cmp_sha);
+    d.done_shas = load_done(done_path, wanted, unique, &d.done_count);
+    free(wanted);
+    d.progress = open(done_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     pthread_mutex_init(&d.lock, NULL);
     d.limit_start = now_seconds();
-    if (!d.progress) { free(starts); free(d.done_shas); job_fail(in, job, "could not write %s", done_path); goto out; }
+    if (d.progress < 0) { free(starts); free(d.done_shas); job_fail(in, job, "could not write %s", done_path); goto out; }
     set_job(in, job, JOB_DOWNLOADING, 0, download_total);
     fprintf(stderr, "[STEAM] app %u: %zu depots, %zu files to build, %zu chunks (%.1f MB)\n", req->appid,
             depot_count, plan.file_count, unique, download_total / 1e6);
@@ -1019,7 +1053,7 @@ static int run_job(Installer *in, Job *job)
         emit_job(in, job);
     }
     for (int t = 0; t < started; t++) pthread_join(threads[t], NULL);
-    fclose(d.progress);
+    close(d.progress);
     free(d.done_shas);
     free(starts);
     pthread_mutex_destroy(&d.lock);
@@ -1327,7 +1361,12 @@ char *installs_json(const char *const *folders, size_t count)
             Record r;
             if (!record_load(folders[i], appid, &r)) continue;
             char name[600], folder[2100], installdir[600], state[64], branch[160], buildid[64], exe[1100],
-                 args[2100], cwd[1100], item[9000];
+                 args[2100], cwd[1100], item[9000], done_path[4096];
+            /* Chunks an unfinished download already wrote (staging/<appid>.done holds one SHA-1 each). */
+            unsigned long long chunks_done = 0;
+            struct stat done_st;
+            meta_path(done_path, sizeof(done_path), folders[i], "staging/%u.done", appid);
+            if (!stat(done_path, &done_st)) chunks_done = (unsigned long long)done_st.st_size / 20;
             json_escape(name, sizeof(name), r.name);
             json_escape(folder, sizeof(folder), folders[i]);
             json_escape(installdir, sizeof(installdir), r.installdir);
@@ -1340,9 +1379,9 @@ char *installs_json(const char *const *folders, size_t count)
             int n = snprintf(item, sizeof(item),
                              "%s{\"appid\":%u,\"name\":\"%s\",\"folder\":\"%s\",\"installdir\":\"%s\",\"state\":\"%s\","
                              "\"branch\":\"%s\",\"buildid\":\"%s\",\"size\":%llu,\"executable\":\"%s\","
-                             "\"arguments\":\"%s\",\"workingdir\":\"%s\"}",
+                             "\"arguments\":\"%s\",\"workingdir\":\"%s\",\"chunks_done\":%llu}",
                              len > 1 ? "," : "", appid, name, folder, installdir, state, branch, buildid,
-                             (unsigned long long)r.size, exe, args, cwd);
+                             (unsigned long long)r.size, exe, args, cwd, chunks_done);
             if (n < 0 || (size_t)n >= sizeof(item)) continue;
             if (len + (size_t)n + 2 > cap) {
                 while (len + (size_t)n + 2 > cap) cap *= 2;

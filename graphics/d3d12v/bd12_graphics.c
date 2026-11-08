@@ -22,10 +22,134 @@ static VkShaderModule make_module(BD12Device *device, const BD12ShaderCode *code
     return module;
 }
 
+/* ---- Shared layouts ----
+ * Engines create tens of thousands of pipelines over a few hundred distinct binding shapes. One descriptor-set
+ * layout and pipeline layout per pipeline multiplied the driver objects (and their memory) by the pipeline count;
+ * identical ones are now shared and live as long as the device. A key is the layout's full description as words;
+ * equal keys are equal layouts (Vulkan layouts are compared by definition, so sharing a handle changes nothing a
+ * pipeline or descriptor set can observe). */
+typedef struct { BD12Device *device; uint64_t hash; uint64_t *key; uint32_t words; uint64_t handle; } SharedLayout;
+static SharedLayout *g_shared_layouts;
+static uint32_t g_shared_layout_count, g_shared_layout_capacity;
+static pthread_mutex_t g_shared_layout_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t shared_key_hash(const uint64_t *key, uint32_t words)
+{
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    for (uint32_t i = 0; i < words; ++i) { h ^= key[i]; h *= UINT64_C(0x100000001b3); h ^= h >> 31; }
+    return h ? h : 1;
+}
+/* Looks the key up; on a miss calls create() and remembers the result. kind separates the two layout kinds. */
+static uint64_t shared_layout_get(BD12Device *device, uint64_t *key, uint32_t words,
+                                  uint64_t (*create)(BD12Device *, const void *), const void *info)
+{
+    const uint64_t hash = shared_key_hash(key, words);
+    pthread_mutex_lock(&g_shared_layout_lock);
+    for (uint32_t i = 0; i < g_shared_layout_count; ++i) {
+        const SharedLayout *e = &g_shared_layouts[i];
+        if (e->device == device && e->hash == hash && e->words == words &&
+            !memcmp(e->key, key, words * sizeof(*key))) {
+            const uint64_t handle = e->handle;
+            pthread_mutex_unlock(&g_shared_layout_lock);
+            return handle;
+        }
+    }
+    const uint64_t handle = create(device, info);
+    if (handle && g_shared_layout_count == g_shared_layout_capacity) {
+        const uint32_t capacity = g_shared_layout_capacity ? g_shared_layout_capacity * 2 : 256;
+        SharedLayout *grown = realloc(g_shared_layouts, capacity * sizeof(*grown));
+        if (grown) { g_shared_layouts = grown; g_shared_layout_capacity = capacity; }
+    }
+    if (handle && g_shared_layout_count < g_shared_layout_capacity) {
+        uint64_t *copy = malloc(words * sizeof(*copy));
+        if (copy) {
+            memcpy(copy, key, words * sizeof(*copy));
+            g_shared_layouts[g_shared_layout_count++] = (SharedLayout){ device, hash, copy, words, handle };
+            if (getenv("BEER_BD12_PIPELIB_LOG") && (g_shared_layout_count == 1 || !(g_shared_layout_count % 200)))
+                fprintf(stderr, "[BD12] shared layouts: %u distinct\n", g_shared_layout_count);
+        }
+    }
+    pthread_mutex_unlock(&g_shared_layout_lock);
+    return handle;
+}
+static uint64_t create_set_layout(BD12Device *device, const void *info)
+{
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    if (device->vk.CreateDescriptorSetLayout(device->device, info, NULL, &layout) != VK_SUCCESS) return 0;
+    return (uint64_t)layout;
+}
+static uint64_t create_pipeline_layout(BD12Device *device, const void *info)
+{
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    if (device->vk.CreatePipelineLayout(device->device, info, NULL, &layout) != VK_SUCCESS) return 0;
+    return (uint64_t)layout;
+}
+
+VkDescriptorSetLayout bd12_shared_set_layout(BD12Device *device, const VkDescriptorSetLayoutCreateInfo *info)
+{
+    const VkDescriptorBindingFlags *flags = NULL;
+    for (const VkBaseInStructure *next = info->pNext; next; next = next->pNext)
+        if (next->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO) {
+            const VkDescriptorSetLayoutBindingFlagsCreateInfo *f = (const void *)next;
+            if (f->bindingCount == info->bindingCount) flags = f->pBindingFlags;
+        } else {
+            VkDescriptorSetLayout layout = VK_NULL_HANDLE;              /* an extension the key doesn't cover */
+            return device->vk.CreateDescriptorSetLayout(device->device, info, NULL, &layout) == VK_SUCCESS
+                   ? layout : VK_NULL_HANDLE;
+        }
+    uint32_t samplers = 0;
+    for (uint32_t i = 0; i < info->bindingCount; ++i)
+        if (info->pBindings[i].pImmutableSamplers) samplers += info->pBindings[i].descriptorCount;
+    const uint32_t words = 3 + info->bindingCount * 3 + samplers;
+    uint64_t stack_key[512], *key = words <= 512 ? stack_key : malloc(words * sizeof(*key));
+    if (!key) return VK_NULL_HANDLE;
+    uint32_t n = 0;
+    key[n++] = 1;                                                         /* kind: set layout */
+    key[n++] = info->flags;
+    key[n++] = info->bindingCount;
+    for (uint32_t i = 0; i < info->bindingCount; ++i) {
+        const VkDescriptorSetLayoutBinding *b = &info->pBindings[i];
+        key[n++] = (uint64_t)b->binding << 32 | (uint32_t)b->descriptorType;
+        key[n++] = (uint64_t)b->descriptorCount << 32 | b->stageFlags;
+        key[n++] = (uint64_t)(flags ? flags[i] : 0) << 1 | (b->pImmutableSamplers != NULL);
+        for (uint32_t k = 0; b->pImmutableSamplers && k < b->descriptorCount; ++k)
+            key[n++] = (uint64_t)b->pImmutableSamplers[k];
+    }
+    const uint64_t handle = shared_layout_get(device, key, n, create_set_layout, info);
+    if (key != stack_key) free(key);
+    return (VkDescriptorSetLayout)handle;
+}
+
+VkPipelineLayout bd12_shared_pipeline_layout(BD12Device *device, const VkPipelineLayoutCreateInfo *info)
+{
+    uint64_t key[3 + 8 + 2 * 4];
+    if (info->pNext || info->setLayoutCount > 8 || info->pushConstantRangeCount > 4) {
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        return device->vk.CreatePipelineLayout(device->device, info, NULL, &layout) == VK_SUCCESS
+               ? layout : VK_NULL_HANDLE;
+    }
+    uint32_t n = 0;
+    key[n++] = 2;                                                         /* kind: pipeline layout */
+    key[n++] = info->flags;
+    key[n++] = (uint64_t)info->setLayoutCount << 32 | info->pushConstantRangeCount;
+    for (uint32_t i = 0; i < info->setLayoutCount; ++i) key[n++] = (uint64_t)info->pSetLayouts[i];
+    for (uint32_t i = 0; i < info->pushConstantRangeCount; ++i) {
+        const VkPushConstantRange *r = &info->pPushConstantRanges[i];
+        key[n++] = (uint64_t)r->stageFlags << 32 | r->offset;
+        key[n++] = r->size;
+    }
+    return (VkPipelineLayout)shared_layout_get(device, key, n, create_pipeline_layout, info);
+}
+
 BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     BD12Device *device, const BD12GraphicsPipelineDesc *desc)
 {
-    if (!desc->vs.spirv || desc->rt_count > BD12_MAX_RENDER_TARGETS) return NULL;
+    const int mesh = desc->ms.spirv != NULL;
+    /* A mesh pipeline has a mesh shader (and optionally an amplification shader) instead of every vertex stage. */
+    if (mesh ? (desc->vs.spirv || desc->hs.spirv || desc->ds.spirv || desc->gs.spirv || !device->CmdDrawMeshTasksEXT)
+             : (!desc->vs.spirv || desc->as.spirv))
+        return NULL;
+    if (desc->rt_count > BD12_MAX_RENDER_TARGETS) return NULL;
     if (!desc->hs.spirv != !desc->ds.spirv) return NULL;
     BD12GraphicsPipeline *gp = calloc(1, sizeof(*gp));
     if (!gp) return NULL;
@@ -33,12 +157,13 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     /* Stable diagnostic identity; no shader-specific behavior depends on it. */
     uint64_t hash = UINT64_C(1469598103934665603);
     /* Pipeline stages in Vulkan order; absent ones have no SPIR-V. */
-    enum { STAGES = 5 };
-    const BD12ShaderCode *stages[STAGES] = { &desc->vs, &desc->hs, &desc->ds, &desc->gs, &desc->ps };
+    enum { STAGES = 7 };
+    const BD12ShaderCode *stages[STAGES] = { &desc->vs, &desc->hs, &desc->ds, &desc->gs, &desc->ps,
+                                             &desc->as, &desc->ms };
     static const VkShaderStageFlagBits stage_bits[STAGES] = {
         VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
         VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
-        VK_SHADER_STAGE_FRAGMENT_BIT
+        VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TASK_BIT_EXT, VK_SHADER_STAGE_MESH_BIT_EXT
     };
     const BD12ShaderCode *const *hash_stages = stages;
     for (int s = 0; s < STAGES; ++s) {
@@ -67,6 +192,7 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
             gp->stages |= stage_bits[s];
         }
     gp->tessellated = desc->hs.spirv != NULL;
+    gp->mesh = mesh;
     VkDescriptorSetLayoutBinding *layout_bindings =
         calloc(total ? total : 1, sizeof(*layout_bindings));
     gp->bindings = calloc(total ? total : 1, sizeof(*gp->bindings));
@@ -78,9 +204,12 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     if (!gp->bindless) goto fail;
     uint32_t *dense_spirv[STAGES] = { NULL };
     uint32_t next_binding = 0;
+    /* Descriptor-buffer pipelines (bd12_heapdb.c) read everything through the heaps, static samplers and push
+     * constants of a device-owned layout: no set 0 of their own, SPIR-V used as translated. */
+    const int db = desc->db_layout != NULL;
     if (!layout_bindings || !gp->bindings || !gp->binding_types) goto fail;
     for (int s = 0; s < STAGES; ++s) {
-        if (!stages[s]->spirv) continue;
+        if (!stages[s]->spirv || db) continue;
         const uint32_t n = stages[s]->binding_count;
         stage_binds[s] = calloc(n ? n : 1, sizeof(*stage_binds[s]));
         if (!stage_binds[s]) goto fail;
@@ -100,7 +229,7 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
                                                &next_binding);
         if (!dense_spirv[s]) goto fail;
     }
-    for (int s = 0; s < STAGES; ++s) {
+    for (int s = 0; s < STAGES && !db; ++s) {
         for (uint32_t i = 0; stages[s]->spirv && i < stage_kept[s]; ++i) {
             BD12ShaderBinding b = stage_binds[s][i];
             VkDescriptorType type;
@@ -117,40 +246,55 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
             ++gp->binding_count;
         }
     }
+    gp->root_push_bytes = desc->root_push_bytes;
+    gp->root_layout_hash = desc->root_layout_hash;
+    if (db) {
+        gp->db_layout = desc->db_layout;
+        gp->layout = bd12_db_pipeline_layout(desc->db_layout);   /* owned by the device */
+        goto layout_done;
+    }
+    VkDescriptorBindingFlags *binding_flags = calloc(gp->binding_count ? gp->binding_count : 1,
+                                                     sizeof(*binding_flags));
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info;
     VkDescriptorSetLayoutCreateInfo set_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = binding_flags ? bd12_layout_partial_arrays(device, layout_bindings, gp->binding_count,
+                                                            binding_flags, &flags_info) : NULL,
         .bindingCount = gp->binding_count,
         .pBindings = layout_bindings
     };
-    if (device->vk.CreateDescriptorSetLayout(device->device, &set_info, NULL,
-                                             &gp->set_layout) != VK_SUCCESS)
-        goto fail;
+    gp->set_layout = bd12_shared_set_layout(device, &set_info);
+    free(binding_flags);
+    if (!gp->set_layout) goto fail;
     VkDescriptorSetLayout set_layouts[2] = { gp->set_layout, VK_NULL_HANDLE };
+    /* Root-signature pipelines (bd12_rootpush.c): the push block holds the root arguments, set 1 is the heap
+     * mirror, set 0 only static samplers. */
+    const int uses_mirror = gp->bindless_words || gp->root_push_bytes;
     VkPushConstantRange push_range = {
         .stageFlags = gp->stages,
-        .size = gp->bindless_words * 4
+        .size = gp->root_push_bytes ? gp->root_push_bytes : gp->bindless_words * 4
     };
-    if (gp->bindless_words) {
+    if (uses_mirror) {
         set_layouts[1] = bd12_mirror_layout(device);
         if (!set_layouts[1]) goto fail;
     }
     VkPipelineLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = gp->bindless_words ? 2u : 1u,
+        .setLayoutCount = uses_mirror ? 2u : 1u,
         .pSetLayouts = set_layouts,
-        .pushConstantRangeCount = gp->bindless_words ? 1u : 0u,
+        .pushConstantRangeCount = uses_mirror ? 1u : 0u,
         .pPushConstantRanges = &push_range
     };
-    if (device->vk.CreatePipelineLayout(device->device, &layout_info, NULL,
-                                        &gp->layout) != VK_SUCCESS)
+    if (!(gp->layout = bd12_shared_pipeline_layout(device, &layout_info)))
         goto fail;
+layout_done:;
 
     VkPipelineShaderStageCreateInfo shader_stages[STAGES];
     uint32_t stage_count = 0;
     for (int s = 0; s < STAGES; ++s) {
         if (!stages[s]->spirv) continue;
         BD12ShaderCode dense = *stages[s];
-        dense.spirv = dense_spirv[s];
+        if (!db) dense.spirv = dense_spirv[s];
         modules[s] = make_module(device, &dense);
         if (!modules[s]) goto fail;
         shader_stages[stage_count++] = (VkPipelineShaderStageCreateInfo){
@@ -260,17 +404,24 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
         .attachmentCount = desc->rt_count,
         .pAttachments = blend_attachments
     };
-    const VkDynamicState dynamic_states[] = {
+    VkDynamicState dynamic_states[7] = {
         VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
         VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
-        VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
-        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
         VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-        VK_DYNAMIC_STATE_STENCIL_REFERENCE
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
+        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY
     };
+    /* Vertex input and topology do not exist in a mesh pipeline and must not be dynamic there. */
+    uint32_t dynamic_count = mesh ? 4 : 6;
+    /* VRS: the per-draw rate and combiners are dynamic in every pipeline, so RSSetShadingRate never needs a new
+     * pipeline; with a rate image (tier 2) every pipeline may also render with the shading-rate attachment. */
+    const int vrs = device->CmdSetFragmentShadingRateKHR != NULL;
+    const int vrs_image = vrs && device->modern->vrs_tier >= 2;
+    if (vrs) dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;
     VkPipelineDynamicStateCreateInfo dynamic = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = sizeof(dynamic_states) / sizeof(dynamic_states[0]),
+        .dynamicStateCount = dynamic_count,
         .pDynamicStates = dynamic_states
     };
     const VkImageAspectFlags ds_aspect =
@@ -293,10 +444,12 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
     VkGraphicsPipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &rendering,
+        .flags = (db ? VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT : 0) |
+                 (vrs_image ? VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR : 0),
         .stageCount = stage_count,
         .pStages = shader_stages,
-        .pVertexInputState = &vertex_input,
-        .pInputAssemblyState = &input_assembly,
+        .pVertexInputState = mesh ? NULL : &vertex_input,
+        .pInputAssemblyState = mesh ? NULL : &input_assembly,
         .pTessellationState = gp->tessellated ? &tessellation : NULL,
         .pViewportState = &viewport,
         .pRasterizationState = &raster,
@@ -336,11 +489,7 @@ void bd12_graphics_pipeline_destroy(BD12GraphicsPipeline *gp)
     BD12Device *device = gp->device;
     if (gp->pipeline)
         device->vk.DestroyPipeline(device->device, gp->pipeline, NULL);
-    if (gp->layout)
-        device->vk.DestroyPipelineLayout(device->device, gp->layout, NULL);
-    if (gp->set_layout)
-        device->vk.DestroyDescriptorSetLayout(device->device, gp->set_layout,
-                                              NULL);
+    /* gp->layout and gp->set_layout are shared (bd12_shared_*_layout) or owned by the descriptor-buffer layout. */
     free(gp->bindings);
     free(gp->bindless);
     free(gp->binding_types);
@@ -370,6 +519,7 @@ void bd12_cmd_set_graphics_root_constants(BD12CmdList *list, uint32_t parameter,
     memcpy(&arg->constants[dest_offset], data, count * sizeof(uint32_t));
     arg->cbv_valid = 0;
     ++list->graphics.epoch;
+    BD12_ROOT_CHANGED(0, 0);
 }
 
 void bd12_cmd_set_graphics_root_va(BD12CmdList *list, uint32_t parameter,
@@ -378,6 +528,7 @@ void bd12_cmd_set_graphics_root_va(BD12CmdList *list, uint32_t parameter,
     if (parameter < BD12_MAX_ROOT_PARAMETERS && list->graphics.arguments[parameter].value != gpu_va) {
         list->graphics.arguments[parameter].value = gpu_va;
         ++list->graphics.epoch;
+        BD12_ROOT_CHANGED(0, 1);
     }
 }
 
@@ -387,6 +538,7 @@ void bd12_cmd_set_graphics_root_table(BD12CmdList *list, uint32_t parameter,
     if (parameter < BD12_MAX_ROOT_PARAMETERS && list->graphics.arguments[parameter].value != gpu_handle) {
         list->graphics.arguments[parameter].value = gpu_handle;
         ++list->graphics.epoch;
+        BD12_ROOT_CHANGED(0, 2);
     }
 }
 
@@ -500,6 +652,43 @@ void bd12_cmd_set_stencil_ref(BD12CmdList *list, uint32_t ref)
     list->gfx.dirty |= BD12_DIRTY_STENCIL;
 }
 
+void bd12_cmd_set_shading_rate(BD12CmdList *list, uint32_t rate, const uint32_t *combiners)
+{
+    if (!list->device->CmdSetFragmentShadingRateKHR) return;
+    { static int logged; if (!logged++) fprintf(stderr, "[BD12] first RSSetShadingRate(rate=0x%x, combiners %u,%u)\n",
+                                                rate, combiners ? combiners[0] : 0, combiners ? combiners[1] : 0); }
+    BD12GfxState *g = &list->gfx;
+    g->shading_rate = rate & 0xfu;
+    g->shading_combiners[0] = combiners ? combiners[0] : 0;
+    g->shading_combiners[1] = combiners ? combiners[1] : 0;
+    g->dirty |= BD12_DIRTY_SHADING_RATE;
+}
+
+void bd12_cmd_set_shading_rate_image(BD12CmdList *list, BD12Image *image)
+{
+    BD12Device *device = list->device;
+    if (!device->CmdSetFragmentShadingRateKHR || device->modern->vrs_tier < 2) return;
+    { static int logged; if (image && !logged++) fprintf(stderr, "[BD12] first RSSetShadingRateImage(%ux%u)\n",
+                                                         image->desc.width, image->desc.height); }
+    BD12GfxState *g = &list->gfx;
+    if (image && !(image->usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)) {
+        static int logged;
+        if (!logged++) fprintf(stderr, "[BD12] RSSetShadingRateImage: image is not a 2D R8_UINT texture; ignored\n");
+        image = NULL;
+    }
+    if (image == g->shading_rate_image) return;
+    /* The rate image is part of the rendering scope: an open one ends, the next draw begins a new one. */
+    bd12_cmd_end_rendering(list);
+    g->shading_rate_image = image;
+    g->shading_rate_view = VK_NULL_HANDLE;
+    if (image) {
+        bd12_image_ensure_initialized(list, image);
+        g->shading_rate_view = bd12_image_view(image, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8_UINT,
+                                               VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
+        if (!g->shading_rate_view) g->shading_rate_image = NULL;
+    }
+}
+
 /* Rendering scopes ---------------------------------------------------------------- */
 
 void bd12_cmd_end_rendering(BD12CmdList *list)
@@ -521,7 +710,7 @@ static void begin_rendering_for(BD12CmdList *list,
                                 const BD12Descriptor *dsv, int clear_color,
                                 const float *color, int clear_depth,
                                 int clear_stencil, float depth,
-                                uint32_t stencil)
+                                uint32_t stencil, int with_shading_rate)
 {
     BD12Device *device = list->device;
     VkRenderingAttachmentInfo colors[BD12_MAX_RENDER_TARGETS];
@@ -583,6 +772,22 @@ static void begin_rendering_for(BD12CmdList *list,
         .pStencilAttachment = dsv && (dsv->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ?
                               &stencil_info : NULL
     };
+    /* RSSetShadingRateImage: the rate image covers the render area in tiles. One that is too small for this
+     * render area cannot be attached (Vulkan requires full coverage); it is then ignored, i.e. rate 1x1 from it. */
+    VkRenderingFragmentShadingRateAttachmentInfoKHR shading_rate = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR
+    };
+    if (with_shading_rate && list->gfx.shading_rate_view && device->modern->vrs_tile) {
+        const BD12Image *image = list->gfx.shading_rate_image;
+        const uint32_t tile = device->modern->vrs_tile;
+        if (image && (uint64_t)image->desc.width * tile >= info.renderArea.extent.width &&
+            (uint64_t)image->desc.height * tile >= info.renderArea.extent.height) {
+            shading_rate.imageView = list->gfx.shading_rate_view;
+            shading_rate.imageLayout = bd12_layout_for_state(BD12_STATE_SHADING_RATE_SOURCE, 0);
+            shading_rate.shadingRateAttachmentTexelSize = (VkExtent2D){ tile, tile };
+            info.pNext = &shading_rate;
+        }
+    }
     if (getenv("BEER_BD12_CAPTURE_DEBUG") && bd12_trace_active()) fprintf(stderr, "[CAPTURE] begin rendering rtv=%u en=%d\n", rtv_count, bd12_capture_rt_enabled());
     if (bd12_capture_rt_enabled()) {
         for (uint32_t i = 0; i < rtv_count && i < BD12_MAX_RENDER_TARGETS; ++i)
@@ -603,7 +808,7 @@ static void begin_draw_rendering(BD12CmdList *list)
     BD12GfxState *g = &list->gfx;
     if (g->rendering) return;
     begin_rendering_for(list, g->rtv, g->rtv_count, g->has_dsv ? &g->dsv : NULL,
-                        0, NULL, 0, 0, 0.0f, 0);
+                        0, NULL, 0, 0, 0.0f, 0, 1);
     g->rendering = 1;
 }
 
@@ -611,7 +816,14 @@ static void begin_draw_rendering(BD12CmdList *list)
 
 static VkBuffer live_buffer(BD12Device *device, uint64_t va, VkBuffer expected);
 
-static int prepare_draw(BD12CmdList *list)
+static int prepare_draw_state(BD12CmdList *list);
+
+static int prepare_graphics(BD12CmdList *list, int mesh);
+static int prepare_draw(BD12CmdList *list) { return prepare_graphics(list, 0); }
+
+/* Everything a draw (mesh = 0) or a mesh dispatch (mesh = 1) needs before the Vulkan draw command. The two only
+ * differ in vertex-pipeline state: patch lists, topology and vertex buffers do not exist for mesh pipelines. */
+static int prepare_graphics(BD12CmdList *list, int mesh)
 {
     BD12Device *device = list->device;
     BD12GfxState *g = &list->gfx;
@@ -622,6 +834,16 @@ static int prepare_draw(BD12CmdList *list)
         { static unsigned logged; if (logged++ < 5) fprintf(stderr, "[BD12] draw dropped: pipeline=%p root_signature=%p resolve_hook=%p\n", (void *)gp, (void *)list->graphics.root_signature, (void *)(uintptr_t)list->resolve_hook); }
         return 0;
     }
+    if (gp->mesh != mesh) {
+        /* Draw* with a mesh pipeline, or DispatchMesh with a vertex pipeline: invalid D3D12, nothing to run. */
+        static int logged;
+        if (logged++ < 5)
+            fprintf(stderr, "[BD12] %s with a %s pipeline: dropped\n", mesh ? "DispatchMesh" : "draw",
+                    gp->mesh ? "mesh" : "vertex");
+        BD12_DROP(BD12_DROP_DRAW_NO_STATE);
+        return 0;
+    }
+    if (!mesh) {
     /* A patch list needs the pipeline's hull/domain stages, and those
      * stages need a patch list. A patch list reaching a pipeline without
      * tessellation is invalid Vulkan (Mesa ANV crashes in vkCmdDraw):
@@ -645,7 +867,26 @@ static int prepare_draw(BD12CmdList *list)
         g->bound_topology = topology;
         g->dirty |= BD12_DIRTY_TOPOLOGY;
     }
+    }
     if (bd12_debug_sync_all()) bd12_cmd_global_barrier(list);
+    if (gp->db_layout) {
+        /* Descriptor-buffer pipeline: the heaps are bound once, the root arguments are push constants. Pending
+         * first-use image transitions are recorded before rendering begins. */
+        if (!bd12_db_prepare(list)) {
+            BD12_DROP(BD12_DROP_DRAW_NO_DESCRIPTORS);
+            return 0;
+        }
+        begin_draw_rendering(list);
+        if (g->dirty & BD12_DIRTY_PIPELINE)
+            device->vk.CmdBindPipeline(list->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, gp->pipeline);
+        g->bound_set = VK_NULL_HANDLE;
+        if (!bd12_cmd_push_root_arguments(list, &list->graphics, VK_PIPELINE_BIND_POINT_GRAPHICS, gp->layout,
+                                          gp->stages, gp->root_push_bytes, gp->root_layout_hash, gp->db_layout)) {
+            BD12_DROP(BD12_DROP_DRAW_NO_DESCRIPTORS);
+            return 0;
+        }
+        return prepare_draw_state(list);
+    }
     /* Resolve first: it can emit first-use layout barriers, which must not
      * land inside a rendering scope. */
     VkDescriptorSet set = bd12_resolve_descriptor_set(
@@ -655,7 +896,7 @@ static int prepare_draw(BD12CmdList *list)
         BD12_DROP(BD12_DROP_DRAW_NO_DESCRIPTORS);
         return 0;
     }
-    if (gp->bindless_words && !bd12_mirror_prepare(list)) {
+    if ((gp->bindless_words || gp->root_push_bytes) && !bd12_mirror_prepare(list)) {
         BD12_DROP(BD12_DROP_DRAW_NO_DESCRIPTORS);
         return 0;
     }
@@ -669,19 +910,42 @@ static int prepare_draw(BD12CmdList *list)
         device->vk.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                          gp->layout, 0, 1, &set, 0, NULL);
         g->bound_set = set;
+        bd12_cmd_note_set_binding(list, 0);
     }
-    if (gp->bindless_words)
+    if (gp->root_push_bytes) {
+        if (!bd12_cmd_push_root_arguments(list, &list->graphics, VK_PIPELINE_BIND_POINT_GRAPHICS, gp->layout,
+                                          gp->stages, gp->root_push_bytes, gp->root_layout_hash, NULL)) {
+            BD12_DROP(BD12_DROP_DRAW_NO_DESCRIPTORS);
+            return 0;
+        }
+    } else if (gp->bindless_words)
         bd12_cmd_bind_bindless(list, &list->graphics, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                gp->layout,
                                gp->stages,
                                gp->bindless, gp->bindless_count, gp->bindless_words);
+    return prepare_draw_state(list);
+}
+
+/* Dynamic state, vertex buffers and the rest of a draw's bindings that do not depend on descriptors. */
+static int prepare_draw_state(BD12CmdList *list)
+{
+    BD12Device *device = list->device;
+    BD12GfxState *g = &list->gfx;
+    BD12GraphicsPipeline *gp = g->pipeline;
+    VkCommandBuffer cb = list->command_buffer;
     if ((g->dirty & BD12_DIRTY_VIEWPORT) && g->viewport_count)
         device->vk.CmdSetViewportWithCount(cb, g->viewport_count, g->viewports);
     if ((g->dirty & BD12_DIRTY_SCISSOR) && g->scissor_count)
         device->vk.CmdSetScissorWithCount(cb, g->scissor_count, g->scissors);
+    if (gp->mesh) {
+        /* No topology or vertex input here. A mesh pipeline does not carry the vertex pipeline's dynamic state, so
+         * the next vertex draw sets its topology again (vertex buffers follow the pipeline change anyway). */
+        g->bound_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+        g->dirty &= ~(BD12_DIRTY_TOPOLOGY | BD12_DIRTY_VERTEX);
+    }
     if (g->dirty & BD12_DIRTY_TOPOLOGY)
         device->vk.CmdSetPrimitiveTopology(cb, g->bound_topology);
-    if (g->dirty & (BD12_DIRTY_VERTEX | BD12_DIRTY_PIPELINE)) {
+    if (!gp->mesh && (g->dirty & (BD12_DIRTY_VERTEX | BD12_DIRTY_PIPELINE))) {
         VkBuffer buffers[BD12_MAX_VERTEX_BUFFERS];
         VkDeviceSize offsets[BD12_MAX_VERTEX_BUFFERS];
         VkDeviceSize sizes[BD12_MAX_VERTEX_BUFFERS];
@@ -704,6 +968,26 @@ static int prepare_draw(BD12CmdList *list)
     if (g->dirty & BD12_DIRTY_STENCIL)
         device->vk.CmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK,
                                           g->stencil_ref);
+    if ((g->dirty & BD12_DIRTY_SHADING_RATE) && device->CmdSetFragmentShadingRateKHR) {
+        /* D3D12_SHADING_RATE and Vulkan's fragment size share the log2 encoding; D3D12_SHADING_RATE_COMBINER
+         * PASSTHROUGH, OVERRIDE, MIN, MAX, SUM map to KEEP, REPLACE, MIN, MAX, MUL (a sum of log2 sizes is a
+         * product of sizes). */
+        static const VkFragmentShadingRateCombinerOpKHR ops[5] = {
+            VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR, VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR,
+            VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MIN_KHR, VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR,
+            VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MUL_KHR
+        };
+        const VkExtent2D size = { 1u << ((g->shading_rate >> 2) & 3u), 1u << (g->shading_rate & 3u) };
+        VkFragmentShadingRateCombinerOpKHR combiners[2];
+        for (int i = 0; i < 2; ++i) {
+            const uint32_t c = g->shading_combiners[i];
+            combiners[i] = c < 5 ? ops[c] : VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+            if (device->modern->vrs_tier < 2) combiners[i] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+            else if (combiners[i] == VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MUL_KHR && !device->modern->vrs_sum_combiner)
+                combiners[i] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR;
+        }
+        device->CmdSetFragmentShadingRateKHR(cb, &size, combiners);
+    }
     g->dirty &= BD12_DIRTY_INDEX;  /* index binding is handled per indexed draw */
     return 1;
 }
@@ -796,6 +1080,43 @@ int bd12_cmd_draw_indirect_count(BD12CmdList *list, BD12Buffer *args,
     list->device->vk.CmdDrawIndirectCount(
         list->command_buffer, args->buffer, offset, count_buffer->buffer,
         count_offset, max_count, stride ? stride : 16);
+    return 1;
+}
+
+/* Mesh dispatches ------------------------------------------------------------------- */
+
+int bd12_cmd_dispatch_mesh(BD12CmdList *list, uint32_t x, uint32_t y, uint32_t z)
+{
+    { static int logged; if (!logged++) fprintf(stderr, "[BD12] first DispatchMesh(%u, %u, %u)\n", x, y, z); }
+    if (!list->device->CmdDrawMeshTasksEXT || !prepare_graphics(list, 1)) return 0;
+    if (bd12_trace_active())
+        fprintf(stderr, "[TRACE] mesh-direct pipeline=%016llx groups=%u,%u,%u\n",
+                (unsigned long long)list->gfx.pipeline->shader_hash, x, y, z);
+    if (!x || !y || !z) return 1;
+    list->device->CmdDrawMeshTasksEXT(list->command_buffer, x, y, z);
+    return 1;
+}
+
+/* D3D12_DISPATCH_MESH_ARGUMENTS and VkDrawMeshTasksIndirectCommandEXT are the same three group counts. */
+int bd12_cmd_dispatch_mesh_indirect(BD12CmdList *list, BD12Buffer *args, VkDeviceSize offset,
+                                    BD12Buffer *count_buffer, VkDeviceSize count_offset,
+                                    uint32_t max_count, uint32_t stride)
+{
+    BD12Device *device = list->device;
+    { static int logged; if (!logged++) fprintf(stderr, "[BD12] first indirect DispatchMesh (max %u, count buffer %d)\n",
+                                                max_count, count_buffer != NULL); }
+    if (!device->CmdDrawMeshTasksEXT || !args || !max_count || !prepare_graphics(list, 1)) return 0;
+    if (!stride) stride = 12;
+    if (bd12_trace_active())     /* traced frame: every indirect mesh dispatch */
+        fprintf(stderr, "[TRACE] mesh-indirect pipeline=%016llx args=%llx+%llu max=%u stride=%u count=%llx+%llu\n",
+                (unsigned long long)list->gfx.pipeline->shader_hash, (unsigned long long)args->va,
+                (unsigned long long)offset, max_count, stride,
+                (unsigned long long)(count_buffer ? count_buffer->va : 0), (unsigned long long)count_offset);
+    if (count_buffer)
+        device->CmdDrawMeshTasksIndirectCountEXT(list->command_buffer, args->buffer, offset, count_buffer->buffer,
+                                                 count_offset, max_count, stride);
+    else
+        device->CmdDrawMeshTasksIndirectEXT(list->command_buffer, args->buffer, offset, max_count, stride);
     return 1;
 }
 
@@ -895,9 +1216,9 @@ void bd12_cmd_clear_rtv(BD12CmdList *list, const BD12Descriptor *rtv,
         bd12_cmd_end_rendering(list);
     }
     if (!rect_count) {
-        begin_rendering_for(list, rtv, 1, NULL, 1, color, 0, 0, 0.0f, 0);
+        begin_rendering_for(list, rtv, 1, NULL, 1, color, 0, 0, 0.0f, 0, 0);
     } else {
-        begin_rendering_for(list, rtv, 1, NULL, 0, NULL, 0, 0, 0.0f, 0);
+        begin_rendering_for(list, rtv, 1, NULL, 0, NULL, 0, 0, 0.0f, 0, 0);
         device->vk.CmdClearAttachments(list->command_buffer, 1, &attachment, n,
                                        clear_rects);
     }
@@ -937,9 +1258,9 @@ void bd12_cmd_clear_dsv(BD12CmdList *list, const BD12Descriptor *dsv,
     const int cd = (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
     const int cs = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
     if (!rect_count) {
-        begin_rendering_for(list, NULL, 0, dsv, 0, NULL, cd, cs, depth, stencil);
+        begin_rendering_for(list, NULL, 0, dsv, 0, NULL, cd, cs, depth, stencil, 0);
     } else {
-        begin_rendering_for(list, NULL, 0, dsv, 0, NULL, 0, 0, 0.0f, 0);
+        begin_rendering_for(list, NULL, 0, dsv, 0, NULL, 0, 0, 0.0f, 0, 0);
         device->vk.CmdClearAttachments(list->command_buffer, 1, &attachment, n,
                                        clear_rects);
     }

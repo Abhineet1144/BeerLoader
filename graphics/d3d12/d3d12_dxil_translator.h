@@ -7,6 +7,8 @@
 int beer_d3d12_is_dxil(const uint8_t *dxbc, size_t size);
 /* Nonzero when dxil-spirv can be loaded, i.e. DXIL (shader model 6) shaders can be translated. */
 int beer_d3d12_dxil_available(void);
+/* File the dxil-spirv library was loaded from (NULL when unavailable): part of the shader disk-cache key. */
+const char *beer_d3d12_dxil_library_path(void);
 
 /* Translates a DXIL container with dxil-spirv. `stage_namespace` is the binding
  * namespace (0 compute, 1 vertex, 2 pixel, ...) used to number descriptors.
@@ -14,6 +16,10 @@ int beer_d3d12_dxil_available(void);
 int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
                               uint32_t stage_namespace,
                               BeerD3D12TranslatedShader *out);
+/* The same for a root-signature layout (BeerD3D12RootLayout): 0 when the shader needs something it cannot
+ * express that way. */
+int beer_d3d12_dxil_translate_rs(const uint8_t *container, size_t size, uint32_t stage_namespace,
+                                 const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out);
 
 /* One translated ray tracing entry point (raygen, miss, hit, intersection, callable). */
 typedef struct BeerD3D12RtShader {

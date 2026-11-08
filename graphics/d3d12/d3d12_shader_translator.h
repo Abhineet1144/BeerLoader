@@ -57,11 +57,58 @@ typedef struct BeerD3D12TranslatedShader {
     BeerD3D12ShaderDescriptor descriptors[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
     uint32_t descriptor_count;
     uint64_t shader_hash;
+    uint64_t root_layout_hash;   /* nonzero: translated for a root signature (beer_d3d12_translate_shader_rs) */
 } BeerD3D12TranslatedShader;
+
+/* Root-signature layout for root-signature translation: the root arguments are passed as push constants, laid out
+ * as `descriptor_count` 64-bit GPU addresses (root CBV/SRV/UAV, in push_index order) followed by `word_count`
+ * 32-bit words (each table's first heap index, root constants, and one word kept zero for direct heap access).
+ * Descriptor tables are read straight from the bindless heap mirror (set 1); static samplers stay set-0 bindings. */
+#define BEER_ROOT_TABLE 0u
+#define BEER_ROOT_CONSTANTS 1u
+#define BEER_ROOT_CBV 2u
+#define BEER_ROOT_SRV 3u
+#define BEER_ROOT_UAV 4u
+typedef struct {
+    uint32_t type;               /* BEER_D3D12_SHADER_DESCRIPTOR_* (SRV, UAV, CBV, SAMPLER) */
+    uint32_t count;              /* UINT32_MAX = unbounded */
+    uint32_t base_register, space;
+    uint32_t offset;             /* descriptors from the table start (appended ranges resolved) */
+} BeerD3D12RootRange;
+typedef struct {
+    uint32_t type;               /* BEER_ROOT_* */
+    uint32_t visibility;         /* D3D12_SHADER_VISIBILITY */
+    uint32_t shader_register, space, dword_count;
+    const BeerD3D12RootRange *ranges;
+    uint32_t range_count;
+    uint32_t push_index;         /* descriptor slot (CBV/SRV/UAV) or first word (table, constants) */
+} BeerD3D12RootParam;
+typedef struct {
+    uint32_t param_count;
+    BeerD3D12RootParam params[64];
+    uint32_t static_count;
+    uint32_t static_register[64], static_space[64];
+    uint32_t descriptor_count, word_count, zero_word;
+    /* Where heap descriptors live. BEER_HEAP_MODEL_CLASSES: set 1, one array per class (bindings 0-5, samplers 5),
+     * static samplers in set 0 at translator-assigned bindings. BEER_HEAP_MODEL_MUTABLE: set 0 binding 0 is one
+     * mutable-type array for the CBV/SRV/UAV heap, set 1 binding 0 the sampler heap, set 2 binding i static
+     * sampler i (immutable). */
+    uint32_t heap_model;
+    uint64_t hash;               /* of everything above that affects translation */
+} BeerD3D12RootLayout;
+#define BEER_HEAP_MODEL_CLASSES 0u
+#define BEER_HEAP_MODEL_MUTABLE 1u
+
+/* Like beer_d3d12_translate_shader for a DXIL shader, translated for `layout` (see BeerD3D12RootLayout). Returns
+ * NULL when the shader cannot use root-signature translation (DXBC, UAV counters, acceleration structures, ...);
+ * the caller then uses beer_d3d12_translate_shader. Cached per (shader, layout). */
+const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
+    const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash, const BeerD3D12RootLayout *layout);
 
 /* Automatically scans DXBC resource declarations and translates the shader to
  * Vulkan SPIR-V. Each D3D register receives a deterministic descriptor binding
  * in set zero. Results are cached by shader hash and bytecode identity. */
+void beer_d3d12_translator_stats(void);
 const BeerD3D12TranslatedShader *beer_d3d12_translate_shader(
     const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash);
 

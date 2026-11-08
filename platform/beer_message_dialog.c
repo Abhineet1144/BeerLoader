@@ -290,6 +290,14 @@ int beer_message_dialog(const char *title, const char *text, const int *ids,
 
 int beer_message_box_dialog(const char *title, const char *text, unsigned type)
 {
+    /* BEER_NO_DIALOGS=1 (diagnostic, unattended runs): show nothing; callers fall back to the type's default.
+     * BEER_NO_DIALOGS=default: show nothing and answer with the dialog's default button, as pressing Enter would. */
+    static int quiet = -1;
+    if (quiet < 0) {
+        const char *setting = getenv("BEER_NO_DIALOGS");
+        quiet = !setting ? 0 : !strcmp(setting, "default") ? 2 : 1;
+    }
+    if (quiet == 1) return -1;
     enum { IDOK = 1, IDCANCEL = 2, IDABORT = 3, IDRETRY = 4, IDIGNORE = 5, IDYES = 6, IDNO = 7,
            IDTRYAGAIN = 10, IDCONTINUE = 11 };
     static const struct { int count, cancel; int ids[3]; const char *labels[3]; } sets[] = {
@@ -305,6 +313,7 @@ int beer_message_box_dialog(const char *title, const char *text, unsigned type)
     if (kind >= sizeof(sets) / sizeof(*sets)) kind = 0;
     int default_index = (int)((type >> 8) & 0xf);   /* MB_DEFBUTTON1..4 = 0x000, 0x100, 0x200, 0x300 */
     if (default_index >= sets[kind].count) default_index = 0;
+    if (quiet == 2) return sets[kind].ids[default_index];
     return beer_message_dialog(title, text, sets[kind].ids, sets[kind].labels, sets[kind].count,
                                default_index, sets[kind].cancel);
 }

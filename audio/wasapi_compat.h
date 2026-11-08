@@ -10,5 +10,9 @@ uint64_t beer_wasapi_create_instance(const void *class_id, const void *interface
 void beer_wasapi_set_event_signaler(BeerWasapiSignalEventFn signal_event);
 int16_t beer_wasapi_float_bits_to_s16(uint32_t bits);
 void beer_wasapi_shutdown(void);
+/* mmdevapi!ActivateAudioInterfaceAsync (Windows ordinal 17). */
+uint64_t __attribute__((ms_abi)) beer_ActivateAudioInterfaceAsync(const uint16_t *device_path, const void *iid,
+                                                                  void *parameters, void *completion_handler,
+                                                                  void **operation);
 
 #endif

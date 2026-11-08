@@ -15,6 +15,9 @@ typedef struct {
     VkDevice device;
     VkQueue queue;
     uint32_t queue_family;
+    uint32_t queue_family_size;   /* queues the family offers */
+    VkQueue queues[BEER_VULKAN_MAX_QUEUES]; /* [0] == queue; more with BEER_BD12_MULTI_QUEUE=1 */
+    uint32_t queue_count;
     PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
     PFN_vkDestroyInstance DestroyInstance;
@@ -33,6 +36,9 @@ typedef struct {
     int ray_tracing;
     int timeline_semaphore;
     int texel_buffer_alignment;
+    int descriptor_buffer_ext, mutable_descriptor_ext;
+    int fragment_shading_rate_ext; /* VK_KHR_fragment_shading_rate requested (BEER_BD12_VRS=1) */
+    int mesh_shader_ext;          /* VK_EXT_mesh_shader requested (BEER_BD12_MESH=1) */
     int nvx_cuda;                 /* VK_NVX_binary_import + VK_NVX_image_view_handle: NVAPI CUDA kernels (DLSS) */
     BeerVulkanModern modern;
     int device_lost;
@@ -54,6 +60,94 @@ typedef struct {
 static BeerVulkanContext g_context;
 static pthread_mutex_t g_context_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Locks for queues 1.. (queue 0 uses g_queue_lock, shared with the presenter and older renderers). */
+static pthread_mutex_t g_queue_locks[BEER_VULKAN_MAX_QUEUES] = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER };
+
+/* VK_KHR_fragment_shading_rate: which D3D12 VRS tier the device can back, and the tile size BD12 reports.
+ * Tier 1 needs per-draw rates; tier 2 adds per-primitive rates and a screen-space rate image. Features the tier
+ * does not need are switched off in `features` before it is chained into device creation. */
+static void query_shading_rate(VkPhysicalDeviceFragmentShadingRateFeaturesKHR *features)
+{
+    BeerVulkanModern *m = &g_context.modern;
+    if (!features->pipelineFragmentShadingRate) {
+        features->primitiveFragmentShadingRate = features->attachmentFragmentShadingRate = VK_FALSE;
+        return;
+    }
+    VkPhysicalDeviceFragmentShadingRatePropertiesKHR props = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR
+    };
+    PFN_vkGetPhysicalDeviceProperties2 get_properties2 = (PFN_vkGetPhysicalDeviceProperties2)
+        g_context.GetInstanceProcAddr(g_context.instance, "vkGetPhysicalDeviceProperties2");
+    PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR get_rates = (PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR)
+        g_context.GetInstanceProcAddr(g_context.instance, "vkGetPhysicalDeviceFragmentShadingRatesKHR");
+    if (!get_properties2 || !get_rates) {
+        features->pipelineFragmentShadingRate = features->primitiveFragmentShadingRate =
+            features->attachmentFragmentShadingRate = VK_FALSE;
+        return;
+    }
+    VkPhysicalDeviceProperties2 properties2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                                .pNext = &props };
+    get_properties2(g_context.physical_device, &properties2);
+    /* D3D12 AdditionalShadingRatesSupported: 2x4, 4x2 and 4x4 at one sample. */
+    uint32_t count = 0;
+    get_rates(g_context.physical_device, &count, NULL);
+    VkPhysicalDeviceFragmentShadingRateKHR rates[32];
+    if (count > 32) count = 32;
+    for (uint32_t i = 0; i < count; ++i)
+        rates[i] = (VkPhysicalDeviceFragmentShadingRateKHR){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR };
+    get_rates(g_context.physical_device, &count, rates);
+    for (uint32_t i = 0; i < count; ++i)
+        if (rates[i].fragmentSize.width == 4 && rates[i].fragmentSize.height == 4 &&
+            (rates[i].sampleCounts & VK_SAMPLE_COUNT_1_BIT))
+            m->vrs_additional_rates = 1;
+    /* D3D12 tiles are square, 8, 16 or 32 pixels; take the smallest the driver accepts. */
+    uint32_t tile = 0;
+    for (uint32_t t = 8; t <= 32 && !tile; t *= 2)
+        if (t >= props.minFragmentShadingRateAttachmentTexelSize.width &&
+            t >= props.minFragmentShadingRateAttachmentTexelSize.height &&
+            t <= props.maxFragmentShadingRateAttachmentTexelSize.width &&
+            t <= props.maxFragmentShadingRateAttachmentTexelSize.height)
+            tile = t;
+    const int tier2 = features->primitiveFragmentShadingRate && features->attachmentFragmentShadingRate &&
+                      tile && props.fragmentShadingRateNonTrivialCombinerOps;
+    if (!tier2) features->primitiveFragmentShadingRate = features->attachmentFragmentShadingRate = VK_FALSE;
+    m->vrs_tier = tier2 ? 2 : 1;
+    m->vrs_tile = tier2 ? tile : 0;
+    m->vrs_sum_combiner = props.fragmentShadingRateNonTrivialCombinerOps;
+    m->vrs_primitive_multi_viewport = tier2 && props.primitiveFragmentShadingRateWithMultipleViewports;
+}
+
+/* VK_EXT_mesh_shader backs D3D12 MeshShaderTier 1 when the device meets the D3D12 limits (256 output vertices and
+ * primitives, 128 threads per group, 16 KiB amplification payload, 28 KiB mesh groupshared memory). Only the task and
+ * mesh stages are enabled; multiview and queries are not used. */
+static void query_mesh_shader(VkPhysicalDeviceMeshShaderFeaturesEXT *features,
+                              const VkPhysicalDeviceFragmentShadingRateFeaturesKHR *shading_rate)
+{
+    VkPhysicalDeviceMeshShaderPropertiesEXT props = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT
+    };
+    PFN_vkGetPhysicalDeviceProperties2 get_properties2 = (PFN_vkGetPhysicalDeviceProperties2)
+        g_context.GetInstanceProcAddr(g_context.instance, "vkGetPhysicalDeviceProperties2");
+    if (get_properties2) {
+        VkPhysicalDeviceProperties2 properties2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                                    .pNext = &props };
+        get_properties2(g_context.physical_device, &properties2);
+    }
+    const int ok = get_properties2 && features->meshShader && features->taskShader &&
+                   props.maxMeshOutputVertices >= 256 && props.maxMeshOutputPrimitives >= 256 &&
+                   props.maxMeshWorkGroupInvocations >= 128 && props.maxTaskWorkGroupInvocations >= 128 &&
+                   props.maxTaskPayloadSize >= 16384 && props.maxMeshSharedMemorySize >= 28672;
+    features->multiviewMeshShader = VK_FALSE;
+    features->meshShaderQueries = VK_FALSE;
+    /* SV_ShadingRate written by a mesh shader (D3D12 OPTIONS10) when VRS tier 2 is on. */
+    features->primitiveFragmentShadingRateMeshShader = ok && features->primitiveFragmentShadingRateMeshShader &&
+                                                       shading_rate->primitiveFragmentShadingRate;
+    if (!ok) features->meshShader = features->taskShader = VK_FALSE;
+    g_context.modern.mesh_shader_tier = ok ? 10 : 0;
+    g_context.modern.mesh_shading_rate = features->primitiveFragmentShadingRateMeshShader;
+}
 
 /* Experiment (BEER_VULKAN_GPU_KEEPALIVE=<MiB per submit>): keep the GPU busy on
  * the shared queue so the driver does not drop to idle clocks between the
@@ -301,6 +395,7 @@ int beer_vulkan_context_initialize(void)
             if ((queues[q].queueFlags & required) == required) {
                 g_context.physical_device = physical_devices[p];
                 g_context.queue_family = q;
+                g_context.queue_family_size = queues[q].queueCount;
                 break;
             }
         }
@@ -310,18 +405,39 @@ int beer_vulkan_context_initialize(void)
     if (!g_context.physical_device) goto fail;
 
     stage = "shared logical device";
-    float priority = 1.0f;
+    /* BEER_BD12_MULTI_QUEUE=1: extra queues of the same family so D3D12 compute and copy queues run beside the
+     * direct queue (vkd3d-proton gives each D3D12 queue its own VkQueue). Same family: command pools, resource
+     * sharing and barrier stages stay valid on every queue. */
+    static const float priorities[BEER_VULKAN_MAX_QUEUES] = { 1.0f, 1.0f, 1.0f };
+    uint32_t want_queues = 1;
+    {
+        const char *multi = getenv("BEER_BD12_MULTI_QUEUE");
+        if (multi && *multi && *multi != '0') want_queues = BEER_VULKAN_MAX_QUEUES;
+        if (want_queues > g_context.queue_family_size) want_queues = g_context.queue_family_size;
+        if (!want_queues) want_queues = 1;
+    }
     VkDeviceQueueCreateInfo queue_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = g_context.queue_family,
-        .queueCount = 1,
-        .pQueuePriorities = &priority
+        .queueCount = want_queues,
+        .pQueuePriorities = priorities
     };
     /* VK_KHR_maintenance1 permits negative viewport heights, which graphics
      * execution uses to preserve D3D's upward-Y clip space. */
     const char *device_extensions[24] = { "VK_KHR_swapchain" };
     int rt_ext_as = 0, rt_ext_rtp = 0, rt_ext_rq = 0, rt_ext_dho = 0, nvx_binary = 0, nvx_view = 0;
     uint32_t device_extension_count = 1;
+    /* D3D12 descriptor heaps as Vulkan descriptor buffers (graphics/d3d12v/bd12_heapdb.c): used by root-signature
+     * translation (BEER_BD12_ROOT_PUSH=1) for now; BEER_NO_DESCRIPTOR_BUFFER=1 keeps them off. */
+    const char *root_push_env = getenv("BEER_BD12_ROOT_PUSH");
+    const int want_descriptor_buffer = root_push_env && *root_push_env && strcmp(root_push_env, "0") != 0 &&
+                                       !getenv("BEER_NO_DESCRIPTOR_BUFFER");
+    /* D3D12 variable-rate shading (BD12 OPTIONS6) on VK_KHR_fragment_shading_rate. Opt-in while it is validated. */
+    const char *vrs_env = getenv("BEER_BD12_VRS");
+    const int want_vrs = vrs_env && *vrs_env && strcmp(vrs_env, "0") != 0;
+    /* D3D12 mesh and amplification shaders (OPTIONS7 MeshShaderTier) on VK_EXT_mesh_shader. Opt-in while validated. */
+    const char *mesh_env = getenv("BEER_BD12_MESH");
+    const int want_mesh = mesh_env && *mesh_env && strcmp(mesh_env, "0") != 0;
     {
         uint32_t available_count = 0;
         g_context.EnumerateDeviceExtensionProperties(
@@ -377,6 +493,22 @@ int beer_vulkan_context_initialize(void)
                 device_extensions[device_extension_count++] =
                     VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME;
                 g_context.texel_buffer_alignment = 1;
+            } else if (!g_context.descriptor_buffer_ext && want_descriptor_buffer &&
+                       strcmp(available[i].extensionName, "VK_EXT_descriptor_buffer") == 0) {
+                device_extensions[device_extension_count++] = "VK_EXT_descriptor_buffer";
+                g_context.descriptor_buffer_ext = 1;
+            } else if (!g_context.mesh_shader_ext && want_mesh &&
+                       strcmp(available[i].extensionName, "VK_EXT_mesh_shader") == 0) {
+                device_extensions[device_extension_count++] = "VK_EXT_mesh_shader";
+                g_context.mesh_shader_ext = 1;
+            } else if (!g_context.fragment_shading_rate_ext && want_vrs &&
+                       strcmp(available[i].extensionName, "VK_KHR_fragment_shading_rate") == 0) {
+                device_extensions[device_extension_count++] = "VK_KHR_fragment_shading_rate";
+                g_context.fragment_shading_rate_ext = 1;
+            } else if (!g_context.mutable_descriptor_ext && want_descriptor_buffer &&
+                       strcmp(available[i].extensionName, "VK_EXT_mutable_descriptor_type") == 0) {
+                device_extensions[device_extension_count++] = "VK_EXT_mutable_descriptor_type";
+                g_context.mutable_descriptor_ext = 1;
             } else if (getenv("BEER_VK_CHECKPOINTS") &&
                        strcmp(available[i].extensionName,
                               "VK_NV_device_diagnostic_checkpoints") == 0) {
@@ -440,8 +572,20 @@ int beer_vulkan_context_initialize(void)
     VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES
     };
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT
+    };
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutable_descriptor = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT
+    };
     VkPhysicalDevicePipelineRobustnessFeaturesEXT pipeline_robustness = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT
+    };
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR shading_rate = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR
+    };
+    VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT
     };
     VkPhysicalDeviceTexelBufferAlignmentPropertiesEXT texel_alignment = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES_EXT
@@ -517,6 +661,20 @@ int beer_vulkan_context_initialize(void)
         pipeline_robustness.pNext = feature_chain;
         feature_chain = &pipeline_robustness;
     }
+    /* Both or neither: heaps are one mutable-type array per descriptor buffer. */
+    if (g_context.descriptor_buffer_ext && g_context.mutable_descriptor_ext) {
+        descriptor_buffer.pNext = feature_chain;
+        mutable_descriptor.pNext = &descriptor_buffer;
+        feature_chain = &mutable_descriptor;
+    }
+    if (g_context.fragment_shading_rate_ext) {
+        shading_rate.pNext = feature_chain;
+        feature_chain = &shading_rate;
+    }
+    if (g_context.mesh_shader_ext) {
+        mesh_shader.pNext = feature_chain;
+        feature_chain = &mesh_shader;
+    }
     if (g_context.timeline_semaphore && !core13) {
         timeline_features.pNext = feature_chain;
         feature_chain = &timeline_features;
@@ -531,6 +689,16 @@ int beer_vulkan_context_initialize(void)
     }
     g_context.pipeline_robustness = g_context.pipeline_robustness &&
         pipeline_robustness.pipelineRobustness;
+    /* Only the base features: capture/replay and push descriptors cost driver work and are not used. */
+    descriptor_buffer.descriptorBufferCaptureReplay = VK_FALSE;
+    descriptor_buffer.descriptorBufferImageLayoutIgnored = VK_FALSE;
+    descriptor_buffer.descriptorBufferPushDescriptors = VK_FALSE;
+    g_context.modern.descriptor_buffer = g_context.descriptor_buffer_ext && g_context.mutable_descriptor_ext &&
+                                         descriptor_buffer.descriptorBuffer &&
+                                         mutable_descriptor.mutableDescriptorType;
+    g_context.modern.null_descriptor = g_context.robustness2 && robustness2.nullDescriptor;
+    if (g_context.fragment_shading_rate_ext) query_shading_rate(&shading_rate);
+    if (g_context.mesh_shader_ext) query_mesh_shader(&mesh_shader, &shading_rate);
     if (core13) {
         VkPhysicalDeviceFeatures2 features2 = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -584,6 +752,12 @@ int beer_vulkan_context_initialize(void)
          * AtomicInt64OnGroupShared); RE Engine titles refuse GPUs without them. */
         v12_enabled.shaderBufferInt64Atomics = s12->shaderBufferInt64Atomics;
         v12_enabled.shaderSharedInt64Atomics = s12->shaderSharedInt64Atomics;
+        /* Shaders may declare these, and the translators emit them: DrawParameters (draw index, base vertex and
+         * instance), wave operations on 8/16/64-bit types (mesh shaders decode packed vertices with them), and the
+         * min/max sampler reduction VK_EXT_sampler_filter_minmax exposes (core 1.2 needs the feature bit too). */
+        v11_enabled.shaderDrawParameters = v11_supported.shaderDrawParameters;
+        v12_enabled.shaderSubgroupExtendedTypes = s12->shaderSubgroupExtendedTypes;
+        v12_enabled.samplerFilterMinmax = s12->samplerFilterMinmax;
         v11_enabled.storageBuffer16BitAccess = v11_supported.storageBuffer16BitAccess;
         v11_enabled.uniformAndStorageBuffer16BitAccess = v11_supported.uniformAndStorageBuffer16BitAccess;
         v13_enabled.synchronization2 = s13->synchronization2;
@@ -716,6 +890,10 @@ int beer_vulkan_context_initialize(void)
     }
     g_context.GetDeviceQueue(g_context.device, g_context.queue_family, 0,
                              &g_context.queue);
+    g_context.queues[0] = g_context.queue;
+    for (uint32_t i = 1; i < want_queues; ++i)
+        g_context.GetDeviceQueue(g_context.device, g_context.queue_family, i, &g_context.queues[i]);
+    g_context.queue_count = want_queues;
     if (g_context.timeline_semaphore) {
         VkSemaphoreTypeCreateInfo timeline_type = {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
@@ -737,10 +915,10 @@ int beer_vulkan_context_initialize(void)
             pthread_detach(keepalive);
     }
     fprintf(stderr,
-            "[VULKAN] shared device initialized (queue family %u, "
+            "[VULKAN] shared device initialized (queue family %u, queues %u, "
             "robust-buffer=%u robust-buffer2=%u robust-image2=%u "
             "pipeline-robustness=%u timeline=%u)\n",
-            g_context.queue_family,
+            g_context.queue_family, g_context.queue_count,
             g_context.enabled_features.robustBufferAccess,
             g_context.robustness2 ? robustness2.robustBufferAccess2 : 0,
             g_context.robustness2 ? robustness2.robustImageAccess2 : 0,
@@ -832,6 +1010,21 @@ PFN_vkGetDeviceProcAddr beer_vulkan_get_device_proc_addr(void)
 }
 void beer_vulkan_queue_lock(void) { pthread_mutex_lock(&g_queue_lock); }
 void beer_vulkan_queue_unlock(void) { pthread_mutex_unlock(&g_queue_lock); }
+uint32_t beer_vulkan_queue_count(void) { return g_context.queue_count ? g_context.queue_count : 1; }
+VkQueue beer_vulkan_queue_at(uint32_t index)
+{
+    return index < g_context.queue_count ? g_context.queues[index] : g_context.queue;
+}
+void beer_vulkan_queue_lock_at(uint32_t index)
+{
+    if (!index || index >= g_context.queue_count) pthread_mutex_lock(&g_queue_lock);
+    else pthread_mutex_lock(&g_queue_locks[index]);
+}
+void beer_vulkan_queue_unlock_at(uint32_t index)
+{
+    if (!index || index >= g_context.queue_count) pthread_mutex_unlock(&g_queue_lock);
+    else pthread_mutex_unlock(&g_queue_locks[index]);
+}
 
 int beer_vulkan_timeline_enabled(void)
 {

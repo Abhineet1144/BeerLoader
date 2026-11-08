@@ -57,8 +57,8 @@ static int beer_pid_is_loader(pid_t pid)
 }
 
 /* ---- Process handles ---- */
-#define BEER_PROC_HANDLE_BASE 0xD1000000u
-#define BEER_SNAP_HANDLE_BASE 0xD2000000u
+#define BEER_PROC_HANDLE_BASE 0x35000000u   /* below 0x80000000: see SEM_HANDLE_BASE in loader.c */
+#define BEER_SNAP_HANDLE_BASE 0x36000000u
 #define BEER_MAX_PROCS 128
 #define BEER_MAX_SNAPS 32
 #define BEER_SNAP_MAX_ENTRIES 128
@@ -100,6 +100,12 @@ static u64 beer_proc_alloc(pid_t pid, int child)
     pthread_mutex_unlock(&g_proc_mtx);
     g_last_error = 4;   /* ERROR_TOO_MANY_OPEN_FILES */
     return 0;
+}
+
+static int beer_proc_handle_pid(u64 handle)
+{
+    BeerProc *p = beer_proc_from_handle(handle);
+    return p ? (int)p->pid : -1;
 }
 
 /* Refreshes p->exited / p->exit_code; returns 1 when the process has ended. */
@@ -255,7 +261,177 @@ static int beer_builtin_console_tool(const char *name, const u8 *startup, u8 *in
     return 1;
 }
 
-static u64 beer_create_process(const char *application, const char *command_line, u32 flags, u8 *info, const u8 *startup)
+/* ---- Named pipes (unix stream sockets) ---- */
+/* shared: a child process holds the listening socket too (inherited instance), so the socket path stays when this
+ * process lets go of it. */
+typedef struct { int used, fd, refs, shared; char name[128]; char path[320]; } BeerPipeListener;
+typedef struct { u8 is_pipe, server, connected, nowait; int listener; } BeerPipeInfo;
+static BeerPipeListener g_pipe_listeners[32];
+static BeerPipeInfo g_pipe_info[MAX_FHANDLES];
+static pthread_mutex_t g_pipe_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* ---- Handle inheritance across processes ----
+ * CreateProcess(bInheritHandles=TRUE) hands every handle marked inheritable to the child under the same value, as
+ * Windows does. Each Win32 process is its own loader, so the objects are carried over host mechanisms:
+ *   events          -> the event moves to a shared page (memfd) both processes map; futex waits across processes;
+ *   files, pipes    -> the descriptor itself (a named-pipe server instance brings its listening socket);
+ *   process handles -> the process id.
+ * The child learns them from BEER_INHERITED_HANDLES ("E:handle:fd:manual", "F:handle:fd:pipe:server:connected:
+ * nowait:path", "P:handle:pid", comma separated) and installs them before the program starts (beer_inherit_install).
+ * Descriptors are placed at fixed numbers from BEER_INHERIT_FD_BASE in the child. Handle kinds without a host
+ * counterpart (threads, mutexes, semaphores, mappings) are not carried over and are reported. */
+#define BEER_INHERIT_FD_BASE 500
+typedef struct { char *env; posix_spawn_file_actions_t actions; int actions_ready; } BeerInherit;
+
+static int beer_inherit_prepare(BeerInherit *inherit)
+{
+    memset(inherit, 0, sizeof(*inherit));
+    if (posix_spawn_file_actions_init(&inherit->actions) != 0) return 0;
+    inherit->actions_ready = 1;
+    size_t cap = 65536, used = 0;
+    inherit->env = malloc(cap);
+    if (!inherit->env) return 0;
+    used += (size_t)snprintf(inherit->env, cap, "BEER_INHERITED_HANDLES=");
+    u64 handles[BEER_MAX_INHERITABLE];
+    pthread_mutex_lock(&g_inheritable_mtx);
+    const u32 count = g_inheritable_count;
+    memcpy(handles, g_inheritable, count * sizeof(*handles));
+    pthread_mutex_unlock(&g_inheritable_mtx);
+    int next_fd = BEER_INHERIT_FD_BASE, entries = 0;
+    for (u32 i = 0; i < count && used + 1600 < cap; ++i) {
+        const u64 h = handles[i];
+        char entry[1500];
+        entry[0] = 0;
+        const int eid = event_id_from_handle(h);
+        const int fd = eid < 0 ? fh_get(h) : -1;
+        if (eid >= 0) {
+            const int shared = event_make_shared(eid);
+            if (shared < 0) continue;
+            posix_spawn_file_actions_adddup2(&inherit->actions, shared, next_fd);
+            snprintf(entry, sizeof(entry), "E:%llx:%d:%d", (unsigned long long)h, next_fd++, g_events[eid].manual_reset);
+        } else if (fd >= 0) {
+            const u32 id = (u32)(h - 0x70000000ULL);
+            const BeerPipeInfo *pipe = &g_pipe_info[id];
+            const char *path = "";
+            if (pipe->is_pipe && pipe->server) {
+                pthread_mutex_lock(&g_pipe_mtx);
+                g_pipe_listeners[pipe->listener].shared = 1;
+                path = g_pipe_listeners[pipe->listener].path;
+                pthread_mutex_unlock(&g_pipe_mtx);
+            }
+            /* The guest-visible name travels hex encoded (it holds ':' and possibly ','). */
+            char guest_hex[2 * 520 + 1] = "";
+            pthread_mutex_lock(&g_fh_mtx);
+            for (size_t k = 0; g_fh_guest_path[id][k] && k < 520; ++k)
+                snprintf(guest_hex + 2 * k, 3, "%02x", (u8)g_fh_guest_path[id][k]);
+            pthread_mutex_unlock(&g_fh_mtx);
+            posix_spawn_file_actions_adddup2(&inherit->actions, fd, next_fd);
+            snprintf(entry, sizeof(entry), "F:%llx:%d:%d:%d:%d:%d:%s:%s", (unsigned long long)h, next_fd++,
+                     pipe->is_pipe, pipe->server, pipe->connected, pipe->nowait, guest_hex, path);
+        } else if (beer_proc_handle_pid(h) > 0) {
+            snprintf(entry, sizeof(entry), "P:%llx:%d", (unsigned long long)h, beer_proc_handle_pid(h));
+        } else {
+            fprintf(stderr, "[PROCESS] inheritable handle 0x%llx has no cross-process form; the child does not get it\n",
+                    (unsigned long long)h);
+            continue;
+        }
+        used += (size_t)snprintf(inherit->env + used, cap - used, "%s%s", entries++ ? "," : "", entry);
+    }
+    fprintf(stderr, "[PROCESS] handing %d inherited handle(s) to the child: %s\n", entries,
+            inherit->env + strlen("BEER_INHERITED_HANDLES="));
+    return 1;
+}
+static void beer_inherit_release(BeerInherit *inherit)
+{
+    if (inherit->actions_ready) posix_spawn_file_actions_destroy(&inherit->actions);
+    free(inherit->env);
+}
+/* The parent's environment, without an inherited-handle list of its own, plus `extra` (may be NULL). */
+static char **beer_inherit_environment(const char *extra)
+{
+    size_t n = 0;
+    while (environ[n]) ++n;
+    char **env = calloc(n + 2, sizeof(*env));
+    if (!env) return NULL;
+    size_t k = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (strncmp(environ[i], "BEER_INHERITED_HANDLES=", 23)) env[k++] = environ[i];
+    if (extra) env[k++] = (char *)extra;
+    env[k] = NULL;
+    return env;
+}
+
+/* Child side: installs the handles the parent passed, at their original values. Runs before the program starts. */
+static void beer_inherit_install(void)
+{
+    const char *list = getenv("BEER_INHERITED_HANDLES");
+    if (!list || !*list) return;
+    char *copy = strdup(list);
+    if (!copy) return;
+    int installed = 0;
+    for (char *save = NULL, *item = strtok_r(copy, ",", &save); item; item = strtok_r(NULL, ",", &save)) {
+        unsigned long long h = 0;
+        int fd = -1, a = 0, b = 0, c = 0, d = 0, pid = 0, consumed = 0;
+        if (item[0] == 'E' && sscanf(item, "E:%llx:%d:%d", &h, &fd, &a) == 3) {
+            installed += event_install_shared(h, fd, a);
+        } else if (item[0] == 'F' && sscanf(item, "F:%llx:%d:%d:%d:%d:%d:%n", &h, &fd, &a, &b, &c, &d, &consumed) == 6) {
+            const u32 id = (u32)(h - 0x70000000ULL);
+            if (h < 0x70000001ULL || id >= MAX_FHANDLES) continue;
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+            const char *guest_hex = item + consumed, *colon = strchr(guest_hex, ':');
+            const size_t hex_len = colon ? (size_t)(colon - guest_hex) : strlen(guest_hex);
+            pthread_mutex_lock(&g_fh_mtx);
+            g_fh_used[id] = 1;
+            g_fh_fd[id] = fd;
+            size_t k = 0;
+            for (; 2 * k + 1 < hex_len && k + 1 < sizeof(g_fh_guest_path[id]); ++k) {
+                unsigned v = 0;
+                sscanf(guest_hex + 2 * k, "%2x", &v);
+                g_fh_guest_path[id][k] = (char)v;
+            }
+            g_fh_guest_path[id][k] = 0;
+            g_fh_host_path[id][0] = 0;
+            pthread_mutex_unlock(&g_fh_mtx);
+            BeerPipeInfo *pipe = &g_pipe_info[id];
+            memset(pipe, 0, sizeof(*pipe));
+            pipe->is_pipe = (u8)a; pipe->server = (u8)b; pipe->connected = (u8)c; pipe->nowait = (u8)d;
+            if (a && b) {                                   /* server instance: adopt the listening socket */
+                const char *path = colon ? colon + 1 : "";
+                pthread_mutex_lock(&g_pipe_mtx);
+                int slot = -1;
+                for (int l = 0; l < (int)(sizeof(g_pipe_listeners) / sizeof(*g_pipe_listeners)) && slot < 0; ++l)
+                    if (!g_pipe_listeners[l].used) slot = l;
+                if (slot >= 0) {
+                    BeerPipeListener *l = &g_pipe_listeners[slot];
+                    memset(l, 0, sizeof(*l));
+                    l->used = 1; l->refs = 1; l->shared = 1;
+                    l->fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+                    snprintf(l->path, sizeof(l->path), "%s", path);
+                    /* the pipe's key, so further instances of the same name join this listener */
+                    const char *key = strrchr(path, '/');
+                    key = key && !strncmp(key, "/pipe-", 6) ? key + 6 : "";
+                    snprintf(l->name, sizeof(l->name), "%.*s", (int)(strlen(key) > 5 ? strlen(key) - 5 : 0), key);
+                    pipe->listener = slot;
+                }
+                pthread_mutex_unlock(&g_pipe_mtx);
+            }
+            installed++;
+        } else if (item[0] == 'P' && sscanf(item, "P:%llx:%d", &h, &pid) == 2) {
+            const u32 id = (u32)h - BEER_PROC_HANDLE_BASE;
+            if (((u32)h & 0xFF000000u) != BEER_PROC_HANDLE_BASE || id >= BEER_MAX_PROCS) continue;
+            pthread_mutex_lock(&g_proc_mtx);
+            g_procs[id] = (BeerProc){ .used = 1, .pid = (pid_t)pid, .child = 0 };
+            pthread_mutex_unlock(&g_proc_mtx);
+            installed++;
+        }
+    }
+    free(copy);
+    fprintf(stderr, "[PROCESS] installed %d inherited handle(s)\n", installed);
+    unsetenv("BEER_INHERITED_HANDLES");
+}
+
+static u64 beer_create_process(const char *application, const char *command_line, u32 flags, u8 *info, const u8 *startup,
+                               int inherit_handles)
 {
     char token[PATH_MAX];
     token[0] = 0;
@@ -307,9 +483,12 @@ static u64 beer_create_process(const char *application, const char *command_line
     char *argv[64];
     int argc = 0;
     argv[argc++] = self;
+    /* Forward the loader's own options only: they end at the executable, and the arguments after it belong to
+     * this program (Where Winds Meet's --commandline-dx12-control=0 made every child loader exit). */
     for (int i = 1; i < g_loader_argc && argc < 56; ++i) {
         const char *a = g_loader_argv[i];
-        if (!strncmp(a, "--", 2) && strncmp(a, "--cmdline=", 10)) argv[argc++] = g_loader_argv[i];
+        if (strncmp(a, "--", 2)) break;
+        if (strncmp(a, "--cmdline=", 10)) argv[argc++] = g_loader_argv[i];
     }
     char cmdline_option[8192 + 16];
     snprintf(cmdline_option, sizeof(cmdline_option), "--cmdline=%s", command);
@@ -320,7 +499,12 @@ static u64 beer_create_process(const char *application, const char *command_line
     if (flags & 0x4u)
         fprintf(stderr, "[PROCESS] CREATE_SUSPENDED is not supported; starting %s immediately\n", host);
     pid_t pid = 0;
-    int rc = posix_spawn(&pid, self, NULL, NULL, argv, environ);
+    BeerInherit inherit;
+    int have_inherit = inherit_handles && g_inheritable_handles && beer_inherit_prepare(&inherit);
+    char **env = beer_inherit_environment(have_inherit ? inherit.env : NULL);
+    int rc = posix_spawn(&pid, self, have_inherit ? &inherit.actions : NULL, NULL, argv, env ? env : environ);
+    free(env);
+    if (have_inherit) beer_inherit_release(&inherit);
     if (rc != 0) { g_last_error = 5; return 0; }       /* ERROR_ACCESS_DENIED */
     fprintf(stderr, "[PROCESS] CreateProcess pid=%d: %s\n", (int)pid, command);
 
@@ -338,16 +522,6 @@ static u64 beer_create_process(const char *application, const char *command_line
     return 1;
 }
 
-/* bInheritHandles=TRUE copies only handles marked inheritable (and redirected standard handles).
- * Beer cannot copy guest handle objects into another process, so the request is refused only when
- * something would actually be inherited; otherwise the child starts as it would on Windows. */
-static int beer_process_inherits_something(const void *startup)
-{
-    u32 startup_flags = 0;
-    if (startup) memcpy(&startup_flags, (const u8 *)startup + 60, 4);   /* STARTUPINFO.dwFlags */
-    return g_inheritable_handles || (startup_flags & 0x100u);          /* STARTF_USESTDHANDLES */
-}
-
 static u64 __attribute__((ms_abi))
 beer_CreateProcessA(const char *application, const char *command_line, void *process_sa, void *thread_sa,
                     u32 inherit, u32 flags, void *environment, const char *directory, void *startup, u8 *info)
@@ -356,12 +530,6 @@ beer_CreateProcessA(const char *application, const char *command_line, void *pro
     /* posix_spawn alone does not copy the guest handle tables or event state.
      * Claiming success here would make inherited numeric handles refer to unrelated
      * objects in the child, so fail while any handle could actually be inherited. */
-    if (inherit && beer_process_inherits_something(startup)) {
-        if (info) memset(info, 0, 24);
-        g_last_error = 50; /* ERROR_NOT_SUPPORTED */
-        fprintf(stderr, "[PROCESS] CreateProcess: inherited guest handles are not supported\n");
-        return 0;
-    }
     if (getenv("BEER_PROCESS_DIAGNOSTICS")) {
         fprintf(stderr, "[PROCESS] CreateProcessA inherit=%u flags=0x%x directory=%s environment=%p\n", inherit, flags, directory ? directory : "(null)", environment);
         if (environment) {
@@ -369,7 +537,8 @@ beer_CreateProcessA(const char *application, const char *command_line, void *pro
             for (int k = 0; k < 64 && *e; ++k) { fprintf(stderr, "[PROCESS]   env %s\n", e); e += strlen(e) + 1; }
         }
     }
-    return beer_create_process(application, command_line, flags, info, startup);
+    if (info) memset(info, 0, 24);                          /* PROCESS_INFORMATION stays zero on failure */
+    return beer_create_process(application, command_line, flags, info, startup, inherit != 0);
 }
 
 static u64 __attribute__((ms_abi))
@@ -378,16 +547,11 @@ beer_CreateProcessW(const u16 *application, const u16 *command_line, void *proce
 {
     (void)environment; (void)directory;
     note_inheritable_sa((u64)(uintptr_t)process_sa); note_inheritable_sa((u64)(uintptr_t)thread_sa);
-    if (inherit && beer_process_inherits_something(startup)) {
-        if (info) memset(info, 0, 24);
-        g_last_error = 50; /* ERROR_NOT_SUPPORTED */
-        fprintf(stderr, "[PROCESS] CreateProcess: inherited guest handles are not supported\n");
-        return 0;
-    }
     char app[PATH_MAX], cmd[8192];
     beer_proc_utf16_to_utf8(application, app, sizeof(app));
     beer_proc_utf16_to_utf8(command_line, cmd, sizeof(cmd));
-    return beer_create_process(application ? app : NULL, command_line ? cmd : NULL, flags, info, startup);
+    if (info) memset(info, 0, 24);                          /* PROCESS_INFORMATION stays zero on failure */
+    return beer_create_process(application ? app : NULL, command_line ? cmd : NULL, flags, info, startup, inherit != 0);
 }
 
 static u64 __attribute__((ms_abi)) beer_GetProcessId(u64 process)
@@ -493,12 +657,6 @@ static u64 beer_thread32_fill(u64 snapshot, u8 *out, int first)
 static u64 __attribute__((ms_abi)) beer_Thread32First(u64 s, u8 *e) { return beer_thread32_fill(s, e, 1); }
 static u64 __attribute__((ms_abi)) beer_Thread32Next(u64 s, u8 *e)  { return beer_thread32_fill(s, e, 0); }
 
-/* ---- Named pipes (unix stream sockets) ---- */
-typedef struct { int used, fd, refs; char name[128]; char path[320]; } BeerPipeListener;
-typedef struct { u8 is_pipe, server, connected, nowait; int listener; } BeerPipeInfo;
-static BeerPipeListener g_pipe_listeners[32];
-static BeerPipeInfo g_pipe_info[MAX_FHANDLES];
-static pthread_mutex_t g_pipe_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* "\\.\pipe\Some\Name" -> "some_name"; returns 0 when <name> is not in the pipe namespace. */
 static int beer_pipe_name(const char *name, char *out, size_t cap)
@@ -579,7 +737,7 @@ static void beer_pipe_released(u32 id)
     BeerPipeListener *l = &g_pipe_listeners[listener];
     if (l->used && --l->refs <= 0) {
         close(l->fd);
-        unlink(l->path);
+        if (!l->shared) unlink(l->path);
         l->used = 0;
     }
     pthread_mutex_unlock(&g_pipe_mtx);
@@ -620,17 +778,17 @@ static u64 __attribute__((ms_abi))
 beer_CreateNamedPipeA(const char *name, u32 open_mode, u32 pipe_mode, u32 max_instances, u32 out_buffer,
                       u32 in_buffer, u32 timeout, void *security)
 {
-    (void)max_instances; (void)out_buffer; (void)in_buffer; (void)timeout; (void)security;
-    return beer_create_named_pipe(name, open_mode, pipe_mode);
+    (void)max_instances; (void)out_buffer; (void)in_buffer; (void)timeout;
+    return inherit_from_sa(beer_create_named_pipe(name, open_mode, pipe_mode), (u64)(uintptr_t)security);
 }
 static u64 __attribute__((ms_abi))
 beer_CreateNamedPipeW(const u16 *name, u32 open_mode, u32 pipe_mode, u32 max_instances, u32 out_buffer,
                       u32 in_buffer, u32 timeout, void *security)
 {
-    (void)max_instances; (void)out_buffer; (void)in_buffer; (void)timeout; (void)security;
+    (void)max_instances; (void)out_buffer; (void)in_buffer; (void)timeout;
     char narrow[512];
     beer_proc_utf16_to_utf8(name, narrow, sizeof(narrow));
-    return beer_create_named_pipe(narrow, open_mode, pipe_mode);
+    return inherit_from_sa(beer_create_named_pipe(narrow, open_mode, pipe_mode), (u64)(uintptr_t)security);
 }
 
 typedef struct { u64 handle; WIN_OVERLAPPED *overlapped; } BeerPipeAccept;
@@ -791,6 +949,37 @@ beer_SetNamedPipeHandleState(u64 handle, u32 *mode, u32 *max_collection, u32 *ti
     (void)max_collection; (void)timeout;
     if (!beer_pipe_is_pipe(handle)) { g_last_error = 6; return 0; }
     if (mode) g_pipe_info[(u32)(handle - 0x70000000ULL)].nowait = (*mode & 1u) ? 1 : 0;
+    return 1;
+}
+
+/* TransactNamedPipe: writes one request and reads the reply on a connected pipe instance. Beer's pipes are byte
+ * streams; the reply is what arrives in one read (a message-mode peer writes a reply in one piece), up to out_size.
+ * An OVERLAPPED call completes synchronously and reports through the structure and its event. */
+static u64 __attribute__((ms_abi))
+beer_TransactNamedPipe(u64 handle, const void *in, u32 in_size, void *out, u32 out_size, u32 *read, void *overlapped)
+{
+    if (read) *read = 0;
+    if (!beer_pipe_is_pipe(handle)) { g_last_error = 6; return 0; }
+    if (!beer_pipe_ensure_connected(handle)) return 0;
+    const int fd = fh_get(handle);
+    if (fd < 0) { g_last_error = 6; return 0; }
+    for (u32 done = 0; done < in_size;) {
+        const ssize_t n = send(fd, (const u8 *)in + done, in_size - done, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { g_last_error = 232; return 0; }               /* ERROR_NO_DATA: the pipe is being closed */
+        done += (u32)n;
+    }
+    ssize_t got;
+    do { got = recv(fd, out, out_size, 0); } while (got < 0 && errno == EINTR);
+    if (got <= 0) { g_last_error = 109; return 0; }                 /* ERROR_BROKEN_PIPE */
+    if (read) *read = (u32)got;
+    if (overlapped) {
+        WIN_OVERLAPPED *ov = overlapped;
+        ov->Internal = 0;
+        ov->InternalHigh = (u64)got;
+        if (ov->hEvent) impl_SetEvent(ov->hEvent);
+    }
+    g_last_error = 0;
     return 1;
 }
 

@@ -70,7 +70,7 @@ static struct {
     uint32_t gc_token_len[16];
     int gc_token_count;
     /* Auth session tickets registered with Steam through ClientAuthList. */
-    struct { uint32_t handle, appid, crc, len; uint8_t data[160]; } tickets[64];
+    struct { uint32_t handle, appid, crc, len, secret_len; uint8_t data[160]; uint8_t secret[136]; } tickets[64];
     int ticket_count;
     uint32_t next_ticket, auth_sequence, connection_count;
 } g = { .lock = PTHREAD_MUTEX_INITIALIZER, .changed = PTHREAD_COND_INITIALIZER };
@@ -869,7 +869,15 @@ static void handle_download_request(const char *op, const char *id, const char *
     } else if (!strcmp(op, "resume")) {
         installer_resume(g.installer, appid);
     } else if (!strcmp(op, "cancel")) {
-        installer_cancel(g.installer, appid);
+        if (installer_busy_with(g.installer, appid) || folder[0] != '/') {
+            installer_cancel(g.installer, appid);
+        } else {
+            /* No job (the provider restarted since the download stopped): drop the partial
+               download it left on disk, which install_remove also covers. */
+            ok = install_remove(folder, appid, err, sizeof(err));
+            if (ok) emit("{\"event\":\"download\",\"id\":\"%s\",\"appid\":%u,\"action\":\"install\","
+                         "\"state\":\"cancelled\"}", idj, appid);
+        }
     } else if (!strcmp(op, "uninstall")) {
         if (installer_busy_with(g.installer, appid)) { ok = 0; snprintf(err, sizeof(err), "cancel the download first"); }
         else ok = install_remove(folder, appid, err, sizeof(err));
@@ -948,6 +956,8 @@ static void send_auth_list_locked(void)
         pb_u64(&t, 5, 1);                              /* h_steam_pipe */
         pb_u64(&t, 6, g.tickets[i].crc);
         pb_bytes(&t, 7, g.tickets[i].data, g.tickets[i].len);
+        if (g.tickets[i].secret_len)                   /* Web API tickets: "str:<identity>\0" */
+            pb_bytes(&t, 8, g.tickets[i].secret, g.tickets[i].secret_len);
         pb_msg(&list, 4, &t);
         pb_free(&t);
         int seen = 0;
@@ -963,9 +973,14 @@ static void send_auth_list_locked(void)
 static void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
 
 /* Auth session ticket: [u32 n][game-connect token], the 24-byte session header, then
- * [u32 n][Steam-signed ownership ticket]. The first two parts are registered with Steam. */
-static void issue_auth_ticket(const char *id, uint32_t appid)
+ * [u32 n][Steam-signed ownership ticket]. The first two parts are registered with Steam.
+ * A Web API ticket (ISteamUser::GetAuthTicketForWebApi) is the same ticket with type 5 instead of 2 in the session
+ * header, registered with server_secret "str:<identity>\0" (the identity the web service passes to
+ * ISteamUserAuth/AuthenticateUserTicket), and padded to the callback's 2560 bytes (as SteamKit2's
+ * SteamAuthTicket.GetAuthTicketForWebApi and the Steam client do). */
+static void issue_ticket(const char *id, uint32_t appid, int web_api, const char *identity)
 {
+    const char *op = web_api ? "web_api_ticket" : "auth_ticket";
     char idj[140];
     json_escape(idj, sizeof(idj), id);
     PbBuf request = {0};
@@ -974,19 +989,19 @@ static void issue_auth_ticket(const char *id, uint32_t appid)
     int answered = cm_request(g.cm, EMSG_CLIENT_GET_APP_OWNERSHIP_TICKET, &request, 0, 20000, &parts);
     pb_free(&request);
     PbField result, owner;
-    if (!answered) { game_error("auth_ticket", id, "Steam did not answer"); return; }
+    if (!answered) { game_error(op, id, "Steam did not answer"); return; }
     int ok = pb_find(parts->body.data, parts->body.len, 1, &result) && (int)result.value == ERESULT_OK &&
              pb_find(parts->body.data, parts->body.len, 3, &owner) && owner.len && owner.len <= 1024;
-    if (!ok) { cm_parts_free(parts); game_error("auth_ticket", id, "Steam refused the ownership ticket"); return; }
+    if (!ok) { cm_parts_free(parts); game_error(op, id, "Steam refused the ownership ticket"); return; }
 
     pthread_mutex_lock(&g.lock);
     if (!g.gc_token_count || g.ticket_count == 64) {
         pthread_mutex_unlock(&g.lock);
         cm_parts_free(parts);
-        game_error("auth_ticket", id, g.ticket_count == 64 ? "too many active tickets" : "Steam has not issued game connect tokens");
+        game_error(op, id, g.ticket_count == 64 ? "too many active tickets" : "Steam has not issued game connect tokens");
         return;
     }
-    uint8_t ticket[2048];
+    uint8_t ticket[2560];
     size_t n = 0;
     uint32_t token_len = g.gc_token_len[0];
     put32(ticket, token_len); n = 4;
@@ -994,12 +1009,15 @@ static void issue_auth_ticket(const char *id, uint32_t appid)
     memmove(g.gc_tokens, g.gc_tokens[1], sizeof(g.gc_tokens[0]) * 15);
     memmove(g.gc_token_len, g.gc_token_len + 1, sizeof(g.gc_token_len[0]) * 15);
     g.gc_token_count--;
-    uint32_t header[7] = { 24, 1, 2, cm_public_ip(g.cm), 0, cm_logon_age(g.cm) * 1000u, ++g.connection_count };
+    uint32_t header[7] = { 24, 1, web_api ? 5u : 2u, cm_public_ip(g.cm), 0, cm_logon_age(g.cm) * 1000u, ++g.connection_count };
     for (int i = 0; i < 7; i++, n += 4) put32(ticket + n, header[i]);
     size_t registered = n;
     put32(ticket + n, (uint32_t)owner.len); n += 4;
     memcpy(ticket + n, owner.data, owner.len); n += owner.len;
     cm_parts_free(parts);
+    if (web_api) {                                       /* GetTicketForWebApiResponse_t carries 2560 bytes */
+        for (; n < sizeof(ticket); n++) ticket[n] = (uint8_t)rand();
+    }
 
     uint32_t handle = ++g.next_ticket;
     if (!handle) handle = ++g.next_ticket;
@@ -1008,6 +1026,13 @@ static void issue_auth_ticket(const char *id, uint32_t appid)
     g.tickets[g.ticket_count].len = (uint32_t)registered;
     memcpy(g.tickets[g.ticket_count].data, ticket, registered);
     g.tickets[g.ticket_count].crc = (uint32_t)crc32(0, ticket, (uInt)registered);
+    g.tickets[g.ticket_count].secret_len = 0;
+    if (identity && *identity) {
+        const int written = snprintf((char *)g.tickets[g.ticket_count].secret, sizeof(g.tickets[0].secret),
+                                     "str:%s", identity);
+        if (written > 0 && (size_t)written < sizeof(g.tickets[0].secret))
+            g.tickets[g.ticket_count].secret_len = (uint32_t)written + 1;   /* with the NUL */
+    }
     g.ticket_count++;
     send_auth_list_locked();
     pthread_mutex_unlock(&g.lock);
@@ -1015,8 +1040,8 @@ static void issue_auth_ticket(const char *id, uint32_t appid)
     char *hex = malloc(n * 2 + 1);
     if (!hex) return;
     hex_text(ticket, n, hex);
-    emit("{\"event\":\"auth_ticket\",\"id\":\"%s\",\"ok\":true,\"appid\":%u,\"handle\":%u,\"ticket\":\"%s\"}",
-         idj, appid, handle, hex);
+    emit("{\"event\":\"%s\",\"id\":\"%s\",\"ok\":true,\"appid\":%u,\"handle\":%u,\"ticket\":\"%s\"}",
+         op, idj, appid, handle, hex);
     free(hex);
 }
 
@@ -1081,7 +1106,13 @@ static void handle_game_request(const char *op, const char *id, const char *line
      * tickets are only minted for apps this account owns. */
     if (!app_owned(appid)) { game_error(event, id, "this account does not own the app"); return; }
 
-    if (!strcmp(op, "auth_ticket")) { issue_auth_ticket(id, appid); return; }
+    if (!strcmp(op, "auth_ticket")) { issue_ticket(id, appid, 0, NULL); return; }
+    if (!strcmp(op, "web_api_ticket")) {
+        char identity[128] = "";
+        json_get(line, "identity", identity, sizeof(identity));
+        issue_ticket(id, appid, 1, identity);
+        return;
+    }
     if (!strcmp(op, "cancel_auth_ticket")) {
         char handle[16] = "";
         json_get(line, "handle", handle, sizeof(handle));
@@ -1270,7 +1301,7 @@ static void handle_request(char *line)
     } else if (!strcmp(op, "library")) {
         emit_library(id);
     } else if (!strcmp(op, "game_session") || !strcmp(op, "app_ticket") || !strcmp(op, "encrypted_ticket") ||
-               !strcmp(op, "auth_ticket") || !strcmp(op, "cancel_auth_ticket")) {
+               !strcmp(op, "auth_ticket") || !strcmp(op, "web_api_ticket") || !strcmp(op, "cancel_auth_ticket")) {
         handle_game_request(op, id, line);
     } else if (!strcmp(op, "mms_request") || !strcmp(op, "mms_send") || !strcmp(op, "games_played")) {
         handle_mms_request(op, id, line);

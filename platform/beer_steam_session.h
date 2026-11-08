@@ -28,6 +28,10 @@ size_t beer_steam_session_encrypted_ticket(uint32_t appid, const void *userdata,
  * length and the provider's ticket handle, 0 on failure. */
 size_t beer_steam_session_auth_ticket(uint32_t appid, uint8_t *out, size_t cap, uint32_t *handle);
 void beer_steam_session_cancel_auth_ticket(uint32_t appid, uint32_t handle);
+/* Web API auth ticket (ISteamUser::GetAuthTicketForWebApi) for the given identity: registered with Steam so the
+ * web service's AuthenticateUserTicket(identity) accepts it. Same return convention; cancel it like the above. */
+size_t beer_steam_session_web_api_ticket(uint32_t appid, const char *identity, uint8_t *out, size_t cap,
+                                         uint32_t *handle);
 
 /* Matchmaking (MMS) relay through the signed-in session, as the Steam client sends it for the running app:
  * a request returns the reply body length (or -1), a send has no reply. games_played tells Steam the app is

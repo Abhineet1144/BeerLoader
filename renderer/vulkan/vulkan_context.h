@@ -37,6 +37,10 @@ VkPhysicalDevice beer_vulkan_physical_device(void);
 VkDevice beer_vulkan_device(void);
 VkQueue beer_vulkan_queue(void);
 uint32_t beer_vulkan_queue_family(void);
+/* Queues of the shared family: index 0 is beer_vulkan_queue(); BEER_BD12_MULTI_QUEUE=1 adds up to two more. */
+#define BEER_VULKAN_MAX_QUEUES 3
+uint32_t beer_vulkan_queue_count(void);
+VkQueue beer_vulkan_queue_at(uint32_t index);
 /* Optional device features enabled at device creation. */
 const VkPhysicalDeviceFeatures *beer_vulkan_enabled_features(void);
 /* Nonzero when VK_KHR_maintenance1 (negative viewport height) is enabled. */
@@ -70,6 +74,15 @@ typedef struct {
     int native_16bit;          /* shaderFloat16, shaderInt16 and 16-bit storage buffer access */
     int buffer_int64_atomics;  /* shaderInt64 + shaderBufferInt64Atomics */
     int shared_int64_atomics;  /* shaderInt64 + shaderSharedInt64Atomics */
+    int descriptor_buffer;     /* VK_EXT_descriptor_buffer + VK_EXT_mutable_descriptor_type (descriptor heaps) */
+    int null_descriptor;       /* robustness2 nullDescriptor */
+    int vrs_tier;              /* D3D12 variable-rate shading tier backed by VK_KHR_fragment_shading_rate (0 = none) */
+    uint32_t vrs_tile;         /* tier 2: shading-rate image tile size in pixels */
+    int vrs_additional_rates;  /* 2x4, 4x2, 4x4 */
+    int vrs_sum_combiner;      /* non-trivial combiner ops (D3D12 SUM = Vulkan MUL) */
+    int vrs_primitive_multi_viewport; /* per-primitive rate with viewport indexing */
+    int mesh_shader_tier;      /* D3D12_MESH_SHADER_TIER backed by VK_EXT_mesh_shader (10 = tier 1, 0 = none) */
+    int mesh_shading_rate;     /* mesh shaders may write SV_ShadingRate */
     VkDeviceSize uniform_texel_buffer_offset_alignment;
     VkDeviceSize storage_texel_buffer_offset_alignment;
     int uniform_texel_buffer_offset_single_texel;
@@ -86,6 +99,9 @@ PFN_vkGetDeviceProcAddr beer_vulkan_get_device_proc_addr(void);
 /* Vulkan queues require external synchronization across host threads. */
 void beer_vulkan_queue_lock(void);
 void beer_vulkan_queue_unlock(void);
+/* Per-queue locks; index 0 (or an index past the count) is the same lock as beer_vulkan_queue_lock. */
+void beer_vulkan_queue_lock_at(uint32_t index);
+void beer_vulkan_queue_unlock_at(uint32_t index);
 
 /* Shared timeline used by the command-list compiler. Submissions are
  * asynchronous; callers wait only at a genuine CPU visibility/fence boundary.

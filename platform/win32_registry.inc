@@ -1,9 +1,11 @@
 /* Minimal in-memory registry: a read-only set of keys/values that make the machine look like a
  * normal Windows install (Steam client location and "running" state). Keys are matched
  * case-insensitively; Wow6432Node is folded away. Values the guest writes are not persisted. */
-typedef struct { const char *path; const char *name; u32 type; char text[160]; u32 dword; } BeerRegValue;
+/* type: 1 REG_SZ (text), 3 REG_BINARY (the low bin_size bytes of qword), 4 REG_DWORD (dword), 11 REG_QWORD. */
+typedef struct { const char *path; const char *name; u32 type; char text[160]; u32 dword; u64 qword; u32 bin_size; }
+    BeerRegValue;
 
-#define BEER_REG_MAX_VALUES 96
+#define BEER_REG_MAX_VALUES 128
 #define BEER_REG_MAX_HANDLES 64
 static BeerRegValue g_reg_values[BEER_REG_MAX_VALUES];
 static int g_reg_value_count;
@@ -22,6 +24,37 @@ static void reg_add_dword(const char *path, const char *name, u32 value)
     if (g_reg_value_count >= BEER_REG_MAX_VALUES) return;
     BeerRegValue *v = &g_reg_values[g_reg_value_count++];
     v->path = path; v->name = name; v->type = 4; v->dword = value;
+}
+static void reg_add_qword(const char *path, const char *name, u64 value)
+{
+    if (g_reg_value_count >= BEER_REG_MAX_VALUES) return;
+    BeerRegValue *v = &g_reg_values[g_reg_value_count++];
+    v->path = path; v->name = name; v->type = 11; v->qword = value;
+}
+/* REG_BINARY of 1..8 little-endian bytes. */
+static void reg_add_binary(const char *path, const char *name, u64 value, u32 bytes)
+{
+    if (g_reg_value_count >= BEER_REG_MAX_VALUES || !bytes || bytes > 8) return;
+    BeerRegValue *v = &g_reg_values[g_reg_value_count++];
+    v->path = path; v->name = name; v->type = 3; v->qword = value; v->bin_size = bytes;
+}
+/* A value's data as RegQueryValueEx returns it (strings UTF-16 when wide); writes it to out when out is non-NULL.
+ * Returns the size in bytes. */
+static u32 reg_value_bytes(const BeerRegValue *v, int wide, void *out)
+{
+    switch (v->type) {
+    case 4:  if (out) memcpy(out, &v->dword, 4); return 4;
+    case 11: if (out) memcpy(out, &v->qword, 8); return 8;
+    case 3:  if (out) memcpy(out, &v->qword, v->bin_size); return v->bin_size;
+    default: {
+        const u32 chars = (u32)strlen(v->text) + 1;
+        if (out) {
+            if (wide) for (u32 c = 0; c < chars; ++c) ((u16 *)out)[c] = (u8)v->text[c];
+            else memcpy(out, v->text, chars);
+        }
+        return chars * (wide ? 2u : 1u);
+    }
+    }
 }
 /* HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0: the real CPU from /proc/cpuinfo unless the
  * BEER_SPOOF_CPU_NAME / _VENDOR / _MHZ variables say otherwise (API-level only; CPUID stays native). */
@@ -157,6 +190,13 @@ static void reg_seed_display_driver_locked(void)
         reg_add_sz(keys[i], "providername", provider);
         reg_add_sz(keys[i], "driverversion", version);
         reg_add_sz(keys[i], "matchingdeviceid", matching);
+        /* Video memory, as the display driver records it: qwMemorySize (REG_QWORD) and the older 32-bit
+         * MemorySize (REG_BINARY, saturated at 4 GiB - 1). Games read it here through the adapter's driver key. */
+        if (have && gpu.dedicated_video_memory) {
+            reg_add_qword(keys[i], "hardwareinformation.qwmemorysize", gpu.dedicated_video_memory);
+            reg_add_binary(keys[i], "hardwareinformation.memorysize",
+                           gpu.dedicated_video_memory > 0xffffffffull ? 0xffffffffull : gpu.dedicated_video_memory, 4);
+        }
     }
 }
 
@@ -190,10 +230,39 @@ static void reg_seed_nvidia_ngx(void)
     fprintf(stderr, "[NGX] NGXCore FullPath=%s\n", windows_path);
 }
 
+/* HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion as on Windows 10 22H2 (build 19045, the version the PEB,
+ * KUSER_SHARED_DATA and the version APIs report), and the DirectX version key. Engines read the build here to
+ * decide OS-dependent features; the key was missing entirely. */
+static void reg_seed_windows_version(void)
+{
+    static const char nt[] = "hklm\\software\\microsoft\\windows nt\\currentversion";
+    reg_add_sz(nt, "productname", "Windows 10 Pro");
+    reg_add_sz(nt, "editionid", "Professional");
+    reg_add_sz(nt, "installationtype", "Client");
+    reg_add_sz(nt, "currentversion", "6.3");
+    reg_add_dword(nt, "currentmajorversionnumber", 10);
+    reg_add_dword(nt, "currentminorversionnumber", 0);
+    reg_add_sz(nt, "currentbuild", "19045");
+    reg_add_sz(nt, "currentbuildnumber", "19045");
+    reg_add_dword(nt, "ubr", 0);
+    reg_add_sz(nt, "displayversion", "22H2");
+    reg_add_sz(nt, "releaseid", "2009");
+    reg_add_sz(nt, "buildlab", "19041.vb_release.191206-1406");
+    reg_add_sz(nt, "buildlabex", "19041.1.amd64fre.vb_release.191206-1406");
+    reg_add_sz(nt, "currenttype", "Multiprocessor Free");
+    reg_add_sz(nt, "systemroot", "C:\\Windows");
+    reg_add_sz(nt, "pathname", "C:\\Windows");
+    reg_add_sz("hklm\\software\\microsoft\\directx", "version", "4.09.00.0904");
+    /* Diagnostic BEER_DSTORAGE_CPU=1: DirectStorage's documented override that keeps decompression on the CPU. */
+    if (getenv("BEER_DSTORAGE_CPU"))
+        reg_add_dword("hklm\\software\\microsoft\\directstorage\\overrides", "disablegpudecompression", 1);
+}
+
 static void reg_seed_locked(void)
 {
     if (g_reg_value_count) return;
     reg_seed_hardware();
+    reg_seed_windows_version();
     reg_seed_vc_runtime();
     reg_seed_nvidia_ngx();
     {   /* Launchers look for their sibling launcher through its install folder: point it at the game directory. */
@@ -268,6 +337,21 @@ static int reg_key_exists_locked(const char *path)
     return 0;
 }
 
+/* BEER_REG_MISS_LOG=1: every distinct key or value the guest asks for that this registry does not have. */
+static void reg_log_miss(const char *path, const char *value)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_REG_MISS_LOG") != NULL;
+    if (!on) return;
+    static char seen[512][96];
+    static int seen_count;
+    char key[96];
+    snprintf(key, sizeof(key), "%.60s|%.30s", path, value ? value : "");
+    for (int i = 0; i < seen_count; ++i) if (!strcmp(seen[i], key)) return;
+    if (seen_count < 512) snprintf(seen[seen_count++], sizeof(seen[0]), "%s", key);
+    fprintf(stderr, "[REG MISS] %s%s%s\n", path, value ? " : " : "", value ? value : "");
+}
+
 static u64 reg_open(u64 key, const char *subkey, u64 *result)
 {
     if (result) *result = 0;
@@ -290,6 +374,7 @@ static u64 reg_open(u64 key, const char *subkey, u64 *result)
         } else if (g_reg_value_count > 0 && reg_key_exists_locked(path)) {
             status = 0;
         }
+        if (status == 2) reg_log_miss(path, NULL);
     }
     pthread_mutex_unlock(&g_reg_mutex);
     return status;
@@ -309,21 +394,20 @@ static u64 reg_query(u64 key, const char *name_ascii, u32 *type, void *data, u32
     else for (int k = 0; k < g_reg_value_count; ++k) {
         BeerRegValue *v = &g_reg_values[k];
         if (strcmp(v->path, path) || strcmp(v->name, lname)) continue;
-        u32 need = v->type == 4 ? 4 : (u32)(strlen(v->text) + 1) * (wide ? 2u : 1u);
+        u32 need = reg_value_bytes(v, wide, NULL);
         if (type) *type = v->type;
         if (size) {
             u32 have = *size;
             *size = need;
             if (data) {
                 if (have < need) { status = 234; break; }   /* ERROR_MORE_DATA */
-                if (v->type == 4) memcpy(data, &v->dword, 4);
-                else if (wide) for (u32 c = 0; c < need / 2; ++c) ((u16 *)data)[c] = (u8)v->text[c];
-                else memcpy(data, v->text, need);
+                reg_value_bytes(v, wide, data);
             }
         }
         status = 0;
         break;
     }
+    if (status == 2) reg_log_miss(path, lname);
     pthread_mutex_unlock(&g_reg_mutex);
     return status;
 }
@@ -364,8 +448,9 @@ static u64 reg_get_value(u64 key, const char *subkey, const char *value, u32 fla
     if (opened) reg_close(opened);
     if (status == 0) {
         if (type) *type = found;
+        /* RRF_RT_REG_SZ 0x2, REG_BINARY 0x8, REG_DWORD 0x10, REG_QWORD 0x40 */
         if ((flags & 0xFFFFu) != 0 && !(found == 1 && (flags & 0x2u)) && !(found == 4 && (flags & 0x10u)) &&
-            (flags & 0xFFFFu) != 0xFFFFu)
+            !(found == 3 && (flags & 0x8u)) && !(found == 11 && (flags & 0x40u)) && (flags & 0xFFFFu) != 0xFFFFu)
             return 1630;                                          /* ERROR_UNSUPPORTED_TYPE */
     }
     return status;
@@ -411,7 +496,7 @@ static u64 reg_query_info(u64 key, u32 *class_chars, u32 *subkeys, u32 *max_subk
         if (strcmp(v->path, path)) continue;
         value_count++;
         if (strlen(v->name) > longest_name) longest_name = (u32)strlen(v->name);
-        u32 data = v->type == 4 ? 4u : (u32)(strlen(v->text) + 1) * (wide ? 2u : 1u);
+        u32 data = reg_value_bytes(v, wide, NULL);
         if (data > longest_data) longest_data = data;
     }
     pthread_mutex_unlock(&g_reg_mutex);
@@ -490,4 +575,41 @@ impl_RegEnumKeyExA(u64 key, u32 index, char *name, u32 *name_chars, u32 *reserve
     (void)reserved;
     if (class_name && class_chars && *class_chars) { class_name[0] = 0; *class_chars = 0; }
     return reg_enum_key(key, index, name, name_chars, last_write, 0);
+}
+
+/* RegEnumValue: the index-th value of the key, in table order (names are stored lower-cased). */
+static u64 __attribute__((ms_abi))
+impl_RegEnumValueW(u64 key, u32 index, u16 *name, u32 *name_chars, u32 *reserved, u32 *type, u8 *data, u32 *data_size)
+{
+    (void)reserved;
+    if (!name || !name_chars) return 87;                  /* ERROR_INVALID_PARAMETER */
+    pthread_mutex_lock(&g_reg_mutex);
+    reg_seed_locked();
+    char path[192];
+    if (!reg_key_path(key, path, sizeof(path)) || !reg_key_exists_locked(path)) {
+        pthread_mutex_unlock(&g_reg_mutex);
+        return 6;
+    }
+    BeerRegValue *found = NULL;
+    u32 seen = 0;
+    for (int k = 0; k < g_reg_value_count && !found; ++k)
+        if (!strcmp(g_reg_values[k].path, path) && seen++ == index) found = &g_reg_values[k];
+    if (!found) { pthread_mutex_unlock(&g_reg_mutex); return 259; }                  /* ERROR_NO_MORE_ITEMS */
+    size_t length = strlen(found->name);
+    if (length + 1 > *name_chars) { pthread_mutex_unlock(&g_reg_mutex); return 234; } /* ERROR_MORE_DATA */
+    for (size_t c = 0; c <= length; ++c) name[c] = (u8)found->name[c];
+    *name_chars = (u32)length;
+    u32 need = reg_value_bytes(found, 1, NULL);
+    u64 status = 0;
+    if (type) *type = found->type;
+    if (data_size) {
+        u32 have = *data_size;
+        *data_size = need;
+        if (data) {
+            if (have < need) status = 234;
+            else reg_value_bytes(found, 1, data);
+        }
+    }
+    pthread_mutex_unlock(&g_reg_mutex);
+    return status;
 }

@@ -739,8 +739,11 @@ class GameDialog(Adw.Dialog):
         adv = Adw.PreferencesGroup(title="Advanced")
         self.args = Adw.EntryRow(title="Extra loader arguments")
         self.args.set_text(game.get("args", ""))
+        self.game_args = Adw.EntryRow(title="Game arguments (passed to the exe)")
+        self.game_args.set_text(game.get("game_args", ""))
         self.env = Adw.EntryRow(title="Environment (KEY=value KEY2=value)")
         self.env.set_text(game.get("env", ""))
+        adv.add(self.game_args)
         adv.add(self.args)
         adv.add(self.env)
         page.add(adv)
@@ -783,6 +786,7 @@ class GameDialog(Adw.Dialog):
             "time_scale": round(self.speed.get_value(), 3),
             "fps_limit": int(self.cap.get_value()),
             "args": self.args.get_text().strip(),
+            "game_args": self.game_args.get_text().strip(),
             "env": self.env.get_text().strip(),
             "prefix": self.prefix_names[self.prefix.get_selected()],
             "presenter": PRESENTERS[self.presenter.get_selected()],
@@ -1043,13 +1047,21 @@ class Manager(Adw.Application):
                     prefix = steam_prefix(appid)
                 except (OSError, ValueError):
                     prefix = "default"
-                entry = {"name": record.get("name") or "App %d" % appid, "exe": exe, "args": record.get("arguments", ""),
+                entry = {"name": record.get("name") or "App %d" % appid, "exe": exe, "args": "",
+                         "game_args": record.get("arguments", ""),
                          "env": "", "prefix": prefix, "audio": "fmod", "time_scale": 1.0, "fps_limit": 0,
                          "presenter": "Default", "present_mode": "Default", "flags": {},
                          "source": "steam", "appid": appid, "steam_folder": record["folder"], "steam_workdir": workdir}
                 self.lib.games.append(entry)
                 changed = True
-            elif entry.get("exe") != exe or entry.get("steam_workdir", "") != workdir:
+            elif "game_args" not in entry:
+                # Older entries kept the launch option's arguments with the loader's own options.
+                arguments = record.get("arguments", "")
+                if arguments and entry.get("args", "") == arguments:
+                    entry["args"] = ""
+                entry["game_args"] = arguments
+                changed = True
+            if entry.get("exe") != exe or entry.get("steam_workdir", "") != workdir:
                 entry["exe"] = exe
                 entry["steam_folder"] = record["folder"]
                 entry["steam_workdir"] = workdir
@@ -1342,7 +1354,8 @@ class Manager(Adw.Application):
             cmd.append("--presenter=%s" % game["presenter"])
         if game.get("present_mode", "Default") != "Default":
             env["BEER_PRESENT_MODE"] = game["present_mode"]
-        cmd += shlex.split(game.get("args", "")) + [game["exe"]]
+        # Loader options come before the exe; everything after it is the game's own command line.
+        cmd += shlex.split(game.get("args", "")) + [game["exe"]] + shlex.split(game.get("game_args", ""))
         os.makedirs(LOG_DIR, exist_ok=True)
         safe = "".join(c if c.isalnum() else "_" for c in game["name"])
         log_path = os.path.join(LOG_DIR, "%s-%s.log" % (safe, time.strftime("%Y%m%d-%H%M%S")))

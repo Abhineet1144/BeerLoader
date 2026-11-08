@@ -128,6 +128,7 @@ typedef struct B11Texture {
     uint32_t subresources;
     uint64_t last_use_serial;
     int is_backbuffer;
+    uint8_t **map_shadow;         /* DYNAMIC/DEFAULT textures: per-subresource CPU copy Map returns; Unmap uploads it */
 } B11Texture;
 
 typedef struct B11View {

@@ -1,3 +1,4 @@
+#include <stdio.h>
 /* D3D12 entry points that remain after the host-snapshot compatibility device
  * was removed: D3D12CreateDevice (always the GPU-resident BD12 core),
  * D3D12GetDebugInterface, D3D12SerializeVersionedRootSignature (with its
@@ -83,6 +84,18 @@ static void *g_blob_vtable[5] = {
     [4] = blob_get_buffer_size,
 };
 
+/* An ID3DBlob holding a copy of `data` (size bytes), reference count 1. */
+void *beer_d3d_blob_create(const void *data, size_t size)
+{
+    BeerD3DBlob *object = calloc(1, sizeof(*object) + size);
+    if (!object) return NULL;
+    object->vtable = g_blob_vtable;
+    object->references = 1;
+    object->size = size;
+    if (size && data) memcpy(object->data, data, size);
+    return object;
+}
+
 static BeerD3D12SignalEventFn g_signal_event;
 
 void beer_d3d12_set_event_signaler(BeerD3D12SignalEventFn signaler)
@@ -104,10 +117,21 @@ beer_d3d12_create_device(uint64_t adapter, uint32_t minimum_feature_level,
                          const uint8_t *riid, void **device)
 {
     (void)adapter;
-    (void)minimum_feature_level;
-    if (!device) return BEER_E_INVALIDARG;
+    /* ppDevice == NULL asks whether a device could be created: S_FALSE (and no device), as on Windows. Games probe
+     * D3D12 support this way before choosing a renderer; E_INVALIDARG made them fall back to D3D11. BD12 offers
+     * feature level 12_2 (0xc200) at most. */
+    if (minimum_feature_level > 0xc200u) {
+        fprintf(stderr, "[D3D12] D3D12CreateDevice(min level 0x%x) -> E_INVALIDARG (above 12_2)\n", minimum_feature_level);
+        return BEER_E_INVALIDARG;
+    }
+    if (!device) {
+        fprintf(stderr, "[D3D12] D3D12CreateDevice(min level 0x%x, NULL) -> S_FALSE (support check)\n", minimum_feature_level);
+        return 1;                                     /* S_FALSE */
+    }
     *device = NULL;
-    return beer_bd12_create_device(riid, device);
+    const uint64_t hr = beer_bd12_create_device(riid, device);
+    fprintf(stderr, "[D3D12] D3D12CreateDevice(min level 0x%x) -> 0x%llx\n", minimum_feature_level, (unsigned long long)hr);
+    return hr;
 }
 
 uint64_t __attribute__((ms_abi))

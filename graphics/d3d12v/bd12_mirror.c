@@ -29,9 +29,7 @@ typedef struct BD12HeapMirror {
 #define MIRROR_SAMPLERS 2048u
 #define MIRROR_COUNT_OF(i) ((i) == 5u ? MIRROR_SAMPLERS : BD12_MIRROR_COUNT)
 
-#define MAX_HEAPS 64
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static BD12DescriptorHeap *g_heaps[MAX_HEAPS];
 static VkDescriptorSetLayout g_layout;
 static int g_layout_failed;
 
@@ -57,7 +55,10 @@ VkDescriptorSetLayout bd12_mirror_layout(BD12Device *device)
                 .binding = i,
                 .descriptorType = k_types[i],
                 .descriptorCount = MIRROR_COUNT_OF(i),
+                /* Mesh pipelines read the heaps through this set too (task/mesh are not in ALL_GRAPHICS). */
                 .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT |
+                              (device->CmdDrawMeshTasksEXT ? (VK_SHADER_STAGE_TASK_BIT_EXT |
+                                                              VK_SHADER_STAGE_MESH_BIT_EXT) : 0) |
                               (device->rt_enabled ? (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                                                      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
                                                      VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR) : 0)
@@ -90,27 +91,15 @@ VkDescriptorSetLayout bd12_mirror_layout(BD12Device *device)
     return layout;
 }
 
-void bd12_mirror_heap_register(BD12DescriptorHeap *heap)
+/* The heap is being destroyed: frees its mirror. */
+void bd12_mirror_heap_release(BD12DescriptorHeap *heap)
 {
-    pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < MAX_HEAPS; ++i)
-        if (!g_heaps[i]) { g_heaps[i] = heap; break; }
-    pthread_mutex_unlock(&g_lock);
-}
-
-void bd12_mirror_heap_unregister(BD12DescriptorHeap *heap)
-{
-    pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < MAX_HEAPS; ++i)
-        if (g_heaps[i] == heap) g_heaps[i] = NULL;
-    pthread_mutex_unlock(&g_lock);
     BD12HeapMirror *mirror = heap->mirror;
-    if (mirror) {
-        heap->device->vk.DestroyDescriptorPool(heap->device->device, mirror->pool, NULL);
-        pthread_mutex_destroy(&mirror->lock);
-        free(mirror);
-        heap->mirror = NULL;
-    }
+    if (!mirror) return;
+    heap->device->vk.DestroyDescriptorPool(heap->device->device, mirror->pool, NULL);
+    pthread_mutex_destroy(&mirror->lock);
+    free(mirror);
+    heap->mirror = NULL;
 }
 
 static void queue_init(BD12Image *image)
@@ -202,26 +191,10 @@ static void write_range(BD12DescriptorHeap *heap, uint32_t first, uint32_t count
     pthread_mutex_unlock(&mirror->lock);
 }
 
-void bd12_mirror_note(const void *first, uint32_t count)
+/* A descriptor write or copy reached heap slots [first, first+count) (bd12_heap_written / bd12_heap_copied). */
+void bd12_mirror_write(BD12DescriptorHeap *heap, uint32_t first, uint32_t count)
 {
-    BD12_DESCRIPTORS_WRITTEN();   /* every descriptor write reaches here; resolved sets may be stale */
-    if (!first || !count) return;
-    BD12DescriptorHeap *found = NULL;
-    uint32_t index = 0;
-    pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < MAX_HEAPS; ++i) {
-        BD12DescriptorHeap *h = g_heaps[i];
-        if (!h || !h->mirror) continue;
-        const BD12Descriptor *base = h->descriptors;
-        if ((const BD12Descriptor *)first >= base &&
-            (const BD12Descriptor *)first < base + h->count) {
-            found = h;
-            index = (uint32_t)((const BD12Descriptor *)first - base);
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_lock);
-    if (found) write_range(found, index, count);
+    if (heap->mirror) write_range(heap, first, count);
 }
 
 static BD12HeapMirror *mirror_ensure(BD12DescriptorHeap *heap)
@@ -333,6 +306,15 @@ static void mirror_refresh_samplers(BD12HeapMirror *mirror, BD12Device *device, 
     mirror->sampler_heap = samplers;
     mirror->sampler_gen = samplers->sampler_gen;
     pthread_mutex_unlock(&mirror->lock);
+}
+
+int bd12_mirror_bind(BD12CmdList *list, VkPipelineBindPoint point, VkPipelineLayout layout)
+{
+    BD12DescriptorHeap *heap = list->heaps[0];
+    if (!heap || !heap->mirror) return 0;
+    mirror_refresh_samplers(heap->mirror, list->device, list->heaps[1]);
+    list->device->vk.CmdBindDescriptorSets(list->command_buffer, point, layout, 1, 1, &heap->mirror->set, 0, NULL);
+    return 1;
 }
 
 int bd12_cmd_bind_bindless(BD12CmdList *list, BD12BindState *state,

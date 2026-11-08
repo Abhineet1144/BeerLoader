@@ -10,7 +10,7 @@ MEDIA_SRCS = media/media_foundation.c
 PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_winhttp_url.c platform/win32_winhttp.c platform/win32_full_path.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
-				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_shell_strings.c
+				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_sddl.c platform/win32_shell_strings.c platform/win32_variant.c platform/win32_schannel.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
                renderer/vulkan/vulkan_post.c \
@@ -28,7 +28,7 @@ GRAPHICS_SRCS = graphics/d3d11/d3d11_impl.c \
                 graphics/d3d12v/bd12_image.c graphics/d3d12v/bd12_graphics.c \
                 graphics/d3d12v/bd12_extra.c graphics/d3d12v/bd12_formats.c \
                 graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c \
-                graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c graphics/d3d12v/bd12_pipelib.c graphics/d3d12v/bd12_cuda.c \
+                graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c graphics/d3d12v/bd12_pipelib.c graphics/d3d12v/bd12_cuda.c graphics/d3d12v/bd12_rootpush.c graphics/d3d12v/bd12_heapdb.c \
                 graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_mirror.c graphics/d3d12v/bd12_rtpipe.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_live.c \
                 graphics/d3d12v/bd12_capture.c graphics/d3d12v/bd12_cbtweak.c \
                 graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c \
@@ -106,6 +106,14 @@ platform/win32_crt_init.o: platform/win32_crt_init.c platform/win32_crt_init.h
 platform/win32_shell_strings.o: platform/win32_shell_strings.c platform/win32_shell_strings.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
 
+# Schannel calls the host OpenSSL (loaded at run time) and is called by guest code.
+platform/win32_schannel.o: platform/win32_schannel.c platform/win32_schannel.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
+# VARIANT conversions use floating point.
+platform/win32_variant.o: platform/win32_variant.c platform/win32_variant.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
 # COM objects the guest calls directly through their vtables (no dispatch trampoline): WASAPI, Media Foundation and
 # Text Services. With -mno-sse GCC cannot keep the Win64 nonvolatile XMM6-XMM15 across the libc calls these methods
 # make, so callers saw them clobbered (the same fault that stopped RE9's frame limiter through DirectInput).
@@ -119,8 +127,13 @@ media/media_foundation.o: media/media_foundation.c media/media_foundation.h
 platform/win32_tsf.o: platform/win32_tsf.c platform/win32_tsf.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
 
-graphics/d3d12/d3d12_shader_translator.o: graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_shader_translator.h
-	$(CC) $(RENDER_CFLAGS) -c $< -o $@
+# The on-disk shader translation cache is keyed by the translator's own sources (not the loader binary), so a rebuild
+# that does not touch translation keeps the cache. Any change to these files rebuilds this object with a new key.
+TRANSLATOR_KEY_SRCS = graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_shader_translator.h \
+                      graphics/d3d12/d3d12_dxil_translator.c graphics/d3d12/d3d12_dxil_translator.h
+graphics/d3d12/d3d12_shader_translator.o: $(TRANSLATOR_KEY_SRCS)
+	$(CC) $(RENDER_CFLAGS) -DBEER_TRANSLATOR_SOURCE_KEY=0x$(shell cat $(TRANSLATOR_KEY_SRCS) | sha1sum | cut -c1-16)ull \
+	      -c $< -o $@
 
 platform/xwayland_backend.o: platform/xwayland_backend.c
 	$(CC) $(RENDER_CFLAGS) -c $< -o $@
@@ -177,11 +190,24 @@ test-native-loader: $(filter-out loader.o,$(OBJS))
 
 .PHONY: test-native-loader
 
+test-native-sync: $(filter-out loader.o,$(OBJS))
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections tests/native_sync_contract_test.c $(filter-out loader.o,$(OBJS)) $(LDFLAGS) -o /tmp/beer-native-sync-contract-test
+	/tmp/beer-native-sync-contract-test
+	rm -f /tmp/beer-native-sync-contract-test
+
+.PHONY: test-native-sync
+
 test-adapter-info:
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_adapter_info_test.c -o /tmp/beer-adapter-info-test
 	/tmp/beer-adapter-info-test
 
 .PHONY: test-adapter-info
+
+test-sddl:
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_sddl_test.c platform/win32_sddl.c -o /tmp/beer-sddl-test
+	/tmp/beer-sddl-test
+
+.PHONY: test-sddl
 
 test-shell-strings:
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_shell_strings_test.c platform/win32_shell_strings.c -o /tmp/beer-shell-strings-test
@@ -300,8 +326,9 @@ D3D12V_SRCS = graphics/d3d12v/bd12_device.c graphics/d3d12v/bd12_cmd.c \
               graphics/d3d12v/bd12_descriptors.c graphics/d3d12v/bd12_bind.c \
               graphics/d3d12v/bd12_image.c graphics/d3d12v/bd12_graphics.c \
               graphics/d3d12v/bd12_extra.c graphics/d3d12v/bd12_mirror.c \
-              graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_capture.c
-D3D12V_CFLAGS = -O2 -g -Wall -Wextra -pthread -Igraphics/d3d12v -Irenderer/vulkan -idirafter $(VULKAN_HEADERS)
+              graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_capture.c \
+              graphics/d3d12v/bd12_heapdb.c graphics/d3d12v/bd12_rootpush.c
+D3D12V_CFLAGS = -O2 -g -Wall -Wextra -pthread -Igraphics/d3d12v -Igraphics/d3d12 -Irenderer/vulkan -idirafter $(VULKAN_HEADERS)
 
 # Standalone tests for the GPU-resident D3D12-on-Vulkan core (no game needed).
 test-bd12-rt:

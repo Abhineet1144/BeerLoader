@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 static void test_string_pointer_probes(void)
@@ -136,8 +137,37 @@ static void test_forward_query_and_commit_boundaries(void)
     assert(munmap(memory, page * 4) == 0);
 }
 
+/* Windows limits VirtualAlloc only by address space: tens of thousands of live regions must work (Beer once had a
+ * fixed 16384-entry table). Every region is found again, queried at an interior address, and released. */
+static void test_many_allocations(void)
+{
+    enum { COUNT = 40000 };
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char **regions = calloc(COUNT, sizeof(*regions));
+    assert(regions);
+    for (size_t i = 0; i < COUNT; ++i) {
+        regions[i] = beer_virtual_alloc(NULL, page * 2, BEER_MEM_RESERVE | BEER_MEM_COMMIT, BEER_PAGE_READWRITE);
+        assert(regions[i]);
+        regions[i][page] = (unsigned char)i;
+    }
+    BeerMemoryBasicInformation info;
+    for (size_t i = 0; i < COUNT; i += 97) {
+        assert(beer_virtual_query(regions[i] + page + 1, &info, sizeof(info)));
+        assert(info.allocation_base == (uint64_t)(uintptr_t)regions[i] && info.state == BEER_MEM_COMMIT);
+        assert(regions[i][page] == (unsigned char)i);
+    }
+    for (size_t i = 0; i < COUNT; i += 2) assert(beer_virtual_free(regions[i], 0, BEER_MEM_RELEASE));
+    for (size_t i = 1; i < COUNT; i += 2) {
+        assert(beer_virtual_query(regions[i], &info, sizeof(info)));
+        assert(info.allocation_base == (uint64_t)(uintptr_t)regions[i]);
+        assert(beer_virtual_free(regions[i], 0, BEER_MEM_RELEASE));
+    }
+    free(regions);
+}
+
 int main(void)
 {
+    test_many_allocations();
     test_forward_query_and_commit_boundaries();
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     unsigned char *memory = beer_virtual_alloc(NULL, page * 2,

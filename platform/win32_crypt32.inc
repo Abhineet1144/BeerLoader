@@ -313,6 +313,8 @@ static BeerCertStore *cert_store_from_p7(PKCS7 *p7)
     return store;
 }
 
+static void crypt_narrow(const u16 *wide, char *out, size_t size);
+static u64 crypt_open_system_store(const char *name);
 /* CertOpenStore: CERT_STORE_PROV_PKCS7 (5) and CERT_STORE_PROV_MSG (1) over a decoded message. */
 static u64 __attribute__((ms_abi))
 impl_CertOpenStore(u64 provider, u32 encoding, u64 crypt_provider, u32 flags, const void *parameter)
@@ -327,6 +329,11 @@ impl_CertOpenStore(u64 provider, u32 encoding, u64 crypt_provider, u32 flags, co
     } else if (provider == 1 && crypt_msg((u64)(uintptr_t)parameter)) {
         PKCS7 *source = crypt_msg((u64)(uintptr_t)parameter)->p7;
         p7 = source ? PKCS7_dup(source) : NULL;
+    } else if ((provider == 9 || provider == 10) && parameter) {   /* CERT_STORE_PROV_SYSTEM_A / _W */
+        char name[64];
+        if (provider == 9) snprintf(name, sizeof(name), "%s", (const char *)parameter);
+        else crypt_narrow((const u16 *)parameter, name, sizeof(name));
+        return crypt_open_system_store(name);
     } else {
         fprintf(stderr, "[CRYPT32] CertOpenStore provider %llu is not implemented\n", (unsigned long long)provider);
         g_last_error = 2;                       /* no provider function for this store type */
@@ -829,4 +836,162 @@ static u64 __attribute__((ms_abi)) impl_WTHelperGetProvCertFromChain(u8 *signer,
 {
     if (!signer || index >= *(const u32 *)(signer + 0x0c)) return 0;
     return *(const u64 *)(signer + 0x10) + (u64)index * 0x58;
+}
+
+/* ---- System certificate stores (CertOpenSystemStore, CERT_STORE_PROV_SYSTEM) ----
+ * "ROOT" holds the host's trusted CA certificates (the system CA bundle, or Android's cacerts directory), so TLS
+ * clients that load Windows' root store into their own verifier (curl/OpenSSL with native CA) trust what the host
+ * trusts. Other system stores ("CA", "MY", ...) open empty. On Windows these opens always succeed; a client that
+ * met NULL here went down an error path that used an uninitialised certificate list (Where Winds Meet). */
+#include <dirent.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+static STACK_OF(X509) *g_crypt_host_roots;
+static pthread_once_t g_crypt_host_roots_once = PTHREAD_ONCE_INIT;
+static void crypt_add_pem_file(STACK_OF(X509) *roots, const char *path)
+{
+    FILE *file = fopen(path, "r");
+    if (!file) return;
+    X509 *cert;
+    while ((cert = PEM_read_X509(file, NULL, NULL, NULL))) sk_X509_push(roots, cert);
+    ERR_clear_error();
+    fclose(file);
+}
+static void crypt_load_host_roots(void)
+{
+    g_crypt_host_roots = sk_X509_new_null();
+    if (!g_crypt_host_roots) return;
+    static const char *const bundles[] = {
+        "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem",
+        "/etc/ssl/cert.pem",
+    };
+    const char *env = getenv("SSL_CERT_FILE");
+    if (env && *env) crypt_add_pem_file(g_crypt_host_roots, env);
+    for (size_t i = 0; !sk_X509_num(g_crypt_host_roots) && i < sizeof(bundles) / sizeof(*bundles); ++i)
+        crypt_add_pem_file(g_crypt_host_roots, bundles[i]);
+    if (!sk_X509_num(g_crypt_host_roots)) {                       /* Android: one PEM file per certificate */
+        DIR *dir = opendir("/system/etc/security/cacerts");
+        struct dirent *entry;
+        while (dir && (entry = readdir(dir))) {
+            if (entry->d_name[0] == '.') continue;
+            char path[512];
+            snprintf(path, sizeof(path), "/system/etc/security/cacerts/%s", entry->d_name);
+            crypt_add_pem_file(g_crypt_host_roots, path);
+        }
+        if (dir) closedir(dir);
+    }
+    fprintf(stderr, "[CRYPT32] ROOT system store: %d host CA certificate(s)\n", sk_X509_num(g_crypt_host_roots));
+}
+static u64 crypt_open_system_store(const char *name)
+{
+    BeerCertStore *store = calloc(1, sizeof(*store));
+    if (!store) { g_last_error = 8; return 0; }
+    store->magic = BEER_CERT_STORE_MAGIC;
+    store->certs = sk_X509_new_null();
+    if (name && !strcasecmp(name, "ROOT")) {
+        pthread_once(&g_crypt_host_roots_once, crypt_load_host_roots);
+        for (int i = 0; g_crypt_host_roots && i < sk_X509_num(g_crypt_host_roots); ++i) {
+            X509 *cert = sk_X509_value(g_crypt_host_roots, i);
+            if (X509_up_ref(cert)) sk_X509_push(store->certs, cert);
+        }
+    }
+    g_last_error = 0;
+    return (u64)(uintptr_t)store;
+}
+static void crypt_narrow(const u16 *wide, char *out, size_t size)
+{
+    size_t i = 0;
+    for (; wide && wide[i] && i + 1 < size; ++i) out[i] = (char)(wide[i] < 0x80 ? wide[i] : '?');
+    out[i] = 0;
+}
+static u64 __attribute__((ms_abi)) impl_CertOpenSystemStoreA(u64 provider, const char *name)
+    { (void)provider; return crypt_open_system_store(name); }
+static u64 __attribute__((ms_abi)) impl_CertOpenSystemStoreW(u64 provider, const u16 *name)
+{
+    (void)provider;
+    char narrow[64];
+    crypt_narrow(name, narrow, sizeof(narrow));
+    return crypt_open_system_store(narrow);
+}
+/* CertEnumCertificatesInStore: the next certificate after pPrevCertContext (which it frees), NULL at the end. */
+static u64 __attribute__((ms_abi)) impl_CertEnumCertificatesInStore(u64 handle, const u8 *previous)
+{
+    if (!cert_store(handle)) { g_last_error = 6; return 0; }
+    return impl_CertFindCertificateInStore(handle, 0, 0, 0, NULL, previous);
+}
+/* CertDuplicateCertificateContext: contexts are independent copies here, so a duplicate is another copy. */
+static u64 __attribute__((ms_abi)) impl_CertDuplicateCertificateContext(const u8 *context)
+{
+    if (!context) return 0;
+    const u8 *der = (const u8 *)(uintptr_t)*(const u64 *)(context + 0x08);
+    X509 *cert = d2i_X509(NULL, &der, (long)*(const u32 *)(context + 0x10));
+    if (!cert) return 0;
+    size_t size = crypt_cert_context(NULL, cert, *(const u64 *)(context + 0x20));
+    u8 *allocation = calloc(1, 16 + size);
+    if (allocation) {
+        *(u32 *)allocation = *(const u32 *)(context - 16);
+        crypt_cert_context(allocation + 16, cert, *(const u64 *)(context + 0x20));
+    }
+    X509_free(cert);
+    return allocation ? (u64)(uintptr_t)(allocation + 16) : 0;
+}
+/* The certificate behind a CERT_INFO that crypt_cert_context laid out (the CERT_CONTEXT is right before it). */
+static X509 *crypt_cert_from_info(const u8 *info)
+{
+    if (!info) return NULL;
+    const u8 *context = info - 0x28;
+    if (*(const u64 *)(context + 0x18) != (u64)(uintptr_t)info) return NULL;
+    const u8 *der = (const u8 *)(uintptr_t)*(const u64 *)(context + 0x08);
+    return d2i_X509(NULL, &der, (long)*(const u32 *)(context + 0x10));
+}
+/* CertGetIntendedKeyUsage: the key-usage extension's bits; FALSE with no error when the certificate has none. */
+static u64 __attribute__((ms_abi)) impl_CertGetIntendedKeyUsage(u32 encoding, const u8 *info, u8 *usage, u32 size)
+{
+    (void)encoding;
+    X509 *cert = crypt_cert_from_info(info);
+    g_last_error = 0;
+    if (!cert) return 0;
+    ASN1_BIT_STRING *bits = X509_get_ext_d2i(cert, NID_key_usage, NULL, NULL);
+    X509_free(cert);
+    if (!bits) return 0;
+    if (usage && size) {
+        memset(usage, 0, size);
+        for (int i = 0; i < ASN1_STRING_length(bits) && (u32)i < size; ++i) usage[i] = ASN1_STRING_get0_data(bits)[i];
+    }
+    ASN1_BIT_STRING_free(bits);
+    return 1;
+}
+/* CertGetEnhancedKeyUsage: CERT_ENHKEY_USAGE { DWORD cUsageIdentifier; LPSTR *rgpszUsageIdentifier } and the OID
+ * strings, in one buffer. No extension: zero identifiers with CRYPT_E_NOT_FOUND ("valid for all uses"). */
+static u64 __attribute__((ms_abi)) impl_CertGetEnhancedKeyUsage(const u8 *context, u32 flags, u8 *usage, u32 *size)
+{
+    (void)flags;
+    if (!context || !size) { g_last_error = 87; return 0; }
+    X509 *cert = crypt_cert_from_info((const u8 *)(uintptr_t)*(const u64 *)(context + 0x18));
+    EXTENDED_KEY_USAGE *eku = cert ? X509_get_ext_d2i(cert, NID_ext_key_usage, NULL, NULL) : NULL;
+    X509_free(cert);
+    const int count = eku ? sk_ASN1_OBJECT_num(eku) : 0;
+    char oids[32][80];
+    size_t needed = 16 + (size_t)count * 8;
+    for (int i = 0; i < count && i < 32; ++i) {
+        OBJ_obj2txt(oids[i], sizeof(oids[i]), sk_ASN1_OBJECT_value(eku, i), 1);
+        needed += strlen(oids[i]) + 1;
+    }
+    sk_ASN1_OBJECT_pop_free(eku, ASN1_OBJECT_free);
+    if (!usage) { *size = (u32)needed; g_last_error = 0; return 1; }
+    if (*size < needed) { *size = (u32)needed; g_last_error = 234; return 0; }   /* ERROR_MORE_DATA */
+    memset(usage, 0, needed);
+    *(u32 *)usage = (u32)(count < 32 ? count : 32);
+    u64 *pointers = (u64 *)(usage + 16);
+    *(u64 *)(usage + 8) = count ? (u64)(uintptr_t)pointers : 0;
+    char *text = (char *)(usage + 16 + (size_t)count * 8);
+    for (int i = 0; i < count && i < 32; ++i) {
+        pointers[i] = (u64)(uintptr_t)text;
+        size_t length = strlen(oids[i]) + 1;
+        memcpy(text, oids[i], length);
+        text += length;
+    }
+    *size = (u32)needed;
+    g_last_error = count ? 0 : BEER_CRYPT_E_NOT_FOUND;
+    return 1;
 }

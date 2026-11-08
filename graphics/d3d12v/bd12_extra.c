@@ -17,6 +17,10 @@ static void global_barrier(BD12CmdList *list, VkPipelineStageFlags2 src_stage,
                            VkPipelineStageFlags2 dst_stage,
                            VkAccessFlags2 dst_access)
 {
+    if (list->barrier_batching) {
+        bd12_cmd_add_memory_barrier(list, src_stage, src_access, dst_stage, dst_access);
+        return;
+    }
     VkMemoryBarrier2 barrier = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask = src_stage,
