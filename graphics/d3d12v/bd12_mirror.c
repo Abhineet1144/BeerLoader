@@ -16,7 +16,17 @@
  * the mirror immediately; a shader finds its table through a push-constant
  * word holding the heap index of the array's first element. */
 
+/* The pinned buffer view a mirror slot holds (the arguments it was looked up with), so it can be released when the
+ * slot is overwritten or the heap goes away. */
+typedef struct {
+    BD12Buffer *buffer;
+    uint32_t serial;
+    VkFormat format;
+    VkDeviceSize offset, range;
+} MirrorPin;
+
 typedef struct BD12HeapMirror {
+    MirrorPin *pins;          /* BD12_MIRROR_COUNT entries, allocated on the first pin; guarded by lock */
     VkDescriptorPool pool;
     VkDescriptorSet set;
     pthread_mutex_t lock;
@@ -96,6 +106,13 @@ void bd12_mirror_heap_release(BD12DescriptorHeap *heap)
 {
     BD12HeapMirror *mirror = heap->mirror;
     if (!mirror) return;
+    if (mirror->pins) {
+        for (uint32_t i = 0; i < BD12_MIRROR_COUNT; ++i) {
+            const MirrorPin *p = &mirror->pins[i];
+            if (p->buffer) bd12_buffer_view_unpin(heap->device, p->buffer, p->serial, p->format, p->offset, p->range);
+        }
+        free(mirror->pins);
+    }
     heap->device->vk.DestroyDescriptorPool(heap->device->device, mirror->pool, NULL);
     pthread_mutex_destroy(&mirror->lock);
     free(mirror);
@@ -115,6 +132,67 @@ static void queue_init(BD12Image *image)
     g_pending[g_pending_count++] = image;
 }
 
+/* One slot of write_range: appends its descriptor write at writes[*n] when the descriptor is usable, and records a
+ * buffer view it pins in mirror->pins[i]. */
+static void write_slot(BD12HeapMirror *mirror, const BD12Descriptor *d, uint32_t i, VkWriteDescriptorSet *writes,
+                       VkDescriptorImageInfo *images, VkDescriptorBufferInfo *buffers, VkBufferView *views,
+                       uint32_t *np)
+{
+    const uint32_t n = *np;
+    uint32_t binding;
+    switch (d->kind) {
+    case BD12_DESC_SRV_IMAGE: binding = 0; break;
+    case BD12_DESC_UAV_IMAGE: binding = 1; break;
+    case BD12_DESC_SRV_BUFFER: binding = 2; break;
+    case BD12_DESC_UAV_BUFFER: binding = 3; break;
+    case BD12_DESC_CBV: binding = 4; break;
+    default: return;
+    }
+    if (!bd12_descriptor_alive(d)) return;
+    if (binding == 4) {
+        if (!d->buffer) return;
+        buffers[n] = (VkDescriptorBufferInfo){ d->buffer, d->offset, d->range };
+        writes[n] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = mirror->set,
+            .dstBinding = 4,
+            .dstArrayElement = i,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &buffers[n]
+        };
+        *np = n + 1;
+        return;
+    }
+    VkBufferView buffer_view = d->buffer_view;
+    if (binding >= 2 && !buffer_view && d->source_buffer) {
+        if (!mirror->pins) mirror->pins = calloc(BD12_MIRROR_COUNT, sizeof(*mirror->pins));
+        if (!mirror->pins) return;                 /* cannot track the pin: leave the slot as it was */
+        buffer_view = bd12_buffer_view_pinned(d->source_buffer, d->format, d->offset, d->range, binding == 3);
+        if (buffer_view)
+            mirror->pins[i] = (MirrorPin){ d->source_buffer, d->buffer_serial, d->format, d->offset, d->range };
+    }
+    if ((binding < 2 && !d->image_view) || (binding >= 2 && !buffer_view)) return;
+    if (binding < 2) {
+        images[n] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, d->image_view,
+            d->image_layout ? d->image_layout : VK_IMAGE_LAYOUT_GENERAL };
+        if (d->image) queue_init(d->image);
+    } else {
+        views[n] = buffer_view;
+    }
+    writes[n] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = mirror->set,
+        .dstBinding = binding,
+        .dstArrayElement = i,
+        .descriptorCount = 1,
+        .descriptorType = k_types[binding],
+        .pImageInfo = binding < 2 ? &images[n] : NULL,
+        .pTexelBufferView = binding >= 2 ? &views[n] : NULL
+    };
+    *np = n + 1;
+}
+
 /* Writes descriptors [first, first+count) of `heap` into its mirror. */
 static void write_range(BD12DescriptorHeap *heap, uint32_t first, uint32_t count)
 {
@@ -130,58 +208,21 @@ static void write_range(BD12DescriptorHeap *heap, uint32_t first, uint32_t count
     pthread_mutex_lock(&g_lock);
     for (uint32_t i = first; i < first + count && i < heap->count && i < BD12_MIRROR_COUNT; ++i) {
         const BD12Descriptor *d = &heap->descriptors[i];
-        uint32_t binding;
-        switch (d->kind) {
-        case BD12_DESC_SRV_IMAGE: binding = 0; break;
-        case BD12_DESC_UAV_IMAGE: binding = 1; break;
-        case BD12_DESC_SRV_BUFFER: binding = 2; break;
-        case BD12_DESC_UAV_BUFFER: binding = 3; break;
-        case BD12_DESC_CBV: binding = 4; break;
-        default: continue;
+        /* A slot that gets a new Vulkan descriptor releases the view it pinned before, after the new one is pinned
+         * (rewriting the same view never drops it to zero pins). A slot left unwritten (null or dead descriptor)
+         * still holds its old view in the set, so that view stays pinned. */
+        MirrorPin old = { 0 };
+        if (mirror->pins && mirror->pins[i].buffer) {
+            old = mirror->pins[i];
+            mirror->pins[i].buffer = NULL;
         }
-        if (!bd12_descriptor_alive(d)) continue;
-        if (binding == 4) {
-            if (!d->buffer) continue;
-            buffers[n] = (VkDescriptorBufferInfo){ d->buffer, d->offset, d->range };
-            writes[n] = (VkWriteDescriptorSet){
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = mirror->set,
-                .dstBinding = 4,
-                .dstArrayElement = i,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                .pBufferInfo = &buffers[n]
-            };
-            if (++n == CHUNK) {
-                device->vk.UpdateDescriptorSets(device->device, n, writes, 0, NULL);
-                n = 0;
-            }
-            continue;
+        const uint32_t before = n;
+        write_slot(mirror, d, i, writes, images, buffers, views, &n);
+        if (old.buffer) {
+            if (n != before) bd12_buffer_view_unpin(device, old.buffer, old.serial, old.format, old.offset, old.range);
+            else mirror->pins[i] = old;
         }
-        VkBufferView buffer_view = d->buffer_view;
-        if (binding >= 2 && !buffer_view && d->source_buffer)
-            buffer_view = bd12_buffer_view_pinned(d->source_buffer, d->format, d->offset,
-                                                  d->range, binding == 3);
-        if ((binding < 2 && !d->image_view) || (binding >= 2 && !buffer_view))
-            continue;
-        if (binding < 2) {
-            images[n] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, d->image_view,
-                d->image_layout ? d->image_layout : VK_IMAGE_LAYOUT_GENERAL };
-            if (d->image) queue_init(d->image);
-        } else {
-            views[n] = buffer_view;
-        }
-        writes[n] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = mirror->set,
-            .dstBinding = binding,
-            .dstArrayElement = i,
-            .descriptorCount = 1,
-            .descriptorType = k_types[binding],
-            .pImageInfo = binding < 2 ? &images[n] : NULL,
-            .pTexelBufferView = binding >= 2 ? &views[n] : NULL
-        };
-        if (++n == CHUNK) {
+        if (n == CHUNK) {
             device->vk.UpdateDescriptorSets(device->device, n, writes, 0, NULL);
             n = 0;
         }
@@ -337,8 +378,10 @@ int bd12_cmd_bind_bindless(BD12CmdList *list, BD12BindState *state,
     mirror_refresh_samplers(heap->mirror, device, list->heaps[1]);
     device->vk.CmdBindDescriptorSets(list->command_buffer, point, layout, 1, 1,
                                      &heap->mirror->set, 0, NULL);
-    if (words)
+    if (words) {
         device->vk.CmdPushConstants(list->command_buffer, layout, stages, 0,
                                     words * 4, values);
+        bd12_cmd_push_disturbed(list);
+    }
     return 1;
 }

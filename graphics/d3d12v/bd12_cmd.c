@@ -234,6 +234,7 @@ BD12CmdList *bd12_cmd_list_create(BD12CmdAllocator *allocator)
 void bd12_cmd_list_destroy(BD12CmdList *list, BD12CmdAllocator *allocator)
 {
     if (!list) return;
+    bd12_gpuprof_list_destroy(list);
     if (list->command_buffer_allocated)
         list->device->vk.FreeCommandBuffers(list->device->device,
             allocator->pool, list->command_buffer_allocated,
@@ -248,6 +249,7 @@ void bd12_cmd_record_flight_op(BD12CmdList *list, BD12FlightOpType type,
                                uint32_t width, uint32_t height, uint32_t depth)
 {
     bd12_ckpt_mark(list, (uint32_t)type, amount, pipeline_hash, width, height, depth);
+    bd12_gpuprof_mark(list, (uint32_t)type, pipeline_hash);
     BD12FlightOp *entry = &list->op_flight[list->op_count++ % BD12_FLIGHT_OPS];
     *entry = (BD12FlightOp){ pipeline_hash, amount, type, width, height, depth,
                              list->command_buffer_count - 1 };
@@ -264,6 +266,7 @@ int bd12_cmd_list_begin(BD12CmdList *list)
     if (list->device->vk.BeginCommandBuffer(list->command_buffer, &info) !=
         VK_SUCCESS)
         return 0;
+    bd12_gpuprof_list_begin(list);
     {   /* D3D12 makes everything earlier work on the queue wrote visible to a command list (state decay and
          * promotion at ExecuteCommandLists boundaries). Every submission goes to one Vulkan queue, and a barrier's
          * first scope covers all earlier submissions on it, so this one barrier gives that ordering on the GPU
@@ -304,6 +307,7 @@ int bd12_cmd_list_begin(BD12CmdList *list)
 int bd12_cmd_list_end(BD12CmdList *list)
 {
     bd12_cmd_end_rendering(list);
+    bd12_gpuprof_list_end(list);
     list->recording = 0;
     return list->device->vk.EndCommandBuffer(list->command_buffer) == VK_SUCCESS;
 }
@@ -601,6 +605,7 @@ void bd12_cmd_dispatch(BD12CmdList *list, BD12ComputePipeline *pipeline,
 {
     BD12Device *device = list->device;
     bd12_cmd_invalidate_point(list, 1);   /* an internal pipeline replaces the title's compute bindings */
+    bd12_cmd_push_disturbed(list);        /* and its push constants replace every bind point's */
     device->vk.CmdBindPipeline(list->command_buffer,
                                VK_PIPELINE_BIND_POINT_COMPUTE,
                                pipeline->pipeline);

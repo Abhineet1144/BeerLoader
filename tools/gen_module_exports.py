@@ -15,7 +15,8 @@ DLL_DIR = sys.argv[1] if len(sys.argv) > 1 else "/usr/lib/x86_64-linux-gnu/wine/
 DLLS = """kernel32 kernelbase user32 advapi32 gdi32 shell32 shlwapi ole32 oleaut32 combase winmm imm32 version psapi
 iphlpapi setupapi cfgmgr32 crypt32 bcrypt rpcrt4 comctl32 msimg32 ws2_32 wldap32 wtsapi32 userenv dbghelp secur32
 powrprof dwmapi uxtheme hid xinput1_4 xinput1_3 dinput8 dsound winhttp wininet mswsock tdh dxva2 evr gdiplus mf
-mfplat mfreadwrite comdlg32 wintrust normaliz dnsapi netapi32 avrt propsys shcore sechost win32u ntdll sspicli""".split()
+mfplat mfreadwrite comdlg32 wintrust normaliz dnsapi netapi32 avrt propsys shcore sechost win32u ntdll sspicli
+bcryptprimitives""".split()
 
 
 def export_ordinals(path):
@@ -46,7 +47,7 @@ def export_ordinals(path):
 
 
 # DLLs whose programs import by ordinal (OLEAUT32's Automation and WS2_32's Winsock ordinals are a fixed Windows ABI).
-ORDINAL_DLLS = ["oleaut32", "ws2_32", "d3d12", "mmdevapi"]   # d3d12: UE resolves D3D12CreateDevice as ordinal 101
+ORDINAL_DLLS = ["oleaut32", "ws2_32", "d3d12", "mmdevapi", "xinput1_4", "xinput1_3"]   # d3d12: UE resolves D3D12CreateDevice as ordinal 101; UE delay-loads XInputGetState as XINPUT1_4 #2
 
 
 def export_names(path):

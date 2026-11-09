@@ -7,7 +7,7 @@ TARGET = loader
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
 MEDIA_SRCS = media/media_foundation.c
-PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_winhttp_url.c platform/win32_winhttp.c platform/win32_full_path.c platform/win32_gdi.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
+PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_winhttp_url.c platform/win32_winhttp.c platform/win32_full_path.c platform/win32_gdi.c platform/win32_gdiplus.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
 				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_sddl.c platform/win32_shell_strings.c platform/win32_variant.c platform/win32_schannel.c
@@ -29,7 +29,7 @@ GRAPHICS_SRCS = graphics/d3d11/d3d11_impl.c \
                 graphics/d3d12v/bd12_extra.c graphics/d3d12v/bd12_formats.c \
                 graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c \
                 graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c graphics/d3d12v/bd12_pipelib.c graphics/d3d12v/bd12_cuda.c graphics/d3d12v/bd12_rootpush.c graphics/d3d12v/bd12_heapdb.c \
-                graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_mirror.c graphics/d3d12v/bd12_rtpipe.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_live.c \
+                graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_mirror.c graphics/d3d12v/bd12_rtpipe.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_gpuprof.c graphics/d3d12v/bd12_live.c \
                 graphics/d3d12v/bd12_capture.c graphics/d3d12v/bd12_cbtweak.c \
                 graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c \
                 graphics/d3d11v/bd11_swap.c
@@ -109,6 +109,10 @@ platform/win32_shell_strings.o: platform/win32_shell_strings.c platform/win32_sh
 # Schannel calls the host OpenSSL (loaded at run time) and is called by guest code.
 platform/win32_schannel.o: platform/win32_schannel.c platform/win32_schannel.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
+# GDI+ takes REAL (float) parameters in XMM registers and calls the guest's IStream through its vtable.
+platform/win32_gdiplus.o: platform/win32_gdiplus.c platform/win32_gdiplus.h platform/win32_gdi.h
+	$(CC) $(D3D12_ABI_CFLAGS) -O2 -Iplatform -c $< -o $@
 
 # VARIANT conversions use floating point.
 platform/win32_variant.o: platform/win32_variant.c platform/win32_variant.h

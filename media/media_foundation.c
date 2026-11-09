@@ -1,3 +1,4 @@
+#define _GNU_SOURCE   /* pipe2 */
 #include "media_foundation.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -1422,15 +1423,23 @@ void *beer_mf_test_create_nv12_sample(const uint8_t *data, uint32_t size,
     return mf_sample_create(data, size, timestamp, duration);
 }
 
+/* Abandons the running decoders (seek, flush to a new position, release). Their output is no longer wanted, so they
+ * are terminated rather than waited for: a decoder blocked writing a full pipe exits only when the pipe breaks, and
+ * waiting on it here stalled the caller (RE4's movie thread on SetCurrentPosition after the logo movie). */
 static void mf_source_reader_stop_decoder(BeerMfSourceReader *self)
 {
     if (self->decoder_output) { fclose(self->decoder_output); self->decoder_output = NULL; }
-    if (self->decoder_pid > 0) { waitpid(self->decoder_pid, NULL, 0); self->decoder_pid = 0; }
     if (self->audio_decoder_output) {
         fclose(self->audio_decoder_output);
         self->audio_decoder_output = NULL;
     }
+    if (self->decoder_pid > 0) {
+        kill(self->decoder_pid, SIGTERM);
+        waitpid(self->decoder_pid, NULL, 0);
+        self->decoder_pid = 0;
+    }
     if (self->audio_decoder_pid > 0) {
+        kill(self->audio_decoder_pid, SIGTERM);
         waitpid(self->audio_decoder_pid, NULL, 0);
         self->audio_decoder_pid = 0;
     }
@@ -1566,9 +1575,11 @@ static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
 {
     if (!self->decoder_input_path) return 0;
     mf_source_reader_stop_decoder(self);
+    /* Close-on-exec: otherwise every decoder started later (another reader, a seek) inherits these read ends, and a
+     * decoder whose reader is gone never sees a broken pipe. dup2 onto stdout clears the flag in the child. */
     int video_pipe[2], audio_pipe[2];
-    if (pipe(video_pipe) != 0) return 0;
-    if (pipe(audio_pipe) != 0) {
+    if (pipe2(video_pipe, O_CLOEXEC) != 0) return 0;
+    if (pipe2(audio_pipe, O_CLOEXEC) != 0) {
         close(video_pipe[0]); close(video_pipe[1]);
         return 0;
     }
@@ -2059,6 +2070,28 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
                                BEER_S_OK, resolved_stream,
                                BEER_MF_SOURCE_READERF_ENDOFSTREAM,
                                0, NULL);
+    return BEER_S_OK;
+}
+
+uint64_t __attribute__((ms_abi))
+beer_mf_tenum_ex(const void *category, uint32_t flags, const void *input_type, const void *output_type,
+                 void ***activates, uint32_t *count)
+{
+    (void)category; (void)flags; (void)input_type; (void)output_type;
+    if (!activates || !count) return BEER_E_INVALIDARG;
+    *activates = NULL;
+    *count = 0;
+    return BEER_S_OK;
+}
+
+uint64_t __attribute__((ms_abi))
+beer_mf_tenum(const void *category, uint32_t flags, const void *input_type, const void *output_type,
+              const void *attributes, void **clsids, uint32_t *count)
+{
+    (void)category; (void)flags; (void)input_type; (void)output_type; (void)attributes;
+    if (!clsids || !count) return BEER_E_INVALIDARG;
+    *clsids = NULL;
+    *count = 0;
     return BEER_S_OK;
 }
 

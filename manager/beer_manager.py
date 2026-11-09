@@ -70,6 +70,43 @@ LAUNCH_FLAGS = [
     ("allow_180_base", "Allow guest DLLs at 0x180000000", "BEER_ALLOW_180_BASE", "1", ""),
     ("mangohud", "Allow MangoHud", "MANGOHUD", "1", "Off by default: the MangoHud Vulkan layer hooks the swapchain and crashed RE8 (Beer has its own overlay)"),
     ("dxr_probe", "Advertise ray tracing (experimental)", "BEER_DXR_PROBE", "1", "DXR probe; the pipeline is not finished"),
+    # D3D12 (BD12)
+    ("bd12_root_push", "Fast D3D12 binding (root push + descriptor buffers)", "BEER_BD12_ROOT_PUSH", "1",
+     "Binds resources the way D3D12 does instead of building descriptor sets per draw. RE8: 73 -> 114 fps. The first launch recompiles every pipeline (one long stall), later launches are smooth"),
+    ("bd12_multi_queue", "Separate Vulkan queues (experimental)", "BEER_BD12_MULTI_QUEUE", "1",
+     "Compute and copy queues on their own Vulkan queues so they can overlap with graphics"),
+    ("bd12_mesh", "Mesh shaders (experimental)", "BEER_BD12_MESH", "1", "Report and run D3D12 mesh/amplification shaders (VK_EXT_mesh_shader)"),
+    ("bd12_vrs", "Variable-rate shading (experimental)", "BEER_BD12_VRS", "1", "Report and run D3D12 VRS (VK_KHR_fragment_shading_rate)"),
+    ("dxr", "Report DXR ray tracing support", "BEER_DXR", "1", "Advertise D3D12 ray tracing to the game (incomplete in some games)"),
+    ("bd12_release_pipelines", "Release pipelines after compiling", "BEER_BD12_RELEASE_PIPELINES", "1",
+     "Always use warm-and-release (lower memory, more stutter). Normally automatic when memory gets tight"),
+    ("bd12_keep_pipelines", "Never release pipelines", "BEER_BD12_RELEASE_PIPELINES", "0", "Keep every compiled pipeline resident even when memory is tight"),
+    ("bd12_no_compile_at_create", "Compile pipelines on first use", "BEER_BD12_COMPILE_AT_CREATE", "0",
+     "Instead of when the game creates them (less up-front work, more stutter in game)"),
+    ("no_pipeline_library", "Disable D3D12 pipeline libraries", "BEER_D3D12_PIPELINE_LIBRARY", "0", "Report no pipeline library support to the game"),
+    ("no_shader_disk_cache", "Disable the shader translation cache", "BEER_SHADER_DISK_CACHE", "0", "Translate every shader again on each launch"),
+    ("no_pipeline_cache", "Ignore the saved pipeline cache", "BEER_NO_PIPELINE_CACHE", "1", "Start without the Vulkan pipeline cache file (it is still written)"),
+    # Window, media and I/O
+    ("hide_fullscreen_cursor", "Hide the cursor in fullscreen", "BEER_HIDE_FULLSCREEN_CURSOR", "1", "Always hide the host cursor while the game is fullscreen"),
+    ("single_window", "Single native window", "BEER_SINGLE_WINDOW", "1", "Give child windows no surface of their own (older behaviour)"),
+    ("dstorage_cpu", "DirectStorage: decompress on the CPU", "BEER_DSTORAGE_CPU", "1", "Sets DirectStorage's own override that disables GPU decompression"),
+    ("mf_composite", "Videos: direct blit", "BEER_MF_COMPOSITE", "1", "Old direct blit of decoded video frames"),
+]
+
+# Launch options that take a value: (key, label, environment variable, description). Empty = not set.
+LAUNCH_VALUES = [
+    ("dll_builtin", "Use Beer's own DLLs (BEER_DLL_BUILTIN)", "BEER_DLL_BUILTIN",
+     "Comma-separated DLL names Beer serves itself, ignoring copies in the game folder (e.g. winmm)"),
+    ("dll_path", "Extra runtime DLL folders (BEER_DLL_PATH)", "BEER_DLL_PATH", "Colon-separated folders searched for redistributable DLLs"),
+    ("pipeline_budget_mb", "Pipeline memory budget in MB", "BEER_BD12_PIPELINE_BUDGET_MB",
+     "Resident size above which pipelines are released after compiling (default: 60% of RAM or the memory limit)"),
+    ("dxgi_vram_mb", "Report at most this much VRAM (MB)", "BEER_DXGI_VRAM_MB", "Caps the dedicated video memory DXGI reports"),
+    ("dxgi_shared_mb", "Report at most this much shared GPU memory (MB)", "BEER_DXGI_SHARED_MB", "Caps the shared system memory DXGI reports"),
+    ("phys_mb", "Report at most this much RAM (MB)", "BEER_PHYS_MB", "Caps the physical memory the game is told about"),
+    ("audio_latency_ms", "Audio latency margin (ms)", "BEER_AUDIO_LATENCY_MS", "Default 40"),
+    ("nvapi_driver", "NVIDIA driver version to report", "BEER_SPOOF_NVAPI_DRIVER", "NVAPI driver version number (e.g. 56603 for 566.03)"),
+    ("ngx_path", "DLSS (NGX) runtime folder", "BEER_NGX_PATH", "Folder with nvngx.dll / _nvngx.dll when it is not found automatically"),
+    ("steam_id", "Steam ID for the offline Steam API", "BEER_STEAM_ID", "SteamID64 or account number reported by Beer's offline Steam"),
 ]
 
 BEER_HOME = os.path.expanduser("~/.beer")
@@ -224,6 +261,7 @@ class Library:
         self.settings.setdefault("loader", os.path.join(REPO, "loader"))
         self.settings.setdefault("vkd3d_library", find_vkd3d_library())
         self.settings.setdefault("steam_libraries", [STEAM_LIBRARY_DIR])
+        self.settings.setdefault("shader_cache_dir", storage.CACHE_DIR)
 
     def save(self):
         save_json(LIBRARY_FILE, {"games": self.games})
@@ -736,6 +774,16 @@ class GameDialog(Adw.Dialog):
             options.add(row)
             self.flag_rows[key] = row
         page.add(options)
+        values = Adw.PreferencesGroup(title="Loader values", description="Leave empty to use the default.")
+        self.value_rows = {}
+        saved_values = game.get("values", {})
+        for key, label, _env, description in LAUNCH_VALUES:
+            row = Adw.EntryRow(title=label)
+            row.set_tooltip_text(description)
+            row.set_text(str(saved_values.get(key, "")))
+            values.add(row)
+            self.value_rows[key] = row
+        page.add(values)
         adv = Adw.PreferencesGroup(title="Advanced")
         self.args = Adw.EntryRow(title="Extra loader arguments")
         self.args.set_text(game.get("args", ""))
@@ -792,6 +840,7 @@ class GameDialog(Adw.Dialog):
             "presenter": PRESENTERS[self.presenter.get_selected()],
             "present_mode": PRESENT_MODES[self.present_mode.get_selected()],
             "flags": {key: row.get_active() for key, row in self.flag_rows.items()},
+            "values": {key: row.get_text().strip() for key, row in self.value_rows.items() if row.get_text().strip()},
             "steam_mode": STEAM_API_MODES[self.steam_mode.get_selected()][0],
             "gpu": {"preset": self.gpu_choices[self.gpu.get_selected()], "name": self.gpu_name.get_text().strip(),
                     "vendor": self.gpu_vendor.get_text().strip(), "device": self.gpu_device.get_text().strip(),
@@ -1230,6 +1279,8 @@ class Manager(Adw.Application):
         loader.set_text(self.lib.settings["loader"])
         vkd3d = Adw.EntryRow(title="vkd3d-shader library")
         vkd3d.set_text(self.lib.settings["vkd3d_library"])
+        cache = Adw.EntryRow(title="Shader cache folder")
+        cache.set_text(self.lib.settings.get("shader_cache_dir") or storage.CACHE_DIR)
         bandwidth = Adw.SpinRow.new_with_range(0, 1000, 1)
         bandwidth.set_title("Steam download limit")
         bandwidth.set_subtitle("MB/s, 0 for no limit")
@@ -1243,6 +1294,7 @@ class Manager(Adw.Application):
         provider.set_text(self.lib.settings.get("steam_provider") or DEFAULT_PROVIDER)
         group.add(loader)
         group.add(vkd3d)
+        group.add(cache)
         group.add(provider)
         page.add(group)
 
@@ -1292,6 +1344,7 @@ class Manager(Adw.Application):
         def closed(_d):
             self.lib.settings["loader"] = loader.get_text().strip() or os.path.join(REPO, "loader")
             self.lib.settings["vkd3d_library"] = vkd3d.get_text().strip()
+            self.lib.settings["shader_cache_dir"] = os.path.expanduser(cache.get_text().strip()) or storage.CACHE_DIR
             self.lib.settings["steam_libraries"] = folders
             self.lib.settings["steam_provider"] = provider.get_text().strip() or DEFAULT_PROVIDER
             self.lib.settings["steam_bandwidth_mbps"] = bandwidth.get_value()
@@ -1325,6 +1378,10 @@ class Manager(Adw.Application):
             env["BEER_STEAM_API_MODE"] = mode
         if self.lib.settings.get("vkd3d_library"):
             env["BEER_VKD3D_SHADER_LIBRARY"] = self.lib.settings["vkd3d_library"]
+        # Where shader caches live (pipeline caches and translated shaders), chosen here rather than by the loader.
+        cache_dir = self.lib.settings.get("shader_cache_dir") or storage.CACHE_DIR
+        storage.migrate_cache(cache_dir)
+        env["BEER_CACHE_DIR"] = cache_dir
         scale = float(game.get("time_scale", 1.0))
         if abs(scale - 1.0) > 1e-6:
             env["BEER_TIME_SCALE"] = "%g" % scale
@@ -1350,6 +1407,10 @@ class Manager(Adw.Application):
                 env[variable] = value
             elif key == "renderer_vulkan":
                 cmd.append("--renderer=vulkan")
+        values = game.get("values", {})
+        for key, _label, variable, _description in LAUNCH_VALUES:
+            if str(values.get(key, "")).strip():
+                env[variable] = str(values[key]).strip()
         if game.get("presenter", "Default") != "Default":
             cmd.append("--presenter=%s" % game["presenter"])
         if game.get("present_mode", "Default") != "Default":

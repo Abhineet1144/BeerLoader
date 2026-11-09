@@ -207,6 +207,7 @@ static BD12AccelStruct *get_accel(BD12Device *device, uint64_t va,
         device->vk_rt.DestroyAccelerationStructureKHR(device->device,
                                                       entry->handle, NULL);
         entry->handle = VK_NULL_HANDLE;
+        free(entry->max_vertex);
     } else {
         if (buffer->accel_count == buffer->accel_capacity) {
             uint32_t capacity = buffer->accel_capacity ? buffer->accel_capacity * 2 : 2;
@@ -224,7 +225,7 @@ static BD12AccelStruct *get_accel(BD12Device *device, uint64_t va,
         .size = size,
         .type = type
     };
-    *entry = (BD12AccelStruct){ offset, size, type, VK_NULL_HANDLE };
+    *entry = (BD12AccelStruct){ offset, size, type, VK_NULL_HANDLE, NULL, 0 };
     if (device->vk_rt.CreateAccelerationStructureKHR(device->device, &info, NULL,
                                                      &entry->handle) != VK_SUCCESS) {
         fprintf(stderr, "[BD12 RT] CreateAccelerationStructure failed va=%llx size=%llu\n",
@@ -266,9 +267,12 @@ void bd12_rt_buffer_release(BD12Buffer *buffer)
     if (!buffer || !buffer->accel) return;
     BD12Device *device = buffer->device;
     for (uint32_t i = 0; i < buffer->accel_count; ++i)
+    {
         if (buffer->accel[i].handle)
             device->vk_rt.DestroyAccelerationStructureKHR(
                 device->device, buffer->accel[i].handle, NULL);
+        free(buffer->accel[i].max_vertex);
+    }
     free(buffer->accel);
     buffer->accel = NULL;
     buffer->accel_count = buffer->accel_capacity = 0;
@@ -316,8 +320,26 @@ void bd12_cmd_build_as(BD12CmdList *list, const void *desc)
         info.srcAccelerationStructure = src->handle;
     }
     for (uint32_t i = 0; i < n; ++i) ranges[i].primitiveCount = counts[i];
+    if (in->type != RT_TLAS) {
+        if (src && src->max_vertex && src->geometry_count == n) {   /* an update repeats the source build's maxVertex */
+            for (uint32_t i = 0; i < n; ++i)
+                if (geoms[i].geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+                    geoms[i].geometry.triangles.maxVertex = src->max_vertex[i];
+        }
+        if (dst != src || !dst->max_vertex) {                       /* record what this build specified */
+            uint32_t *mv = dst->geometry_count == n && dst->max_vertex ? dst->max_vertex : realloc(dst->max_vertex, (n ? n : 1) * sizeof(*mv));
+            if (mv) {
+                for (uint32_t i = 0; i < n; ++i)
+                    mv[i] = geoms[i].geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR ? geoms[i].geometry.triangles.maxVertex : 0;
+                dst->max_vertex = mv;
+                dst->geometry_count = n;
+            }
+        }
+    }
     const VkAccelerationStructureBuildRangeInfoKHR *range_ptr = ranges;
     bd12_cmd_global_barrier(list);
+    /* GPU checkpoint kind 200: AS build (a = destination VA, b = 1 TLAS / 2 BLAS + 4 update, w = descriptor count). */
+    bd12_ckpt_mark(list, 200u, d->dest, (in->type == RT_TLAS ? 1u : 2u) | (src ? 4u : 0u), in->num_descs, 0, 0);
     device->vk_rt.CmdBuildAccelerationStructuresKHR(list->command_buffer, 1, &info,
                                                     &range_ptr);
     bd12_cmd_global_barrier(list);
@@ -338,6 +360,14 @@ void bd12_cmd_copy_as(BD12CmdList *list, uint64_t dst_va, uint64_t src_va,
      * application is the full size, so its destination is large enough. */
     BD12AccelStruct *dst = get_accel(device, dst_va, src->type, src->size);
     if (!dst) return;
+    if (dst != src && src->max_vertex) {   /* a clone keeps the source's geometry description for later updates */
+        uint32_t *mv = realloc(dst->max_vertex, src->geometry_count * sizeof(*mv));
+        if (mv) {
+            memcpy(mv, src->max_vertex, src->geometry_count * sizeof(*mv));
+            dst->max_vertex = mv;
+            dst->geometry_count = src->geometry_count;
+        }
+    }
     (void)mode;
     VkCopyAccelerationStructureInfoKHR info = {
         .sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR,
@@ -346,6 +376,7 @@ void bd12_cmd_copy_as(BD12CmdList *list, uint64_t dst_va, uint64_t src_va,
         .mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR
     };
     bd12_cmd_global_barrier(list);
+    bd12_ckpt_mark(list, 201u, dst_va, src_va, mode, 0, 0);   /* GPU checkpoint kind 201: AS copy */
     device->vk_rt.CmdCopyAccelerationStructureKHR(list->command_buffer, &info);
     bd12_cmd_global_barrier(list);
 }

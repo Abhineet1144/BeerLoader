@@ -136,6 +136,7 @@ BD12Device *bd12_device_create(void)
     device->min_uniform_alignment =
         properties.limits.minUniformBufferOffsetAlignment;
     device->max_uniform_range = properties.limits.maxUniformBufferRange;
+    { extern float g_bd12_timestamp_period; g_bd12_timestamp_period = properties.limits.timestampPeriod; }
     device->min_uniform_texel_alignment =
         modern->uniform_texel_buffer_offset_alignment ?
         modern->uniform_texel_buffer_offset_alignment :
@@ -156,10 +157,15 @@ BD12Device *bd12_device_create(void)
     /* Persistent pipeline cache: driver pipeline compiles dominate first-run loading.
      * BEER_PIPELINE_CACHE_OFF=1 (diagnostic): no VkPipelineCache at all, to measure what it holds in memory. */
     if (!getenv("BEER_PIPELINE_CACHE_OFF")) {
-        const char *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+        /* BEER_CACHE_DIR (set by the manager) holds every shader cache; otherwise $XDG_CACHE_HOME/beer or
+         * ~/.cache/beer. */
+        const char *root = getenv("BEER_CACHE_DIR"), *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
         char dir[400];
-        if (xdg && *xdg) snprintf(dir, sizeof(dir), "%s/beer", xdg);
+        if (root && *root) snprintf(dir, sizeof(dir), "%s", root);
+        else if (xdg && *xdg) snprintf(dir, sizeof(dir), "%s/beer", xdg);
         else snprintf(dir, sizeof(dir), "%s/.cache/beer", home ? home : "/tmp");
+        for (size_t i = 1; dir[i]; ++i)                    /* mkdir -p */
+            if (dir[i] == '/') { dir[i] = 0; mkdir(dir, 0700); dir[i] = '/'; }
         mkdir(dir, 0700);
         /* One file per program (its executable name) and GPU/driver, as vkd3d-proton keeps one per application: a
          * single file shared by every game grew past the old 256 MB read limit, was then skipped at load, and the
@@ -985,17 +991,16 @@ void bd12_buffer_destroy(BD12Buffer *buffer)
     bd12_live_remove(buffer);
     va_remove(device, buffer);
     bd12_rt_buffer_release(buffer);
-    for (uint32_t i = 0; i < buffer->view_count; ++i)
-        device->vk.DestroyBufferView(device->device, buffer->views[i].view,
-                                     NULL);
-    free(buffer->views);
-    free(buffer->view_hash);
+    bd12_buffer_views_release(buffer);
     device->vk.DestroyBuffer(device->device, buffer->buffer, NULL);
     if (buffer->owns_heap) bd12_heap_destroy(buffer->heap);
     free(buffer);
 }
 
 /* Fences ---------------------------------------------------------------- */
+
+extern uint64_t g_bd12_fences_released, g_bd12_fence_release_calls, g_bd12_fence_completed_calls;
+uint64_t g_bd12_fences_live;   /* profiler: D3D12 fences alive (each owns a timeline semaphore) */
 
 BD12Fence *bd12_fence_create(BD12Device *device, uint64_t initial)
 {
@@ -1017,12 +1022,14 @@ BD12Fence *bd12_fence_create(BD12Device *device, uint64_t initial)
         free(fence);
         return NULL;
     }
+    __atomic_add_fetch(&g_bd12_fences_live, 1, __ATOMIC_RELAXED);
     return fence;
 }
 
 void bd12_fence_destroy(BD12Fence *fence)
 {
     if (!fence) return;
+    __atomic_sub_fetch(&g_bd12_fences_live, 1, __ATOMIC_RELAXED);
     fence->device->vk.DestroySemaphore(fence->device->device, fence->semaphore,
                                        NULL);
     free(fence);
@@ -1403,8 +1410,17 @@ void bd12_prof_report(void)
                 (unsigned long long)__atomic_exchange_n(&g_bd12_resolve_cache_stats[1], 0, __ATOMIC_RELAXED),
                 (unsigned long long)__atomic_exchange_n(&g_bd12_resolve_cache_stats[2], 0, __ATOMIC_RELAXED),
                 (unsigned long long)__atomic_exchange_n(&g_bd12_resolve_cache_stats[3], 0, __ATOMIC_RELAXED));
+        uint64_t views, pinned;
+        bd12_view_stats(&views, &pinned);
+        fprintf(stderr, " buffer-views=%llu pinned=%llu fences-live=%llu released=%llu (release-calls=%llu completed-calls=%llu)",
+                (unsigned long long)views, (unsigned long long)pinned,
+                (unsigned long long)__atomic_load_n(&g_bd12_fences_live, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&g_bd12_fences_released, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&g_bd12_fence_release_calls, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&g_bd12_fence_completed_calls, __ATOMIC_RELAXED));
     }
     fputc('\n', stderr);
+    bd12_gpuprof_report();
     if (sampling) sample_report();
     last = now;
 }

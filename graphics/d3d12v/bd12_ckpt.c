@@ -11,7 +11,8 @@
 
 #define RING 16384u
 
-typedef struct { uint64_t seq; uint32_t kind; uint32_t w, h, d; uint64_t a, b; } Entry;
+typedef struct { uint64_t seq; uint32_t kind; uint32_t w, h, d; uint64_t a, b; const void *list; uint64_t args, count; } Entry;
+static __thread uint64_t t_last_seq;
 
 static Entry g_ring[RING];
 static uint64_t g_seq;
@@ -43,8 +44,26 @@ void bd12_ckpt_mark(BD12CmdList *list, uint32_t kind, uint64_t a, uint64_t b, ui
 {
     if (!enabled(list->device)) return;
     const uint64_t seq = __atomic_add_fetch(&g_seq, 1, __ATOMIC_RELAXED);
-    g_ring[seq % RING] = (Entry){ seq, kind, w, h, d, a, b };
+    g_ring[seq % RING] = (Entry){ seq, kind, w, h, d, a, b, list, 0, 0 };
+    t_last_seq = seq;
     g_set(list->command_buffer, (const void *)(uintptr_t)seq);
+}
+
+/* Indirect draws: the GPU addresses of the argument and count buffers, attached to the mark just recorded. */
+void bd12_ckpt_args(uint64_t args_va, uint64_t count_va)
+{
+    if (g_state <= 0 || !t_last_seq) return;
+    Entry *e = &g_ring[t_last_seq % RING];
+    if (e->seq != t_last_seq) return;
+    e->args = args_va;
+    e->count = count_va;
+}
+
+static void print_entry(const Entry *e)
+{
+    fprintf(stderr, "kind=%u a=%llx b=%llx dims=%ux%ux%u list=%p", e->kind, (unsigned long long)e->a,
+            (unsigned long long)e->b, e->w, e->h, e->d, e->list);
+    if (e->args) fprintf(stderr, " args=%llx count=%llx", (unsigned long long)e->args, (unsigned long long)e->count);
 }
 
 void bd12_ckpt_dump(void)
@@ -62,9 +81,33 @@ void bd12_ckpt_dump(void)
         const Entry *e = &g_ring[seq % RING];
         fprintf(stderr, "[CKPT]   stage=0x%x seq=%llu %s", (unsigned)data[i].stage, (unsigned long long)seq,
                 e->seq == seq ? "" : "(overwritten) ");
-        if (e->seq == seq)
-            fprintf(stderr, "kind=%u a=%llx b=%llx dims=%ux%ux%u", e->kind, (unsigned long long)e->a, (unsigned long long)e->b, e->w, e->h, e->d);
+        if (e->seq == seq) print_entry(e);
         fprintf(stderr, "\n");
+    }
+    /* Everything the reported command lists recorded between the oldest and newest reported marks: the operation
+     * that hung is among these (sequence numbers are global, so other lists' marks in the range are skipped). */
+    uint64_t lo = UINT64_MAX, hi = 0;
+    const void *lists[16]; uint32_t nl = 0;
+    for (uint32_t i = 0; i < count && i < 16; ++i) {
+        const uint64_t seq = (uint64_t)(uintptr_t)data[i].pCheckpointMarker;
+        const Entry *e = &g_ring[seq % RING];
+        if (seq < lo) lo = seq;
+        if (seq > hi) hi = seq;
+        if (e->seq == seq) lists[nl++] = e->list;
+    }
+    if (hi >= lo && hi - lo < RING) {
+        uint32_t printed = 0;
+        for (uint64_t seq = lo; seq <= hi + 8 && printed < 400; ++seq) {
+            const Entry *e = &g_ring[seq % RING];
+            if (e->seq != seq) continue;
+            int mine = 0;
+            for (uint32_t i = 0; i < nl; ++i) mine |= e->list == lists[i];
+            if (!mine) continue;
+            fprintf(stderr, "[CKPT]     seq=%llu ", (unsigned long long)seq);
+            print_entry(e);
+            fprintf(stderr, "\n");
+            ++printed;
+        }
     }
     __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
 }

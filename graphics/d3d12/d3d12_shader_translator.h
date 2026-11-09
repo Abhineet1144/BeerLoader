@@ -94,6 +94,7 @@ typedef struct {
      * mutable-type array for the CBV/SRV/UAV heap, set 1 binding 0 the sampler heap, set 2 binding i static
      * sampler i (immutable). */
     uint32_t heap_model;
+    uint32_t accel_in_heap;      /* MUTABLE model: the mutable array also holds acceleration structures (TLAS SRVs) */
     uint64_t hash;               /* of everything above that affects translation */
 } BeerD3D12RootLayout;
 #define BEER_HEAP_MODEL_CLASSES 0u

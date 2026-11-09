@@ -10,6 +10,28 @@
 #define VIEW_AGE_FRAMES 16
 #define VIEW_GC_MIN 4096
 
+/* Device-wide totals for the profiler; guarded by view_lock. */
+static uint64_t g_views, g_pinned;
+
+void bd12_view_stats(uint64_t *views, uint64_t *pinned)
+{
+    *views = __atomic_load_n(&g_views, __ATOMIC_RELAXED);
+    *pinned = __atomic_load_n(&g_pinned, __ATOMIC_RELAXED);
+}
+
+/* The range a view over [offset, offset + range) actually covers: clamped to the buffer and to whole texels.
+ * 0 when no view can be made. Views are cached under this range. */
+static VkDeviceSize view_range(const BD12Buffer *buffer, VkFormat format, VkDeviceSize offset, VkDeviceSize range)
+{
+    if (offset >= buffer->size) return 0;
+    if (range == VK_WHOLE_SIZE || offset + range > buffer->size)
+        range = buffer->size - offset;
+    uint32_t texel_bytes = 0;
+    bd12_format_block(format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, NULL, &texel_bytes);
+    if (texel_bytes > 1) range -= range % texel_bytes;
+    return range;
+}
+
 static uint64_t view_key(VkFormat format, VkDeviceSize offset, VkDeviceSize range)
 {
     uint64_t k = ((uint64_t)format * 0x9E3779B97F4A7C15ull) ^
@@ -28,10 +50,11 @@ static void view_gc(BD12Buffer *buffer, uint64_t age)
     uint32_t kept = 0;
     for (uint32_t i = 0; i < buffer->view_count; ++i) {
         BD12BufferView v = buffer->views[i];
-        if (v.pinned || v.last_use + age >= device->epoch) {
+        if (v.pins || v.last_use + age >= device->epoch) {
             buffer->views[kept++] = v;
         } else {
             device->vk.DestroyBufferView(device->device, v.view, NULL);
+            --g_views;
         }
     }
     buffer->view_count = kept;
@@ -46,6 +69,25 @@ static void view_gc(BD12Buffer *buffer, uint64_t age)
         }
     }
     buffer->view_gc_threshold = kept * 2 > VIEW_GC_MIN ? kept * 2 : VIEW_GC_MIN;
+}
+
+/* bd12_buffer_destroy, after the buffer left the live registry: under view_lock, so an unpin that saw the buffer
+ * alive finishes first. */
+void bd12_buffer_views_release(BD12Buffer *buffer)
+{
+    BD12Device *device = buffer->device;
+    pthread_mutex_lock(&device->view_lock);
+    for (uint32_t i = 0; i < buffer->view_count; ++i) {
+        device->vk.DestroyBufferView(device->device, buffer->views[i].view, NULL);
+        if (buffer->views[i].pins) --g_pinned;
+    }
+    g_views -= buffer->view_count;
+    free(buffer->views);
+    free(buffer->view_hash);
+    buffer->views = NULL;
+    buffer->view_hash = NULL;
+    buffer->view_count = buffer->view_capacity = 0;
+    pthread_mutex_unlock(&device->view_lock);
 }
 
 void bd12_device_advance_epoch(BD12Device *device)
@@ -76,15 +118,8 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
                                      int storage, int pin)
 {
     BD12Device *device = buffer->device;
-    if (offset >= buffer->size) return VK_NULL_HANDLE;
-    if (range == VK_WHOLE_SIZE || offset + range > buffer->size)
-        range = buffer->size - offset;
-    {   /* A texel-buffer range must be a whole number of texels. */
-        uint32_t texel_bytes = 0;
-        bd12_format_block(format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, NULL, &texel_bytes);
-        if (texel_bytes > 1) range -= range % texel_bytes;
-        if (!range) return VK_NULL_HANDLE;
-    }
+    range = view_range(buffer, format, offset, range);   /* a whole number of texels inside the buffer */
+    if (!range) return VK_NULL_HANDLE;
     VkDeviceSize alignment = storage ? device->min_storage_texel_alignment :
                                        device->min_uniform_texel_alignment;
     const int single_texel = storage ? device->storage_texel_single_alignment :
@@ -139,7 +174,7 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
             if (v->format == format && v->offset == offset && v->range == range) {
                 found = v->view;
                 buffer->views[entry - 1].last_use = device->epoch;
-                if (pin) buffer->views[entry - 1].pinned = 1;
+                if (pin && !buffer->views[entry - 1].pins++) ++g_pinned;
                 break;
             }
         }
@@ -208,7 +243,9 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
             }
             if (stored) {
                 buffer->views[buffer->view_count] = (BD12BufferView){
-                    format, offset, range, found, device->epoch, pin };
+                    format, offset, range, found, device->epoch, pin ? 1u : 0u };
+                ++g_views;
+                if (pin) ++g_pinned;
                 uint32_t slot = (uint32_t)key & buffer->view_hash_mask;
                 while (buffer->view_hash[slot])
                     slot = (slot + 1) & buffer->view_hash_mask;
@@ -230,6 +267,34 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
     }
     pthread_mutex_unlock(&device->view_lock);
     return found;
+}
+
+/* A heap-mirror slot stopped holding the view bd12_buffer_view_pinned returned for these arguments. When no slot
+ * holds it any more it ages out like any other view, after the frames that may still use it have finished. A buffer
+ * destroyed in the meantime took its views with it (serial guards against a reused pointer). */
+void bd12_buffer_view_unpin(BD12Device *device, BD12Buffer *buffer, uint32_t serial, VkFormat format,
+                            VkDeviceSize offset, VkDeviceSize range)
+{
+    if (!buffer) return;
+    /* `buffer` may already be freed: nothing is read through it until the live check below passes. */
+    pthread_mutex_lock(&device->view_lock);   /* bd12_buffer_destroy frees the views under this lock */
+    if (bd12_live_has(buffer) && buffer->serial == serial && buffer->view_hash) {
+        range = view_range(buffer, format, offset, range);
+        const uint64_t key = view_key(format, offset, range);
+        for (uint32_t slot = (uint32_t)key & buffer->view_hash_mask;; slot = (slot + 1) & buffer->view_hash_mask) {
+            const uint32_t entry = buffer->view_hash[slot];
+            if (!entry) break;
+            BD12BufferView *v = &buffer->views[entry - 1];
+            if (v->format == format && v->offset == offset && v->range == range) {
+                if (v->pins && !--v->pins) {
+                    --g_pinned;
+                    v->last_use = device->epoch;
+                }
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&device->view_lock);
 }
 
 /* Descriptor heaps -------------------------------------------------------------- */

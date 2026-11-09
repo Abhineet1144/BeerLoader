@@ -359,8 +359,8 @@ static uint32_t to_bindings(const BeerD3D12TranslatedShader *shader,
     return shader->descriptor_count;
 }
 
-/* Input patch size a hull shader declares (dcl_input_control_point_count),
- * 0 when absent. */
+/* Input patch size a hull shader declares, 0 when absent: dcl_input_control_point_count in DXBC (SHEX/SHDR),
+ * PSVRuntimeInfo.HS.InputControlPointCount in DXIL (PSV0, the first word after the info's size). */
 static uint32_t hull_input_control_points(const uint8_t *dxbc, size_t size)
 {
     if (!dxbc || size < 32 || memcmp(dxbc, "DXBC", 4) != 0) return 0;
@@ -368,6 +368,13 @@ static uint32_t hull_input_control_points(const uint8_t *dxbc, size_t size)
     for (uint32_t c = 0; c < chunks && 32 + (size_t)c * 4 + 4 <= size; ++c) {
         const uint32_t offset = rd32(dxbc + 32 + c * 4);
         if ((size_t)offset + 8 > size) continue;
+        if (!memcmp(dxbc + offset, "PSV0", 4)) {
+            const size_t chunk = rd32(dxbc + offset + 4);
+            if (chunk < 8 || (size_t)offset + 8 + chunk > size || rd32(dxbc + offset + 8) < 4) continue;
+            const uint32_t count = rd32(dxbc + offset + 12);
+            if (count >= 1 && count <= 32) return count;
+            continue;
+        }
         if (memcmp(dxbc + offset, "SHEX", 4) && memcmp(dxbc + offset, "SHDR", 4)) continue;
         const size_t end = offset + 8 + (size_t)rd32(dxbc + offset + 4);
         size_t at = offset + 16;                /* skip version and length tokens */
@@ -570,10 +577,13 @@ static BD12GraphicsPipeline *create_graphics(BD12Device *device, const BD12PsoDe
     {
         BD12GraphicsPipeline *created = bd12_graphics_pipeline_create(device, &desc);
         if (created && getenv("BEER_BD12_PSO_LOG"))
-            fprintf(stderr, "[PSOSHADERS] %016llx vs=%016llx ps=%016llx\n",
+            fprintf(stderr, "[PSOSHADERS] %016llx vs=%016llx ps=%016llx hs=%016llx ds=%016llx gs=%016llx\n",
                     (unsigned long long)created->shader_hash,
                     (unsigned long long)vs->shader_hash,
-                    (unsigned long long)(ps ? ps->shader_hash : 0));
+                    (unsigned long long)(ps ? ps->shader_hash : 0),
+                    (unsigned long long)(hs ? hs->shader_hash : 0),
+                    (unsigned long long)(ds ? ds->shader_hash : 0),
+                    (unsigned long long)(gs ? gs->shader_hash : 0));
         return created;
     }
 }

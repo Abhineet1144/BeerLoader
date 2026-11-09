@@ -344,10 +344,21 @@ done:
     return ok;
 }
 
+/* Diagnostic (BEER_DXR_PROBE): every built pipeline, to find which one a shader table's identifiers came from. */
+static BD12RtPipeline *g_rt_built[512];
+static uint32_t g_rt_built_count;
+
 static int ensure_built(BD12RtPipeline *p)
 {
     pthread_mutex_lock(&p->lock);
-    if (!p->built) { p->built = 1; p->ok = build(p); }
+    if (!p->built) {
+        p->built = 1;
+        p->ok = build(p);
+        if (p->ok) {
+            const uint32_t at = __atomic_fetch_add(&g_rt_built_count, 1, __ATOMIC_RELAXED);
+            if (at < 512) __atomic_store_n(&g_rt_built[at], p, __ATOMIC_RELEASE);
+        }
+    }
     const int ok = p->ok;
     pthread_mutex_unlock(&p->lock);
     return ok;
@@ -396,11 +407,41 @@ int bd12_cmd_dispatch_rays(BD12CmdList *list, BD12RtPipeline *p, const uint8_t *
     if (pso->bindless_words)
         bd12_cmd_bind_bindless(list, &list->compute, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pso->layout, RT_ALL_STAGES,
                                pso->bindless, pso->bindless_count, pso->bindless_words);
+    {   /* Diagnostic: whose identifier is in the ray-generation record? */
+        static unsigned checked;
+        if (getenv("BEER_DXR_PROBE") && checked < 6) {
+            ++checked;
+            VkDeviceSize offset = 0;
+            BD12Buffer *b = bd12_va_resolve(device, v[0], &offset);
+            const uint8_t *rec = b && b->cpu ? (const uint8_t *)b->cpu + offset : NULL;
+            if (!rec) {
+                fprintf(stderr, "[DXR] raygen record at %llx: %s\n", (unsigned long long)v[0],
+                        b ? "not host-visible (default heap)" : "no buffer");
+            } else {
+                int found = 0;
+                const uint32_t n = __atomic_load_n(&g_rt_built_count, __ATOMIC_ACQUIRE);
+                for (uint32_t k = 0; k < n && k < 512 && !found; ++k) {
+                    BD12RtPipeline *q = __atomic_load_n(&g_rt_built[k], __ATOMIC_ACQUIRE);
+                    for (uint32_t g = 0; q && g < q->group_count; ++g)
+                        if (!memcmp(q->handles + (size_t)g * q->handle_size, rec, q->handle_size)) {
+                            fprintf(stderr, "[DXR] raygen record = \"%s\" of pipeline %p (bound %p)%s\n", q->group_names[g],
+                                    (void *)q, (void *)p, q == p ? "" : "  <-- DIFFERENT PIPELINE");
+                            found = 1;
+                            break;
+                        }
+                }
+                if (!found)
+                    fprintf(stderr, "[DXR] raygen record %02x%02x%02x%02x... matches no built pipeline (%u built)\n",
+                            rec[0], rec[1], rec[2], rec[3], n);
+            }
+        }
+    }
     VkStridedDeviceAddressRegionKHR raygen = { v[0], v[1], v[1] };
     VkStridedDeviceAddressRegionKHR miss = { v[2], v[4], v[3] };
     VkStridedDeviceAddressRegionKHR hit = { v[5], v[7], v[6] };
     VkStridedDeviceAddressRegionKHR callable = { v[8], v[10], v[9] };
     bd12_canary_check("DispatchRays bind");
+    bd12_ckpt_mark(list, 202u, v[0], 0, dims[0], dims[1], dims[2]);   /* GPU checkpoint kind 202: DispatchRays */
     device->vk_rt.CmdTraceRaysKHR(list->command_buffer, &raygen, &miss, &hit, &callable, dims[0], dims[1], dims[2]);
     bd12_canary_check("vkCmdTraceRays");
     if (capture) {

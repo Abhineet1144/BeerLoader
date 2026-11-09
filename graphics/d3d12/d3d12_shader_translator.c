@@ -81,10 +81,31 @@ typedef struct Vkd3dShaderInterfaceInfo {
     uint32_t uav_counter_count;
 } Vkd3dShaderInterfaceInfo;
 
+/* struct vkd3d_shader_spirv_target_info: the Vulkan features the generated SPIR-V may rely on. */
+typedef struct Vkd3dShaderSpirvTargetInfo {
+    uint32_t type;
+    uint32_t padding;
+    const void *next;
+    const char *entry_point;
+    uint32_t environment;
+    uint32_t padding2;
+    const uint32_t *extensions;
+    uint32_t extension_count;
+    uint32_t padding3;
+    const void *parameters;
+    uint32_t parameter_count;
+    uint8_t dual_source_blending;
+    const uint32_t *output_swizzles;
+    uint32_t output_swizzle_count;
+} Vkd3dShaderSpirvTargetInfo;
+
 enum {
     VKD3D_STRUCTURE_COMPILE_INFO = 0,
     VKD3D_STRUCTURE_INTERFACE_INFO = 1,
     VKD3D_STRUCTURE_SCAN_DESCRIPTOR_INFO = 2,
+    VKD3D_STRUCTURE_SPIRV_TARGET_INFO = 4,
+    VKD3D_SPIRV_ENVIRONMENT_VULKAN_1_0 = 2,
+    VKD3D_SPIRV_EXTENSION_EXT_VIEWPORT_INDEX_LAYER = 4,
     VKD3D_SOURCE_DXBC_TPF = 1,
     VKD3D_TARGET_SPIRV_BINARY = 1,
     VKD3D_LOG_WARNING = 2,
@@ -456,11 +477,22 @@ static uint32_t *spirv_sync_workgroup(const uint32_t *in, size_t size,
     return out;
 }
 
+/* SignedZeroInfNanPreserve for 32-bit floats: opt-in with BEER_SPV_FLOAT_CONTROLS=1. It was added while chasing
+ * RE8's pop-in (culling math divides by zero and compares against infinities) and did not change it, but it keeps
+ * the driver from the usual floating-point optimisations in every shader: RE8 GPU time per frame fell ~15% without
+ * it (same spot, 78 -> 92 fps under the GPU profiler) with no visible difference. vkd3d-proton does not request it
+ * for DXBC either. */
+static int spirv_float_controls_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("BEER_SPV_FLOAT_CONTROLS"); on = v && *v && atoi(v) != 0; }
+    return on;
+}
 /* D3D12 shaders rely on IEEE Inf/NaN/signed-zero behaviour (culling math in
  * particular divides by zero and compares against infinities). Vulkan only
  * guarantees that when the module asks for it, otherwise a driver may compile
  * assuming finite values. Request SignedZeroInfNanPreserve for 32-bit floats
- * (BEER_SPV_FLOAT_CONTROLS=0 turns this off). */
+ * (see spirv_float_controls_enabled). */
 static uint32_t *spirv_preserve_inf_nan(const uint32_t *in, size_t size,
                                         size_t *out_size)
 {
@@ -609,7 +641,9 @@ static const char *disk_cache_dir(void)
     const char *on = getenv("BEER_SHADER_DISK_CACHE");          /* on by default; BEER_SHADER_DISK_CACHE=0 disables */
     if (on && (!*on || !strcmp(on, "0"))) return NULL;
     const char *custom = getenv("BEER_SHADER_CACHE_DIR"), *home = getenv("HOME"), *xdg = getenv("XDG_CACHE_HOME");
+    const char *root = getenv("BEER_CACHE_DIR");           /* the manager's cache folder */
     if (custom && *custom) snprintf(dir, sizeof(dir), "%s", custom);
+    else if (root && *root) snprintf(dir, sizeof(dir), "%s/shaders", root);
     else if (xdg && *xdg) snprintf(dir, sizeof(dir), "%s/beer/shaders", xdg);
     else if (home && *home) snprintf(dir, sizeof(dir), "%s/.cache/beer/shaders", home);
     else return NULL;
@@ -775,7 +809,7 @@ static TranslationCacheEntry *translate_fresh(const uint8_t *dxbc, size_t dxbc_s
         }
         entry->dxbc_size = dxbc_size;
         entry->shader.shader_hash = shader_hash;
-        if (!getenv("BEER_SPV_FLOAT_CONTROLS") || atoi(getenv("BEER_SPV_FLOAT_CONTROLS"))) {
+        if (spirv_float_controls_enabled()) {
             size_t fs = 0;
             uint32_t *fc = spirv_preserve_inf_nan((const uint32_t *)entry->shader.spirv,
                                                   entry->shader.spirv_size, &fs);
@@ -875,8 +909,20 @@ static TranslationCacheEntry *translate_fresh(const uint8_t *dxbc, size_t dxbc_s
         }
         mappings[i].binding.count = source->count ? source->count : 1;
     }
+    /* SV_RenderTargetArrayIndex / SV_ViewportArrayIndex outside the geometry stage (vertex and domain shaders that
+     * write the layer, as Unreal's layered rendering does) need SPV_EXT_shader_viewport_index_layer; the device
+     * enables shaderOutputLayer/shaderOutputViewportIndex for it. Without this vkd3d-shader rejects the shader. */
+    static const uint32_t spirv_extensions[] = { VKD3D_SPIRV_EXTENSION_EXT_VIEWPORT_INDEX_LAYER };
+    Vkd3dShaderSpirvTargetInfo target_info = {
+        .type = VKD3D_STRUCTURE_SPIRV_TARGET_INFO,
+        .entry_point = "main",
+        .environment = VKD3D_SPIRV_ENVIRONMENT_VULKAN_1_0,
+        .extensions = spirv_extensions,
+        .extension_count = 1
+    };
     Vkd3dShaderInterfaceInfo interface_info = {
         .type = VKD3D_STRUCTURE_INTERFACE_INFO,
+        .next = &target_info,
         .bindings = mappings,
         .binding_count = scan.descriptor_count
     };
@@ -901,7 +947,9 @@ static TranslationCacheEntry *translate_fresh(const uint8_t *dxbc, size_t dxbc_s
     if (result < 0 || !spirv.code || !spirv.size || (spirv.size & 3u)) {
         set_compile_error("DXBC to SPIR-V translation", result, messages);
         if (messages) g_api.free_messages(messages);
-        if (spirv.code) g_api.free_code(&spirv);
+        /* The output is only defined on success: a failed compile may already have freed spirv.code without
+         * clearing it (vkd3d-shader 1.19), and freeing it again aborted Beast of Reincarnation. */
+        if (result >= 0 && spirv.code) g_api.free_code(&spirv);
         g_api.free_scan(&scan);
         return NULL;
     }
@@ -917,7 +965,7 @@ static TranslationCacheEntry *translate_fresh(const uint8_t *dxbc, size_t dxbc_s
     }
     memcpy(entry->shader.spirv, spirv.code, spirv.size);
     size_t final_size = spirv.size;
-    if (!getenv("BEER_SPV_FLOAT_CONTROLS") || atoi(getenv("BEER_SPV_FLOAT_CONTROLS"))) {
+    if (spirv_float_controls_enabled()) {
         size_t fs = 0;
         uint32_t *fc = spirv_preserve_inf_nan((const uint32_t *)entry->shader.spirv,
                                               spirv.size, &fs);
@@ -980,6 +1028,44 @@ static TranslationCacheEntry *translate_fresh(const uint8_t *dxbc, size_t dxbc_s
     return entry;
 }
 
+/* BEER_BD12_ROOT_PUSH_SKIP=<tokens> (diagnostic bisection): root-signature translations to refuse, so those shaders
+ * take the per-draw descriptor path. Tokens, comma separated: "16bit" (SPIR-V declares Int16/Float16 or 16-bit
+ * storage), "cs" (compute shaders), "cs/<mask>=<value>" (compute shaders whose
+ * hash & mask == value, hex), "cs!/<mask>=<value>" (all other compute shaders), "gfx" (every other stage), "mod<n>=<k>" (shader hash % n == k), or a 16-digit shader hash. */
+static int rs_skip(uint64_t shader_hash, const uint32_t *w, size_t bytes)
+{
+    const char *list = getenv("BEER_BD12_ROOT_PUSH_SKIP");
+    if (!list || !*list) return 0;
+    int sixteen = 0, compute = 0;
+    for (size_t i = 5; w && i + 1 < bytes / 4; ) {
+        const uint32_t count = w[i] >> 16, op = w[i] & 0xffff;
+        if (!count) break;
+        if (op == 17 && (w[i + 1] == 22 || w[i + 1] == 9 || (w[i + 1] >= 4433 && w[i + 1] <= 4436))) sixteen = 1;
+        if (op == 15) { compute = w[i + 1] == 5; break; }   /* OpEntryPoint: GLCompute */
+        i += count;
+    }
+    for (const char *p = list; *p; ) {
+        const char *end = strchr(p, ',');
+        const size_t len = end ? (size_t)(end - p) : strlen(p);
+        unsigned n = 0, k = 0;
+        if (len == 5 && !strncmp(p, "16bit", 5)) { if (sixteen) return 1; }
+        else if (len == 2 && !strncmp(p, "cs", 2)) { if (compute) return 1; }
+        else if (!strncmp(p, "cs!/", 4)) {          /* cs!/<mask>=<value>: compute shaders with (hash & mask) != value */
+            unsigned long long mask = 0, value = 0;
+            if (sscanf(p + 4, "%llx=%llx", &mask, &value) == 2 && compute && (shader_hash & mask) != value) return 1;
+        }
+        else if (!strncmp(p, "cs/", 3)) {           /* cs/<mask>=<value>: compute shaders with (hash & mask) == value */
+            unsigned long long mask = 0, value = 0;
+            if (sscanf(p + 3, "%llx=%llx", &mask, &value) == 2 && compute && (shader_hash & mask) == value) return 1;
+        }
+        else if (len == 3 && !strncmp(p, "gfx", 3)) { if (!compute) return 1; }
+        else if (sscanf(p, "mod%u=%u", &n, &k) == 2 && n) { if (shader_hash % n == k) return 1; }
+        else if (len == 16 && strtoull(p, NULL, 16) == shader_hash) return 1;
+        p += len + (end ? 1 : 0);
+    }
+    return 0;
+}
+
 /* Root-signature translations (see the header). Entries carry the layout hash; a failed translation is cached too
  * (spirv NULL) so the shader is not retried for every pipeline that uses it. */
 const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
@@ -990,7 +1076,8 @@ const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
     pthread_mutex_lock(&g_lock);
     TranslationCacheEntry *found = cache_find_locked(shader_hash, chash, dxbc_size, layout->hash);
     pthread_mutex_unlock(&g_lock);
-    if (found) return found->shader.spirv ? &found->shader : NULL;
+    if (found) return found->shader.spirv && !rs_skip(shader_hash, (const uint32_t *)found->shader.spirv,
+                                                     found->shader.spirv_size) ? &found->shader : NULL;
     const uint64_t layout_key = disk_layout_key(layout);
     TranslationCacheEntry *entry = disk_cache_load(dxbc, dxbc_size, shader_hash, layout_key);
     if (entry) {                                                       /* translated by an earlier run */
@@ -998,14 +1085,15 @@ const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
         pthread_mutex_lock(&g_lock);
         entry = cache_insert_locked(entry);
         pthread_mutex_unlock(&g_lock);
-        return &entry->shader;
+        return rs_skip(shader_hash, (const uint32_t *)entry->shader.spirv, entry->shader.spirv_size) ? NULL
+                                                                                                    : &entry->shader;
     }
     entry = calloc(1, sizeof(*entry));
     if (!entry) return NULL;
     entry->content_hash = chash;
     entry->dxbc_size = dxbc_size;
     if (beer_d3d12_dxil_translate_rs(dxbc, dxbc_size, ~0u, layout, &entry->shader)) {
-        if (!getenv("BEER_SPV_FLOAT_CONTROLS") || atoi(getenv("BEER_SPV_FLOAT_CONTROLS"))) {
+        if (spirv_float_controls_enabled()) {
             size_t size = 0;
             uint32_t *patched = spirv_preserve_inf_nan((const uint32_t *)entry->shader.spirv,
                                                        entry->shader.spirv_size, &size);
@@ -1018,6 +1106,18 @@ const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
             if (patched) { free(entry->shader.spirv); entry->shader.spirv = (void *)patched; entry->shader.spirv_size = size; }
         }
         disk_cache_store(dxbc, dxbc_size, &entry->shader, layout_key);
+        {   /* BEER_DUMP_SHADERS=<dir>: root-layout DXIL translations too (<hash>.rs.dxil / <hash>.rs.spv). */
+            const char *dir = getenv("BEER_DUMP_SHADERS");
+            if (dir) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/%016llx.rs.dxil", dir, (unsigned long long)shader_hash);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite(dxbc, 1, dxbc_size, f); fclose(f); }
+                snprintf(path, sizeof(path), "%s/%016llx.rs.spv", dir, (unsigned long long)shader_hash);
+                f = fopen(path, "wb");
+                if (f) { fwrite(entry->shader.spirv, 1, entry->shader.spirv_size, f); fclose(f); }
+            }
+        }
     } else {
         free(entry->shader.spirv);
         entry->shader.spirv = NULL;
@@ -1029,7 +1129,8 @@ const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
     pthread_mutex_lock(&g_lock);
     entry = cache_insert_locked(entry);
     pthread_mutex_unlock(&g_lock);
-    return entry->shader.spirv ? &entry->shader : NULL;
+    return entry->shader.spirv && !rs_skip(shader_hash, (const uint32_t *)entry->shader.spirv,
+                                           entry->shader.spirv_size) ? &entry->shader : NULL;
 }
 
 const BeerD3D12TranslatedShader *beer_d3d12_translate_shader(

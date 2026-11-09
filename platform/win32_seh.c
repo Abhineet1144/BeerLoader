@@ -28,6 +28,13 @@ static int stack_contains(uint64_t low, uint64_t high, uint64_t address,
     return low && high > low && address >= low && size <= high - address;
 }
 
+static BeerSehHandlerCaller g_handler_caller;
+
+void beer_seh_set_handler_caller(BeerSehHandlerCaller caller)
+{
+    g_handler_caller = caller;
+}
+
 int beer_seh_dispatch(BeerExceptionRecord64 *record, void *context_record,
                       BeerSehLookupFunction lookup,
                       BeerSehAddressValidator executable_address,
@@ -104,8 +111,10 @@ int beer_seh_dispatch(BeerExceptionRecord64 *record, void *context_record,
                         (unsigned long long)handler, frame_index,
                         (unsigned long long)control_pc,
                         (unsigned long long)establisher_frame);
-            int32_t disposition = ((BeerLanguageHandler)(uintptr_t)handler)(
-                record, establisher_frame, context_record, &dispatcher);
+            int32_t disposition = g_handler_caller ?
+                g_handler_caller(handler, record, establisher_frame, context_record, &dispatcher,
+                                 context_u64(context_record, CONTEXT_RSP_OFFSET)) :
+                ((BeerLanguageHandler)(uintptr_t)handler)(record, establisher_frame, context_record, &dispatcher);
             if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
                 fprintf(stderr, "[SEH] handler 0x%llx returned disposition %d\n",
                         (unsigned long long)handler, disposition);

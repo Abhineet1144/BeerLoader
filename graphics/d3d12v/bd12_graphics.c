@@ -43,6 +43,9 @@ static uint64_t shared_key_hash(const uint64_t *key, uint32_t words)
 static uint64_t shared_layout_get(BD12Device *device, uint64_t *key, uint32_t words,
                                   uint64_t (*create)(BD12Device *, const void *), const void *info)
 {
+    static int off = -1;                    /* BEER_BD12_SHARED_LAYOUTS=0 (diagnostic): one new layout per call */
+    if (off < 0) { const char *v = getenv("BEER_BD12_SHARED_LAYOUTS"); off = v && !strcmp(v, "0"); }
+    if (off) return create(device, info);
     const uint64_t hash = shared_key_hash(key, words);
     pthread_mutex_lock(&g_shared_layout_lock);
     for (uint32_t i = 0; i < g_shared_layout_count; ++i) {
@@ -1063,6 +1066,7 @@ int bd12_cmd_draw_indexed_indirect(BD12CmdList *list, BD12Buffer *args,
     bind_index(list);
     bd12_cmd_record_flight_op(list, BD12_FLIGHT_DRAW_INDEXED_INDIRECT,
         list->gfx.pipeline->shader_hash, count, count, stride ? stride : 20, 0);
+    bd12_ckpt_args(args->va + offset, 0);
     list->device->vk.CmdDrawIndexedIndirect(list->command_buffer, args->buffer,
                                             offset, count, stride ? stride : 20);
     return 1;
@@ -1176,6 +1180,7 @@ int bd12_cmd_draw_indexed_indirect_count(
     bd12_cmd_record_flight_op(list, BD12_FLIGHT_DRAW_INDEXED_INDIRECT,
         list->gfx.pipeline->shader_hash, max_count, max_count,
         stride ? stride : 20, 1);
+    bd12_ckpt_args(args->va + offset, count_buffer->va + count_offset);
     list->device->vk.CmdDrawIndexedIndirectCount(
         list->command_buffer, args->buffer, offset, count_buffer->buffer,
         count_offset, max_count, stride ? stride : 20);

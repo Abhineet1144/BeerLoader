@@ -165,6 +165,38 @@ static void test_many_allocations(void)
     free(regions);
 }
 
+static uintptr_t g_test_image;
+static size_t g_test_image_size;
+static int test_image_lookup(uintptr_t address, uintptr_t *base, size_t *size)
+{
+    if (address < g_test_image || address - g_test_image >= g_test_image_size) return 0;
+    *base = g_test_image;
+    *size = g_test_image_size;
+    return 1;
+}
+
+/* Pages inside a registered image read back as MEM_IMAGE from the image base, and the region stops at the image end. */
+static void test_image_pages(void)
+{
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char *memory = beer_virtual_alloc(NULL, page * 4, BEER_MEM_RESERVE | BEER_MEM_COMMIT, BEER_PAGE_READWRITE);
+    assert(memory);
+    g_test_image = (uintptr_t)memory;
+    g_test_image_size = page * 3;
+    beer_virtual_set_image_lookup(test_image_lookup);
+    BeerMemoryBasicInformation info;
+    assert(beer_virtual_query(memory + page + 5, &info, sizeof(info)));
+    assert(info.type == BEER_MEM_IMAGE);
+    assert(info.allocation_base == (uint64_t)(uintptr_t)memory);
+    assert(info.allocation_protect == BEER_PAGE_EXECUTE_WRITECOPY);
+    assert(info.base_address == (uint64_t)(uintptr_t)(memory + page));
+    assert(info.base_address + info.region_size == (uint64_t)(uintptr_t)(memory + page * 3));
+    assert(beer_virtual_query(memory + page * 3, &info, sizeof(info)));
+    assert(info.type != BEER_MEM_IMAGE);                     /* past the image */
+    beer_virtual_set_image_lookup(NULL);
+    assert(beer_virtual_free(memory, 0, BEER_MEM_RELEASE));
+}
+
 int main(void)
 {
     test_many_allocations();
@@ -201,6 +233,7 @@ int main(void)
     test_allocate_query_protect_release();
     test_reserve_and_validation();
     test_string_pointer_probes();
+    test_image_pages();
     beer_virtual_memory_reset();
     puts("Win32 virtual-memory tests passed");
     return 0;

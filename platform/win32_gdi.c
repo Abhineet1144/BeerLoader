@@ -698,6 +698,46 @@ int GDI_MS beer_DrawTextA(uint64_t dc, const char *text, int count, int32_t *rec
     return beer_DrawTextW(dc, wide, n, rect, format);
 }
 
+/* Direct access to the pixels a DC draws into (GDI+ renders into DCs). Bits are bottom-up unless *topdown;
+ * *bpp is 32 or 24. The pointer stays valid until the DC's bitmap changes. Returns 0 for a DC without pixels. */
+int beer_gdi_dc_surface(uint64_t dc, uint8_t **bits, int *width, int *height, int *stride, int *bpp, int *topdown)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    Surface *s = dc_surface(d);
+    const int ok = s && s->bits;
+    if (ok) {
+        *bits = s->bits; *width = s->w; *height = s->h; *stride = s->stride; *bpp = s->bpp; *topdown = s->topdown;
+        if (d && d->is_window) g_window_dirty = 1;
+    }
+    UNLOCK();
+    return ok;
+}
+
+/* For UpdateLayeredWindow: copies a width x height block at (src_x, src_y) of the bitmap selected into dc as
+ * top-down 0xAARRGGBB pixels (memory order B, G, R, A, as a 32 bpp DIB holds them); pixels outside the bitmap are
+ * transparent black. *has_alpha is 1 for a 32 bpp source, whose fourth byte is (premultiplied) alpha. */
+int beer_gdi_read_dc_argb(uint64_t dc, int src_x, int src_y, int width, int height, uint32_t *out, int *has_alpha)
+{
+    if (!out || width <= 0 || height <= 0) return 0;
+    LOCK();
+    Surface *s = dc_surface(dc_get(dc));
+    if (!s || !s->bits) { UNLOCK(); return 0; }
+    if (has_alpha) *has_alpha = s->bpp == 32;
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x) {
+            const int sx = src_x + x, sy = src_y + y;
+            uint32_t px = 0;
+            if (sx >= 0 && sy >= 0 && sx < s->w && sy < s->h) {
+                px = s_get(s, sx, sy);
+                if (s->bpp != 32) px |= 0xFF000000u;
+            }
+            out[(size_t)y * (size_t)width + (size_t)x] = px;
+        }
+    UNLOCK();
+    return 1;
+}
+
 /* -------------------------------------------------------------- GDI32 API */
 
 uint64_t GDI_MS beer_GetStockObject(int index)

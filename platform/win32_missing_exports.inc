@@ -129,8 +129,6 @@ static u64 __attribute__((ms_abi)) stub_DeleteMenu(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMenuItemRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_WindowFromDC(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetDCEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_InvalidateRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RedrawWindow(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ScrollWindowEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ShowScrollBar(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnableScrollBar(void){ return 0; }
@@ -146,7 +144,6 @@ static u64 __attribute__((ms_abi)) stub_GetSysColorBrush(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetSysColors(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DrawFocusRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FrameRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetParent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetParent(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumWindows(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumThreadWindows(void){ return 0; }
@@ -384,14 +381,14 @@ static u64 __attribute__((ms_abi)) beer_SetLayeredWindowAttributes(u64 window, u
 static u64 __attribute__((ms_abi)) beer_getpeername(u64 socket_handle, void *address, s32 *address_length)
 {
     if (!winsock_ready()) return (u32)-1;
-    if (!address || !address_length || *address_length < 0) { g_wsa_last_error = 10014; return (u32)-1; }
+    if (!address || !address_length || *address_length < 0) { beer_wsa_set_error(10014); return (u32)-1; }
     socklen_t length = (socklen_t)*address_length;
     if (getpeername((int)socket_handle, (struct sockaddr *)address, &length) != 0) {
-        g_wsa_last_error = winsock_error_from_errno(errno);
+        beer_wsa_set_error(winsock_error_from_errno(errno));
         return (u32)-1;
     }
     *address_length = (s32)length;
-    g_wsa_last_error = 0;
+    beer_wsa_set_error(0);
     return 0;
 }
 static u64 __attribute__((ms_abi)) beer_inet_addr(const char *text)
@@ -438,8 +435,8 @@ static u64 __attribute__((ms_abi)) beer_WSASendTo(u64 socket_handle, const u8 *b
                                                   u64 *overlapped, u64 completion)
 {
     if (!winsock_ready()) return (u32)-1;
-    if ((!buffers && buffer_count) || buffer_count > 1024) { g_wsa_last_error = 10014; return (u32)-1; }
-    if (completion) { g_wsa_last_error = 10045; return (u32)-1; }                 /* WSAEOPNOTSUPP */
+    if ((!buffers && buffer_count) || buffer_count > 1024) { beer_wsa_set_error(10014); return (u32)-1; }
+    if (completion) { beer_wsa_set_error(10045); return (u32)-1; }                 /* WSAEOPNOTSUPP */
     if (overlapped && buffer_count <= 16) {                                        /* completes asynchronously if needed */
         WsaAsyncOp request;
         memset(&request, 0, sizeof(request));
@@ -474,7 +471,7 @@ static u64 __attribute__((ms_abi)) beer_WSASendTo(u64 socket_handle, const u8 *b
     message.msg_iovlen = buffer_count;
     ssize_t sent = sendmsg((int)socket_handle, &message, (int)flags | MSG_NOSIGNAL);
     if (sent < 0) {
-        g_wsa_last_error = winsock_error_from_errno(errno);
+        beer_wsa_set_error(winsock_error_from_errno(errno));
         return (u32)-1;
     }
     if (sent_bytes) *sent_bytes = (u32)sent;
@@ -483,7 +480,7 @@ static u64 __attribute__((ms_abi)) beer_WSASendTo(u64 socket_handle, const u8 *b
         overlapped[1] = (u64)sent;
         if (overlapped[3]) impl_SetEvent(overlapped[3]);
     }
-    g_wsa_last_error = 0;
+    beer_wsa_set_error(0);
     return 0;
 }
 
@@ -527,8 +524,8 @@ static u64 beer_wsa_receive(u64 socket_handle, const u8 *buffers, u32 count, u32
 {
     if (!winsock_ready()) return (u32)-1;
     struct iovec vectors[1024];
-    if (!beer_wsabuf_vectors(buffers, count, vectors)) { g_wsa_last_error = 10014; return (u32)-1; }
-    if (completion) { beer_unsupported_once("WSARecv completion routines"); g_wsa_last_error = 10045; return (u32)-1; }
+    if (!beer_wsabuf_vectors(buffers, count, vectors)) { beer_wsa_set_error(10014); return (u32)-1; }
+    if (completion) { beer_unsupported_once("WSARecv completion routines"); beer_wsa_set_error(10045); return (u32)-1; }
     if (overlapped && count <= 16) {                                               /* completes asynchronously if needed */
         WsaAsyncOp request;
         memset(&request, 0, sizeof(request));
@@ -558,9 +555,9 @@ static u64 beer_wsa_receive(u64 socket_handle, const u8 *buffers, u32 count, u32
     if (got < 0) {
         if (overlapped && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             beer_unsupported_once("overlapped socket receive without waiting data");
-            g_wsa_last_error = 10045;
+            beer_wsa_set_error(10045);
         } else {
-            g_wsa_last_error = winsock_error_from_errno(errno);
+            beer_wsa_set_error(winsock_error_from_errno(errno));
         }
         return (u32)-1;
     }
@@ -569,7 +566,7 @@ static u64 beer_wsa_receive(u64 socket_handle, const u8 *buffers, u32 count, u32
     if (flags) *flags = (message.msg_flags & MSG_TRUNC) ? 0x2 /* MSG_PARTIAL */ : 0;
     if (from && from_length) *from_length = (s32)message.msg_namelen;
     beer_wsa_complete(overlapped, (u64)got);
-    g_wsa_last_error = 0;
+    beer_wsa_set_error(0);
     return 0;
 }
 static u64 __attribute__((ms_abi)) beer_WSARecv(u64 socket_handle, const u8 *buffers, u32 count, u32 *received,
@@ -588,13 +585,13 @@ static u64 __attribute__((ms_abi)) beer_WSASocketW(s32 family, s32 type, s32 pro
     return impl_socket(family, type, protocol);
 }
 static u64 __attribute__((ms_abi)) beer_WSADuplicateSocketW(u64 socket_handle, u32 process, void *info)
-    { (void)socket_handle; (void)process; (void)info; beer_unsupported_once("WSADuplicateSocketW"); g_wsa_last_error = 10045; return (u32)-1; }
+    { (void)socket_handle; (void)process; (void)info; beer_unsupported_once("WSADuplicateSocketW"); beer_wsa_set_error(10045); return (u32)-1; }
 static u64 __attribute__((ms_abi)) beer_WSASendDisconnect(u64 socket_handle, const void *data)
 {
     (void)data;
     if (!winsock_ready()) return (u32)-1;
-    if (shutdown((int)socket_handle, SHUT_WR) != 0) { g_wsa_last_error = winsock_error_from_errno(errno); return (u32)-1; }
-    g_wsa_last_error = 0;
+    if (shutdown((int)socket_handle, SHUT_WR) != 0) { beer_wsa_set_error(winsock_error_from_errno(errno)); return (u32)-1; }
+    beer_wsa_set_error(0);
     return 0;
 }
 /* "a.b.c.d[:port]" for AF_INET (2); "addr" or "[addr]:port" for AF_INET6 (23). */
@@ -603,20 +600,20 @@ static u64 __attribute__((ms_abi)) beer_WSAStringToAddressW(const u16 *text, s32
 {
     (void)info;
     if (!winsock_ready()) return (u32)-1;
-    if (!text || !length) { g_wsa_last_error = 10014; return (u32)-1; }
+    if (!text || !length) { beer_wsa_set_error(10014); return (u32)-1; }
     char narrow[128];
     size_t n = 0;
     while (text[n] && n + 1 < sizeof(narrow)) { narrow[n] = (char)(text[n] < 0x80 ? text[n] : '?'); ++n; }
     narrow[n] = 0;
     const s32 needed = family == 23 ? 28 : 16;
-    if (family != 2 && family != 23) { g_wsa_last_error = 10047; return (u32)-1; }
-    if (!address || *length < needed) { *length = needed; g_wsa_last_error = 10014; return (u32)-1; }
+    if (family != 2 && family != 23) { beer_wsa_set_error(10047); return (u32)-1; }
+    if (!address || *length < needed) { *length = needed; beer_wsa_set_error(10014); return (u32)-1; }
     char host[128];
     unsigned port = 0;
     const char *port_text = NULL;
     if (family == 23 && narrow[0] == '[') {
         const char *close = strchr(narrow, ']');
-        if (!close) { g_wsa_last_error = 10022; return (u32)-1; }
+        if (!close) { beer_wsa_set_error(10022); return (u32)-1; }
         snprintf(host, sizeof(host), "%.*s", (int)(close - narrow - 1), narrow + 1);
         if (close[1] == ':') port_text = close + 2;
     } else {
@@ -627,18 +624,18 @@ static u64 __attribute__((ms_abi)) beer_WSAStringToAddressW(const u16 *text, s32
     if (port_text) {
         char *end = NULL;
         unsigned long value = strtoul(port_text, &end, 10);
-        if (!*port_text || *end || value > 65535) { g_wsa_last_error = 10022; return (u32)-1; }
+        if (!*port_text || *end || value > 65535) { beer_wsa_set_error(10022); return (u32)-1; }
         port = (unsigned)value;
     }
     memset(address, 0, (size_t)needed);
     *(u16 *)address = (u16)family;
     *(u16 *)(address + 2) = htons((u16)port);
     if (inet_pton(family == 23 ? AF_INET6 : AF_INET, host, address + (family == 23 ? 8 : 4)) != 1) {
-        g_wsa_last_error = 10022;
+        beer_wsa_set_error(10022);
         return (u32)-1;
     }
     *length = needed;
-    g_wsa_last_error = 0;
+    beer_wsa_set_error(0);
     return 0;
 }
 static u64 __attribute__((ms_abi)) beer_WSAAddressToStringW(const u8 *address, u32 address_length, const void *info,
@@ -646,7 +643,7 @@ static u64 __attribute__((ms_abi)) beer_WSAAddressToStringW(const u8 *address, u
 {
     (void)info;
     if (!winsock_ready()) return (u32)-1;
-    if (!address || !text_length || address_length < 16) { g_wsa_last_error = 10014; return (u32)-1; }
+    if (!address || !text_length || address_length < 16) { beer_wsa_set_error(10014); return (u32)-1; }
     const u16 family = *(const u16 *)address;
     const unsigned port = ntohs(*(const u16 *)(address + 2));
     char host[64], formatted[96];
@@ -659,14 +656,14 @@ static u64 __attribute__((ms_abi)) beer_WSAAddressToStringW(const u8 *address, u
         if (port) snprintf(formatted, sizeof(formatted), "[%s]:%u", host, port);
         else snprintf(formatted, sizeof(formatted), "%s", host);
     } else {
-        g_wsa_last_error = 10047;
+        beer_wsa_set_error(10047);
         return (u32)-1;
     }
     const u32 needed = (u32)strlen(formatted) + 1;
-    if (!text || *text_length < needed) { *text_length = needed; g_wsa_last_error = 10014; return (u32)-1; }
+    if (!text || *text_length < needed) { *text_length = needed; beer_wsa_set_error(10014); return (u32)-1; }
     for (u32 i = 0; i < needed; ++i) text[i] = (u8)formatted[i];
     *text_length = needed;
-    g_wsa_last_error = 0;
+    beer_wsa_set_error(0);
     return 0;
 }
 /* MSWSOCK: asynchronous accept needs completion delivery that Beer does not have. */
@@ -676,7 +673,7 @@ static u64 __attribute__((ms_abi)) beer_AcceptEx(u64 listen_socket, u64 accept_s
     (void)listen_socket; (void)accept_socket; (void)buffer; (void)receive_length; (void)local_length;
     (void)remote_length; (void)received; (void)overlapped;
     beer_unsupported_once("AcceptEx");
-    g_wsa_last_error = 10045;
+    beer_wsa_set_error(10045);
     return 0;
 }
 static u64 __attribute__((ms_abi)) beer_GetAcceptExSockaddrs(void *buffer, u32 receive_length, u32 local_length,
@@ -1592,18 +1589,6 @@ static u64 __attribute__((ms_abi)) beer_GdipFree(void *pointer) { free(pointer);
 #define BEER_GDIP_CLEAR_6 do { if (f) *(u64 *)(uintptr_t)f = 0; } while (0)
 BEER_GDIP_NI(GdipCreateFont, 5, u64 a, u64 b, u64 c, u64 d, u64 e)                  /* (family, size, style, unit, font**) */
 BEER_GDIP_NI(GdipCreateFontFamilyFromName, 3, u64 a, u64 b, u64 c)                  /* (name, collection, family**) */
-BEER_GDIP_NI(GdipDrawString, 0, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g)
-BEER_GDIP_NI(GdipCreateStringFormat, 3, u64 a, u64 b, u64 c)                        /* (flags, language, format**) */
-BEER_GDIP_NI(GdipSetStringFormatAlign, 0, u64 a, u64 b)
-BEER_GDIP_NI(GdipSetStringFormatLineAlign, 0, u64 a, u64 b)
-BEER_GDIP_NI(GdipCreateSolidFill, 2, u64 a, u64 b)                                  /* (color, brush**) */
-BEER_GDIP_NI(GdipCloneImage, 2, u64 a, u64 b)                                       /* (image, clone**) */
-BEER_GDIP_NI(GdipGetImageGraphicsContext, 2, u64 a, u64 b)                          /* (image, graphics**) */
-BEER_GDIP_NI(GdipCreateHBITMAPFromBitmap, 2, u64 a, u64 b, u64 c)                   /* (bitmap, hbitmap*, background) */
-BEER_GDIP_NI(GdipSetSmoothingMode, 0, u64 a, u64 b)
-BEER_GDIP_NI(GdipGraphicsClear, 0, u64 a, u64 b)
-BEER_GDIP_NI(GdipSetTextRenderingHint, 0, u64 a, u64 b)
-BEER_GDIP_NI(GdipCreateBitmapFromScan0, 6, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) /* (w, h, stride, format, scan0, bitmap**) */
 static u64 __attribute__((ms_abi)) beer_GdipGetGenericFontFamilySansSerif(u64 *family) { if (family) *family = 0; return BEER_GDIP_NOT_IMPLEMENTED; }
 /* Deleting objects that were never created: GDI+ answers InvalidParameter for NULL. */
 static u64 __attribute__((ms_abi)) beer_GdipDeleteObject(void *object) { return object ? 0 : 2; }
@@ -1675,10 +1660,41 @@ static u64 __attribute__((ms_abi)) beer_GetUserProfileDirectoryW(u64 token, u16 
     *size = length + 1;
     return 1;
 }
-/* SetDllDirectory: Beer searches the application directory, the system directories and its runtime directory; an
- * extra directory is accepted (DLLs there are found by their full path, which is how SDKs load them). */
-static u64 __attribute__((ms_abi)) beer_SetDllDirectoryW(const u16 *path) { (void)path; return 1; }
-static u64 __attribute__((ms_abi)) beer_SetDllDirectoryA(const char *path) { (void)path; return 1; }
+/* SetDllDirectory(path): sets the one extra DLL search directory (searched after the application directory);
+ * NULL or "" clears it. Fails with ERROR_PATH_NOT_FOUND / ERROR_DIRECTORY like Windows when the path is no
+ * directory. */
+static u64 beer_set_dll_directory_utf8(const char *path)
+{
+    char host[PATH_MAX];
+    host[0] = 0;
+    if (path && *path) {
+        struct stat status;
+        if (!resolve_windows_host_path(path, host, sizeof(host)) || stat(host, &status) != 0) {
+            g_last_error = 3;                                   /* ERROR_PATH_NOT_FOUND */
+            return 0;
+        }
+        if (!S_ISDIR(status.st_mode)) { g_last_error = 267; return 0; }   /* ERROR_DIRECTORY */
+    }
+    pthread_mutex_lock(&g_dll_directory_mutex);
+    snprintf(g_set_dll_directory, sizeof(g_set_dll_directory), "%s", host);
+    pthread_mutex_unlock(&g_dll_directory_mutex);
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) beer_SetDllDirectoryW(const u16 *path)
+{
+    if (!path) return beer_set_dll_directory_utf8(NULL);
+    char narrow[PATH_MAX];
+    size_t length = 0;
+    while (path[length] && length + 1 < sizeof(narrow)) {
+        narrow[length] = path[length] < 0x80 ? (char)path[length] : '?';
+        ++length;
+    }
+    if (path[length]) { g_last_error = 206; return 0; }         /* ERROR_FILENAME_EXCED_RANGE */
+    narrow[length] = 0;
+    return beer_set_dll_directory_utf8(narrow);
+}
+static u64 __attribute__((ms_abi)) beer_SetDllDirectoryA(const char *path) { return beer_set_dll_directory_utf8(path); }
 
 /* ---- System time in NT form (100-ns intervals since 1601-01-01 UTC) ---- */
 #define BEER_EPOCH_1970 116444736000000000ull                  /* 1970-01-01 as NT time */
@@ -1936,6 +1952,66 @@ static u64 __attribute__((ms_abi)) beer_PathIsDirectoryW(const u16 *path)
     const u32 attributes = path ? (u32)impl_GetFileAttributesW(path) : 0xffffffffu;
     return attributes != 0xffffffffu && (attributes & 0x10) ? 0x10 : 0;
 }
+
+/* USER32 CharNext/CharPrev, as Wine implements them: one UTF-16 unit (no surrogate or combining handling), never
+ * past the terminator or before the start. The ANSI forms step one byte: Beer's ANSI code page is single-byte.
+ * NetEase's login protocol module walks its XML with CharNextW; the old stubs returned NULL and it crashed. */
+static u64 __attribute__((ms_abi)) beer_CharNextW(const u16 *x)
+    { return (u64)(uintptr_t)(x && *x ? x + 1 : x); }
+static u64 __attribute__((ms_abi)) beer_CharPrevW(const u16 *start, const u16 *x)
+    { return (u64)(uintptr_t)(x > start ? x - 1 : start); }
+static u64 __attribute__((ms_abi)) beer_CharNextA(const char *x)
+    { return (u64)(uintptr_t)(x && *x ? x + 1 : x); }
+static u64 __attribute__((ms_abi)) beer_CharNextExA(u16 codepage, const char *x, u32 flags)
+    { (void)codepage; (void)flags; return (u64)(uintptr_t)(x && *x ? x + 1 : x); }
+static u64 __attribute__((ms_abi)) beer_CharPrevA(const char *start, const char *x)
+    { return (u64)(uintptr_t)(x > start ? x - 1 : start); }
+static u64 __attribute__((ms_abi)) beer_CharPrevExA(u16 codepage, const char *start, const char *x, u32 flags)
+    { (void)codepage; (void)flags; return (u64)(uintptr_t)(x > start ? x - 1 : start); }
+
+/* bcryptprimitives!ProcessPrng: the system RNG Rust's standard library uses on Windows (it aborts the process when the
+ * import is missing; WWM's Discord SDK did). Always succeeds, as on Windows. */
+static u64 __attribute__((ms_abi)) beer_ProcessPrng(u8 *data, u64 length)
+{
+    for (u64 done = 0; data && done < length; ) {
+        const ssize_t got = getrandom(data + done, (size_t)(length - done), 0);
+        if (got > 0) done += (u64)got;
+        else if (errno != EINTR) break;
+    }
+    return 1;
+}
+/* ws2_32!GetHostNameW: gethostname as UTF-16 (the host name is ASCII). */
+static u64 __attribute__((ms_abi)) beer_GetHostNameW(u16 *name, s32 length)
+{
+    if (!name || length <= 0) { beer_wsa_set_error(10014); return (u32)-1; }   /* WSAEFAULT */
+    char host[256];
+    if (gethostname(host, sizeof(host)) != 0) snprintf(host, sizeof(host), "BEER-PC");
+    host[sizeof(host) - 1] = 0;
+    const size_t n = strlen(host);
+    if ((size_t)length <= n) { beer_wsa_set_error(10014); return (u32)-1; }
+    for (size_t i = 0; i <= n; ++i) name[i] = (u8)host[i];
+    return 0;
+}
+/* SetWinEventHook: accessibility events (foreground, focus, ...) are not generated, so the hook is valid and silent. */
+static u64 __attribute__((ms_abi)) beer_SetWinEventHook(u32 event_min, u32 event_max, u64 module, u64 proc, u32 pid,
+                                                        u32 tid, u32 flags)
+{
+    (void)event_min; (void)event_max; (void)module; (void)pid; (void)tid; (void)flags;
+    static u64 next = 0xE7000000u;
+    if (!proc) { g_last_error = 87; return 0; }
+    return __atomic_add_fetch(&next, 1, __ATOMIC_RELAXED);
+}
+static u64 __attribute__((ms_abi)) beer_UnhookWinEvent(u64 hook) { return hook ? 1 : 0; }
+/* powrprof!PowerRegisterSuspendResumeNotification: registration succeeds; Beer's process never sees a suspend. */
+static u64 __attribute__((ms_abi)) beer_PowerRegisterSuspendResumeNotification(u32 flags, u64 recipient, u64 *handle)
+{
+    (void)flags; (void)recipient;
+    static u64 next = 0xE8000000u;
+    if (!handle) return 87;
+    *handle = __atomic_add_fetch(&next, 1, __ATOMIC_RELAXED);
+    return 0;                                                          /* ERROR_SUCCESS */
+}
+static u64 __attribute__((ms_abi)) beer_PowerUnregisterSuspendResumeNotification(u64 handle) { return handle ? 0 : 6; }
 
 /* SHGetMalloc: the shell's allocator is the COM task allocator (PIDLs come from CoTaskMemAlloc). */
 static u64 __attribute__((ms_abi)) beer_SHGetMalloc(void **out) { return beer_CoGetMalloc(1, out); }

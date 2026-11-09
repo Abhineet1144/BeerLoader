@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static const uint8_t iid_allocator[16] = { 0xe4, 0xde, 0x02, 0x61, 0x59, 0xaf,
     0x09, 0x4b, 0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24 };
@@ -107,14 +108,72 @@ static void pso_compile(ComPso *p)
  * (Where Winds Meet: 19.9k pipelines = 2.1 GB, killed at 9 GB; Stellar Blade 7.8 GB; RE9 ~1.6 GB more than Proton).
  * By default every compiled pipeline stays alive, as on Windows (layouts are shared, so each costs only its
  * VkPipeline). BEER_BD12_RELEASE_PIPELINES=1 opts into warm-and-release when memory is tight. */
+/* The memory budget for keeping pipelines: BEER_BD12_PIPELINE_BUDGET_MB, else 60% of the smaller of this process's
+ * cgroup limit (memory.max, e.g. a 9 GB launcher cap) and the machine's RAM. 0 = unknown (keep everything). */
+static uint64_t pipeline_budget_bytes(void)
+{
+    const char *set = getenv("BEER_BD12_PIPELINE_BUDGET_MB");
+    if (set && *set) return (uint64_t)strtoull(set, NULL, 10) << 20;
+    uint64_t limit = 0;
+    {   /* MemTotal */
+        FILE *f = fopen("/proc/meminfo", "r");
+        char line[256];
+        while (f && fgets(line, sizeof(line), f))
+            if (!strncmp(line, "MemTotal:", 9)) { limit = strtoull(line + 9, NULL, 10) << 10; break; }
+        if (f) fclose(f);
+    }
+    {   /* cgroup v2: "0::/path" in /proc/self/cgroup, the limit in /sys/fs/cgroup/<path>/memory.max */
+        FILE *f = fopen("/proc/self/cgroup", "r");
+        char line[512];
+        if (f && fgets(line, sizeof(line), f) && !strncmp(line, "0::", 3)) {
+            line[strcspn(line, "\n")] = 0;
+            char path[700];
+            snprintf(path, sizeof(path), "/sys/fs/cgroup%s/memory.max", line + 3);
+            FILE *m = fopen(path, "r");
+            char value[64];
+            if (m && fgets(value, sizeof(value), m) && strncmp(value, "max", 3)) {
+                const uint64_t cg = strtoull(value, NULL, 10);
+                if (cg && (!limit || cg < limit)) limit = cg;
+            }
+            if (m) fclose(m);
+        }
+        if (f) fclose(f);
+    }
+    return limit / 10 * 6;
+}
+static uint64_t process_resident_bytes(void)
+{
+    FILE *f = fopen("/proc/self/statm", "r");
+    unsigned long long total = 0, resident = 0;
+    if (f) { if (fscanf(f, "%llu %llu", &total, &resident) != 2) resident = 0; fclose(f); }
+    return (uint64_t)resident * (uint64_t)sysconf(_SC_PAGESIZE);
+}
+/* Keep compiled pipelines (Windows behaviour) unless memory is tight: every 64 creations the process's resident size
+ * is compared with the budget, and once over it, later compile-at-create pipelines are warmed into the cache and
+ * released (pso_warm); the choice is sticky. BEER_BD12_RELEASE_PIPELINES=1 releases from the start, =0 never. */
 static int keep_pipelines(void)
 {
-    static int value = -1;
-    if (value < 0) {
+    static int forced = -2;                 /* -2 unread, -1 automatic, 0 release, 1 keep */
+    static _Atomic int tight;
+    static _Atomic uint32_t checks;
+    static uint64_t budget;
+    if (forced == -2) {
         const char *release = getenv("BEER_BD12_RELEASE_PIPELINES");
-        value = !(release && *release && strcmp(release, "0") != 0);
+        forced = release && *release ? (strcmp(release, "0") ? 0 : 1) : -1;
+        if (forced < 0) budget = pipeline_budget_bytes();
     }
-    return value;
+    if (forced >= 0) return forced;
+    if (atomic_load(&tight)) return 0;
+    if (!budget || (atomic_fetch_add(&checks, 1) & 63)) return 1;
+    const uint64_t resident = process_resident_bytes();
+    if (resident > budget) {
+        if (!atomic_exchange(&tight, 1))
+            fprintf(stderr, "[BD12] memory tight (%llu MB resident, budget %llu MB): new pipelines are now warmed "
+                    "into the cache and released\n", (unsigned long long)(resident >> 20),
+                    (unsigned long long)(budget >> 20));
+        return 0;
+    }
+    return 1;
 }
 static void pso_warm(ComPso *p)
 {
@@ -730,8 +789,8 @@ static void MS cl_draw_indexed(ComList *l, uint32_t ic, uint32_t inst,
 {
     LIST_CUR(l);
     if (bd12_trace_active() && c->gfx.pipeline)
-        fprintf(stderr, "[DRAW] indexed pso=%016llx indices=%u instances=%u start=%u base=%d\n",
-                (unsigned long long)c->gfx.pipeline->shader_hash, ic, inst, si, bv);
+        fprintf(stderr, "[DRAW] indexed list=%p pso=%016llx indices=%u instances=%u start=%u base=%d\n",
+                (void *)c, (unsigned long long)c->gfx.pipeline->shader_hash, ic, inst, si, bv);
     bd12_cmd_draw_indexed(c, ic, inst, si, bv, sinst);
 }
 
@@ -1349,7 +1408,8 @@ static void MS cl_execute_indirect(ComList *l, ComSignature *sig,
     BD12Buffer *cb = count_res ? count_res->buffer : NULL;
     { static int force = -1; if (force < 0) force = getenv("BEER_BD12_INDIRECT_FORCE") != NULL; if (force) cb = NULL; }
     if (bd12_trace_active())
-        fprintf(stderr, "[TRACE] execute_indirect type=%u max=%u args=%llx+%llx count=%llx+%llx\n",
+        fprintf(stderr, "[TRACE] execute_indirect list=%p pso=%016llx type=%u max=%u args=%llx+%llx count=%llx+%llx\n",
+                (void *)c, (unsigned long long)(sig->arg_types[0] <= 2 && c->gfx.pipeline ? c->gfx.pipeline->shader_hash : 0),
                 sig->arg_types[0], max_count,
                 (unsigned long long)args->buffer->va, (unsigned long long)arg_off,
                 (unsigned long long)(cb ? cb->va : 0), (unsigned long long)count_off);
@@ -1421,7 +1481,18 @@ static void MS cl_rt_set_pso1(ComList *l, ComStateObject *state)
         for (unsigned i = 0; i < seen_count; ++i) known |= seen[i] == (void *)state;
         if (!known && seen_count < 64) {
             seen[seen_count++] = (void *)state;
-            fprintf(stderr, "[DXR] SetPipelineState1 #%u: new state object %p (rt pipeline %p), %u distinct so far\n", calls, (void *)state, state ? (void *)state->rt : NULL, seen_count);
+            {
+                extern __thread uint64_t g_dispatch_incoming_return;
+                fprintf(stderr, "[DXR] SetPipelineState1 #%u: new state object %p (rt pipeline %p), %u distinct so far (guest caller 0x%llx)\n",
+                        calls, (void *)state, state ? (void *)state->rt : NULL, seen_count,
+                        (unsigned long long)g_dispatch_incoming_return);
+                extern __thread uint64_t g_dispatch_incoming_rsp;
+                const uint64_t *sp = (const uint64_t *)(uintptr_t)g_dispatch_incoming_rsp;
+                fprintf(stderr, "[DXR]   guest stack:");
+                for (int k = 0; sp && k < 160; ++k)
+                    if (sp[k] >= 0x140001000ull && sp[k] < 0x14d000000ull) fprintf(stderr, " %llx", (unsigned long long)sp[k]);
+                fprintf(stderr, "\n");
+            }
         }
     }
 }

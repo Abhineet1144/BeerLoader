@@ -503,3 +503,50 @@ static u64 __attribute__((ms_abi)) impl_MapViewOfFile(u64 mapping, u32 access, u
     { return impl_MapViewOfFileEx(mapping, access, offset_high, offset_low, bytes, NULL); }
 static u64 __attribute__((ms_abi)) impl_UnmapViewOfFile(void *base)
     { return beer_nt_section_unmap(base) == 0 ? 1 : (g_last_error = 487, 0); }
+
+/* ---- Event Log (advapi32) ----
+ * Beer has no Windows event log. Event sources and logs are handles that accept writes and read as empty: ReportEvent
+ * succeeds and prints the message strings, as a log sink. Programs register a source at start-up and report errors
+ * through it; Forza Horizon 6 resolves RegisterEventSourceW from advapi32's export table and stops with "entry point
+ * not found" when it is absent. Handles use 0x38000000.. (kernel-object values stay below 0x80000000). */
+#define BEER_EVENTLOG_HANDLE_BASE 0x38000000u
+static _Atomic(u32) g_eventlog_next = 1;
+static int eventlog_handle(u64 h) { return h > BEER_EVENTLOG_HANDLE_BASE && h < BEER_EVENTLOG_HANDLE_BASE + 0x01000000u; }
+static u64 eventlog_new(void) { return BEER_EVENTLOG_HANDLE_BASE + (atomic_fetch_add(&g_eventlog_next, 1) & 0x00ffffffu); }
+static u64 __attribute__((ms_abi)) impl_RegisterEventSourceW(const u16 *server, const u16 *source)
+    { (void)server; (void)source; g_last_error = 0; return eventlog_new(); }
+static u64 __attribute__((ms_abi)) impl_RegisterEventSourceA(const char *server, const char *source)
+    { (void)server; (void)source; g_last_error = 0; return eventlog_new(); }
+static u64 __attribute__((ms_abi)) impl_OpenEventLogW(const u16 *server, const u16 *source)
+    { (void)server; (void)source; g_last_error = 0; return eventlog_new(); }
+static u64 __attribute__((ms_abi)) impl_OpenEventLogA(const char *server, const char *source)
+    { (void)server; (void)source; g_last_error = 0; return eventlog_new(); }
+static u64 __attribute__((ms_abi)) impl_DeregisterEventSource(u64 h)
+    { if (!eventlog_handle(h)) { g_last_error = 6; return 0; } return 1; }
+static u64 __attribute__((ms_abi)) impl_CloseEventLog(u64 h)
+    { if (!eventlog_handle(h)) { g_last_error = 6; return 0; } return 1; }
+static u64 __attribute__((ms_abi)) impl_GetNumberOfEventLogRecords(u64 h, u32 *count)
+    { if (!eventlog_handle(h) || !count) { g_last_error = 6; return 0; } *count = 0; return 1; }
+/* ReportEvent(handle, type, category, event id, user SID, string count, data size, strings, raw data) */
+static u64 eventlog_report(u64 h, u16 type, u32 event_id, u16 count, const void *const *strings, int wide)
+{
+    if (!eventlog_handle(h)) { g_last_error = 6; return 0; }
+    fprintf(stderr, "[EVENTLOG] type=0x%x id=0x%x", type, event_id);
+    for (u16 i = 0; strings && i < count && i < 8; ++i) {
+        char text[256];
+        size_t n = 0;
+        if (wide) { const u16 *w = strings[i]; for (; w && w[n] && n + 1 < sizeof(text); ++n) text[n] = w[n] < 0x80 ? (char)w[n] : '?'; }
+        else { const char *a = strings[i]; for (; a && a[n] && n + 1 < sizeof(text); ++n) text[n] = a[n]; }
+        text[n] = 0;
+        fprintf(stderr, " \"%s\"", text);
+    }
+    fprintf(stderr, "\n");
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_ReportEventW(u64 h, u16 type, u16 category, u32 event_id, void *sid, u16 count,
+                                                      u32 data_size, const u16 **strings, void *data)
+    { (void)category; (void)sid; (void)data_size; (void)data; return eventlog_report(h, type, event_id, count, (const void *const *)strings, 1); }
+static u64 __attribute__((ms_abi)) impl_ReportEventA(u64 h, u16 type, u16 category, u32 event_id, void *sid, u16 count,
+                                                      u32 data_size, const char **strings, void *data)
+    { (void)category; (void)sid; (void)data_size; (void)data; return eventlog_report(h, type, event_id, count, (const void *const *)strings, 0); }

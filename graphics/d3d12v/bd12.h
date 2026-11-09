@@ -146,15 +146,15 @@ typedef struct {
     VkDeviceSize base;            /* offset of the heap in `memory` */
 } BD12Heap;
 
-/* Cached typed views over a buffer range (texel-buffer SRV/UAV descriptors).
- * Views live as long as the buffer, so descriptor sets written at record time
- * can never reference a destroyed view. */
+/* Cached typed views over a buffer range (texel-buffer SRV/UAV descriptors). Unpinned views are freed once no
+ * lookup has used them for a number of frames; pinned ones stay while a long-lived descriptor set (a heap mirror
+ * slot) holds them. */
 typedef struct {
     VkFormat format;
     VkDeviceSize offset, range;
     VkBufferView view;
     uint64_t last_use;            /* device epoch of the last lookup */
-    int pinned;                   /* referenced by a long-lived descriptor: never freed */
+    uint32_t pins;                /* heap-mirror slots holding this view; it is never freed while non-zero */
 } BD12BufferView;
 
 typedef struct BD12Buffer {
@@ -180,6 +180,10 @@ typedef struct BD12AccelStruct {
     VkDeviceSize offset, size;
     VkAccelerationStructureTypeKHR type;
     VkAccelerationStructureKHR handle;
+    /* Each triangle geometry's maxVertex at the last full build: a Vulkan update must repeat it exactly, while D3D12
+     * titles may pass a different VertexCount when they update (RE8 does). */
+    uint32_t *max_vertex;
+    uint32_t geometry_count;
 } BD12AccelStruct;
 
 typedef struct BD12SamplerEntry {
@@ -698,6 +702,7 @@ typedef struct BD12CmdList {
     uint64_t dispatch_count;
     BD12FlightOp op_flight[BD12_FLIGHT_OPS];
     uint64_t op_count;
+    struct BD12GpuProfList *gpuprof;   /* BEER_BD12_GPU_PROF: per-list timestamp pools (bd12_gpuprof.c) */
 } BD12CmdList;
 
 /* Device ------------------------------------------------------------- */
@@ -1211,6 +1216,9 @@ int bd12_db_prepare(BD12CmdList *list);
 void bd12_db_bind(BD12CmdList *list, VkPipelineBindPoint point, const BD12DbLayout *layout);
 /* Binding-state invalidation: `which` 0 = graphics, 1 = compute. */
 void bd12_cmd_invalidate_point(BD12CmdList *list, int which);
+int bd12_db_accel_in_heap(const BD12Device *device);
+void bd12_rp_trace_record(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash);
+void bd12_rp_trace_submit(const BD12CmdList *list);
 void bd12_cmd_invalidate_bindings(BD12CmdList *list);
 /* Barrier batching: between begin and end, image, buffer and global barriers are collected and recorded as one
  * dependency (ending rendering once). Outside a batch they are recorded immediately. */
@@ -1220,12 +1228,19 @@ void bd12_cmd_barrier_flush(BD12CmdList *list);
 void bd12_cmd_add_image_barrier(BD12CmdList *list, const VkImageMemoryBarrier2 *barrier);
 void bd12_cmd_add_memory_barrier(BD12CmdList *list, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
                                  VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access);
+/* Push-constant contents changed outside bd12_cmd_push_root_arguments. A command buffer has one push-constant
+ * store shared by every bind point (vkCmdPushConstants takes no bind point), so neither point's cached root
+ * arguments are in it any more. */
+static inline void bd12_cmd_push_disturbed(BD12CmdList *list)
+{
+    list->root_push_key[0] = list->root_push_key[1] = 0;
+}
 /* A draw/dispatch bound descriptor sets or push constants of a non-descriptor-buffer pipeline layout. */
 static inline void bd12_cmd_note_set_binding(BD12CmdList *list, int which)
 {
     list->db_offsets_valid[which] = 0;
     list->db_static[which] = NULL;
-    if (list->root_push_key[which] == 1) list->root_push_key[which] = 0;
+    bd12_cmd_push_disturbed(list);
 }
 /* Before a draw/dispatch outside rendering: creates the bound heap's mirror
  * and initializes images it exposes. Returns 0 if bindless is unavailable. */
@@ -1299,6 +1314,11 @@ const uint8_t *bd12_rt_pipeline_identifier(BD12RtPipeline *pipeline, const char 
 /* GPU checkpoints (BEER_VK_CHECKPOINTS=1): mark the next command, dump the last reached ones after a fault. */
 void bd12_ckpt_mark(BD12CmdList *list, uint32_t kind, uint64_t a, uint64_t b, uint32_t w, uint32_t h, uint32_t d);
 void bd12_ckpt_dump(void);
+void bd12_buffer_view_unpin(BD12Device *device, BD12Buffer *buffer, uint32_t serial, VkFormat format, VkDeviceSize offset,
+                            VkDeviceSize range);
+void bd12_view_stats(uint64_t *views, uint64_t *pinned);
+void bd12_buffer_views_release(BD12Buffer *buffer);
+void bd12_ckpt_args(uint64_t args_va, uint64_t count_va);
 void bd12_zero_flush(BD12Device *device);
 /* live-object registry for descriptor-referenced buffers and images (bd12_live.c) */
 void bd12_live_add(const void *ptr);
@@ -1317,6 +1337,12 @@ extern int g_bd12_cbt_active;   /* nonzero while capture is on or any tweak is e
 void bd12_cbt_observe(uint64_t pso_hash, uint32_t stage, uint32_t space, uint32_t reg,
                       BD12Buffer *buffer, VkDeviceSize offset, VkDeviceSize range);
 void bd12_cbt_frame_advance(void);
+/* BEER_BD12_GPU_PROF=1: GPU time per shader from a timestamp before every draw/dispatch/copy (bd12_gpuprof.c). */
+void bd12_gpuprof_list_begin(BD12CmdList *list);
+void bd12_gpuprof_mark(BD12CmdList *list, uint32_t kind, uint64_t tag);
+void bd12_gpuprof_list_end(BD12CmdList *list);
+void bd12_gpuprof_list_destroy(BD12CmdList *list);
+void bd12_gpuprof_report(void);
 void bd12_cbt_handle(const char *cmd, const char *request, char *out, size_t size);
 
 #endif

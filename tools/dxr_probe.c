@@ -81,6 +81,12 @@ int main(int argc, char **argv)
             if (r == DXIL_SPV_SUCCESS) p_converter_get_compiled_spirv(c, &sp);
             ++total; if (r != DXIL_SPV_SUCCESS) ++failed;
             printf("  %-24s stage=%2d result=%d spirv=%zu words srv=%d uav=%d cbv=%d smp=%d as=%d%s\n", name, st, r, sp.size / 4, seen.srv, seen.uav, seen.cbv, seen.smp, seen.as, seen.note);
+            if (sp.size && getenv("DXR_PROBE_SPV")) {   /* DXR_PROBE_SPV=<dir>: <dir>/<export>.spv for spirv-dis */
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%s.spv", getenv("DXR_PROBE_SPV"), name);
+                FILE *o = fopen(path, "wb");
+                if (o) { fwrite(sp.data, 1, sp.size, o); fclose(o); }
+            }
             p_converter_free(c);
         }
         p_parsed_blob_free(blob);

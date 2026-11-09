@@ -51,6 +51,14 @@ typedef int32_t (__attribute__((ms_abi)) *BeerLanguageHandler)(
     BeerExceptionRecord64 *record, uint64_t establisher_frame,
     void *context_record, BeerDispatcherContext64 *dispatcher_context);
 
+/* Optional: how language handlers are called. The loader supplies one that runs the handler on the guest stack
+ * below `guest_rsp` (the faulting frame), as Windows does, instead of on the dispatcher's own stack. NULL = call
+ * directly. */
+typedef int32_t (*BeerSehHandlerCaller)(uint64_t handler, BeerExceptionRecord64 *record, uint64_t establisher_frame,
+                                        void *context_record, BeerDispatcherContext64 *dispatcher_context,
+                                        uint64_t guest_rsp);
+void beer_seh_set_handler_caller(BeerSehHandlerCaller caller);
+
 /* Performs first-pass AMD64 frame-based exception dispatch. Vectored handlers
  * must run before this function. Returns one only when a language handler asks
  * to continue execution. Malformed metadata, invalid stack frames, unsupported

@@ -83,11 +83,18 @@ uint32_t MS com_add_ref(ComObj *obj)
     return obj ? __atomic_add_fetch(&obj->refs, 1, __ATOMIC_RELAXED) : 0;
 }
 
+static void com_obj_private_clear(ComObj *self);
+uint64_t g_bd12_fence_release_calls, g_bd12_fence_completed_calls;   /* profiler */
+static int fence_diag(void);
 uint32_t MS com_release(ComObj *obj)
 {
     if (!obj) return 0;
+    if (obj->kind == COM_FENCE) __atomic_add_fetch(&g_bd12_fence_release_calls, 1, __ATOMIC_RELAXED);
     uint32_t refs = __atomic_sub_fetch(&obj->refs, 1, __ATOMIC_ACQ_REL);
-    if (!refs) obj->destroy(obj);
+    if (!refs) {
+        if (obj->private_data) com_obj_private_clear(obj);
+        obj->destroy(obj);
+    }
     return refs;
 }
 
@@ -116,25 +123,123 @@ HR com_obj_query(ComObj *self, const uint8_t *riid, void **out,
 
 /* Generic ID3D12Object slots ----------------------------------------------- */
 
+/* ID3D12Object private data: a per-object list of GUID-keyed blobs. Engines cache per-object state this way and
+ * create it again whenever GetPrivateData misses: Unreal keeps a fence per object behind a private GUID, and with
+ * the old no-op store Beast of Reincarnation created ~80 fences a frame that were never retired (the frame rate fell
+ * from 180 to ~12 within a minute as they piled up). An interface entry holds a reference when it is a BD12 object
+ * (one whose AddRef is com_add_ref); other interfaces are kept as plain pointers. */
+typedef struct ComPrivateData {
+    struct ComPrivateData *next;
+    uint8_t guid[16];
+    uint32_t size;
+    ComObj *iface;               /* SetPrivateDataInterface entry (size == sizeof(void *)) */
+    uint8_t data[];
+} ComPrivateData;
+static pthread_mutex_t g_private_lock = PTHREAD_MUTEX_INITIALIZER;
+#define HR_MORE_DATA UINT64_C(0x887a0003)
+
+static int private_iface_is_bd12(const ComObj *iface)
+{
+    return iface && iface->vtable && iface->vtable[1] == (void *)com_add_ref;
+}
+
+/* Removes the entry for `guid`; returns it unlinked (caller frees it outside the lock), or NULL. */
+static ComPrivateData *private_unlink_locked(ComObj *self, const uint8_t *guid)
+{
+    for (ComPrivateData **link = &self->private_data; *link; link = &(*link)->next)
+        if (!memcmp((*link)->guid, guid, 16)) {
+            ComPrivateData *entry = *link;
+            *link = entry->next;
+            return entry;
+        }
+    return NULL;
+}
+
+static void private_free(ComPrivateData *entry)
+{
+    if (!entry) return;
+    if (entry->iface && private_iface_is_bd12(entry->iface)) com_release(entry->iface);
+    free(entry);
+}
+
+/* Frees every entry: the object is being destroyed. */
+static void com_obj_private_clear(ComObj *self)
+{
+    pthread_mutex_lock(&g_private_lock);
+    ComPrivateData *entry = self->private_data;
+    self->private_data = NULL;
+    pthread_mutex_unlock(&g_private_lock);
+    while (entry) {
+        ComPrivateData *next = entry->next;
+        private_free(entry);
+        entry = next;
+    }
+}
+
 HR MS com_obj_get_private(ComObj *self, const uint8_t *guid, uint32_t *size,
                              void *data)
 {
-    (void)self; (void)data;
-    if (!guid || !size) return HR_E_INVALIDARG;
-    *size = 0;
-    return HR_NOT_FOUND;
+    if (!self || !guid || !size) return HR_E_INVALIDARG;
+    pthread_mutex_lock(&g_private_lock);
+    const ComPrivateData *entry = NULL;
+    for (const ComPrivateData *e = self->private_data; e; e = e->next)
+        if (!memcmp(e->guid, guid, 16)) { entry = e; break; }
+    if (!entry) {
+        pthread_mutex_unlock(&g_private_lock);
+        *size = 0;
+        return HR_NOT_FOUND;
+    }
+    if (!data) {                                     /* size query */
+        *size = entry->size;
+        pthread_mutex_unlock(&g_private_lock);
+        return HR_OK;
+    }
+    if (*size < entry->size) {
+        *size = entry->size;
+        pthread_mutex_unlock(&g_private_lock);
+        return HR_MORE_DATA;
+    }
+    memcpy(data, entry->data, entry->size);
+    *size = entry->size;
+    if (entry->iface && private_iface_is_bd12(entry->iface)) com_add_ref(entry->iface);   /* caller owns one */
+    pthread_mutex_unlock(&g_private_lock);
+    return HR_OK;
 }
+
+static HR private_store(ComObj *self, const uint8_t *guid, uint32_t size, const void *data, ComObj *iface)
+{
+    ComPrivateData *entry = NULL;
+    if (size && data) {
+        entry = malloc(sizeof(*entry) + size);
+        if (!entry) return HR_E_OUTOFMEMORY;
+        memcpy(entry->guid, guid, 16);
+        entry->size = size;
+        entry->iface = iface;
+        memcpy(entry->data, data, size);
+        if (iface && private_iface_is_bd12(iface)) com_add_ref(iface);
+    }
+    pthread_mutex_lock(&g_private_lock);
+    ComPrivateData *old = private_unlink_locked(self, guid);
+    if (entry) { entry->next = self->private_data; self->private_data = entry; }
+    pthread_mutex_unlock(&g_private_lock);
+    private_free(old);
+    return HR_OK;
+}
+
+/* SetPrivateData(guid, size, data): size 0 / NULL data removes the entry. */
 HR MS com_obj_set_private(ComObj *self, const uint8_t *guid, uint32_t size,
                              const void *data)
 {
-    (void)self; (void)guid; (void)size; (void)data;
-    return HR_OK;
+    if (!self || !guid || (size && !data)) return HR_E_INVALIDARG;
+    return private_store(self, guid, size, data, NULL);
 }
+/* SetPrivateDataInterface(guid, iface): stores the interface pointer; NULL removes the entry. */
 HR MS com_obj_set_private_iface(ComObj *self, const uint8_t *guid,
                                    void *iface)
 {
-    (void)self; (void)guid; (void)iface;
-    return HR_OK;
+    if (!self || !guid) return HR_E_INVALIDARG;
+    return private_store(self, guid, iface ? (uint32_t)sizeof(iface) : 0, iface ? (const void *)&iface : NULL,
+                         (ComObj *)iface);
 }
 HR MS com_obj_set_name(ComObj *self, const uint16_t *name)
 {
@@ -402,6 +507,42 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
 
 /* Fence waiter: signals guest events when timeline values are reached. */
 
+/* Whether a waiter's condition holds: its fence reached the value, or (multiple fences) all / any of them did. */
+static int waiter_ready(const ComWaiter *w)
+{
+    if (beer_vulkan_device_lost()) return 1;
+    if (!w->count) return bd12_fence_completed(((ComFence *)w->fence)->fence) >= w->value;
+    for (uint32_t i = 0; i < w->count; ++i) {
+        const int done = bd12_fence_completed(((ComFence *)w->fences[i])->fence) >= w->values[i];
+        if (w->any && done) return 1;
+        if (!w->any && !done) return 0;
+    }
+    return !w->any;
+}
+/* A fence the waiter still waits for (the first unfinished one), with its value. */
+static ComFence *waiter_pending(const ComWaiter *w, uint64_t *value)
+{
+    if (!w->count) { *value = w->value; return (ComFence *)w->fence; }
+    for (uint32_t i = 0; i < w->count; ++i)
+        if (bd12_fence_completed(((ComFence *)w->fences[i])->fence) < w->values[i]) {
+            *value = w->values[i];
+            return (ComFence *)w->fences[i];
+        }
+    *value = w->values[0];
+    return (ComFence *)w->fences[0];
+}
+static void waiter_free(ComWaiter *w)
+{
+    if (w->count) {
+        for (uint32_t i = 0; i < w->count; ++i) com_release(w->fences[i]);
+        free(w->fences);
+        free(w->values);
+    } else {
+        com_release(w->fence);
+    }
+    free(w);
+}
+
 static void *waiter_main(void *arg)
 {
     ComDevice *dev = arg;
@@ -411,9 +552,7 @@ static void *waiter_main(void *arg)
         ComWaiter *ready = NULL, **link = &dev->waiters;
         while (*link) {
             ComWaiter *w = *link;
-            ComFence *fence = (ComFence *)w->fence;
-            if (bd12_fence_completed(fence->fence) >= w->value ||
-                beer_vulkan_device_lost()) {
+            if (waiter_ready(w)) {
                 *link = w->next;
                 w->next = ready;
                 ready = w;
@@ -428,14 +567,13 @@ static void *waiter_main(void *arg)
                 ComWaiter *w = ready;
                 ready = w->next;
                 if (signal && w->event) signal(w->event);
-                com_release(w->fence);
-                free(w);
+                waiter_free(w);
             }
             pthread_mutex_lock(&dev->wait_lock);
             continue;
         }
-        ComFence *first = (ComFence *)dev->waiters->fence;
-        uint64_t value = dev->waiters->value;
+        uint64_t value = 0;
+        ComFence *first = waiter_pending(dev->waiters, &value);
         com_add_ref(&first->obj);
         pthread_mutex_unlock(&dev->wait_lock);
         bd12_fence_wait(first->fence, value, 1000000);
@@ -445,6 +583,7 @@ static void *waiter_main(void *arg)
     return NULL;
 }
 
+static void queue_waiter(ComDevice *dev, ComWaiter *w);
 static void add_waiter(ComDevice *dev, ComFence *fence, uint64_t value,
                        uint64_t event)
 {
@@ -454,6 +593,10 @@ static void add_waiter(ComDevice *dev, ComFence *fence, uint64_t value,
     w->value = value;
     w->event = event;
     com_add_ref(&fence->obj);
+    queue_waiter(dev, w);
+}
+static void queue_waiter(ComDevice *dev, ComWaiter *w)
+{
     pthread_mutex_lock(&dev->wait_lock);
     if (!dev->waiter_started) {
         pthread_t thread;
@@ -484,13 +627,30 @@ static void fence_free(ComDevice *dev, void *ptr)
     bd12_fence_destroy(f->fence);
     free(f);
 }
-static void fence_destroy(ComObj *o) { com_defer(o->dev, fence_free, o); }
+uint64_t g_bd12_fences_released;   /* profiler: fences whose last reference was released (freed after the GPU) */
+static void fence_destroy(ComObj *o)
+{
+    __atomic_add_fetch(&g_bd12_fences_released, 1, __ATOMIC_RELAXED);
+    com_defer(o->dev, fence_free, o);
+}
 
 static HR MS fence_query(ComObj *s, const uint8_t *r, void **o)
 { return com_obj_query(s, r, o, iid_fence, NULL); }
 static uint64_t MS fence_completed(ComFence *f)
 {
-    return bd12_fence_completed(f->fence);
+    const uint64_t calls = __atomic_add_fetch(&g_bd12_fence_completed_calls, 1, __ATOMIC_RELAXED);
+    const uint64_t value = bd12_fence_completed(f->fence);
+    if (fence_diag() && ++f->polls == 100000)   /* a fence a polling loop keeps waiting on */
+        fprintf(stderr, "[FENCE] polled 100000x: fence=%p completed=%llu signaled=%llu last-signal=%llu caller=%p\n",
+                (void *)f, (unsigned long long)value,
+                (unsigned long long)__atomic_load_n(&f->fence->signaled, __ATOMIC_RELAXED),
+                (unsigned long long)f->last_signal, __builtin_return_address(0));
+    if (fence_diag() && !(calls % 1000000))   /* which fence a polling loop is spinning on */
+        fprintf(stderr, "[FENCE] GetCompletedValue #%llu fence=%p completed=%llu signaled=%llu refs=%u caller=%p\n",
+                (unsigned long long)calls, (void *)f, (unsigned long long)value,
+                (unsigned long long)__atomic_load_n(&f->fence->signaled, __ATOMIC_RELAXED), f->obj.refs,
+                __builtin_return_address(0));
+    return value;
 }
 static int fence_diag(void)
 {
@@ -515,11 +675,62 @@ static HR MS fence_set_event(ComFence *f, uint64_t value, uint64_t event)
     add_waiter(f->obj.dev, f, value, event);
     return HR_OK;
 }
+/* ID3D12Device1::SetEventOnMultipleFenceCompletion(fences, values, count, flags, event): the event is set when every
+ * fence reaches its value (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL = 0) or any one does (FLAG_ANY = 1); with no event the
+ * call blocks until then. It answered E_NOTIMPL, so its event was never set: RE4's thread waiting on it held a lock
+ * every other game thread needed, and the game stopped at its first loading screen. */
+static HR MS dev_set_event_multiple(ComDevice *self, ComFence *const *fences, const uint64_t *values, uint32_t count,
+                                    uint32_t flags, uint64_t event)
+{
+    if (getenv("BEER_BD12_NO_MULTI_FENCE_EVENT")) return HR_E_NOTIMPL;   /* diagnostic: the previous answer */
+    if (fence_diag()) fprintf(stderr, "[FENCE] SetEventOnMultipleFenceCompletion called (count %u)\n", count);
+    if (!count) {
+        SignalEventFn signal = beer_d3d12_get_event_signaler();
+        if (signal && event) signal(event);
+        return HR_OK;
+    }
+    if (!fences || !values || flags > 1) return HR_E_INVALIDARG;
+    for (uint32_t i = 0; i < count; ++i) if (!fences[i]) return HR_E_INVALIDARG;
+    ComWaiter *w = calloc(1, sizeof(*w));
+    if (!w || !(w->fences = calloc(count, sizeof(*w->fences))) || !(w->values = calloc(count, sizeof(*w->values)))) {
+        if (w) { free(w->fences); free(w); }
+        return HR_E_OUTOFMEMORY;
+    }
+    w->count = count;
+    w->any = flags == 1;
+    w->event = event;
+    for (uint32_t i = 0; i < count; ++i) {
+        w->fences[i] = &fences[i]->obj;
+        w->values[i] = values[i];
+        com_add_ref(&fences[i]->obj);
+    }
+    if (fence_diag())
+        fprintf(stderr, "[FENCE] SetEventOnMultipleFenceCompletion count=%u %s event=0x%llx\n", count,
+                w->any ? "any" : "all", (unsigned long long)event);
+    if (waiter_ready(w)) {
+        SignalEventFn signal = beer_d3d12_get_event_signaler();
+        if (signal && event) signal(event);
+        waiter_free(w);
+        return HR_OK;
+    }
+    if (!event) {                                  /* block until the condition holds */
+        while (!waiter_ready(w)) {
+            uint64_t value = 0;
+            ComFence *pending = waiter_pending(w, &value);
+            bd12_fence_wait(pending->fence, value, w->any ? 1000000 : UINT64_MAX);
+        }
+        waiter_free(w);
+        return HR_OK;
+    }
+    queue_waiter(self, w);
+    return HR_OK;
+}
 static void queue_flush_deferred(ComDevice *dev);
 static HR MS fence_signal(ComFence *f, uint64_t value)
 {
     if (fence_diag())
         fprintf(stderr, "[FENCE] CPU Signal fence=%p value=%llu\n", (void *)f, (unsigned long long)value);
+    f->last_signal = value;
     const int ok = bd12_fence_signal_cpu(f->fence, value);
     if (ok && f->obj.dev) queue_flush_deferred(f->obj.dev);   /* a held queue Wait may now be satisfiable */
     return ok ? HR_OK : HR_E_FAIL;
@@ -715,7 +926,7 @@ static void MS queue_execute(ComQueue *q, uint32_t count, ComObj *const *lists)
     op.lists = count ? malloc(count * sizeof(*op.lists)) : NULL;
     for (uint32_t i = 0; op.lists && i < count; ++i) {
         BD12CmdList *recorded = lists[i] ? com_list_finish(lists[i]) : NULL;
-        if (recorded) op.lists[op.count++] = recorded;
+        if (recorded) { bd12_rp_trace_submit(recorded); op.lists[op.count++] = recorded; }
     }
     if (op.count) queue_push(q, &op);
     else free(op.lists);
@@ -735,6 +946,7 @@ static HR MS queue_signal(ComQueue *q, ComFence *f, uint64_t value)
     if (fence_diag())
         fprintf(stderr, "[FENCE] queue %p Signal fence=%p value=%llu\n", (void *)q, (void *)f, (unsigned long long)value);
     com_add_ref(&f->obj);
+    f->last_signal = value;
     QueueOp op = { .kind = QUEUE_OP_SIGNAL, .fence = f, .value = value };
     return queue_push(q, &op);
 }
@@ -2844,7 +3056,12 @@ static HR MS dev_create_state_object(ComDevice *self, const uint8_t *desc,
     HR hr = so_query(&so->obj, riid ? riid : iid_state_object, out);
     com_release(&so->obj);
     {   static unsigned created;
-        if (++created % 500 == 0 || created == 1) fprintf(stderr, "[DXR] CreateStateObject: %u created so far\n", created);
+        ++created;
+        if (getenv("BEER_DXR_PROBE")) {            /* which state object is which, and who created it */
+            extern __thread uint64_t g_dispatch_incoming_return;
+            fprintf(stderr, "[DXR] CreateStateObject #%u -> %p (libraries=%u, guest caller 0x%llx)\n", created, (void *)*out,
+                    d.library_count, (unsigned long long)g_dispatch_incoming_return);
+        } else if (created % 500 == 0 || created == 1) fprintf(stderr, "[DXR] CreateStateObject: %u created so far\n", created);
     }
     return hr;
 fail:
@@ -3015,7 +3232,7 @@ static void *device_vtable[76] = {
     [36] = dev_create_fence, [37] = dev_removed_reason,
     [38] = dev_get_footprints, [39] = dev_create_query_heap, [40] = obj_ok,
     [41] = dev_create_command_signature, [42] = dev_get_resource_tiling,
-    [43] = dev_get_luid, [44] = dev_create_pipeline_library, [45] = obj_notimpl,
+    [43] = dev_get_luid, [44] = dev_create_pipeline_library, [45] = dev_set_event_multiple,
     [46] = obj_ok, [47] = dev_create_pso,
     /* Device3 */ [48] = obj_notimpl, [49] = obj_notimpl, [50] = dev_enqueue_make_resident,
     /* Device4 */ [51] = dev_create_list1, [52] = obj_notimpl,

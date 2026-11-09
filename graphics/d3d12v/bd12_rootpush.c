@@ -17,6 +17,7 @@
  * the layout below at most (a root descriptor costs two words), plus one word kept zero for direct heap access. */
 
 static pthread_mutex_t g_layout_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t rp_trace_hash(void);
 
 /* Pipelines built with root-signature translation vs. falling back to per-draw descriptors (logged every 200). */
 void bd12_root_push_count(int graphics, int used)
@@ -62,9 +63,12 @@ static void build_layout(BD12RootSignature *rs)
     uint64_t h = 1469598103934665603ull;
     /* Descriptor-buffer heaps (bd12_heapdb.c) need the mutable-heap binding model. */
     layout->heap_model = rs->device && rs->device->db ? BEER_HEAP_MODEL_MUTABLE : BEER_HEAP_MODEL_CLASSES;
+    layout->accel_in_heap = layout->heap_model == BEER_HEAP_MODEL_MUTABLE && bd12_db_accel_in_heap(rs->device);
     {
-        const uint32_t model[2] = { 0x6d6f646cu, layout->heap_model };
-        h = fnv_words(h, model, 2);
+        /* accel_in_heap joins the hash only when set, so layouts without it keep their hash (and the on-disk
+         * translations made before it existed). */
+        const uint32_t model[3] = { 0x6d6f646cu, layout->heap_model, layout->accel_in_heap };
+        h = fnv_words(h, model, layout->accel_in_heap ? 3 : 2);
     }
     layout->param_count = rs->parameter_count;
     for (uint32_t i = 0; i < rs->parameter_count; ++i) {
@@ -157,6 +161,16 @@ static void build_push(BD12CmdList *list, const BD12BindState *state, uint8_t *o
             if (heap && arg->value >= heap->gpu_base &&
                 arg->value < heap->gpu_base + (uint64_t)heap->count * BD12_DESCRIPTOR_INCREMENT)
                 words[p->push_index] = (uint32_t)((arg->value - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT);
+            else if (rp_trace_hash()) {   /* BEER_BD12_TRACE_CS diagnostics: tables left unset (pushed as index 0) */
+                static int logged;
+                if (logged < 12) {
+                    ++logged;
+                    fprintf(stderr, "[BD12] root push: table param %u handle 0x%llx outside the bound %s heap "
+                            "(%p base 0x%llx, %u descriptors)\n", i, (unsigned long long)arg->value,
+                            samplers ? "sampler" : "resource", (const void *)heap,
+                            heap ? (unsigned long long)heap->gpu_base : 0ull, heap ? heap->count : 0u);
+                }
+            }
             break;
         }
         case BEER_ROOT_CONSTANTS:
@@ -197,7 +211,94 @@ int bd12_cmd_push_root_arguments(BD12CmdList *list, BD12BindState *state, VkPipe
         return 1;
     list->device->vk.CmdPushConstants(list->command_buffer, layout, stages, 0, push_bytes, block);
     memcpy(list->root_push_last[which], block, push_bytes);
+    /* The push-constant store is shared by all bind points: the other point's cached block was just overwritten.
+     * (Skipping a push because only this point's cache matched made RE8's SM 6.5 compute shaders read the graphics or
+     * per-draw pipeline's constants as heap indices: wrong buffers written, overexposure, GPU hangs.) */
+    list->root_push_key[!which] = 0;
     list->root_push_key[which] = key;
     list->root_push_size[which] = push_bytes;
     return 1;
+}
+
+/* BEER_BD12_TRACE_CS=<16-digit hash> (diagnostic): for root-push dispatches of that compute shader, each descriptor
+ * table's first descriptor is logged when the dispatch is recorded and compared again when its command list is
+ * submitted. Root push reads heap descriptors when the GPU runs; the per-draw path copies them at recording. */
+typedef struct { const BD12CmdList *list; const BD12Descriptor *slot; BD12Descriptor snap; uint32_t param, index; } RpTrace;
+static RpTrace g_rp_trace[64];
+static uint32_t g_rp_trace_count, g_rp_trace_logged;
+static pthread_mutex_t g_rp_trace_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t rp_trace_hash(void)
+{
+    static uint64_t hash = 1;
+    if (hash == 1) { const char *v = getenv("BEER_BD12_TRACE_CS"); hash = v ? strtoull(v, NULL, 16) : 0; }
+    return hash;
+}
+
+static void rp_print(const char *what, uint32_t param, uint32_t index, const BD12Descriptor *d)
+{
+    fprintf(stderr, "[RPTRACE] %s param %u slot %u: kind %d va 0x%llx offset %llu range %llu format %d serial %llu\n",
+            what, param, index, (int)d->kind,
+            d->source_buffer ? (unsigned long long)d->source_buffer->va : 0ull, (unsigned long long)d->offset,
+            (unsigned long long)d->range, (int)d->format, (unsigned long long)d->buffer_serial);
+}
+
+void bd12_rp_trace_record(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash)
+{
+    if (!shader_hash || shader_hash != rp_trace_hash() || !state->root_signature || !state->root_signature->root_layout)
+        return;
+    const BeerD3D12RootLayout *layout = state->root_signature->root_layout;
+    pthread_mutex_lock(&g_rp_trace_lock);
+    {
+        static const BeerD3D12RootLayout *printed;
+        if (printed != layout) {
+            printed = layout;
+            fprintf(stderr, "[RPTRACE] layout: %u params, %u root descriptors, %u words\n", layout->param_count,
+                    layout->descriptor_count, layout->word_count);
+            for (uint32_t i = 0; i < layout->param_count; ++i) {
+                const BeerD3D12RootParam *p = &layout->params[i];
+                fprintf(stderr, "[RPTRACE]   param %u type %u vis %u reg %u space %u push %u:", i, p->type, p->visibility,
+                        p->shader_register, p->space, p->push_index);
+                for (uint32_t r = 0; r < p->range_count; ++r)
+                    fprintf(stderr, " [t%u b%u n%u s%u o%u]", p->ranges[r].type, p->ranges[r].base_register,
+                            p->ranges[r].count, p->ranges[r].space, p->ranges[r].offset);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+    for (uint32_t i = 0; i < layout->param_count; ++i) {
+        const BeerD3D12RootParam *p = &layout->params[i];
+        if (p->type != BEER_ROOT_TABLE || !p->range_count) continue;
+        const int samplers = p->ranges[0].type == BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER;
+        const BD12DescriptorHeap *heap = list->heaps[samplers ? 1 : 0];
+        const uint64_t v = state->arguments[i].value;
+        if (!heap || v < heap->gpu_base || v >= heap->gpu_base + (uint64_t)heap->count * BD12_DESCRIPTOR_INCREMENT) {
+            if (g_rp_trace_logged < 400) { ++g_rp_trace_logged; fprintf(stderr, "[RPTRACE] record param %u: handle 0x%llx not in the bound heap\n", i, (unsigned long long)v); }
+            continue;
+        }
+        const uint32_t index = (uint32_t)((v - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT) + p->ranges[0].offset;
+        if (index >= heap->count) continue;
+        const BD12Descriptor *slot = &heap->descriptors[index];
+        if (g_rp_trace_logged < 400) { ++g_rp_trace_logged; rp_print("record", i, index, slot); }
+        if (g_rp_trace_count < 64) g_rp_trace[g_rp_trace_count++] = (RpTrace){ list, slot, *slot, i, index };
+    }
+    pthread_mutex_unlock(&g_rp_trace_lock);
+}
+
+void bd12_rp_trace_submit(const BD12CmdList *list)
+{
+    if (!rp_trace_hash()) return;
+    pthread_mutex_lock(&g_rp_trace_lock);
+    for (uint32_t i = 0; i < g_rp_trace_count; ) {
+        RpTrace *e = &g_rp_trace[i];
+        if (e->list != list) { ++i; continue; }
+        const int changed = memcmp(e->slot, &e->snap, sizeof(e->snap)) != 0;
+        if (g_rp_trace_logged < 400) {
+            ++g_rp_trace_logged;
+            if (changed) rp_print("submit CHANGED", e->param, e->index, e->slot);
+            else fprintf(stderr, "[RPTRACE] submit same param %u slot %u\n", e->param, e->index);
+        }
+        g_rp_trace[i] = g_rp_trace[--g_rp_trace_count];
+    }
+    pthread_mutex_unlock(&g_rp_trace_lock);
 }

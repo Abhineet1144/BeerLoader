@@ -244,11 +244,12 @@ static void reg_seed_windows_version(void)
     reg_add_dword(nt, "currentminorversionnumber", 0);
     reg_add_sz(nt, "currentbuild", "19045");
     reg_add_sz(nt, "currentbuildnumber", "19045");
-    reg_add_dword(nt, "ubr", 0);
+    reg_add_dword(nt, "ubr", 5371);                     /* update revision: 19045.5371 (no real install has 0) */
     reg_add_sz(nt, "displayversion", "22H2");
     reg_add_sz(nt, "releaseid", "2009");
     reg_add_sz(nt, "buildlab", "19041.vb_release.191206-1406");
     reg_add_sz(nt, "buildlabex", "19041.1.amd64fre.vb_release.191206-1406");
+    reg_add_sz(nt, "lcuver", "10.0.19041.5371");
     reg_add_sz(nt, "currenttype", "Multiprocessor Free");
     reg_add_sz(nt, "systemroot", "C:\\Windows");
     reg_add_sz(nt, "pathname", "C:\\Windows");

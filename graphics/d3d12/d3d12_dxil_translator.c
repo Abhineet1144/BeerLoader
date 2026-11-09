@@ -382,7 +382,30 @@ static int is_buffer_kind(const dxil_spv_d3d_binding *d)
 /* SRV (uav = 0) or UAV (uav = 1) in root-signature mode. */
 static dxil_spv_bool rs_resource(Collect *c, const dxil_spv_d3d_binding *d, int uav, dxil_spv_vulkan_binding *out)
 {
-    if (d->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE) { c->failed = 1; return DXIL_SPV_FALSE; }
+    if (d->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE) {
+        /* Inline ray queries: a TLAS passed as a root SRV is its GPU address, and BD12 places every acceleration
+         * structure at exactly that address (bd12_raytracing.c), so the shader converts the pushed address
+         * (OpConvertUToAccelerationStructureKHR). A TLAS in a descriptor table still takes the per-draw path. */
+        const BeerD3D12RootRange *range;
+        const BeerD3D12RootParam *p = rs_find(c, BEER_D3D12_SHADER_DESCRIPTOR_SRV, d, &range);
+        if (p && p->type == BEER_ROOT_TABLE && !uav && c->rl->heap_model == BEER_HEAP_MODEL_MUTABLE &&
+            c->rl->accel_in_heap) {   /* a TLAS SRV in a table: the mutable heap holds its AS descriptor */
+            rs_heap(c, out, 0, p->push_index, range->offset + (d->register_index - range->base_register),
+                    DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY);
+            return DXIL_SPV_TRUE;
+        }
+        if (!p || p->type == BEER_ROOT_TABLE || uav) {
+            static int logged;
+            if (logged++ < 3) fprintf(stderr, "[DXIL] ray-query TLAS in a %s: per-draw descriptors\n",
+                                      p ? "descriptor table" : "root signature without it");
+            c->failed = 1;
+            return DXIL_SPV_FALSE;
+        }
+        memset(out, 0, sizeof(*out));
+        out->root_constant_index = p->push_index;
+        out->descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_BUFFER_DEVICE_ADDRESS;
+        return DXIL_SPV_TRUE;
+    }
     const uint32_t heap_class = (is_buffer_kind(d) ? 2u : 0u) + (uav ? 1u : 0u);
     const dxil_spv_vulkan_descriptor_type type = untyped_buffer(d) ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER
                                                                    : DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;

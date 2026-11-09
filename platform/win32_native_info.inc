@@ -1082,6 +1082,14 @@ static u64 __attribute__((ms_abi)) impl_console_invalid_handle(void)
     g_last_error = 6;
     return 0;
 }
+/* GenerateConsoleCtrlEvent(event, process_group): the event goes to the processes sharing the caller's console.
+ * Beer processes have no console, so it fails as it does on Windows for a process without one. */
+static u64 __attribute__((ms_abi)) impl_GenerateConsoleCtrlEvent(u32 event, u32 process_group)
+{
+    (void)event; (void)process_group;
+    g_last_error = 6;                                    /* ERROR_INVALID_HANDLE: no console */
+    return 0;
+}
 /* A handler can be registered; with no console, no control event is ever delivered to it. */
 static u64 __attribute__((ms_abi)) impl_SetConsoleCtrlHandler(u64 handler, u32 add)
 {

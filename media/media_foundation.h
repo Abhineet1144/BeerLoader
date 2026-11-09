@@ -30,6 +30,13 @@ void beer_mf_set_worker_starter(BeerMfWorkerStartFn start);
 
 uint64_t __attribute__((ms_abi)) beer_mf_startup(uint32_t version, uint32_t flags);
 uint64_t __attribute__((ms_abi)) beer_mf_shutdown(void);
+/* MFTEnumEx / MFTEnum: Media Foundation transform enumeration. Beer registers no MFTs (decoding goes through the
+ * source reader), so every query succeeds with an empty list. */
+uint64_t __attribute__((ms_abi)) beer_mf_tenum_ex(const void *category, uint32_t flags, const void *input_type,
+                                                  const void *output_type, void ***activates, uint32_t *count);
+uint64_t __attribute__((ms_abi)) beer_mf_tenum(const void *category, uint32_t flags, const void *input_type,
+                                               const void *output_type, const void *attributes, void **clsids,
+                                               uint32_t *count);
 uint64_t __attribute__((ms_abi)) beer_mf_create_dxgi_device_manager(
     uint32_t *reset_token, void **manager);
 uint64_t __attribute__((ms_abi)) beer_mf_create_attributes(

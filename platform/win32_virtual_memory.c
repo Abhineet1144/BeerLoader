@@ -490,6 +490,13 @@ static int query_proc_map(uintptr_t address, uintptr_t *start, uintptr_t *end,
     return found;
 }
 
+static BeerImageLookup g_image_lookup;
+
+void beer_virtual_set_image_lookup(BeerImageLookup lookup)
+{
+    g_image_lookup = lookup;
+}
+
 size_t beer_virtual_query(const void *address, BeerMemoryBasicInformation *info,
                           size_t info_size)
 {
@@ -536,6 +543,19 @@ size_t beer_virtual_query(const void *address, BeerMemoryBasicInformation *info,
         info->allocation_protect = info->protect;
     }
     pthread_mutex_unlock(&g_allocation_mutex);
+    /* Pages of a loaded image: MEM_IMAGE, one allocation from the image base (created PAGE_EXECUTE_WRITECOPY), and
+     * no region past the image end. Integrity checks compare these against their own module. */
+    uintptr_t image_base = 0;
+    size_t image_size = 0;
+    if (g_image_lookup && g_image_lookup(value, &image_base, &image_size) && image_size &&
+        value - image_base < image_size) {
+        info->type = BEER_MEM_IMAGE;
+        info->allocation_base = image_base;
+        info->allocation_protect = BEER_PAGE_EXECUTE_WRITECOPY;
+        const uintptr_t image_end = image_base + image_size;
+        if (info->base_address + info->region_size > image_end)
+            info->region_size = image_end - info->base_address;
+    }
     return sizeof(*info);
 }
 

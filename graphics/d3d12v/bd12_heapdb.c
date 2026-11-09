@@ -30,11 +30,14 @@
 #define SAMPLER_SLOTS 2048u                     /* D3D12 sampler heap limit */
 #define MAX_STATIC 64u
 
-enum { T_SAMPLED, T_STORAGE_IMAGE, T_UNIFORM_TEXEL, T_STORAGE_TEXEL, T_UBO, T_SSBO, T_COUNT };
+/* T_ACCEL is last: it joins the mutable type list only with ray tracing on and a driver that accepts it
+ * (db->mutable_count), so heaps without it keep exactly the layout and stride they had before. */
+enum { T_SAMPLED, T_STORAGE_IMAGE, T_UNIFORM_TEXEL, T_STORAGE_TEXEL, T_UBO, T_SSBO, T_ACCEL, T_COUNT };
 static const VkDescriptorType k_mutable_types[T_COUNT] = {
     VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
     VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
-    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+    VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
 };
 
 typedef struct BD12DbLayout {
@@ -52,6 +55,7 @@ struct BD12DescriptorBuffers {
     PFN_vkCmdSetDescriptorBufferOffsetsEXT CmdSetOffsets;
     PFN_vkCmdBindDescriptorBufferEmbeddedSamplersEXT CmdBindEmbedded;
     uint32_t type_size[T_COUNT];
+    uint32_t mutable_count;       /* entries of k_mutable_types in the heap's mutable list (T_ACCEL or T_SSBO + 1) */
     uint32_t sampler_size;
     uint32_t resource_stride, sampler_stride;
     VkDeviceSize resource_offset, sampler_offset;   /* binding 0 within its set */
@@ -284,7 +288,7 @@ int bd12_heapdb_heap_destroy(BD12DescriptorHeap *heap)
 
 static uint32_t type_size(const struct BD12DescriptorBuffers *db, VkDescriptorType type)
 {
-    for (uint32_t i = 0; i < T_COUNT; ++i)
+    for (uint32_t i = 0; i < db->mutable_count; ++i)
         if (k_mutable_types[i] == type) return db->type_size[i];
     return type == VK_DESCRIPTOR_TYPE_SAMPLER ? db->sampler_size : 0;
 }
@@ -385,6 +389,10 @@ static void encode(BD12Device *device, const BD12Descriptor *d, VkDescriptorType
         };
         info.data.pUniformBuffer = &address;
         break;
+    case BD12_DESC_SRV_AS:           /* a TLAS SRV: `offset` is the structure's GPU address (bd12_raytracing.c) */
+        info.type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        info.data.accelerationStructure = d->offset;
+        break;
     case BD12_DESC_SAMPLER:
         info.type = VK_DESCRIPTOR_TYPE_SAMPLER;
         if (d->sampler) info.data.pSampler = &d->sampler;
@@ -443,15 +451,28 @@ void bd12_heap_copied(const void *dst, const void *src, uint32_t count)
 
 /* Layouts --------------------------------------------------------------------------------------------------------- */
 
+static VkDescriptorSetLayout heap_set_layout_flags(BD12Device *device, int samplers, uint32_t count,
+                                                   VkDescriptorBindingFlags flags);
+
+/* The heap array (binding 0, the set's last binding) is variable-count: a bound descriptor heap is often smaller than
+ * the layout's maximum, and a fixed count would describe descriptors past the end of the bound descriptor buffer
+ * (VUID-vkCmdSetDescriptorBufferOffsetsEXT-pOffsets-08063; RE8 crashed in the NVIDIA driver's vkCmdDispatch). */
 static VkDescriptorSetLayout heap_set_layout(BD12Device *device, int samplers, uint32_t count)
 {
-    const VkMutableDescriptorTypeListEXT list = { T_COUNT, k_mutable_types };
+    VkDescriptorSetLayout layout = heap_set_layout_flags(device, samplers, count,
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT);
+    return layout ? layout : heap_set_layout_flags(device, samplers, count, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+}
+
+static VkDescriptorSetLayout heap_set_layout_flags(BD12Device *device, int samplers, uint32_t count,
+                                                   VkDescriptorBindingFlags flags)
+{
+    const VkMutableDescriptorTypeListEXT list = { device->db->mutable_count, k_mutable_types };
     const VkMutableDescriptorTypeCreateInfoEXT mutable_info = {
         .sType = VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT,
         .mutableDescriptorTypeListCount = 1,
         .pMutableDescriptorTypeLists = &list
     };
-    const VkDescriptorBindingFlags flags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     const VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
         .pNext = samplers ? NULL : &mutable_info,
@@ -580,6 +601,12 @@ VkShaderStageFlags bd12_db_push_stages(const BD12Device *device)
     return device && device->db ? device->db->push_stages : 0;
 }
 
+/* Heap descriptors can be acceleration structures: root-signature shaders read a TLAS straight from the heap. */
+int bd12_db_accel_in_heap(const BD12Device *device)
+{
+    return device && device->db && device->db->mutable_count == T_COUNT;
+}
+
 /* Recording ------------------------------------------------------------------------------------------------------- */
 
 void bd12_cmd_invalidate_point(BD12CmdList *list, int which)
@@ -697,6 +724,8 @@ void bd12_db_init(BD12Device *device)
     db->type_size[T_SSBO] = (uint32_t)(robust ? props.robustStorageBufferDescriptorSize
                                               : props.storageBufferDescriptorSize);
     db->sampler_size = (uint32_t)props.samplerDescriptorSize;
+    db->type_size[T_ACCEL] = (uint32_t)props.accelerationStructureDescriptorSize;
+    db->mutable_count = device->rt_enabled && db->type_size[T_ACCEL] ? T_COUNT : T_ACCEL;
     db->offset_alignment = props.descriptorBufferOffsetAlignment;
     db->max_texel_elements = properties.properties.limits.maxTexelBufferElements;
     db->null_descriptor = device->modern->null_descriptor;
@@ -708,6 +737,10 @@ void bd12_db_init(BD12Device *device)
     pthread_mutex_init(&db->pending_lock, NULL);
     device->db = db;   /* heap_set_layout and the dummy heaps read it */
     db->resource_layout = heap_set_layout(device, 0, HEAP_SLOTS);
+    if (!db->resource_layout && db->mutable_count == T_COUNT) {   /* the driver refuses AS in a mutable list */
+        db->mutable_count = T_ACCEL;
+        db->resource_layout = heap_set_layout(device, 0, HEAP_SLOTS);
+    }
     db->sampler_layout = heap_set_layout(device, 1, SAMPLER_SLOTS);
     if (!db->resource_layout || !db->sampler_layout) goto fail;
     VkDeviceSize resource_size = 0, sampler_size = 0;
@@ -719,13 +752,14 @@ void bd12_db_init(BD12Device *device)
     db->resource_stride = (uint32_t)((resource_size - db->resource_offset) / HEAP_SLOTS);
     db->sampler_stride = (uint32_t)((sampler_size - db->sampler_offset) / SAMPLER_SLOTS);
     uint32_t largest = 0;
-    for (uint32_t i = 0; i < T_COUNT; ++i) if (db->type_size[i] > largest) largest = db->type_size[i];
+    for (uint32_t i = 0; i < db->mutable_count; ++i) if (db->type_size[i] > largest) largest = db->type_size[i];
     if (!db->resource_stride || db->resource_stride < largest || db->sampler_stride < db->sampler_size) goto fail;
     db->dummy[0] = bd12_descriptor_heap_create_ex(device, 0, 1, BD12_HEAP_FLAG_SHADER_VISIBLE);
     db->dummy[1] = bd12_descriptor_heap_create_ex(device, 1, 1, BD12_HEAP_FLAG_SHADER_VISIBLE);
     if (!db->dummy[0] || !db->dummy[0]->db_buffer || !db->dummy[1] || !db->dummy[1]->db_buffer) goto fail;
     fprintf(stderr, "[BD12] descriptor heaps are descriptor buffers (resource stride %u, sampler stride %u, "
-            "null descriptors %d)\n", db->resource_stride, db->sampler_stride, db->null_descriptor);
+            "null descriptors %d, acceleration structures %d)\n", db->resource_stride, db->sampler_stride,
+            db->null_descriptor, db->mutable_count == T_COUNT);
     return;
 fail:
     fprintf(stderr, "[BD12] descriptor buffers unusable: root signatures use the descriptor-set heap\n");

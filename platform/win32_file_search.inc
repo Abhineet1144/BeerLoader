@@ -893,6 +893,33 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxA(u64 owner, const char *text,
     touch_trace_disarm();
     fprintf(stderr, "[MSGBOX] \"%s\": %s\n", title ? title : "", text ? text : "");
     beer_log_guest_stack("MSGBOX");
+    /* BEER_DUMP_AT_MESSAGEBOX=<dir> (diagnostic): the caller's code (return address -0x1000..+0x400) and the guest
+     * stack (saved RSP..+0x4000) as files, for code that is only decrypted at run time. */
+    {
+        const char *dir = getenv("BEER_DUMP_AT_MESSAGEBOX");
+        if (dir && *dir) {
+            const u64 ret = g_dispatch_incoming_return, rsp = g_saved_guest_rsp;
+            fprintf(stderr, "[MSGBOX] caller return=0x%llx guest rsp=0x%llx\n", (unsigned long long)ret,
+                    (unsigned long long)rsp);
+            const struct { const char *name; u64 start, size; } parts[2] = {
+                { "code", ret - 0x1000, 0x1400 }, { "stack", rsp, 0x4000 } };
+            for (int k = 0; k < 2; ++k) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/msgbox_%s_%llx.bin", dir, parts[k].name,
+                         (unsigned long long)parts[k].start);
+                FILE *f = fopen(path, "wb");
+                if (!f) continue;
+                u8 buffer[4096];
+                for (u64 off = 0; off < parts[k].size; off += sizeof(buffer)) {
+                    struct iovec local = { buffer, sizeof(buffer) }, remote = { (void *)(uintptr_t)(parts[k].start + off), sizeof(buffer) };
+                    const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+                    if (got <= 0) memset(buffer, 0, sizeof(buffer));
+                    fwrite(buffer, 1, sizeof(buffer), f);
+                }
+                fclose(f);
+            }
+        }
+    }
     int chosen = beer_message_box_dialog(title, text, type);
     return chosen >= 0 ? (u64)chosen : beer_message_box_result(type);
 }

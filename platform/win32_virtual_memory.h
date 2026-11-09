@@ -11,6 +11,7 @@
 #define BEER_MEM_FREE        UINT32_C(0x00010000)
 #define BEER_MEM_PRIVATE     UINT32_C(0x00020000)
 #define BEER_MEM_MAPPED      UINT32_C(0x00040000)
+#define BEER_MEM_IMAGE       UINT32_C(0x01000000)
 
 #define BEER_PAGE_NOACCESS          UINT32_C(0x01)
 #define BEER_PAGE_READONLY          UINT32_C(0x02)
@@ -18,6 +19,7 @@
 #define BEER_PAGE_EXECUTE           UINT32_C(0x10)
 #define BEER_PAGE_EXECUTE_READ      UINT32_C(0x20)
 #define BEER_PAGE_EXECUTE_READWRITE UINT32_C(0x40)
+#define BEER_PAGE_EXECUTE_WRITECOPY UINT32_C(0x80)
 
 /* Windows AMD64 MEMORY_BASIC_INFORMATION layout (48 bytes). */
 typedef struct BeerMemoryBasicInformation {
@@ -37,6 +39,10 @@ void *beer_virtual_alloc(void *address, size_t size, uint32_t allocation_type,
 void *beer_virtual_alloc_aligned(size_t size, size_t alignment, uint32_t allocation_type,
                                  uint32_t protection);
 int beer_virtual_free(void *address, size_t size, uint32_t free_type);
+/* Loaded PE images (the executable and guest DLLs): returns 1 and the image range when `address` is inside one.
+ * VirtualQuery reports such pages as MEM_IMAGE with the image base as AllocationBase, as Windows does. */
+typedef int (*BeerImageLookup)(uintptr_t address, uintptr_t *base, size_t *size);
+void beer_virtual_set_image_lookup(BeerImageLookup lookup);
 int beer_virtual_protect(void *address, size_t size, uint32_t new_protection,
                          uint32_t *old_protection);
 /* BaseAddress is the requested address rounded DOWN to a page. RegionSize

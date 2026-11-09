@@ -24,6 +24,37 @@ typedef XID Atom;
 typedef XID Pixmap;
 typedef XID Cursor;
 typedef int Bool;
+typedef XID Colormap;
+
+/* Exact Xlib layouts for the ARGB secondary surfaces (layered popup windows). */
+typedef struct {
+    Visual *visual;
+    unsigned long visualid;
+    int screen, depth, class_;
+    unsigned long red_mask, green_mask, blue_mask;
+    int colormap_size, bits_per_rgb;
+} XVisualInfoLocal;
+typedef struct {
+    Pixmap background_pixmap;
+    unsigned long background_pixel;
+    Pixmap border_pixmap;
+    unsigned long border_pixel;
+    int bit_gravity, win_gravity, backing_store;
+    unsigned long backing_planes, backing_pixel;
+    Bool save_under;
+    long event_mask, do_not_propagate_mask;
+    Bool override_redirect;
+    Colormap colormap;
+    Cursor cursor;
+} XSetWindowAttributesLocal;
+typedef struct {
+    int type;
+    unsigned long serial;
+    Bool send_event;
+    Display *display;
+    Window window;
+} XAnyEventLocal;
+#define BEER_X11_MAX_SURFACES 16
 
 typedef union {
     int type;
@@ -222,6 +253,22 @@ typedef struct {
                        Cursor, unsigned long);
     int (*UngrabPointer)(Display *, unsigned long);
     int (*TranslateCoordinates)(Display *, Window, Window, int, int, int *, int *, Window *);
+    int (*MatchVisualInfo)(Display *, int, int, int, XVisualInfoLocal *);
+    Colormap (*CreateColormap)(Display *, Window, Visual *, int);
+    int (*FreeColormap)(Display *, Colormap);
+    Window (*CreateWindow)(Display *, Window, int, int, unsigned int, unsigned int, unsigned int, int, unsigned int,
+                           Visual *, unsigned long, XSetWindowAttributesLocal *);
+    GC (*CreateGC)(Display *, XID, unsigned long, void *);
+    int (*FreeGC)(Display *, GC);
+    /* Secondary surfaces: ARGB override-redirect windows for layered popups (UpdateLayeredWindow). id = index + 1. */
+    struct {
+        Window window;
+        Colormap colormap;
+        GC gc;
+        Visual *visual;
+        int x, y, width, height, mapped;
+        uint32_t *pixels;          /* last content, repainted on Expose */
+    } surfaces[BEER_X11_MAX_SURFACES];
     int pointer_confine_wanted;   /* ClipCursor active */
     int win_decorated;            /* last set_style */
     int focused;
@@ -339,6 +386,12 @@ static int initialize_locked(void)
     X11_LOAD(FreeEventData, "XFreeEventData");
     X11_LOAD(UngrabPointer, "XUngrabPointer");
     X11_LOAD(TranslateCoordinates, "XTranslateCoordinates");
+    X11_LOAD(MatchVisualInfo, "XMatchVisualInfo");
+    X11_LOAD(CreateColormap, "XCreateColormap");
+    X11_LOAD(FreeColormap, "XFreeColormap");
+    X11_LOAD(CreateWindow, "XCreateWindow");
+    X11_LOAD(CreateGC, "XCreateGC");
+    X11_LOAD(FreeGC, "XFreeGC");
 
     g_x11.InitThreads();
     g_x11.SetErrorHandler(beer_x_error_handler);
@@ -1226,6 +1279,119 @@ int xwayland_get_screen_refresh(void)
     return hz;
 }
 
+/* ---- Secondary surfaces ---- */
+
+static void surface_repaint_locked(int id)
+{
+    if (id < 1 || id > BEER_X11_MAX_SURFACES) return;
+    __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
+    if (!s->window || !s->pixels || s->width <= 0 || s->height <= 0) return;
+    const size_t bytes = (size_t)s->width * (size_t)s->height * 4u;
+    char *copy = malloc(bytes);                  /* XDestroyImage frees the image data */
+    if (!copy) return;
+    memcpy(copy, s->pixels, bytes);
+    XImage *image = g_x11.CreateImage(g_x11.display, s->visual, 32, 2 /* ZPixmap */, 0, copy,
+                                      (unsigned)s->width, (unsigned)s->height, 32, s->width * 4);
+    if (!image) { free(copy); return; }
+    g_x11.PutImage(g_x11.display, s->window, s->gc, image, 0, 0, 0, 0, (unsigned)s->width, (unsigned)s->height);
+    g_x11.DestroyImage(image);
+}
+
+int xwayland_surface_create(int x, int y, int width, int height)
+{
+    if (beer_headless() || width <= 0 || height <= 0) return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    int id = 0;
+    for (int i = 0; i < BEER_X11_MAX_SURFACES && !id; ++i)
+        if (!g_x11.surfaces[i].window) id = i + 1;
+    XVisualInfoLocal info;
+    memset(&info, 0, sizeof(info));
+    if (!id || !g_x11.display || !g_x11.MatchVisualInfo(g_x11.display, 0, 32, 4 /* TrueColor */, &info)) {
+        pthread_mutex_unlock(&g_x11.lock);
+        return 0;
+    }
+    __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
+    const Window root = g_x11.DefaultRootWindow(g_x11.display);
+    XSetWindowAttributesLocal attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.colormap = g_x11.CreateColormap(g_x11.display, root, info.visual, 0 /* AllocNone */);
+    attributes.override_redirect = 1;            /* a popup: placed by the game, no frame */
+    attributes.event_mask = (1L << 2) | (1L << 3) | (1L << 6) | (1L << 15);   /* buttons, motion, exposure */
+    const unsigned long mask = (1UL << 1) | (1UL << 3) | (1UL << 9) | (1UL << 11) | (1UL << 13);
+    s->window = g_x11.CreateWindow(g_x11.display, root, x, y, (unsigned)width, (unsigned)height, 0, 32,
+                                   1 /* InputOutput */, info.visual, mask, &attributes);
+    if (!s->window) {
+        g_x11.FreeColormap(g_x11.display, attributes.colormap);
+        pthread_mutex_unlock(&g_x11.lock);
+        return 0;
+    }
+    s->colormap = attributes.colormap;
+    s->visual = info.visual;
+    s->gc = g_x11.CreateGC(g_x11.display, s->window, 0, NULL);
+    s->x = x; s->y = y; s->width = width; s->height = height; s->mapped = 0;
+    s->pixels = calloc((size_t)width * (size_t)height, 4);
+    g_x11.Flush(g_x11.display);
+    pthread_mutex_unlock(&g_x11.lock);
+    fprintf(stderr, "[XWAYLAND] secondary surface %d: %dx%d at %d,%d\n", id, width, height, x, y);
+    return id;
+}
+
+/* New position, size and (when pixels is not NULL) content: width x height premultiplied 0xAARRGGBB. */
+int xwayland_surface_update(int id, int x, int y, int width, int height, const uint32_t *pixels)
+{
+    if (beer_headless()) return 1;
+    if (id < 1 || id > BEER_X11_MAX_SURFACES || width <= 0 || height <= 0) return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
+    if (!s->window) { pthread_mutex_unlock(&g_x11.lock); return 0; }
+    if (x != s->x || y != s->y || width != s->width || height != s->height) {
+        g_x11.MoveResizeWindow(g_x11.display, s->window, x, y, (unsigned)width, (unsigned)height);
+        if (width != s->width || height != s->height) {
+            uint32_t *grown = calloc((size_t)width * (size_t)height, 4);
+            if (grown) { free(s->pixels); s->pixels = grown; }
+        }
+        s->x = x; s->y = y; s->width = width; s->height = height;
+    }
+    if (pixels && s->pixels) memcpy(s->pixels, pixels, (size_t)width * (size_t)height * 4u);
+    if (s->mapped) surface_repaint_locked(id);
+    g_x11.Flush(g_x11.display);
+    pthread_mutex_unlock(&g_x11.lock);
+    return 1;
+}
+
+int xwayland_surface_show(int id, int visible)
+{
+    if (beer_headless()) return 1;
+    if (id < 1 || id > BEER_X11_MAX_SURFACES) return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
+    if (s->window && !!visible != s->mapped) {
+        if (visible) g_x11.MapRaised(g_x11.display, s->window);
+        else g_x11.UnmapWindow(g_x11.display, s->window);
+        s->mapped = !!visible;
+        if (visible) surface_repaint_locked(id);
+        g_x11.Flush(g_x11.display);
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    return 1;
+}
+
+void xwayland_surface_destroy(int id)
+{
+    if (beer_headless() || id < 1 || id > BEER_X11_MAX_SURFACES) return;
+    pthread_mutex_lock(&g_x11.lock);
+    __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
+    if (s->window && g_x11.display) {
+        if (s->gc) g_x11.FreeGC(g_x11.display, s->gc);
+        g_x11.DestroyWindow(g_x11.display, s->window);
+        if (s->colormap) g_x11.FreeColormap(g_x11.display, s->colormap);
+        g_x11.Flush(g_x11.display);
+    }
+    free(s->pixels);
+    memset(s, 0, sizeof(*s));
+    pthread_mutex_unlock(&g_x11.lock);
+}
+
 int xwayland_window_poll_event(XwaylandEvent *out)
 {
     if (beer_headless()) { (void)out; return 0; }
@@ -1248,6 +1414,32 @@ int xwayland_window_poll_event(XwaylandEvent *out)
     XEvent event;
     memset(&event, 0, sizeof(event));
     g_x11.NextEvent(g_x11.display, &event);
+    /* Pointer and expose events of a secondary surface: tagged with its id; everything else of it is ignored. */
+    if (event.type >= 4 && event.type <= 12 && ((XAnyEventLocal *)&event)->window != g_x11.window) {
+        const Window target = ((XAnyEventLocal *)&event)->window;
+        int id = 0;
+        for (int i = 0; i < BEER_X11_MAX_SURFACES && !id; ++i)
+            if (g_x11.surfaces[i].window && g_x11.surfaces[i].window == target) id = i + 1;
+        if (id && event.type == 12) surface_repaint_locked(id);
+        else if (id && (event.type == 4 || event.type == 5)) {
+            XButtonEvent *button = (XButtonEvent *)&event;
+            out->type = event.type == 4 ? XWAYLAND_EVENT_BUTTON_DOWN : XWAYLAND_EVENT_BUTTON_UP;
+            out->x = button->x; out->y = button->y;
+            out->root_x = button->x_root; out->root_y = button->y_root;
+            out->button = button->button;
+            out->state = button->state;
+            out->surface = id;
+        } else if (id && event.type == 6) {
+            XMotionEvent *motion = (XMotionEvent *)&event;
+            out->type = XWAYLAND_EVENT_POINTER_MOTION;
+            out->x = motion->x; out->y = motion->y;
+            out->root_x = motion->x_root; out->root_y = motion->y_root;
+            out->state = motion->state;
+            out->surface = id;
+        }
+        pthread_mutex_unlock(&g_x11.lock);
+        return out->type != XWAYLAND_EVENT_NONE;
+    }
     switch (event.type) {
         case 2:
         case 3: {

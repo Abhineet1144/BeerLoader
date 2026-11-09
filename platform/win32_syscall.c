@@ -522,6 +522,34 @@ static void beer_win32_syscall_signal(int sig, siginfo_t *info, void *context)
             if (service) {
                 service->reported = 1;
                 trace_object_name(service->name, regs, line, sizeof(line));
+                /* NtProtectVirtualMemory(process, &base, &size, protect, &old): the values behind the pointers. */
+                if (g_trace && !strcmp(service->name, "NtProtectVirtualMemory") && regs[REG_RDX] && regs[REG_R8]) {
+                    const uint64_t base = *(const uint64_t *)(uintptr_t)regs[REG_RDX];
+                    const uint64_t size = *(const uint64_t *)(uintptr_t)regs[REG_R8];
+                    const uint32_t old = stack[0] ? *(const uint32_t *)(uintptr_t)stack[0] : 0;
+                    length = snprintf(line, sizeof(line), "[SYSCALL]   base=%llx size=%llx old=0x%x\n",
+                                      (unsigned long long)base, (unsigned long long)size, old);
+                    if (length > 0) (void)!write(2, line, (size_t)length);
+                }
+                /* Query results and affinity arguments, as hex (diagnostic). */
+                const char *nm = service->name;
+                const uint8_t *buffer = NULL;
+                size_t bytes = 0;
+                if (status == 0 && !strcmp(nm, "NtQuerySystemInformation")) {
+                    buffer = (const uint8_t *)(uintptr_t)regs[REG_RDX]; bytes = (size_t)regs[REG_R8];
+                } else if (status == 0 && (!strcmp(nm, "NtQueryInformationProcess") || !strcmp(nm, "NtQueryInformationThread"))) {
+                    buffer = (const uint8_t *)(uintptr_t)regs[REG_R8]; bytes = (size_t)regs[REG_R9];
+                } else if (!strcmp(nm, "NtSetInformationThread") || !strcmp(nm, "NtDelayExecution")) {
+                    buffer = (const uint8_t *)(uintptr_t)(nm[2] == 'S' ? regs[REG_R8] : regs[REG_RDX]); bytes = 8;
+                }
+                if (g_trace && buffer) {
+                    if (bytes > 64) bytes = 64;
+                    int used = snprintf(line, sizeof(line), "[SYSCALL]   data:");
+                    for (size_t i = 0; i < bytes && used < (int)sizeof(line) - 4; ++i)
+                        used += snprintf(line + used, sizeof(line) - (size_t)used, "%s%02x", (i % 8) ? "" : " ", buffer[i]);
+                    used += snprintf(line + used, sizeof(line) - (size_t)used, "\n");
+                    (void)!write(2, line, (size_t)used);
+                }
             }
         }
     }

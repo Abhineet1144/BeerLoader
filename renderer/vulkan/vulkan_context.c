@@ -758,6 +758,9 @@ int beer_vulkan_context_initialize(void)
         v11_enabled.shaderDrawParameters = v11_supported.shaderDrawParameters;
         v12_enabled.shaderSubgroupExtendedTypes = s12->shaderSubgroupExtendedTypes;
         v12_enabled.samplerFilterMinmax = s12->samplerFilterMinmax;
+        /* Layer / viewport index written from vertex and domain shaders (D3D12 VPAndRTArrayIndexFromAnyShader...). */
+        v12_enabled.shaderOutputViewportIndex = s12->shaderOutputViewportIndex;
+        v12_enabled.shaderOutputLayer = s12->shaderOutputLayer;
         v11_enabled.storageBuffer16BitAccess = v11_supported.storageBuffer16BitAccess;
         v11_enabled.uniformAndStorageBuffer16BitAccess = v11_supported.uniformAndStorageBuffer16BitAccess;
         v13_enabled.synchronization2 = s13->synchronization2;

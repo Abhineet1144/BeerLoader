@@ -212,6 +212,15 @@ static u64 __attribute__((ms_abi)) impl_CreateIconFromResource(const u8 *bits, u
     return 0;
 }
 
+/* CreateIconFromResourceEx(bits, size, icon, version, cx, cy, flags): the same as CreateIconFromResource with a
+ * size and flags. Not supported either. */
+static u64 __attribute__((ms_abi)) impl_CreateIconFromResourceEx(const u8 *bits, u32 size, u32 icon, u32 version,
+                                                                  s32 cx, s32 cy, u32 flags)
+{
+    (void)cx; (void)cy; (void)flags;
+    return impl_CreateIconFromResource(bits, size, icon, version);
+}
+
 /* Dialog templates are not supported; no dialog windows or their controls exist. */
 static u64 __attribute__((ms_abi)) impl_DialogBoxIndirectParamW(u64 instance, const void *dialog_template, u64 parent,
                                                                  u64 dialog_proc, u64 init_param)
@@ -366,6 +375,7 @@ static u64 __attribute__((ms_abi)) impl_ToUnicode(u32 vk, u32 scan, const u8 *st
     {"InsertMenuW",                 (ImplFn)impl_menu_invalid}, \
     {"TrackPopupMenu",              (ImplFn)impl_menu_invalid}, \
     {"CreateIconFromResource",      (ImplFn)impl_CreateIconFromResource}, \
+    {"CreateIconFromResourceEx",    (ImplFn)impl_CreateIconFromResourceEx}, \
     {"DialogBoxIndirectParamW",     (ImplFn)impl_DialogBoxIndirectParamW}, \
     {"EndDialog",                   (ImplFn)impl_EndDialog}, \
     {"GetDlgItem",                  (ImplFn)impl_GetDlgItem}, \

@@ -21,6 +21,9 @@ uint64_t GDI_MS beer_LoadImageW(uint64_t instance, uint64_t name, uint32_t type,
                                 uint32_t flags);
 uint64_t GDI_MS beer_LoadImageA(uint64_t instance, uint64_t name, uint32_t type, int cx, int cy,
                                 uint32_t flags);
+/* Pixels of the bitmap selected into a DC, top-down 0xAARRGGBB (see win32_gdi.c). Not a Win32 export. */
+int beer_gdi_dc_surface(uint64_t dc, uint8_t **bits, int *width, int *height, int *stride, int *bpp, int *topdown);
+int beer_gdi_read_dc_argb(uint64_t dc, int src_x, int src_y, int width, int height, uint32_t *out, int *has_alpha);
 int GDI_MS beer_FillRect(uint64_t dc, const int32_t *rect, uint64_t brush);
 int GDI_MS beer_DrawTextW(uint64_t dc, const uint16_t *text, int count, int32_t *rect, uint32_t format);
 int GDI_MS beer_DrawTextA(uint64_t dc, const char *text, int count, int32_t *rect, uint32_t format);

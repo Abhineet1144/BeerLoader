@@ -363,7 +363,7 @@ static const BD12Descriptor *table_descriptor(BD12CmdList *list,
 {
     if (run) *run = 0;
     BD12DescriptorHeap *heap = list->heaps[type == BD12_RANGE_SAMPLER ? 1 : 0];
-    if (!heap || handle < heap->gpu_base ||
+    if (!heap || !heap->descriptors || handle < heap->gpu_base ||
         handle >= heap->gpu_base + (uint64_t)heap->count * BD12_DESCRIPTOR_INCREMENT)
         return NULL;
     const uint32_t base = (uint32_t)((handle - heap->gpu_base) /
@@ -457,6 +457,13 @@ static void build_candidates(BD12ShaderBinding *b, const BD12RootSignature *rs)
 static void resolve_from_descriptor(const BD12Descriptor *d, Resolved *out, int want_view)
 {
     memset(out, 0, sizeof(*out));
+    if ((uintptr_t)d < 0x10000) {       /* a heap without descriptor storage: report once, act as a null descriptor */
+        static int reported;
+        if (!reported++)
+            fprintf(stderr, "[BD12] descriptor lookup produced %p (caller %p): treated as a null descriptor\n",
+                    (const void *)d, __builtin_return_address(0));
+        return;
+    }
     out->kind = d->kind;
     if (d->kind == BD12_DESC_SRV_AS) { out->as_va = d->offset; return; }
     /* A descriptor left behind by a destroyed resource acts as a null descriptor. */
@@ -633,7 +640,7 @@ static int resolve_array(BD12CmdList *list, BD12BindState *state, const BD12Shad
         }
         BD12DescriptorHeap *heap = list->heaps[0];
         const uint64_t handle = state->arguments[i].value;
-        if (!heap || handle < heap->gpu_base ||
+        if (!heap || !heap->descriptors || handle < heap->gpu_base ||
             handle >= heap->gpu_base + (uint64_t)heap->count * BD12_DESCRIPTOR_INCREMENT)
             continue;
         const uint32_t base = (uint32_t)((handle - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT);
@@ -861,6 +868,7 @@ static void record_dispatch(BD12CmdList *list, uint32_t x, uint32_t y,
     BD12DispatchFlight *entry =
         &list->dispatch_flight[sequence % BD12_FLIGHT_DISPATCHES];
     bd12_ckpt_mark(list, 100u + (indirect != 0), pso ? pso->shader_hash : 0, 0, x, y, z);
+    bd12_gpuprof_mark(list, 100u + (indirect != 0), pso ? pso->shader_hash : 0);
     *entry = (BD12DispatchFlight){
         .shader_hash = pso ? pso->shader_hash : 0,
         .x = x, .y = y, .z = z,
@@ -1043,6 +1051,7 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
             BD12_DROP(BD12_DROP_DISPATCH_NO_DESCRIPTORS);
             return 0;
         }
+        bd12_rp_trace_record(list, &list->compute, pso->shader_hash);
         record_dispatch(list, x, y, z, 0);
         list->device->vk.CmdDispatch(list->command_buffer, x, y, z);
         return 1;

@@ -52,6 +52,7 @@ typedef struct ComObj {
     uint32_t kind;
     ComDevice *dev;
     void (*destroy)(struct ComObj *);
+    struct ComPrivateData *private_data;   /* ID3D12Object::SetPrivateData entries (guarded by a global lock) */
 } ComObj;
 
 /* Deferred destruction: objects the GPU may still read are freed once the
@@ -68,6 +69,11 @@ typedef struct ComWaiter {
     ComObj *fence;
     uint64_t value;
     uint64_t event;
+    /* SetEventOnMultipleFenceCompletion: count > 0 replaces fence/value with these arrays; any = FLAG_ANY. */
+    uint32_t count;
+    int any;
+    ComObj **fences;
+    uint64_t *values;
 } ComWaiter;
 
 /* One Vulkan queue with its own retire timeline. Every submission takes the next device-wide serial and signals
@@ -181,6 +187,8 @@ typedef struct ComRootSig {
 typedef struct ComFence {
     ComObj obj;
     BD12Fence *fence;
+    uint32_t polls;              /* diagnostic (BEER_FENCE_DIAGNOSTICS): GetCompletedValue calls */
+    uint64_t last_signal;        /* diagnostic: the last value a queue or the CPU signalled */
 } ComFence;
 
 /* ID3D12StateObject (+ ID3D12StateObjectProperties as an embedded second interface). */

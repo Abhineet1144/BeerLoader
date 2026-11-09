@@ -45,6 +45,7 @@ typedef struct {
     unsigned long keysym;
     unsigned int button;
     unsigned int state;
+    int surface;          /* 0: the native window; otherwise the secondary surface (xwayland_surface_create) */
 } XwaylandEvent;
 
 typedef enum {
@@ -62,6 +63,11 @@ const char *xwayland_presenter_name(XwaylandPresenter presenter);
 int xwayland_window_create(int x, int y, int width, int height,
                            const char *title, int initially_visible);
 int xwayland_window_show(int visible);
+/* Secondary surfaces: ARGB popup windows for layered Win32 windows. Return an id (0 = failure). */
+int xwayland_surface_create(int x, int y, int width, int height);
+int xwayland_surface_update(int id, int x, int y, int width, int height, const uint32_t *pixels);
+int xwayland_surface_show(int id, int visible);
+void xwayland_surface_destroy(int id);
 /* Requests native keyboard focus for the guest's top-level XWayland window. */
 int xwayland_window_request_focus(void);
 int xwayland_window_focus_lost_by_user(void);

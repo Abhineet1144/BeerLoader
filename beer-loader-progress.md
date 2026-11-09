@@ -1,5 +1,218 @@
 # Beer Loader — Active Development Context
 
+## RE8 ray tracing "super dim / shadows too dark" (2026-11-09, night): the game picks its SM 6.0 shader pack without sampler feedback
+
+**Symptom.** RE8 with ray tracing on: the image is very dim and areas in shadow are almost black, even with AO. The only DXR work is two
+DispatchRays a frame on an empty RG_Main pipeline (state object #66). Proton with the same config.ini looks right.
+
+**Root cause.** RE8 ships two complete shader packs. It loads the SM 6.5 pack, the one whose 60-odd compute shaders use inline
+ray queries (RT GI and shadows), only when the device is DX12 Ultimate: DXR 1.1, VRS tier 2, mesh shader tier 1 **and sampler
+feedback** (OPTIONS7 word 1). Beer reports SamplerFeedbackTier 0, so RE8 used the SM 6.0 pack: no ray-query shaders, RT only as the
+empty DispatchRays. Shader model, OPTIONS5 tier, feature level and adapter identity were all already right.
+
+**How it was found.**
+- vkd3d-proton dump (VKD3D_SHADER_DUMP_PATH): every DXIL is SM 6.5 and 62 SPIR-V modules declare RayQueryKHR (capability 4472).
+  Beer's `BEER_DUMP_SHADERS` dump: all SM 6.0/6.3 and 0 ray-query modules. The DXIL program-version histogram is the quickest test
+  of which pack loaded.
+- `BEER_FEATURE_LOG=1` lists every CheckFeatureSupport answer. Bisection with `BEER_FAKE_FEATURES=30,32` (SM 6.5 pack), then the
+  real `BEER_BD12_VRS=1 BEER_BD12_MESH=1` (still SM 6.0), then adding `BEER_FAKE_FEATURES=32 BEER_FAKE_OPTIONS7=feedback`
+  (SM 6.5 pack): sampler feedback is the deciding bit.
+- At the title no sampler-feedback resources (formats 189/190) or CreateSamplerFeedbackUnorderedAccessView calls appear: RE8 seems
+  to use the bit only as the DX12U test.
+
+**Status.** With `BEER_FAKE_FEATURES=32 BEER_FAKE_OPTIONS7=feedback` (plus `BEER_DXR=1 BEER_BD12_VRS=1 BEER_BD12_MESH=1`)
+the user confirmed correct RT shadows/brightness. The proper fix is real sampler feedback (MinMip / MipRegionUsed), so the
+DX12U answer is true and needs no fake.
+
+### Then: GPU hangs (Xid 109 CTX SWITCH TIMEOUT / Xid 13) and overexposure with root push on the SM 6.5 pack
+
+- Root push off (per-draw everything): correct RT, correct exposure, stable.
+- Root push, heap mirror (`BEER_NO_DESCRIPTOR_BUFFER=1`): overexposed / pulsing dark; hang seen before the push fix.
+- Root push, descriptor buffers: correct image, but GPU hang within 1-5 minutes in game; the NVIDIA driver then segfaults
+  in vkCmdDispatch (libnvidia-glcore +0x105b077) — the crash is fallout of the hang, check `journalctl -k | grep Xid`.
+
+Fixed on the way (generic):
+1. **Push-constant cache per bind point** (`bd12_cmd_push_root_arguments`): Vulkan has one push-constant store per command
+   buffer, shared by all bind points. Skipping a push because this point's cache matched let a root-push shader read
+   the graphics or per-draw pipeline's constants as heap indices. Now any other push (`bd12_cmd_push_disturbed`) clears
+   both points' caches.
+2. **Descriptor-buffer heap array is VARIABLE_DESCRIPTOR_COUNT** (VUID-vkCmdSetDescriptorBufferOffsetsEXT-pOffsets-08063).
+3. **BLAS updates repeat the source build's maxVertex** (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-03764): RE8
+   passes a different VertexCount on PERFORM_UPDATE; `BD12AccelStruct.max_vertex` keeps the build's values.
+4. **TLAS SRVs in the mutable heap** (descriptor buffers, RT on): `VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR` joins the
+   mutable list (`bd12_db_accel_in_heap`), so inline-ray-query shaders with the TLAS in a descriptor table translate for
+   root push (`accel_in_heap` in the root layout); a root-SRV TLAS uses its address (BDA). Resource stride stays 16.
+
+Tools added (diagnostic): `BEER_BD12_ROOT_PUSH_SKIP=16bit|cs|gfx|cs/<mask>=<v>|cs!/<mask>=<v>|<hash>` sends matching
+shaders to the per-draw path (bisection: hash-bit masks, inverted when several culprits exist);
+`BEER_BD12_TRACE_CS=<hash>` logs a root-push dispatch's table descriptors at record vs submit; GPU checkpoints
+(`BEER_VK_CHECKPOINTS=1`) now cover AS builds (200), AS copies (201), DispatchRays (202); `kill -USR1` dumps them.
+Vulkan validation: Steam's `libVkLayer_khronos_validation.so` with a hand-written manifest (`VK_LAYER_PATH`).
+
+Open: the descriptor-buffer hang happens even with every compute shader per-draw (graphics root push only), so it is
+specific to descriptor-buffer mode, not to compute translation. The shader caught in the dumps (eca0c15f9fa350f2,
+0638eae42a3b43f2, 2aea685ea7f2f63f) has bounded loops: a victim of bad data or a bad descriptor. Root arguments are
+cleared on every root signature change (vkd3d-proton keeps them) — unset tables push index 0 instead of a null slot.
+
+## Shader cache location chosen by the manager (2026-11-09)
+
+- The loader reads **`BEER_CACHE_DIR`**. Vulkan pipeline caches (`pipelines-<gpu>-<driver>-<exe>.bin`) go there,
+  translated shaders in `shaders/` (`BEER_SHADER_CACHE_DIR` still overrides that subfolder). Without it the loader
+  falls back to `$XDG_CACHE_HOME/beer` or `~/.cache/beer`.
+- Manager: the setting `shader_cache_dir` (default `~/.beer/cache`, with the rest of the manager's files) is the
+  "Shader cache folder" row in Loader settings and is passed on every launch. `storage.migrate_cache()` moves the
+  old `~/.cache/beer` there once, by rename: the disk is nearly full, so no copy. On another filesystem it starts
+  empty. Done and verified: SB loaded its pipeline cache and shaders from ~/.beer/cache.
+
+## Known-folder GUIDs fixed; automatic pipeline release (2026-11-09)
+
+- **KNOWNFOLDERID table** (platform/win32_filesystem_policy.h): Profile, RoamingAppData, LocalAppData and
+  ProgramData had wrong GUIDs (only the first 4 bytes right), so `SHGetKnownFolderPath` answered "not found".
+  Unreal Engine games then fell back to saving next to the executable (`Binaries/Win64/<Project>/Saved`). With the
+  fix they use `%LOCALAPPDATA%\<Project>\Saved`, as on Windows/Proton (checked with Stellar Blade). The
+  filesystem-policy test had the same wrong GUID and is corrected.
+  - Saves copied (originals left in place): Stellar Blade and Chained Together, to
+    `~/.beer/prefixes/default/drive_c/Users/Player/AppData/Local/<Project>/Saved`. Beast of Reincarnation had
+    only config/logs in its fallback folder.
+- **Automatic pipeline release** (bd12_com_list.c `keep_pipelines`): pipelines are kept by default. Every 64
+  creations the resident size is checked against a budget: `BEER_BD12_PIPELINE_BUDGET_MB`, else 60% of
+  min(cgroup memory.max, MemTotal). Once over it, compile-at-create switches to warm-and-release (sticky, logged as
+  "[BD12] memory tight"). `BEER_BD12_RELEASE_PIPELINES=1/0` forces release/keep.
+  - WWM, 150 s under the 9 GB cap: automatic peak 8.25-8.46 GB, settles ~7.8-8.0 GB, no OOM. Forced release:
+    peak 8.39, settles 8.0. With shared layouts, pipelines no longer dominate WWM's memory.
+
+## RE4 Remake status (2026-11-09, later): past the logos, into the first-run menus
+
+**Fixed: the post-logo stall was Beer's Media Foundation decoder teardown** (`media/media_foundation.c`). It was not the job system or the null mesh PSO.
+- After the logo movie hits EOS, RE4's movie thread runs a handshake: it sets a flag at `obj+0xa9`, then waits on the event at `obj+0x4dd0`. A per-tick callback sets the event, and the woken side calls `Flush(ANY)` and `SetCurrentPosition(0)`.
+- Beer's `SetCurrentPosition` restarts the decoders, and `mf_source_reader_stop_decoder` called `waitpid` on the old ffmpeg. That ffmpeg was blocked in `anon_pipe_write`, because its pipe still had a reader: the pipes were created without O_CLOEXEC, so ffmpeg processes spawned later for the second reader inherited the read end. The movie thread never returned, so the per-tick callback never ran.
+- Fix: decoder pipes use `pipe2(O_CLOEXEC)`, and `stop_decoder` closes the pipes and sends SIGTERM before `waitpid`. These are generic fixes for every game that seeks or flushes an MF source reader.
+- Result: ~100 fps, and input via the control socket works. The flow reaches Initial Settings, brightness, accessibility notice, display area, and the "Sending Play Data" consent screen, where I stopped (the user's choice). The two "graphics PSO without VS" rejections still happen but are harmless here.
+- User confirmed: RE4 works and renders in-game. **Open: resolution will not go above 1080p.** Lead: RE4's log shows `GetDisplayModeList format=28 -> 11 modes (largest 1920x1080@60)`, while RE8 swapchains at 2560x1440. Check DXGI output mode enumeration and the reported desktop size.
+- New diagnostic: `BEER_DUMP_IMAGE=<file>` writes the main image as it is in memory on `kill -USR1`, for disassembling unpacked code: `objdump -D -b binary -m i386:x86-64 --adjust-vma=0x140000000`. Use `BEER_API_TRACE_COUNT` and `BEER_API_TRACE_FILTER` to trace past the first 6000 calls.
+
+## RE4 Remake status (2026-11-09)
+
+The GPU check now passes (on RE9Compat). The device and swapchain are created, the startup logos render correctly
+(~70-80 fps; screenshot via the control socket `{"cmd":"screenshot"}`), and then the game **stalls right after the
+logos**, at 0% CPU with no more frames.
+- **Stall mechanism (deterministic):** the job coordinator spins on `TryAcquireSRWLockShared(0x395b0ed0)` + Sleep(1).
+  The lock's holder took it exclusively and then waits INFINITE on an auto-reset event. A job worker created that
+  event as one of a pair right before, and nothing ever sets it: no SetEvent/NtSetEvent, fence completion,
+  WASAPI SetEventHandle or close.
+- **Correlated:** immediately before the stall, BD12 rejects two pipeline streams "graphics PSO without VS": no VS
+  subobject, AS/MS/PS present with null bytecode. Same with BEER_BD12_MESH=1, with VRS, and with fake sampler
+  feedback (DX12U set). The likely story: a pipeline-build job fails on the empty mesh pipeline and never signals
+  its completion event. Open question: why the shader bytecode is null.
+  - Not registry: CurrentVersion is seeded, and a realistic UBR made no difference.
+  - Not loose-file misses: those are normal pak probing.
+- Fixes made on the way, all generic:
+  - `ID3D12Device1::SetEventOnMultipleFenceCompletion` implemented (was E_NOTIMPL; all/any, NULL event blocks);
+    ComWaiter takes fence arrays.
+  - Windows CurrentVersion UBR = 5371 (was 0), plus LCUVer.
+- Next: find why RE4's mesh-pipeline bytecode is null. Options: compare with Proton (do the same PSOs get real
+  MS/AS bytecode there?), or trace the engine's shader-library lookup for that pipeline.
+
+## Ghost of Tsushima without OnlineFix (2026-11-09, evening) — renders, then fast-fail 0xC0000409 on a DirectStorage thread
+
+- **Launcher:** `EOSAuthLauncher.exe` is PE32 (Online-Fix EOS Auth Launcher: logs into Epic with OnlineFix's credentials via `OnlineFix/EOSSDK-Win32-Shipping.dll`, sets env vars, CreateProcessW the game). Started directly, OnlineFix (loaded by the game folder's `winmm.dll` proxy) shows "Launch game from EOSAuthLauncher.exe". Not worked around; instead:
+- **New generic switch `BEER_DLL_BUILTIN=name[,name]`:** DLLs Beer always serves itself, ignoring an application-directory copy (like a Wine builtin override). Checked in the static-import app-local path and in `guest_dll_load`. With `BEER_DLL_BUILTIN=winmm` OnlineFix never loads, and the game runs on its Steam emulator files.
+- **Result:** the game's own launcher window (790x445) appears; Enter (Play) via the control socket starts the game. It creates the device and swapchain and renders (~360 fps, menus/intro) for ~20 s.
+- **Current stop:** `UnhandledExceptionFilter: code=0xc0000409 p0=2` (FAST_FAIL_STACK_COOKIE_CHECK_FAILURE) at RVA 0xd0dcb4 on a worker thread whose stack is mostly `dstoragecore.dll` frames (+0x66178, +0x15fb10, +0x2fa72, +0x34248, +0x32fe9, +0x160450). The game RVA 0x449211 on that stack belongs to key-name code (GetKeyNameTextW; Beer's version is size-safe) and is probably stale.
+  - Under `BEER_API_TRACE` the game exits with ExitProcess(0) instead (timing-dependent).
+  - Checked and correct: GetKeyNameTextW, GetQueuedCompletionStatus(Ex).
+  - Noted: `DeviceIoControl` is a stub returning FALSE without SetLastError (DStorage calls it with FSCTL 0x90448 / 0x900fc per file).
+  - Next: find which call corrupts the DStorage thread's stack (e.g. a write into an OVERLAPPED/IO_STATUS_BLOCK after its frame returned, or a structure-size mismatch). Try `BEER_DSTORAGE`-off / builtin dstorage, or watch the cookie slot.
+- **Unhandled-exception report** now lists return addresses from any thread's stack (`process_vm_readv`), and guest DLLs as module+offset.
+- **Later the same evening, generic fixes found through GoT:**
+  1. **Guest exception handlers run on the guest stack** (`seh_call_handler_on_guest_stack`, hooked into win32_seh.c through `beer_seh_set_handler_caller` and used by RtlUnwind's handler calls).
+     - Before: language handlers, and through them C++ catch blocks and `__finally`, ran on Beer's host-call stack, sharing it with Beer's API frames.
+     - Now: the handler runs below the deepest live guest data (exception frame, Beer caller frame, record/context/dispatcher); the TEB describes the guest stack while it runs; the host-call stack top is lowered below the dispatcher's frames (reset in `beer_prepare_direct_guest_resume`).
+     - The unwinder treats the wrapper's return address (`beer_seh_handler_return`) as the dispatcher boundary and continues from the exception context, as Windows unwinds through KiUserExceptionDispatcher.
+     - `BEER_SEH_HOST_STACK=1` restores the old behaviour (diagnostic).
+     - RE8 80 s gate passes; SEH unit tests pass.
+  2. **GetLocaleInfoW/Ex:** added the en-US date/time/calendar, day and month names, monetary/sign and ISO-name LCTYPEs. LOCALE_ILDATE (0x22) and its neighbours were missing, so the UCRT's `setlocale` and `std::locale(".OCP")` failed and threw `std::runtime_error`.
+  3. **Descriptor liveness race** (`bd12_descriptor_alive`): `d->image` / `d->source_buffer` are now read once. Another thread rewriting the slot made the second read NULL (AV at 0x78 inside Beer while recording).
+  4. **Descriptor table lookups** skip heaps without descriptor storage, and a near-NULL descriptor pointer is logged once and treated as null (defensive; never seen firing).
+  5. **Manager:** new switches (root push, multi-queue, mesh, VRS, DXR, pipeline release/keep/compile mode, pipeline library, shader/pipeline caches, fullscreen cursor, single window, CPU DirectStorage, video blit) and a "Loader values" group (BEER_DLL_BUILTIN, BEER_DLL_PATH, pipeline budget, VRAM/shared/RAM caps, audio latency, NVAPI driver, NGX path, Steam ID).
+- **GoT state now:** it gets past the first ~20 s into a loading burst (~5 GB RSS, 1800% CPU), then still ends with FAST_FAIL 2 after one remaining `std::locale` C++ exception (timing-dependent; it does not happen under API tracing). Crashpad's `NtSuspendProcess` is unimplemented (only matters for crash dumps). Next: why the locale throws intermittently (possibly a thread-safety issue in a locale API), and what still corrupts the cookie in the catch path.
+
+## RE8 performance vs Proton (2026-11-09, evening) — root push makes the GPU the limit; Beer's GPU work is ~1.55x Proton's
+
+Same spot (outdoors, RT off, V-Sync off, 2560x1440):
+
+| | fps | GPU busy | power | GPU ms/frame |
+|---|---|---|---|---|
+| Beer default (descriptor sets) | 73 | 57% | 156 W | ~7.8 |
+| Beer `BEER_BD12_ROOT_PUSH=1` | **114** | 98-99% | ~255 W | ~8.7 |
+| Proton 10 (vkd3d-proton) | **130** | 73% | ~195 W | ~5.6 |
+
+- **Default mode is CPU-bound** in descriptor resolution: ~2700 resolve calls per frame, 1.3 s per 2 s window, resolve-cache hit=0. **Root push + descriptor buffers** removes that (resolve 8 ms per window) and RE8 renders correctly with it (user-checked). Its first launch recompiles every pipeline (new layouts, cache miss: a big stall); later launches are smooth. **Next decision: make root push the default** after RE9/PRAGMATA/Onimusha validation (plan step 3).
+- **Remaining gap is GPU efficiency:** nvidia-smi dmon shows SM ~99% and memory ~27%, so Beer is shader-bound. Image layouts were checked and are correct.
+- **New diagnostic `BEER_BD12_GPU_PROF=1`** (`bd12_gpuprof.c`): a timestamp before every draw/dispatch/copy/clear and at list end. Each interval is charged to the operation that follows, and the top 20 per 2 s window print as `[GPU PROF]` with kind and shader hash. It costs ~25% fps while on. First breakdown (85 fps with the profiler; log `/mnt/hdd2/beer-trace/re8-gpuprof-1.log`):
+  - compute dominates: `dispatch 9d5ff13c1f8f7f` 11.3% (1 per frame, ~1.3 ms!), `27d3a4cced850d` 8.6% (~290 per frame), `11a615bd91a96d` 6.6% and `786a5affccee8e` 5.9% (21 per frame), `d3fc615794e337`/`4143b562873f0a` 3.8% each (~150 per frame), then `draw 52391a3788303d` 2.9% (1 per frame, fullscreen) and indirect indexed draws.
+  - Next: dump these shaders (`BEER_DUMP_SHADERS`), look at what they do and how vkd3d-shader translated them (loops, typed UAV loads, structured-buffer access through texel buffers, root-push indirection), and compare with vkd3d-proton's translation of the same DXBC.
+- Proton note: the user's RE8 Steam shortcut pointed at the old `/run/media/...` mount; the drive is now at `/mnt/56A4064AA4062CD5`, and the user fixed the shortcut.
+
+## Beast of Reincarnation bring-up (2026-11-09) — UE5, Steam wrapper: now runs at 60 fps (visual check pending)
+
+Launch `BeastOfReincarnation/Binaries/Win64/BeastOfReincarnation-Win64-Shipping.exe BeastOfReincarnation`.
+Each step below was a separate stop, in order. All fixes are generic.
+1. **Hang at 0% CPU, early: "steam_api64.dll rejected DLL_PROCESS_ATTACH".** The steam_api64 wrapper (`.dll` + `.rne` + `steam_emu.ini`, the same kind as RE4's) resolves its own imports by name and refuses to attach on the first NULL. Missing: `GenerateConsoleCtrlEvent` (fails with ERROR_INVALID_HANDLE, no console) and `CreateIconFromResourceEx` (like CreateIconFromResource: unsupported, returns 0). How to find: API-trace the lines between "loaded steam_api64" and "process attach", and look for the last "export not found".
+2. **"Pure virtual function being called" LowLevelFatalError ~40 s after D3D12 device creation.** The cause was a *failed delay-load*: Windows raises an exception for it, UE does not catch it, and UE's crash handler then dies with the pure-virtual error. Two causes:
+   - `libxess.dll` lives in the XeSS plugin folder, which UE registers with `SetDllDirectoryW`, and Beer's SetDllDirectory was a no-op. It is now implemented: one directory, searched right after the application directory; NULL/"" clears it.
+   - `XINPUT1_4.dll` imported by ordinal #2. Added xinput1_4/xinput1_3 to `ORDINAL_DLLS` in tools/gen_module_exports.py and registered XInputGetCapabilities/XInputEnable by name.
+   **Rule of thumb: any `[IMPL] delay-load failed:` line before a UE fatal error is the real cause.**
+3. **glibc "double free or corruption (out)" in `translate_fresh`.** vkd3d-shader rejected a SM5 vertex shader writing SV_RenderTargetArrayIndex ("target environment does not support decoration Layer"). Its failed compile frees `spirv.code` without clearing it, and Beer then freed it again.
+   - The free is now guarded by `result >= 0`.
+   - The translator passes a `vkd3d_shader_spirv_target_info` with `EXT_VIEWPORT_INDEX_LAYER`, and the device enables `shaderOutputLayer`/`shaderOutputViewportIndex`.
+   - Found with the new abort handler (below), then reproduced offline: dump with `BEER_DUMP_SHADERS`, and run a harness over the blobs on 12 threads with `-fsanitize=address`.
+4. **Stall after the opening frames: `delay-load failed: MFPlat.DLL!MFTEnumEx`.** Implemented MFTEnumEx/MFTEnum as succeeding with an empty list (Beer registers no MFTs). The game then kept running.
+5. **Frame rate decayed 180 → 35 → 12 fps within a minute; the RHI submission thread was busy in `vkCreateSemaphore`.** Cause: **ID3D12Object::SetPrivateData was a no-op and GetPrivateData always returned NOT_FOUND.**
+   - Unreal caches a fence per object behind a private GUID: GetPrivateData, and on a miss CreateFence + SetPrivateData (seen in the dumped exe near 0x142dd7a20). So every lookup made a new fence, about 80 per frame, and none was ever retired.
+   - Its completion loop then walked an ever-longer list (87M GetCompletedValue calls in 36 s).
+   - Fix (`bd12_com.c`): real per-object private data. Set stores a copy and empty data removes; SetPrivateDataInterface references BD12 objects; Get handles size query, DXGI_ERROR_MORE_DATA and copy; entries are freed on final release.
+   - Result: live fences steady at 17, steady 60 fps (vsync). The game writes `Saved/Config/Windows/GameUserSettings.ini` and `SaveGames/borSaveDataConfig.sav`.
+   - Diagnostics added: the profiler line now has `fences-live= released= (release-calls= completed-calls=)`. `BEER_FENCE_DIAGNOSTICS` also logs a fence polled 100000x and samples GetCompletedValue every 1M calls with the caller.
+   - **Rule of thumb: when a count of live objects grows without bound, check whether the engine caches through Get/SetPrivateData.**
+- Open: the control-socket screenshot does not save for this game (10-bit R10G10B10A2 swapchain; the post pass that takes screenshots apparently does not run on its present path), and `xwd` cannot read the Vulkan window either. Visual state is unverified.
+- **New general diagnostic:** host SIGABRT prints `[ABORT]` frames (module + offset; resolve with addr2line). backtrace() is primed in main.
+
+## FH6 status (2026-11-09, later): "Self-protection failed. Error code: 4" is a broken OnlineFix.ini, not Beer
+
+- OnlineFix's anti-tamper prologue completes normally under Beer: it unprotects and reprotects its sections, reported old protections are correct, then SystemBasicInformation, process and thread basic info, a per-CPU affinity loop, and a restore. The error comes later in its DllMain, right after it reads `OnlineFix.ini` and probes its AppData stats files, with no further API calls.
+- The install's `OnlineFix.ini` (3334 bytes, modified 2026-09-10, link count 2) contains an unrelated text document instead of OnlineFix configuration. Public reports tie error 4 to a broken OnlineFix.ini, and the fix is a clean copy from the original archive. The file was left untouched; the user needs to restore it.
+- Generic fixes made on the way:
+  - VirtualQuery reports pages of loaded images as MEM_IMAGE, with AllocationBase = image base, AllocationProtect = PAGE_EXECUTE_WRITECOPY, and the region clamped to the image end (`beer_virtual_set_image_lookup`, unit test in win32_virtual_memory_test.c).
+  - The syscall trace (`BEER_SYSCALL_DIAGNOSTICS=1`) now prints NtProtectVirtualMemory base/size/old and hex of query results and affinity arguments.
+  - `BEER_DUMP_IMAGE_MODULE=<dll>` dumps a guest DLL instead of the exe.
+- Noted, not changed: Beer reports Linux PIDs/TIDs. On Windows they are multiples of 4, and the main thread's TID differs from the PID; protectors may check this.
+
+## FH6 status (2026-11-09)
+
+Launched as `forzahorizon6.exe` from `/mnt/746A40B26A4072C2/Games/Forza Horizon 6` (default prefix). The install is
+an OnlineFix copy: a `winmm.dll` proxy loads the DLLs named in `dlllist.txt` (`OnlineFix64.dll`).
+- Since Nov 1: the game's protector now hooks Beer's `KiUserExceptionDispatcher`. In one run it raised and handled
+  22 illegal-instruction (0xC000001D) exceptions through the hook, then resumed a zeroed context (RIP/RSP 0) and
+  crashed. Its direct syscalls use correct Windows-19045 numbers (0x50 NtProtectVirtualMemory, 0x28/0x37 for a
+  `\KnownDlls\ntdll.dll` mapping). Start-up paths vary between runs.
+- **Event Log API added** (win32_advapi_misc.inc): RegisterEventSourceA/W, DeregisterEventSource, ReportEventA/W,
+  OpenEventLogA/W, CloseEventLog, GetNumberOfEventLogRecords (a log sink; handles 0x38000000..). FH6 resolved
+  RegisterEventSourceW by walking advapi32's export table and raised a hard error when it was absent.
+- **Current stop:** inside `LoadLibraryW("OnlineFix64.dll")` (proxy winmm.dll+0x4673), a message box "Self-protection
+  failed. Error code: 4", right after four NtProtectVirtualMemory calls (PAGE_EXECUTE_READ / PAGE_READONLY). The
+  process then idles (OpenSSL entropy calls, no device). This is OnlineFix's own integrity check, not the game's.
+- Investigation of "error 4" (2026-11-09):
+  - No failing API precedes it: between its last file checks and the message the main thread makes no calls.
+    It is decided in-process.
+  - Its preceding steps: SystemBasicInformation, process/thread basic info, a per-CPU affinity loop (affinity
+    is real in Beer), protect toggles 0x20/0x2, `\KnownDlls\ntdll.dll` map/unmap. Beer serves that section as
+    a byte copy of the live module (raw = RVA), and Beer's Nt* exports already carry full Windows syscall stubs,
+    so a plain ntdll-diff or stub-shape check should pass.
+  - The caller (onlinefix64+0x7dc691) is virtualized/obfuscated code. Getting the exact condition needs
+    instruction-level tracing.
+  - Diagnostic added: `BEER_DUMP_AT_MESSAGEBOX=<dir>` writes the MessageBoxA caller's code and the guest stack.
+
 ## Stellar Blade: Crashpad handler runs; past the splash via a per-HWND window table (2026-11-08, night)
 
 Launched as `SB/Binaries/Win64/SB-Win64-Shipping.exe SB` (the `SB.exe` launcher exits right away). All uncommitted.
@@ -77,6 +290,17 @@ Still open / new:
   longs/rects work per HWND. PostQuitMessage now posts to the calling thread. Message-only windows (HWND_MESSAGE)
   get no surface. RegisterClass no longer replaces the live window's procedure (g_last_class_proc).
   Stellar Blade now gets past the splash: main window 0xd0000002, ~26.6k shaders, steady at 7.8 GB.
+- Window table follow-up (2026-11-09): owned windows (not WS_CHILD, parent = a live window) are surfaceless and
+  never take the native surface; WWM's 1x1 helper popup took it and the swapchain went 30x30. Fallback
+  `BEER_SINGLE_WINDOW=1` restores the one-native-window model. Possible next step: let the native surface follow
+  the swapchain's target window.
+- RegisterWaitForSingleObject objects are reference-counted: the wait thread freed the mutex while UnregisterWaitEx
+  was still in pthread_mutex_unlock (glibc "futex facility returned an unexpected error code", seen once in WWM).
+- Sync-object slot reuse (2026-11-09): events, semaphores and Win32 mutexes keep their pthread mutex/condvar
+  for the life of the slot (initialised once). CloseHandle wakes waiters instead of pthread_*_destroy, and reuse
+  no longer memsets and re-inits. A waiter inside pthread_cond_timedwait on a closed or reused slot (registered
+  waits, WaitForSingleObject racing CloseHandle) made glibc abort with "futex facility returned an unexpected
+  error code" (WWM, twice).
 - d3d12 ordinals now come from `tools/gen_module_exports.py` (`ORDINAL_DLLS` += d3d12). A regeneration had
   dropped the hand-added entries. Also added StringFromCLSID/StringFromIID, and RaiseException logs MSVC
   delay-load failures (DLL!name).
@@ -100,6 +324,56 @@ Still open / new:
   (~110 KB of driver memory each; WWM: 19.9k PSOs = 2.1 GB, OOM at 9 GB). Option: compile at create to warm the
   pipeline cache, then destroy the VkPipeline and rebuild on first bind, or default to lazy. This is likely
   also RE9's ~1.6 GB per-pipeline overhead.
+
+## Where Winds Meet: Steam login ticket, NetEase agreement dialog renders (2026-11-09, 03:30)
+
+**Login (Steam Web API ticket).** Pressing Start showed "please check your network settings". The SDK
+(ntunisdksteam) calls `ISteamUser::GetAuthTicketForWebApi`, which was not implemented.
+- `steam/provider.c` now issues it like an auth session ticket, following SteamKit2: ticket type 5 in the session
+  block, identity registered as `server_secret = "str:<identity>\0"`, padded to 2560 bytes.
+- The loader delivers `GetTicketForWebApiResponse_t` (callback 168).
+- Two bugs found on the way: the callback queue capped events at 256 bytes, and posted callbacks never went
+  through `Steam_BGetCallback`, so games with Valve's real steam_api64 never saw them.
+- Crash after the ticket: USER32 `CharNextW`/`CharPrevW`/... were stubs returning NULL, and
+  `NtUniSdkProtocol.dll` walks its XML with them.
+
+**Agreement dialog** (`NtUniSdkProtocol.dll`, a duilib window plus a layered drop-shadow window):
+- **Secondary windows.** Windows without the native surface get ARGB override-redirect X11 surfaces
+  (`xwayland_surface_*`):
+  - layered windows via `UpdateLayeredWindow`/`Indirect`;
+  - ordinary popups via per-window GDI canvases (`BeginPaint`/`GetDC` → `EndPaint`/`ReleaseDC`).
+  
+  A popup that never paints gets no surface. Pointer input is routed to the popup's thread.
+- **Window messages.** `SetWindowPos`/`MoveWindow` on such windows send `WM_WINDOWPOSCHANGING`/`CHANGED`, which
+  `DefWindowProc` turns into `WM_MOVE`/`WM_SIZE`. `WM_PAINT` is queued on show/size/invalidate. `GetUpdateRect`,
+  `ValidateRect`, `UpdateWindow`, `InvalidateRgn` and `RedrawWindow` now work for them.
+- **Window relations.** `GetParent` (was a NULL stub; the shadow then measured `GetWindowRect(NULL)` on garbage and
+  crashed intermittently), `GetWindow` and `GetAncestor` now come from the window table.
+- **GDI+** (`platform/win32_gdiplus.c`, new): the 40-function subset duilib uses. Several functions used to fall
+  into the generic stub, which returns 0 = Ok, so nothing was drawn and the dialog came out white.
+- **Result:** the dialog renders its Decline / I Agree buttons. The agreement text area is still blank, and the
+  user is testing clicks by hand. Enter on the dialog declines, and the game exits.
+- **Diagnostics:** `BEER_DUMP_POPUPS=<dir>` writes popup content as PPM; `BEER_WINDOW_DIAGNOSTICS=1`.
+
+**After "I Agree".** Clicking it works, and the game then starts the Discord SDK (`discord_partner_sdk.dll`, Rust).
+- **Abort:** Rust's std aborts (`STATUS_FATAL_APP_EXIT`) when `bcryptprimitives!ProcessPrng` is missing.
+  `ProcessPrng` (getrandom), `GetHostNameW`, `SetWinEventHook`/`UnhookWinEvent` and
+  `PowerRegister/UnregisterSuspendResumeNotification` are now implemented. `bcryptprimitives` was added to
+  tools/gen_module_exports.py.
+- **/GS cookie failure:** next came one stack-cookie failure in a function that calls `ConnectEx` and then kernel32
+  `GetLastError` (expecting 997). Beer kept Winsock's error separate from the Win32 last error.
+  - Aliasing the two made the loading screen hang (idle CPU). Beer's internals reset `g_last_error` between a
+    Winsock failure and the guest's `WSAGetLastError`.
+  - Now all 147 Winsock error sites call `beer_wsa_set_error()`: `WSAGetLastError` keeps its own value, and non-zero
+    errors are mirrored into `g_last_error`.
+- **Result:** with that, a 290 s run reaches the title video with the Discord SDK loaded, with no crash or hang. The
+  cookie failure did not recur, but it is not proven fixed.
+
+**ARM64** (apk branch method: NDK clang, aarch64-linux-android30, syntax only):
+- New and changed platform files: 0 errors.
+- To fix before an apk merge: `win32_crypt32.inc` includes OpenSSL (my ROOT store; the APK has no OpenSSL).
+  `pthread_cancel` (TerminateThread) and the two `shm_open` calls in `win32_advapi_misc.inc` don't exist in bionic.
+  Both are older, from commit 79c57fa (2026-11-07). Needed: a signal-based thread stop, and `memfd_create`.
 
 ## Where Winds Meet: title video plays (2026-11-09, 01:20)
 
@@ -4391,3 +4665,43 @@ waits on it, GPU 30–40%); nearly all of it is BD12 descriptor resolve (~3300 p
   `BEER_SHADER_CACHE_DIR`), keyed by shader bytes + loader/translator builds + SPIR-V options. RE9 second launch:
   6 fresh translations instead of 693; little effect on title-screen time (driver pipeline build dominates).
 - Diagnostics: `BEER_BD12_PIPELIB_LOG=1` (library/create call counts).
+
+## RE8 "stutters, then stops rendering after exploring" (2026-11-09)
+
+Three separate faults looked like the same symptom. All three are fixed (uncommitted). The user's run after the fixes had no issues.
+
+1. **Buffer-view pins never released** (`bd12_descriptors.c`, `bd12_mirror.c`). Heap-mirror slots pinned a texel-buffer view for every (buffer, format, offset, range) ever written, until the buffer died. RE8 rewrites descriptors at new offsets constantly, so pinned views grew without bound. `view_gc` could not free them but kept rescanning and rehashing under the device-wide `view_lock`. Every resolve thread then queued on that lock (resolve went from ~2.8 us to ~0.5 ms per call, 1–2 presents per 2 s), and the driver eventually refused new views, so descriptors resolved to null.
+   - Fix: `pins` is now a count. Each mirror slot records the view it pinned (`MirrorPin`, calloc'd lazily per mirror). A rewritten slot unpins its old view after pinning the new one, and an unpinned view ages out after `VIEW_AGE_FRAMES`. A slot left unwritten keeps its pin, because the set still references that view.
+   - `bd12_buffer_destroy` now frees views under `view_lock` (`bd12_buffer_views_release`). `bd12_buffer_view_unpin` takes the device explicitly and checks liveness and serial before touching the buffer; the first version read `buffer->device` from a freed buffer and deadlocked.
+   - The profiler line now ends with `buffer-views=N pinned=M`.
+   - Watch: in the clean run the counts still rose slowly (63k views / 18.6k pinned after ~15 min). Recheck in a longer session.
+2. **SRWLOCK lost wakeup** (`loader.c` `srw_acquire_shared`). A reader blocked only by a queued writer could set `SRW_SLEEPERS` after that writer had already acquired and released the lock, then sleep forever. The dump showed the lock state at 0x2 with no holder and no writers. Fix: after setting `SRW_SLEEPERS`, re-read the writer count (all seq_cst) and retry if it is zero. This is a generic fix and affects every game.
+3. **Live-registry tombstones** (`bd12_live.c`). Removals left tombstones that were never cleared, so lookups slowed as resources churned. The table is now rebuilt once tombstones reach CAP/16; readers stay lock-free, and the replaced table is freed at the next rebuild.
+
+Other findings:
+- **Xid 109 GPU timeouts** happened only in runs where the manager's speed slider was at 4–5x. In-flight work at the hang was indexed indirect draws. `BEER_VK_CHECKPOINTS=1` now also lists every op in flight for the reported lists, plus the indirect argument and count buffer VAs (`bd12_ckpt_args`). Not yet root-caused.
+- **CPU profiling without perf:** `kill -USR1` stacks plus `addr2line -f -e loader <off>`. `perf_event_paranoid=4` and `ptrace_scope=1` block perf and gdb attach.
+
+### RE8 distillery wine/blood transparent with a checkerboard pattern: SM6 tessellation patch size (2026-11-10)
+- **Symptom.** Castle Dimitrescu distillery: the wine/blood on the floor shows as a blocky checkerboard of liquid and
+  bare floor, in world space (blocks shrink with distance), shifting as the camera moves. Not affected by
+  `BEER_BD12_SYNC_ALL` / `NO_RESOLVE_CACHE` / `NO_SET_CACHE`.
+- **Found with** `BEER_BD12_CAPTURE_RT=1` + `BEER_BD12_TRACE_FILE`: the pattern first appears in the G-buffer pass of PSO
+  37c5bb74ae3208f4 (topo=10, i.e. a patch list). Its DXIL hull shader 4f478510690a6274 takes a 1-control-point patch
+  (quad domain, one tile per point, tess factors from the VS output `SUBDIV`).
+- **Cause.** `hull_input_control_points()` (bd12_pso.c) only parsed the DXBC `dcl_input_control_point_count` token. DXIL
+  hull shaders have no SHEX chunk, so it returned 0 and the pipeline used `patchControlPoints = 3`: patches were
+  assembled from 3 points each, so most tiles were dropped or built from the wrong points.
+- **Fix.** Also read `PSVRuntimeInfo.HS.InputControlPointCount` from the DXIL `PSV0` chunk (first word after the info
+  size). Generic for every SM6 game with tessellation whose patch size is not 3. Verified in game: wine renders correctly.
+- **Diagnostics added (trace-only):** `[PSOSHADERS]` lists hs/ds/gs hashes; `[DRAW]`/`[TRACE] execute_indirect` carry
+  `list=` and `pso=`; `[TRACE] pass end list=.. rtNNN` maps capture files to the draws of that pass (the capture file
+  hash is the last PSO of the pass). Note `BEER_BD12_GPU_PROF` only prints together with `BEER_BD12_PROF=1`.
+
+### RE8 laggy spot: one tessellated SM5 draw is 70% of GPU time (2026-11-10, open)
+- 47 fps, GPU 99% / 275 W, CPU idle, settings ImageQualityRate=1.3 (internal 3328x1871), RT off.
+- `BEER_BD12_GPU_PROF=1 BEER_BD12_PROF=1`: PSO 44ea143159cce70c, one non-indexed draw per frame, ~14 ms. DXBC VS 01ca965b,
+  HS c75fbbff (1-point quad patches, constant tess factors from an immediate constant buffer), DS 4b5b2c32, PS 25bc6424
+  (3686 SPIR-V lines, two light-list loops, 2D-array + 1D-array samplers, blending, no depth): looks like a volumetric /
+  light-shaft pass. Not affected by the PSV0 fix (DXBC). The user reports Proton is much faster at this spot, so this is a
+  real BD12 gap (DXBC PS codegen, sampler/image setup, or tessellation path). Parked; user plays at ImageQualityRate=1.0.

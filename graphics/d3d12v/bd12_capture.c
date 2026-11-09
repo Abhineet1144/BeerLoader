@@ -281,6 +281,7 @@ void bd12_capture_rt_pass(BD12CmdList *list)
     BD12Device *device = list->device;
     static uint32_t pass_seq;
     const uint32_t pass = __atomic_add_fetch(&pass_seq, 1, __ATOMIC_RELAXED);
+    fprintf(stderr, "[TRACE] pass end list=%p rt%03u\n", (void *)list, pass);
     if (list->gfx.cap_has_dsv) bd12_capture_depth_pass(list);
     if (getenv("BEER_BD12_CAPTURE_RT_DEPTH_ONLY")) return;
     for (uint32_t i = 0; i < list->gfx.cap_rtv_count; ++i) {
