@@ -826,6 +826,90 @@ static uint32_t clamp_extent(uint32_t want, uint32_t offset, uint32_t limit)
     return offset >= limit ? 0 : (want > limit - offset ? limit - offset : want);
 }
 
+/* ID3D12GraphicsCommandList::CopyTiles(tiled, D3D12_TILED_RESOURCE_COORDINATE {x, y, z, subresource},
+ * D3D12_TILE_REGION_SIZE {u32 tiles, BOOL use_box, u32 width, u16 height, u16 depth}, buffer, offset, flags).
+ * Streaming engines upload texture tiles this way into reserved resources. Reserved resources are fully resident
+ * here, so each 64 KiB tile is an ordinary copy between the buffer (one tile after another, texels row-major within
+ * the tile's standard shape) and the tile's texel box. Without a box the tiles run X, then Y, then Z, then on into
+ * the next subresource. Flag 0x4 copies the resource into the buffer; otherwise the buffer goes into the resource.
+ * Tiles in a packed mip tail have an opaque layout and are skipped (logged once). */
+static void MS cl_copy_tiles(ComList *l, ComResource *tiled, const uint32_t *coord, const uint8_t *region,
+                             ComResource *buf, uint64_t offset, uint32_t flags)
+{
+    LIST_CUR(l);
+    if (!tiled || !coord || !region || !buf || !buf->buffer) return;
+    const int to_buffer = (flags & 0x4) != 0;
+    const uint32_t count = rd32(region), use_box = rd32(region + 4);
+    const uint32_t box_w = rd32(region + 8);
+    const uint16_t box_h = *(const uint16_t *)(region + 12), box_d = *(const uint16_t *)(region + 14);
+    static _Atomic int logged;
+    if (atomic_load(&logged) < 4) {
+        atomic_fetch_add(&logged, 1);
+        fprintf(stderr, "[BD12] CopyTiles %s tiles=%u box=%u(%ux%ux%u) at %u,%u,%u sub=%u fmt=%u %llux%u flags=0x%x\n",
+                to_buffer ? "resource->buffer" : "buffer->resource", count, use_box, box_w, box_h, box_d,
+                coord[0], coord[1], coord[2], coord[3], tiled->dxgi_format, (unsigned long long)tiled->width,
+                tiled->height, flags);
+    }
+    if (tiled->dimension == 1) {                         /* buffer: 64 KiB tiles in a row */
+        if (!tiled->buffer) return;
+        const uint64_t bytes = (uint64_t)(use_box ? box_w : count) * 65536u;
+        const uint64_t at = (uint64_t)coord[0] * 65536u;
+        if (to_buffer) bd12_cmd_copy_buffer(c, buf->buffer, offset, tiled->buffer, at, bytes);
+        else bd12_cmd_copy_buffer(c, tiled->buffer, at, buf->buffer, offset, bytes);
+        return;
+    }
+    if (!tiled->image) return;
+    uint32_t shape[3];
+    bd12_standard_tile_shape(tiled, shape);
+    uint32_t bw = 1, bh = 1, bytes = 4;
+    const VkFormat vk = bd12_dxgi_to_vk(tiled->dxgi_format);
+    if (vk != VK_FORMAT_UNDEFINED) bd12_format_block(vk, VK_IMAGE_ASPECT_COLOR_BIT, &bw, &bh, &bytes);
+    if (!bytes) bytes = 4;
+    const uint32_t pitch = (shape[0] / bw) * bytes;
+    const uint32_t mips = tiled->mips ? tiled->mips : 1;
+    const uint32_t subresources = mips * (tiled->dimension == 4 ? 1 : (tiled->depth_or_layers ? tiled->depth_or_layers : 1));
+    uint32_t sub = coord[3], tx = coord[0], ty = coord[1], tz = coord[2];
+    const uint32_t total = use_box ? box_w * box_h * box_d : count;
+    for (uint32_t i = 0; i < total; ++i) {
+        if (use_box) {
+            const uint32_t plane = box_w * box_h;
+            tx = coord[0] + i % box_w; ty = coord[1] + (i % plane) / box_w; tz = coord[2] + i / plane;
+        }
+        if (sub >= subresources) break;
+        uint32_t mw, mh, md;
+        mip_extent(tiled, sub, &mw, &mh, &md);
+        if (mw < shape[0] || mh < shape[1] || (tiled->dimension == 4 && md < shape[2])) {   /* packed tail */
+            static _Atomic int packed_logged;
+            if (!atomic_exchange(&packed_logged, 1))
+                fprintf(stderr, "[BD12] CopyTiles into a packed mip tail (sub %u, %ux%u): skipped\n", sub, mw, mh);
+            break;
+        }
+        const uint32_t wt = (mw + shape[0] - 1) / shape[0], ht = (mh + shape[1] - 1) / shape[1];
+        const uint32_t dt = (md + shape[2] - 1) / shape[2];
+        if (!use_box) {                                  /* linear walk: wrap into the next row/slice/subresource */
+            if (tx >= wt) { tx = 0; ++ty; }
+            if (ty >= ht) { ty = 0; ++tz; }
+            if (tz >= dt) {
+                tz = 0; ++sub; --i;                      /* retry this tile in the next subresource */
+                continue;
+            }
+        }
+        const uint32_t x = tx * shape[0], y = ty * shape[1], z = tz * shape[2];
+        const uint32_t w = clamp_extent(shape[0], x, mw), h = clamp_extent(shape[1], y, mh);
+        const uint32_t d = clamp_extent(shape[2], z, md);
+        if (w && h && d) {
+            const uint64_t at = offset + (uint64_t)i * 65536u;
+            if (to_buffer)
+                bd12_cmd_copy_image_to_buffer(c, buf->buffer, at, pitch, tiled->image,
+                    (BD12ImagePoint){ sub, (int32_t)x, (int32_t)y, (int32_t)z }, w, h, d);
+            else
+                bd12_cmd_copy_buffer_to_image(c, tiled->image,
+                    (BD12ImagePoint){ sub, (int32_t)x, (int32_t)y, (int32_t)z }, buf->buffer, at, pitch, w, h, d);
+        }
+        if (!use_box) ++tx;
+    }
+}
+
 static void MS cl_copy_texture_region(ComList *l, const uint8_t *dst,
                                       uint32_t dx, uint32_t dy, uint32_t dz,
                                       const uint8_t *src, const uint8_t *box)
@@ -1521,7 +1605,7 @@ void *com_list_vtable_[80] = {
     [7] = com_obj_get_device, [8] = cl_get_type, [9] = cl_close,
     [10] = cl_reset, [11] = cl_clear_state, [12] = cl_draw,
     [13] = cl_draw_indexed, [14] = cl_dispatch, [15] = cl_copy_buffer_region,
-    [16] = cl_copy_texture_region, [17] = cl_copy_resource, [18] = cl_noop,
+    [16] = cl_copy_texture_region, [17] = cl_copy_resource, [18] = cl_copy_tiles,
     [19] = cl_resolve, [20] = cl_set_topology, [21] = cl_set_viewports,
     [22] = cl_set_scissors, [23] = cl_set_blend_factor,
     [24] = cl_set_stencil_ref, [25] = cl_set_pso, [26] = cl_barrier,

@@ -1544,6 +1544,7 @@ static void emit_thunk(int idx)
  *   FF E0                           jmp rax                  (2)
  *   90 * 6                          nop pad                  (6)
  */
+static u64 beer_fast_sync_body(u64 fn);
 static void emit_impl_thunk(int idx, u64 fn_ptr)
 {
     u8 *p = g_tramp + idx * THUNK_SZ;
@@ -1554,6 +1555,10 @@ static void emit_impl_thunk(int idx, u64 fn_ptr)
 
     u32 idx32 = (u32)idx;
     u64 tramp = (u64)beer_dispatch_trampoline;
+    if (!g_api_trace) {   /* hot synchronization calls: guest-side fast path first (beer_fast_srw_*) */
+        const u64 fast = beer_fast_sync_body(fn_ptr);
+        if (fast) tramp = fast;
+    }
 
     p[0] = 0x41; p[1] = 0xBA;
     memcpy(p + 2, &idx32, 4);        /* mov r10d, idx */
@@ -2000,7 +2005,7 @@ static WIN_CS g_loader_critical_section;
 static CsBackend g_fallback_cs;             /* shared by sections at impossible addresses */
 static pthread_once_t g_fallback_cs_once = PTHREAD_ONCE_INIT;
 static void fallback_cs_init(void) { sem_init(&g_fallback_cs.lock, 0, 1); }
-static __thread u64 g_cached_windows_thread_id;
+__thread u64 g_cached_windows_thread_id;   /* also read by beer_fast_get_current_thread_id */
 /* Host thread id for lock diagnostics fields, without a gettid system call per lock operation. */
 static long srw_host_tid(void)
 {
@@ -14568,6 +14573,121 @@ static int srw_try_shared(u64 *lock)
     return 0;
 }
 
+/* Guest-side fast paths for the SRW calls. Lock-heavy guests (RE9's job system: one thread spends a whole core in
+ * Acquire/ReleaseSRWLockExclusive pairs) paid the full dispatch trampoline (host-stack switch, XMM6-15 save, argument
+ * copy) for what Windows does with one interlocked instruction. emit_impl_thunk() points these imports at the bodies
+ * below instead of beer_dispatch_trampoline: the import index stays in r10, the uncontended case is a single
+ * lock cmpxchg on the guest's lock word using only volatile registers (rax, rdx), and anything that might block or
+ * must wake sleepers falls through to the trampoline and the C implementation above, unchanged.
+ * Bit layout: SRW_HELD 1, SRW_SLEEPERS 2, SRW_EXCLUSIVE 4, shared count from bit 4; writers waiting at +4.
+ * BEER_FAST_SYNC=0 routes every call through the trampoline again. */
+_Static_assert(SRW_HELD == 1 && SRW_SLEEPERS == 2 && SRW_EXCLUSIVE == 4 && SRW_SHARE_ONE == 0x10 &&
+               SRW_SHARE_MASK == 0xfffffff0u, "beer_fast_srw_* assembly uses these values");
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    "beer_fast_srw_acquire_exclusive:\n"
+    "    test %rcx, %rcx\n"
+    "    jz 9f\n"
+    "    mov (%rcx), %eax\n"
+    "1:  test $0xfffffff4, %eax\n"          /* exclusive or shared holders: may block */
+    "    jnz 9f\n"
+    "    mov %eax, %edx\n"
+    "    or $5, %edx\n"                     /* HELD | EXCLUSIVE, sleepers bit kept */
+    "    lock cmpxchg %edx, (%rcx)\n"
+    "    jne 1b\n"
+    "    ret\n"
+    "9:  jmp beer_dispatch_trampoline\n"
+    ".p2align 4\n"
+    "beer_fast_srw_release_exclusive:\n"
+    "    test %rcx, %rcx\n"
+    "    jz 9f\n"
+    "    mov (%rcx), %eax\n"
+    "1:  test $2, %eax\n"                   /* sleepers: the C path wakes them */
+    "    jnz 9f\n"
+    "    mov %eax, %edx\n"
+    "    and $-8, %edx\n"
+    "    lock cmpxchg %edx, (%rcx)\n"
+    "    jne 1b\n"
+    "    ret\n"
+    "9:  jmp beer_dispatch_trampoline\n"
+    ".p2align 4\n"
+    "beer_fast_srw_acquire_shared:\n"
+    "    test %rcx, %rcx\n"
+    "    jz 9f\n"
+    "    mov (%rcx), %eax\n"
+    "1:  test $4, %eax\n"
+    "    jnz 9f\n"
+    "    cmpl $0, 4(%rcx)\n"                /* writers waiting go first */
+    "    jne 9f\n"
+    "    lea 0x10(%rax), %edx\n"
+    "    or $1, %edx\n"
+    "    lock cmpxchg %edx, (%rcx)\n"
+    "    jne 1b\n"
+    "    ret\n"
+    "9:  jmp beer_dispatch_trampoline\n"
+    ".p2align 4\n"
+    "beer_fast_srw_release_shared:\n"
+    "    test %rcx, %rcx\n"
+    "    jz 9f\n"
+    "    mov (%rcx), %eax\n"
+    "1:  test $2, %eax\n"
+    "    jnz 9f\n"
+    "    test $0xfffffff0, %eax\n"
+    "    jz 9f\n"
+    "    lea -0x10(%rax), %edx\n"
+    "    test $0xfffffff0, %edx\n"
+    "    jnz 2f\n"
+    "    and $-4, %edx\n"                   /* last reader: clear HELD */
+    "2:  lock cmpxchg %edx, (%rcx)\n"
+    "    jne 1b\n"
+    "    ret\n"
+    "9:  jmp beer_dispatch_trampoline\n"
+    ".p2align 4\n"
+    "beer_fast_srw_try_exclusive:\n"
+    "    test %rcx, %rcx\n"
+    "    jz 9f\n"
+    "    mov (%rcx), %eax\n"
+    "1:  test $0xfffffff4, %eax\n"
+    "    jnz 8f\n"
+    "    mov %eax, %edx\n"
+    "    or $5, %edx\n"
+    "    lock cmpxchg %edx, (%rcx)\n"
+    "    jne 1b\n"
+    "    mov $1, %eax\n"
+    "    ret\n"
+    "8:  xor %eax, %eax\n"
+    "    ret\n"
+    "9:  jmp beer_dispatch_trampoline\n"
+    ".p2align 4\n"
+    "beer_fast_srw_try_shared:\n"
+    "    test %rcx, %rcx\n"
+    "    jz 9f\n"
+    "    mov (%rcx), %eax\n"
+    "1:  test $4, %eax\n"
+    "    jnz 8f\n"
+    "    cmpl $0, 4(%rcx)\n"
+    "    jne 8f\n"
+    "    lea 0x10(%rax), %edx\n"
+    "    or $1, %edx\n"
+    "    lock cmpxchg %edx, (%rcx)\n"
+    "    jne 1b\n"
+    "    mov $1, %eax\n"
+    "    ret\n"
+    "8:  xor %eax, %eax\n"
+    "    ret\n"
+    "9:  jmp beer_dispatch_trampoline\n"
+    /* GetCurrentThreadId: the per-thread cached id (host TLS, reachable through %fs from guest code just as the
+     * trampoline reaches it); before it is cached, the C implementation fills it. */
+    ".p2align 4\n"
+    "beer_fast_get_current_thread_id:\n"
+    "    mov %fs:g_cached_windows_thread_id@tpoff, %rax\n"
+    "    test %rax, %rax\n"
+    "    jz 9f\n"
+    "    ret\n"
+    "9:  jmp beer_dispatch_trampoline\n"
+);
+
 static u64 __attribute__((ms_abi)) impl_InitializeSRWLock(u64 *lock)
 {
     if (lock) *lock = 0;
@@ -14599,6 +14719,24 @@ static u64 __attribute__((ms_abi)) impl_TryAcquireSRWLockShared(u64 *lock)
 static u64 __attribute__((ms_abi)) impl_ReleaseSRWLockShared(u64 *lock)
 {
     if (lock) srw_release_shared(lock);
+    return 0;
+}
+
+extern char beer_fast_srw_acquire_exclusive[], beer_fast_srw_release_exclusive[], beer_fast_srw_acquire_shared[],
+            beer_fast_srw_release_shared[], beer_fast_srw_try_exclusive[], beer_fast_srw_try_shared[],
+            beer_fast_get_current_thread_id[];
+static u64 beer_fast_sync_body(u64 fn)
+{
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("BEER_FAST_SYNC"); enabled = !e || atoi(e); }
+    if (!enabled) return 0;
+    if (fn == (u64)impl_AcquireSRWLockExclusive) return (u64)beer_fast_srw_acquire_exclusive;
+    if (fn == (u64)impl_ReleaseSRWLockExclusive) return (u64)beer_fast_srw_release_exclusive;
+    if (fn == (u64)impl_AcquireSRWLockShared) return (u64)beer_fast_srw_acquire_shared;
+    if (fn == (u64)impl_ReleaseSRWLockShared) return (u64)beer_fast_srw_release_shared;
+    if (fn == (u64)impl_TryAcquireSRWLockExclusive) return (u64)beer_fast_srw_try_exclusive;
+    if (fn == (u64)impl_TryAcquireSRWLockShared) return (u64)beer_fast_srw_try_shared;
+    if (fn == (u64)impl_GetCurrentThreadId) return (u64)beer_fast_get_current_thread_id;
     return 0;
 }
 
@@ -21035,7 +21173,8 @@ static void collect_native_window_events(void)
                 }
                 break;
             }
-            case XWAYLAND_EVENT_CLOSE:
+            case XWAYLAND_EVENT_CLOSE:   /* the compositor/user asked to close the window (WM_DELETE_WINDOW) */
+                fprintf(stderr, "[WIN] native close request -> WM_CLOSE%s\n", top_level ? "" : " (ignored: not top-level)");
                 if (top_level) queue_window_message(0x0010, 0, 0); break;
             case XWAYLAND_EVENT_SHOW:
                 if (top_level) queue_window_message(0x0018, 1, 0); break;

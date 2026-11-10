@@ -1,5 +1,7 @@
 # Beer Loader — Active Development Context
 
+RE9 Path: /home/tejas/Game/Resident Evil Requiem/re9.exe 
+
 ## RE8 ray tracing "super dim / shadows too dark" (2026-11-09, night): the game picks its SM 6.0 shader pack without sampler feedback
 
 **Symptom.** RE8 with ray tracing on: the image is very dim and areas in shadow are almost black, even with AO. The only DXR work is two
@@ -4705,3 +4707,58 @@ Other findings:
   (3686 SPIR-V lines, two light-list loops, 2D-array + 1D-array samplers, blending, no depth): looks like a volumetric /
   light-shaft pass. Not affected by the PSV0 fix (DXBC). The user reports Proton is much faster at this spot, so this is a
   real BD12 gap (DXBC PS codegen, sampler/image setup, or tessellation path). Parked; user plays at ImageQualityRate=1.0.
+
+## 2026-11-09: "Unsupported graphics card" again, and the RE9 CPU profile
+
+- **"Unsupported graphics card" was the manager launching an old build.** `~/.beer/manager.json` had `"loader"` and
+  `"steam_provider"` pointing at `/home/tejas/Projects/BeerLoader (Copy)/` (main @ dc4eb89, built 11-01), which has
+  none of the CheckFeatureSupport fixes (OPTIONS11 AtomicInt64OnDescriptorHeapResource, TiledResourcesTier >= 2).
+  They now point at this repo's `loader` and `beer-steam` (backup: `~/.beer/manager.json.bak-20261109`). Restart the
+  manager to pick it up. If the message comes back, check which binary the manager runs before touching BD12.
+- **The low fps on the first run after a pull is the cold shader cache, not steady-state cost.** The translation
+  cache is keyed by `BEER_TRANSLATOR_SOURCE_KEY` (the translator sources), so a pull that changes the translator
+  re-translates every RE9 shader (about 1,800) and misses the NVIDIA pipeline cache with them. About 7 cores sat in
+  `libnvidia-gpucomp`/`nvvm` and the game ran at about 15 fps at 1440p for several minutes. The second run reached
+  25 fps, and the third held a steady 59.9 fps with no new translations.
+- **Guest-side fast paths for hot synchronisation imports (generic).** With warm caches, one RE9 job thread spent a
+  full core in AcquireSRWLockExclusive/ReleaseSRWLockExclusive pairs. 25% of all samples were
+  `beer_dispatch_trampoline` (host-stack switch, XMM6-15 save, 12-qword argument copy per call) for what Windows does
+  with one interlocked instruction.
+  - `emit_impl_thunk` now points the SRW Acquire/Release/TryAcquire imports (exclusive and shared) and
+    GetCurrentThreadId at small assembly bodies in loader.c (`beer_fast_srw_*`, `beer_fast_get_current_thread_id`).
+  - The import index stays in r10. The uncontended case is one `lock cmpxchg` on the guest's lock word using only
+    rax/rdx, and GetCurrentThreadId reads the cached id from host TLS through %fs.
+  - Anything that could block or must wake sleepers, a null lock, or an id not yet cached tail-jumps to
+    `beer_dispatch_trampoline`, so the existing C implementation handles it unchanged.
+  - Matching is by implementation pointer, so ntdll Rtl* aliases and GetProcAddress results get it too.
+  - It is disabled under BEER_API_TRACE. BEER_FAST_SYNC=0 turns it off.
+  - Result: trampoline share went from 25% to 2.3% of samples in the same scene. RE9 ran without crashes.
+- **Native close requests are logged.** `[WIN] native close request -> WM_CLOSE`. Two test runs ended because
+  something sent WM_DELETE_WINDOW, after which the game shuts down and shows its own "unhandled exception" dialog.
+  This log line now marks it, so that sequence is not mistaken for a Beer crash.
+
+## 2026-11-10: RE9 characters had flat grey skin (stencil-plane SRVs)
+
+- **Symptom.** Every character's skin (faces, hands, bald heads) rendered flat clay-grey, with lighting but no albedo,
+  while clothing was textured. RE Engine's skin/subsurface pass reads the depth buffer's stencil plane through an SRV
+  to find skin pixels.
+- **Cause.** `bd12_image_view_swizzled` defaults the view aspect to DEPTH for every SRV of a depth-stencil image.
+  A stencil-plane SRV (`X24_TYPELESS_G8_UINT` 47, `X32_TYPELESS_G8X24_UINT` 22) therefore read depth bits, and
+  `bd12_dxgi_reads_stencil()` existed but was never used. D3D also returns stencil in `.g`, while a Vulkan
+  stencil-aspect view returns it in `.r`.
+- **Fix (generic, `dev_create_srv_impl`).**
+  - A stencil-plane view format selects the STENCIL aspect.
+  - The view swizzle comes from `bd12_dxgi_srv_swizzle()`. It composes the SRV's **Shader4ComponentMapping**
+    (desc + 8, previously ignored: per-component select of R/G/B/A, force 0, force 1) with where each D3D memory
+    component lives in Beer's view. For stencil planes that is G to R, with R/B = 0 and A = 1; for A8_UNORM it is
+    A to R.
+  - A mapping without bit 12 is treated as the default 0x1688.
+- **Also added.**
+  - `CopyTiles` (command list slot 18, previously `cl_noop`). It copies 64 KiB tiles between a buffer and a reserved
+    resource, with or without a box, wrapping across subresources; packed mip tails are skipped and logged.
+  - `BEER_TILE_LOG=1` logs UpdateTileMappings requests. RE9 only tile-maps reserved buffers, from dedicated 16 MB
+    heaps with no placed aliases, so full-resident emulation is correct for it.
+- **Screenshots of direct-blit back buffers.** The `screenshot` control command and hotkey now work when the back
+  buffer is BGRA8 or R10G10B10A2. That frame is blitted (format-converting) into the RGBA8 upload image and goes
+  through the post pass. Driving RE9 with `drive.py key 13 28` (Enter) and `key 70 33` (F, Continue) plus `shot`
+  reaches gameplay for checks like this one.

@@ -122,6 +122,29 @@ int bd12_dxgi_reads_stencil(uint32_t f)
     return f == 22 || f == 47;
 }
 
+/* Vulkan swizzle for a D3D12 SRV: Shader4ComponentMapping (3 bits per output component: 0-3 take memory component
+ * R/G/B/A, 4 forces 0, 5 forces 1; D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING is 0x1688) composed with where each D3D
+ * memory component lives in Beer's view: A8_UNORM is stored as R8, and a stencil plane (X24_TYPELESS_G8_UINT,
+ * X32_TYPELESS_G8X24_UINT) holds the stencil in G in D3D but in R of a Vulkan stencil-aspect view. Packed one
+ * VkComponentSwizzle per byte, r lowest; 0 is the identity. */
+uint32_t bd12_dxgi_srv_swizzle(uint32_t f, uint32_t mapping, int has_mapping)
+{
+    const uint8_t R = VK_COMPONENT_SWIZZLE_R, G = VK_COMPONENT_SWIZZLE_G, B = VK_COMPONENT_SWIZZLE_B,
+                  A = VK_COMPONENT_SWIZZLE_A, Z = VK_COMPONENT_SWIZZLE_ZERO, O = VK_COMPONENT_SWIZZLE_ONE;
+    uint8_t memory[4] = { R, G, B, A };
+    if (f == 65) { memory[0] = Z; memory[1] = Z; memory[2] = Z; memory[3] = R; }
+    else if (bd12_dxgi_reads_stencil(f)) { memory[0] = Z; memory[1] = R; memory[2] = Z; memory[3] = O; }
+    if (!has_mapping || !(mapping & 0x1000)) mapping = 0x1688;   /* bit 12 is always set in a valid mapping */
+    uint32_t out = 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t sel = (mapping >> (3 * i)) & 7;
+        const uint8_t c = sel < 4 ? memory[sel] : sel == 4 ? Z : O;
+        out |= (uint32_t)c << (8 * i);
+    }
+    const uint32_t identity = (uint32_t)R | ((uint32_t)G << 8) | ((uint32_t)B << 16) | ((uint32_t)A << 24);
+    return out == identity ? 0 : out;
+}
+
 /* D3D samples A8_UNORM as (0, 0, 0, A); Beer stores it as R8, so its views read (0, 0, 0, R). */
 uint32_t bd12_dxgi_view_swizzle(uint32_t f)
 {

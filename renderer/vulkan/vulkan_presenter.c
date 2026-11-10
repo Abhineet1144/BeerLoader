@@ -931,6 +931,8 @@ int vulkan_presenter_present_resource_rgba8(void *display, unsigned long window,
                                  output_width, output_height);
 }
 
+int beer_post_screenshot_pending(void);
+
 int vulkan_presenter_present_image(void *display, unsigned long window,
                                    uint64_t source_image, uint32_t source_layout,
                                    int width, int height, int direct_blit,
@@ -941,6 +943,10 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
     VkImage source = (VkImage)(uintptr_t)source_image;
     if (beer_vulkan_device_lost()) return 0;
     if (getenv("BEER_PRESENT_SKIP_ALL")) return 1;
+    /* A back buffer that is normally blitted straight to the swapchain (BGRA8, R10G10B10A2) goes through the RGBA8
+     * upload image and the post pass on a frame that takes a screenshot: the blit into it converts the format. */
+    int convert = 0;
+    if (direct_blit && beer_post_screenshot_pending()) { convert = 1; direct_blit = 0; }
     record_direct_present(sequence, "enter", source_image, source_layout,
                           width, height, output_width, output_height, -1,
                           VK_SUCCESS);
@@ -1065,9 +1071,19 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .extent = { (uint32_t)width, (uint32_t)height, 1 }
         };
-        g_vk.CmdCopyImage(g_vk.command_buffer, source,
-                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_vk.upload_image,
-                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        if (convert) {
+            const VkImageBlit whole = {
+                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .srcOffsets = { { 0, 0, 0 }, { width, height, 1 } },
+                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .dstOffsets = { { 0, 0, 0 }, { width, height, 1 } }
+            };
+            g_vk.CmdBlitImage(g_vk.command_buffer, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_vk.upload_image,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole, VK_FILTER_NEAREST);
+        } else
+            g_vk.CmdCopyImage(g_vk.command_buffer, source,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_vk.upload_image,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         VkImage processed = vulkan_post_apply(g_vk.command_buffer, g_vk.upload_image, (uint32_t)width, (uint32_t)height,
                                               g_vk.extent.width, g_vk.extent.height, &overlay_blended);
         VkImageMemoryBarrier upload_read = to_read[1];

@@ -995,10 +995,41 @@ static void MS queue_tile_noop(void)
                         "mappings are not applied\n");
 }
 
+/* UpdateTileMappings: still a no-op (fully resident). BEER_TILE_LOG=1 logs what is asked for (first calls in detail,
+ * then at powers of two) and any placed resource sharing a tile-mapped heap. */
+static void MS queue_update_tile_mappings(ComQueue *q, ComResource *r, uint32_t regions, const uint32_t *coords,
+                                          const uint8_t *sizes, ComHeap *heap, uint32_t ranges,
+                                          const uint32_t *range_flags, const uint32_t *heap_starts,
+                                          const uint32_t *range_counts, uint32_t flags)
+{
+    (void)q;
+    queue_tile_noop();
+    static int log = -1;
+    if (log < 0) log = getenv("BEER_TILE_LOG") != NULL;
+    if (heap && !atomic_exchange(&heap->tile_mapped, 1) && log)
+        fprintf(stderr, "[BD12 TILE] heap %p first tile-mapped; %u placed resources already on it, heap size %llu\n",
+                (void *)heap, atomic_load(&heap->placed_count), (unsigned long long)*(const uint64_t *)heap->desc);
+    static _Atomic uint32_t calls;
+    const uint32_t n = atomic_fetch_add(&calls, 1);
+    if (log && (n < 40 || (n & (n - 1)) == 0)) {
+        fprintf(stderr, "[BD12 TILE] #%u res=%p dim=%u fmt=%u %llux%ux%u mips=%u heap=%p regions=%u ranges=%u flags=0x%x",
+                n, (void *)r, r ? r->dimension : 0, r ? r->dxgi_format : 0, r ? (unsigned long long)r->width : 0ull,
+                r ? r->height : 0, r ? r->depth_or_layers : 0, r ? r->mips : 0, (void *)heap, regions, ranges, flags);
+        for (uint32_t i = 0; i < regions && i < 3 && coords; ++i)
+            fprintf(stderr, " | c%u=%u,%u,%u,s%u sz=%u box=%u", i, coords[i * 4], coords[i * 4 + 1], coords[i * 4 + 2],
+                    coords[i * 4 + 3], sizes ? *(const uint32_t *)(sizes + 16 * i) : 1u,
+                    sizes ? *(const uint32_t *)(sizes + 16 * i + 4) : 0u);
+        for (uint32_t i = 0; i < ranges && i < 3; ++i)
+            fprintf(stderr, " | r%u f=%u start=%u n=%u", i, range_flags ? range_flags[i] : 0u,
+                    heap_starts ? heap_starts[i] : 0u, range_counts ? range_counts[i] : 0u);
+        fputc('\n', stderr);
+    }
+}
+
 static void *queue_vtable[19] = {
     [0] = queue_query, [1] = com_add_ref, [2] = com_release,
     [3] = com_obj_get_private, [4] = com_obj_set_private, [5] = com_obj_set_private_iface,
-    [6] = com_obj_set_name, [7] = com_obj_get_device, [8] = queue_tile_noop,
+    [6] = com_obj_set_name, [7] = com_obj_get_device, [8] = queue_update_tile_mappings,
     [9] = queue_tile_noop, [10] = queue_execute, [11] = queue_marker,
     [12] = queue_marker, [13] = queue_end_event, [14] = queue_signal,
     [15] = queue_wait, [16] = queue_frequency, [17] = queue_clock,
@@ -2273,8 +2304,14 @@ static void MS dev_create_srv_impl(ComDevice *self, ComResource *r,
     }
     mips = clamp_mips(mips, mip, total_mips);
     if (count == UINT32_MAX) count = layers - first;
-    bd12_descriptor_write_image_srv_mapped(&heap, 0, r->image, type, format, mip, mips, first, count,
-                                           bd12_dxgi_view_swizzle(desc && rd32(desc) ? rd32(desc) : r->dxgi_format));
+    /* A stencil-plane format (X24_TYPELESS_G8_UINT, X32_TYPELESS_G8X24_UINT) reads the stencil aspect; any other
+     * view of a depth-stencil image reads depth. Shader4ComponentMapping (desc + 8) is applied to the view. */
+    const uint32_t view_dxgi = desc && rd32(desc) ? rd32(desc) : r->dxgi_format;
+    const VkImageAspectFlags aspect =
+        bd12_dxgi_reads_stencil(view_dxgi) && (r->image->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ?
+            VK_IMAGE_ASPECT_STENCIL_BIT : 0;
+    bd12_descriptor_write_image_srv_view(&heap, 0, r->image, type, format, mip, mips, first, count, aspect,
+                                         bd12_dxgi_srv_swizzle(view_dxgi, desc ? rd32(desc + 8) : 0, desc != NULL));
 }
 
 static void MS dev_create_uav_impl(ComDevice *self, ComResource *r, ComResource *counter,
@@ -2522,6 +2559,10 @@ static HR MS dev_create_placed(ComDevice *self, ComHeap *heap, uint64_t offset,
 {
     (void)clear;
     if (!heap) return HR_E_INVALIDARG;
+    if (atomic_fetch_add(&heap->placed_count, 1) < 8 && atomic_load(&heap->tile_mapped) && getenv("BEER_TILE_LOG"))
+        fprintf(stderr, "[BD12 TILE] placed resource on tile-mapped heap %p offset=%llu dim=%u width=%llu\n",
+                (void *)heap, (unsigned long long)offset, desc ? *(const uint32_t *)desc : 0u,
+                desc ? (unsigned long long)*(const uint64_t *)(desc + 16) : 0ull);
     return create_resource(self, heap, offset, heap->desc + 8, 0, desc, state,
                            riid, out);
 }
@@ -2696,7 +2737,7 @@ static HR MS dev_create_command_signature(ComDevice *self, const uint8_t *desc,
  * smaller than a tile in any dimension; every array slice has its own tail, after its standard mips.
  * Output structs: D3D12_PACKED_MIP_INFO {u8 standard, u8 packed, u32 tiles, u32 start} (12 bytes),
  * D3D12_TILE_SHAPE {u32 w, h, d}, D3D12_SUBRESOURCE_TILING {u32 width, u16 height, u16 depth, u32 start}. */
-static void bd12_standard_tile_shape(const ComResource *r, uint32_t shape[3])
+void bd12_standard_tile_shape(const ComResource *r, uint32_t shape[3])
 {
     shape[0] = 65536; shape[1] = shape[2] = 1;
     if (r->dimension == 1) return;

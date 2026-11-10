@@ -109,6 +109,15 @@ static void request_screenshot(int clean)
     post.shot_pending = 1;
 }
 
+/* Nonzero while a screenshot is requested and not yet taken (the presenter routes that frame through the post pass). */
+int beer_post_screenshot_pending(void)
+{
+    pthread_mutex_lock(&post.lock);
+    const int pending = post.shot_pending;
+    pthread_mutex_unlock(&post.lock);
+    return pending;
+}
+
 int beer_post_take_screenshot(char *path, size_t size, int *clean)
 {
     pthread_mutex_lock(&post.lock);

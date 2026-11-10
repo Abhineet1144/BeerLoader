@@ -1075,6 +1075,11 @@ int bd12_descriptor_write_image_srv(BD12DescriptorHeap *heap, uint32_t index,
                                     uint32_t mip_count, uint32_t base_layer,
                                     uint32_t layer_count);
 /* As bd12_descriptor_write_image_srv, with the view's component swizzle (bd12_dxgi_view_swizzle). */
+int bd12_descriptor_write_image_srv_view(BD12DescriptorHeap *heap, uint32_t index,
+                                         BD12Image *image, VkImageViewType type,
+                                         VkFormat format, uint32_t base_mip,
+                                         uint32_t mip_count, uint32_t base_layer,
+                                         uint32_t layer_count, VkImageAspectFlags aspect, uint32_t swizzle);
 int bd12_descriptor_write_image_srv_mapped(BD12DescriptorHeap *heap, uint32_t index,
                                            BD12Image *image, VkImageViewType type,
                                            VkFormat format, uint32_t base_mip,

@@ -15,5 +15,6 @@ uint32_t bd12_dxgi_bytes(uint32_t dxgi);
 int bd12_dxgi_is_compressed(uint32_t dxgi);
 /* 1 when the SRV format reads the stencil plane of a depth-stencil image. */
 int bd12_dxgi_reads_stencil(uint32_t dxgi);
+uint32_t bd12_dxgi_srv_swizzle(uint32_t dxgi, uint32_t mapping, int has_mapping);
 
 #endif

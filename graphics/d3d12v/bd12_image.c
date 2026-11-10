@@ -809,6 +809,17 @@ int bd12_descriptor_write_dsv(BD12DescriptorHeap *heap, uint32_t index,
                                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 }
 
+/* SRV of one aspect (0: the image's default) with a component swizzle (bd12_dxgi_srv_swizzle). */
+int bd12_descriptor_write_image_srv_view(BD12DescriptorHeap *heap, uint32_t index,
+                                         BD12Image *image, VkImageViewType type,
+                                         VkFormat format, uint32_t base_mip,
+                                         uint32_t mip_count, uint32_t base_layer,
+                                         uint32_t layer_count, VkImageAspectFlags aspect, uint32_t swizzle)
+{
+    return write_image_mapped(heap, index, BD12_DESC_SRV_IMAGE, image, type, format, base_mip,
+                              mip_count, base_layer, layer_count, aspect, swizzle);
+}
+
 int bd12_descriptor_write_image_srv_mapped(BD12DescriptorHeap *heap, uint32_t index,
                                            BD12Image *image, VkImageViewType type,
                                            VkFormat format, uint32_t base_mip,

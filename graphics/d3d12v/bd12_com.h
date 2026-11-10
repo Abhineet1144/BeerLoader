@@ -144,6 +144,8 @@ typedef struct ComHeap {
     ComObj obj;
     BD12Heap *heap;
     uint8_t desc[48];
+    _Atomic uint32_t placed_count;   /* diagnostics: placed resources / tile mappings using this heap */
+    _Atomic uint32_t tile_mapped;
 } ComHeap;
 
 /* ID3D12QueryHeap: a Vulkan query pool. D3D12 heap types: 0 occlusion,
@@ -172,6 +174,8 @@ typedef struct ComResource {
     uint32_t planes;              /* 2 for combined depth/stencil */
     uint32_t reserved;            /* CreateReservedResource: fully-resident emulation */
 } ComResource;
+/* D3D12 standard 64 KiB tile shape of a resource in texels (bd12_com.c, also used by CopyTiles). */
+void bd12_standard_tile_shape(const ComResource *r, uint32_t shape[3]);
 
 typedef struct ComDescHeap {
     ComObj obj;
