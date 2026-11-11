@@ -38,6 +38,13 @@ static VkPipelineStageFlags2 bd12_mesh_stages(void)
     }
     return cached ? (VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT) : 0;
 }
+/* Ray-tracing shaders (DispatchRays) write UAVs too; their stage bit is valid only with VK_KHR_ray_tracing_pipeline. */
+static VkPipelineStageFlags2 bd12_rt_stages(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = beer_vulkan_ray_tracing_enabled() ? 1 : 0;
+    return cached ? VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR : 0;
+}
 
 void bd12_state_sync(uint32_t state, int is_source,
                      VkPipelineStageFlags2 *stage, VkAccessFlags2 *access)
@@ -63,9 +70,11 @@ void bd12_state_sync(uint32_t state, int is_source,
              VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
     }
     if (state & BD12_STATE_UNORDERED_ACCESS) {
-        s |= BD12_ALL_SHADER_STAGES | bd12_mesh_stages();
+        /* ClearUnorderedAccessView* is a UAV write too, recorded as a transfer fill/clear: the state covers it so the
+         * application's transitions and UAV barriers order clears (bd12_extra.c) without a drain of their own. */
+        s |= BD12_ALL_SHADER_STAGES | bd12_mesh_stages() | bd12_rt_stages() | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
         a |= VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
     }
     if (state & (BD12_STATE_DEPTH_WRITE | BD12_STATE_DEPTH_READ | BD12_STATE_DEPTH_READ_STENCIL_WRITE)) {
         s |= VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
@@ -255,6 +264,30 @@ void bd12_cmd_record_flight_op(BD12CmdList *list, BD12FlightOpType type,
                              list->command_buffer_count - 1 };
 }
 
+int bd12_list_barrier_mode(void)
+{
+    static int mode = -1;
+    if (mode >= 0) return mode;
+    const char *v = getenv("BEER_BD12_LIST_BARRIER");
+    if (v && !strcmp(v, "list")) mode = BD12_LIST_BARRIER_LIST;
+    else if (v && !strcmp(v, "submit")) mode = BD12_LIST_BARRIER_SUBMIT;
+    else if (v && !strcmp(v, "none")) mode = BD12_LIST_BARRIER_NONE;
+    else {
+        const BeerVulkanModern *m = beer_vulkan_modern();
+        switch (m ? m->driver_id : 0) {
+        case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+        case VK_DRIVER_ID_AMD_PROPRIETARY:
+        case VK_DRIVER_ID_AMD_OPEN_SOURCE:
+        case VK_DRIVER_ID_MESA_RADV: mode = BD12_LIST_BARRIER_NONE; break;
+        default: mode = BD12_LIST_BARRIER_SUBMIT; break;
+        }
+    }
+    static const char *const names[] = { "none (driver orders submissions)", "one per submission",
+                                         "one per command list" };
+    fprintf(stderr, "[BD12] submission ordering barrier: %s\n", names[mode]);
+    return mode;
+}
+
 int bd12_cmd_list_begin(BD12CmdList *list)
 {
     list->command_buffer_count = 1;
@@ -267,7 +300,7 @@ int bd12_cmd_list_begin(BD12CmdList *list)
         VK_SUCCESS)
         return 0;
     bd12_gpuprof_list_begin(list);
-    {   /* D3D12 makes everything earlier work on the queue wrote visible to a command list (state decay and
+    if (bd12_list_barrier_mode() == BD12_LIST_BARRIER_LIST) {   /* D3D12 makes everything earlier work on the queue wrote visible to a command list (state decay and
          * promotion at ExecuteCommandLists boundaries). Every submission goes to one Vulkan queue, and a barrier's
          * first scope covers all earlier submissions on it, so this one barrier gives that ordering on the GPU
          * without chaining submissions through a semaphore wait. */
@@ -449,8 +482,32 @@ void bd12_cmd_uav_barrier_buffer(BD12CmdList *list, BD12Buffer *buffer)
     VkPipelineStageFlags2 stage;
     VkAccessFlags2 access;
     bd12_state_sync(BD12_STATE_UNORDERED_ACCESS, 0, &stage, &access);
-    buffer_barrier(list, buffer, stage, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    buffer_barrier(list, buffer, stage, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
                    stage, access);
+}
+
+/* A UAV barrier without a resource, mapped as vkd3d-proton maps it: one memory barrier over the UNORDERED_ACCESS state,
+ * i.e. every shader stage with generic SHADER_READ | SHADER_WRITE (which also covers a UAV write read back through an
+ * SRV, texel or uniform path), plus acceleration-structure builds when ray tracing is on (scratch buffers and RTAS are
+ * synchronised with UAV barriers). It used to be a full ALL_COMMANDS / MEMORY_READ|WRITE drain, ~370 per frame in RE9.
+ * (A first attempt with only SHADER_STORAGE_READ/WRITE hung RE9, 2026-11-11.) BEER_BD12_UAV_BARRIER=full: the old drain. */
+void bd12_cmd_uav_barrier_all(BD12CmdList *list)
+{
+    static int full = -1;
+    if (full < 0) { const char *v = getenv("BEER_BD12_UAV_BARRIER"); full = v && !strcmp(v, "full"); }
+    if (full) { bd12_cmd_global_barrier(list); return; }
+    /* + transfer: UAV clears are transfer fills/clears (bd12_extra.c). */
+    VkPipelineStageFlags2 stage = BD12_ALL_SHADER_STAGES | bd12_mesh_stages() | bd12_rt_stages() |
+                                  VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    VkAccessFlags2 src = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                   dst = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    if (beer_vulkan_ray_tracing_enabled()) {
+        stage |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        src |= VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        dst |= VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    }
+    bd12_cmd_end_rendering(list);
+    bd12_cmd_add_memory_barrier(list, stage, src, stage, dst);
 }
 
 void bd12_cmd_host_visibility(BD12CmdList *list, BD12Buffer *buffer)

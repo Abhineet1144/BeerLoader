@@ -1,6 +1,238 @@
 # Beer Loader — Active Development Context
 
+## WORK PLAN (read first, every session) — agreed 2026-11-11
+
+**DONE 2026-11-12 03:20: real sampler feedback (tier 0.9). RE8 RT renders correctly with NO fake env** (user
+confirmed; launch with `BEER_DXR=1 BEER_BD12_VRS=1 BEER_BD12_MESH=1` only). Implementation:
+VK_EXT_shader_image_atomic_int64 (modern->image_int64_atomics); OPTIONS7 SamplerFeedbackTier=90 when available;
+FEATURE_LEVELS 12_2 only when DXR(offered)+VRS2+mesh1+SF0.9+SM6.5 are all real; feedback maps (DXGI 189/190 via DESC1
+entry points, region read at DESC1+52 through `t_desc1`) = R64_UINT storage images, padded extent (region grid rounded
+to 16, low 4 bits = log2 region, dxil-spirv convention), 1 mip; CreateSamplerFeedbackUnorderedAccessView = R64
+storage-image view; translator maps FEEDBACK_TEXTURE_2D(_ARRAY); ClearUAV zeroes; ResolveSubresourceRegion
+(List1 slot 64, was a no-op) modes 4/5 via bd12_feedback.c: copy map/R8 to scratch, BDA compute
+(graphics/d3d12v/shaders/sampler_feedback.comp -> bd12_sampler_feedback_spv.h via tools/gen_sampler_feedback_spv.sh),
+copy back. Shader-side WriteSamplerFeedback + decode are NOT yet exercised by a real title (RE8 only checks the bit):
+needs a synthetic test or a game that uses feedback maps.
+Remaining fake audit: `BEER_DXR_FEATURES` path hard-codes OPTIONS/OPTIONS1 (incl. TotalLaneCount 0x2800) - opt-in only.
+Former plan for reference: **NEXT (user, 2026-11-12): remove every load-bearing fake, first sampler feedback.** RE8 RT only works with
+`BEER_FAKE_FEATURES=32 BEER_FAKE_OPTIONS7=feedback` (it gates its SM 6.5 ray-query pack on SamplerFeedbackTier != 0).
+Plan: (1) enable VK_EXT_shader_image_atomic_int64 (supported), report tier 0.9 like vkd3d-proton (enough for FL 12_2);
+(2) formats 189/190 as R64 storage images on the mip-region grid (CreateCommittedResource2/Placed1 SamplerFeedbackMipRegion);
+(3) ID3D12Device8::CreateSamplerFeedbackUnorderedAccessView; (4) translator: bind dxil-spirv FeedbackTexture2D(Array)
+(its WriteSamplerFeedback* lowering emits R64 image atomics); (5) ResolveSubresourceRegion DECODE/ENCODE_SAMPLER_FEEDBACK
+with own glslc compute shaders (MinMip / MipRegionUsed R8 layouts); (6) clears/barriers; (7) test RE8 RT with NO fake env
+(shader dump shows SM 6.5 + RayQuery), plus RE8 non-RT gate. Also re-audit: no other fake answer may be needed by any game.
+**Then, in order (agreed 2026-11-12):**
+2. **RE8 RT performance**: user has seen RE8 do ~120 fps at 1.3x image quality with RT; Beer is lower, so something is
+   holding it back. Same method as RE9: `BEER_BD12_GPU_PROF=1` (+ `BEER_BD12_GPU_PROF_FRAME`), `BEER_BD12_HITCH`, top
+   shaders/ops, compare with Proton at the same spot; fix structurally (RE9 lesson: a single persistent-thread compute
+   was 3-4 ms because TotalLaneCount was 32).
+   First profile (2026-11-12 03:00, RE8 RT, 1.3x image quality, user spot: 90 fps at 1x, 83 fps at 1.3x; profiled
+   77 fps, 12.1 ms GPU/frame, log /mnt/hdd2/beer-tools/logs/re8_rtprof.log): ~800 tiny compute dispatches per frame
+   from three shaders = ~3 ms/frame (25%): `3d10379a895ac9` ~176/frame ~7 us each (9.6%), `8bf9b48baee646` and
+   `52cfdfb90ad7d0` ~319/frame each, always paired, ~2.5-3.5 us (15%). Then draw `4fc334bd4118ba` 6.6% (1/frame),
+   draw-idx-ind `a053dcc1f8001c` 4.9%, copy-img 4.5%. ~145 barriers, ~12 full drains, ~57 render passes per frame.
+   **User (2026-11-12): Proton reaches ~120 fps with the SAME settings at that spot => Beer-side gap (~83 vs ~120).**
+   Full hashes: 283d10379a895ac9, fe8bf9b48baee646, e052cfdfb90ad7d0 (shader cache file prefixes).
+   Next: dispatch sizes/barriers of the three (`BEER_BD12_TRACE_CS=<hash>` + `BEER_BD12_CALL_LOG=1`), whether their
+   count/size depends on something Beer reports (like RE9's TotalLaneCount), Proton comparison at the same spot.
+3. **DLSS visibility**: RE9 (Streamline sl.interposer) and other games do not detect DLSS. Log shows Streamline trying
+   `nvngx_update.exe` for sl_dlss / sl_dlss_g / sl_reflex. Find why the plugins fail (NGX/nvngx.dll path, NVAPI entry
+   points, CUDA interop via bd12_cuda). Fixing it may give DLSS and DLSS frame generation together.
+4. **FSR frame generation (RE9)**: first just try the in-game option and see what breaks (FSR3 FG swaps the DXGI
+   swapchain for its own and needs async compute/present queues); then implement what is missing.
+**Rule 1: one item at a time, each with a "done" test; finish it before the next.** Anything new goes to the parked list
+below unless it blocks the current item.
+**Rule 2: architecture first.** Never push frame rate inside an inefficient design. The target architecture is root push +
+descriptor buffers + storage buffers (vkd3d-proton shape). The per-draw descriptor path and heap mirror are retired,
+not tuned. When a game is slower than Proton, first find the structural difference (binding model, queues, memory
+placement, barriers, shader translation), then fix that. No per-game hacks, caps or fps tricks.
+**Rule 3: measured against Proton.** Each game has a fixed save/spot with Proton numbers (fps, GPU W/load, RAM, VRAM).
+Claims of "faster" or "fixed" need those numbers.
+
+0. **Session start:** keep a read-only reference clone of vkd3d-proton at `/mnt/hdd2/ref/vkd3d-proton` (outside the Beer
+   tree). It is a guide for design and behaviour only: never copy its code into Beer (user's rule; LGPL). Before any perf
+   change, compare how vkd3d-proton handles that case structurally.
+1. **Finish the base:** dxil-spirv 2.78 in third_party (built at /mnt/hdd2/dxil-spirv-new) + storage-buffer mode default.
+   Done = RE8, RE9, RE4, PRAGMATA, GoT title render correctly, no Xid. Then commit.
+   - 2026-11-11 evening: third_party/dxil-spirv is now 7506dc1 (2.78.0; old 2.75.0 .so kept beside it, old revision
+     8434b06). SSBO mode is the default (`BEER_BD12_SSBO=0` = old texel path). Policy (layout hash ssbo_heap=3): every
+     raw/structured heap view is an SSBO with set-3 offsets, as vkd3d-proton's shaders see them outside heap lowering
+     (it also stores a texel sibling for odd strides; dxil-spirv cannot do 64-bit raw loads on texel buffers, so a
+     stride-based texel rule dropped ~3000 GoT dispatches).
+   - Validation on the new default (no env): RE8 OK (median 173 fps), RE9 OK (usual spot 62 -> 75-82 fps, GPU 96% /
+     151 W), RE4 OK (heavy first-launch stutter = full re-translation + pipeline compile after the cache reset; settles),
+     PRAGMATA runs (15k+ frames, ~75 fps in game) but stutters while moving: 240-490 ms hitches with pso=0 (no
+     compiles), present 1.8 ms/call in those windows (frames late), cgroup 7.2 GB < MemoryHigh, no memory.events,
+     ~234 MB swapped, VRAM 12/16 GB, DXGI QueryVideoMemoryInfo reports only ~0.9 GB usage to the game (suspicious:
+     RE Engine streams by that budget). -> step 4 perf item. GoT title: to re-check.
+2. **Correctness gate:** RE9 intermittent start-up GPU fault (unattended launch loops while the user is away) and the
+   GoT gameplay hang (compute 524c7c2e7e8bd58d). Done = 10 clean launches per game.
+   - GoT gameplay hang, 2026-11-11 evening findings (step 2, in progress):
+     - Same hang with every SSBO policy and with `BEER_DSTORAGE_CPU=1`; checkpoints always in compute
+       `524c7c2e7e8bd58d` (1x1x1, 512 threads, workgroup arrays, loops, 64-bit raw loads; it never ran before SSBO mode).
+     - Fixed on the way (generic, matches vkd3d-proton `d3d12_command_list_set_root_signature`): root arguments now
+       survive a root-signature change (only per-draw constant scratch copies are invalidated). Did not fix the hang.
+     - `BEER_BD12_TRACE_CS` (now prints every table slot + SSBO metadata + root constants) and `BEER_BD12_CALL_LOG=1`
+       (per-list ring of the last 48 compute binding calls, dumped at the traced dispatch): GoT alternates root
+       signatures (…2d50 / …3050) setting only table 1 (a 12 MB raw SRV, SSBO, meta offset 0) and root constants
+       (word 0 = 0x1a1000, 0x1a1230, … per dispatch). Tables 2-5 (CBV x11, SRV x22, sampler x3, UAV x12) are never set.
+     - Tables 2-5 are a red herring: all three cached translations read push words 0-3 only as dxil-spirv's uint4 load
+       of the root-constant cbuffer b14 (component .x used). Inputs are correct: root constant .x (an offset stepping
+       0x1a1000, 0x1a1230, ...) and table 1 = a 12 MB raw SRV (SSBO, meta offset 0, va 0x1cf90000).
+     - So the loop comes from the *contents* of that 12 MB buffer at the dispatch (data not written yet / wrong:
+       sync or an earlier pass), the same pattern as the RE9 multi-queue hang (1x1x1 compute looping on buffer data).
+     - Next: extend `BEER_BD12_CAPTURE_CS` to descriptor-buffer dispatches (copy table-1 buffer range around the
+       traced dispatch to readback, dump), load once, decode what the shader parses at that offset; find who writes
+       the buffer (copy queue / DirectStorage / earlier dispatch) and whether its fence/barrier is honoured.
+   - RE9 start-up fault seen again 2026-11-11 23:57 on the new default as **Xid 31 (MMU fault, channel 0xd)**: the GPU
+     touched an unmapped address (stale/freed buffer VA, e.g. in a descriptor or BDA), more specific than the earlier
+     13/32/69.
+3. **Proton baselines** for each game (fixed save + spot), recorded in a table here. Sampler:
+   `/mnt/hdd2/beer-tools/sample.sh <label> <process pattern> 20` (GPU util/W/VRAM, game RSS); fps from MangoHud
+   (Proton, read by the user) and the BD12 fps log (Beer). Raw data: `/mnt/hdd2/beer-tools/baselines/results.tsv`.
+   Same config.ini for both (RE Engine keeps it in the game folder). Saves: Beer's RE8 saves copied into the Proton
+   prefix (3306354235) with `steam_emu.ini AccountId=1638` = Beer's SteamID account (backups in /mnt/hdd2/beer-backup).
+
+   | Game / spot (2026-11-11) | Proton 11.0 | Beer (default) |
+   |---|---|---|
+   | RE8 castle | ~146 fps (1% ~100), GPU 91% 150 W, VRAM 8.4 G, RAM 3.5 G | ~144 fps (140-150), GPU 88% 167 W, VRAM 9.0 G, RAM 4.7 G |
+   | RE8 light-shaft | ~110 fps (1% ~90), GPU 97% 257 W, VRAM 8.7 G, RAM 3.5 G | ~129 fps (121-137), GPU 96% 243 W, VRAM 9.4 G, RAM 4.7 G |
+
+   | RE9 initial scene | ~70 fps (1% ~55), GPU 81% 122 W, VRAM 10.0 G, RAM 6.3 G | ~58 fps (57-59), GPU 80% 111 W, VRAM 11.4 G, RAM 7.6 G |
+
+   RE9: Beer ~17% behind in the same scene. Both GPUs ~80% busy with the same idle share, so it is NOT a CPU/sync gap:
+   GPU time per frame is ~13.8 ms (Beer) vs ~11.6 ms (Proton). RAM +1.3 GB, VRAM +1.4 GB.
+   - Step 4 RE9 (2026-11-12): NULL UAV barriers now mapped like vkd3d-proton (UNORDERED_ACCESS state: all shader stages,
+     SHADER_READ|SHADER_WRITE, + AS build with RT) instead of an ALL_COMMANDS drain: full drains 58.7k -> 3.2k per 2 s,
+     RE9 58 -> ~62 fps (GPU ~12.9 ms/frame), no visual issues or faults. `BEER_BD12_UAV_BARRIER=full` = old drain.
+     Gap now ~11%. Also: deferred frees no longer *wait* for the presenter's last blit (postponed instead;
+     `BEER_BD12_REAP_WAIT=1` = old); no measurable fps change but removes a render-thread stall.
+   - Reverted (opt-in `BEER_BD12_KEEP_ROOT_ARGS=1`): carrying root arguments across root-signature changes made every
+     RE9 start fault (Xid 31 MMU fault in GR0_PBDMA, 3/3) even with a same-type check; GoT never needed it.
+   - dxil-spirv device options like vkd3d-proton (2026-11-12): VK_NV_raw_access_chains enabled
+     (`BEER_VK_RAW_ACCESS_CHAINS=0` disables), SCALAR_BLOCK_LAYOUT (per-component robustness only on AMD),
+     CONSERVATIVE_SSBO_VECTORIZATION on NVIDIA; caps in the shader disk-cache key (`[DXIL] caps:` log line).
+     RE9 initial scene ~62 -> ~63-64 fps, GPU 80% 113 W, VRAM 11.5 G, RAM 6.8 G: within noise, no visual change reported.
+     So shader SSBO codegen is NOT the gap. GPU ~80% busy at LOWER power than Proton (113 vs 122 W) = bubbles/stalls,
+     not ALU: next suspects are the single VkQueue (async compute serialized), ~27 full drains and ~70 render passes
+     per frame. First start of this run hit the known startup Xid 31 (GR0_PBDMA); attempt 2 fine.
+   - **REGRESSION found + fixed (2026-11-12, 02:45): VK_NV_raw_access_chains hangs RE8 at start-up** (Xid 109 CTX
+     SWITCH TIMEOUT, frames stop; plain and RT configs). Bisected with env switches: list barrier / clear sync not it;
+     `BEER_VK_RAW_ACCESS_CHAINS=0` alone fixes it. Now OPT-IN (`=1`); scalar block layout stays on. Suspect: raw
+     access chains + Beer's SSBO heap offset emulation (SSBO_ALIGNMENT/offset buffer) in dxil-spirv; RE9 never showed
+     a gain from it. Lesson: run the RE8 gate after every default change, not only RE9.
+   - Command-list start barrier removed like vkd3d-proton (2026-11-12): Beer put an ALL_COMMANDS->ALL_COMMANDS
+     MEMORY_WRITE->READ|WRITE barrier at the start of EVERY command list; vkd3d-proton emits none, and between
+     submissions only on drivers that don't order them (not NVIDIA/AMD/RADV: one prebuilt barrier cb per submit).
+     Beer now: `BEER_BD12_LIST_BARRIER=none|submit|list` (default none on NVIDIA/AMD/RADV, submit elsewhere; log
+     "[BD12] submission ordering barrier:"). RE9 initial scene ~63 fps: NO change, started fine first try.
+     => two vkd3d-shaped fixes, both no gain: stop guessing; next = per-pipeline GPU timing to find where the
+     ~1-2 ms/frame goes.
+   - **GPU profile found it: TotalLaneCount (2026-11-12).** `BEER_BD12_GPU_PROF=1` at the RE9 spot: one compute,
+     `87034edcf26367` (LocalSize 32, ONE dispatch/frame, atomics + ring queue of 512 + polling AtomicOr loops =
+     persistent-thread work queue), took 17-29% of all GPU time (3-4 ms/frame). Beer reported D3D12 OPTIONS1
+     TotalLaneCount = 32 (one wave), so the game ran its whole queue on one wave. Now derived like vkd3d-proton:
+     NVIDIA SMs x warps/SM x 2 (VK_NV_shader_sm_builtins; 4070 Ti S = 6336), AMD CUs x 64, else 32 x subgroup.
+     Log `[BD12] TotalLaneCount`. Shader dropped out of the top list; profiled fps 50 -> 62; plain ~63 -> ~65-68.
+     Symptom to search: "single compute dispatch dominates GPU time", "persistent threads", "work queue slow".
+   - UAV clears no longer drain first (2026-11-12): pre-clear ALL_COMMANDS->TRANSFER barrier dropped (vkd3d-proton has
+     none); UNORDERED_ACCESS state, UAV barriers (global + per resource) now include ALL_TRANSFER + TRANSFER_WRITE so the
+     app's barriers order transfer-based clears. Post-clear TRANSFER->ALL kept. `BEER_BD12_CLEAR_SYNC=full` = old.
+     RE9 spot: ~69-71 fps (Proton ~70), ~119 W, GPU busy fell 80% -> ~70%: Beer now needs ~10 ms GPU/frame vs
+     Proton ~11.6 ms; the GPU waits on the game's CPU frame.
+   - CPU profile at the spot (`BEER_PROF_SAMPLE=wait`, SIGUSR2 start/stop -> /tmp/beer-prof.txt; NOTE the BD12 SIGPROF
+     sampler `BEER_BD12_SAMPLE` crashes RE9: no SA_ONSTACK and guest stacks are 16 KiB): excluding DirectStorage,
+     ~70% of game-thread samples are re9.exe code, Beer's D3D12/sync code only a few % => game CPU bound, not Beer.
+     DirectStorage worker ("DirectStorage W") spins one full core in user space: polling WaitForMultipleObjects +
+     GetQueuedCompletionStatus + SRW fast paths that return immediately.
+   - **I/O completion ports are now waitable (2026-11-12).** `BEER_WAIT_LOG_THREAD=DirectStorage` showed every
+     `WaitForMultipleObjects(n=3, ms=5000)` returning WAIT_FAILED: one handle was the IOCP (0x34000000), which
+     wait_handle_poll did not know. Now: a port is signaled while packets are queued (no dequeue), registered with
+     the wait buckets (WAIT_OBJECT_IOCP) and notified by iocp_post; WaitForSingleObject on a port goes the same way.
+     DirectStorage worker 100% -> ~7% of a core at the RE9 spot; fps unchanged (~69): the game itself is the limit.
+     Symptom to search: "DirectStorage W thread 100% CPU", "WaitForMultipleObjects returns WAIT_FAILED".
+   - **RE9 4-5 s freeze ~1 min into gameplay, every launch: FIXED (2026-11-12).** `BEER_WAIT_DIAGNOSTICS=1`: every
+     game thread blocked ~4-5 s on normal waits; `BD12 PROF` showed `pso=3779ms/1` = one "pipeline build" that was
+     really bd12_pipeline_cache_save(): GetPipelineCacheData of the WHOLE 1.1 GB VkPipelineCache + fwrite to ntfs-3g,
+     run inline on the game thread that built the 25th new pipeline (once a minute). Periodic saves now run on a
+     background thread (`beer-pcache`, nice 10), every 5 min (`BEER_BD12_PIPELINE_CACHE_SAVE_S`), and are skipped when
+     the content hash is unchanged (cache hits count as "new" builds). NOTE: `BEER_PROF_SAMPLE` (SIGPROF) during RE9's
+     load crashes the game (guest NULL access); use /mnt/hdd2/beer-tools/threadmon.sh (no signals) instead.
+   - **RE9 load into gameplay ~50-60 s -> ~30 s; RAM 7.7 -> 5.2 GiB (2026-11-12).** Two caches were full:
+     (1) NVIDIA's shader disk cache is keyed by executable: every Beer game runs as `./loader`, so all games shared ONE
+     ~1 GB GLCache and evicted each other (RE9 recompiled ~900 pipelines, 60 s of compile time, on every load).
+     The loader now sets, per program (unless already set): `__GL_SHADER_DISK_CACHE_PATH=<cache>/driver/<exe>`,
+     `__GL_SHADER_DISK_CACHE=1`, `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`, `MESA_SHADER_CACHE_DIR`, `MESA_SHADER_CACHE_MAX_SIZE=10G`
+     (as Steam does for Proton games; `BEER_DRIVER_CACHE=0` disables). (2) Beer's own VkPipelineCache file had
+     stopped growing at 1.13 GB and cost ~1.5 GB RSS. On drivers with a disk cache (NVIDIA, RADV, ANV, Turnip, NVK)
+     Beer now keeps an in-memory VkPipelineCache only (no file); others keep the file (`BEER_BD12_PIPELINE_CACHE=1|0`).
+     Pitfalls found on the way: VK_NULL_HANDLE cache made RE9 ~60 fps (GPU 36%) - keep a cache object; the D3D12
+     pipeline-library identity was only set inside the cache-file block (zero identity -> RE9 rebuilt every pipeline
+     at the title, 85 s) - now always set.
+     Result at the RE9 spot: ~100 fps (Proton ~70), GPU 72% 144 W, RAM 5.2 GiB (Proton 6.3), VRAM 11.3 GiB (Proton
+     10.0). Unproven: the jump from ~70 may be the 8500M MemoryHigh throttle no longer being hit.
+   - **RE9 camera-turn stutter: better, not gone (2026-11-12).** Proton is smooth there. New diagnostics:
+     `BEER_BD12_HITCH=<ms>` prints, per slow frame, BD12 work (pso, heap/resource/view create, descriptor copies,
+     submit), the presenting thread's waits (total + longest handle/caller), its user/sys CPU, faults and
+     voluntary/involuntary switches; `BEER_BD12_GPU_PROF_FRAME=<ms>` (with GPU_PROF) sums GPU time per frame.
+     Findings: no pipeline compiles in hitches, no GPU-time spikes (no frame >25 ms GPU), BD12 work ~3-8 ms; the rest
+     was the game's own CPU work on the render thread (~20 ms user) with ~10 involuntary switches per frame.
+     Root causes fixed (generic):
+       (1) GetLogicalProcessorInformation(Ex) reported every logical CPU as its own identical core: now real cores
+           from sysfs thread_siblings, SMT flag, hybrid EfficiencyClass (E-cores 0, from /sys/devices/cpu_atom/cpus or
+           max-frequency classes). Log `[LOADER] CPU topology`.
+       (2) New guest threads inherited the creator's affinity (Linux) instead of the process affinity (Windows): RE9
+           pins its spawner, so 57 of 71 threads shared 10-11 logical CPUs incl. E-cores. win_thread_trampoline now
+           resets affinity to the process mask. Now 67 threads on 0-19, 3 deliberately pinned.
+     After: involuntary switches per hitch 10 -> 3, user reports "better, not the best yet". Remaining hitch frames
+     (~30-45 ms) are still ~20 ms of game CPU on the render thread. Next ideas: per-API call counts on the render
+     thread without BEER_API_TRACE (trampoline counter), CPU sets (GetSystemCpuSetInformation is only an export name),
+     SetThreadIdealProcessor is ignored. NOTE: BEER_PROF_SAMPLE (SIGPROF) crashes RE9 in gameplay too.
+   RE8: fps parity / ahead. Gaps: RAM +1.2 GB, VRAM +0.6 GB, castle power +11%; one 4 s stall on the way to the
+   light-shaft spot (unprofiled). User suspects the Proton RE8 run has an issue of its own.
+4. **One game at a time to Proton parity** (within ~10% at its spot, renders right): RE8 (RT, light-shaft pass) -> RE9
+   (DX12U mesh geometry, performance) -> GoT (cursor, gameplay).
+
+Parked: multi-queue (unsafe on RE9), RE4 1080p cap, 32-bit/WoW32, RE8 RT descriptor-buffer hang (re-test after item 1),
+Stellar Blade/BoR/Onimusha/WWM regression checks.
+
+
 RE9 Path: /home/tejas/Game/Resident Evil Requiem/re9.exe 
+## Ghost of Tsushima startup investigation (2026-11-10): locale contracts fixed; cookie overwrite captured
+
+- Reproduced with `BEER_DLL_BUILTIN=winmm`, default descriptor-set path, native bundled MSVC runtimes and no full API trace. The game still stops with FAST_FAIL 2; **startup is not fixed**.
+- **Generic locale fixes** in `loader.c`: `GetLocaleInfoEx` now shares `GetLocaleInfoW` instead of returning fabricated zeroes for most `LOCALE_RETURN_NUMBER` queries (and incorrectly returning LCID 0x409 for ANSI code page type 0x1004). W/A numeric language IDs parse hexadecimal; code pages and other LOCALE_I fields parse decimal. Supported NOUSEROVERRIDE/USE_CP_ACP modifiers no longer obscure the type; numeric queries reject string fields; negative capacities and NULL/nonzero-capacity buffers fail. Added US/Japan IGEOID, observed in GoT's filtered trace. SENGLANGUAGE now consistently returns `English`, not `English (United States)`.
+- Added real Win64 wrapper tests in `tests/native_loader_contract_test.c`: negative control failed before the fix; numeric Ex/W/A parity, en-US/ja-JP language IDs/code pages/calendar/geographic IDs, buffer guards, flags and invalid parameters pass. Full `make test-input` passed before the final IGEOID/test additions; final validation below/in subsequent notes. A 75 s RE8 regression run reached 2560x1440 swapchains without a crash (timeout 124 is the intentional stop, not proof of long-term stability).
+- **New precise crash evidence**, not a guessed DirectStorage async-write problem: a hardware watchpoint catches `msvcp140.dll+0x4981` (`movups xmm0,[rdx]`, Intel operand order: destination `[rdx]`) zeroing the cookie during the **search-phase catch-object copy**, before `RtlUnwindEx`. The failing run is on the launch/main thread. Native `std::runtime_error` copy construction targets `0x11e178`, derived from establisher `0x11e0f0` + the decoded catch displacement `0x88`; its 16-byte write at `0x11e180` overlaps the valid cookie at `0x11e188` (frame+0x98). Cookie initially equals the global cookie XOR frame RSP. Then target-frame GS checking during unwind correctly detects the corruption.
+  - The game's catch descriptor names `std::runtime_error` (type RVA 0x198afd0); catch funclet RVA 0x10cb940, cleanup RVA 0x10cb930. The executable's cleanup for the catch object is tiny (`0x14040a590` only resets its vtable), whereas native MSVCP's copy writes a vtable plus exception data. **Investigate this apparent catch-object layout/type-copy mismatch and the original locale construction failure; do not patch cookies, catch offsets or the guest binary.**
+  - Debugger-only attempt to change the target's dispatcher-context RSP to the establisher did NOT fix it. Changing every frame's RSP also breaks traversal; no such source changes retained. Do not treat the post-unwind-context theory as established.
+  - Filtered `BEER_API_TRACE=1` changes exception entry context (RIP becomes a host wrapper, no unwind metadata) and can abort differently. Use `BEER_EXCEPTION_DIAGNOSTICS=1` without API tracing for the real failure.
+- Evidence in `/mnt/hdd2/beer-trace/`: `got-baseline-20261110.log`, `got-locale-fixed-20261110.log`, `got-cookie-watch-20261110.log`, `got-copy-probe-20261110.log`, `got-target-context-probe-20261110.log`, `got-input-tests-20261110.log`, `got-re8-gate-20261110.log`. GDB needs SIGSYS/SIGSEGV/SIGILL passed to Beer's handlers and SIGTRAP suppressed after `start`; otherwise it stops before the useful guest path. No speculative SEH/assembly changes made.
+
+## Session 2026-11-12 summary (BD12Perf, staged, not committed)
+
+| | before | after | Proton |
+|---|---|---|---|
+| RE9 initial scene fps | ~62 | ~100 | ~70 |
+| RE9 RAM | 7.0-7.9 GiB | 5.2 GiB | 6.3 GiB |
+| RE9 load into gameplay | 50-60 s | ~30 s | - |
+| RE9 4-5 s freeze after load | every launch | gone | - |
+| RE9 camera-turn stutter | yes | better, not gone | smooth |
+| RE8 RT | hung within minutes, needed fake DX12U | works, real sampler feedback | - |
+| RE8 RT 1.3x at user spot | - | ~83 fps | ~120 fps (open) |
+
+Generic changes (all default on unless noted; opt-outs): real TotalLaneCount; UAV clears without pre-drain
+(`BEER_BD12_CLEAR_SYNC=full`); no command-list start barrier on NVIDIA/AMD/RADV (`BEER_BD12_LIST_BARRIER=list|submit`);
+waitable IOCP handles; pipeline-cache saves on a background thread, hash-skipped, 5 min (`BEER_BD12_PIPELINE_CACHE_SAVE_S`);
+per-game driver shader cache (`__GL_SHADER_DISK_CACHE_PATH`..., `BEER_DRIVER_CACHE=0`); in-memory VkPipelineCache only
+on NVIDIA/Mesa (`BEER_BD12_PIPELINE_CACHE=1` for the file); pipeline-library identity always set; real CPU topology
+(cores/SMT/EfficiencyClass); new threads start on the process affinity; real sampler feedback tier 0.9 + FL 12_2 when
+DX12U is complete; scalar block layout + conservative SSBO vectorization in dxil-spirv; raw access chains OPT-IN
+(`BEER_VK_RAW_ACCESS_CHAINS=1`, hung RE8). Diagnostics: `BEER_BD12_HITCH`, `BEER_BD12_GPU_PROF_FRAME`,
+`BEER_WAIT_LOG_THREAD`, tools: /mnt/hdd2/beer-tools/{re9watch.sh,sample.sh,threadmon.sh}.
+Next session: RE8 RT gap vs Proton (tiny-dispatch pattern above), DLSS visibility, FSR FG, RE9 camera stutter,
+RE9 start-up Xid 31 @0x04fa1000.
 
 ## RE8 ray tracing "super dim / shadows too dark" (2026-11-09, night): the game picks its SM 6.0 shader pack without sampler feedback
 
@@ -27,6 +259,11 @@ the user confirmed correct RT shadows/brightness. The proper fix is real sampler
 DX12U answer is true and needs no fake.
 
 ### Then: GPU hangs (Xid 109 CTX SWITCH TIMEOUT / Xid 13) and overexposure with root push on the SM 6.5 pack
+
+**2026-11-12, 02:46: user confirms RE8 RT works** on the BD12Perf defaults (root push + descriptor buffers + SSBO heap,
+vkd3d-style UAV barriers, no list-start barrier, real TotalLaneCount, clears without pre-drain, raw access chains OFF),
+launched with `BEER_DXR=1 BEER_BD12_VRS=1 BEER_BD12_MESH=1 BEER_FAKE_FEATURES=32 BEER_FAKE_OPTIONS7=feedback`. No Xid in
+the session. The old 1-5 min hang did not reproduce. Still needed: real sampler feedback so the DX12U fake goes away.
 
 - Root push off (per-draw everything): correct RT, correct exposure, stable.
 - Root push, heap mirror (`BEER_NO_DESCRIPTOR_BUFFER=1`): overexposed / pulsing dark; hang seen before the push fix.
@@ -4762,3 +4999,117 @@ Other findings:
   buffer is BGRA8 or R10G10B10A2. That frame is blitted (format-converting) into the RGBA8 upload image and goes
   through the post pass. Driving RE9 with `drive.py key 13 28` (Enter) and `key 70 33` (F, Continue) plus `shot`
   reaches gameplay for checks like this one.
+- **Lead for tomorrow (unverified):** BD12 picks UPLOAD heap memory that *avoids* DEVICE_LOCAL (bd12_device.c
+  `pick_memory_type`, upload=type 2 on the 4070 Ti SUPER), so shaders that read UPLOAD buffers directly (light lists,
+  per-pixel loops) go over PCIe. vkd3d-proton prefers device-local host-visible (ReBAR) memory for upload heaps. Check
+  which heap PS 25bc6424's t1 (uint texel buffer) and CBVs live in, then try ReBAR for upload heaps. Work branch: BD12Perf.
+
+### RE8 "older build was faster": SM6 pack + heap mirror; root push + descriptor buffers is now the default (2026-11-10, BD12Perf)
+- **Symptom.** Same spot (castle, ImageQualityRate 1.0): `3240eb5` (2026-10-31) 135-140 fps, current default 67 fps with the
+  GPU at 39%: CPU-bound in descriptor resolve (~1.35 s per 2 s window, ~3000 resolves/frame, resolve cache
+  hit=123 vs miss(state)=357k: the game changes root constants/CBV VAs per draw, so per-draw sets can't be cached).
+- **Cause.** Not a code regression: since `df53fe0` (real capability reporting) RE8 gets SM 6.x and loads its DXIL pack.
+  The old build loaded no DXIL and created no heap mirror (it also *dropped* every tessellated draw: "1-control-point
+  patch list without tessellation"). The DXIL path's default binding (1M-slot heap mirror + per-draw sets, mirror
+  `write_slot` on every CopyDescriptors, `view_lock` per texel view) is the slow part.
+- **Measured** at that spot: root push + descriptor buffers 148 fps, GPU 96% (resolve 2 ms per window). Long play
+  session in that mode (RT off, SM 6.0 pack): no Xid, median 171 fps, min 86.
+- **Change.** Root push with descriptor buffers is the default wherever `VK_EXT_descriptor_buffer` is available
+  (vulkan_context.c requests it unless `BEER_BD12_ROOT_PUSH=0` / `BEER_NO_DESCRIPTOR_BUFFER=1`; `bd12_root_push_enabled`
+  auto = `device->db != NULL`). Without descriptor buffers (ARM64 drivers, old GPUs) it stays per-draw; the heap-mirror
+  root push variant (overexposure bug) is only used with an explicit `BEER_BD12_ROOT_PUSH=1`. Manager: the toggle is now
+  the opt-out "Per-draw D3D12 binding (old path)" (`BEER_BD12_ROOT_PUSH=0`).
+- **Open:** the RT-on SM 6.5 hang (Xid 109 after 1-5 min) is still in this mode; RT is opt-in (`BEER_DXR`). Validate the
+  default on RE9, PRAGMATA, Onimusha, WWM, Stellar Blade, BoR, RE4.
+
+### RE9 "compiling shaders" (~20 min) on every launch: game and Beer cache folders on a read-only NTFS mount (2026-11-11)
+- **Symptom.** RE9 shows its shader compile screen on every launch; `[BD12] CreatePipelineLibrary(8975536-byte blob) ->
+  0x887e0002` (DRIVER_VERSION_MISMATCH) each time.
+- **Cause.** The 8.9 MB `shader.cache2` is vkd3d-proton's library from the Wine oracle runs (2026-11-08), so BD12 correctly
+  rejects it. The game compiles ~40k pipelines, serializes a valid BD12 library and loads 22k+ pipelines from it, but never
+  opens the file for writing (`BEER_PATH_WATCH=cache BEER_PATH_WATCH_WRITES=1`). The game folder
+  (`/mnt/FE5007855007443D`) — and Beer's `BEER_CACHE_DIR` on `/mnt/56A4064AA4062CD5` — were mounted **read-only** by
+  ntfs-3g at this boot ("NTFS partition is in an unsafe state ... hibernation or fast restarting"). RE4's shader.cache2
+  (written 2026-11-10 before the reboot) shows Beer's write path itself works.
+- **RE9 writes `shader.cache2` only at a clean exit** (quit from the game menu): `CreateFile(shader.cache2, GENERIC_WRITE,
+  TRUNCATE_EXISTING)` right before ExitProcess. Runs ended by killing the loader (e.g. `systemctl --user stop`) never
+  save it; the one clean exit before this happened while the folder was read-only. Verified 2026-11-11 00:56: a
+  3,876,144-byte BD12 library was written.
+- **Fix.** Not a Beer bug: shut Windows down fully (no Fast Startup/hibernation) so the partitions mount read-write, and quit
+  RE9 from its menu once after a compile. Beer now warns at start-up when the pipeline-cache or translation-cache folder
+  is not writable.
+- **Separate, open: intermittent start-up hang** (2 of 9 launches): no present ever, a "DirectStorage W" thread spins in
+  dstoragecore (SRW acquire/release + `GetQueuedCompletionStatus(0)`), its sibling sleeps in SleepConditionVariableSRW,
+  the IOCP is empty and Beer's disk worker idle. SRW fast paths and CV code reviewed: look correct. `kill -USR1` now also
+  prints BD12 lane serials and every D3D12 queue holding work (`bd12_com_debug_dump`) for the next occurrence.
+- **New diagnostics.** `BEER_PATH_WATCH=<substring>` (CreateFile/NtCreateFile/MoveFile/DeleteFile on matching paths, with
+  results), `BEER_PATH_WATCH_WRITES=1` (every open for writing). `BEER_BD12_PROF` now also splits submit time into
+  submit-lock / vk-submit / reap / list-finish. Note: `BEER_BD12_SAMPLE=1` (SIGPROF sampler) stops RE9 before its first
+  present (DirectStorage thread spins); don't use it with RE9.
+- **RE9 start-up Xid 31 lead (2026-11-12):** all 5 Xid 31 since 11-10 are IDENTICAL: channel 0xd, `MMU Fault: ENGINE
+  GR0_PBDMA0 HUBCLIENT_ESC faulted @ 0x0_04fa1000`, VIRT_READ, before the first frame. PBDMA = command fetch, fixed VA
+  => the GPU fetches a command buffer / driver allocation that was freed or reset (allocator reset before its fence,
+  Beer's internal cbs: zero fill batch, submit barrier, presenter). Next: log command-pool reset/destroy vs retire value.
+- **RE9 intermittent start-up GPU fault (open, unattended task).** About 1 in 4 launches, during the start-up load: Xid
+  69+32 / Xid 32 (invalid push buffer) / Xid 13 (compute exception, class c9c0), then device lost or a frozen load
+  (DirectStorage worker spinning on a fence that never completes). Launch loops: root push + translation cache 3/7,
+  root push without translation cache 0/5, per-draw 1/4, `BEER_DSTORAGE_CPU=1` 1/4 => not descriptor buffers, not the
+  new default, not GPU decompression. Next: `BEER_VK_CHECKPOINTS=1` launch loop until a fault (dumped automatically on
+  device lost) to get the faulting draw/dispatch and shader. Script pattern: scratchpad `re9loop.sh`.
+- **RE9 + `BEER_BD12_MULTI_QUEUE=1`:** faults far more often (2 of 2 at start-up; a third run hung in game with Xid 109,
+  earlier Xid 31). RE9 uses no async compute: lane 1 (compute) gets 0 submissions, lane 2 (copy) about as many as the
+  direct lane, so multi-queue only moves DirectStorage copies. GPU checkpoints at the Xid 109 hang: both stages stuck in
+  compute `43af4b32c66bb55f` (1x1x1, 64 threads, 21 loops, no atomics/barriers: loop bounds from buffers), i.e. it read
+  bad or not-yet-written data. Reviewed and correct: held Waits become timeline-semaphore GPU waits, GetCompletedValue
+  reads the timeline, all semaphore stages ALL_COMMANDS, non-main queues wait for heap zero fills. Still open; likely the
+  same race as the single-queue start-up fault. Multi-queue is not a perf lever for RE9.
+
+### Ghost of Tsushima: input, black lighting, raw-buffer SSBOs with UAV counters (2026-11-11, BD12Perf)
+- **No key/mouse input in menus.** Log: `[INPUT] raw-input slots full`. GoT registers raw input for its splash window
+  first (thread 7xxxxx), then for the game window (thread 29). WM_INPUT packets the splash window took but never read
+  with GetRawInputData kept their slots (released only on that read); after 256 all input was dropped. Fixes (loader.c,
+  generic): a packet is also released when its thread takes its next message (`t_unread_raw_input`); when the slots are
+  full the oldest queued WM_INPUT of any kind is reclaimed; WM_INPUT is posted to the target window's owner thread.
+- **Title screen: grass missing, sword black/untextured.** G-buffer was right (`BEER_BD12_CAPTURE_RT`), the lit image
+  black: the tiled lighting compute (`87d223eb6ca731fe`, 160x90) and its helpers never ran — `[BD12 DROP]
+  dispatch(no pipeline)`, thousands per minute. Root push refused UAVs with hidden counters (`BEER_DXIL_VERBOSE` now
+  prints `[DXIL] UAV uN refused: kind=12 counter=1 root-layout=1`), and the per-draw fallback then failed on 64-bit raw
+  loads from an unbounded raw-buffer array (dxil-spirv needs SSBOs; bindless arrays stayed texel buffers). Also found:
+  `CreateUnorderedAccessView` ignored the counter resource entirely (per-draw counters were a dummy binding).
+- **Storage-buffer mode (`BEER_BD12_SSBO=1`, opt-in):** raw/structured heap views are SSBO descriptors in the mutable
+  heap, base aligned down to minStorageBufferOffsetAlignment. Each CBV/SRV/UAV heap carries 16-byte metadata per slot
+  (`{offset, size}` of the view inside its SSBO; the UAV counter's GPU address = counter resource VA +
+  CounterOffsetInBytes), kept in the heap's descriptor buffer and bound as set 3 binding 0 (descriptor inside the same
+  descriptor buffer at `meta_desc_offset`). Root-signature translation emits SSBOs with dxil-spirv's offset buffer
+  (`BINDLESS_OFFSET_BUFFER_LAYOUT {0,0,2}`, `SSBO_ALIGNMENT`) and counters through
+  `PHYSICAL_ADDRESS_DESCRIPTOR_INDEXING {2,1}` (counter binding = same slot, set 3, BDA). Descriptor records gained
+  `flags` (BD12_DESC_FLAG_UNTYPED, also on null raw/structured views -> null SSBO) and `counter_va` (record stays 128 B).
+  Result: GoT title renders correctly (grass, textured sword), no dropped dispatches, no Xid, ~260 fps at the title.
+  Next: validate on RE8/RE9/RE4/PRAGMATA, then make it the default (RE9's earlier per-draw SSBO test failed only for
+  lack of the offset emulation this adds).
+- Also: compute pipelines get the whole 32-word push block for bindless arrays on the per-draw path (was 4 words per
+  stage); GoT saves imported from the Windows user MSI into the default prefix
+  (`Documents/Ghost of Tsushima DIRECTOR'S CUT/76561197960271872/`).
+- **Open: GoT hangs entering gameplay in SSBO mode (Xid 109).** GPU checkpoints: both stages stuck in compute
+  `524c7c2e7e8bd58d` (repeated 1x1x1 dispatches, 512 threads, 17 loops, workgroup arrays, subgroup ops, raw buffers
+  through SSBOs with the offset table, 64-bit raw loads). Same with `BEER_DSTORAGE_CPU=1`, so it is GoT's shader, not
+  DirectStorage GDeflate. It never ran before SSBO mode (64-bit raw loads failed translation, dispatch dropped), so the
+  hang is either wrong SSBO data (offset/size/alias handling) or a separate issue in a newly-running shader. Next: run
+  RE8/RE9 with `BEER_BD12_SSBO=1` to validate the offset path on known-good games, then capture this dispatch's
+  inputs (`BEER_BD12_CAPTURE_CS=524c7c2e7e8bd58d`, heap metadata) and replay its loop bounds.
+- **Manager:** a child loader that presents no frames while its parent does (GoT's crs-handler) is now treated as a
+  helper and hidden, instead of hiding the game as a "launcher". New launch option "Storage-buffer descriptors
+  (experimental)" (`BEER_BD12_SSBO=1`).
+- **RE8 with `BEER_BD12_SSBO=1`:** played through several areas incl. the castle: no visual issues, median 159 fps, no
+  drops or Xid. Validates the SSBO offset path on a known-good game.
+- **RE9 with SSBO mode crashed in dxil-spirv:** `[DXIL] Fatal, detected infinite loop.` then abort() (cfg_structurizer
+  `process_switch_blocks`). Shaders with 64-bit raw loads now convert fully and reach the structurizer for the first time.
+  - Upstream dxil-spirv master (7506dc1, 2.78.0, 66 commits after Beer's 8434b06 / 2.75.0) built at
+    `/mnt/hdd2/dxil-spirv-new/build/libdxil-spirv-c-shared.so.2.78.0` (git worktree of third_party/dxil-spirv). With
+    `BEER_DXIL_SPIRV_LIBRARY=<that>` RE9 runs in SSBO mode: no structurizer abort, root push 600/600 compute
+    pipelines, no Xid; user: "works fine". In-game fps vs the 62 fps baseline not measured yet.
+  - Safety net (d3d12_dxil_translator.c): conversions run with a per-thread SIGABRT jump (`guarded_converter_run`), so
+    a dxil-spirv abort fails that one shader (`[DXIL] dxil-spirv aborted during conversion`) instead of the game.
+- **Next session:** measure RE9 SSBO fps at the usual spot; retry GoT gameplay with the new dxil-spirv (its hang in
+  `524c7c2e7e8bd58d` may be the same structurizer weakness miscompiling rather than aborting); then switch
+  third_party/dxil-spirv to the new revision and make SSBO mode the default after RE4/PRAGMATA checks.

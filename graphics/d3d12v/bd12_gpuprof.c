@@ -25,10 +25,38 @@ typedef struct BD12GpuProfList {
     VkQueryPool pool;
     uint32_t count;
     uint64_t when_ns;            /* host time the recording was closed */
+    uint64_t frame;              /* present epoch at close (BEER_BD12_GPU_PROF_FRAME) */
     uint64_t tag[SLOTS];         /* kind << 56 | shader hash (low 56 bits) */
 } BD12GpuProfList;
 
 typedef struct { uint64_t tag; uint64_t ns; uint64_t calls; } Entry;
+
+/* BEER_BD12_GPU_PROF_FRAME=<ms>: GPU time summed per frame (recordings grouped by the present epoch they were closed
+ * in); frames above the threshold are printed with their five most expensive operations. */
+#define FRAME_RING 512
+#define FRAME_TAGS 48
+typedef struct { uint64_t frame, ns, lists; uint32_t tag_count; Entry tags[FRAME_TAGS]; int printed; } FrameAgg;
+static FrameAgg g_frames[FRAME_RING];
+static uint64_t frame_threshold_ns(void)
+{
+    static int64_t t = -1;
+    if (t < 0) { const char *v = getenv("BEER_BD12_GPU_PROF_FRAME"); t = v && *v ? strtol(v, NULL, 10) * 1000000ll : 0; }
+    return (uint64_t)t;
+}
+static FrameAgg *frame_agg(uint64_t frame)
+{
+    FrameAgg *f = &g_frames[frame % FRAME_RING];
+    if (f->frame != frame) { memset(f, 0, sizeof(*f)); f->frame = frame; }
+    return f;
+}
+static void frame_charge(FrameAgg *f, uint64_t tag, uint64_t ns)
+{
+    f->ns += ns;
+    for (uint32_t i = 0; i < f->tag_count; ++i)
+        if (f->tags[i].tag == tag) { f->tags[i].ns += ns; f->tags[i].calls++; return; }
+    if (f->tag_count < FRAME_TAGS) f->tags[f->tag_count++] = (Entry){ tag, ns, 1 };
+    else { f->tags[FRAME_TAGS - 1].tag = ~0ull; f->tags[FRAME_TAGS - 1].ns += ns; f->tags[FRAME_TAGS - 1].calls++; }
+}
 
 float g_bd12_timestamp_period = 1.0f;
 static Entry g_table[TABLE];
@@ -80,11 +108,14 @@ static void harvest_locked(void)
         if (p->count < 2) done = 1;
         else if (g_device->vk.GetQueryPoolResults(g_device->device, p->pool, 0, p->count, p->count * sizeof(uint64_t),
                                                   values, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            FrameAgg *f = frame_threshold_ns() ? frame_agg(p->frame) : NULL;
+            if (f) ++f->lists;
             for (uint32_t q = 0; q + 1 < p->count; ++q) {
                 if (values[q + 1] < values[q]) continue;
                 const uint64_t ns = (uint64_t)((double)(values[q + 1] - values[q]) * g_bd12_timestamp_period);
                 if (ns > 1000000000ull) continue;
                 charge(p->tag[q], ns);
+                if (f) frame_charge(f, p->tag[q], ns);
                 g_total_ns += ns;
             }
             done = 1;
@@ -136,6 +167,7 @@ void bd12_gpuprof_list_end(BD12CmdList *list)
     if (!p) return;
     bd12_gpuprof_mark(list, 255, 0);                      /* closes the last operation's interval */
     p->when_ns = now_ns();
+    p->frame = __atomic_load_n(&list->device->epoch, __ATOMIC_RELAXED);
     list->gpuprof = NULL;
     pthread_mutex_lock(&g_lock);
     if (g_pending_count == PENDING) harvest_locked();
@@ -173,6 +205,30 @@ void bd12_gpuprof_report(void)
     qsort(snapshot, TABLE, sizeof(*snapshot), by_time);
     static const char *const names[] = { "draw", "draw-idx", "draw-ind", "draw-idx-ind", "copy-buf", "copy-buf-img",
                                          "copy-img-buf", "copy-img", "clear", "resolve" };
+    if (frame_threshold_ns() && g_device) {
+        /* Frames at least 4 presents old are complete (their recordings were harvested above). */
+        const uint64_t now_frame = __atomic_load_n(&g_device->epoch, __ATOMIC_RELAXED);
+        uint64_t sum = 0, n = 0;
+        for (int i = 0; i < FRAME_RING; ++i) {
+            FrameAgg *f = &g_frames[i];
+            if (!f->frame || f->frame + 4 > now_frame) continue;
+            sum += f->ns; ++n;
+            if (f->printed || f->ns < frame_threshold_ns()) continue;
+            f->printed = 1;
+            qsort(f->tags, f->tag_count, sizeof(Entry), by_time);
+            fprintf(stderr, "[GPU FRAME] frame %llu: %.1f ms GPU in %llu lists:", (unsigned long long)f->frame,
+                    f->ns / 1e6, (unsigned long long)f->lists);
+            for (uint32_t t = 0; t < f->tag_count && t < 5; ++t) {
+                const uint32_t kind = (uint32_t)(f->tags[t].tag >> 56);
+                fprintf(stderr, " %s %014llx %.2fms/%llu", kind < 10 ? names[kind] : kind == 100 ? "dispatch" :
+                        kind == 101 ? "dispatch-ind" : "other", (unsigned long long)(f->tags[t].tag & 0x00ffffffffffffffull),
+                        f->tags[t].ns / 1e6, (unsigned long long)f->tags[t].calls);
+            }
+            fputc('\n', stderr);
+        }
+        if (n) fprintf(stderr, "[GPU FRAME] average of the last %llu complete frames: %.1f ms\n", (unsigned long long)n,
+                       sum / 1e6 / n);
+    }
     fprintf(stderr, "[GPU PROF] measured %.1f ms of GPU time in this window\n", total / 1e6);
     for (int i = 0; i < 20 && snapshot[i].calls; ++i) {
         const uint32_t kind = (uint32_t)(snapshot[i].tag >> 56);

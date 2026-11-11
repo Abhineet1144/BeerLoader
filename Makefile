@@ -30,7 +30,7 @@ GRAPHICS_SRCS = graphics/d3d11/d3d11_impl.c \
                 graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c \
                 graphics/d3d12v/bd12_com.c graphics/d3d12v/bd12_com_list.c graphics/d3d12v/bd12_pipelib.c graphics/d3d12v/bd12_cuda.c graphics/d3d12v/bd12_rootpush.c graphics/d3d12v/bd12_heapdb.c \
                 graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_mirror.c graphics/d3d12v/bd12_rtpipe.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_gpuprof.c graphics/d3d12v/bd12_live.c \
-                graphics/d3d12v/bd12_capture.c graphics/d3d12v/bd12_cbtweak.c \
+                graphics/d3d12v/bd12_capture.c graphics/d3d12v/bd12_cbtweak.c graphics/d3d12v/bd12_feedback.c \
                 graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c \
                 graphics/d3d11v/bd11_swap.c
 SRCS = loader.c $(AUDIO_SRCS) $(MEDIA_SRCS) $(PLATFORM_SRCS) $(VULKAN_SRCS) $(GRAPHICS_SRCS)

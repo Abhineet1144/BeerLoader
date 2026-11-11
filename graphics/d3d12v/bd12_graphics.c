@@ -505,7 +505,7 @@ void bd12_cmd_set_graphics_root_signature(BD12CmdList *list,
                                           BD12RootSignature *signature)
 {
     if (list->graphics.root_signature == signature) return;
-    memset(list->graphics.arguments, 0, sizeof(list->graphics.arguments));
+    bd12_root_arguments_carry(list->graphics.root_signature, signature, list->graphics.arguments);   /* bd12_bind.c */
     list->graphics.root_signature = signature;
     ++list->graphics.epoch;
 }

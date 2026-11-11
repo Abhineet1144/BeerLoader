@@ -33,13 +33,17 @@ void bd12_root_push_count(int graphics, int used)
 
 int bd12_root_push_enabled(BD12Device *device)
 {
-    static int value = -1;
-    if (value < 0) {
+    /* -1 unset: root push where the heaps are descriptor buffers (the default); 0 off; 1 forced on, which also
+     * allows the heap-mirror variant when descriptor buffers are unavailable or disabled. */
+    static int value = -2;
+    if (value == -2) {
         const char *on = getenv("BEER_BD12_ROOT_PUSH");
-        value = on && *on && strcmp(on, "0") != 0;
+        value = !on ? -1 : *on && strcmp(on, "0") != 0;
     }
-    return value && device && device->modern && device->modern->descriptor_indexing &&
-           device->modern->buffer_device_address;
+    if (!value || !device || !device->modern || !device->modern->descriptor_indexing ||
+        !device->modern->buffer_device_address)
+        return 0;
+    return value > 0 || device->db != NULL;
 }
 
 static uint64_t fnv_words(uint64_t h, const uint32_t *words, size_t count)
@@ -64,11 +68,16 @@ static void build_layout(BD12RootSignature *rs)
     /* Descriptor-buffer heaps (bd12_heapdb.c) need the mutable-heap binding model. */
     layout->heap_model = rs->device && rs->device->db ? BEER_HEAP_MODEL_MUTABLE : BEER_HEAP_MODEL_CLASSES;
     layout->accel_in_heap = layout->heap_model == BEER_HEAP_MODEL_MUTABLE && bd12_db_accel_in_heap(rs->device);
+    /* Storage-buffer mode: raw/structured heap views are SSBOs with set-3 offsets and counter addresses. */
+    /* 3 = the SSBO policy (every raw/structured heap view an SSBO with set-3 offsets), part of the hash. */
+    layout->ssbo_heap = layout->heap_model == BEER_HEAP_MODEL_MUTABLE &&
+                        bd12_db_ssbo(rs->device, &layout->ssbo_alignment) ? 3u : 0u;
     {
         /* accel_in_heap joins the hash only when set, so layouts without it keep their hash (and the on-disk
          * translations made before it existed). */
-        const uint32_t model[3] = { 0x6d6f646cu, layout->heap_model, layout->accel_in_heap };
-        h = fnv_words(h, model, layout->accel_in_heap ? 3 : 2);
+        const uint32_t model[5] = { 0x6d6f646cu, layout->heap_model, layout->accel_in_heap, layout->ssbo_heap,
+                                    layout->ssbo_alignment };
+        h = fnv_words(h, model, layout->ssbo_heap ? 5 : layout->accel_in_heap ? 3 : 2);
     }
     layout->param_count = rs->parameter_count;
     for (uint32_t i = 0; i < rs->parameter_count; ++i) {
@@ -237,10 +246,23 @@ static uint64_t rp_trace_hash(void)
 
 static void rp_print(const char *what, uint32_t param, uint32_t index, const BD12Descriptor *d)
 {
-    fprintf(stderr, "[RPTRACE] %s param %u slot %u: kind %d va 0x%llx offset %llu range %llu format %d serial %llu\n",
-            what, param, index, (int)d->kind,
+    fprintf(stderr, "[RPTRACE] %s param %u slot %u: kind %d flags %u va 0x%llx offset %llu range %llu format %d "
+            "counter 0x%llx bufsize %llu serial %llu\n",
+            what, param, index, (int)d->kind, d->flags,
             d->source_buffer ? (unsigned long long)d->source_buffer->va : 0ull, (unsigned long long)d->offset,
-            (unsigned long long)d->range, (int)d->format, (unsigned long long)d->buffer_serial);
+            (unsigned long long)d->range, (int)d->format, (unsigned long long)d->counter_va,
+            d->source_buffer ? (unsigned long long)d->source_buffer->size : 0ull, (unsigned long long)d->buffer_serial);
+}
+/* The storage-buffer metadata the shader reads for heap slot `index` (bd12_heapdb.c: offset, size, counter). */
+static void rp_print_meta(const BD12DescriptorHeap *heap, uint32_t index)
+{
+    if (!heap->meta) return;
+    uint32_t off, size; uint64_t counter;
+    memcpy(&off, heap->meta + (size_t)index * 16, 4);
+    memcpy(&size, heap->meta + (size_t)index * 16 + 4, 4);
+    memcpy(&counter, heap->meta + (size_t)index * 16 + 8, 8);
+    fprintf(stderr, "[RPTRACE]     meta slot %u: offset %u size %u counter 0x%llx\n", index, off, size,
+            (unsigned long long)counter);
 }
 
 void bd12_rp_trace_record(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash)
@@ -276,11 +298,32 @@ void bd12_rp_trace_record(BD12CmdList *list, const BD12BindState *state, uint64_
             if (g_rp_trace_logged < 400) { ++g_rp_trace_logged; fprintf(stderr, "[RPTRACE] record param %u: handle 0x%llx not in the bound heap\n", i, (unsigned long long)v); }
             continue;
         }
-        const uint32_t index = (uint32_t)((v - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT) + p->ranges[0].offset;
-        if (index >= heap->count) continue;
-        const BD12Descriptor *slot = &heap->descriptors[index];
-        if (g_rp_trace_logged < 400) { ++g_rp_trace_logged; rp_print("record", i, index, slot); }
-        if (g_rp_trace_count < 64) g_rp_trace[g_rp_trace_count++] = (RpTrace){ list, slot, *slot, i, index };
+        const uint32_t base = (uint32_t)((v - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT);
+        for (uint32_t r = 0; r < p->range_count; ++r) {   /* every range of the table, up to 8 descriptors each */
+            const uint32_t n = p->ranges[r].count > 8 ? 8 : p->ranges[r].count;
+            for (uint32_t k = 0; k < n; ++k) {
+                const uint32_t index = base + p->ranges[r].offset + k;
+                if (index >= heap->count) break;
+                const BD12Descriptor *slot = &heap->descriptors[index];
+                if (g_rp_trace_logged < 3000) {
+                    ++g_rp_trace_logged;
+                    fprintf(stderr, "[RPTRACE] range %u (type %u reg %u space %u) +%u:", r, p->ranges[r].type,
+                            p->ranges[r].base_register + k, p->ranges[r].space, k);
+                    rp_print(" record", i, index, slot);
+                    if (!samplers) rp_print_meta(heap, index);
+                }
+                if (g_rp_trace_count < 64) g_rp_trace[g_rp_trace_count++] = (RpTrace){ list, slot, *slot, i, index };
+            }
+        }
+    }
+    for (uint32_t i = 0; i < layout->param_count && g_rp_trace_logged < 3000; ++i) {   /* root descriptors/constants */
+        const BeerD3D12RootParam *p = &layout->params[i];
+        if (p->type == BEER_ROOT_TABLE) continue;
+        ++g_rp_trace_logged;
+        fprintf(stderr, "[RPTRACE] root param %u type %u reg %u space %u value 0x%llx constants 0x%x 0x%x 0x%x 0x%x\n", i,
+                p->type, p->shader_register, p->space, (unsigned long long)state->arguments[i].value,
+                state->arguments[i].constants[0], state->arguments[i].constants[1],
+                state->arguments[i].constants[2], state->arguments[i].constants[3]);
     }
     pthread_mutex_unlock(&g_rp_trace_lock);
 }

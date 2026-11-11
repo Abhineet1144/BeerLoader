@@ -17,6 +17,8 @@ static void global_barrier(BD12CmdList *list, VkPipelineStageFlags2 src_stage,
                            VkPipelineStageFlags2 dst_stage,
                            VkAccessFlags2 dst_access)
 {
+    if (src_stage == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT && dst_stage == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT)
+        g_bd12_cmd_counts[3]++;   /* full ALL_COMMANDS -> ALL_COMMANDS dependencies (BEER_BD12_PROF) */
     if (list->barrier_batching) {
         bd12_cmd_add_memory_barrier(list, src_stage, src_access, dst_stage, dst_access);
         return;
@@ -85,6 +87,17 @@ void bd12_cmd_global_barrier(BD12CmdList *list)
                    VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access);
 }
 
+/* A UAV clear is ordered against earlier work by the application's transition or UAV barrier, as on D3D12 (both cover
+ * the transfer stage, bd12_cmd.c); vkd3d-proton records no barrier ahead of a clear either. Afterwards every later
+ * command waits for the clear (D3D12 drivers treat ClearUAV as implicitly synchronised, so vkd3d-proton does too).
+ * BEER_BD12_CLEAR_SYNC=full: the old drain before each clear as well. */
+static int clear_sync_full(void)
+{
+    static int full = -1;
+    if (full < 0) { const char *v = getenv("BEER_BD12_CLEAR_SYNC"); full = v && !strcmp(v, "full"); }
+    return full;
+}
+
 void bd12_cmd_clear_uav_buffer(BD12CmdList *list, BD12Buffer *buffer,
                                VkDeviceSize offset, VkDeviceSize size,
                                uint32_t value)
@@ -95,9 +108,10 @@ void bd12_cmd_clear_uav_buffer(BD12CmdList *list, BD12Buffer *buffer,
         size = buffer->size - offset;
     size &= ~(VkDeviceSize)3;
     if (!size) return;
-    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access,
-                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    if (clear_sync_full())
+        global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access,
+                       VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
     bd12_cmd_record_flight_op(list, BD12_FLIGHT_CLEAR, 0, size, 0, 0, 0);
     list->device->vk.CmdFillBuffer(list->command_buffer, buffer->buffer,
                                    offset, size, value);
@@ -116,9 +130,10 @@ void bd12_cmd_clear_uav_image(BD12CmdList *list, const BD12Descriptor *uav,
         VK_IMAGE_ASPECT_COLOR_BIT, uav->view_mip, 1, uav->view_base_layer,
         uav->view_layers ? uav->view_layers : VK_REMAINING_ARRAY_LAYERS
     };
-    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access,
-                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    if (clear_sync_full())
+        global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access,
+                       VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
     bd12_cmd_record_flight_op(list, BD12_FLIGHT_CLEAR, 0,
         (uint64_t)uav->width * uav->height * uav->layer_count,
         uav->width, uav->height, uav->layer_count);

@@ -101,6 +101,8 @@ struct ComDevice {
     pthread_cond_t wait_cond;
     ComWaiter *waiters;
     int waiter_started;
+    BD12Fence *waiter_wake;       /* host-signalled timeline: a new waiter interrupts the waiter thread's wait */
+    uint64_t waiter_wake_value;   /* guarded by wait_lock */
     /* D3D12 queues run independently, but every BD12 submission goes to one Vulkan queue in order. A queue Wait
      * whose fence value has not been signalled or queued yet is therefore held on the CPU, with everything after
      * it on that queue, until a Signal claims the value (see queue_push in bd12_com.c). */
@@ -173,7 +175,12 @@ typedef struct ComResource {
     uint32_t height, depth_or_layers, mips, dxgi_format, flags;
     uint32_t planes;              /* 2 for combined depth/stencil */
     uint32_t reserved;            /* CreateReservedResource: fully-resident emulation */
+    uint32_t feedback_region[2];  /* sampler-feedback map (format 189/190): mip region width, height */
 } ComResource;
+/* Sampler-feedback map extents (bd12_com.c): the region grid of the paired texture's `mip`, and the R64 image extent
+ * (grid rounded to 16, low 4 bits = log2 of the region size). */
+void bd12_feedback_active_extent(const ComResource *r, uint32_t mip, uint32_t *w, uint32_t *h);
+void bd12_feedback_padded_extent(const ComResource *r, uint32_t *w, uint32_t *h);
 /* D3D12 standard 64 KiB tile shape of a resource in texels (bd12_com.c, also used by CopyTiles). */
 void bd12_standard_tile_shape(const ComResource *r, uint32_t shape[3]);
 

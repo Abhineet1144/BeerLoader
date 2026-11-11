@@ -1181,6 +1181,13 @@ int vulkan_presenter_is_active(void)
     return g_vk.initialized;
 }
 
+/* Non-blocking: 1 when the last direct-image blit has finished reading its source (nothing to wait for). */
+int vulkan_presenter_source_idle(void)
+{
+    if (!g_vk.initialized || !g_vk.submit_fence) return 1;
+    return g_vk.WaitForFences(g_vk.device, 1, &g_vk.submit_fence, VK_TRUE, 0) == VK_SUCCESS;
+}
+
 /* Blocks until the last direct-image blit has finished reading its source. */
 int vulkan_presenter_wait_source(void)
 {

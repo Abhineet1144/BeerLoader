@@ -10,6 +10,18 @@ int beer_d3d12_dxil_available(void);
 /* File the dxil-spirv library was loaded from (NULL when unavailable): part of the shader disk-cache key. */
 const char *beer_d3d12_dxil_library_path(void);
 
+/* Device shader capabilities that change the generated SPIR-V (vkd3d-proton's target extensions). Set once before
+ * the first translation; part of the shader disk-cache key. */
+typedef struct BeerD3D12DxilCaps {
+    int scalar_block_layout;    /* scalarBlockLayout: vectorized SSBO access with scalar alignment */
+    int raw_access_chains;      /* VK_NV_raw_access_chains: SSBO access with explicit byte offsets and alignment */
+    uint32_t vendor_id;         /* PCI vendor: NVIDIA (0x10de) needs conservative SSBO vectorization, AMD (0x1002)
+                                 * bounds-checks SSBO access per component */
+} BeerD3D12DxilCaps;
+void beer_d3d12_dxil_set_caps(const BeerD3D12DxilCaps *caps);
+/* Key of the current caps (0 when unset). */
+uint64_t beer_d3d12_dxil_caps_key(void);
+
 /* Translates a DXIL container with dxil-spirv. `stage_namespace` is the binding
  * namespace (0 compute, 1 vertex, 2 pixel, ...) used to number descriptors.
  * Fills out->spirv (malloc'd), spirv_size and the descriptor list. */

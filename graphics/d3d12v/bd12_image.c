@@ -59,6 +59,7 @@ void bd12_format_block(VkFormat f, VkImageAspectFlags aspect,
         case VK_FORMAT_R16G16B16A16_SFLOAT:
         case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT:
         case VK_FORMAT_R32G32_SFLOAT:
+        case VK_FORMAT_R64_UINT: case VK_FORMAT_R64_SINT:   /* sampler-feedback maps */
             bytes = 8; break;
         case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT:
         case VK_FORMAT_R32G32B32_SFLOAT:
@@ -112,6 +113,9 @@ VkImageLayout bd12_layout_for_state(uint32_t state, int ds)
 
 static VkImageUsageFlags image_usage_for(const BD12ImageDesc *desc)
 {
+    /* Sampler-feedback maps (R64_UINT): storage atomics and copies only; 64-bit formats need not be sampleable. */
+    if (desc->format == VK_FORMAT_R64_UINT)
+        return VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT |
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (desc->allow_render_target) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -188,6 +192,7 @@ static BD12Image *image_create(BD12Device *device, BD12Heap *heap,
     if (desc->allow_depth_stencil)
         image->usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if (desc->allow_uav) image->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if (desc->format == VK_FORMAT_R64_UINT) image->usage = image_usage_for(desc);   /* sampler-feedback map */
 
     VkImageCreateInfo info = image_create_info(desc, image->usage);
     const int is_3d = desc->type == VK_IMAGE_TYPE_3D;
@@ -477,7 +482,7 @@ void bd12_cmd_uav_barrier_image(BD12CmdList *list, BD12Image *image)
     bd12_state_sync(BD12_STATE_UNORDERED_ACCESS, 0, &stage, &access);
     const VkImageSubresourceRange range = whole_range(image);
     image_barrier(list, image, &range, stage,
-                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
                   VK_IMAGE_LAYOUT_GENERAL, stage, access,
                   VK_IMAGE_LAYOUT_GENERAL);
 }

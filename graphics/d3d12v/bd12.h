@@ -76,6 +76,7 @@ struct BD12Device {
     uint8_t pipeline_identity[28];
     uint32_t pipeline_cache_new;         /* pipelines built since the last save */
     uint64_t pipeline_cache_saved_ms;
+    uint64_t pipeline_cache_hash;        /* of the data last loaded or written: unchanged data is not rewritten */
     const BeerVulkanModern *modern;
     /* D3D12 variable-rate shading (modern->vrs_tier > 0): vkCmdSetFragmentShadingRateKHR. */
     PFN_vkCmdSetFragmentShadingRateKHR CmdSetFragmentShadingRateKHR;
@@ -92,6 +93,7 @@ struct BD12Device {
     VkDeviceSize max_uniform_range;
     uint32_t wave_lane_min;       /* Vulkan subgroup size range, reported as D3D12 wave widths */
     uint32_t wave_lane_max;
+    uint32_t total_lane_count;     /* D3D12 OPTIONS1.TotalLaneCount: SIMD lanes across the whole GPU */
     VkDeviceSize min_uniform_texel_alignment;
     VkDeviceSize min_storage_texel_alignment;
     VkDeviceSize min_storage_buffer_alignment;
@@ -117,6 +119,10 @@ struct BD12Device {
      * buffer and submitted together ahead of the next queue submit instead of one submission per heap. */
     pthread_mutex_t zero_lock;
     VkCommandPool zero_pool;
+    /* BD12_LIST_BARRIER_SUBMIT: one prebuilt full barrier appended to every queue submission. */
+    pthread_mutex_t submit_barrier_lock;
+    VkCommandPool submit_barrier_pool;
+    VkCommandBuffer submit_barrier_cb;
     VkCommandBuffer zero_cb;       /* batch being recorded */
     VkSemaphore zero_sem;          /* timeline: value of the newest submitted batch */
     uint64_t zero_recorded, zero_submitted;
@@ -275,8 +281,12 @@ typedef enum {
 /* One D3D12 descriptor. The heap is plain host memory: descriptors are
  * resolved into Vulkan descriptor sets at record time, or (descriptor
  * buffers, bd12_heapdb.c) also encoded into the heap's payload on write. */
+#define BD12_DESC_FLAG_UNTYPED 1u   /* buffer SRV/UAV of a raw or structured view (not a typed buffer) */
+#define BD12_DESC_FLAG_SSBO 2u      /* untyped and SSBO-eligible: a raw view, or structured with a stride multiple of 16
+                                     * (the rule the shader side applies to dxil-spirv's binding alignment) */
 typedef struct {
     uint32_t kind;
+    uint32_t flags;               /* BD12_DESC_FLAG_* (fills the padding after `kind`) */
     VkBuffer buffer;              /* CBV */
     VkDeviceSize offset, range;   /* CBV or source buffer byte range */
     struct BD12Buffer *source_buffer; /* diagnostic source for buffer views */
@@ -290,6 +300,7 @@ typedef struct {
     uint32_t width, height, layer_count; /* RTV/DSV */
     uint32_t view_mip, view_base_layer, view_layers; /* image views, for clears */
     uint32_t buffer_serial, image_serial;  /* identity of source_buffer / image when written (pointers get reused) */
+    uint64_t counter_va;          /* buffer UAV: its UAV counter's GPU address (counter resource + CounterOffsetInBytes) */
 } __attribute__((aligned(128))) BD12Descriptor;   /* power-of-two stride: ray tracing shader records index the heap by shifting */
 _Static_assert(sizeof(BD12Descriptor) == 128, "descriptor stride must stay 128 bytes (DXIL SBT shift)");
 
@@ -315,6 +326,11 @@ typedef struct {
     VkBuffer db_buffer;
     VkDeviceMemory db_memory;
     VkDeviceAddress db_address;
+    /* Storage-buffer mode (bd12_heapdb.c, BEER_BD12_SSBO): 16 bytes per descriptor for shaders, {offset, size} of a
+     * raw/structured view inside its aligned SSBO and its UAV counter address. Shader-visible heaps keep it in their
+     * descriptor buffer (`meta_desc_offset`: the set-3 storage-buffer descriptor pointing at it). */
+    uint8_t *meta;
+    VkDeviceSize meta_desc_offset;
     /* Per-draw descriptor resolving (bd12_resolve_descriptor_set) has read this heap: from then on every write
      * advances write_epoch, which its set cache checks. Heaps it never reads (CPU-only heaps, heaps only read
      * through descriptor buffers) cost writers nothing. */
@@ -756,6 +772,12 @@ int bd12_cmd_allocator_reset(BD12CmdAllocator *allocator);
 BD12CmdList *bd12_cmd_list_create(BD12CmdAllocator *allocator);
 void bd12_cmd_list_destroy(BD12CmdList *list, BD12CmdAllocator *allocator);
 int bd12_cmd_list_begin(BD12CmdList *list);
+/* How work of separate submissions on a queue is ordered (D3D12 makes earlier work visible at ExecuteCommandLists
+ * boundaries): NONE where the driver serializes submissions itself (NVIDIA, AMD, RADV), SUBMIT = one full barrier
+ * per submission (other drivers), LIST = a full barrier at the start of every command list (old behaviour).
+ * BEER_BD12_LIST_BARRIER=none|submit|list overrides. */
+enum { BD12_LIST_BARRIER_NONE, BD12_LIST_BARRIER_SUBMIT, BD12_LIST_BARRIER_LIST };
+int bd12_list_barrier_mode(void);
 int bd12_cmd_list_end(BD12CmdList *list);
 /* Starts another primary command-buffer segment in the same D3D12 list. */
 int bd12_cmd_append_segment(BD12CmdList *list);
@@ -771,6 +793,7 @@ void bd12_cmd_copy_buffer(BD12CmdList *list, BD12Buffer *dst,
 void bd12_cmd_transition_buffer(BD12CmdList *list, BD12Buffer *buffer,
                                 uint32_t before, uint32_t after);
 void bd12_cmd_uav_barrier_buffer(BD12CmdList *list, BD12Buffer *buffer);
+void bd12_cmd_uav_barrier_all(BD12CmdList *list);
 /* Makes prior GPU writes to a READBACK buffer visible to the host. */
 void bd12_cmd_host_visibility(BD12CmdList *list, BD12Buffer *buffer);
 
@@ -864,6 +887,7 @@ void bd12_cmd_dispatch(BD12CmdList *list, BD12ComputePipeline *pipeline,
 void bd12_cmd_set_descriptor_heaps(BD12CmdList *list,
                                    BD12DescriptorHeap *cbv_srv_uav,
                                    BD12DescriptorHeap *sampler);
+void bd12_root_arguments_carry(const BD12RootSignature *from, const BD12RootSignature *to, BD12RootArgument *arguments);
 void bd12_cmd_set_compute_root_signature(BD12CmdList *list,
                                          BD12RootSignature *signature);
 void bd12_cmd_set_pipeline(BD12CmdList *list, BD12ComputePipeline *pipeline);
@@ -1125,13 +1149,15 @@ void bd12_cmd_update_buffer(BD12CmdList *list, BD12Buffer *dst,
 enum { BD12_PROF_EXECUTE, BD12_PROF_SUBMIT, BD12_PROF_PSO, BD12_PROF_RESOLVE,
        BD12_PROF_FENCE_WAIT, BD12_PROF_FINISH, BD12_PROF_PRESENT, BD12_PROF_HEAP_CREATE,
        BD12_PROF_HEAP_DESTROY,
-       BD12_PROF_ALLOC_SET, BD12_PROF_UPDATE_SETS, BD12_PROF_COUNT };
+       BD12_PROF_ALLOC_SET, BD12_PROF_UPDATE_SETS,
+       BD12_PROF_SUBMIT_LOCK, BD12_PROF_VK_SUBMIT, BD12_PROF_REAP, BD12_PROF_LIST_FINISH,
+       BD12_PROF_RESOURCE, BD12_PROF_VIEW, BD12_PROF_DESC_COPY, BD12_PROF_COUNT };
 extern uint64_t g_bd12_prof_ns[BD12_PROF_COUNT];
 extern uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
 static inline uint64_t bd12_prof_now(void)
 {
-    /* Per-draw timing is only read with BEER_BD12_PROF; skip the clock read on every draw otherwise. */
-    if (!getenv("BEER_BD12_PROF")) return 0;
+    /* Per-draw timing is only read with BEER_BD12_PROF or BEER_BD12_HITCH; skip the clock read otherwise. */
+    if (!getenv("BEER_BD12_PROF") && !getenv("BEER_BD12_HITCH")) return 0;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -1140,6 +1166,8 @@ static inline uint64_t bd12_prof_now(void)
 #define BD12_PROF_END(id) do { g_bd12_prof_ns[id] += bd12_prof_now() - bd12_prof_t0_; \
                                ++g_bd12_prof_calls[id]; } while (0)
 void bd12_prof_report(void);
+/* BEER_BD12_HITCH=<ms>: for every frame (present to present) slower than that, print what BD12 did in it. */
+void bd12_hitch_present(void);
 /* Recorded-command counters for the per-frame stats lines (BEER_BD11_STATS): barriers, render passes. */
 extern uint64_t g_bd12_cmd_counts[4];
 enum { BD12_COUNT_BARRIER, BD12_COUNT_RENDER_PASS, BD12_COUNT_SUBMIT };
@@ -1222,6 +1250,7 @@ void bd12_db_bind(BD12CmdList *list, VkPipelineBindPoint point, const BD12DbLayo
 /* Binding-state invalidation: `which` 0 = graphics, 1 = compute. */
 void bd12_cmd_invalidate_point(BD12CmdList *list, int which);
 int bd12_db_accel_in_heap(const BD12Device *device);
+int bd12_db_ssbo(const BD12Device *device, uint32_t *alignment);
 void bd12_rp_trace_record(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash);
 void bd12_rp_trace_submit(const BD12CmdList *list);
 void bd12_cmd_invalidate_bindings(BD12CmdList *list);
@@ -1258,6 +1287,24 @@ int bd12_cmd_bind_bindless(BD12CmdList *list, BD12BindState *state,
                            VkShaderStageFlags stages,
                            const BD12ShaderBinding *bindless, uint32_t count,
                            uint32_t words);
+
+/* Sampler-feedback resolves (bd12_feedback.c): opaque R64 map <-> R8_UINT MinMip / MipRegionUsed data. */
+typedef enum { BD12_FEEDBACK_DECODE_MIN_MIP, BD12_FEEDBACK_DECODE_MIP_USED, BD12_FEEDBACK_ENCODE_MIN_MIP,
+               BD12_FEEDBACK_ENCODE_MIP_USED } BD12FeedbackVariant;
+typedef struct BD12FeedbackOp {
+    BD12FeedbackVariant variant;
+    struct BD12Image *map;           /* R64_UINT map, one Vulkan mip */
+    uint32_t map_pitch, map_rows;    /* its (padded) extent */
+    uint32_t map_layer, layers;      /* first array layer and count */
+    uint32_t mips, mip;              /* paired texture mip count; MIP_USED: the mip of this pass */
+    uint32_t x0, y0, w, h;           /* region rectangle (in that mip's region grid) */
+    struct BD12Image *r8_image;      /* R8_UINT side: an image (subresource r8_mip + layer * r8_mips) ... */
+    uint32_t r8_mip, r8_mips, r8_layer;
+    int32_t r8_x, r8_y;
+    BD12Buffer *r8_buffer;           /* ... or a buffer (tight rows) */
+    VkDeviceSize r8_offset;
+} BD12FeedbackOp;
+int bd12_cmd_feedback_transcode(BD12CmdList *list, const BD12FeedbackOp *op);
 
 int bd12_scratch_alloc(BD12CmdAllocator *a, VkDeviceSize size,
                        BD12Buffer **buffer, VkDeviceSize *offset, void **ptr);

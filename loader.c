@@ -2759,6 +2759,32 @@ static int configure_guest_prefix(const char *requested)
     fprintf(stderr, "[PREFIX] %s (C: -> %s)\n", g_prefix_path, g_drive_c_path);
     return 1;
 }
+/* The GPU driver's own shader disk cache, per program. Every Beer game runs as the same host executable, so the
+ * driver's default cache (keyed by executable, ~1 GB, cleaned when full) was shared by all of them: they evicted each
+ * other's shaders and RE9 recompiled ~900 pipelines (60 s of compile time) on every load. Steam gives each Proton game
+ * its own cache folder the same way. Variables the user already set are kept. */
+static void beer_driver_shader_cache_env(const char *exe)
+{
+    if (getenv("BEER_DRIVER_CACHE") && !strcmp(getenv("BEER_DRIVER_CACHE"), "0")) return;
+    const char *root = getenv("BEER_CACHE_DIR"), *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+    const char *base = strrchr(exe, '/');
+    base = base ? base + 1 : exe;
+    char dir[1024];
+    if (root && *root) snprintf(dir, sizeof(dir), "%s/driver/%s", root, base);
+    else if (xdg && *xdg) snprintf(dir, sizeof(dir), "%s/beer/driver/%s", xdg, base);
+    else if (home && *home) snprintf(dir, sizeof(dir), "%s/.cache/beer/driver/%s", home, base);
+    else return;
+    for (char *c = dir + 1; *c; ++c)                       /* mkdir -p */
+        if (*c == '/') { *c = 0; mkdir(dir, 0755); *c = '/'; }
+    mkdir(dir, 0755);
+    setenv("__GL_SHADER_DISK_CACHE", "1", 0);               /* NVIDIA */
+    setenv("__GL_SHADER_DISK_CACHE_PATH", dir, 0);
+    setenv("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1", 0);
+    setenv("MESA_SHADER_CACHE_DIR", dir, 0);                /* Mesa (RADV, ANV, Turnip, ...) */
+    setenv("MESA_SHADER_CACHE_MAX_SIZE", "10G", 0);
+    fprintf(stderr, "[LOADER] driver shader cache: %s\n", getenv("__GL_SHADER_DISK_CACHE_PATH"));
+}
+
 
 /* A Windows game launcher starts the process with a stable executable path and,
  * in Sekiro's case, the installation directory as its current directory. Host
@@ -2797,6 +2823,7 @@ static const char *configure_guest_process_path(const char *exe)
     g_exe_host_path = g_exe_host_path_storage;
     g_exe_path = g_exe_path_storage;
     setenv("BEER_GUEST_EXE", g_exe_host_path, 1);   /* per-program caches (BD12 pipeline cache file name) */
+    beer_driver_shader_cache_env(g_exe_host_path);
     return g_exe_host_path;
 }
 
@@ -10712,6 +10739,79 @@ dxgi_Factory_CheckFeatureSupport(u64 *obj, u32 feature, void *data, u32 size)
     return feature == 0 ? S_OK : 0x80070057u;
 }
 
+/* The CPU's real core layout for GetLogicalProcessorInformation(Ex): logical processors grouped into physical cores
+ * (thread siblings), SMT flag, and the hybrid efficiency class (Windows: P-cores 1, E-cores 0; all 0 when not hybrid).
+ * Reporting every logical processor as its own identical core made RE9 pin 58 of its threads to 10 logical CPUs that
+ * included three E-cores and one thread of each P-core (stutter while turning the camera); Wine reports the real
+ * layout too. BEER_SPOOF_CPU_THREADS keeps the flat layout. */
+typedef struct { u32 count; u64 mask[64]; u8 efficiency[64]; u8 smt[64]; } BeerCpuTopology;
+
+static u64 parse_cpu_list(const char *text, u32 limit)
+{
+    u64 mask = 0;
+    const char *p = text;
+    while (p && *p && *p != '\n') {
+        char *end;
+        long a = strtol(p, &end, 10);
+        if (end == p) break;
+        long b = a;
+        if (*end == '-') { p = end + 1; b = strtol(p, &end, 10); }
+        for (long i = a; i <= b && i < (long)limit && i < 64; ++i) if (i >= 0) mask |= (u64)1 << i;
+        p = *end == ',' ? end + 1 : NULL;
+    }
+    return mask;
+}
+
+static int read_small_file(const char *path, char *buf, size_t size)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    const size_t n = fread(buf, 1, size - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return n > 0;
+}
+
+static const BeerCpuTopology *beer_cpu_topology(void)
+{
+    static BeerCpuTopology topo;
+    static int built;
+    if (built) return &topo;
+    built = 1;
+    const u32 count = win_processor_count();
+    char buf[512], path[160];
+    u64 assigned = 0, atom = 0;
+    const int spoof = getenv("BEER_SPOOF_CPU_THREADS") != NULL;
+    if (!spoof && read_small_file("/sys/devices/cpu_atom/cpus", buf, sizeof(buf))) atom = parse_cpu_list(buf, count);
+    unsigned long freq[64] = { 0 }, max_freq = 0, min_freq = ~0ul;
+    for (u32 i = 0; i < count && !spoof; ++i) {
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpufreq/cpuinfo_max_freq", i);
+        if (read_small_file(path, buf, sizeof(buf))) freq[i] = strtoul(buf, NULL, 10);
+        if (freq[i] > max_freq) max_freq = freq[i];
+        if (freq[i] && freq[i] < min_freq) min_freq = freq[i];
+    }
+    for (u32 i = 0; i < count; ++i) {
+        if (assigned & ((u64)1 << i)) continue;
+        u64 siblings = 0;
+        if (!spoof) {
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/topology/thread_siblings_list", i);
+            if (read_small_file(path, buf, sizeof(buf))) siblings = parse_cpu_list(buf, count);
+        }
+        siblings &= ~assigned;
+        if (!(siblings & ((u64)1 << i))) siblings = (u64)1 << i;
+        assigned |= siblings;
+        const u32 c = topo.count++;
+        topo.mask[c] = siblings;
+        topo.smt[c] = __builtin_popcountll(siblings) > 1;
+        if (atom) topo.efficiency[c] = (siblings & atom) ? 0 : 1;
+        else if (max_freq && min_freq != ~0ul && max_freq > min_freq + min_freq / 10)   /* clearly two core types */
+            topo.efficiency[c] = freq[i] >= max_freq - max_freq / 20 ? 1 : 0;
+    }
+    fprintf(stderr, "[LOADER] CPU topology: %u logical processors in %u cores%s\n", count, topo.count,
+            atom ? " (hybrid: E-cores efficiency class 0)" : "");
+    return &topo;
+}
+
 /* ---- GetLogicalProcessorInformation ---- */
 /* SYSTEM_LOGICAL_PROCESSOR_INFORMATION (32 bytes on x64) */
 typedef struct {
@@ -10727,9 +10827,10 @@ typedef struct {
 static u64 __attribute__((ms_abi))
 impl_GetLogicalProcessorInformation(SLPI *buf, u32 *retlen)
 {
-    u32 ncpus = win_processor_count();
+    const BeerCpuTopology *topo = beer_cpu_topology();
+    u32 ncpus = topo->count;
 
-    u32 needed = (ncpus + 1) * sizeof(SLPI); /* ncpus Core entries + 1 Package */
+    u32 needed = (ncpus + 1) * sizeof(SLPI); /* one Core entry per physical core + 1 Package */
 
     if (!buf || !retlen || *retlen < needed) {
         if (retlen) *retlen = needed;
@@ -10738,10 +10839,10 @@ impl_GetLogicalProcessorInformation(SLPI *buf, u32 *retlen)
     }
 
     memset(buf, 0, needed);
-    for (long i = 0; i < ncpus; i++) {
-        buf[i].ProcessorMask = (u64)1 << i;
+    for (u32 i = 0; i < ncpus; i++) {
+        buf[i].ProcessorMask = topo->mask[i];
         buf[i].Relationship  = 0;        /* RelationProcessorCore */
-        buf[i].Core.Flags    = 1;        /* HT enabled (hyper-threading) */
+        buf[i].Core.Flags    = topo->smt[i];   /* LTP_PC_SMT: more than one logical processor */
     }
     buf[ncpus].ProcessorMask = win_processor_mask();
     buf[ncpus].Relationship  = 3; /* RelationProcessorPackage */
@@ -10782,7 +10883,8 @@ impl_GetLogicalProcessorInformationEx(u32 relationship, void *buffer, u32 *lengt
         return 0;
     }
 
-    u32 count = win_processor_count();
+    const BeerCpuTopology *topo = beer_cpu_topology();
+    u32 count = topo->count;
     u32 needed = count * (u32)sizeof(WIN_SLPI_EX_CORE);
     if (!buffer || *length < needed) {
         *length = needed;
@@ -10795,9 +10897,10 @@ impl_GetLogicalProcessorInformationEx(u32 relationship, void *buffer, u32 *lengt
     for (u32 i = 0; i < count; ++i) {
         records[i].relationship = RelationProcessorCore;
         records[i].size = sizeof(records[i]);
-        records[i].flags = 0; /* expose one logical processor per core */
+        records[i].flags = topo->smt[i];                 /* LTP_PC_SMT */
+        records[i].efficiency_class = topo->efficiency[i];
         records[i].group_count = 1;
-        records[i].group_mask[0].mask = (u64)1 << i;
+        records[i].group_mask[0].mask = topo->mask[i];
         records[i].group_mask[0].group = 0;
     }
     *length = needed;
@@ -11339,6 +11442,7 @@ static void wait_multi_notify(void)
  * frame-rate gain, with no missed wake-up detected (BEER_WAIT_DIAGNOSTICS); the global wake stays the default. */
 #define WAIT_OBJECT_EVENT (UINT64_C(1) << 32)
 #define WAIT_OBJECT_SEMAPHORE (UINT64_C(2) << 32)
+#define WAIT_OBJECT_IOCP (UINT64_C(3) << 32)
 #define WAIT_BUCKETS 256u
 typedef struct WaitWord { _Atomic u32 word; } WaitWord;
 typedef struct WaitNode { u64 key; WaitWord *waiter; struct WaitNode *next; } WaitNode;
@@ -11997,6 +12101,8 @@ static u64 win_mutex_wait(int id, u32 ms)
     return rc == ETIMEDOUT ? 0x102u : 0u;
 }
 
+static u64 __attribute__((ms_abi)) beer_wait_multiple_raw(u32 n, const u64 *handles, u32 all, u32 ms);
+
 static u64 __attribute__((ms_abi))
 beer_wait_single_raw(u64 h, u32 ms)
 {
@@ -12012,6 +12118,9 @@ beer_wait_single_raw(u64 h, u32 ms)
                     (unsigned long long)g_dispatch_incoming_return);
     }
     /* WAIT_OBJECT_0=0, WAIT_TIMEOUT=0x102, WAIT_FAILED=0xFFFFFFFF */
+    if (iocp_from_handle(h) >= 0) {   /* a completion port is a waitable queue: the multi-object path handles it */
+        return beer_wait_multiple_raw(1, &h, 0, ms);
+    }
     g_dbg_wait_kind = 2; g_dbg_wait_handle = h; g_dbg_wait_ms = ms;
     u64 trc = thread_wait_handle(h, ms);
     if (trc != (u64)-2) { g_dbg_wait_kind = 0; return trc; }
@@ -12120,10 +12229,59 @@ static u64 beer_wait_now_ms(void)
     return (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
 }
 
+/* BEER_BD12_HITCH: per-thread time blocked in waits and sleeps since the last query, and the longest single wait
+ * (handle, guest caller), so a slow frame can be pinned on what its presenting thread waited for. */
+static __thread u64 g_wacc_total, g_wacc_max, g_wacc_max_handle, g_wacc_max_caller;
+static int wacc_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_BD12_HITCH") != NULL;
+    return on;
+}
+static inline u64 wacc_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+static inline void wacc_add(u64 t0, u64 handle, u64 caller)
+{
+    const u64 d = wacc_now() - t0;
+    g_wacc_total += d;
+    if (d > g_wacc_max) { g_wacc_max = d; g_wacc_max_handle = handle; g_wacc_max_caller = caller; }
+}
+u64 beer_thread_wait_stats(u64 *max_ns, u64 *max_handle, u64 *max_caller)
+{
+    const u64 total = g_wacc_total;
+    if (max_ns) *max_ns = g_wacc_max;
+    if (max_handle) *max_handle = g_wacc_max_handle;
+    if (max_caller) *max_caller = g_wacc_max_caller;
+    g_wacc_total = g_wacc_max = g_wacc_max_handle = g_wacc_max_caller = 0;
+    return total;
+}
+
+static int wait_log_thread(void);
 /* BEER_WAIT_DIAGNOSTICS=1 logs guest waits that block for >= 100 ms. */
+static u64 __attribute__((ms_abi)) impl_WaitForSingleObject_body(u64 h, u32 ms);
 static u64 __attribute__((ms_abi))
 impl_WaitForSingleObject(u64 h, u32 ms)
 {
+    if (!wacc_on()) return impl_WaitForSingleObject_body(h, ms);
+    const u64 caller = g_dispatch_incoming_return, t0 = wacc_now();
+    const u64 r = impl_WaitForSingleObject_body(h, ms);
+    wacc_add(t0, h, caller);
+    return r;
+}
+static u64 __attribute__((ms_abi))
+impl_WaitForSingleObject_body(u64 h, u32 ms)
+{
+    if (wait_log_thread()) {
+        const u64 caller = g_dispatch_incoming_return;
+        const u64 r = beer_wait_single_raw(h, ms);
+        fprintf(stderr, "[WAITLOG] tid %ld WaitForSingle h=%llx ms=%u -> %llu caller=0x%llx\n", (long)syscall(SYS_gettid),
+                (unsigned long long)h, ms, (unsigned long long)r, (unsigned long long)caller);
+        return r;
+    }
     static int diag = -1;
     static u64 trace_rva;                 /* BEER_WAIT_TRACE_RVA=<exe rva>: every wait returning there (diagnostic) */
     if (diag < 0) {
@@ -12233,6 +12391,7 @@ impl_WSAWaitForMultipleEvents(u32 count, const u64 *events, u32 wait_all,
     return impl_WaitForMultipleObjects(count, events, wait_all, timeout);
 }
 
+static int iocp_has_packets(int idx);
 /* Nonblocking wait used by multiple-object waits. A positive result means the
  * object is signaled, zero means it is pending, and -1 means invalid handle.
  * Auto-reset events and semaphores are consumed only when requested. */
@@ -12261,6 +12420,11 @@ static int wait_handle_poll(u64 handle, int consume)
         pthread_mutex_unlock(&g_sem_mtx[sid]);
         return signaled;
     }
+
+    /* An I/O completion port is a kernel queue object: signaled while packets are queued. A wait does not dequeue
+     * (DirectStorage waits on its port with events and a timeout, then dequeues; failing the wait made it spin). */
+    const int port = iocp_from_handle(handle);
+    if (port >= 0) return iocp_has_packets(port);
 
     int process_state = beer_proc_poll(handle);
     if (process_state != -2) return process_state;
@@ -12315,8 +12479,10 @@ beer_wait_multiple_raw_inner(u32 n, const u64 *handles, u32 all, u32 ms)
         if (thread_wait_handle(handles[i], 0) == (u64)-2) {
             const int eid = event_id_from_handle(handles[i]);
             const int sid = eid < 0 ? sem_id_from_handle(handles[i]) : -1;
+            const int port = eid < 0 && sid < 0 ? iocp_from_handle(handles[i]) : -1;
             if (eid >= 0) key = WAIT_OBJECT_EVENT | (u32)eid;
             else if (sid >= 0) key = WAIT_OBJECT_SEMAPHORE | (u32)sid;
+            else if (port >= 0) key = WAIT_OBJECT_IOCP | (u32)port;
             if (eid >= 0 && g_events[eid].shared) needs_poll = 1;   /* set by another process: poll */
         }
         if (!key) { needs_poll = 1; continue; }
@@ -12399,9 +12565,48 @@ done:
     return result;
 }
 
+/* BEER_WAIT_LOG_THREAD=<name substring>: log the first 200 waits (then every 20000th) of threads whose name contains it (handles, timeout,
+ * result, caller), to see why a thread polls instead of sleeping. Diagnostic only. */
+static int wait_log_thread(void)
+{
+    static const char *want;
+    static int on = -1;
+    if (on < 0) { want = getenv("BEER_WAIT_LOG_THREAD"); on = want && *want; }
+    if (!on) return 0;
+    static __thread int match = -1;
+    if (match < 0) {
+        char name[32] = { 0 };
+        prctl(PR_GET_NAME, name, 0, 0, 0);
+        match = strstr(name, want) != NULL;
+    }
+    if (!match) return 0;
+    static _Atomic(u32) calls;
+    const u32 i = atomic_fetch_add(&calls, 1);
+    return i < 200 || i % 20000 == 0;   /* start-up, then a steady-state sample */
+}
+
+static u64 __attribute__((ms_abi)) impl_WaitForMultipleObjects_body(u32 n, const u64 *handles, u32 all, u32 ms);
 static u64 __attribute__((ms_abi))
 impl_WaitForMultipleObjects(u32 n, const u64 *handles, u32 all, u32 ms)
 {
+    if (!wacc_on()) return impl_WaitForMultipleObjects_body(n, handles, all, ms);
+    const u64 caller = g_dispatch_incoming_return, t0 = wacc_now();
+    const u64 r = impl_WaitForMultipleObjects_body(n, handles, all, ms);
+    wacc_add(t0, (handles && n) ? handles[0] : 0, caller);
+    return r;
+}
+static u64 __attribute__((ms_abi))
+impl_WaitForMultipleObjects_body(u32 n, const u64 *handles, u32 all, u32 ms)
+{
+    if (wait_log_thread()) {
+        const u64 caller = g_dispatch_incoming_return;
+        const u64 r = beer_wait_multiple_raw(n, handles, all, ms);
+        fprintf(stderr, "[WAITLOG] tid %ld WaitForMultiple n=%u all=%u ms=%u -> %llu caller=0x%llx handles:",
+                (long)syscall(SYS_gettid), n, all, ms, (unsigned long long)r, (unsigned long long)caller);
+        for (u32 i = 0; i < n && i < 8; ++i) fprintf(stderr, " %llx", (unsigned long long)(handles ? handles[i] : 0));
+        fputc('\n', stderr);
+        return r;
+    }
     static int diag = -1;
     if (diag < 0) diag = getenv("BEER_WAIT_DIAGNOSTICS") != NULL;
     if (!diag) return beer_wait_multiple_raw(n, handles, all, ms);
@@ -12466,7 +12671,15 @@ static u64 __attribute__((ms_abi)) impl_OpenMutexA(u32 a, u32 b, const char *n)
 
 /* ---- Sleep / Timing ---- */
 static u64 __attribute__((ms_abi)) impl_Sleep_inner(u32 ms);
+static u64 __attribute__((ms_abi)) impl_Sleep_body(u32 ms);
 static u64 __attribute__((ms_abi)) impl_Sleep(u32 ms) {
+    if (!wacc_on()) return impl_Sleep_body(ms);
+    const u64 caller = g_dispatch_incoming_return, t0 = wacc_now();
+    const u64 r = impl_Sleep_body(ms);
+    wacc_add(t0, 0x51ee9u, caller);   /* "sleep" */
+    return r;
+}
+static u64 __attribute__((ms_abi)) impl_Sleep_body(u32 ms) {
     if (getenv("BEER_SPIN_DIAGNOSTICS")) {
         /* A thread that keeps calling Sleep is usually spin-waiting on a flag another thread should set. */
         static __thread u32 sleeps;
@@ -12689,7 +12902,7 @@ impl_LCMapStringA(u32 l, u32 f, const char *s, int sl, char *d, int dl)
 static const char *beer_locale_info_ascii(u32 locale, u32 type)
 {
     const int japanese = (locale & 0xffffu) == 0x0411u;
-    switch (type & ~0x20000000u) { /* strip LOCALE_RETURN_NUMBER */
+    switch (type & ~0xe0000000u) { /* RETURN_NUMBER, USE_CP_ACP, NOUSEROVERRIDE */
     case 0x00000001: return japanese ? "0411" : "0409"; /* ILANGUAGE */
     case 0x00000002: return japanese ? "Japanese (Japan)" : "English (United States)";
     case 0x00000003: return japanese ? "JPN" : "ENU";   /* SABBREVLANGNAME */
@@ -12773,6 +12986,7 @@ static const char *beer_locale_info_ascii(u32 locale, u32 type)
     case 0x00001012: return japanese ? "20290" : "037"; /* IDEFAULTEBCDICCODEPAGE */
     case 0x00000059: return japanese ? "ja" : "en";     /* SISO639LANGNAME */
     case 0x0000005a: return japanese ? "JP" : "US";     /* SISO3166CTRYNAME */
+    case 0x0000005b: return japanese ? "122" : "244";   /* IGEOID: Japan / United States */
     case 0x00000067: return japanese ? "jpn" : "eng";   /* SISO639LANGNAME2 */
     case 0x00000068: return japanese ? "JPN" : "USA";   /* SISO3166CTRYNAME2 */
     case 0x0000006d: return japanese ? "ja" : "en";     /* SPARENT */
@@ -12780,19 +12994,41 @@ static const char *beer_locale_info_ascii(u32 locale, u32 type)
     }
 }
 
+/* Only LOCALE_I* entries have numeric representations. Language IDs use hex
+ * text; code pages, country codes and formatting options use decimal text. */
+static int beer_locale_info_number(u32 type, const char *value, u32 *result)
+{
+    type &= ~0xe0000000u;
+    switch (type) {
+    case 0x01: case 0x05: case 0x09: case 0x0a: case 0x0b: case 0x0d:
+    case 0x11: case 0x12: case 0x19: case 0x1a: case 0x1b: case 0x1c:
+    case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+    case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: case 0x5b:
+    case 0x1004: case 0x1005: case 0x1008: case 0x1009: case 0x100b:
+    case 0x100c: case 0x100d: case 0x1010: case 0x1012:
+        break;
+    default:
+        return 0;
+    }
+    char *end = NULL;
+    unsigned long number = strtoul(value, &end, type == 0x01 || type == 0x09 ? 16 : 10);
+    if (end == value || *end || number > UINT32_MAX) return 0;
+    *result = (u32)number;
+    return 1;
+}
+
 static u64 __attribute__((ms_abi))
 impl_GetLocaleInfoW(u32 locale, u32 type, u16 *buf, int size)
 {
+    if (size < 0 || (!buf && size)) { g_last_error = 87; return 0; }
     const char *value = beer_locale_info_ascii(locale, type);
     if (!value) { g_last_error = 1004; return 0; } /* ERROR_INVALID_FLAGS */
 
     if (type & 0x20000000u) { /* LOCALE_RETURN_NUMBER */
-        char *end = NULL;
-        unsigned long number = strtoul(value, &end, 10);
-        if (!end || *end) { g_last_error = 87; return 0; }
+        u32 result;
+        if (!beer_locale_info_number(type, value, &result)) { g_last_error = 1004; return 0; }
         if (!buf || size == 0) return 2; /* DWORD measured in WCHAR units */
         if (size < 2) { g_last_error = 122; return 0; }
-        u32 result = (u32)number;
         memcpy(buf, &result, sizeof(result));
         g_last_error = 0;
         return 2;
@@ -14452,8 +14688,18 @@ beer_sleep_cv_cs(u64 *cv, WIN_CS *cs, u32 ms)
 }
 
 /* BEER_WAIT_DIAGNOSTICS: condition-variable waits that block for >= 100 ms. */
+static u64 __attribute__((ms_abi)) impl_SleepConditionVariableCS_body(u64 *cv, WIN_CS *cs, u32 ms);
 static u64 __attribute__((ms_abi))
 impl_SleepConditionVariableCS(u64 *cv, WIN_CS *cs, u32 ms)
+{
+    if (!wacc_on()) return impl_SleepConditionVariableCS_body(cv, cs, ms);
+    const u64 caller = g_dispatch_incoming_return, t0 = wacc_now();
+    const u64 r = impl_SleepConditionVariableCS_body(cv, cs, ms);
+    wacc_add(t0, (u64)(uintptr_t)cv, caller);
+    return r;
+}
+static u64 __attribute__((ms_abi))
+impl_SleepConditionVariableCS_body(u64 *cv, WIN_CS *cs, u32 ms)
 {
     static int diag = -1;
     if (diag < 0) diag = getenv("BEER_WAIT_DIAGNOSTICS") != NULL;
@@ -14763,9 +15009,22 @@ beer_sleep_cv_srw(u64 *cv, u64 *lock, u32 ms, u32 flags)
     return 1;
 }
 
+static u64 __attribute__((ms_abi)) impl_SleepConditionVariableSRW_body(u64 *cv, u64 *lock, u32 ms, u32 flags);
 static u64 __attribute__((ms_abi))
 impl_SleepConditionVariableSRW(u64 *cv, u64 *lock, u32 ms, u32 flags)
 {
+    if (!wacc_on()) return impl_SleepConditionVariableSRW_body(cv, lock, ms, flags);
+    const u64 caller = g_dispatch_incoming_return, t0 = wacc_now();
+    const u64 r = impl_SleepConditionVariableSRW_body(cv, lock, ms, flags);
+    wacc_add(t0, (u64)(uintptr_t)cv, caller);
+    return r;
+}
+static u64 __attribute__((ms_abi))
+impl_SleepConditionVariableSRW_body(u64 *cv, u64 *lock, u32 ms, u32 flags)
+{
+    if (wait_log_thread())
+        fprintf(stderr, "[WAITLOG] tid %ld SleepConditionVariableSRW cv=%p ms=%u flags=%u caller=0x%llx\n",
+                (long)syscall(SYS_gettid), (void *)cv, ms, flags, (unsigned long long)g_dispatch_incoming_return);
     static int diag = -1;
     if (diag < 0) diag = getenv("BEER_WAIT_DIAGNOSTICS") != NULL;
     if (!diag) return beer_sleep_cv_srw(cv, lock, ms, flags);
@@ -15077,6 +15336,17 @@ static void *win_thread_trampoline(void *p) {
     int id = (int)(intptr_t)p;
     if (id <= 0 || id >= g_thread_cnt) return NULL;
     WinThread *t = &g_threads[id];
+
+    /* A Windows thread starts on the process affinity, never its creator's thread affinity; a Linux thread inherits
+     * the creator's. RE9 pins the thread that spawns its job workers, and every worker inherited that pin: 57 threads
+     * on the same 10-11 logical CPUs (E-cores included) while the rest sat idle (stutter turning the camera). */
+    {
+        cpu_set_t all;
+        CPU_ZERO(&all);
+        const u64 mask = win_processor_mask();
+        for (int cpu = 0; cpu < 64; ++cpu) if (mask & ((u64)1 << cpu)) CPU_SET(cpu, &all);
+        sched_setaffinity(0, sizeof(all), &all);
+    }
 
     /* Give this thread its own private TEB + TLS array so implicit TLS
      * (__declspec(thread) via gs:[0x58][index]) is per-thread, not shared. */
@@ -16332,11 +16602,32 @@ static u64 synthetic_system_module_file(const char *name)
 }
 
 static u64 create_file_a(const char *name, u32 access, u32 share, u64 sa, u32 creation, u32 attrs, u64 tmpl);
+
+/* BEER_PATH_WATCH=<substring>: log file opens, moves and deletes whose Windows path contains the text (case-insensitive),
+ * with their results; BEER_PATH_WATCH_WRITES=1 also logs every open for writing or creating. Diagnostic only. */
+static const char *beer_path_watch(void)
+{
+    static const char *watch = (const char *)1;
+    if (watch == (const char *)1) { watch = getenv("BEER_PATH_WATCH"); if (watch && !*watch) watch = NULL; }
+    return watch;
+}
+static int beer_path_watched(const char *path)
+{
+    const char *watch = beer_path_watch();
+    return watch && path && strcasestr(path, watch) != NULL;
+}
+
 static u64 __attribute__((ms_abi))
 impl_CreateFileA(const char *name, u32 access, u32 share, u64 sa,
                   u32 creation, u32 attrs, u64 tmpl)
 {
-    return inherit_from_sa(create_file_a(name, access, share, sa, creation, attrs, tmpl), sa);
+    const u64 handle = inherit_from_sa(create_file_a(name, access, share, sa, creation, attrs, tmpl), sa);
+    static int writes = -1;
+    if (writes < 0) writes = getenv("BEER_PATH_WATCH_WRITES") != NULL;
+    if (beer_path_watched(name) || (writes && ((access & 0x40000000u) || (creation != 3 && creation != 0))))
+        fprintf(stderr, "[PATHWATCH] CreateFile(%s, access=0x%x share=0x%x creation=%u attrs=0x%x) -> 0x%llx err=%u\n",
+                name, access, share, creation, attrs, (unsigned long long)handle, (unsigned)g_last_error);
+    return handle;
 }
 static u64 create_file_a(const char *name, u32 access, u32 share, u64 sa, u32 creation, u32 attrs, u64 tmpl)
 {
@@ -16587,6 +16878,16 @@ static void iocp_post(int idx, u64 key, u64 overlapped, u32 bytes, u32 status)
         pthread_cond_signal(&p->cv);
     }
     pthread_mutex_unlock(&p->mtx);
+    wait_object_notify(WAIT_OBJECT_IOCP | (u32)idx);   /* WaitFor*Object(s) on the port */
+}
+
+static int iocp_has_packets(int idx)
+{
+    Iocp *p = &g_iocps[idx];
+    pthread_mutex_lock(&p->mtx);
+    const int ready = p->used && p->count > 0;
+    pthread_mutex_unlock(&p->mtx);
+    return ready;
 }
 
 /* Called after an OVERLAPPED operation on `file` completed (bytes transferred, 0 = ok / errno). */
@@ -16686,6 +16987,10 @@ impl_GetQueuedCompletionStatus(u64 port, u32 *bytes, u64 *key, u64 *overlapped, 
     if (idx < 0) { g_last_error = 6; if (overlapped) *overlapped = 0; return 0; }
     IocpPacket pkt;
     g_dbg_wait_handle = port;                     /* SIGUSR1 stack dump: the port this thread waits on */
+    if (wait_log_thread())
+        fprintf(stderr, "[WAITLOG] tid %ld GetQueuedCompletionStatus port=%llx ms=%u queued=%u caller=0x%llx\n",
+                (long)syscall(SYS_gettid), (unsigned long long)port, ms, g_iocps[idx].count,
+                (unsigned long long)g_dispatch_incoming_return);
     if (iocp_take(&g_iocps[idx], ms, &pkt) != 0) {
         if (overlapped) *overlapped = 0;
         g_last_error = 258;                       /* WAIT_TIMEOUT */
@@ -16708,6 +17013,10 @@ impl_GetQueuedCompletionStatusEx(u64 port, u8 *entries, u32 count, u32 *removed,
     int idx = iocp_from_handle(port);
     if (idx < 0 || !entries || !count) { g_last_error = idx < 0 ? 6u : 87u; if (removed) *removed = 0; return 0; }
     IocpPacket pkt;
+    if (wait_log_thread())
+        fprintf(stderr, "[WAITLOG] tid %ld GetQueuedCompletionStatusEx port=%llx ms=%u queued=%u caller=0x%llx\n",
+                (long)syscall(SYS_gettid), (unsigned long long)port, ms, g_iocps[idx].count,
+                (unsigned long long)g_dispatch_incoming_return);
     if (iocp_take(&g_iocps[idx], ms, &pkt) != 0) {
         if (removed) *removed = 0;
         g_last_error = 258;
@@ -18196,14 +18505,28 @@ impl_DeleteFileW(const u16 *path)
     if (unlink(host) != 0) {
         g_last_error = errno == EACCES || errno == EPERM ? 5u :
                        (errno == ENOENT ? 2u : 1u);
+        if (beer_path_watched(narrow)) fprintf(stderr, "[PATHWATCH] DeleteFile(%s) failed err=%u\n", narrow, (unsigned)g_last_error);
         return 0;
     }
+    if (beer_path_watched(narrow)) fprintf(stderr, "[PATHWATCH] DeleteFile(%s) ok\n", narrow);
     g_last_error = 0;
     return 1;
 }
 
-static int move_windows_file_w(const u16 *source, const u16 *destination,
-                               u32 flags)
+static int move_windows_file_w_impl(const u16 *source, const u16 *destination, u32 flags);
+static int move_windows_file_w(const u16 *source, const u16 *destination, u32 flags)
+{
+    const int ok = move_windows_file_w_impl(source, destination, flags);
+    char a[PATH_MAX], b[PATH_MAX];
+    if (windows_wide_path_to_ascii(source, a, sizeof(a)) && windows_wide_path_to_ascii(destination, b, sizeof(b)) &&
+        (beer_path_watched(a) || beer_path_watched(b)))
+        fprintf(stderr, "[PATHWATCH] MoveFile(%s -> %s, flags=0x%x) -> %d err=%u\n", a, b, flags, ok,
+                ok ? 0u : (unsigned)g_last_error);
+    return ok;
+}
+
+static int move_windows_file_w_impl(const u16 *source, const u16 *destination,
+                                    u32 flags)
 {
     enum { MOVEFILE_REPLACE_EXISTING = 1u, MOVEFILE_COPY_ALLOWED = 2u,
            MOVEFILE_WRITE_THROUGH = 8u };
@@ -19681,6 +20004,11 @@ static BEER_RAW_INPUT_DEVICE g_raw_keyboard_registration;
 static int g_raw_mouse_registered;
 static int g_raw_keyboard_registered;
 static void release_raw_input(u64 handle);
+/* The WM_INPUT this thread removed last and has not read with GetRawInputData. Windows frees a raw input packet
+ * once its message has been processed, read or not; Beer frees it on the read, or here when the thread takes its
+ * next message. Without the second rule every WM_INPUT a window procedure ignored (a splash screen's) kept its slot,
+ * and after 256 of them all key and mouse input was dropped (Ghost of Tsushima's menus). */
+static __thread u64 t_unread_raw_input;
 
 /* Low-level hooks execute on the installing/message thread on Windows. Native
  * events are therefore translated into queued messages first, and callbacks
@@ -20322,8 +20650,10 @@ impl_GetRawInputData(u64 handle, u32 command, void *data,
      * every WM_INPUT once; retaining slots until ring wrap let unread motion
      * overwrite button packets, while releasing at PeekMessage time would be
      * too early because the read happens while processing the removed message. */
-    if (command == 0x10000003u)
+    if (command == 0x10000003u) {
         release_raw_input(handle);
+        if (t_unread_raw_input == handle) t_unread_raw_input = 0;   /* read: not released again (the slot may be reused) */
+    }
     if (getenv("BEER_INPUT_DIAGNOSTICS")) {
         static _Atomic(u32) logs;
         u32 log = atomic_fetch_add(&logs, 1);
@@ -20745,17 +21075,42 @@ static void queue_raw_input(const BeerRawInput *input, int keyboard)
         pthread_mutex_unlock(&g_win_message_mutex);
         handle = store_raw_input(input);
         if (!handle) {
+            /* No motion to give up: drop the oldest queued WM_INPUT of any kind (with its message, so no stale handle
+             * is left behind). Packets nobody reads (a window whose thread stopped pumping, e.g. a splash screen
+             * that raw input was registered to first) otherwise held every slot for good, and all later key and
+             * mouse input was lost (Ghost of Tsushima's menus ignored all input). */
+            pthread_mutex_lock(&g_win_message_mutex);
+            for (u32 i = 0; i < g_win_message_count; ++i) {
+                u32 index = (g_win_message_head + i) % WIN_MESSAGE_CAPACITY;
+                if (g_win_messages[index].message != 0x00ffu) continue;
+                u64 candidate = g_win_messages[index].lParam;
+                remove_window_message_locked(i);
+                release_raw_input(candidate);
+                break;
+            }
+            pthread_mutex_unlock(&g_win_message_mutex);
+            handle = store_raw_input(input);
+        }
+        if (!handle) {
             if (getenv("BEER_INPUT_DIAGNOSTICS"))
-                fprintf(stderr, "[INPUT] raw-input slots full; no motion packet available to reclaim\n");
+                fprintf(stderr, "[INPUT] raw-input slots full; no queued WM_INPUT to reclaim\n");
             return;
         }
+    }
+    /* WM_INPUT goes to the thread that owns the registered target window, as Windows posts to a window's own thread
+     * (not to whichever thread created the newest window). */
+    u32 owner = g_window_thread_id ? g_window_thread_id : (u32)current_windows_thread_id();
+    if (target) {
+        pthread_mutex_lock(&g_beer_windows_mtx);
+        const BeerWindow *window = beer_window_find(target);
+        if (window && window->owner_tid) owner = window->owner_tid;
+        pthread_mutex_unlock(&g_beer_windows_mtx);
     }
     /* RIDEV_INPUTSINK permits delivery without focus; wParam is RIM_INPUT (0)
      * while the window is foreground and RIM_INPUTSINK (1) only when it is
      * not. Reporting sink for a focused window made RE8 treat every raw
      * mouse message as background input. */
-    if (!queue_message_for_thread(g_window_thread_id ? g_window_thread_id :
-                                                       (u32)current_windows_thread_id(),
+    if (!queue_message_for_thread(owner,
                                   target ? target : FAKE_HWND, 0x00ff,
                                   ((flags & 0x00000100u) && !g_window_focused) ? 1 : 0,
                                   handle))
@@ -21402,6 +21757,7 @@ static u64 __attribute__((ms_abi)) impl_GetQueueStatus(u32 flags)
 static u64 __attribute__((ms_abi)) impl_GetMessageTime(void) { return t_last_message_time; }
 static u64 __attribute__((ms_abi)) impl_GetMessagePos(void) { return t_last_message_pos; }
 
+
 static int take_window_message(WIN_MSG *message, u32 min, u32 max, int remove)
 {
     int found = 0;
@@ -21416,6 +21772,8 @@ static int take_window_message(WIN_MSG *message, u32 min, u32 max, int remove)
         t_last_message_time = g_win_messages[index].time;
         t_last_message_pos = ((u32)(u16)g_win_messages[index].pt.x) | ((u32)(u16)g_win_messages[index].pt.y << 16);
         if (remove) {
+            if (t_unread_raw_input) { release_raw_input(t_unread_raw_input); t_unread_raw_input = 0; }
+            if (id == 0x00ffu) t_unread_raw_input = g_win_messages[index].lParam;
             beer_win32_apply_input_message(g_win_message_keys, id,
                                             g_win_messages[index].wParam);
             for (u32 j = i; j + 1 < g_win_message_count; ++j) {
@@ -22510,16 +22868,15 @@ impl_IsValidLocale(u32 lcid, u32 flags) { (void)flags; return lcid <= 0xFFFF ? 1
 static u64 __attribute__((ms_abi))
 impl_GetLocaleInfoA(u32 locale, u32 type, char *buf, int size)
 {
+    if (size < 0 || (!buf && size)) { g_last_error = 87; return 0; }
     const char *value = beer_locale_info_ascii(locale, type);
     if (!value) { g_last_error = 1004; return 0; }
 
     if (type & 0x20000000u) {
-        char *end = NULL;
-        unsigned long number = strtoul(value, &end, 10);
-        if (!end || *end) { g_last_error = 87; return 0; }
+        u32 result;
+        if (!beer_locale_info_number(type, value, &result)) { g_last_error = 1004; return 0; }
         if (!buf || size == 0) return sizeof(u32);
         if (size < (int)sizeof(u32)) { g_last_error = 122; return 0; }
-        u32 result = (u32)number;
         memcpy(buf, &result, sizeof(result));
         g_last_error = 0;
         return sizeof(result);
@@ -23754,40 +24111,11 @@ static u64 __attribute__((ms_abi))
 impl_GetLocaleInfoEx(u64 locale, u32 lctype, u16 *data, int cchdata)
 {
     const u16 *name = (const u16 *)locale;
-    const int return_number = (lctype & 0x20000000u) != 0;
-    const u32 type = lctype & ~0x20000000u;
-
-    if (return_number) {
-        u32 value;
-        switch (type) {
-            case 0x1004: value = 0x0409; break; /* LOCALE_ILANGUAGE */
-            default: value = 0;
-        }
-        if (!data || cchdata == 0) return 2; /* DWORD measured in WCHARs */
-        if (cchdata < 2) { g_last_error = 122; return 0; }
-        memcpy(data, &value, sizeof(value));
-        return 2;
-    }
-
     const int japanese = name && (u16_ascii_equal_ci(name, "ja-JP") ||
                                   u16_ascii_equal_ci(name, "Japanese"));
-    switch (type) {
-        case 0x00000002: /* LOCALE_SLANGUAGE */
-        case 0x00001001: /* LOCALE_SENGLANGUAGE */
-            return copy_ascii_to_u16(japanese ? "Japanese" : "English (United States)",
-                                     data, cchdata);
-        case 0x0000005c: /* LOCALE_SNAME */
-            return copy_ascii_to_u16(japanese ? "ja-JP" : "en-US", data, cchdata);
-        case 0x00000001: /* LOCALE_ILANGUAGE */
-            return copy_ascii_to_u16(japanese ? "0411" : "0409", data, cchdata);
-        case 0x0000000e: /* LOCALE_SDECIMAL */
-            return copy_ascii_to_u16(".", data, cchdata);
-        case 0x0000000f: /* LOCALE_STHOUSAND */
-            return copy_ascii_to_u16(",", data, cchdata);
-        default:
-            return impl_GetLocaleInfoW(japanese ? 0x0411 : 0x0409,
-                                       type, data, cchdata);
-    }
+    /* Share the W implementation so numeric values, flags and lengths cannot
+     * diverge. In particular 0x1004 is IDEFAULTANSICODEPAGE, not ILANGUAGE. */
+    return impl_GetLocaleInfoW(japanese ? 0x0411 : 0x0409, lctype, data, cchdata);
 }
 
 static u64 __attribute__((ms_abi))
@@ -29263,8 +29591,10 @@ static void guest_dll_resolve_imports(GuestDll *dll)
              * kernel/API contracts Beer already implements. */
             GuestDll *dependency_dll = NULL;
             if (api_set_contract) {
-                if (!implementation && !strncmp(dependency_lower,
-                                                "api-ms-win-crt-", 15)) {
+                /* One native UCRT owns ALL CRT contracts, including names
+                 * for which Beer has fallbacks. Mixing setlocale/ctype/heap
+                 * state with the native runtime makes std::locale fail. */
+                if (!strncmp(dependency_lower, "api-ms-win-crt-", 15)) {
                     dependency_dll = guest_dll_find("ucrtbase.dll");
                     /* A bundled C++ runtime pulled in by a game DLL (not by the exe) needs its UCRT too. */
                     if (!dependency_dll && !g_loading_ucrtbase) {
@@ -36452,11 +36782,13 @@ static void beer_dump_outstanding_io(void)
 /* Hang diagnostics: `kill -USR1 <pid>` makes every thread print its host call chain (module offsets, resolve with
  * `addr2line -f -e loader <offset>`) and the guest address of its last API call (RVA inside the exe). */
 extern void bd12_ckpt_dump(void);
+extern void bd12_com_debug_dump(void);
 static void on_dump_stacks(int sig, siginfo_t *info, void *uctx)
 {
     (void)sig; (void)uctx;
     if (info && info->si_code == SI_USER) {   /* from outside: fan out to every thread */
         bd12_ckpt_dump();                       /* last GPU checkpoints (BEER_VK_CHECKPOINTS=1) */
+        bd12_com_debug_dump();                  /* D3D12 queues BD12 holds on the CPU, lane serials */
         beer_dump_outstanding_io();
         /* BEER_DUMP_IMAGE=<file>: the main image as it is in memory now (unpacked code included), so the RVAs in
          * this dump can be disassembled. Unreadable pages are written as zeros (write() reports EFAULT instead of

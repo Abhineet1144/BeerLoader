@@ -68,6 +68,10 @@ typedef struct {
     int dynamic_rendering;
     int descriptor_indexing;   /* runtime arrays + partially bound + update-after-bind */
     int scalar_block_layout;
+    int raw_access_chains;     /* VK_NV_raw_access_chains shaderRawAccessChains */
+    int image_int64_atomics;   /* VK_EXT_shader_image_atomic_int64 shaderImageInt64Atomics (sampler feedback maps) */
+    uint32_t vendor_id;
+    uint32_t driver_id;        /* VkDriverId (0 when unknown) */
     int host_query_reset;
     int maintenance4;
     int demote_to_helper;

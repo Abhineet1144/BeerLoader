@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -653,6 +654,9 @@ static const char *disk_cache_dir(void)
     mkdir(dir, 0755);
     state = 1;
     fprintf(stderr, "[SHADER-CACHE] on-disk translation cache: %s\n", dir);
+    if (access(dir, W_OK) != 0)   /* e.g. an NTFS partition that ntfs-3g mounted read-only after Windows hibernation */
+        fprintf(stderr, "[SHADER-CACHE] WARNING: %s is not writable (%s): translated shaders will not be saved, "
+                        "every launch translates them again\n", dir, strerror(errno));
     return dir;
 }
 
@@ -675,6 +679,10 @@ static uint64_t disk_cache_build_key(void)
     {
         Dl_info info;   /* vkd3d-shader (DXBC), wherever it was found */
         h = file_key(h, load_api() && dladdr((void *)g_api.compile, &info) ? info.dli_fname : NULL);
+    }
+    {
+        const uint64_t caps = beer_d3d12_dxil_caps_key();   /* device-dependent dxil-spirv options */
+        h = fnv64_seed((const uint8_t *)&caps, sizeof(caps), h);
     }
     const char *opts[] = { "BEER_SPV_FLOAT_CONTROLS", "BEER_SPV_INVARIANT_POSITION", "BEER_SPV_SYNC" };
     for (size_t i = 0; i < sizeof(opts) / sizeof(*opts); ++i) {

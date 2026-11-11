@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "bd12.h"
+#include "d3d12_dxil_translator.h"
 
 #include <pthread.h>
 #include <time.h>
@@ -8,8 +9,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 
 static BD12Device *g_pc_device;
+static uint64_t pc_now_ms(void);
+/* Content hash of a pipeline cache blob (8 bytes at a time; a whole-cache rewrite is skipped when it matches). */
+static uint64_t pc_hash(const void *data, size_t size)
+{
+    const uint8_t *p = data;
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ size;
+    size_t i = 0;
+    for (; i + 8 <= size; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
+    for (; i < size; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
 static void pc_atexit(void)
 {
     if (g_pc_device && g_pc_device->pipeline_cache_new) bd12_pipeline_cache_save(g_pc_device);
@@ -54,6 +69,31 @@ static int32_t pick_memory_type(const VkPhysicalDeviceMemoryProperties *memory,
     return -1;
 }
 
+/* Whether Beer keeps its own whole-cache VkPipelineCache file. Drivers with a reliable shader disk cache of their own
+ * (NVIDIA proprietary; Mesa RADV, ANV, Turnip, NVK), given a per-program folder by the loader, serve repeat pipeline
+ * builds from it, as they do for vkd3d-proton; the blob only duplicates that in memory (RE9: 1.1 GB file, +1.5 GB RSS,
+ * load time unchanged without it). Other drivers keep the blob. BEER_BD12_PIPELINE_CACHE=1|0 forces it;
+ * BEER_PIPELINE_CACHE_OFF=1 is the older off switch. */
+static int use_pipeline_cache_blob(void)
+{
+    const char *force = getenv("BEER_BD12_PIPELINE_CACHE");
+    if (force && *force) return strcmp(force, "0") != 0;
+    if (getenv("BEER_PIPELINE_CACHE_OFF")) return 0;
+    const BeerVulkanModern *m = beer_vulkan_modern();
+    switch (m ? m->driver_id : 0) {
+    case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+    case VK_DRIVER_ID_MESA_RADV:
+    case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
+    case VK_DRIVER_ID_MESA_TURNIP:
+    case VK_DRIVER_ID_MESA_NVK:
+        if (getenv("BEER_DRIVER_CACHE") && !strcmp(getenv("BEER_DRIVER_CACHE"), "0")) return 1;  /* no per-game cache */
+        fprintf(stderr, "[BD12] pipeline cache: in memory only, repeat builds from the driver's shader disk cache\n");
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 BD12Device *bd12_device_create(void)
 {
     if (!beer_vulkan_context_initialize()) return NULL;
@@ -71,7 +111,12 @@ BD12Device *bd12_device_create(void)
     device->queue = beer_vulkan_queue();
     device->queue_family = beer_vulkan_queue_family();
     device->modern = modern;
+    {
+        const BeerD3D12DxilCaps caps = { modern->scalar_block_layout, modern->raw_access_chains, modern->vendor_id };
+        beer_d3d12_dxil_set_caps(&caps);
+    }
     pthread_mutex_init(&device->va_lock, NULL);
+    pthread_mutex_init(&device->submit_barrier_lock, NULL);
     pthread_mutex_init(&device->view_lock, NULL);
     pthread_mutex_init(&device->zero_lock, NULL);
 
@@ -132,6 +177,41 @@ BD12Device *bd12_device_create(void)
         if (get_properties2) get_properties2(device->physical_device, &properties2);
         device->wave_lane_min = size_control.minSubgroupSize ? size_control.minSubgroupSize : subgroup.subgroupSize;
         device->wave_lane_max = size_control.maxSubgroupSize ? size_control.maxSubgroupSize : subgroup.subgroupSize;
+        /* TotalLaneCount: games size persistent-thread work queues from it (one group per lane batch), so a
+         * single wave's width makes them run on one wave. Vulkan has no direct query; derive it like vkd3d-proton:
+         * NVIDIA SMs x warps per SM x 2, AMD compute units x 64, otherwise 32 waves. */
+        PFN_vkEnumerateDeviceExtensionProperties enumerate =
+            (PFN_vkEnumerateDeviceExtensionProperties)get_instance(device->instance,
+                                                                   "vkEnumerateDeviceExtensionProperties");
+        int nv_sm = 0, amd_core = 0;
+        uint32_t count = 0;
+        if (enumerate && enumerate(device->physical_device, NULL, &count, NULL) == VK_SUCCESS && count) {
+            VkExtensionProperties *extensions = calloc(count, sizeof(*extensions));
+            if (extensions && enumerate(device->physical_device, NULL, &count, extensions) == VK_SUCCESS)
+                for (uint32_t i = 0; i < count; ++i) {
+                    nv_sm |= !strcmp(extensions[i].extensionName, VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME);
+                    amd_core |= !strcmp(extensions[i].extensionName, VK_AMD_SHADER_CORE_PROPERTIES_EXTENSION_NAME);
+                }
+            free(extensions);
+        }
+        VkPhysicalDeviceShaderSMBuiltinsPropertiesNV sm = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV };
+        VkPhysicalDeviceShaderCorePropertiesAMD core = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD };
+        VkPhysicalDeviceProperties2 lanes2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        if (nv_sm) lanes2.pNext = &sm;
+        else if (amd_core) lanes2.pNext = &core;
+        if (get_properties2 && lanes2.pNext) get_properties2(device->physical_device, &lanes2);
+        const uint32_t amd_units = core.shaderEngineCount * core.shaderArraysPerEngineCount *
+                                   core.computeUnitsPerShaderArray;
+        if (nv_sm && sm.shaderSMCount && sm.shaderWarpsPerSM)
+            device->total_lane_count = sm.shaderSMCount * sm.shaderWarpsPerSM * 2;
+        else if (amd_core && amd_units)
+            device->total_lane_count = amd_units * 64;
+        else
+            device->total_lane_count = 32 * (subgroup.subgroupSize ? subgroup.subgroupSize : 32);
+        fprintf(stderr, "[BD12] TotalLaneCount %u (%s)\n", device->total_lane_count,
+                nv_sm ? "SMs x warps per SM x 2" : amd_units ? "compute units x 64" : "32 waves");
     }
     device->min_uniform_alignment =
         properties.limits.minUniformBufferOffsetAlignment;
@@ -154,9 +234,15 @@ BD12Device *bd12_device_create(void)
         modern->storage_texel_buffer_offset_single_texel;
 
 
-    /* Persistent pipeline cache: driver pipeline compiles dominate first-run loading.
-     * BEER_PIPELINE_CACHE_OFF=1 (diagnostic): no VkPipelineCache at all, to measure what it holds in memory. */
-    if (!getenv("BEER_PIPELINE_CACHE_OFF")) {
+    /* Identity of serialised pipeline libraries (ID3D12PipelineLibrary): GPU, driver and pipeline-cache UUID. It must
+     * not depend on whether Beer keeps a cache file: a zero identity made RE9 reject its saved library and rebuild
+     * every pipeline at the title screen. */
+    memcpy(device->pipeline_identity, &properties.vendorID, 4);
+    memcpy(device->pipeline_identity + 4, &properties.deviceID, 4);
+    memcpy(device->pipeline_identity + 8, &properties.driverVersion, 4);
+    memcpy(device->pipeline_identity + 12, properties.pipelineCacheUUID, 16);
+    /* Persistent pipeline cache: driver pipeline compiles dominate first-run loading. */
+    if (use_pipeline_cache_blob()) {
         /* BEER_CACHE_DIR (set by the manager) holds every shader cache; otherwise $XDG_CACHE_HOME/beer or
          * ~/.cache/beer. */
         const char *root = getenv("BEER_CACHE_DIR"), *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
@@ -167,6 +253,9 @@ BD12Device *bd12_device_create(void)
         for (size_t i = 1; dir[i]; ++i)                    /* mkdir -p */
             if (dir[i] == '/') { dir[i] = 0; mkdir(dir, 0700); dir[i] = '/'; }
         mkdir(dir, 0700);
+        if (access(dir, W_OK) != 0)   /* e.g. NTFS mounted read-only by ntfs-3g after Windows hibernation */
+            fprintf(stderr, "[BD12] WARNING: pipeline cache folder %s is not writable (%s): compiled pipelines will "
+                            "not be saved, every launch compiles them again\n", dir, strerror(errno));
         /* One file per program (its executable name) and GPU/driver, as vkd3d-proton keeps one per application: a
          * single file shared by every game grew past the old 256 MB read limit, was then skipped at load, and the
          * next save replaced it with that session's few MB (Stellar Blade recompiled everything on every launch). */
@@ -194,10 +283,6 @@ BD12Device *bd12_device_create(void)
         snprintf(device->pipeline_cache_path, sizeof(device->pipeline_cache_path),
                  "%s/pipelines-%04x-%04x-%08x-%s.bin", dir, properties.vendorID, properties.deviceID,
                  properties.driverVersion, program);
-        memcpy(device->pipeline_identity, &properties.vendorID, 4);
-        memcpy(device->pipeline_identity + 4, &properties.deviceID, 4);
-        memcpy(device->pipeline_identity + 8, &properties.driverVersion, 4);
-        memcpy(device->pipeline_identity + 12, properties.pipelineCacheUUID, 16);
         void *blob = NULL;
         size_t blob_size = 0;
         FILE *f = getenv("BEER_NO_PIPELINE_CACHE") ? NULL : fopen(device->pipeline_cache_path, "rb");
@@ -217,10 +302,19 @@ BD12Device *bd12_device_create(void)
                 device->pipeline_cache = VK_NULL_HANDLE;
         }
         if (blob_size) fprintf(stderr, "[BD12] pipeline cache: loaded %zu bytes from %s\n", blob_size, device->pipeline_cache_path);
+        device->pipeline_cache_hash = blob_size ? pc_hash(blob, blob_size) : 0;
         free(blob);
-        device->pipeline_cache_saved_ms = 0;
+        /* With a loaded cache the first background save waits a full interval; a fresh one saves early. */
+        device->pipeline_cache_saved_ms = blob_size ? pc_now_ms() : 0;
         g_pc_device = device;
         atexit(pc_atexit);
+    } else {
+        /* The driver's disk cache supplies repeat builds, but pipelines are still created through an in-memory
+         * VkPipelineCache: with VK_NULL_HANDLE, RE9 at the same spot fell from ~70 to ~60 fps (GPU 61% -> 36%).
+         * No path: nothing is loaded or saved, so the session cache never becomes a GB-sized file again. */
+        const VkPipelineCacheCreateInfo cache_info = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+        if (device->vk.CreatePipelineCache(device->device, &cache_info, NULL, &device->pipeline_cache) != VK_SUCCESS)
+            device->pipeline_cache = VK_NULL_HANDLE;
     }
 
     /* Probe the memory type bits every D3D12 buffer can use. */
@@ -251,6 +345,25 @@ BD12Device *bd12_device_create(void)
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
         0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    /* UPLOAD heaps in device-local, host-visible memory when the whole VRAM is CPU-mappable (resizable BAR), as
+     * vkd3d-proton does: games read constants, light lists and other data straight out of upload heaps in their
+     * shaders, and from system memory every such read crosses PCIe (RE9: GPU "busy" at half power). CPU writes stay
+     * write-combined, as Windows upload heaps are. A small (256 MB) BAR window is left alone; BEER_BD12_UPLOAD_SYSMEM=1
+     * keeps system memory. */
+    if (!getenv("BEER_BD12_UPLOAD_SYSMEM")) {
+        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t i = 0; i < device->memory.memoryTypeCount; ++i) {
+            const VkMemoryType *t = &device->memory.memoryTypes[i];
+            if (!(device->buffer_memory_bits & (1u << i)) || (t->propertyFlags & want) != want ||
+                (t->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ||
+                device->memory.memoryHeaps[t->heapIndex].size < (4ull << 30))
+                continue;
+            device->memory_type[BD12_HEAP_UPLOAD] = (int32_t)i;
+            fprintf(stderr, "[BD12] upload heaps in device-local host-visible memory (type %u, resizable BAR)\n", i);
+            break;
+        }
+    }
     device->memory_type[BD12_HEAP_READBACK] = pick_memory_type(
         &device->memory, device->buffer_memory_bits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -295,14 +408,18 @@ void bd12_pipeline_cache_save(BD12Device *device)
     size_t size = 0;
     if (device->vk.GetPipelineCacheData(device->device, device->pipeline_cache, &size, NULL) == VK_SUCCESS && size) {
         void *blob = malloc(size);
-        if (blob && device->vk.GetPipelineCacheData(device->device, device->pipeline_cache, &size, blob) == VK_SUCCESS) {
+        const uint64_t hash = blob && device->vk.GetPipelineCacheData(device->device, device->pipeline_cache, &size,
+                                                                     blob) == VK_SUCCESS ? pc_hash(blob, size) : 0;
+        /* Pipelines found in the cache count as builds too: when the driver's data did not change, keep the file. */
+        if (hash && hash != device->pipeline_cache_hash) {
             char tmp[560];
             snprintf(tmp, sizeof(tmp), "%s.tmp", device->pipeline_cache_path);
             FILE *f = fopen(tmp, "wb");
             if (f) {
                 const int ok = fwrite(blob, 1, size, f) == size;
                 fclose(f);
-                if (ok) rename(tmp, device->pipeline_cache_path); else unlink(tmp);
+                if (ok && rename(tmp, device->pipeline_cache_path) == 0) device->pipeline_cache_hash = hash;
+                else unlink(tmp);
             }
         }
         free(blob);
@@ -312,13 +429,71 @@ void bd12_pipeline_cache_save(BD12Device *device)
     pthread_mutex_unlock(&lock);
 }
 
-/* Called after every pipeline build: save in the background of normal work, but not on every pipeline. */
+/* Periodic saves run on their own thread. A save copies the whole driver cache out (RE9: 1.1 GB) and writes it to
+ * disk; done inline it ran on whichever game thread built the triggering pipeline, and the whole game waited for it
+ * (RE9: a 3.8-5 s freeze a minute into gameplay, every launch). The final save at exit stays synchronous. */
+static pthread_mutex_t g_pc_saver_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pc_saver_cv = PTHREAD_COND_INITIALIZER;
+static BD12Device *g_pc_saver_device;
+static int g_pc_saver_running;
+
+static void *pc_saver_main(void *arg)
+{
+    (void)arg;
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);   /* background work: below the game's threads */
+    pthread_mutex_lock(&g_pc_saver_lock);
+    for (;;) {
+        while (!g_pc_saver_device) pthread_cond_wait(&g_pc_saver_cv, &g_pc_saver_lock);
+        BD12Device *device = g_pc_saver_device;
+        g_pc_saver_device = NULL;
+        pthread_mutex_unlock(&g_pc_saver_lock);
+        bd12_pipeline_cache_save(device);
+        pthread_mutex_lock(&g_pc_saver_lock);
+    }
+    return NULL;
+}
+
+/* Seconds between background saves while new pipelines keep appearing (BEER_BD12_PIPELINE_CACHE_SAVE_S, default 300):
+ * each save rewrites the whole file, so frequent saves only cost disk bandwidth and a cache-sized buffer. */
+static uint64_t pc_save_interval_ms(void)
+{
+    static uint64_t ms;
+    if (!ms) {
+        const char *v = getenv("BEER_BD12_PIPELINE_CACHE_SAVE_S");
+        const long s = v ? strtol(v, NULL, 10) : 300;
+        ms = (uint64_t)(s > 0 ? s : 300) * 1000u;
+    }
+    return ms;
+}
+
+/* Called after every pipeline build: hands a save to the saver thread now and then, never blocks the caller. */
 void bd12_pipeline_cache_note_new(BD12Device *device)
 {
-    if (!device || !device->pipeline_cache) return;
+    if (!device || !device->pipeline_cache || !device->pipeline_cache_path[0]) return;   /* in-memory only */
     const uint32_t fresh = __atomic_add_fetch(&device->pipeline_cache_new, 1, __ATOMIC_RELAXED);
-    /* Each save writes the whole cache (hundreds of MB for big games): at most once a minute while compiling. */
-    if (fresh >= 25 && pc_now_ms() - device->pipeline_cache_saved_ms > 60000) bd12_pipeline_cache_save(device);
+    if (fresh < 25) return;
+    const uint64_t now = pc_now_ms();
+    uint64_t last = __atomic_load_n(&device->pipeline_cache_saved_ms, __ATOMIC_RELAXED);
+    if (now - last <= pc_save_interval_ms()) return;
+    /* One caller claims this save; the saver thread sets the real time when it finishes. */
+    if (!__atomic_compare_exchange_n(&device->pipeline_cache_saved_ms, &last, now, 0, __ATOMIC_RELAXED,
+                                     __ATOMIC_RELAXED))
+        return;
+    pthread_mutex_lock(&g_pc_saver_lock);
+    if (!g_pc_saver_running) {
+        pthread_t thread;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        g_pc_saver_running = pthread_create(&thread, &attr, pc_saver_main, NULL) == 0;
+        pthread_attr_destroy(&attr);
+        if (g_pc_saver_running) pthread_setname_np(thread, "beer-pcache");
+    }
+    if (g_pc_saver_running) {
+        g_pc_saver_device = device;
+        pthread_cond_signal(&g_pc_saver_cv);
+    }
+    pthread_mutex_unlock(&g_pc_saver_lock);
 }
 
 void bd12_device_destroy(BD12Device *device)
@@ -1099,6 +1274,50 @@ BD12Queue *bd12_queue_create_at(BD12Device *device, uint32_t index)
 
 BD12Queue *bd12_queue_create(BD12Device *device) { return bd12_queue_create_at(device, 0); }
 
+/* The prebuilt barrier command buffer for BD12_LIST_BARRIER_SUBMIT (simultaneous use: every queue of the family
+ * submits the same one), or VK_NULL_HANDLE in the other modes. */
+static VkCommandBuffer submit_barrier(BD12Device *device)
+{
+    if (bd12_list_barrier_mode() != BD12_LIST_BARRIER_SUBMIT) return VK_NULL_HANDLE;
+    VkCommandBuffer cb = __atomic_load_n(&device->submit_barrier_cb, __ATOMIC_ACQUIRE);
+    if (cb) return cb;
+    pthread_mutex_lock(&device->submit_barrier_lock);
+    if (!device->submit_barrier_cb) {
+        const VkCommandPoolCreateInfo pool = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                               .queueFamilyIndex = device->queue_family };
+        if (!device->submit_barrier_pool &&
+            device->vk.CreateCommandPool(device->device, &pool, NULL, &device->submit_barrier_pool) != VK_SUCCESS)
+            device->submit_barrier_pool = VK_NULL_HANDLE;
+        const VkCommandBufferAllocateInfo allocate = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                                       .commandPool = device->submit_barrier_pool,
+                                                       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                                       .commandBufferCount = 1 };
+        VkCommandBuffer made = VK_NULL_HANDLE;
+        if (device->submit_barrier_pool &&
+            device->vk.AllocateCommandBuffers(device->device, &allocate, &made) == VK_SUCCESS) {
+            const VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                                     .flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT };
+            const VkMemoryBarrier2 barrier = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT,
+                .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT |
+                                 VK_ACCESS_2_HOST_READ_BIT
+            };
+            const VkDependencyInfo dependency = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                                  .memoryBarrierCount = 1, .pMemoryBarriers = &barrier };
+            device->vk.BeginCommandBuffer(made, &begin);
+            device->vk.CmdPipelineBarrier2(made, &dependency);
+            if (device->vk.EndCommandBuffer(made) == VK_SUCCESS)
+                __atomic_store_n(&device->submit_barrier_cb, made, __ATOMIC_RELEASE);
+        }
+    }
+    cb = device->submit_barrier_cb;
+    pthread_mutex_unlock(&device->submit_barrier_lock);
+    return cb;
+}
+
 void bd12_queue_destroy(BD12Queue *queue)
 {
     if (!queue) return;
@@ -1137,6 +1356,8 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
         }
     }
     const uint32_t extra_waits = zero_wait ? 1u : 0u;
+    const VkCommandBuffer order_barrier = submit_barrier(device);
+    if (order_barrier) ++command_count;
     const uint32_t total = command_count + wait_count + extra_waits + signal_count;
     /* One allocation holds all three info arrays. */
     size_t bytes = command_count * sizeof(VkCommandBufferSubmitInfo) +
@@ -1166,6 +1387,9 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
             };
     }
 
+    if (order_barrier)   /* after the lists: their writes are visible to every later submission and the host */
+        command_infos[at++] = (VkCommandBufferSubmitInfo){ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                                                           .commandBuffer = order_barrier };
     for (uint32_t i = 0; i < wait_count; ++i)
         wait_infos[i] = (VkSemaphoreSubmitInfo){
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -1351,6 +1575,96 @@ uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
 
 uint64_t g_bd12_cmd_counts[4];
 
+static uint64_t self_read_bytes(void)
+{
+    FILE *f = fopen("/proc/self/io", "r");
+    if (!f) return 0;
+    char line[96];
+    uint64_t v = 0;
+    while (fgets(line, sizeof(line), f))
+        if (!strncmp(line, "read_bytes:", 11)) { v = strtoull(line + 11, NULL, 10); break; }
+    fclose(f);
+    return v;
+}
+
+/* This thread's counters: minor/major faults, user/system CPU (clock ticks), voluntary/involuntary switches. */
+static void thread_counters(uint64_t out[6])
+{
+    memset(out, 0, 6 * sizeof(uint64_t));
+    char buf[1024];
+    FILE *f = fopen("/proc/thread-self/stat", "r");
+    if (f) {
+        const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        const char *p = strrchr(buf, ')');
+        unsigned long long v[16] = { 0 };
+        /* after ")": state(3) ppid pgrp session tty tpgid flags minflt(10) cminflt majflt(12) cmajflt utime(14) stime(15) */
+        if (p && sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %llu %*u %llu %*u %llu %llu", &v[0], &v[1], &v[2], &v[3]) == 4) {
+            out[0] = v[0]; out[1] = v[1]; out[2] = v[2]; out[3] = v[3];
+        }
+    }
+    f = fopen("/proc/thread-self/status", "r");
+    if (f) {
+        while (fgets(buf, sizeof(buf), f)) {
+            if (!strncmp(buf, "voluntary_ctxt_switches:", 24)) out[4] = strtoull(buf + 24, NULL, 10);
+            else if (!strncmp(buf, "nonvoluntary_ctxt_switches:", 27)) out[5] = strtoull(buf + 27, NULL, 10);
+        }
+        fclose(f);
+    }
+}
+
+extern uint64_t beer_thread_wait_stats(uint64_t *max_ns, uint64_t *max_handle, uint64_t *max_caller)
+    __attribute__((weak));
+
+void bd12_hitch_present(void)
+{
+    static int64_t threshold_ns = -1;
+    if (threshold_ns < 0) {
+        const char *v = getenv("BEER_BD12_HITCH");
+        threshold_ns = v && *v ? (int64_t)strtol(v, NULL, 10) * 1000000 : 0;
+    }
+    if (!threshold_ns) return;
+    static uint64_t last, frame, ns[BD12_PROF_COUNT], calls[BD12_PROF_COUNT], read_bytes;
+    const uint64_t now = bd12_prof_now();
+    const uint64_t io = self_read_bytes();
+    uint64_t wait_max = 0, wait_handle = 0, wait_caller = 0;
+    const uint64_t waited = beer_thread_wait_stats ? beer_thread_wait_stats(&wait_max, &wait_handle, &wait_caller) : 0;
+    static uint64_t counters[6];
+    uint64_t now_counters[6];
+    thread_counters(now_counters);
+    ++frame;
+    if (last && (int64_t)(now - last) > threshold_ns) {
+        static const char *names[] = { "execute", "submit", "pso", "resolve", "fence-wait", "finish", "present",
+                                       "heap-create", "heap-destroy", "alloc-set", "update-sets", "submit-lock",
+                                       "vk-submit", "reap", "list-finish", "resource-create", "view-create", "descriptor-copy" };
+        fprintf(stderr, "[HITCH] frame %llu took %.1f ms:", (unsigned long long)frame, (now - last) / 1e6);
+        for (int i = 0; i < BD12_PROF_COUNT; ++i) {
+            /* BEER_BD12_PROF resets the counters every 2 s: a smaller value means a reset, count from zero. */
+            const uint64_t dn = g_bd12_prof_ns[i] >= ns[i] ? g_bd12_prof_ns[i] - ns[i] : g_bd12_prof_ns[i];
+            const uint64_t dc = g_bd12_prof_calls[i] >= calls[i] ? g_bd12_prof_calls[i] - calls[i] : g_bd12_prof_calls[i];
+            if (dn >= 1000000 || (i == BD12_PROF_PSO && dc) || (i == BD12_PROF_HEAP_CREATE && dc) ||
+                (i == BD12_PROF_RESOURCE && dc))
+                fprintf(stderr, " %s=%.1fms/%llu", names[i], dn / 1e6, (unsigned long long)dc);
+        }
+        fprintf(stderr, " waited=%.1fms (longest %.1fms on %llx from 0x%llx)", waited / 1e6, wait_max / 1e6,
+                (unsigned long long)wait_handle, (unsigned long long)wait_caller);
+        fprintf(stderr, " thread: user=%llums sys=%llums minflt=%llu majflt=%llu csw=%llu/%llu",
+                (unsigned long long)((now_counters[2] - counters[2]) * 10), (unsigned long long)((now_counters[3] - counters[3]) * 10),
+                (unsigned long long)(now_counters[0] - counters[0]), (unsigned long long)(now_counters[1] - counters[1]),
+                (unsigned long long)(now_counters[4] - counters[4]), (unsigned long long)(now_counters[5] - counters[5]));
+        fprintf(stderr, " heaps-live=%llu/%llu/%llu read=%lluKB\n",
+                (unsigned long long)g_bd12_heap_live[BD12_HEAP_DEFAULT], (unsigned long long)g_bd12_heap_live[BD12_HEAP_UPLOAD],
+                (unsigned long long)g_bd12_heap_live[BD12_HEAP_READBACK],
+                (unsigned long long)((io >= read_bytes ? io - read_bytes : 0) >> 10));
+    }
+    last = now;
+    memcpy(counters, now_counters, sizeof(counters));
+    memcpy(ns, g_bd12_prof_ns, sizeof(ns));
+    memcpy(calls, g_bd12_prof_calls, sizeof(calls));
+    read_bytes = io;
+}
+
 void bd12_prof_report(void)
 {
     bd12_report_drops();
@@ -1368,7 +1682,7 @@ void bd12_prof_report(void)
     if (now - last < 2000000000ull) return;
     static const char *names[] = { "execute", "submit", "pso", "resolve",
                                    "fence-wait", "finish", "present", "heap-create", "heap-destroy",
-                                   "alloc-set", "update-sets" };
+                                   "alloc-set", "update-sets", "submit-lock", "vk-submit", "reap", "list-finish", "resource-create", "view-create", "descriptor-copy" };
     fprintf(stderr, "[BD12 PROF] %llu ms window:", (unsigned long long)((now - last) / 1000000));
     for (int i = 0; i < BD12_PROF_COUNT; ++i) {
         fprintf(stderr, " %s=%llums/%llu", names[i],
@@ -1376,6 +1690,10 @@ void bd12_prof_report(void)
                 (unsigned long long)g_bd12_prof_calls[i]);
         g_bd12_prof_ns[i] = g_bd12_prof_calls[i] = 0;
     }
+    fprintf(stderr, " barriers=%llu full=%llu render-passes=%llu",
+            (unsigned long long)g_bd12_cmd_counts[BD12_COUNT_BARRIER], (unsigned long long)g_bd12_cmd_counts[3],
+            (unsigned long long)g_bd12_cmd_counts[BD12_COUNT_RENDER_PASS]);
+    g_bd12_cmd_counts[BD12_COUNT_BARRIER] = g_bd12_cmd_counts[3] = g_bd12_cmd_counts[BD12_COUNT_RENDER_PASS] = 0;
     fprintf(stderr, " heaps(default/upload/readback)=%llu/%llu/%llu live, %llu/%llu/%llu MiB",
             (unsigned long long)g_bd12_heap_live[BD12_HEAP_DEFAULT], (unsigned long long)g_bd12_heap_live[BD12_HEAP_UPLOAD],
             (unsigned long long)g_bd12_heap_live[BD12_HEAP_READBACK],

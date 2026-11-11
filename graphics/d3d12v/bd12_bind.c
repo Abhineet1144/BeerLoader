@@ -290,11 +290,32 @@ void bd12_cmd_set_descriptor_heaps(BD12CmdList *list,
     list->heaps[1] = sampler;   /* part of each resolve-cache key */
 }
 
+/* Root arguments across a root-signature change. D3D12 drivers and vkd3d-proton keep them (vkd3d-proton only marks them
+ * for re-push, and keeps tables, root descriptors and constants in separate arrays), and games rely on it: they set a
+ * table once and switch between compatible root signatures. BD12 keeps one value per parameter, so a value survives
+ * only where the parameter keeps its type: a table handle carried into a root CBV/SRV/UAV slot would be used as a GPU
+ * address (RE9 start-up GPU page faults, Xid 31). The per-draw path's scratch copies of root constants are rebuilt. */
+void bd12_root_arguments_carry(const BD12RootSignature *from, const BD12RootSignature *to, BD12RootArgument *arguments)
+{
+    for (uint32_t i = 0; i < BD12_MAX_ROOT_PARAMETERS; ++i) {
+        /* Carrying values (vkd3d-proton style) made every RE9 start fault in the command fetch (Xid 31 MMU fault,
+         * GR0_PBDMA; 3 of 3 runs, 2026-11-12) even with the type check, and GoT never needed it (its unset tables were
+         * unused). Until the cause is understood, arguments are cleared as before. BEER_BD12_KEEP_ROOT_ARGS=1 carries
+         * them (same-type parameters only) for experiments. */
+        static int keep = -1;
+        if (keep < 0) keep = getenv("BEER_BD12_KEEP_ROOT_ARGS") != NULL;
+        const int same = keep && from && to && i < from->parameter_count && i < to->parameter_count &&
+                         from->parameters[i].type == to->parameters[i].type;
+        if (same) arguments[i].cbv_valid = 0;
+        else memset(&arguments[i], 0, sizeof(arguments[i]));
+    }
+}
+
 void bd12_cmd_set_compute_root_signature(BD12CmdList *list,
                                          BD12RootSignature *signature)
 {
     if (list->compute.root_signature == signature) return;
-    memset(list->compute.arguments, 0, sizeof(list->compute.arguments));
+    bd12_root_arguments_carry(list->compute.root_signature, signature, list->compute.arguments);
     list->compute.root_signature = signature;
     ++list->compute.epoch;
 }

@@ -9,6 +9,7 @@
 #include "bd12_formats.h"
 
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -611,10 +612,13 @@ static void list_reset_state(BD12CmdList *c)
     c->gfx.index_type = VK_INDEX_TYPE_UINT16;
 }
 
+static int call_log_on(void);
+static void call_note(const void *list, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void list_set_pso(ComList *l, ComPso *p)
 {
     BD12CmdList *c = l->cur;
     if (!p) return;
+    if (c && call_log_on()) call_note(c, "pso %016llx%s", (unsigned long long)p->hash, p->compute ? " (compute)" : "");
     ComAllocator *a = l->alloc;
     if (p->last_alloc != a || p->last_gen != a->gen) {
         pthread_mutex_lock(&a->lock);
@@ -675,6 +679,7 @@ static int list_start(ComList *l, ComAllocator *a, ComPso *pso)
     }
     l->cur = c;
     if (!bd12_cmd_list_begin(c)) { l->cur = NULL; return 0; }
+    if (call_log_on()) call_note(c, "reset");
     l->open = 1;
     if (pso) list_set_pso(l, pso);
     return 1;
@@ -794,9 +799,60 @@ static void MS cl_draw_indexed(ComList *l, uint32_t ic, uint32_t inst,
     bd12_cmd_draw_indexed(c, ic, inst, si, bv, sinst);
 }
 
+
+/* BEER_BD12_CALL_LOG=1 with BEER_BD12_TRACE_CS=<hash>: every list keeps a ring of its last 48 compute binding calls
+ * (root signature, tables, pipeline) and prints it when it dispatches that compute shader, to see which arguments
+ * the dispatch was given. Diagnostic only; rings are keyed by list pointer (collisions overwrite). */
+#define CALL_RING 48
+typedef struct { const void *list; uint32_t pos; char line[CALL_RING][112]; } CallRing;
+static CallRing g_call_rings[256];
+static int call_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_BD12_CALL_LOG") != NULL;
+    return on;
+}
+static uint64_t call_log_hash(void)
+{
+    static uint64_t h = 1;
+    if (h == 1) { const char *v = getenv("BEER_BD12_TRACE_CS"); h = v ? strtoull(v, NULL, 16) : 0; }
+    return h;
+}
+static CallRing *call_ring(const void *list)
+{
+    CallRing *r = &g_call_rings[((uintptr_t)list >> 6) & 255];
+    if (r->list != list) { r->list = list; r->pos = 0; memset(r->line, 0, sizeof(r->line)); }
+    return r;
+}
+static void call_note(const void *list, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void call_note(const void *list, const char *fmt, ...)
+{
+    CallRing *r = call_ring(list);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(r->line[r->pos++ % CALL_RING], sizeof(r->line[0]), fmt, ap);
+    va_end(ap);
+}
+static void call_dump(const void *list, uint64_t cs)
+{
+    static _Atomic unsigned dumps;
+    if (atomic_fetch_add(&dumps, 1) >= 6) return;
+    CallRing *r = call_ring(list);
+    fprintf(stderr, "[CALL] list=%p dispatch of %016llx; its last binding calls:\n", list, (unsigned long long)cs);
+    for (uint32_t i = 0; i < CALL_RING; ++i) {
+        const char *line = r->line[(r->pos + i) % CALL_RING];
+        if (line[0]) fprintf(stderr, "[CALL]   %s\n", line);
+    }
+}
 static void MS cl_dispatch(ComList *l, uint32_t x, uint32_t y, uint32_t z)
 {
     LIST_CUR(l);
+    if (call_log_on()) {
+        const uint64_t cs = c->compute_pipeline ? c->compute_pipeline->shader_hash : 0;
+        if (cs && cs == call_log_hash()) call_dump(c, cs);
+        call_note(c, "dispatch %u,%u,%u cs=%016llx rs=%p", x, y, z, (unsigned long long)cs,
+                  (void *)c->compute.root_signature);
+    }
     bd12_cmd_dispatch_bound(c, x, y, z);
 }
 
@@ -1038,6 +1094,74 @@ static void MS cl_resolve(ComList *l, ComResource *dst, uint32_t dsub,
         bd12_cmd_resolve_image(c, dst->image, dsub, src->image, ssub);
 }
 
+/* ResolveSubresourceRegion DECODE (5) / ENCODE (4) _SAMPLER_FEEDBACK: between a feedback map and R8_UINT data.
+ * MIN_MIP: the R8 side is a single-mip texture (or, decoding, a buffer); its subresource picks the array layer
+ * (UINT_MAX: all), the map's subresource is ignored. MIP_REGION_USED: the R8 texture has the map's mip count and the
+ * subresource is mip + layer * mips (UINT_MAX: every mip and layer; a mismatched pair takes the concrete one). */
+static void feedback_resolve(BD12CmdList *c, int encode, ComResource *map, uint32_t map_sub, ComResource *r8,
+                             uint32_t r8_sub, uint32_t r8_x, uint32_t r8_y, const int32_t *rect)
+{
+    if (!map || !map->image || (map->dxgi_format != 189 && map->dxgi_format != 190) || !map->feedback_region[0] ||
+        !r8 || (!r8->image && !r8->buffer)) {
+        static unsigned logged;
+        if (logged++ < 5) fprintf(stderr, "[BD12] sampler-feedback %s: invalid resources, skipped\n", encode ? "encode" : "decode");
+        return;
+    }
+    const int min_mip = map->dxgi_format == 189;
+    const uint32_t mips = map->mips ? map->mips : 1, layers = map->depth_or_layers ? map->depth_or_layers : 1;
+    BD12FeedbackOp op = { 0 };
+    op.map = map->image;
+    bd12_feedback_padded_extent(map, &op.map_pitch, &op.map_rows);
+    op.mips = mips;
+    op.r8_image = r8->image;
+    op.r8_buffer = r8->buffer;
+    op.r8_mips = r8->image ? (r8->image->desc.mip_levels ? r8->image->desc.mip_levels : 1) : 1;
+    op.r8_x = (int32_t)r8_x;
+    op.r8_y = (int32_t)r8_y;
+    if (min_mip) {
+        op.variant = encode ? BD12_FEEDBACK_ENCODE_MIN_MIP : BD12_FEEDBACK_DECODE_MIN_MIP;
+        const int all = r8_sub == UINT32_MAX || r8->buffer;
+        op.map_layer = op.r8_layer = all ? 0 : r8_sub;
+        op.layers = r8->buffer ? 1 : all ? layers : 1;
+        bd12_feedback_active_extent(map, 0, &op.w, &op.h);
+        if (rect && !encode) {   /* D3D12_RECT left, top, right, bottom in region units */
+            op.x0 = (uint32_t)rect[0]; op.y0 = (uint32_t)rect[1];
+            op.w = (uint32_t)(rect[2] - rect[0]); op.h = (uint32_t)(rect[3] - rect[1]);
+        }
+        bd12_cmd_feedback_transcode(c, &op);
+        return;
+    }
+    op.variant = encode ? BD12_FEEDBACK_ENCODE_MIP_USED : BD12_FEEDBACK_DECODE_MIP_USED;
+    uint32_t sub = map_sub != UINT32_MAX ? map_sub : r8_sub;
+    for (uint32_t layer = 0; layer < layers; ++layer)
+        for (uint32_t mip = 0; mip < mips; ++mip) {
+            if (sub != UINT32_MAX && sub != mip + layer * mips) continue;
+            op.mip = op.r8_mip = mip;
+            op.map_layer = op.r8_layer = layer;
+            op.layers = 1;
+            op.x0 = op.y0 = 0;
+            bd12_feedback_active_extent(map, mip, &op.w, &op.h);
+            if (rect && sub != UINT32_MAX && !encode) {
+                op.x0 = (uint32_t)rect[0]; op.y0 = (uint32_t)rect[1];
+                op.w = (uint32_t)(rect[2] - rect[0]); op.h = (uint32_t)(rect[3] - rect[1]);
+            }
+            bd12_cmd_feedback_transcode(c, &op);
+        }
+}
+
+/* ID3D12GraphicsCommandList1::ResolveSubresourceRegion. Modes 0-3 (decompress/min/max/average) resolve the whole
+ * subresource; 4/5 transcode sampler feedback. */
+static void MS cl_resolve_region(ComList *l, ComResource *dst, uint32_t dsub, uint32_t dx, uint32_t dy,
+                                 ComResource *src, uint32_t ssub, const int32_t *rect, uint32_t format, uint32_t mode)
+{
+    (void)format;
+    LIST_CUR(l);
+    if (mode == 5) { feedback_resolve(c, 0, src, ssub, dst, dsub, dx, dy, rect); return; }
+    if (mode == 4) { feedback_resolve(c, 1, dst, dsub, src, ssub, dx, dy, rect); return; }
+    if (dst && src && dst->image && src->image)
+        bd12_cmd_resolve_image(c, dst->image, dsub, src->image, ssub);
+}
+
 static void MS cl_set_topology(ComList *l, uint32_t topology)
 {
     LIST_CUR(l);
@@ -1136,7 +1260,7 @@ static void MS cl_barrier(ComList *l, uint32_t n, const uint8_t *barriers)
             ComResource *r = rdptr(b + 8);
             if (r && r->buffer) bd12_cmd_uav_barrier_buffer(c, r->buffer);
             else if (r && r->image) bd12_cmd_uav_barrier_image(c, r->image);
-            else bd12_cmd_global_barrier(c);
+            else bd12_cmd_uav_barrier_all(c);
         }
     }
     bd12_cmd_barrier_batch_end(c);
@@ -1157,6 +1281,7 @@ static void MS cl_set_descriptor_heaps(ComList *l, uint32_t n, ComDescHeap *cons
 static void MS cl_set_compute_rs(ComList *l, ComRootSig *rs)
 {
     LIST_CUR(l);
+    if (call_log_on()) call_note(c, "compute rs %p", (void *)(rs ? rs->rs : NULL));
     bd12_cmd_set_compute_root_signature(c, rs ? rs->rs : NULL);
 }
 static void MS cl_set_graphics_rs(ComList *l, ComRootSig *rs)
@@ -1167,6 +1292,7 @@ static void MS cl_set_graphics_rs(ComList *l, ComRootSig *rs)
 static void MS cl_set_compute_table(ComList *l, uint32_t i, uint64_t h)
 {
     LIST_CUR(l);
+    if (call_log_on()) call_note(c, "compute table %u = 0x%llx", i, (unsigned long long)h);
     bd12_cmd_set_compute_root_table(c, i, h);
 }
 static void MS cl_set_graphics_table(ComList *l, uint32_t i, uint64_t h)
@@ -1177,6 +1303,7 @@ static void MS cl_set_graphics_table(ComList *l, uint32_t i, uint64_t h)
 static void MS cl_set_compute_const(ComList *l, uint32_t i, uint32_t v, uint32_t off)
 {
     LIST_CUR(l);
+    if (call_log_on()) call_note(c, "compute const %u [%u] = 0x%x", i, off, v);
     bd12_cmd_set_compute_root_constants(c, i, &v, 1, off);
 }
 static void MS cl_set_graphics_const(ComList *l, uint32_t i, uint32_t v, uint32_t off)
@@ -1188,6 +1315,7 @@ static void MS cl_set_compute_consts(ComList *l, uint32_t i, uint32_t n,
                                      const uint32_t *d, uint32_t off)
 {
     LIST_CUR(l);
+    if (call_log_on()) call_note(c, "compute consts %u [%u..+%u] = 0x%x 0x%x", i, off, n, n > 0 ? d[0] : 0, n > 1 ? d[1] : 0);
     bd12_cmd_set_compute_root_constants(c, i, d, n, off);
 }
 static void MS cl_set_graphics_consts(ComList *l, uint32_t i, uint32_t n,
@@ -1329,6 +1457,8 @@ static void clear_uav(BD12CmdList *c, uint64_t cpu_handle, ComResource *r,
         VkClearColorValue color;
         memcpy(&color, values, sizeof(color));
         (void)is_float;
+        /* A sampler-feedback map (R64_UINT) is cleared to "nothing sampled"; D3D12 only defines a zero clear. */
+        if (r && (r->dxgi_format == 189 || r->dxgi_format == 190)) memset(&color, 0, sizeof(color));
         bd12_cmd_clear_uav_image(c, d, &color);
     }
 }
@@ -1624,7 +1754,7 @@ void *com_list_vtable_[80] = {
     [55] = cl_noop, [56] = cl_marker, [57] = cl_marker, [58] = cl_end_event,
     [59] = cl_execute_indirect,
     /* List1 */ [60] = cl_noop, [61] = cl_noop, [62] = cl_noop, [63] = cl_noop,
-    [64] = cl_noop, [65] = cl_noop,
+    [64] = cl_resolve_region, [65] = cl_noop,
     /* List2, List3 */ [66] = cl_noop, [67] = cl_noop,
     /* List4 */ [68] = cl_noop, [69] = cl_noop, [70] = cl_noop, [71] = cl_noop,
     [72] = cl_rt_build, [73] = cl_rt_emit, [74] = cl_rt_copy,

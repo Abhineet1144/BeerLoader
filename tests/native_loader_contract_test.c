@@ -190,8 +190,136 @@ static void wldap_ordinal_contract_test(void)
     assert(wldap_ordinal_impl(301) == (ImplFn)impl_ber_free);
 }
 
+static void native_crt_import_ownership_test(void)
+{
+    /* A DLL's CRT API-set imports must use the loaded UCRT even when Beer has
+     * a same-named fallback (setlocale's fallback only supports C). */
+    int saved_count = g_guest_dll_count;
+    assert(saved_count < MAX_GUEST_DLLS);
+    GuestDll saved = g_guest_dlls[saved_count];
+    GuestDll *runtime = &g_guest_dlls[g_guest_dll_count++];
+    memset(runtime, 0, sizeof(*runtime));
+    strcpy(runtime->name, "ucrtbase.dll");
+    runtime->image_size = 4096;
+    runtime->image = calloc(1, runtime->image_size);
+    GuestDll dependent = { .image_size = 4096 };
+    dependent.image = calloc(1, dependent.image_size);
+    assert(runtime->image && dependent.image);
+    GuestDll *images[] = {runtime, &dependent};
+    for (size_t i = 0; i < 2; ++i) {
+        DosHdr *dos = (DosHdr *)images[i]->image;
+        dos->magic = MZ_MAGIC;
+        dos->lfanew = sizeof(*dos);
+        NtHdrs64 *nt = (NtHdrs64 *)(images[i]->image + dos->lfanew);
+        nt->sig = PE_SIG;
+        nt->opt.magic = PE32PLUS;
+        nt->opt.sz_image = 4096;
+    }
+    NtHdrs64 *nt = (NtHdrs64 *)(runtime->image + sizeof(DosHdr));
+    nt->opt.dirs[0 /* IMAGE_DIRECTORY_ENTRY_EXPORT */].rva = 512;
+    nt->opt.dirs[0].size = 128;
+    /* IMAGE_EXPORT_DIRECTORY: counts +20/+24, EAT/name/ordinal RVAs +28/32/36. */
+    u32 *exports = (u32 *)(runtime->image + 512);
+    exports[5] = exports[6] = 1;
+    exports[7] = 640;
+    exports[8] = 648;
+    exports[9] = 656;
+    *(u32 *)(runtime->image + 640) = 1024;
+    *(u32 *)(runtime->image + 648) = 700;
+    strcpy((char *)runtime->image + 700, "setlocale");
+    assert(guest_dll_export(runtime, "setlocale") == (u64)(uintptr_t)(runtime->image + 1024));
+    nt = (NtHdrs64 *)(dependent.image + sizeof(DosHdr));
+    nt->opt.dirs[DIR_IMPORT].rva = 512;
+    nt->opt.dirs[DIR_IMPORT].size = 2 * sizeof(ImportDesc);
+    ImportDesc *import = (ImportDesc *)(dependent.image + 512);
+    import->name_rva = 640;
+    import->orig_ilt = 768;
+    import->iat_rva = 800;
+    strcpy((char *)dependent.image + 640, "api-ms-win-crt-locale-l1-1-0.dll");
+    *(u64 *)(dependent.image + 768) = 704;
+    strcpy((char *)dependent.image + 706, "setlocale");
+    u8 *saved_tramp = g_tramp;
+    u64 saved_trampsz = g_trampsz;
+    int saved_stubs = g_nstubs, saved_pending = g_pending_dependency_count;
+    const char *saved_name = g_snames[saved_stubs];
+    u64 saved_target = g_impl_targets[saved_stubs];
+    int saved_ready = g_fake_pe_ready;
+    g_fake_pe_ready = 0;
+    g_tramp = calloc(1, 4096);
+    g_trampsz = 4096;
+    assert(g_tramp);
+    guest_dll_resolve_imports(&dependent);
+    assert(*(u64 *)(dependent.image + 800) == (u64)(uintptr_t)(runtime->image + 1024));
+    free((void *)g_snames[saved_stubs]);
+    g_snames[saved_stubs] = saved_name;
+    g_impl_targets[saved_stubs] = saved_target;
+    g_nstubs = saved_stubs;
+    g_pending_dependency_count = saved_pending;
+    free(g_tramp);
+    g_tramp = saved_tramp;
+    g_trampsz = saved_trampsz;
+    g_fake_pe_ready = saved_ready;
+    free(runtime->image);
+    free(dependent.image);
+    *runtime = saved;
+    g_guest_dll_count = saved_count;
+}
+
+static void locale_info_contract_test(void)
+{
+    const u16 english[] = {'e','n','-','U','S',0};
+    const u16 japanese[] = {'j','a','-','J','P',0};
+    const struct { u32 type, english, japanese; } numbers[] = {
+        {0x0001, 0x0409, 0x0411}, /* ILANGUAGE is hexadecimal in text form. */
+        {0x0009, 0x0409, 0x0411}, /* IDEFAULTLANGUAGE */
+        {0x000b, 437, 932},       /* IDEFAULTCODEPAGE (OEM, not ANSI) */
+        {0x1004, 1252, 932},      /* IDEFAULTANSICODEPAGE */
+        {0x1008, 10000, 10001},   /* IDEFAULTMACCODEPAGE */
+        {0x1009, 1, 1},           /* ICALENDARTYPE */
+        {0x0019, 2, 0},           /* ICURRDIGITS */
+        {0x0022, 0, 2},           /* ILDATE */
+        {0x005b, 244, 122},       /* IGEOID */
+    };
+    for (size_t i = 0; i < sizeof(numbers) / sizeof(*numbers); ++i) {
+        for (int jp = 0; jp < 2; ++jp) {
+            u32 expected = jp ? numbers[i].japanese : numbers[i].english;
+            u32 type = numbers[i].type | 0x20000000u;
+            struct { u32 value, guard; } out = {0xdeadbeef, 0x12345678};
+            assert(impl_GetLocaleInfoEx((u64)(uintptr_t)(jp ? japanese : english), type,
+                                       (u16 *)&out.value, 2) == 2);
+            assert(out.value == expected && out.guard == 0x12345678);
+            assert(impl_GetLocaleInfoW(jp ? 0x0411 : 0x0409, type,
+                                      (u16 *)&out.value, 2) == 2);
+            assert(out.value == expected && out.guard == 0x12345678);
+            assert(impl_GetLocaleInfoA(jp ? 0x0411 : 0x0409, type,
+                                      (char *)&out.value, 4) == 4);
+            assert(out.value == expected && out.guard == 0x12345678);
+        }
+    }
+    u32 value = 0xdeadbeef;
+    assert(impl_GetLocaleInfoEx(0, 0xa0001004u, (u16 *)&value, 2) == 2);
+    assert(value == 1252); /* NOUSEROVERRIDE must not change the LCTYPE. */
+    assert(impl_GetLocaleInfoEx(0, 0x20001004u, NULL, 0) == 2);
+    assert(impl_GetLocaleInfoA(0x0409, 0x20001004u, NULL, 0) == 4);
+    assert(!impl_GetLocaleInfoEx(0, 0x20001004u, (u16 *)&value, 1));
+    assert(g_last_error == 122 && value == 1252);
+    assert(!impl_GetLocaleInfoEx(0, 0x2000ffffu, (u16 *)&value, 2));
+    assert(g_last_error == 1004 && value == 1252);
+    assert(!impl_GetLocaleInfoEx(0, 0x2000000eu, (u16 *)&value, 2));
+    assert(g_last_error == 1004 && value == 1252); /* SDECIMAL is not numeric. */
+    assert(!impl_GetLocaleInfoEx(0, 0x1004, NULL, 2) && g_last_error == 87);
+    assert(!impl_GetLocaleInfoW(0x0409, 0x1004, (u16 *)&value, -1) && g_last_error == 87);
+    assert(!impl_GetLocaleInfoA(0x0409, 0x1004, (char *)&value, -1) && g_last_error == 87);
+    u16 text[16];
+    assert(impl_GetLocaleInfoEx((u64)(uintptr_t)english, 0x1001, text, 16) == 8);
+    const char *expected = "English";
+    for (size_t i = 0; i <= strlen(expected); ++i) assert(text[i] == (u8)expected[i]);
+}
+
 int main(void)
 {
+    native_crt_import_ownership_test();
+    locale_info_contract_test();
     winsock_ordinal_contract_test();
     wldap_ordinal_contract_test();
     guest_module_filename_test();

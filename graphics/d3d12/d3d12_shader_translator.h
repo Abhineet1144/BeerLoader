@@ -95,6 +95,9 @@ typedef struct {
      * sampler i (immutable). */
     uint32_t heap_model;
     uint32_t accel_in_heap;      /* MUTABLE model: the mutable array also holds acceleration structures (TLAS SRVs) */
+    uint32_t ssbo_heap;          /* MUTABLE model: raw/structured views are SSBOs; set 3 binding 0 holds per-slot
+                                  * {offset, size} (16-byte records) and the UAV counter address (bytes 8-15) */
+    uint32_t ssbo_alignment;     /* the SSBO base alignment the offsets correct for */
     uint64_t hash;               /* of everything above that affects translation */
 } BeerD3D12RootLayout;
 #define BEER_HEAP_MODEL_CLASSES 0u

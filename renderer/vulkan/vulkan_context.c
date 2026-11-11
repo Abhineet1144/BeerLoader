@@ -39,6 +39,8 @@ typedef struct {
     int descriptor_buffer_ext, mutable_descriptor_ext;
     int fragment_shading_rate_ext; /* VK_KHR_fragment_shading_rate requested (BEER_BD12_VRS=1) */
     int mesh_shader_ext;          /* VK_EXT_mesh_shader requested (BEER_BD12_MESH=1) */
+    int raw_access_chains_ext;    /* VK_NV_raw_access_chains requested (opt-in: BEER_VK_RAW_ACCESS_CHAINS=1) */
+    int image_int64_ext;          /* VK_EXT_shader_image_atomic_int64 requested (D3D12 sampler feedback maps) */
     int nvx_cuda;                 /* VK_NVX_binary_import + VK_NVX_image_view_handle: NVAPI CUDA kernels (DLSS) */
     BeerVulkanModern modern;
     int device_lost;
@@ -427,10 +429,11 @@ int beer_vulkan_context_initialize(void)
     const char *device_extensions[24] = { "VK_KHR_swapchain" };
     int rt_ext_as = 0, rt_ext_rtp = 0, rt_ext_rq = 0, rt_ext_dho = 0, nvx_binary = 0, nvx_view = 0;
     uint32_t device_extension_count = 1;
-    /* D3D12 descriptor heaps as Vulkan descriptor buffers (graphics/d3d12v/bd12_heapdb.c): used by root-signature
-     * translation (BEER_BD12_ROOT_PUSH=1) for now; BEER_NO_DESCRIPTOR_BUFFER=1 keeps them off. */
+    /* D3D12 descriptor heaps as Vulkan descriptor buffers (graphics/d3d12v/bd12_heapdb.c), the base of root-signature
+     * translation (root push), which is the default where the device has them. BEER_BD12_ROOT_PUSH=0 or
+     * BEER_NO_DESCRIPTOR_BUFFER=1 keeps them off. */
     const char *root_push_env = getenv("BEER_BD12_ROOT_PUSH");
-    const int want_descriptor_buffer = root_push_env && *root_push_env && strcmp(root_push_env, "0") != 0 &&
+    const int want_descriptor_buffer = !(root_push_env && (!*root_push_env || strcmp(root_push_env, "0") == 0)) &&
                                        !getenv("BEER_NO_DESCRIPTOR_BUFFER");
     /* D3D12 variable-rate shading (BD12 OPTIONS6) on VK_KHR_fragment_shading_rate. Opt-in while it is validated. */
     const char *vrs_env = getenv("BEER_BD12_VRS");
@@ -438,6 +441,9 @@ int beer_vulkan_context_initialize(void)
     /* D3D12 mesh and amplification shaders (OPTIONS7 MeshShaderTier) on VK_EXT_mesh_shader. Opt-in while validated. */
     const char *mesh_env = getenv("BEER_BD12_MESH");
     const int want_mesh = mesh_env && *mesh_env && strcmp(mesh_env, "0") != 0;
+    const char *raw_chains_env = getenv("BEER_VK_RAW_ACCESS_CHAINS");
+    /* Opt-in: with raw access chains RE8 hung the GPU at start-up (Xid 109) and RE9 gained nothing measurable. */
+    const int want_raw_chains = raw_chains_env && *raw_chains_env && strcmp(raw_chains_env, "0") != 0;
     {
         uint32_t available_count = 0;
         g_context.EnumerateDeviceExtensionProperties(
@@ -497,6 +503,14 @@ int beer_vulkan_context_initialize(void)
                        strcmp(available[i].extensionName, "VK_EXT_descriptor_buffer") == 0) {
                 device_extensions[device_extension_count++] = "VK_EXT_descriptor_buffer";
                 g_context.descriptor_buffer_ext = 1;
+            } else if (!g_context.image_int64_ext &&
+                       strcmp(available[i].extensionName, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME) == 0) {
+                device_extensions[device_extension_count++] = VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME;
+                g_context.image_int64_ext = 1;
+            } else if (!g_context.raw_access_chains_ext && want_raw_chains &&
+                       strcmp(available[i].extensionName, VK_NV_RAW_ACCESS_CHAINS_EXTENSION_NAME) == 0) {
+                device_extensions[device_extension_count++] = VK_NV_RAW_ACCESS_CHAINS_EXTENSION_NAME;
+                g_context.raw_access_chains_ext = 1;
             } else if (!g_context.mesh_shader_ext && want_mesh &&
                        strcmp(available[i].extensionName, "VK_EXT_mesh_shader") == 0) {
                 device_extensions[device_extension_count++] = "VK_EXT_mesh_shader";
@@ -587,6 +601,12 @@ int beer_vulkan_context_initialize(void)
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT
     };
+    VkPhysicalDeviceRawAccessChainsFeaturesNV raw_chains = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAW_ACCESS_CHAINS_FEATURES_NV
+    };
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT
+    };
     VkPhysicalDeviceTexelBufferAlignmentPropertiesEXT texel_alignment = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES_EXT
     };
@@ -675,6 +695,14 @@ int beer_vulkan_context_initialize(void)
         mesh_shader.pNext = feature_chain;
         feature_chain = &mesh_shader;
     }
+    if (g_context.raw_access_chains_ext) {
+        raw_chains.pNext = feature_chain;
+        feature_chain = &raw_chains;
+    }
+    if (g_context.image_int64_ext) {
+        image_int64.pNext = feature_chain;
+        feature_chain = &image_int64;
+    }
     if (g_context.timeline_semaphore && !core13) {
         timeline_features.pNext = feature_chain;
         feature_chain = &timeline_features;
@@ -697,6 +725,25 @@ int beer_vulkan_context_initialize(void)
                                          descriptor_buffer.descriptorBuffer &&
                                          mutable_descriptor.mutableDescriptorType;
     g_context.modern.null_descriptor = g_context.robustness2 && robustness2.nullDescriptor;
+    /* The extension stays enabled (it is in the list) but shaders use it only if the feature is on. */
+    g_context.modern.raw_access_chains = g_context.raw_access_chains_ext && raw_chains.shaderRawAccessChains;
+    raw_chains.shaderRawAccessChains = g_context.modern.raw_access_chains ? VK_TRUE : VK_FALSE;
+    g_context.modern.image_int64_atomics = g_context.image_int64_ext && image_int64.shaderImageInt64Atomics;
+    image_int64.shaderImageInt64Atomics = g_context.modern.image_int64_atomics ? VK_TRUE : VK_FALSE;
+    image_int64.sparseImageInt64Atomics = VK_FALSE;
+    g_context.modern.vendor_id = physical_properties.vendorID;
+    if (physical_properties.apiVersion >= VK_API_VERSION_1_2) {
+        PFN_vkGetPhysicalDeviceProperties2 get_properties2 =
+            (PFN_vkGetPhysicalDeviceProperties2)g_context.GetInstanceProcAddr(g_context.instance,
+                                                                              "vkGetPhysicalDeviceProperties2");
+        VkPhysicalDeviceDriverProperties driver = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+        VkPhysicalDeviceProperties2 properties2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                                    .pNext = &driver };
+        if (get_properties2) {
+            get_properties2(g_context.physical_device, &properties2);
+            g_context.modern.driver_id = (uint32_t)driver.driverID;
+        }
+    }
     if (g_context.fragment_shading_rate_ext) query_shading_rate(&shading_rate);
     if (g_context.mesh_shader_ext) query_mesh_shader(&mesh_shader, &shading_rate);
     if (core13) {

@@ -5,12 +5,100 @@
 #include <libgen.h>
 #include <limits.h>
 #include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "dxil_spirv_c.h"
+
+/* dxil-spirv calls abort() on some internal failures (the CFG structurizer: "Fatal, detected infinite loop"), which
+ * ended the whole game. Around a conversion the translating thread arms t_abort_jump; the chained SIGABRT handler
+ * jumps back to it, the conversion counts as failed (the pipeline uses its fallback or is not created) and the game
+ * keeps running. What the aborted conversion allocated is leaked. Any other SIGABRT goes to the previous handler. */
+static __thread sigjmp_buf *t_abort_jump;
+static struct sigaction g_previous_abort;
+static BeerD3D12DxilCaps g_caps;
+
+void beer_d3d12_dxil_set_caps(const BeerD3D12DxilCaps *caps)
+{
+    if (caps) g_caps = *caps;
+    fprintf(stderr, "[DXIL] caps: scalar block layout %d, raw access chains %d, vendor 0x%04x\n",
+            g_caps.scalar_block_layout, g_caps.raw_access_chains, g_caps.vendor_id);
+}
+
+uint64_t beer_d3d12_dxil_caps_key(void)
+{
+    return ((uint64_t)g_caps.vendor_id << 32) | ((uint64_t)!!g_caps.raw_access_chains << 1) |
+           (uint64_t)!!g_caps.scalar_block_layout;
+}
+
+/* Options that follow the device (vkd3d-proton adds the same ones from its device's shader target extensions). */
+static void add_device_options(dxil_spv_converter converter,
+                               dxil_spv_result (*add)(dxil_spv_converter, const dxil_spv_option_base *))
+{
+    if (g_caps.scalar_block_layout) {
+        /* Vectorized SSBO loads/stores with scalar alignment. Only AMD bounds-checks such access per component; on
+         * the others a vec3 byte-address access stays split so robustness keeps working per element. */
+        const dxil_spv_option_scalar_block_layout scalar = { { DXIL_SPV_OPTION_SCALAR_BLOCK_LAYOUT }, DXIL_SPV_TRUE,
+                                                             g_caps.vendor_id == 0x1002 ? DXIL_SPV_TRUE : DXIL_SPV_FALSE };
+        add(converter, &scalar.base);
+        /* NVIDIA assumes the shader-implied SSBO alignment (the heap binds 16-byte-aligned bases below it), so do
+         * not vectorize past what the shader itself guarantees. */
+        if (g_caps.vendor_id == 0x10de) {
+            const dxil_spv_option_conservative_ssbo_vectorization conservative = {
+                { DXIL_SPV_OPTION_CONSERVATIVE_SSBO_VECTORIZATION }, DXIL_SPV_TRUE };
+            add(converter, &conservative.base);
+        }
+    }
+    if (g_caps.raw_access_chains) {
+        const dxil_spv_option_raw_access_chains_nv chains = { { DXIL_SPV_OPTION_RAW_ACCESS_CHAINS_NV }, DXIL_SPV_TRUE };
+        add(converter, &chains.base);
+    }
+}
+static void translator_abort_handler(int sig, siginfo_t *info, void *context)
+{
+    sigjmp_buf *jump = t_abort_jump;
+    if (jump) { t_abort_jump = NULL; siglongjmp(*jump, 1); }
+    if (g_previous_abort.sa_flags & SA_SIGINFO) {
+        if (g_previous_abort.sa_sigaction) { g_previous_abort.sa_sigaction(sig, info, context); return; }
+    } else if (g_previous_abort.sa_handler != SIG_IGN && g_previous_abort.sa_handler != SIG_DFL &&
+               g_previous_abort.sa_handler) {
+        g_previous_abort.sa_handler(sig);
+        return;
+    }
+    signal(SIGABRT, SIG_DFL);
+    raise(SIGABRT);
+}
+static void translator_abort_guard_setup(void)
+{
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = translator_abort_handler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGABRT, &action, &g_previous_abort);
+}
+static void translator_abort_guard_install(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, translator_abort_guard_setup);
+}
+static dxil_spv_result guarded_converter_run(dxil_spv_result (*run)(dxil_spv_converter), dxil_spv_converter converter)
+{
+    translator_abort_guard_install();
+    sigjmp_buf jump;
+    if (sigsetjmp(jump, 1)) {
+        fprintf(stderr, "[DXIL] dxil-spirv aborted during conversion: shader treated as untranslatable\n");
+        return DXIL_SPV_ERROR_GENERIC;
+    }
+    t_abort_jump = &jump;
+    const dxil_spv_result result = run(converter);
+    t_abort_jump = NULL;
+    return result;
+}
 
 /* DXIL (shader model 6) -> SPIR-V through dxil-spirv, loaded at run time from
  * third_party/dxil-spirv/build (built by `make dxil-spirv`). Resources are
@@ -143,12 +231,15 @@ typedef struct {
 } Collect;
 
 #define PUSH_WORDS_PER_STAGE 4u
+#define COMPUTE_PUSH_WORDS 32u
 
 static uint32_t resource_type(dxil_spv_resource_kind kind)
 {
     switch (kind) {
     case DXIL_SPV_RESOURCE_KIND_TEXTURE_1D: return BEER_D3D12_SHADER_RESOURCE_TEXTURE_1D;
     case DXIL_SPV_RESOURCE_KIND_TEXTURE_2D: return BEER_D3D12_SHADER_RESOURCE_TEXTURE_2D;
+    case DXIL_SPV_RESOURCE_KIND_FEEDBACK_TEXTURE_2D: return BEER_D3D12_SHADER_RESOURCE_TEXTURE_2D;   /* R64 storage image */
+    case DXIL_SPV_RESOURCE_KIND_FEEDBACK_TEXTURE_2D_ARRAY: return BEER_D3D12_SHADER_RESOURCE_TEXTURE_2D_ARRAY;
     case DXIL_SPV_RESOURCE_KIND_TEXTURE_2DMS: return BEER_D3D12_SHADER_RESOURCE_TEXTURE_2D_MS;
     case DXIL_SPV_RESOURCE_KIND_TEXTURE_3D: return BEER_D3D12_SHADER_RESOURCE_TEXTURE_3D;
     case DXIL_SPV_RESOURCE_KIND_TEXTURE_CUBE: return BEER_D3D12_SHADER_RESOURCE_TEXTURE_CUBE;
@@ -407,8 +498,14 @@ static dxil_spv_bool rs_resource(Collect *c, const dxil_spv_d3d_binding *d, int 
         return DXIL_SPV_TRUE;
     }
     const uint32_t heap_class = (is_buffer_kind(d) ? 2u : 0u) + (uav ? 1u : 0u);
-    const dxil_spv_vulkan_descriptor_type type = untyped_buffer(d) ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER
-                                                                   : DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
+    /* Storage-buffer mode: raw/structured heap views are SSBOs (bd12_heapdb.c writes them that way). */
+    /* Every raw/structured heap access is an SSBO (as vkd3d-proton's shaders see them outside heap lowering, where a
+     * slot also holds an SSBO for odd strides): misaligned bases are corrected by the set-3 offsets, and 64-bit raw
+     * accesses, which dxil-spirv cannot do on texel buffers, work. */
+    const int ssbo = c->rl->ssbo_heap && untyped_buffer(d);
+    const dxil_spv_vulkan_descriptor_type type =
+        !untyped_buffer(d) ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY :
+        ssbo ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_SSBO : DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER;
     if (is_heap_access(d)) { rs_heap(c, out, heap_class, c->rl->zero_word, 0, type); return DXIL_SPV_TRUE; }
     const BeerD3D12RootRange *range;
     const BeerD3D12RootParam *p = rs_find(c, uav ? BEER_D3D12_SHADER_DESCRIPTOR_UAV : BEER_D3D12_SHADER_DESCRIPTOR_SRV,
@@ -425,12 +522,27 @@ static dxil_spv_bool rs_resource(Collect *c, const dxil_spv_d3d_binding *d, int 
     return DXIL_SPV_TRUE;
 }
 
+/* Storage-buffer mode: an SSBO heap access reads its {offset, size} from the heap metadata (set 3 binding 0, a plain
+ * binding: dxil-spirv indexes it by the same heap slot). */
+static void rs_ssbo_offsets(const Collect *c, const dxil_spv_vulkan_binding *buffer, dxil_spv_vulkan_binding *offset)
+{
+    memset(offset, 0, sizeof(*offset));
+    if (!c->rl->ssbo_heap || buffer->descriptor_type != DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_SSBO ||
+        !buffer->bindless.use_heap)
+        return;
+    offset->set = 3;
+    offset->binding = 0;
+    offset->descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_SSBO;
+}
+
 static dxil_spv_bool srv_cb(void *user, const dxil_spv_d3d_binding *d,
                             dxil_spv_srv_vulkan_binding *out)
 {
     if (((Collect *)user)->rl) {
         memset(out, 0, sizeof(*out));
-        return rs_resource(user, d, 0, &out->buffer_binding);
+        const dxil_spv_bool ok = rs_resource(user, d, 0, &out->buffer_binding);
+        if (ok) rs_ssbo_offsets(user, &out->buffer_binding, &out->offset_binding);
+        return ok;
     }
     Collect *c = user;
     memset(out, 0, sizeof(*out));
@@ -482,14 +594,39 @@ static dxil_spv_bool sampler_cb(void *user, const dxil_spv_d3d_binding *d,
     return c->failed ? DXIL_SPV_FALSE : DXIL_SPV_TRUE;
 }
 
-static dxil_spv_bool uav_cb(void *user, const dxil_spv_uav_d3d_binding *d,
-                            dxil_spv_uav_vulkan_binding *out)
+static dxil_spv_bool uav_cb_impl(void *user, const dxil_spv_uav_d3d_binding *d, dxil_spv_uav_vulkan_binding *out);
+/* BEER_DXIL_VERBOSE: why a UAV was refused (the converter only says "Failed to remap UAV"). */
+static dxil_spv_bool uav_cb(void *user, const dxil_spv_uav_d3d_binding *d, dxil_spv_uav_vulkan_binding *out)
+{
+    const dxil_spv_bool ok = uav_cb_impl(user, d, out);
+    if (!ok && getenv("BEER_DXIL_VERBOSE")) {
+        const Collect *c = user;
+        fprintf(stderr, "[DXIL] UAV u%u space %u refused: kind=%d range=%u counter=%d root-layout=%d descriptors=%u bindless=%u/%u\n",
+                d->d3d_binding.register_index, d->d3d_binding.register_space, (int)d->d3d_binding.kind,
+                d->d3d_binding.range_size, (int)d->has_counter, c->rl != NULL, c->shader->descriptor_count,
+                c->bindless, c->words_per_stage);
+    }
+    return ok;
+}
+static dxil_spv_bool uav_cb_impl(void *user, const dxil_spv_uav_d3d_binding *d,
+                                 dxil_spv_uav_vulkan_binding *out)
 {
     Collect *c = user;
     memset(out, 0, sizeof(*out));
     if (c->rl) {
-        if (d->has_counter) { c->failed = 1; return DXIL_SPV_FALSE; }   /* hidden counter buffers: per-draw path */
-        return rs_resource(c, &d->d3d_binding, 1, &out->buffer_binding);
+        /* Hidden counters need the storage-buffer heap: the counter's address is read from the slot's metadata and
+         * the atomic goes through it (physical storage buffer). Without it: per-draw path. */
+        if (d->has_counter && !c->rl->ssbo_heap) { c->failed = 1; return DXIL_SPV_FALSE; }
+        if (!rs_resource(c, &d->d3d_binding, 1, &out->buffer_binding)) return DXIL_SPV_FALSE;
+        rs_ssbo_offsets(c, &out->buffer_binding, &out->offset_binding);
+        if (d->has_counter) {
+            if (!out->buffer_binding.bindless.use_heap) { c->failed = 1; return DXIL_SPV_FALSE; }
+            out->counter_binding = out->buffer_binding;   /* same push word and heap offset: the same slot */
+            out->counter_binding.set = 3;
+            out->counter_binding.binding = 0;
+            out->counter_binding.descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_BUFFER_DEVICE_ADDRESS;
+        }
+        return DXIL_SPV_TRUE;
     }
     if (wants_bindless(&d->d3d_binding, BEER_D3D12_SHADER_DESCRIPTOR_UAV)) {
         assign_bindless(c, BEER_D3D12_SHADER_DESCRIPTOR_UAV, &d->d3d_binding,
@@ -634,14 +771,34 @@ static int dxil_translate(const uint8_t *container, size_t size, uint32_t stage_
         default: collect.stage = 0; break;
         }
     }
+    /* A compute pipeline has a single stage, so it owns the whole push block: 32 words (128 bytes, the guaranteed
+     * maxPushConstantsSize) of bindless arrays instead of the 4-word per-stage share graphics stages split. Ghost of
+     * Tsushima's lighting shaders declare more than four large UAV arrays; they failed to translate ("Failed to remap
+     * UAV") and every dispatch was dropped, leaving the lit image black. */
+    if (!layout && collect.stage == 0 && collect.words_per_stage == PUSH_WORDS_PER_STAGE)
+        collect.words_per_stage = COMPUTE_PUSH_WORDS;
 retry:
     if (g.create_converter(blob, &converter) != DXIL_SPV_SUCCESS) goto done;
+    add_device_options(converter, g.converter_add_option);
     if (layout) {
         /* Root-signature translation: the push block holds the root arguments (BeerD3D12RootLayout). */
         g.converter_set_root_descriptor_count(converter, layout->descriptor_count);
         g.converter_set_root_constant_word_count(converter, layout->word_count);
         dxil_spv_option_physical_storage_buffer bda = { { DXIL_SPV_OPTION_PHYSICAL_STORAGE_BUFFER }, DXIL_SPV_TRUE };
         g.converter_add_option(converter, &bda.base);
+        if (layout->ssbo_heap) {
+            /* SSBO heap views: bases aligned down to ssbo_alignment, the rest in the set-3 metadata, which holds per
+             * slot uvec2 {offset, size} at uvec2 index 2*slot and the UAV counter address at u64 index 2*slot+1. */
+            dxil_spv_option_ssbo_alignment align = { { DXIL_SPV_OPTION_SSBO_ALIGNMENT },
+                                                     layout->ssbo_alignment ? layout->ssbo_alignment : 16 };
+            g.converter_add_option(converter, &align.base);
+            dxil_spv_option_bindless_offset_buffer_layout offsets = { { DXIL_SPV_OPTION_BINDLESS_OFFSET_BUFFER_LAYOUT },
+                                                                      0, 0, 2 };
+            g.converter_add_option(converter, &offsets.base);
+            dxil_spv_option_physical_address_descriptor_indexing counters = {
+                { DXIL_SPV_OPTION_PHYSICAL_ADDRESS_DESCRIPTOR_INDEXING }, 2, 1 };
+            g.converter_add_option(converter, &counters.base);
+        }
     } else {
         /* Push block covering this stage's word window. */
         g.converter_set_root_constant_word_count(converter,
@@ -659,7 +816,7 @@ retry:
         dxil_spv_option_ssbo_alignment align = { { DXIL_SPV_OPTION_SSBO_ALIGNMENT }, 1 };
         g.converter_add_option(converter, &align.base);
     }
-    if (g.converter_run(converter) != DXIL_SPV_SUCCESS || collect.failed) {
+    if (guarded_converter_run(g.converter_run, converter) != DXIL_SPV_SUCCESS || collect.failed) {
         if (!collect.failed && !collect.ssbo && !layout) {
             /* Texel buffers cannot express everything raw/structured buffers allow (64-bit raw loads and stores):
              * translate again with those buffers as storage buffers. */
@@ -738,6 +895,7 @@ int beer_d3d12_dxil_translate_library(const uint8_t *container, size_t size, Bee
         if (g.parsed_blob_get_entry_point_demangled_name(blob, i, &demangled) != DXIL_SPV_SUCCESS || !demangled) demangled = mangled;
         dxil_spv_converter converter = NULL;
         if (g.create_converter(blob, &converter) != DXIL_SPV_SUCCESS) { fprintf(stderr, "[DXIL] cannot create converter for %s\n", demangled); goto done; }
+        add_device_options(converter, g.converter_add_option);
         g.converter_set_entry_point(converter, mangled);
         g.converter_set_root_constant_word_count(converter, RT_PUSH_WORDS);
         g.converter_set_srv_remapper(converter, srv_cb, &collect);
@@ -750,7 +908,7 @@ int beer_d3d12_dxil_translate_library(const uint8_t *container, size_t size, Bee
             dxil_spv_option_sbt_descriptor_size_log2 sbt = { { DXIL_SPV_OPTION_SBT_DESCRIPTOR_SIZE_LOG2 }, 7, 7 };
             g.converter_add_option(converter, &sbt.base);
         }
-        if (g.converter_run(converter) != DXIL_SPV_SUCCESS || collect.failed) {
+        if (guarded_converter_run(g.converter_run, converter) != DXIL_SPV_SUCCESS || collect.failed) {
             fprintf(stderr, "[DXIL] conversion of %s failed%s\n", demangled, collect.failed ? " (unsupported resource)" : "");
             g.converter_free(converter);
             goto done;

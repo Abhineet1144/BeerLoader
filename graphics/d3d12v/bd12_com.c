@@ -277,9 +277,22 @@ ComDevice *g_com_device;
  * longer waits for its blit to finish, so a destroyed resource may still be
  * read by the previous frame's present blit. */
 extern int __attribute__((weak)) vulkan_presenter_wait_source(void);
+extern int __attribute__((weak)) vulkan_presenter_source_idle(void);
 static void presenter_sync(void)
 {
     if (vulkan_presenter_wait_source) vulkan_presenter_wait_source();
+}
+/* Whether the presenter's last copy has finished reading its source, without waiting. Deferred destruction used to
+ * *wait* for it (presenter_sync) from com_reap on the game's submitting thread, once per freed object: RE9 frees
+ * resources and heaps every frame, so its render thread waited for the GPU to finish the last presented frame and
+ * CPU and GPU ran in lockstep (both ~80% busy, 17% behind Proton). Now freeing is postponed while the presenter is
+ * busy instead (BEER_BD12_REAP_WAIT=1 restores the wait). */
+static int presenter_idle(void)
+{
+    static int wait = -1;
+    if (wait < 0) wait = getenv("BEER_BD12_REAP_WAIT") != NULL;
+    if (wait) { presenter_sync(); return 1; }
+    return vulkan_presenter_source_idle ? vulkan_presenter_source_idle() : 1;
 }
 
 /* A lane whose timeline has reached its newest submission is idle and bounds nothing. A busy lane has completed
@@ -313,14 +326,13 @@ void com_reap(ComDevice *dev)
     for (;;) {
         pthread_mutex_lock(&dev->grave_lock);
         ComGrave *grave = dev->grave_head;
-        if (!grave || grave->serial > done) {
+        if (!grave || grave->serial > done || !presenter_idle()) {   /* presenter busy: retry at the next reap */
             pthread_mutex_unlock(&dev->grave_lock);
             return;
         }
         dev->grave_head = grave->next;
         if (!dev->grave_head) dev->grave_tail = NULL;
         pthread_mutex_unlock(&dev->grave_lock);
-        presenter_sync();
         grave->fn(dev, grave->ptr);
         free(grave);
     }
@@ -331,8 +343,7 @@ void com_defer(ComDevice *dev, void (*fn)(ComDevice *, void *), void *ptr)
     pthread_mutex_lock(&dev->submit_lock);
     uint64_t serial = dev->serial;
     pthread_mutex_unlock(&dev->submit_lock);
-    if (serial <= com_completed(dev)) {
-        presenter_sync();
+    if (serial <= com_completed(dev) && presenter_idle()) {
         fn(dev, ptr);
         return;
     }
@@ -467,7 +478,12 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
         return VK_ERROR_INITIALIZATION_FAILED;
     memcpy(all_waits, waits, wait_count * sizeof(*waits));
     BD12_PROF_BEGIN();
-    pthread_mutex_lock(&dev->submit_lock);
+    {
+        const uint64_t t_lock = bd12_prof_now();
+        pthread_mutex_lock(&dev->submit_lock);
+        g_bd12_prof_ns[BD12_PROF_SUBMIT_LOCK] += bd12_prof_now() - t_lock;
+        ++g_bd12_prof_calls[BD12_PROF_SUBMIT_LOCK];
+    }
     total_signals = 0;
     for (uint32_t i = 0; i < signal_count; ++i)
         if (bd12_fence_claim(signals[i].fence, signals[i].value))
@@ -487,9 +503,12 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
     for (uint32_t i = 0; i < total_waits; ++i) __atomic_store_n(&all_waits[i].fence->last_use, serial, __ATOMIC_RELEASE);
     for (uint32_t i = 0; i < total_signals; ++i) __atomic_store_n(&all_signals[i].fence->last_use, serial, __ATOMIC_RELEASE);
     dump_dispatch_flight(dev, serial, lists, count, all_waits, total_waits, all_signals, total_signals);
+    const uint64_t t_vk = bd12_prof_now();
     VkResult result = bd12_queue_submit(l->queue, lists, count, all_waits,
                                         total_waits, all_signals,
                                         total_signals);
+    g_bd12_prof_ns[BD12_PROF_VK_SUBMIT] += bd12_prof_now() - t_vk;
+    ++g_bd12_prof_calls[BD12_PROF_VK_SUBMIT];
     if (result == VK_SUCCESS) {
         __atomic_store_n(&l->submitted, serial, __ATOMIC_RELEASE);   /* before the serial: see com_completed */
         __atomic_store_n(&dev->serial, serial, __ATOMIC_RELEASE);
@@ -500,7 +519,12 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
         if (drain < 0) drain = getenv("BEER_BD12_SYNC_SUBMIT") != NULL;
         if (drain && result == VK_SUCCESS) bd12_fence_wait(l->retire, serial, UINT64_MAX);
     }
-    com_reap(dev);
+    {
+        const uint64_t t_reap = bd12_prof_now();
+        com_reap(dev);
+        g_bd12_prof_ns[BD12_PROF_REAP] += bd12_prof_now() - t_reap;
+        ++g_bd12_prof_calls[BD12_PROF_REAP];
+    }
     BD12_PROF_END(BD12_PROF_SUBMIT);
     return result;
 }
@@ -572,12 +596,51 @@ static void *waiter_main(void *arg)
             pthread_mutex_lock(&dev->wait_lock);
             continue;
         }
-        uint64_t value = 0;
-        ComFence *first = waiter_pending(dev->waiters, &value);
-        com_add_ref(&first->obj);
+        if (!dev->waiter_wake) {   /* no wake semaphore: poll the first pending fence (1 ms steps) */
+            uint64_t value = 0;
+            ComFence *first = waiter_pending(dev->waiters, &value);
+            com_add_ref(&first->obj);
+            pthread_mutex_unlock(&dev->wait_lock);
+            bd12_fence_wait(first->fence, value, 1000000);
+            com_release(&first->obj);
+            pthread_mutex_lock(&dev->wait_lock);
+            continue;
+        }
+        /* Wait for any pending fence at once, or for a new waiter (wake semaphore). Waiting on one fence with a 1 ms
+         * timeout signalled every other event up to 1 ms late, and a waiter queued during that wait was not even
+         * looked at until it timed out: CPU and GPU then took turns idling (RE9: both at ~60-80%). */
+        enum { MAX_WAIT = 64 };
+        VkSemaphore semaphores[MAX_WAIT];
+        uint64_t values[MAX_WAIT];
+        ComFence *held[MAX_WAIT];
+        uint32_t n = 0;
+        for (ComWaiter *w = dev->waiters; w && n < MAX_WAIT - 1; w = w->next) {
+            const uint32_t fences = w->count ? w->count : 1;
+            for (uint32_t i = 0; i < fences && n < MAX_WAIT - 1; ++i) {
+                ComFence *f = (ComFence *)(w->count ? w->fences[i] : w->fence);
+                const uint64_t v = w->count ? w->values[i] : w->value;
+                if (bd12_fence_completed(f->fence) >= v) continue;
+                com_add_ref(&f->obj);
+                held[n] = f;
+                semaphores[n] = f->fence->semaphore;
+                values[n++] = v;
+            }
+        }
+        const uint32_t fence_count = n;
+        semaphores[n] = dev->waiter_wake->semaphore;
+        values[n++] = dev->waiter_wake_value + 1;
+        BD12Device *bd = dev->waiter_wake->device;
         pthread_mutex_unlock(&dev->wait_lock);
-        bd12_fence_wait(first->fence, value, 1000000);
-        com_release(&first->obj);
+        VkSemaphoreWaitInfo info = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .flags = VK_SEMAPHORE_WAIT_ANY_BIT,
+            .semaphoreCount = n,
+            .pSemaphores = semaphores,
+            .pValues = values
+        };
+        const VkResult result = bd->vk.WaitSemaphores(bd->device, &info, 100000000ull);   /* 100 ms safety net */
+        if (result != VK_SUCCESS && result != VK_TIMEOUT) beer_vulkan_record_result(result, "BD12 fence waiter");
+        for (uint32_t i = 0; i < fence_count; ++i) com_release(&held[i]->obj);
         pthread_mutex_lock(&dev->wait_lock);
     }
     return NULL;
@@ -599,6 +662,7 @@ static void queue_waiter(ComDevice *dev, ComWaiter *w)
 {
     pthread_mutex_lock(&dev->wait_lock);
     if (!dev->waiter_started) {
+        if (!dev->waiter_wake && !getenv("BEER_BD12_WAITER_POLL")) dev->waiter_wake = bd12_fence_create(dev->bd, 0);
         pthread_t thread;
         if (pthread_create(&thread, NULL, waiter_main, dev) == 0) {
             pthread_detach(thread);
@@ -608,6 +672,13 @@ static void queue_waiter(ComDevice *dev, ComWaiter *w)
     w->next = dev->waiters;
     dev->waiters = w;
     pthread_cond_signal(&dev->wait_cond);
+    if (dev->waiter_wake) {   /* interrupt a wait in progress so it includes this waiter */
+        BD12Device *bd = dev->waiter_wake->device;
+        VkSemaphoreSignalInfo info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+                                       .semaphore = dev->waiter_wake->semaphore,
+                                       .value = ++dev->waiter_wake_value };
+        bd->vk.SignalSemaphore(bd->device, &info);
+    }
     pthread_mutex_unlock(&dev->wait_lock);
 }
 
@@ -925,7 +996,10 @@ static void MS queue_execute(ComQueue *q, uint32_t count, ComObj *const *lists)
     QueueOp op = { .kind = QUEUE_OP_EXECUTE };
     op.lists = count ? malloc(count * sizeof(*op.lists)) : NULL;
     for (uint32_t i = 0; op.lists && i < count; ++i) {
+        const uint64_t t_finish = bd12_prof_now();
         BD12CmdList *recorded = lists[i] ? com_list_finish(lists[i]) : NULL;
+        g_bd12_prof_ns[BD12_PROF_LIST_FINISH] += bd12_prof_now() - t_finish;
+        ++g_bd12_prof_calls[BD12_PROF_LIST_FINISH];
         if (recorded) { bd12_rp_trace_submit(recorded); op.lists[op.count++] = recorded; }
     }
     if (op.count) queue_push(q, &op);
@@ -1270,6 +1344,36 @@ static uint32_t full_mip_count(uint64_t w, uint32_t h, uint32_t d)
     return n;
 }
 
+/* D3D12_RESOURCE_DESC1 entry points (CreateCommittedResource2, CreatePlacedResource1, GetResourceAllocationInfo2,
+ * GetCopyableFootprints1) mark the description they pass down: only a DESC1 carries SamplerFeedbackMipRegion (+52). */
+static __thread const uint8_t *t_desc1;
+
+static int is_feedback_format(uint32_t format) { return format == 189 || format == 190; }
+
+/* Sampler-feedback maps (DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE 189 / MIP_REGION_USED_OPAQUE 190) are R64_UINT
+ * images with one texel per mip region of the paired texture's top mip, as dxil-spirv's WriteSamplerFeedback lowering
+ * expects: each texel holds 4 bits per mip level (self, +x, +y, +xy neighbour region touched) written with 64-bit
+ * image atomics, and the low 4 bits of the image width/height are log2 of the mip region width/height (the shader
+ * reads the region size from OpImageQuerySize). So the extent is the region grid rounded to 16 with those bits set. */
+void bd12_feedback_active_extent(const ComResource *r, uint32_t mip, uint32_t *w, uint32_t *h)
+{
+    uint32_t tw = (uint32_t)(r->width >> mip), th = r->height >> mip;
+    if (!tw) tw = 1;
+    if (!th) th = 1;
+    *w = (tw + r->feedback_region[0] - 1) / r->feedback_region[0];
+    *h = (th + r->feedback_region[1] - 1) / r->feedback_region[1];
+}
+void bd12_feedback_padded_extent(const ComResource *r, uint32_t *w, uint32_t *h)
+{
+    uint32_t aw, ah;
+    bd12_feedback_active_extent(r, 0, &aw, &ah);
+    const uint32_t lw = (uint32_t)__builtin_ctz(r->feedback_region[0]), lh = (uint32_t)__builtin_ctz(r->feedback_region[1]);
+    *w = (aw & ~15u) | lw;
+    *h = (ah & ~15u) | lh;
+    if (*w < aw) *w += 16;
+    if (*h < ah) *h += 16;
+}
+
 static void resource_parse(ComResource *r, const uint8_t *desc)
 {
     memcpy(r->desc, desc, sizeof(r->desc));
@@ -1282,10 +1386,14 @@ static void resource_parse(ComResource *r, const uint8_t *desc)
     r->depth_or_layers = depth ? depth : 1;
     r->mips = mips;
     r->dxgi_format = rd32(desc + 32);
-    if (r->dxgi_format == 189 || r->dxgi_format == 190) {   /* DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP / MIP_REGION_USED */
+    r->feedback_region[0] = r->feedback_region[1] = 0;
+    if (is_feedback_format(r->dxgi_format) && t_desc1 == desc) {
+        r->feedback_region[0] = rd32(desc + 52);
+        r->feedback_region[1] = rd32(desc + 56);
         static unsigned logged;
-        if (logged++ < 5) fprintf(stderr, "[BD12] sampler-feedback resource (format %u, %llux%u)\n", r->dxgi_format,
-                                  (unsigned long long)rd64(desc + 16), rd32(desc + 24));
+        if (logged++ < 5) fprintf(stderr, "[BD12] sampler-feedback map (format %u) for a %llux%u texture, %ux%u regions\n",
+                                  r->dxgi_format, (unsigned long long)rd64(desc + 16), rd32(desc + 24),
+                                  r->feedback_region[0], r->feedback_region[1]);
     }
     r->flags = rd32(desc + 48);
     if (r->dimension != 1 && !r->mips)
@@ -1300,6 +1408,25 @@ static int image_desc_from(const ComResource *r, BD12ImageDesc *d)
     d->type = r->dimension == 2 ? VK_IMAGE_TYPE_1D :
               r->dimension == 4 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     d->allow_depth_stencil = (r->flags & 2) != 0;
+    if (is_feedback_format(r->dxgi_format)) {
+        /* D3D12 rules: 2D, region a power of two of at least 4x4 and at most half the texture. */
+        const uint32_t rw = r->feedback_region[0], rh = r->feedback_region[1];
+        const BeerVulkanModern *m = beer_vulkan_modern();
+        if (!m || !m->image_int64_atomics || r->dimension != 3 || rw < 4 || rh < 4 || (rw & (rw - 1)) ||
+            (rh & (rh - 1)) || (uint64_t)rw * 2 > r->width || rh * 2 > r->height) {
+            fprintf(stderr, "[BD12] sampler-feedback map rejected (region %ux%u, texture %llux%u, int64 image atomics %d)\n",
+                    rw, rh, (unsigned long long)r->width, r->height, m ? m->image_int64_atomics : 0);
+            return 0;
+        }
+        d->type = VK_IMAGE_TYPE_2D;
+        d->format = VK_FORMAT_R64_UINT;
+        bd12_feedback_padded_extent(r, &d->width, &d->height);
+        d->depth_or_layers = r->depth_or_layers;
+        d->mip_levels = 1;
+        d->samples = 1;
+        d->allow_uav = 1;
+        return 1;
+    }
     d->format = bd12_dxgi_resource_to_vk(r->dxgi_format, d->allow_depth_stencil);
     if (d->format == VK_FORMAT_UNDEFINED) {
         static uint64_t logged[4];          /* once per DXGI format below 256 */
@@ -1330,10 +1457,22 @@ static void res_finish_planes(ComResource *r)
         r->planes = 2;
 }
 
+static HR create_resource_impl(ComDevice *dev, ComHeap *heap, uint64_t heap_offset, const uint8_t *props,
+                               uint32_t heap_flags, const uint8_t *desc, uint32_t state, const uint8_t *riid,
+                               void **out);
 static HR create_resource(ComDevice *dev, ComHeap *heap, uint64_t heap_offset,
                           const uint8_t *props, uint32_t heap_flags,
                           const uint8_t *desc, uint32_t state,
                           const uint8_t *riid, void **out)
+{
+    BD12_PROF_BEGIN();
+    const HR hr = create_resource_impl(dev, heap, heap_offset, props, heap_flags, desc, state, riid, out);
+    BD12_PROF_END(BD12_PROF_RESOURCE);
+    return hr;
+}
+static HR create_resource_impl(ComDevice *dev, ComHeap *heap, uint64_t heap_offset, const uint8_t *props,
+                               uint32_t heap_flags, const uint8_t *desc, uint32_t state, const uint8_t *riid,
+                               void **out)
 {
     if (!desc || !riid) return HR_E_INVALIDARG;
     if (out) *out = NULL;
@@ -1830,6 +1969,27 @@ static uint32_t shader_model_limit(uint32_t highest)
 }
 
 static HR dev_check_feature_impl(ComDevice *self, uint32_t feature, void *data, uint32_t size);
+
+/* D3D12_SAMPLER_FEEDBACK_TIER_0_9 (90) when feedback maps can be backed: R64_UINT storage images with 64-bit image
+ * atomics (dxil-spirv's WriteSamplerFeedback lowering) and 64-bit shader integers. Tier 1.0 additionally requires
+ * exact behaviour for every sampler mode, which a software implementation does not give (as in vkd3d-proton). */
+static uint32_t sampler_feedback_tier(void)
+{
+    const BeerVulkanModern *m = beer_vulkan_modern();
+    const VkPhysicalDeviceFeatures *f = beer_vulkan_enabled_features();
+    return m && m->image_int64_atomics && f && f->shaderInt64 ? 90u : 0u;
+}
+
+/* Feature level 12_2 (DirectX 12 Ultimate) needs DXR 1.1, VRS tier 2, mesh shader tier 1, sampler feedback 0.9 and
+ * shader model 6.5, each actually supported here: DXR only when it is offered (rt_enabled + BEER_DXR). */
+static int dx12_ultimate(ComDevice *self)
+{
+    const BeerVulkanModern *m = self->bd->modern;
+    return m && self->bd->rt_enabled && getenv("BEER_DXR") && m->vrs_tier >= 2 && self->bd->CmdDrawMeshTasksEXT &&
+           m->mesh_shader_tier >= 10 && sampler_feedback_tier() >= 90 && beer_d3d12_dxil_available() &&
+           shader_model_limit(0x66) >= 0x65;
+}
+
 /* BEER_FEATURE_LOG=1: every CheckFeatureSupport with the words the caller passed in and the words returned. */
 static HR MS dev_check_feature(ComDevice *self, uint32_t feature, void *data, uint32_t size)
 {
@@ -1992,8 +2152,7 @@ static HR dev_check_feature_impl(ComDevice *self, uint32_t feature, void *data, 
     }
     if (feature == 8 && size >= 24) {
         /* OPTIONS1. Wave intrinsics exist only in shader model 6, where dxil-spirv maps them to subgroup
-         * operations. Vulkan does not expose the processor-wide lane total, so TotalLaneCount reports the
-         * one certain value, a single wave's maximum width. */
+         * operations. TotalLaneCount is derived from the GPU's core counts (bd12_device_create). */
         uint32_t *f = data;
         memset(data, 0, size);
         f[0] = dxil;                                               /* WaveOps */
@@ -2001,18 +2160,20 @@ static HR dev_check_feature_impl(ComDevice *self, uint32_t feature, void *data, 
         f[5] = vk_features && vk_features->shaderInt64;            /* Int64ShaderOps */
         f[1] = self->bd->wave_lane_min;
         f[2] = self->bd->wave_lane_max;
-        f[3] = self->bd->wave_lane_max;
+        f[3] = self->bd->total_lane_count ? self->bd->total_lane_count : self->bd->wave_lane_max;
         return HR_OK;
     }
     switch (feature) {
-    case 2:                                         /* FEATURE_LEVELS: the highest requested level up to 12_1 */
+    case 2:                                         /* FEATURE_LEVELS: the highest requested level up to 12_1, or
+                                                     * 12_2 when every DirectX 12 Ultimate part is real */
         if (size >= 24) {
             uint8_t *d = data;
             const uint32_t count = *(uint32_t *)d;
             const uint32_t *requested = *(const uint32_t **)(d + 8);
+            const uint32_t top = dx12_ultimate(self) ? 0xc200u : 0xc100u;
             uint32_t best = 0;
             for (uint32_t i = 0; requested && i < count; ++i)
-                if (requested[i] <= 0xc100u && requested[i] > best) best = requested[i];
+                if (requested[i] <= top && requested[i] > best) best = requested[i];
             *(uint32_t *)(d + 16) = best;
             return best ? HR_OK : HR_E_INVALIDARG;
         }
@@ -2087,10 +2248,11 @@ static HR dev_check_feature_impl(ComDevice *self, uint32_t feature, void *data, 
         }
         return HR_OK;
     }
-    case 32:                                        /* OPTIONS7: mesh shaders; no sampler feedback yet */
+    case 32:                                        /* OPTIONS7: mesh shader tier, sampler feedback tier */
         memset(data, 0, size);
         if (size >= 8 && self->bd->CmdDrawMeshTasksEXT)
             ((uint32_t *)data)[0] = (uint32_t)self->bd->modern->mesh_shader_tier;
+        if (size >= 8) ((uint32_t *)data)[1] = sampler_feedback_tier();
         return HR_OK;
     case 7: case 12: case 18:
     case 21: case 23: case 27:
@@ -2176,8 +2338,10 @@ static void clear_descriptor(uint64_t handle)
 static void MS dev_create_cbv_impl(ComDevice *self, const uint8_t *desc, uint64_t dest);
 static void MS dev_create_cbv(ComDevice *self, const uint8_t *desc, uint64_t dest)
 {
+    BD12_PROF_BEGIN();
     dev_create_cbv_impl(self, desc, dest);
     if (dest) bd12_heap_written((const void *)(uintptr_t)dest, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+    BD12_PROF_END(BD12_PROF_VIEW);
 }
 static void MS dev_create_cbv_impl(ComDevice *self, const uint8_t *desc,
                               uint64_t dest)
@@ -2210,17 +2374,19 @@ static uint32_t clamp_mips(uint32_t count, uint32_t base, uint32_t total)
 
 static void write_buffer_view(ComDevice *self, ComResource *r,
                               uint64_t first, uint32_t count, uint32_t stride,
-                              uint32_t dxgi, int raw, int uav, uint64_t dest)
+                              uint32_t dxgi, int raw, int uav, uint64_t counter_va, uint64_t dest)
 {
     if (!r->buffer) return;
     BD12DescriptorHeap heap = temp_heap(self, dest);
     VkFormat format = VK_FORMAT_R32_UINT;
     uint32_t element = 4;
+    int typed_view = 0;
     if (dxgi && !raw) {
         VkFormat typed = bd12_dxgi_to_vk(dxgi);
         if (typed != VK_FORMAT_UNDEFINED) {
             format = typed;
             element = bd12_dxgi_bytes(dxgi);
+            typed_view = 1;
         }
     } else if (stride) {
         element = stride;
@@ -2242,6 +2408,11 @@ static void write_buffer_view(ComDevice *self, ComResource *r,
     }
     heap.descriptors[0].offset = offset;
     heap.descriptors[0].range = size;
+    if (!typed_view) {   /* raw or structured; SSBO-eligible like vkd3d-proton: raw, or a stride multiple of 16 */
+        heap.descriptors[0].flags |= BD12_DESC_FLAG_UNTYPED;
+        if (raw || (stride && stride % 16 == 0)) heap.descriptors[0].flags |= BD12_DESC_FLAG_SSBO;
+    }
+    heap.descriptors[0].counter_va = counter_va;
 }
 
 static void MS dev_create_srv_impl(ComDevice *self, ComResource *r,
@@ -2255,13 +2426,19 @@ static void MS dev_create_srv_impl(ComDevice *self, ComResource *r,
         d->offset = rd64(desc + 16);
         return;
     }
+    /* A null raw/structured buffer view (DXGI_FORMAT_UNKNOWN or the RAW flag) reads as a null storage buffer. */
+    if (!r && desc && rd32(desc + 4) == 1 && (rd32(desc) == 0 || (rd32(desc + 32) & 1))) {
+        const uint32_t stride = rd32(desc + 28);
+        ((BD12Descriptor *)(uintptr_t)dest)->flags |= BD12_DESC_FLAG_UNTYPED |
+            ((rd32(desc + 32) & 1) || (stride && stride % 16 == 0) ? BD12_DESC_FLAG_SSBO : 0);
+    }
     if (!r) return;
     uint32_t dim = desc ? rd32(desc + 4) : 0;
     if (r->buffer) {
         if (!desc || dim != 1) return;
         write_buffer_view(self, r, rd64(desc + 16), rd32(desc + 24),
                           rd32(desc + 28), rd32(desc), (rd32(desc + 32) & 1) != 0,
-                          0, dest);
+                          0, 0, dest);
         return;
     }
     if (!r->image) return;
@@ -2317,16 +2494,24 @@ static void MS dev_create_srv_impl(ComDevice *self, ComResource *r,
 static void MS dev_create_uav_impl(ComDevice *self, ComResource *r, ComResource *counter,
                               const uint8_t *desc, uint64_t dest)
 {
-    (void)counter;
     if (!dest) return;
     clear_descriptor(dest);
+    if (!r && desc && rd32(desc + 4) == 1 && (rd32(desc) == 0 || (rd32(desc + 32) & 1))) {   /* null raw/structured UAV */
+        const uint32_t stride = rd32(desc + 20);
+        ((BD12Descriptor *)(uintptr_t)dest)->flags |= BD12_DESC_FLAG_UNTYPED |
+            ((rd32(desc + 32) & 1) || (stride && stride % 16 == 0) ? BD12_DESC_FLAG_SSBO : 0);
+    }
     if (!r) return;
     uint32_t dim = desc ? rd32(desc + 4) : 0;
     if (r->buffer) {
         if (!desc || dim != 1) return;
+        /* D3D12_BUFFER_UAV: FirstElement @8, NumElements @16, StructureByteStride @20, CounterOffsetInBytes @24,
+         * Flags @32. The counter lives in `counter` (a separate resource) at CounterOffsetInBytes. */
+        const uint64_t counter_va = counter && counter->buffer && counter->buffer->va
+                                        ? counter->buffer->va + rd64(desc + 24) : 0;
         write_buffer_view(self, r, rd64(desc + 8), rd32(desc + 16),
                           rd32(desc + 20), rd32(desc), (rd32(desc + 32) & 1) != 0,
-                          1, dest);
+                          1, counter_va, dest);
         return;
     }
     if (!r->image) return;
@@ -2365,18 +2550,22 @@ static int view_is_buffer(const ComResource *r, const uint8_t *desc)
 static void MS dev_create_srv(ComDevice *self, ComResource *r,
                               const uint8_t *desc, uint64_t dest)
 {
+    BD12_PROF_BEGIN();
     dev_create_srv_impl(self, r, desc, dest);
     if (dest) bd12_heap_written((const void *)(uintptr_t)dest, 1,
                                 view_is_buffer(r, desc) ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
                                                         : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+    BD12_PROF_END(BD12_PROF_VIEW);
 }
 static void MS dev_create_uav(ComDevice *self, ComResource *r, ComResource *counter,
                               const uint8_t *desc, uint64_t dest)
 {
+    BD12_PROF_BEGIN();
     dev_create_uav_impl(self, r, counter, desc, dest);
     if (dest) bd12_heap_written((const void *)(uintptr_t)dest, 1,
                                 view_is_buffer(r, desc) ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
                                                         : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    BD12_PROF_END(BD12_PROF_VIEW);
 }
 
 static void MS dev_create_rtv(ComDevice *self, ComResource *r,
@@ -2447,9 +2636,11 @@ static void MS dev_copy_descriptors_simple(ComDevice *self, uint32_t count,
 {
     (void)self; (void)type;
     if (!count || !dest || !src) return;
+    BD12_PROF_BEGIN();
     memmove((void *)(uintptr_t)dest, (const void *)(uintptr_t)src,
             (size_t)count * sizeof(BD12Descriptor));
     bd12_heap_copied((const void *)(uintptr_t)dest, (const void *)(uintptr_t)src, count);
+    BD12_PROF_END(BD12_PROF_DESC_COPY);
 }
 
 static void MS dev_copy_descriptors(ComDevice *self, uint32_t dest_ranges,
@@ -2461,6 +2652,7 @@ static void MS dev_copy_descriptors(ComDevice *self, uint32_t dest_ranges,
 {
     (void)self; (void)type;
     if (!dest_ranges || !src_ranges || !dest_starts || !src_starts) return;
+    BD12_PROF_BEGIN();
     uint32_t dr = 0, sr = 0, doff = 0, soff = 0;
     while (dr < dest_ranges && sr < src_ranges) {
         uint32_t dcount = dest_sizes ? dest_sizes[dr] : 1;
@@ -2477,6 +2669,7 @@ static void MS dev_copy_descriptors(ComDevice *self, uint32_t dest_ranges,
         doff += n;
         soff += n;
     }
+    BD12_PROF_END(BD12_PROF_DESC_COPY);
 }
 
 /* Allocation info and footprints ---------------------------------------------------- */
@@ -3180,7 +3373,9 @@ static void *dev_allocation_info_strided(ComDevice *self, uint64_t *result, uint
     uint64_t total = 0, max_align = 65536;
     for (uint32_t i = 0; i < count; ++i) {
         uint64_t one[2];
+        if (stride == 64) t_desc1 = descs + (size_t)i * stride;   /* GetResourceAllocationInfo2: DESC1 */
         dev_get_allocation_info(self, one, mask, 1, descs + (size_t)i * stride);
+        t_desc1 = NULL;
         const uint64_t offset = align_up(total, one[1]);
         if (info1) { info1[i * 3] = offset; info1[i * 3 + 1] = one[1]; info1[i * 3 + 2] = one[0]; }
         total = offset + one[0];
@@ -3206,18 +3401,44 @@ static HR MS dev_set_background_processing(ComDevice *self, uint32_t mode, uint3
 static HR MS dev_create_committed2(ComDevice *self, const uint8_t *props, uint32_t flags, const uint8_t *desc1,
                                    uint32_t state, const void *clear, const void *session, const uint8_t *riid,
                                    void **out)
-{ return dev_create_committed1(self, props, flags, desc1, state, clear, session, riid, out); }
+{
+    t_desc1 = desc1;
+    const HR hr = dev_create_committed1(self, props, flags, desc1, state, clear, session, riid, out);
+    t_desc1 = NULL;
+    return hr;
+}
 static HR MS dev_create_placed1(ComDevice *self, ComHeap *heap, uint64_t offset, const uint8_t *desc1,
                                 uint32_t state, const void *clear, const uint8_t *riid, void **out)
-{ return dev_create_placed(self, heap, offset, desc1, state, clear, riid, out); }
+{
+    t_desc1 = desc1;
+    const HR hr = dev_create_placed(self, heap, offset, desc1, state, clear, riid, out);
+    t_desc1 = NULL;
+    return hr;
+}
 static void MS dev_get_footprints1(ComDevice *self, const uint8_t *desc1, uint32_t first, uint32_t count,
                                    uint64_t base, uint8_t *layouts, uint32_t *rows, uint64_t *row_sizes,
                                    uint64_t *total)
-{ dev_get_footprints(self, desc1, first, count, base, layouts, rows, row_sizes, total); }
-static void MS dev_create_feedback_uav(void)
 {
-    static unsigned logged;
-    if (logged++ < 5) fprintf(stderr, "[BD12] CreateSamplerFeedbackUnorderedAccessView (not implemented)\n");
+    t_desc1 = desc1;
+    dev_get_footprints(self, desc1, first, count, base, layouts, rows, row_sizes, total);
+    t_desc1 = NULL;
+}
+/* ID3D12Device8::CreateSamplerFeedbackUnorderedAccessView(targeted texture, feedback map, destination): a storage
+ * image view of the feedback map (R64_UINT, see bd12_feedback_padded_extent). The targeted texture is the shader's paired
+ * SRV, bound separately; WriteSamplerFeedback* reads its size and mip count from that SRV. */
+static void MS dev_create_feedback_uav(ComDevice *self, ComResource *targeted, ComResource *feedback, uint64_t dest)
+{
+    (void)targeted;
+    if (!dest) return;
+    clear_descriptor(dest);
+    if (feedback && feedback->image && is_feedback_format(feedback->dxgi_format)) {
+        BD12DescriptorHeap heap = temp_heap(self, dest);
+        const uint32_t layers = feedback->depth_or_layers ? feedback->depth_or_layers : 1;
+        bd12_descriptor_write_image_uav(&heap, 0, feedback->image,
+                                        layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+                                        VK_FORMAT_R64_UINT, 0, 0, layers);
+    }
+    bd12_heap_written((const void *)(uintptr_t)dest, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 }
 
 /* Device9: queues ignore the creator id; driver shader caches are not offered (as on drivers without them). */
@@ -3421,6 +3642,7 @@ static HR MS sc_present(ComSwapChain *sc, uint32_t sync, uint32_t flags)
     /* DXGI_PRESENT_TEST only asks whether presenting would succeed (occlusion probe): it neither shows the
      * back buffer nor advances the buffer index. Treating it as a real present doubles every frame. */
     if (flags & 0x1u) return HR_OK;
+    bd12_hitch_present();
     ComResource *texture = sc->buffers[sc->index % (sc->buffer_count ? sc->buffer_count : 1)];
     HR hr = HR_E_FAIL;
     if (texture) {                      /* in queue order: held behind any held work of the swapchain's queue */
@@ -3718,4 +3940,36 @@ uint64_t MS beer_bd12_create_device(const uint8_t *riid, void **out)
     com_add_ref(&g_com_device->obj);
     *out = g_com_device;
     return HR_OK;
+}
+
+/* Hang diagnostics (`kill -USR1`, loader.c on_dump_stacks): every D3D12 queue whose work BD12 holds on the CPU, with
+ * the fence wait at its head, and each lane's submitted vs completed serial. Uses trylock: may print nothing when
+ * a lock is held by the thread that took the signal. Diagnostic only, not async-signal-safe. */
+void bd12_com_debug_dump(void)
+{
+    ComDevice *dev = g_com_device;
+    if (!dev) return;
+    for (uint32_t l = 0; l < dev->lane_count; ++l)
+        fprintf(stderr, "[STACKS] bd12 lane %u submitted=%llu retired=%llu\n", l,
+                (unsigned long long)__atomic_load_n(&dev->lanes[l].submitted, __ATOMIC_ACQUIRE),
+                (unsigned long long)(dev->lanes[l].retire ? bd12_fence_completed(dev->lanes[l].retire) : 0));
+    if (pthread_mutex_trylock(&dev->defer_lock) != 0) {
+        fprintf(stderr, "[STACKS] bd12 queues: defer_lock busy\n");
+        return;
+    }
+    int any = 0;
+    for (ComQueue *q = dev->deferred; q; q = q->next_deferred) {
+        any = 1;
+        const QueueOp *op = q->held_count ? &q->held[0] : NULL;
+        fprintf(stderr, "[STACKS] bd12 queue %p (type %u, lane %u) holds %u ops; head kind=%d", (void *)q, q->desc[0],
+                q->lane, q->held_count, op ? op->kind : -1);
+        if (op && op->fence && op->fence->fence)
+            fprintf(stderr, " fence=%p wants %llu signaled=%llu completed=%llu", (void *)op->fence,
+                    (unsigned long long)op->value,
+                    (unsigned long long)__atomic_load_n(&op->fence->fence->signaled, __ATOMIC_ACQUIRE),
+                    (unsigned long long)bd12_fence_completed(op->fence->fence));
+        fputc('\n', stderr);
+    }
+    if (!any) fprintf(stderr, "[STACKS] bd12 queues: none holding work\n");
+    pthread_mutex_unlock(&dev->defer_lock);
 }

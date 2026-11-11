@@ -1,0 +1,95 @@
+#version 460
+// D3D12 sampler-feedback resolves (ResolveSubresourceRegion DECODE / ENCODE_SAMPLER_FEEDBACK) between BD12's opaque
+// feedback maps and the R8_UINT layouts D3D12 defines. Built into bd12_sampler_feedback_spv.h by glslc with one of
+// DECODE_MIN_MIP, DECODE_MIP_USED, ENCODE_MIN_MIP, ENCODE_MIP_USED defined.
+//
+// Opaque map (the layout dxil-spirv's WriteSamplerFeedback* lowering writes): one 64-bit texel per mip region; for
+// mip level L the shader addresses region (u * width_L / region_w, v * height_L / region_h), i.e. the region grid of
+// that mip in the top-left corner, and ORs 4 bits at bit 4*L: 1 = this region, 2 = its +x neighbour, 4 = its +y
+// neighbour, 8 = its +x+y neighbour (a bilinear footprint crossing region edges). The map was copied to a buffer
+// with `src_pitch` texels per row and `src_rows` rows per layer; each texel is two uints (low = mips 0-7).
+//
+// Everything is addressed by buffer device address; R8 values are bytes in a zeroed buffer of `out_w` x `out_h` per
+// layer, written with 32-bit atomic OR so no 8-bit storage feature is needed.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+layout(push_constant, std430) uniform Args {
+    uint64_t map;        // opaque map texels (uint pairs)
+    uint64_t bytes;      // R8 values
+    uint src_pitch;      // map texels per row
+    uint src_rows;       // map rows per layer
+    uint out_w;          // R8 region processed (width, height) per layer
+    uint out_h;
+    uint mips;           // mip levels of the paired texture (MIN_MIP: all are searched)
+    uint mip;            // MIP_USED: the mip level of this pass
+    uint x0;             // first map region of the processed rectangle
+    uint y0;
+    uint layer_bytes;    // R8 bytes per layer (out_w * out_h)
+} args;
+
+uint map_bits(uint mip, int x, int y, uint layer)
+{
+    if (x < 0 || y < 0 || uint(x) >= args.src_pitch || uint(y) >= args.src_rows) return 0u;
+    Words map = Words(args.map);
+    const uint texel = (layer * args.src_rows + uint(y)) * args.src_pitch + uint(x);
+    const uint word = mip < 8u ? map.w[texel * 2u] : map.w[texel * 2u + 1u];
+    return (word >> (4u * (mip & 7u))) & 15u;
+}
+
+// Region (x, y) of mip `mip` was sampled: its own bit, or the neighbour bit of the region left of, above, or
+// above-left of it.
+bool touched(uint mip, int x, int y, uint layer)
+{
+    return (map_bits(mip, x, y, layer) & 1u) != 0u || (map_bits(mip, x - 1, y, layer) & 2u) != 0u ||
+           (map_bits(mip, x, y - 1, layer) & 4u) != 0u || (map_bits(mip, x - 1, y - 1, layer) & 8u) != 0u;
+}
+
+void put_byte(uint index, uint value)
+{
+    Words bytes = Words(args.bytes);
+    atomicOr(bytes.w[index >> 2u], (value & 255u) << (8u * (index & 3u)));
+}
+
+uint get_byte(uint index)
+{
+    Words bytes = Words(args.bytes);
+    return (bytes.w[index >> 2u] >> (8u * (index & 3u))) & 255u;
+}
+
+void set_map_bit(uint mip, uint x, uint y, uint layer)
+{
+    if (x >= args.src_pitch || y >= args.src_rows) return;
+    Words map = Words(args.map);
+    const uint texel = (layer * args.src_rows + y) * args.src_pitch + x;
+    atomicOr(map.w[texel * 2u + (mip < 8u ? 0u : 1u)], 1u << (4u * (mip & 7u)));
+}
+
+void main()
+{
+    const uvec3 id = gl_GlobalInvocationID;
+    if (id.x >= args.out_w || id.y >= args.out_h) return;
+    const uint layer = id.z;
+    const uint out_index = layer * args.layer_bytes + id.y * args.out_w + id.x;
+    const int rx = int(args.x0 + id.x), ry = int(args.y0 + id.y);
+#if defined(DECODE_MIN_MIP)
+    // The smallest mip whose region covering this top-mip region was sampled; 0xFF when none was.
+    uint value = 255u;
+    for (uint mip = 0u; mip < args.mips && mip < 16u; ++mip)
+        if (touched(mip, rx >> mip, ry >> mip, layer)) { value = mip; break; }
+    put_byte(out_index, value);
+#elif defined(DECODE_MIP_USED)
+    put_byte(out_index, touched(args.mip, rx, ry, layer) ? 1u : 0u);
+#elif defined(ENCODE_MIN_MIP)
+    const uint value = get_byte(out_index);
+    if (value < args.mips && value < 16u) set_map_bit(value, uint(rx) >> value, uint(ry) >> value, layer);
+#elif defined(ENCODE_MIP_USED)
+    if (get_byte(out_index) != 0u) set_map_bit(args.mip, uint(rx), uint(ry), layer);
+#else
+#error define one of DECODE_MIN_MIP, DECODE_MIP_USED, ENCODE_MIN_MIP, ENCODE_MIP_USED
+#endif
+}

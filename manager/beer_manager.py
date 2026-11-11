@@ -71,8 +71,10 @@ LAUNCH_FLAGS = [
     ("mangohud", "Allow MangoHud", "MANGOHUD", "1", "Off by default: the MangoHud Vulkan layer hooks the swapchain and crashed RE8 (Beer has its own overlay)"),
     ("dxr_probe", "Advertise ray tracing (experimental)", "BEER_DXR_PROBE", "1", "DXR probe; the pipeline is not finished"),
     # D3D12 (BD12)
-    ("bd12_root_push", "Fast D3D12 binding (root push + descriptor buffers)", "BEER_BD12_ROOT_PUSH", "1",
-     "Binds resources the way D3D12 does instead of building descriptor sets per draw. RE8: 73 -> 114 fps. The first launch recompiles every pipeline (one long stall), later launches are smooth"),
+    ("bd12_no_root_push", "Per-draw D3D12 binding (old path)", "BEER_BD12_ROOT_PUSH", "0",
+     "Build descriptor sets per draw instead of the default root push + descriptor buffers. Much slower in SM 6 games (RE8: 148 -> 67 fps); for comparison when a game renders wrongly"),
+    ("bd12_no_ssbo", "Texel-buffer descriptors (old path)", "BEER_BD12_SSBO", "0",
+     "Raw/structured buffers as texel buffers instead of the default storage buffers (no UAV counters or 64-bit loads)"),
     ("bd12_multi_queue", "Separate Vulkan queues (experimental)", "BEER_BD12_MULTI_QUEUE", "1",
      "Compute and copy queues on their own Vulkan queues so they can overlap with graphics"),
     ("bd12_mesh", "Mesh shaders (experimental)", "BEER_BD12_MESH", "1", "Report and run D3D12 mesh/amplification shaders (VK_EXT_mesh_shader)"),
@@ -1481,9 +1483,17 @@ class Manager(Adw.Application):
         # show the game, under the launcher's library name and log, instead of two cards.
         launcher_of = {pid: parent_pid(pid) for pid in sockets}
         launcher_of = {pid: parent for pid, parent in launcher_of.items() if parent in sockets}
+        # A child loader is not always the game: Ghost of Tsushima starts its crash handler (crs-handler) as one.
+        # Whichever of the pair presents frames is the game; the other is the launcher or a helper.
+        helpers = set()
+        for child, parent in list(launcher_of.items()):
+            child_frames, parent_frames = self.frames_of(sockets[child]), self.frames_of(sockets[parent])
+            if parent_frames > 0 and child_frames == 0:
+                helpers.add(child)
+                del launcher_of[child]
         seen = set()
         for pid, path in sockets.items():
-            if pid in launcher_of.values():
+            if pid in launcher_of.values() or pid in helpers:
                 continue
             seen.add(pid)
             if pid not in self.cards:
@@ -1517,6 +1527,18 @@ class Manager(Adw.Application):
             self.running_games = running
             self.rebuild_library()
         return True
+
+    def frames_of(self, path):
+        """Frames a running loader has presented (0 when it does not answer)."""
+        control = Control(path)
+        try:
+            status = control.request({"cmd": "status"}) or {}
+        finally:
+            control.close()
+        try:
+            return int(status.get("frames", 0))
+        except (TypeError, ValueError):
+            return 0
 
     def running_pid(self, game):
         """PID of the running copy of a library game (matched by exe, or by name for launcher games)."""
