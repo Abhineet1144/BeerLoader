@@ -108,6 +108,10 @@ typedef struct {
  * the caller then uses beer_d3d12_translate_shader. Cached per (shader, layout). */
 const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
     const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash, const BeerD3D12RootLayout *layout);
+/* A mesh pipeline's pixel shader: inputs linked to `mesh_shader`'s outputs by semantic (locations, per-primitive). */
+const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs_linked(
+    const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash, const BeerD3D12RootLayout *layout,
+    const uint8_t *mesh_shader, size_t mesh_shader_size);
 
 /* Automatically scans DXBC resource declarations and translates the shader to
  * Vulkan SPIR-V. Each D3D register receives a deterministic descriptor binding

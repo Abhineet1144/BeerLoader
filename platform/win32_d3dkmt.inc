@@ -54,11 +54,20 @@ static u64 beer_kmt_query_registry(const u8 *query, u8 *data, u32 size, const Be
     const u32 room = size - 544;
     u64 qword = 0;
     u32 value_type = 0, value_size = 0;
+    u16 text[160];   /* REG_SZ values (UTF-16, NUL-terminated) */
+    const void *value = &qword;
     if (type == 1 && gpu && !strcasecmp(name, "HardwareInformation.qwMemorySize")) {
         qword = gpu->dedicated_video_memory; value_type = 11; value_size = 8;            /* REG_QWORD */
     } else if (type == 1 && gpu && !strcasecmp(name, "HardwareInformation.MemorySize")) {
         qword = gpu->dedicated_video_memory > 0xffffffffull ? 0xffffffffull : gpu->dedicated_video_memory;
         value_type = 3; value_size = 4;                                                   /* REG_BINARY, 4 bytes */
+    } else if (g_ngx_windows_path && !strcasecmp(name, "NGXCore\\NGXPath")) {
+        /* The NVIDIA driver publishes its NGX (DLSS) core folder on the display driver's keys; current NGX loaders
+         * (Streamline 2.x) ask for it through this query and give up with "adapter query failed" without it. */
+        size_t i = 0;
+        for (; g_ngx_windows_path[i] && i < 159; ++i) text[i] = (u16)(unsigned char)g_ngx_windows_path[i];
+        text[i] = 0;
+        value = text; value_type = 1; value_size = (u32)((i + 1) * 2);                 /* REG_SZ */
     }
     {
         static int logs;
@@ -73,7 +82,7 @@ static u64 beer_kmt_query_registry(const u8 *query, u8 *data, u32 size, const Be
     }
     *(u32 *)(data + 536) = value_size;
     if (room < value_size) { *(u32 *)(data + 540) = 1; return 0; }                        /* BUFFER_OVERFLOW */
-    memcpy(data + 544, &qword, value_size);
+    memcpy(data + 544, value, value_size);
     *(u32 *)(data + 540) = 0;
     return 0;
 }
@@ -91,9 +100,9 @@ static u64 __attribute__((ms_abi)) impl_D3DKMTQueryAdapterInfo(u8 *query)
     const int have = beer_vulkan_host_gpu_info(&gpu);
     if (type != 48) memset(data, 0, size);                /* QUERYREGISTRY carries its input in the buffer */
     {
-        static u64 seen;
-        if (type < 64 && !(seen & (1ull << type))) {
-            seen |= 1ull << type;
+        static u64 seen[2];
+        if (type < 128 && !(seen[type / 64] & (1ull << (type % 64)))) {
+            seen[type / 64] |= 1ull << (type % 64);
             fprintf(stderr, "[D3DKMT] QueryAdapterInfo type %u (%u bytes)\n", type, size);
         }
     }
@@ -117,6 +126,13 @@ static u64 __attribute__((ms_abi)) impl_D3DKMTQueryAdapterInfo(u8 *query)
         return 0;
     case 48:                                              /* QUERYREGISTRY: D3DDDI_QUERYREGISTRY_INFO */
         return beer_kmt_query_registry(query, data, size, have ? &gpu : NULL);
+    case 70:                                              /* WDDM_2_7_CAPS: hardware GPU scheduling */
+        /* HwSchSupported | HwSchEnabled | HwSchEnabledByDefault on NVIDIA: the Linux driver schedules GPU work in
+         * hardware, which is what Windows' HAGS switch selects. Streamline's DLSS frame generation requires it
+         * ("not supported on current hardware" otherwise). Other vendors: not reported. */
+        if (size < 4) return BEER_STATUS_INVALID_PARAMETER;
+        *(u32 *)data = have && gpu.vendor_id == 0x10de ? 0x7u : 0u;
+        return 0;
     case 30:                                              /* PHYSICALADAPTERCOUNT */
         if (size < 4) return BEER_STATUS_INVALID_PARAMETER;
         *(u32 *)data = 1;

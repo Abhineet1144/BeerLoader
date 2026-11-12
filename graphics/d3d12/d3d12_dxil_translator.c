@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "dxil_spirv_c.h"
@@ -31,14 +32,22 @@ void beer_d3d12_dxil_set_caps(const BeerD3D12DxilCaps *caps)
 
 uint64_t beer_d3d12_dxil_caps_key(void)
 {
-    return ((uint64_t)g_caps.vendor_id << 32) | ((uint64_t)!!g_caps.raw_access_chains << 1) |
-           (uint64_t)!!g_caps.scalar_block_layout;
+    return ((uint64_t)g_caps.vendor_id << 32) | ((uint64_t)!!g_caps.barycentrics << 2) |
+           ((uint64_t)!!g_caps.raw_access_chains << 1) | (uint64_t)!!g_caps.scalar_block_layout;
 }
 
 /* Options that follow the device (vkd3d-proton adds the same ones from its device's shader target extensions). */
 static void add_device_options(dxil_spv_converter converter,
                                dxil_spv_result (*add)(dxil_spv_converter, const dxil_spv_option_base *))
 {
+    {   /* BEER_DXIL_LEGACY_STRUCTURIZER=1: dxil-spirv's older CFG structurizer (diagnostic comparison). */
+        static int legacy = -1;
+        if (legacy < 0) { const char *v = getenv("BEER_DXIL_LEGACY_STRUCTURIZER"); legacy = v && *v && strcmp(v, "0"); }
+        if (legacy) {
+            const dxil_spv_option_legacy_structurizer opt = { { DXIL_SPV_OPTION_LEGACY_STRUCTURIZER }, DXIL_SPV_TRUE };
+            add(converter, &opt.base);
+        }
+    }
     if (g_caps.scalar_block_layout) {
         /* Vectorized SSBO loads/stores with scalar alignment. Only AMD bounds-checks such access per component; on
          * the others a vec3 byte-address access stays split so robustness keeps working per element. */
@@ -52,6 +61,10 @@ static void add_device_options(dxil_spv_converter converter,
                 { DXIL_SPV_OPTION_CONSERVATIVE_SSBO_VECTORIZATION }, DXIL_SPV_TRUE };
             add(converter, &conservative.base);
         }
+    }
+    if (g_caps.barycentrics) {
+        const dxil_spv_option_barycentric_khr bary = { { DXIL_SPV_OPTION_BARYCENTRIC_KHR }, DXIL_SPV_TRUE };
+        add(converter, &bary.base);
     }
     if (g_caps.raw_access_chains) {
         const dxil_spv_option_raw_access_chains_nv chains = { { DXIL_SPV_OPTION_RAW_ACCESS_CHAINS_NV }, DXIL_SPV_TRUE };
@@ -131,6 +144,7 @@ static struct {
     void (*converter_set_sampler_remapper)(dxil_spv_converter, dxil_spv_sampler_remapper_cb, void *);
     void (*converter_set_uav_remapper)(dxil_spv_converter, dxil_spv_uav_remapper_cb, void *);
     void (*converter_set_cbv_remapper)(dxil_spv_converter, dxil_spv_cbv_remapper_cb, void *);
+    void (*converter_set_stage_input_remapper)(dxil_spv_converter, dxil_spv_shader_stage_io_remapper_cb, void *);
     dxil_spv_result (*converter_add_option)(dxil_spv_converter, const dxil_spv_option_base *);
     dxil_spv_result (*converter_run)(dxil_spv_converter);
     dxil_spv_result (*converter_get_compiled_spirv)(dxil_spv_converter, dxil_spv_compiled_spirv *);
@@ -158,6 +172,7 @@ static int load_symbols(void)
     LOAD(converter_set_sampler_remapper);
     LOAD(converter_set_uav_remapper);
     LOAD(converter_set_cbv_remapper);
+    LOAD(converter_set_stage_input_remapper);
     LOAD(converter_add_option);
     LOAD(converter_run);
     LOAD(converter_get_compiled_spirv);
@@ -719,24 +734,127 @@ int beer_d3d12_dxil_available(void)
     return ok;
 }
 
+/* Mesh-shader -> pixel-shader linkage. D3D12 links the stages by semantic; Vulkan by location, and a per-primitive
+ * attribute must be PerPrimitiveEXT on both sides. dxil-spirv places a mesh shader's per-vertex outputs at their
+ * signature row and its per-primitive outputs at row + (end of the per-vertex rows), decorated per-primitive. A pixel
+ * shader translated on its own takes its own rows and no per-primitive flag, so materials reading per-primitive
+ * attributes got undefined inputs (RE9 floors and walls on the mesh-shader path vanished). The map below is built
+ * from the mesh shader's OSG1 and PSG1 signature chunks and applied through the stage-input remapper. */
+#define LINK_MAX 64
+typedef struct {
+    uint32_t count;
+    struct { char name[48]; uint32_t index, location, component, flags; } e[LINK_MAX];
+} StageLink;
+
+static const uint8_t *dxbc_chunk(const uint8_t *c, size_t size, const char fourcc[4], uint32_t *chunk_size)
+{
+    if (size < 32 || memcmp(c, "DXBC", 4)) return NULL;
+    uint32_t count; memcpy(&count, c + 28, 4);
+    for (uint32_t i = 0; i < count && 32 + 4ull * (i + 1) <= size; ++i) {
+        uint32_t off; memcpy(&off, c + 32 + 4 * i, 4);
+        if ((size_t)off + 8 > size) continue;
+        if (memcmp(c + off, fourcc, 4)) continue;
+        uint32_t n; memcpy(&n, c + off + 4, 4);
+        if ((size_t)off + 8 + n > size) return NULL;
+        *chunk_size = n;
+        return c + off + 8;
+    }
+    return NULL;
+}
+/* Signature v1 elements (32 bytes): stream, name offset, semantic index, system value, component type, register,
+ * mask, rw mask, pad, min precision. `extent` gets the end row of every element; user elements are added to `link`
+ * at register + `row_offset`. */
+static void link_add_signature(StageLink *link, const uint8_t *chunk, uint32_t chunk_size, uint32_t row_offset,
+                               uint32_t flags, uint32_t *extent)
+{
+    if (!chunk || chunk_size < 8) return;
+    uint32_t count, first; memcpy(&count, chunk, 4); memcpy(&first, chunk + 4, 4);
+    for (uint32_t i = 0; i < count; ++i) {
+        const size_t at = (size_t)first + 32u * i;
+        if (at + 32 > chunk_size) break;
+        uint32_t name_off, index, sysval, reg; uint8_t mask = chunk[at + 24];
+        memcpy(&name_off, chunk + at + 4, 4); memcpy(&index, chunk + at + 8, 4);
+        memcpy(&sysval, chunk + at + 12, 4); memcpy(&reg, chunk + at + 20, 4);
+        if (reg == ~0u) continue;
+        if (extent && reg + 1 > *extent) *extent = reg + 1;
+        if (sysval || name_off >= chunk_size || link->count == LINK_MAX) continue;
+        const char *name = (const char *)chunk + name_off;
+        const size_t len = strnlen(name, chunk_size - name_off);
+        if (len == chunk_size - name_off || len >= sizeof(link->e[0].name)) continue;
+        uint32_t component = 0;
+        while (component < 4 && mask && !(mask & (1u << component))) ++component;
+        memcpy(link->e[link->count].name, name, len + 1);
+        link->e[link->count].index = index;
+        link->e[link->count].location = reg + row_offset;
+        link->e[link->count].component = component & 3;
+        link->e[link->count].flags = flags;
+        ++link->count;
+    }
+}
+static int link_from_mesh_shader(const uint8_t *ms, size_t ms_size, StageLink *link)
+{
+    memset(link, 0, sizeof(*link));
+    uint32_t osg_size = 0, psg_size = 0, extent = 0;
+    const uint8_t *osg = dxbc_chunk(ms, ms_size, "OSG1", &osg_size);
+    const uint8_t *psg = dxbc_chunk(ms, ms_size, "PSG1", &psg_size);
+    if (!osg) return 0;
+    link_add_signature(link, osg, osg_size, 0, DXIL_SPV_SHADER_STAGE_IO_NONE, &extent);
+    link_add_signature(link, psg, psg_size, extent, DXIL_SPV_SHADER_STAGE_IO_PER_PRIMITIVE, NULL);
+    return 1;
+}
+uint64_t beer_d3d12_dxil_stage_link_hash(const uint8_t *ms, size_t ms_size)
+{
+    StageLink link;
+    if (!ms || !link_from_mesh_shader(ms, ms_size, &link)) return 0;
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *p = (const uint8_t *)&link;
+    for (size_t i = 0; i < sizeof(link); ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h ? h : 1;
+}
+static dxil_spv_bool link_remap(void *user, const dxil_spv_d3d_shader_stage_io *d3d, dxil_spv_vulkan_shader_stage_io *vk)
+{
+    const StageLink *link = user;
+    for (uint32_t i = 0; i < link->count; ++i)
+        if (link->e[i].index == d3d->semantic_index && !strcasecmp(link->e[i].name, d3d->semantic)) {
+            vk->location = link->e[i].location;
+            vk->component = link->e[i].component;
+            vk->flags = link->e[i].flags;
+            return DXIL_SPV_TRUE;
+        }
+    return DXIL_SPV_TRUE;   /* not written by the mesh shader: keep the pixel shader's own row (reads are undefined) */
+}
+
 static int dxil_translate(const uint8_t *container, size_t size, uint32_t stage_namespace,
-                          const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out);
+                          const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out,
+                          const StageLink *link);
 
 int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
                               uint32_t stage_namespace,
                               BeerD3D12TranslatedShader *out)
 {
-    return dxil_translate(container, size, stage_namespace, NULL, out);
+    return dxil_translate(container, size, stage_namespace, NULL, out, NULL);
 }
 
 int beer_d3d12_dxil_translate_rs(const uint8_t *container, size_t size, uint32_t stage_namespace,
                                  const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out)
 {
-    return layout ? dxil_translate(container, size, stage_namespace, layout, out) : 0;
+    return layout ? dxil_translate(container, size, stage_namespace, layout, out, NULL) : 0;
+}
+
+int beer_d3d12_dxil_translate_rs_linked(const uint8_t *container, size_t size, uint32_t stage_namespace,
+                                        const BeerD3D12RootLayout *layout, const uint8_t *mesh_shader,
+                                        size_t mesh_shader_size, BeerD3D12TranslatedShader *out)
+{
+    StageLink link;
+    if (!layout) return 0;
+    if (!mesh_shader || !link_from_mesh_shader(mesh_shader, mesh_shader_size, &link))
+        return dxil_translate(container, size, stage_namespace, layout, out, NULL);
+    return dxil_translate(container, size, stage_namespace, layout, out, &link);
 }
 
 static int dxil_translate(const uint8_t *container, size_t size, uint32_t stage_namespace,
-                          const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out)
+                          const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out,
+                          const StageLink *link)
 {
     /* The lock covers loading the library only. dxil-spirv converts concurrently (per-thread allocator contexts and
      * log callbacks; parsed blobs and converters are per call), and pipeline warm-ups translate on many threads. */
@@ -808,6 +926,8 @@ retry:
     g.converter_set_sampler_remapper(converter, sampler_cb, &collect);
     g.converter_set_uav_remapper(converter, uav_cb, &collect);
     g.converter_set_cbv_remapper(converter, cbv_cb, &collect);
+    if (link && g.parsed_blob_get_shader_stage(blob) == DXIL_SPV_STAGE_PIXEL)
+        g.converter_set_stage_input_remapper(converter, link_remap, (void *)link);
     add_bool_option(converter, DXIL_SPV_OPTION_SHADER_DEMOTE_TO_HELPER, 1);
     add_bool_option(converter, DXIL_SPV_OPTION_TYPED_UAV_READ_WITHOUT_FORMAT, 1);
     if (collect.ssbo) {

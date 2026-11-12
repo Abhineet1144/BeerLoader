@@ -17,6 +17,7 @@ typedef struct BeerD3D12DxilCaps {
     int raw_access_chains;      /* VK_NV_raw_access_chains: SSBO access with explicit byte offsets and alignment */
     uint32_t vendor_id;         /* PCI vendor: NVIDIA (0x10de) needs conservative SSBO vectorization, AMD (0x1002)
                                  * bounds-checks SSBO access per component */
+    int barycentrics;           /* VK_KHR_fragment_shader_barycentric: SV_Barycentrics as BaryCoordKHR */
 } BeerD3D12DxilCaps;
 void beer_d3d12_dxil_set_caps(const BeerD3D12DxilCaps *caps);
 /* Key of the current caps (0 when unset). */
@@ -32,6 +33,13 @@ int beer_d3d12_dxil_translate(const uint8_t *container, size_t size,
  * express that way. */
 int beer_d3d12_dxil_translate_rs(const uint8_t *container, size_t size, uint32_t stage_namespace,
                                  const BeerD3D12RootLayout *layout, BeerD3D12TranslatedShader *out);
+/* A pixel shader of a mesh pipeline: its inputs take the locations and per-primitive flags of `mesh_shader`'s outputs
+ * (matched by semantic, as D3D12 links the stages). */
+int beer_d3d12_dxil_translate_rs_linked(const uint8_t *container, size_t size, uint32_t stage_namespace,
+                                        const BeerD3D12RootLayout *layout, const uint8_t *mesh_shader,
+                                        size_t mesh_shader_size, BeerD3D12TranslatedShader *out);
+/* Identity of a mesh shader's output linkage (0: none); translations made with it are cached under it. */
+uint64_t beer_d3d12_dxil_stage_link_hash(const uint8_t *mesh_shader, size_t mesh_shader_size);
 
 /* One translated ray tracing entry point (raygen, miss, hit, intersection, callable). */
 typedef struct BeerD3D12RtShader {

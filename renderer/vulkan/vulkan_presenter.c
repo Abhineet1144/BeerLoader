@@ -7,6 +7,7 @@
 #include "vulkan_post.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -410,6 +411,172 @@ static void record_overlay(VkImage destination)
     }
 }
 
+/* NVIDIA Reflex on VK_NV_low_latency2 (platform/win32_nvapi.inc forwards NvAPI_D3D_SetSleepMode / Sleep /
+ * SetLatencyMarker / GetLatency and NvAPI_D3D12_SetAsyncFrameMarker here). The presenter owns the swapchain the
+ * latency state belongs to: every swapchain is created latency-enabled, the sleep mode is re-applied to each new one,
+ * and the frame id of the latest PRESENT_START marker becomes the next present's VkPresentIdKHR, so the driver can
+ * match markers to presents. g_ll.lock guards the swapchain handle against recreation. */
+static struct {
+    pthread_mutex_t lock;
+    int loaded, enabled_mode;
+    VkLatencySleepModeInfoNV mode;
+    VkSemaphore sleep_semaphore;
+    uint64_t sleep_value;
+    uint64_t pending_present_id, last_present_id;
+    PFN_vkSetLatencySleepModeNV set_mode;
+    PFN_vkLatencySleepNV sleep;
+    PFN_vkSetLatencyMarkerNV marker;
+    PFN_vkGetLatencyTimingsNV timings;
+    PFN_vkWaitSemaphores wait_semaphores;
+} g_ll = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static int ll_ready_locked(void)
+{
+    const BeerVulkanModern *m = beer_vulkan_modern();
+    if (!m || !m->low_latency || !g_vk.device) return 0;
+    if (!g_ll.loaded) {
+        g_ll.loaded = 1;
+        PFN_vkGetDeviceProcAddr get = beer_vulkan_get_device_proc_addr();
+        if (get) {
+            g_ll.set_mode = (PFN_vkSetLatencySleepModeNV)get(g_vk.device, "vkSetLatencySleepModeNV");
+            g_ll.sleep = (PFN_vkLatencySleepNV)get(g_vk.device, "vkLatencySleepNV");
+            g_ll.marker = (PFN_vkSetLatencyMarkerNV)get(g_vk.device, "vkSetLatencyMarkerNV");
+            g_ll.timings = (PFN_vkGetLatencyTimingsNV)get(g_vk.device, "vkGetLatencyTimingsNV");
+            g_ll.wait_semaphores = (PFN_vkWaitSemaphores)get(g_vk.device, "vkWaitSemaphores");
+        }
+        const VkSemaphoreTypeCreateInfo type = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                                 .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE };
+        const VkSemaphoreCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type };
+        if (g_vk.CreateSemaphore(g_vk.device, &info, NULL, &g_ll.sleep_semaphore) != VK_SUCCESS)
+            g_ll.sleep_semaphore = VK_NULL_HANDLE;
+        fprintf(stderr, "[REFLEX] VK_NV_low_latency2: %s\n",
+                g_ll.set_mode && g_ll.sleep && g_ll.marker && g_ll.timings && g_ll.sleep_semaphore ? "ready" : "unavailable");
+    }
+    return g_ll.set_mode && g_ll.sleep && g_ll.marker && g_ll.timings && g_ll.wait_semaphores && g_ll.sleep_semaphore;
+}
+
+int beer_vulkan_low_latency_available(void)
+{
+    pthread_mutex_lock(&g_ll.lock);
+    const int ready = ll_ready_locked();
+    pthread_mutex_unlock(&g_ll.lock);
+    return ready;
+}
+
+/* Before the presenter has its device and swapchain the mode is kept and applied to the first swapchain. */
+int beer_vulkan_low_latency_set_mode(int enable, int boost, uint32_t minimum_interval_us)
+{
+    pthread_mutex_lock(&g_ll.lock);
+    g_ll.mode = (VkLatencySleepModeInfoNV){ .sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV,
+                                            .lowLatencyMode = enable ? VK_TRUE : VK_FALSE,
+                                            .lowLatencyBoost = boost ? VK_TRUE : VK_FALSE,
+                                            .minimumIntervalUs = minimum_interval_us };
+    g_ll.enabled_mode = 1;
+    int ok = 1;
+    if (g_vk.swapchain && ll_ready_locked()) ok = g_ll.set_mode(g_vk.device, g_vk.swapchain, &g_ll.mode) == VK_SUCCESS;
+    pthread_mutex_unlock(&g_ll.lock);
+    return ok;
+}
+
+void beer_vulkan_low_latency_get_mode(int *enable, int *boost, uint32_t *minimum_interval_us)
+{
+    pthread_mutex_lock(&g_ll.lock);
+    if (enable) *enable = g_ll.enabled_mode && g_ll.mode.lowLatencyMode;
+    if (boost) *boost = g_ll.enabled_mode && g_ll.mode.lowLatencyBoost;
+    if (minimum_interval_us) *minimum_interval_us = g_ll.enabled_mode ? g_ll.mode.minimumIntervalUs : 0;
+    pthread_mutex_unlock(&g_ll.lock);
+}
+
+/* Blocks until the driver says the next frame should start (vkLatencySleepNV signals the timeline). */
+int beer_vulkan_low_latency_sleep(void)
+{
+    pthread_mutex_lock(&g_ll.lock);
+    if (!g_vk.swapchain || !ll_ready_locked()) { pthread_mutex_unlock(&g_ll.lock); return 1; }   /* nothing to pace yet */
+    const uint64_t value = ++g_ll.sleep_value;
+    const VkLatencySleepInfoNV info = { .sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV,
+                                        .signalSemaphore = g_ll.sleep_semaphore, .value = value };
+    const VkResult result = g_ll.sleep(g_vk.device, g_vk.swapchain, &info);
+    const VkSemaphore semaphore = g_ll.sleep_semaphore;
+    pthread_mutex_unlock(&g_ll.lock);
+    if (result != VK_SUCCESS) return 0;
+    const VkSemaphoreWaitInfo wait = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                       .pSemaphores = &semaphore, .pValues = &value };
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const VkResult waited = g_ll.wait_semaphores(g_vk.device, &wait, UINT64_C(1000000000));   /* 1 s safety bound */
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    {   static int log = -1; static unsigned n;
+        if (log < 0) log = getenv("BEER_REFLEX_LOG") != NULL;
+        if (log && (n++ < 40 || n % 500 == 0))
+            fprintf(stderr, "[REFLEX] sleep #%u value %llu -> %d after %.2f ms\n", n, (unsigned long long)value, (int)waited,
+                    (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+    }
+    return waited == VK_SUCCESS;
+}
+
+/* `marker` is a VkLatencyMarkerNV value. PRESENT_START's frame id is used as the next present id. */
+int beer_vulkan_low_latency_marker(uint64_t frame_id, int marker)
+{
+    pthread_mutex_lock(&g_ll.lock);
+    const int ok = g_vk.swapchain && ll_ready_locked();
+    if (ok) {
+        const VkSetLatencyMarkerInfoNV info = { .sType = VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV,
+                                                .presentID = frame_id, .marker = (VkLatencyMarkerNV)marker };
+        g_ll.marker(g_vk.device, g_vk.swapchain, &info);
+        {   static int log = -1; static unsigned counts[16], n;
+            if (log < 0) log = getenv("BEER_REFLEX_LOG") != NULL;
+            if (log && marker >= 0 && marker < 16) {
+                ++counts[marker];
+                if (++n % 300 == 1)
+                    fprintf(stderr, "[REFLEX] markers so far: sim %u/%u submit %u/%u present %u/%u input %u oob %u/%u/%u/%u (frame %llu)\n",
+                            counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[8],
+                            counts[9], counts[10], counts[11], (unsigned long long)frame_id);
+            }
+        }
+        if (marker == VK_LATENCY_MARKER_PRESENT_START_NV && frame_id > g_ll.last_present_id)
+            g_ll.pending_present_id = frame_id;
+    }
+    pthread_mutex_unlock(&g_ll.lock);
+    return 1;   /* markers before the first swapchain are dropped */
+}
+
+/* Up to `max` frame reports, oldest first; returns the count. */
+uint32_t beer_vulkan_low_latency_timings(VkLatencyTimingsFrameReportNV *reports, uint32_t max)
+{
+    pthread_mutex_lock(&g_ll.lock);
+    uint32_t count = 0;
+    if (g_vk.swapchain && reports && max && ll_ready_locked()) {
+        /* NvAPI reports a full history or nothing: until the driver holds `max` frames, the report stays empty. */
+        VkGetLatencyMarkerInfoNV info = { .sType = VK_STRUCTURE_TYPE_GET_LATENCY_MARKER_INFO_NV };
+        g_ll.timings(g_vk.device, g_vk.swapchain, &info);
+        if (info.timingCount >= max) {
+            for (uint32_t i = 0; i < max; ++i)
+                reports[i] = (VkLatencyTimingsFrameReportNV){ .sType = VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV };
+            info.timingCount = max;
+            info.pTimings = reports;
+            g_ll.timings(g_vk.device, g_vk.swapchain, &info);
+            count = info.timingCount;
+        }
+    }
+    pthread_mutex_unlock(&g_ll.lock);
+    return count;
+}
+
+/* Present-time hooks (called with the swapchain about to be presented / just created). */
+static const void *ll_present_id_chain(VkPresentIdKHR *present_id, uint64_t *id)
+{
+    pthread_mutex_lock(&g_ll.lock);
+    const void *chain = NULL;
+    if (g_ll.pending_present_id > g_ll.last_present_id) {
+        *id = g_ll.pending_present_id;
+        g_ll.last_present_id = *id;
+        *present_id = (VkPresentIdKHR){ .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .swapchainCount = 1, .pPresentIds = id };
+        chain = present_id;
+    }
+    pthread_mutex_unlock(&g_ll.lock);
+    return chain;
+}
+
 static int recreate_swapchain(int requested_width, int requested_height,
                               int source_width, int source_height)
 {
@@ -417,8 +584,10 @@ static int recreate_swapchain(int requested_width, int requested_height,
     /* Hand the old swapchain to the new one (oldSwapchain) instead of destroying it first: with the NVIDIA driver on
      * XWayland a surface that briefly has no swapchain is detached from the compositor, which drops the window's
      * focus and input. */
+    pthread_mutex_lock(&g_ll.lock);   /* Reflex calls use the swapchain handle */
     VkSwapchainKHR retired = g_vk.swapchain;
     g_vk.swapchain = VK_NULL_HANDLE;
+    pthread_mutex_unlock(&g_ll.lock);
     destroy_swapchain();
     VkSurfaceCapabilitiesKHR capabilities;
     if (g_vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(
@@ -524,7 +693,27 @@ static int recreate_swapchain(int requested_width, int requested_height,
         .clipped = VK_TRUE,
         .oldSwapchain = retired
     };
-    const VkResult swapchain_result = g_vk.CreateSwapchainKHR(g_vk.device, &info, NULL, &g_vk.swapchain);
+    /* Latency-enabled (Reflex) when the device offers it; a new swapchain starts with the current sleep mode and a
+     * fresh present-id sequence. */
+    const VkSwapchainLatencyCreateInfoNV latency = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV,
+                                                     .latencyModeEnable = VK_TRUE };
+    const BeerVulkanModern *modern = beer_vulkan_modern();
+    if (modern && modern->low_latency) info.pNext = &latency;
+    VkSwapchainKHR created = VK_NULL_HANDLE;
+    const VkResult swapchain_result = g_vk.CreateSwapchainKHR(g_vk.device, &info, NULL, &created);
+    pthread_mutex_lock(&g_ll.lock);
+    g_vk.swapchain = created;
+    g_ll.last_present_id = g_ll.pending_present_id = 0;
+    /* Every latency swapchain gets an explicit sleep mode (off until the game sets one): the driver's state for a
+     * swapchain that never had one is not the documented default. */
+    if (created && info.pNext && ll_ready_locked()) {
+        VkLatencySleepModeInfoNV mode = g_ll.mode;
+        mode.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
+        mode.pNext = NULL;
+        if (!g_ll.enabled_mode) mode.lowLatencyMode = mode.lowLatencyBoost = VK_FALSE, mode.minimumIntervalUs = 0;
+        g_ll.set_mode(g_vk.device, created, &mode);
+    }
+    pthread_mutex_unlock(&g_ll.lock);
     if (retired && g_vk.DestroySwapchainKHR) g_vk.DestroySwapchainKHR(g_vk.device, retired, NULL);
     if (swapchain_result != VK_SUCCESS) return 0;
     g_vk.format = chosen.format;
@@ -889,6 +1078,9 @@ static int present_rgba8_staging(void *display, unsigned long window,
         .pSwapchains = &g_vk.swapchain,
         .pImageIndices = &image_index
     };
+    VkPresentIdKHR present_id_info;
+    uint64_t present_id = 0;
+    present.pNext = ll_present_id_chain(&present_id_info, &present_id);
     /* Queue submissions and presentation each require external host
      * synchronization, but they do not need one uninterrupted critical
      * section. QueuePresentKHR may block for the compositor/vblank; retaining
@@ -1161,6 +1353,9 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
         .pSwapchains = &g_vk.swapchain,
         .pImageIndices = &image_index
     };
+    VkPresentIdKHR present_id_info;
+    uint64_t present_id = 0;
+    present.pNext = ll_present_id_chain(&present_id_info, &present_id);
     beer_vulkan_queue_lock();
     result = getenv("BEER_PRESENT_SKIP_FLIP") ? VK_SUCCESS :
              g_vk.QueuePresentKHR(g_vk.queue, &present);

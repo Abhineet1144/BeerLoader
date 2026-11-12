@@ -22,15 +22,56 @@ BD12ComputePipeline *bd12_compute_pipeline_create_dxbc(
     return create_dxbc(device, dxbc, dxbc_size, hash, NULL);
 }
 
+/* BEER_BD12_CS_WATCH=<hash>[,<hash>...] (diagnostic): logs those compute PSOs' creation and counts their dispatches
+ * (bd12_cs_watch_count, printed every 600 presents). Tells "never dispatched" apart from "PSO never created". */
+static uint64_t g_cs_watch[16];
+static uint64_t g_cs_watch_hits[16];
+static int g_cs_watch_n = -1;
+int bd12_cs_watch_index(uint64_t hash)
+{
+    if (g_cs_watch_n < 0) {
+        int n = 0;
+        const char *v = getenv("BEER_BD12_CS_WATCH");
+        while (v && *v && n < 16) {
+            char *end;
+            g_cs_watch[n] = strtoull(v, &end, 16);
+            if (end == v) break;
+            ++n;
+            v = *end == ',' ? end + 1 : end;
+        }
+        g_cs_watch_n = n;
+    }
+    for (int i = 0; i < g_cs_watch_n; ++i) if (g_cs_watch[i] == hash) return i;
+    return -1;
+}
+void bd12_cs_watch_count(uint64_t hash)
+{
+    if (!g_cs_watch_n) return;
+    const int i = bd12_cs_watch_index(hash);
+    if (i >= 0) __atomic_add_fetch(&g_cs_watch_hits[i], 1, __ATOMIC_RELAXED);
+}
+void bd12_cs_watch_report(void)
+{
+    static unsigned presents;
+    if (g_cs_watch_n <= 0 || ++presents % 600) return;
+    for (int i = 0; i < g_cs_watch_n; ++i)
+        fprintf(stderr, "[CSWATCH] %016llx dispatches %llu (after %u presents)\n", (unsigned long long)g_cs_watch[i],
+                (unsigned long long)__atomic_load_n(&g_cs_watch_hits[i], __ATOMIC_RELAXED), presents);
+}
 BD12ComputePipeline *bd12_compute_pipeline_create_dxbc_rs(
     BD12Device *device, const uint8_t *dxbc, size_t dxbc_size, uint64_t hash, BD12RootSignature *root_signature)
 {
+    BD12ComputePipeline *result = NULL;
     if (root_signature && bd12_root_push_enabled(device) && bd12_root_layout(root_signature)) {
         BD12ComputePipeline *pipeline = create_dxbc(device, dxbc, dxbc_size, hash, root_signature);
         bd12_root_push_count(0, pipeline != NULL);
-        if (pipeline) return pipeline;   /* otherwise: per-dispatch descriptors */
+        result = pipeline;   /* otherwise: per-dispatch descriptors */
     }
-    return create_dxbc(device, dxbc, dxbc_size, hash, NULL);
+    if (!result) result = create_dxbc(device, dxbc, dxbc_size, hash, NULL);
+    if (bd12_cs_watch_index(hash) >= 0)
+        fprintf(stderr, "[CSWATCH] compute PSO %016llx: %s\n", (unsigned long long)hash,
+                result ? (result->db_layout ? "created (root push)" : "created (per-dispatch descriptors)") : "FAILED");
+    return result;
 }
 
 static BD12ComputePipeline *create_dxbc(BD12Device *device, const uint8_t *dxbc, size_t dxbc_size, uint64_t hash,

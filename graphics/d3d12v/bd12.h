@@ -1127,6 +1127,9 @@ void bd12_cmd_global_barrier(BD12CmdList *list);
 int bd12_debug_sync_all(void);
 void bd12_trace_frame_advance(void);
 int bd12_trace_active(void);
+int bd12_cs_watch_index(uint64_t hash);
+void bd12_cs_watch_count(uint64_t hash);
+void bd12_cs_watch_report(void);
 /* D3D12 ClearUnorderedAccessView* on buffers (all four values equal) and
  * images. Colors are raw 32-bit patterns (uint) or floats. */
 void bd12_cmd_clear_uav_buffer(BD12CmdList *list, BD12Buffer *buffer,
@@ -1252,6 +1255,11 @@ void bd12_cmd_invalidate_point(BD12CmdList *list, int which);
 int bd12_db_accel_in_heap(const BD12Device *device);
 int bd12_db_ssbo(const BD12Device *device, uint32_t *alignment);
 void bd12_rp_trace_record(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash);
+void bd12_rp_snap_uav_after(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash, uint32_t x, uint32_t y,
+                            uint32_t z);
+void bd12_rp_snap_dispatch(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash, uint32_t x, uint32_t y,
+                           uint32_t z);
+void bd12_rp_snap_dump(void);
 void bd12_rp_trace_submit(const BD12CmdList *list);
 void bd12_cmd_invalidate_bindings(BD12CmdList *list);
 /* Barrier batching: between begin and end, image, buffer and global barriers are collected and recorded as one

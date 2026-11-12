@@ -2,6 +2,43 @@
 
 ## WORK PLAN (read first, every session) — agreed 2026-11-11
 
+**PENDING after 2026-11-13 session (all work since 14bdfde is UNCOMMITTED).** Done that day: RE8 RT ~parity with
+Proton, DLSS, DLSS FG + Reflex (XMM6 fix), RE9 DX12U mesh path (barycentrics). User's major pendings, in order:
+1. **Ghost of Tsushima: get into actual gameplay** (title renders as of 14bdfde).
+2. **RE8 1.3x RT hang** (title hang only when the game STARTS at ImageQualityRate=1.3 with RT; see "RE8 RT hang
+   at 1.3x"; config currently 1.0, backups in /mnt/hdd2/beer-backup/re8-config.ini.*).
+   **2026-11-13 user report:** RE8 plays through (past the Donna section) at 1.3x + RT, 120 fps, GPU ~60%, no
+   stutter or spikes. Proton by comparison loses the VK device in RT now and then and can't play the RE Engine logo
+   videos. Still to check: whether the hang when the game STARTS at 1.3 is still there.
+0. **(Next session first, user 2026-11-13) Finish DXR:** local root signatures (shader-record arguments; dxil-spirv
+   has `converter_add_local_root_*`) and state objects without a DXIL library (collections / config-only). DXR stays
+   default-on meanwhile; Stellar Blade dies at start-up until then (see "DXR / mesh / VRS default-on" below).
+0b. **Audio crackle in the new RE Engine games (RE9, PRAGMATA, Onimusha), user 2026-11-13:** constant
+   static/noise over the sound, "like a radio in bad weather" (crackle, hiss, distortion). RE8 not reported. Suspects to
+   check: sample format/rate conversion (float32 vs int16, 48 kHz mixing), channel-mask/layout (7.1/5.1 downmix),
+   XAudio2/WASAPI buffer underruns (period vs `BEER_AUDIO_LATENCY_MS`), or clipping in the mix.
+   User detail: silence is clean; the distortion is only ON the sound while it plays ("distorted a bit"), not a
+   constant hiss => points at the samples themselves (format/bit-depth or rate conversion, wrong channel mapping or
+   downmix gain, clipping/saturation), less likely at underruns (those give gaps/clicks).
+Others not to forget:
+- RE9: run ended with ExitProcess(-1) at re9.exe+0x9ea20ce (ask whether user-initiated); exit crash after
+  Streamline shutdown (NULL read re9.exe+0x5bc1987); startup Xid 31 @0x04fa1000; camera stutter.
+- RE8 RT perf gap (~800 tiny dispatches/frame); FSR FG.
+- Review the dxil-spirv QueueFamily coherence change (kept, did not fix anything; revert if perf drops).
+- Other games per memory: PRAGMATA stutter while moving, Onimusha, WWM (press Start), Stellar Blade low fps,
+  RE4 capped at 1080p, Beast of Reincarnation visuals unverified, Android RE8 (paused).
+- Run RE8 gate + RE9 after any default change; commit only when the user asks.
+- **DXR / mesh / VRS default-on (2026-11-13, user request):** `BEER_DXR`, `BEER_BD12_MESH`, `BEER_BD12_VRS` are now on
+  where the device has the extensions (`=0` hides each; manager switches are now opt-outs). Smoke (100 s each):
+  RE8 OK (first launch once: device lost, Xid 69 + 32 at the title, `RayTracing=false` @1.3x; two re-runs clean,
+  unexplained), RE9 OK, PRAGMATA OK, Onimusha OK 120 fps, RE4 OK ~52 fps, Beast OK 60, WWM OK 60.
+  **Stellar Blade REGRESSION:** "LowLevelFatalError ... RayTracingDevice->CreateStateObject failed
+  (D3D12RayTracing.cpp:359)". Log: `[BD12 RT] local root signature with 3 parameters is not supported yet`, then
+  `[DXR] CreateStateObject FAILED (#1): libraries=0 hit_groups=0 subobjects=8` => DXR is incomplete: no local root
+  signatures (shader-record arguments), and state objects without a DXIL library (collections / config-only) fail.
+  GoT smoke invalid (launched EOSAuthLauncher.exe, 32-bit; use GhostOfTsushima.exe).
+  Config backups before the smoke: /mnt/hdd2/beer-backup/dxrdefault-0240/.
+
 **DONE 2026-11-12 03:20: real sampler feedback (tier 0.9). RE8 RT renders correctly with NO fake env** (user
 confirmed; launch with `BEER_DXR=1 BEER_BD12_VRS=1 BEER_BD12_MESH=1` only). Implementation:
 VK_EXT_shader_image_atomic_int64 (modern->image_int64_atomics); OPTIONS7 SamplerFeedbackTier=90 when available;
@@ -23,6 +60,10 @@ Plan: (1) enable VK_EXT_shader_image_atomic_int64 (supported), report tier 0.9 l
 with own glslc compute shaders (MinMip / MipRegionUsed R8 layouts); (6) clears/barriers; (7) test RE8 RT with NO fake env
 (shader dump shows SM 6.5 + RayQuery), plus RE8 non-RT gate. Also re-audit: no other fake answer may be needed by any game.
 **Then, in order (agreed 2026-11-12):**
+- (2026-11-13) RE9 crashes on EXIT (after Streamline shutdown, "pipeline library serialized"): WaitForSingleObject(0x0)
+  WAIT_FAILED x5 from re9.exe+0x9e8c97, then SIGSEGV NULL read at re9.exe+0x5bc1987 and the "unhandled exception" crash
+  dialog. Exit-path only; log re9_ngx4_3.log. Also: re9watch.sh miscounted old Xids (journalctl -S) and killed healthy
+  runs - fixed (count before/after).
 2. **RE8 RT performance**: user has seen RE8 do ~120 fps at 1.3x image quality with RT; Beer is lower, so something is
    holding it back. Same method as RE9: `BEER_BD12_GPU_PROF=1` (+ `BEER_BD12_GPU_PROF_FRAME`), `BEER_BD12_HITCH`, top
    shaders/ops, compare with Proton at the same spot; fix structurally (RE9 lesson: a single persistent-thread compute
@@ -33,12 +74,105 @@ with own glslc compute shaders (MinMip / MipRegionUsed R8 layouts); (6) clears/b
    `52cfdfb90ad7d0` ~319/frame each, always paired, ~2.5-3.5 us (15%). Then draw `4fc334bd4118ba` 6.6% (1/frame),
    draw-idx-ind `a053dcc1f8001c` 4.9%, copy-img 4.5%. ~145 barriers, ~12 full drains, ~57 render passes per frame.
    **User (2026-11-12): Proton reaches ~120 fps with the SAME settings at that spot => Beer-side gap (~83 vs ~120).**
+   **RE8 RT hang at 1.3x image quality (2026-11-13): reproducible at the TITLE (no input), Xid 109, every launch;
+   1.0x runs fine.** Checkpoints: compute `eca0c15f9fa350f2` (32535x1x1 groups, 1/frame, shadow-map sampling loops,
+   one float-march loop `max(|x-.5|,|y-.5|) > .5`, loops bounded by `i > cbv.y - 1`) started and never finished;
+   the dispatch before (`d91ee10add7210bb`, 8160 groups) completed. RULED OUT (each still hangs): list-start barrier
+   (`BEER_BD12_LIST_BARRIER=list`), clear pre-drain (`CLEAR_SYNC=full`), every draw/dispatch serialized
+   (`BEER_BD12_SYNC_ALL=1`), no driver disk cache (`__GL_SHADER_DISK_CACHE=0`), texel path (`BEER_BD12_SSBO=0`),
+   per-draw binding (`BEER_BD12_ROOT_PUSH=0`), no scalar layout (`BEER_DXIL_SCALAR_LAYOUT=0`, new switch), newer
+   dxil-spirv 31871f3 (vkd3d HEAD pin; /mnt/hdd2/dxil-spirv-new), legacy structurizer (`BEER_DXIL_LEGACY_STRUCTURIZER=1`,
+   new switch; output then matches vkd3d's dump 5590605fbcc2577a.spv: 9 loops, 193 phis), and the PRE-SESSION build
+   (4556c21 worktree /mnt/hdd2/beer-prev) => not a BD12Perf regression; the old "RE8 RT hangs in 1-5 min" bug.
+   GPU-side root-CBV snapshots (`BEER_BD12_SNAP_CS=1` + `BEER_BD12_TRACE_CS=<hash>`, dumped on SIGUSR1): the hung
+   dispatch's root CBVs look like the previous (completed) one's. => bad DATA from another resource at 1.3x: an
+   earlier pass's output or a resource Beer backs differently at the larger size (placement/aliasing, image views,
+   VRAM pressure). Also fixed on the way (generic): VERTEX_AND_CONSTANT_BUFFER state now includes SHADER_READ (root
+   CBVs are read by address, as vkd3d-proton does).
+   Matrix: RT on @1.0 OK, RT off @1.3 OK, RT on @1.3 HANGS (title, every launch). => RE8's ray-query passes produce
+   bad data at the larger size (likely NaN or a mis-sized RT output); the hung shader's float-march loop
+   (`max(|x-.5|,|y-.5|) > .5`) never exits on NaN. Next: find the RT pass feeding it (ray-query compute shaders run
+   just before; check their output image/buffer sizes at 3328x1872 and TLAS/scratch handling), e.g. GPU-snapshot their
+   UAV outputs for NaNs.
+   Frame trace at the hang (frame 6484, `BEER_BD12_TRACE_FILE` + `[TRACE] dispatch ... root-push` line, new): #522
+   `1746692719880f28` (8160 groups, RAY QUERY) -> #523 `ca1ddb8fbcb8d57f` (32535, RAY QUERY) -> #524 `d91ee10add7210bb`
+   (8160, completes) -> #525 `eca0c15f9fa350f2` (32535) HANGS. The hung shader consumes the two ray-query passes.
+   **USER OBSERVATIONS (2026-11-13, do not lose):** (a) switching to 1.3x IN GAME works fine; only STARTING the game
+   with ImageQualityRate=1.3 in config.ini hangs (at the title) => suspect a resource created at start-up at the 1.3x
+   size (RT output / denoiser history / BVH scratch), not the RT passes at 1.3x in general. (b) The user's whole PC was
+   running badly the previous day (2026-11-12); a later launch at 1.0x played well. Worth keeping in mind when
+   comparing that day's fps numbers. RE8 config set back to ImageQualityRate=1.0 (backups in /mnt/hdd2/beer-backup).
+   Next for the hang: GPU-snapshot the two ray-query passes' UAV outputs (NaN/garbage), and compare start-up resource
+   creation at 1.0 vs 1.3 (sizes, placed/aliased, reserved).
+   vkd3d-proton hint for RE9: RE Engine `PersistentClusterCulling` / `PersistentShadowClusterCulling` entry points get
+   CLAMP_WAVE_SIZE_TO_THREAD_GROUP32 | ENABLE_FAIR_SCHEDULING (persistent spin-wait shaders) - check for RE9 stutter/perf.
    Full hashes: 283d10379a895ac9, fe8bf9b48baee646, e052cfdfb90ad7d0 (shader cache file prefixes).
    Next: dispatch sizes/barriers of the three (`BEER_BD12_TRACE_CS=<hash>` + `BEER_BD12_CALL_LOG=1`), whether their
    count/size depends on something Beer reports (like RE9's TotalLaneCount), Proton comparison at the same spot.
-3. **DLSS visibility**: RE9 (Streamline sl.interposer) and other games do not detect DLSS. Log shows Streamline trying
+3. **DLSS: WORKS in RE9 (2026-11-13, user: "no issues when it's turned on").** Fixes (generic, matching what
+   dxvk-nvapi/vkd3d-proton give NGX): (a) D3DKMTQueryAdapterInfo QUERYREGISTRY answers `NGXCore\NGXPath` (REG_SZ,
+   the driver's wine folder, same as the NGXCore FullPath registry value) - NGX: "Path to driverStore found using
+   QAI"; (b) NvAPI_D3D12_IsFatbinPTXSupported = TRUE when the NVX extensions work (vkCreateCuModuleNVX JITs PTX);
+   "no" made NGX look for an arch-specific SASS set: InitCubins(0x4) -> -104; (c) CreateCubinComputeShaderExV2 modules
+   use 64-bit texturing (VkCuModuleTexturingModeCreateInfoNVX) when VK_NVX_binary_import>=2 and
+   VK_NVX_image_view_handle>=3; merged texture+sampler handles are 64-bit (vkGetImageViewHandle64NVX);
+   (d) new NvAPI_D3D12_GetCudaIndependentDescriptorObject (0x0DDAC234): surface/texture 64-bit handles (sampler type
+   unsupported, as in vkd3d-proton) -> NGX "Enabling texmode_raw"; (e) NV_D3D12_GRAPHICS_CAPS: CUDA SM pair 0 (as
+   dxvk-nvapi), fast UAV clear supported, VRS bit from the device. Log check: `[NVAPI] CreateCubinComputeShader(...,
+   64-bit texturing) -> 0` x ~80. DLSS-G still off: "not supported on current hardware" + Reflex entry points absent.
+   (old notes) DLSS visibility: RE9 (Streamline sl.interposer) and other games do not detect DLSS. Log shows Streamline trying
    `nvngx_update.exe` for sl_dlss / sl_dlss_g / sl_reflex. Find why the plugins fail (NGX/nvngx.dll path, NVAPI entry
    points, CUDA interop via bd12_cuda). Fixing it may give DLSS and DLSS frame generation together.
+3b. **DLSS frame generation (RE9), in progress 2026-11-13.** Done: D3DKMTQueryAdapterInfo KMTQAITYPE_WDDM_2_7_CAPS
+   (type 70) answers HwSchSupported|HwSchEnabled|EnabledByDefault on NVIDIA (Streamline checks it per adapter LUID; was
+   0 => "DLSS-G not supported on current hardware"). Now sl.dlss_g loads ("max generated frames 1", correct for RTX 40),
+   the option can be selected, but no frames are generated. Missing (all implemented by dxvk-nvapi under Proton):
+   NvAPI_D3D12_SetAsyncFrameMarker (0x13C98F73), NvAPI_D3D12_CaptureUAVInfo (0x6E5EA9DB), and all of Reflex
+   (SetSleepMode/Sleep/SetLatencyMarker/GetSleepStatus/GetLatency/NotifyOutOfBandCommandQueue: "-3 no implementation").
+   Plan: CaptureUAVInfo (UAV GPU address/size); real Reflex on VK_NV_low_latency2 + VK_KHR_present_id on the presenter
+   swapchain (driver has low_latency2 rev 2, present_id, present_wait); then test FG presentation through Beer's
+   swapchain.
+   **Implemented 2026-11-13:** CaptureUAVInfo (bd12_cuda_uav_created), SetAsyncFrameMarker, NotifyOutOfBandCommandQueue,
+   real Reflex (vulkan_presenter.c `g_ll`: latency swapchain, vkLatencySleepNV + timeline wait, markers, timings).
+   Reflex is offered from the device caps (Streamline probes it before the first swapchain; a device-existence check
+   made Streamline turn Reflex off). Every new latency swapchain gets an explicit sleep mode (off until the game sets
+   one, as vkd3d-proton does); GetLatency is a full 64-frame history or empty.
+   **Symptom: RE9 stops after 3-15 frames at the title when Reflex is on, 0 BD12 FPS lines, GPU idle, every queue
+   retired, no thread in host code; the sim thread spins in Sleep(1) at re9.exe+0x935f3 (its frame limiter).** Cause:
+   loader.c is built with `-mno-sse`, so its ms_abi functions never save XMM6-XMM15 (Windows nonvolatile). NvAPI
+   pointers from nvapi_QueryInterface were called directly (not through an import thunk), so the Reflex sleep reached
+   the NVIDIA driver with the game's XMM6 live; the driver zeroed it. XMM6 held the limiter's QPC frequency divisor:
+   elapsed = ticks / 0 = -inf (limiter field +0x34c), never past the target, so the loop never ended. A/B: latency
+   swapchain off = runs; sleep alone = hangs; markers alone = runs (no SSE use deep enough). FP control (MXCSR/x87) was
+   unchanged. **Fix (generic):** nvapi_QueryInterface hands out `beer_guest_com_entry` trampoline entries (they save
+   XMM6-XMM15 and switch to the host call stack, same as COM vtables since the RE8 GetDisplayModeList bug); that
+   function is now locked (NvAPI and objects are created on many threads). Verified: RE9 with Reflex fully on, 103 FPS
+   lines, 12000+ driver sleeps. **Rule: any function pointer from loader.c that the guest calls directly must go
+   through beer_guest_com_entry** (or code built with SSE that saves XMM itself, like graphics/d3d12v and
+   vulkan_bridge.c). Diagnostic kept: `BEER_REFLEX_LOG=1` (every Reflex call, args, result; sleeps; marker counts).
+   **DLSS FG: WORKS in RE9 (user, 2026-11-13).**
+3c. **RE9 DX12 Ultimate (mesh-shader path) floors/walls missing: FIXED 2026-11-13 (user: "it works now").**
+   **Symptom: with `BEER_DXR=1 BEER_BD12_VRS=1 BEER_BD12_MESH=1` (config AllowMeshShader=Enable) floors and some
+   walls are not rendered at all; buildings look dotted (LOD dither); AllowMeshShader=Disable renders fine.**
+   **Cause: OPTIONS3 BarycentricsSupported was 0.** RE9 draws that geometry with SV_Barycentrics pixel shaders
+   (SV_Position + PrimitiveID + SV_Barycentrics, as Proton's dumps show) only when barycentrics are supported.
+   **Fix:** VK_KHR_fragment_shader_barycentric enabled (modern->barycentrics), dxil-spirv
+   DXIL_SPV_OPTION_BARYCENTRIC_KHR (in the caps key), OPTIONS3 f[4] reported when both are real.
+   **Lesson: diff SPIR-V capabilities over ALL Proton dumps vs Beer dumps first** (FragmentBarycentricKHR proton=3
+   beer=0 found it in one command after hours of per-pass digging).
+   Also changed on the way (generic, kept):
+   - Mesh->pixel stage linking: a mesh pipeline's PS is translated with the MS's OSG1/PSG1 signature map (location
+     by semantic, per-primitive attributes PerPrimitiveEXT), cached under a link hash
+     (beer_d3d12_translate_shader_rs_linked). Before, 0 of 1159 PS had PerPrimitiveEXT inputs (spec mismatch).
+   - dxil-spirv (vendored): coherence inferred from thread-group barriers uses QueueFamily scope under the Vulkan
+     memory model (was Workgroup), matching the GLSL450/Proton semantics. Did not fix this bug; review if perf drops.
+   - Capture timing: traced-frame captures flush 3 presents later (RE9 submits its main view after the present).
+     **The old "14/15 DispatchMesh args X=0" finding was this artifact**; real args were (45..2549,1,1).
+   Diagnostics added: `BEER_BD12_SNAP_UAV=<cs hashes>` (UAV buffers after each dispatch, SIGUSR1),
+   `BEER_BD12_CS_WATCH=<cs hashes>` (PSO creation + dispatch counts), trace lines for submit/signal/wait and
+   indirect dispatches, `BEER_DUMP_SHADERS` now in the translation cache key (dump runs retranslate).
+   RE8 gate after: 115-120 fps RT, no Xid. Open: RE9 run ends with ExitProcess(-1) at re9.exe+0x9ea20ce
+   (also seen in one trace run, Xid 109 there) - check whether user-initiated.
 4. **FSR frame generation (RE9)**: first just try the in-game option and see what breaks (FSR3 FG swaps the DXGI
    swapchain for its own and needs async compute/present queues); then implement what is missing.
 **Rule 1: one item at a time, each with a "done" test; finish it before the next.** Anything new goes to the parked list

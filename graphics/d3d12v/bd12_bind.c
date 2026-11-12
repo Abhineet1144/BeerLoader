@@ -1065,6 +1065,7 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
                             uint32_t z)
 {
     BD12ComputePipeline *pso = list->compute_pipeline;
+    if (pso) bd12_cs_watch_count(pso->shader_hash);
     if (pso && pso->db_layout && list->compute.root_signature) {
         if (bd12_debug_sync_all()) bd12_cmd_global_barrier(list);
         bd12_cmd_end_rendering(list);
@@ -1072,9 +1073,14 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
             BD12_DROP(BD12_DROP_DISPATCH_NO_DESCRIPTORS);
             return 0;
         }
+        if (bd12_trace_active())
+            fprintf(stderr, "[TRACE] dispatch cs=%016llx groups=%u,%u,%u root-push list=%p\n",
+                    (unsigned long long)pso->shader_hash, x, y, z, (void *)list);
         bd12_rp_trace_record(list, &list->compute, pso->shader_hash);
+        bd12_rp_snap_dispatch(list, &list->compute, pso->shader_hash, x, y, z);
         record_dispatch(list, x, y, z, 0);
         list->device->vk.CmdDispatch(list->command_buffer, x, y, z);
+        bd12_rp_snap_uav_after(list, &list->compute, pso->shader_hash, x, y, z);
         return 1;
     }
     if (!pso || !pso->set_layout || (!list->compute.root_signature && !list->resolve_hook)) {
@@ -1135,6 +1141,11 @@ int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
                                      VkDeviceSize offset)
 {
     BD12ComputePipeline *pso = list->compute_pipeline;
+    if (pso) bd12_cs_watch_count(pso->shader_hash);
+    if (bd12_trace_active())
+        fprintf(stderr, "[TRACE] dispatch-indirect cs=%016llx args=%llx+%llu list=%p%s\n",
+                (unsigned long long)(pso ? pso->shader_hash : 0), (unsigned long long)(args ? args->va : 0),
+                (unsigned long long)offset, (void *)list, pso && pso->db_layout ? " root-push" : "");
     if (pso && pso->db_layout && list->compute.root_signature) {
         bd12_cmd_end_rendering(list);
         if (!bind_compute_db(list, pso)) return 0;

@@ -41,6 +41,8 @@ typedef struct {
     int mesh_shader_ext;          /* VK_EXT_mesh_shader requested (BEER_BD12_MESH=1) */
     int raw_access_chains_ext;    /* VK_NV_raw_access_chains requested (opt-in: BEER_VK_RAW_ACCESS_CHAINS=1) */
     int image_int64_ext;          /* VK_EXT_shader_image_atomic_int64 requested (D3D12 sampler feedback maps) */
+    int barycentric_ext;          /* VK_KHR_fragment_shader_barycentric requested (D3D12 SV_Barycentrics) */
+    int low_latency_ext, present_id_ext; /* VK_NV_low_latency2 + VK_KHR_present_id (NVIDIA Reflex) */
     int nvx_cuda;                 /* VK_NVX_binary_import + VK_NVX_image_view_handle: NVAPI CUDA kernels (DLSS) */
     BeerVulkanModern modern;
     int device_lost;
@@ -435,12 +437,14 @@ int beer_vulkan_context_initialize(void)
     const char *root_push_env = getenv("BEER_BD12_ROOT_PUSH");
     const int want_descriptor_buffer = !(root_push_env && (!*root_push_env || strcmp(root_push_env, "0") == 0)) &&
                                        !getenv("BEER_NO_DESCRIPTOR_BUFFER");
-    /* D3D12 variable-rate shading (BD12 OPTIONS6) on VK_KHR_fragment_shading_rate. Opt-in while it is validated. */
+    /* D3D12 variable-rate shading (BD12 OPTIONS6) on VK_KHR_fragment_shading_rate, where the device has it.
+     * Default on (validated on RE8/RE9 DX12 Ultimate); BEER_BD12_VRS=0 turns it off. */
     const char *vrs_env = getenv("BEER_BD12_VRS");
-    const int want_vrs = vrs_env && *vrs_env && strcmp(vrs_env, "0") != 0;
-    /* D3D12 mesh and amplification shaders (OPTIONS7 MeshShaderTier) on VK_EXT_mesh_shader. Opt-in while validated. */
+    const int want_vrs = !(vrs_env && strcmp(vrs_env, "0") == 0);
+    /* D3D12 mesh and amplification shaders (OPTIONS7 MeshShaderTier) on VK_EXT_mesh_shader, where the device has it.
+     * Default on (RE9 mesh path validated with real barycentrics); BEER_BD12_MESH=0 turns it off. */
     const char *mesh_env = getenv("BEER_BD12_MESH");
-    const int want_mesh = mesh_env && *mesh_env && strcmp(mesh_env, "0") != 0;
+    const int want_mesh = !(mesh_env && strcmp(mesh_env, "0") == 0);
     const char *raw_chains_env = getenv("BEER_VK_RAW_ACCESS_CHAINS");
     /* Opt-in: with raw access chains RE8 hung the GPU at start-up (Xid 109) and RE9 gained nothing measurable. */
     const int want_raw_chains = raw_chains_env && *raw_chains_env && strcmp(raw_chains_env, "0") != 0;
@@ -503,6 +507,18 @@ int beer_vulkan_context_initialize(void)
                        strcmp(available[i].extensionName, "VK_EXT_descriptor_buffer") == 0) {
                 device_extensions[device_extension_count++] = "VK_EXT_descriptor_buffer";
                 g_context.descriptor_buffer_ext = 1;
+            } else if (!g_context.low_latency_ext &&
+                       strcmp(available[i].extensionName, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) == 0) {
+                device_extensions[device_extension_count++] = VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
+                g_context.low_latency_ext = 1;
+            } else if (!g_context.present_id_ext &&
+                       strcmp(available[i].extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0) {
+                device_extensions[device_extension_count++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+                g_context.present_id_ext = 1;
+            } else if (!g_context.barycentric_ext &&
+                       strcmp(available[i].extensionName, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) == 0) {
+                device_extensions[device_extension_count++] = VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME;
+                g_context.barycentric_ext = 1;
             } else if (!g_context.image_int64_ext &&
                        strcmp(available[i].extensionName, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME) == 0) {
                 device_extensions[device_extension_count++] = VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME;
@@ -604,8 +620,14 @@ int beer_vulkan_context_initialize(void)
     VkPhysicalDeviceRawAccessChainsFeaturesNV raw_chains = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAW_ACCESS_CHAINS_FEATURES_NV
     };
+    VkPhysicalDevicePresentIdFeaturesKHR present_id = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR
+    };
     VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT
+    };
+    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR
     };
     VkPhysicalDeviceTexelBufferAlignmentPropertiesEXT texel_alignment = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES_EXT
@@ -703,6 +725,14 @@ int beer_vulkan_context_initialize(void)
         image_int64.pNext = feature_chain;
         feature_chain = &image_int64;
     }
+    if (g_context.barycentric_ext) {
+        barycentric.pNext = feature_chain;
+        feature_chain = &barycentric;
+    }
+    if (g_context.present_id_ext) {
+        present_id.pNext = feature_chain;
+        feature_chain = &present_id;
+    }
     if (g_context.timeline_semaphore && !core13) {
         timeline_features.pNext = feature_chain;
         feature_chain = &timeline_features;
@@ -731,6 +761,12 @@ int beer_vulkan_context_initialize(void)
     g_context.modern.image_int64_atomics = g_context.image_int64_ext && image_int64.shaderImageInt64Atomics;
     image_int64.shaderImageInt64Atomics = g_context.modern.image_int64_atomics ? VK_TRUE : VK_FALSE;
     image_int64.sparseImageInt64Atomics = VK_FALSE;
+    /* SV_Barycentrics (D3D12 OPTIONS3 BarycentricsSupported). */
+    g_context.modern.barycentrics = g_context.barycentric_ext && barycentric.fragmentShaderBarycentric;
+    barycentric.fragmentShaderBarycentric = g_context.modern.barycentrics ? VK_TRUE : VK_FALSE;
+    /* Reflex needs both: latency markers and sleep are keyed by present ids. */
+    g_context.modern.low_latency = g_context.low_latency_ext && g_context.present_id_ext && present_id.presentId;
+    present_id.presentId = g_context.present_id_ext && present_id.presentId ? VK_TRUE : VK_FALSE;
     g_context.modern.vendor_id = physical_properties.vendorID;
     if (physical_properties.apiVersion >= VK_API_VERSION_1_2) {
         PFN_vkGetPhysicalDeviceProperties2 get_properties2 =

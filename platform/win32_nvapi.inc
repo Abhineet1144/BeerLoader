@@ -185,15 +185,15 @@ static int nvapi_cuda_sm(u32 *major, u32 *minor)
 
 static int __attribute__((ms_abi))
 nvapi_D3D12_CreateCubinComputeShader(void *device, const void *cubin, u32 size, u32 bx, u32 by, u32 bz, u64 *shader)
-{ return bd12_cuda_create_shader(device, cubin, size, bx, by, bz, 0, "", shader); }
+{ return bd12_cuda_create_shader(device, cubin, size, bx, by, bz, 0, "", 0, shader); }
 static int __attribute__((ms_abi))
 nvapi_D3D12_CreateCubinComputeShaderWithName(void *device, const void *cubin, u32 size, u32 bx, u32 by, u32 bz,
                                              const char *name, u64 *shader)
-{ return bd12_cuda_create_shader(device, cubin, size, bx, by, bz, 0, name, shader); }
+{ return bd12_cuda_create_shader(device, cubin, size, bx, by, bz, 0, name, 0, shader); }
 static int __attribute__((ms_abi))
 nvapi_D3D12_CreateCubinComputeShaderEx(void *device, const void *cubin, u32 size, u32 bx, u32 by, u32 bz,
                                        u32 shared, const char *name, u64 *shader)
-{ return bd12_cuda_create_shader(device, cubin, size, bx, by, bz, shared, name, shader); }
+{ return bd12_cuda_create_shader(device, cubin, size, bx, by, bz, shared, name, 0, shader); }
 /* NVAPI_D3D12_CREATE_CUBIN_SHADER_PARAMS: structSizeIn, structSizeOut, pDevice, pCubin, size, blockX/Y/Z,
  * dynSharedMemBytes, pShaderName, flags, hShader. */
 typedef struct {
@@ -211,8 +211,10 @@ static int __attribute__((ms_abi)) nvapi_D3D12_CreateCubinComputeShaderExV2(NvCu
 {
     if (!p || p->size_in < sizeof(*p)) return NVAPI_INVALID_ARGUMENT;
     p->size_out = sizeof(*p);
+    /* ExV2 modules use 64-bit texturing (their texture/surface handles come from the merged and independent
+     * descriptor-object calls), as on the Windows driver and in vkd3d-proton. */
     return bd12_cuda_create_shader(p->device, p->cubin, p->size, p->block_x, p->block_y, p->block_z, p->shared,
-                                   p->name, &p->shader);
+                                   p->name, 1, &p->shader);
 }
 static int __attribute__((ms_abi)) nvapi_D3D12_DestroyCubinComputeShader(void *device, u64 shader)
 { return bd12_cuda_destroy_shader(device, shader); }
@@ -229,16 +231,41 @@ static int __attribute__((ms_abi)) nvapi_D3D12_GetCudaMergedTextureSamplerObject
 {
     if (!p || p->size_in < sizeof(*p)) return NVAPI_INVALID_ARGUMENT;
     p->size_out = sizeof(*p);
+    if (bd12_cuda_texturing64()) return bd12_cuda_view_handle64(p->device, p->texture, p->sampler, 0, &p->handle);
     u32 handle = 0;
     const int status = bd12_cuda_texture_object(p->device, p->texture, p->sampler, &handle);
     p->handle = handle;
     return status;
 }
+/* NvAPI_D3D12_CaptureUAVInfo(device, NVAPI_UAV_INFO*): the next CreateUnorderedAccessView on this thread fills it
+ * (bd12_cuda.c). V1 is version 1 (24 bytes), V2 adds outFlags (40 bytes, version 2). */
+static int __attribute__((ms_abi)) nvapi_D3D12_CaptureUAVInfo(void *device, u32 *info)
+{
+    if (!device || !info) return NVAPI_INVALID_ARGUMENT;
+    if (info[0] != 1u && info[0] != (40u | (2u << 16))) return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    if (info[0] != 1u) { info[8] = info[9] = 0; }        /* outFlags */
+    return bd12_cuda_capture_uav_info(device, info);
+}
+/* NVAPI_D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_PARAMS: sizes, pDevice, type (0 surface, 1 texture,
+ * 2 sampler), CPU descriptor handle, handle (u64). 64-bit handles; separate samplers have no Vulkan equivalent
+ * (vkd3d-proton does not offer them either). */
+typedef struct { u64 size_in, size_out; void *device; u32 type, pad; u64 desc, handle; } NvIndependentDescriptorParams;
+static int __attribute__((ms_abi)) nvapi_D3D12_GetCudaIndependentDescriptorObject(NvIndependentDescriptorParams *p)
+{
+    if (!p || p->size_in < sizeof(*p)) return NVAPI_INVALID_ARGUMENT;
+    p->size_out = sizeof(*p);
+    p->handle = 0;
+    if (p->type > 1) return NVAPI_NOT_SUPPORTED;
+    return bd12_cuda_view_handle64(p->device, p->desc, 0, p->type == 0, &p->handle);
+}
 static int __attribute__((ms_abi)) nvapi_D3D12_IsFatbinPTXSupported(void *device, u8 *supported)
 {
     (void)device;
     if (!supported) return NVAPI_INVALID_ARGUMENT;
-    *supported = 0;                          /* modules are loaded as SASS cubins; no PTX JIT */
+    /* vkCreateCuModuleNVX takes fatbins with PTX (the driver JIT-compiles them), as dxvk-nvapi reports with both NVX
+     * extensions. Answering "no" sent NGX (DLSS 310) to an architecture-specific SASS kernel set it does not ship
+     * (InitCubins -> NVAPI_NOT_SUPPORTED: DLSS unavailable). */
+    *supported = bd12_cuda_available() ? 1 : 0;
     return NVAPI_OK;
 }
 /* NV_D3D12_GRAPHICS_CAPS_V1: flags (exclusive scissor, VRS, fast UAV clear), majorSM, minorSM, majorCudaSM,
@@ -251,8 +278,13 @@ static int __attribute__((ms_abi)) nvapi_D3D12_GetGraphicsCapabilities(void *dev
     u32 major = 0, minor = 0;
     if (!nvapi_cuda_sm(&major, &minor)) return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
     memset(caps, 0, 32);
-    const u16 sm[4] = { (u16)major, (u16)minor, (u16)major, (u16)minor };
+    /* majorSMVersion/minorSMVersion: the GPU's SM architecture. The CUDA SM pair stays 0, as dxvk-nvapi reports it:
+     * with it set, NGX (DLSS 310) looked for a kernel set it does not ship (InitCubins -> NVAPI_NOT_SUPPORTED) and
+     * DLSS failed to initialise. UAV clears need no padding on Vulkan (fast clear); VRS follows the device. */
+    const u16 sm[4] = { (u16)major, (u16)minor, 0, 0 };
     memcpy(caps + 4, sm, sizeof(sm));
+    const BeerVulkanModern *m = beer_vulkan_modern();
+    *(u32 *)caps = 4u | (m && m->vrs_tier ? 2u : 0u);   /* bFastUAVClearSupported, bVariablePixelRateShadingSupported */
     return NVAPI_OK;
 }
 
@@ -517,8 +549,166 @@ static u32 __attribute__((ms_abi)) nvapi_DRS_GetSetting(u64 session, u64 profile
     return NVAPI_SETTING_NOT_FOUND;
 }
 
-/* Reflex (NvAPI_D3D_SetSleepMode, Sleep, SetLatencyMarker, GetSleepStatus, GetLatency) is not exposed: Beer has no
- * low-latency mode behind it, and a game offers its Reflex option whenever the entry points exist. */
+/* NVIDIA Reflex: VK_NV_low_latency2 on the presenter's swapchain (renderer/vulkan/vulkan_presenter.c), as dxvk-nvapi
+ * implements it under Proton. Offered only when the device has VK_NV_low_latency2 + VK_KHR_present_id; otherwise
+ * NO_IMPLEMENTATION, so a game shows no Reflex option. Structs (NVAPI R555+): sizes from their version words. */
+static int nvapi_reflex_ready(const void *device)
+{
+    if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
+    if (!device) return NVAPI_INVALID_ARGUMENT;
+    /* The device capability decides: games and Streamline query Reflex before the first swapchain exists. */
+    const BeerVulkanModern *m = beer_vulkan_modern();
+    return m && m->low_latency ? NVAPI_OK : NVAPI_NO_IMPLEMENTATION;
+}
+/* BEER_REFLEX_LOG=1: every Reflex entry point, its parameters and its result (first 200 calls, then every 1000th). */
+static int nvapi_reflex_log(const char *name, u64 a, u64 b, int result)
+{
+    static int log = -1;
+    static unsigned n;
+    if (log < 0) log = getenv("BEER_REFLEX_LOG") != NULL;
+    if (log) {
+        const unsigned i = __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED);
+        if (i < 200 || i % 1000 == 0)
+            fprintf(stderr, "[REFLEX] #%u tid=%ld %s(%llx, %llx) -> %d\n", i, (long)syscall(SYS_gettid), name, (unsigned long long)a, (unsigned long long)b, result);
+    }
+    return result;
+}
+static int nvapi_struct_v1(const void *p, u32 min_size)
+{
+    const u32 v = p ? *(const u32 *)p : 0;
+    return (v >> 16) == 1 && (v & 0xffffu) >= min_size;
+}
+/* NV_LATENCY_MARKER_TYPE -> VkLatencyMarkerNV: equal up to TRIGGER_FLASH; PC_LATENCY_PING (8) has no Vulkan marker;
+ * the out-of-band markers (9..12) are 8..11 there. -1: drop. */
+static int nvapi_reflex_marker(u32 type)
+{
+    if (type <= 7) return (int)type;
+    if (type >= 9 && type <= 12) return (int)type - 1;
+    return -1;
+}
+/* NV_SET_SLEEP_MODE_PARAMS: version@0, bLowLatencyMode@4, bLowLatencyBoost@5, minimumIntervalUs@8. */
+static int nvapi_D3D_SetSleepMode_impl(void *device, const u8 *p)
+{
+    const int ready = nvapi_reflex_ready(device);
+    if (ready != NVAPI_OK) return ready;
+    if (!nvapi_struct_v1(p, 12)) return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    return beer_vulkan_low_latency_set_mode(p[4] != 0, p[5] != 0, *(const u32 *)(p + 8)) ? NVAPI_OK : NVAPI_ERROR;
+}
+/* NV_GET_SLEEP_STATUS_PARAMS: version@0, bLowLatencyMode@4, bFsVrr@5, bCplVsyncOn@6, sleepIntervalUs@8, ... */
+static int nvapi_D3D_GetSleepStatus_impl(void *device, u8 *p)
+{
+    const int ready = nvapi_reflex_ready(device);
+    if (ready != NVAPI_OK) return ready;
+    if (!nvapi_struct_v1(p, 8)) return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    const u32 size = *(const u32 *)p & 0xffffu;
+    memset(p + 4, 0, size - 4);
+    int enable = 0;
+    u32 interval = 0;
+    beer_vulkan_low_latency_get_mode(&enable, NULL, &interval);
+    p[4] = (u8)enable;
+    if (size >= 12) *(u32 *)(p + 8) = interval;
+    return NVAPI_OK;
+}
+static int nvapi_D3D_Sleep_impl(void *device)
+{
+    const int ready = nvapi_reflex_ready(device);
+    if (ready != NVAPI_OK) return ready;
+    return beer_vulkan_low_latency_sleep() ? NVAPI_OK : NVAPI_ERROR;
+}
+/* NV_LATENCY_MARKER_PARAMS: version@0, frameID@8, markerType@16. */
+static int nvapi_D3D_SetLatencyMarker_impl(void *device, const u8 *p)
+{
+    const int ready = nvapi_reflex_ready(device);
+    if (ready != NVAPI_OK) return ready;
+    if (!nvapi_struct_v1(p, 20)) return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    const int marker = nvapi_reflex_marker(*(const u32 *)(p + 16));
+    if (marker < 0) return NVAPI_OK;                       /* PC_LATENCY_PING: nothing to forward */
+    beer_vulkan_low_latency_marker(*(const u64 *)(p + 8), marker);
+    return NVAPI_OK;
+}
+/* NV_ASYNC_FRAME_MARKER_PARAMS (D3D12 queue): version@0, frameID@8, markerType@16, presentFrameID@24. */
+static int nvapi_D3D12_SetAsyncFrameMarker_impl(void *queue, const u8 *p)
+{
+    const int ready = nvapi_reflex_ready(queue);
+    if (ready != NVAPI_OK) return ready;
+    if (!nvapi_struct_v1(p, 20)) return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    const int marker = nvapi_reflex_marker(*(const u32 *)(p + 16));
+    if (marker < 0) return NVAPI_OK;
+    beer_vulkan_low_latency_marker(*(const u64 *)(p + 8), marker);
+    return NVAPI_OK;
+}
+/* One D3D12 queue type is "out of band" (frame generation's present work). Beer runs every D3D12 queue on one Vulkan
+ * queue, so flagging that queue would mislabel the game's own rendering: accepted, nothing to change. */
+static int nvapi_D3D12_NotifyOutOfBandCommandQueue_impl(void *queue, u32 type)
+{
+    const int ready = nvapi_reflex_ready(queue);
+    if (ready != NVAPI_OK) return ready;
+    return type <= 4 ? NVAPI_OK : NVAPI_INVALID_ARGUMENT;
+}
+/* NV_LATENCY_RESULT_PARAMS: version@0, frameReport[64]@8 (240 bytes each: 14 u64 timestamps in microseconds,
+ * gpuActiveRenderTimeUs@112, gpuFrameTimeUs@116, ...), oldest first. */
+static int nvapi_D3D_GetLatency_impl(void *device, u8 *p)
+{
+    const int ready = nvapi_reflex_ready(device);
+    if (ready != NVAPI_OK) return ready;
+    if (!nvapi_struct_v1(p, 8 + 64 * 240)) return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    memset(p + 8, 0, 64 * 240);
+    static VkLatencyTimingsFrameReportNV reports[64];
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    const u32 count = beer_vulkan_low_latency_timings(reports, 64);
+    const u32 first = count > 64 ? count - 64 : 0;
+    u64 previous_gpu_end = 0;
+    for (u32 i = first, slot = 0; i < count && slot < 64; ++i, ++slot) {
+        const VkLatencyTimingsFrameReportNV *r = &reports[i];
+        if (!r->presentID) continue;                       /* no frame behind this entry yet */
+        u8 *f = p + 8 + (size_t)slot * 240;
+        const u64 v[14] = { r->presentID, r->inputSampleTimeUs, r->simStartTimeUs, r->simEndTimeUs,
+                            r->renderSubmitStartTimeUs, r->renderSubmitEndTimeUs, r->presentStartTimeUs,
+                            r->presentEndTimeUs, r->driverStartTimeUs, r->driverEndTimeUs,
+                            r->osRenderQueueStartTimeUs, r->osRenderQueueEndTimeUs, r->gpuRenderStartTimeUs,
+                            r->gpuRenderEndTimeUs };
+        memcpy(f, v, sizeof(v));
+        const u32 active = r->gpuRenderEndTimeUs > r->gpuRenderStartTimeUs
+                               ? (u32)(r->gpuRenderEndTimeUs - r->gpuRenderStartTimeUs) : 0;
+        const u32 frame = previous_gpu_end && r->gpuRenderEndTimeUs > previous_gpu_end
+                              ? (u32)(r->gpuRenderEndTimeUs - previous_gpu_end) : 0;
+        memcpy(f + 112, &active, 4);
+        memcpy(f + 116, &frame, 4);
+        previous_gpu_end = r->gpuRenderEndTimeUs;
+    }
+    pthread_mutex_unlock(&lock);
+    return NVAPI_OK;
+}
+
+static int __attribute__((ms_abi)) nvapi_D3D_SetSleepMode(void *device, const u8 *p)
+{
+    return nvapi_reflex_log("D3D_SetSleepMode", p ? *(const u32 *)(p + 4) : 0, p ? *(const u32 *)(p + 8) : 0, nvapi_D3D_SetSleepMode_impl(device, p));
+}
+static int __attribute__((ms_abi)) nvapi_D3D_GetSleepStatus(void *device, u8 *p)
+{
+    return nvapi_reflex_log("D3D_GetSleepStatus", (u64)(uintptr_t)device, 0, nvapi_D3D_GetSleepStatus_impl(device, p));
+}
+static int __attribute__((ms_abi)) nvapi_D3D_Sleep(void *device)
+{
+    return nvapi_reflex_log("D3D_Sleep", (u64)(uintptr_t)device, 0, nvapi_D3D_Sleep_impl(device));
+}
+static int __attribute__((ms_abi)) nvapi_D3D_SetLatencyMarker(void *device, const u8 *p)
+{
+    return nvapi_reflex_log("D3D_SetLatencyMarker", p ? *(const u64 *)(p + 8) : 0, p ? *(const u32 *)(p + 16) : 0, nvapi_D3D_SetLatencyMarker_impl(device, p));
+}
+static int __attribute__((ms_abi)) nvapi_D3D12_SetAsyncFrameMarker(void *queue, const u8 *p)
+{
+    return nvapi_reflex_log("D3D12_SetAsyncFrameMarker", p ? *(const u64 *)(p + 8) : 0, p ? *(const u32 *)(p + 16) : 0, nvapi_D3D12_SetAsyncFrameMarker_impl(queue, p));
+}
+static int __attribute__((ms_abi)) nvapi_D3D12_NotifyOutOfBandCommandQueue(void *queue, u32 type)
+{
+    return nvapi_reflex_log("D3D12_NotifyOutOfBandCommandQueue", (u64)(uintptr_t)queue, type, nvapi_D3D12_NotifyOutOfBandCommandQueue_impl(queue, type));
+}
+static int __attribute__((ms_abi)) nvapi_D3D_GetLatency(void *device, u8 *p)
+{
+    return nvapi_reflex_log("D3D_GetLatency", (u64)(uintptr_t)device, 0, nvapi_D3D_GetLatency_impl(device, p));
+}
 
 static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
 {
@@ -553,6 +743,15 @@ static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
         { 0x80403FC9u, nvapi_D3D12_GetCudaTextureObject },
         { 0x48F5B2EEu, nvapi_D3D12_GetCudaSurfaceObject },
         { 0x329FE6E0u, nvapi_D3D12_GetCudaMergedTextureSamplerObject },
+        { 0x0DDAC234u, nvapi_D3D12_GetCudaIndependentDescriptorObject },
+        { 0x6E5EA9DBu, nvapi_D3D12_CaptureUAVInfo },
+        { 0xAC1CA9E0u, nvapi_D3D_SetSleepMode },
+        { 0xAEF96CA1u, nvapi_D3D_GetSleepStatus },
+        { 0x852CD1D2u, nvapi_D3D_Sleep },
+        { 0xD9984C05u, nvapi_D3D_SetLatencyMarker },
+        { 0x1A587F9Cu, nvapi_D3D_GetLatency },
+        { 0x13C98F73u, nvapi_D3D12_SetAsyncFrameMarker },
+        { 0x03D6E8CBu, nvapi_D3D12_NotifyOutOfBandCommandQueue },
         { 0x70C07832u, nvapi_D3D12_IsFatbinPTXSupported },
         { 0x01E87354u, nvapi_D3D12_GetGraphicsCapabilities },
         { 0x0694D52Eu, nvapi_DRS_CreateSession },
@@ -578,10 +777,16 @@ static void *__attribute__((ms_abi)) impl_nvapi_QueryInterface(u32 id)
                 table[i].fn == (void *)nvapi_D3D12_GetCudaTextureObject ||
                 table[i].fn == (void *)nvapi_D3D12_GetCudaSurfaceObject ||
                 table[i].fn == (void *)nvapi_D3D12_GetCudaMergedTextureSamplerObject ||
+                table[i].fn == (void *)nvapi_D3D12_GetCudaIndependentDescriptorObject ||
+                table[i].fn == (void *)nvapi_D3D12_CaptureUAVInfo ||
                 table[i].fn == (void *)nvapi_D3D12_IsFatbinPTXSupported;
             if (!cuda && cuda_entry) break;
             if (getenv("BEER_NVAPI_LOG")) fprintf(stderr, "[NVAPI] QueryInterface(0x%08X)\n", id);
-            return table[i].fn;
+            /* The game calls these pointers directly. This file is built without SSE, so its ms_abi functions do not
+             * keep the nonvolatile XMM6-XMM15 across the SSE code they reach (presenter, Vulkan driver): the Reflex
+             * sleep cleared RE9's frame-limiter divisor in XMM6 and the game spun in its limiter forever. Hand out
+             * dispatch-trampoline entries, which save XMM6-XMM15 like an import call. */
+            return (void *)(uintptr_t)beer_guest_com_entry((u64)(uintptr_t)table[i].fn, "nvapi", id);
         }
     static _Atomic(u32) logged;
     if (atomic_fetch_add(&logged, 1) < 64)

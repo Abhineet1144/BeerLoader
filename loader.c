@@ -1581,17 +1581,22 @@ static u64 beer_guest_com_entry(u64 fn, const char *iface, size_t slot)
 {
     static u64 known_fn[512], known_thunk[512];
     static size_t known;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;   /* objects and NvAPI entries are made on many threads */
+    pthread_mutex_lock(&lock);
+    u64 thunk = fn;
     for (size_t i = 0; i < known; ++i)
-        if (known_fn[i] == fn) return known_thunk[i];
-    if (g_nstubs >= MAX_STUBS || known >= sizeof(known_fn) / sizeof(*known_fn)) return fn;
+        if (known_fn[i] == fn) { thunk = known_thunk[i]; goto done; }
+    if (g_nstubs >= MAX_STUBS || known >= sizeof(known_fn) / sizeof(*known_fn)) goto done;
     char name[64];
     snprintf(name, sizeof(name), "%s[%zu]", iface, slot);
     g_snames[g_nstubs] = strdup(name);
     emit_impl_thunk(g_nstubs, fn);
-    const u64 thunk = (u64)(g_tramp + g_nstubs * THUNK_SZ);
+    thunk = (u64)(g_tramp + g_nstubs * THUNK_SZ);
     ++g_nstubs;
     known_fn[known] = fn;
     known_thunk[known++] = thunk;
+done:
+    pthread_mutex_unlock(&lock);
     return thunk;
 }
 

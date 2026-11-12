@@ -10,6 +10,7 @@ int beer_fake_caps_state;
 #include <unistd.h>
 #include "bd12_formats.h"
 #include "d3d12_dxil_translator.h"
+#include "bd12_cuda.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1002,6 +1003,11 @@ static void MS queue_execute(ComQueue *q, uint32_t count, ComObj *const *lists)
         ++g_bd12_prof_calls[BD12_PROF_LIST_FINISH];
         if (recorded) { bd12_rp_trace_submit(recorded); op.lists[op.count++] = recorded; }
     }
+    if (bd12_trace_active()) {   /* submission order of the traced frame (recording order is in the dispatch lines) */
+        fprintf(stderr, "[TRACE] submit queue=%p type=%u lists", (void *)q, q->desc[0]);
+        for (uint32_t i = 0; i < op.count; ++i) fprintf(stderr, " %p", (void *)op.lists[i]);
+        fputc('\n', stderr);
+    }
     if (op.count) queue_push(q, &op);
     else free(op.lists);
     BD12_PROF_END(BD12_PROF_EXECUTE);
@@ -1019,6 +1025,9 @@ static HR MS queue_signal(ComQueue *q, ComFence *f, uint64_t value)
     }
     if (fence_diag())
         fprintf(stderr, "[FENCE] queue %p Signal fence=%p value=%llu\n", (void *)q, (void *)f, (unsigned long long)value);
+    if (bd12_trace_active())
+        fprintf(stderr, "[TRACE] signal queue=%p type=%u fence=%p value=%llu\n", (void *)q, q->desc[0], (void *)f,
+                (unsigned long long)value);
     com_add_ref(&f->obj);
     f->last_signal = value;
     QueueOp op = { .kind = QUEUE_OP_SIGNAL, .fence = f, .value = value };
@@ -1029,6 +1038,10 @@ static HR MS queue_wait(ComQueue *q, ComFence *f, uint64_t value)
     if (!q || !f || !f->fence) return HR_E_INVALIDARG;
     if (fence_diag())
         fprintf(stderr, "[FENCE] queue %p Wait fence=%p value=%llu\n", (void *)q, (void *)f, (unsigned long long)value);
+    if (bd12_trace_active())
+        fprintf(stderr, "[TRACE] wait queue=%p type=%u fence=%p value=%llu signaled=%llu\n", (void *)q, q->desc[0],
+                (void *)f, (unsigned long long)value,
+                (unsigned long long)__atomic_load_n(&f->fence->signaled, __ATOMIC_ACQUIRE));
     com_add_ref(&f->obj);
     QueueOp op = { .kind = QUEUE_OP_WAIT, .fence = f, .value = value };
     return queue_push(q, &op);
@@ -1169,11 +1182,18 @@ static HR present_epilogue(ComQueue *q, ComResource *texture)
         com_wait_serial(dev, dev->serial);
         bd12_capture_rb_flush();
     }
-    if (bd12_capture_pending()) {      /* traced frame: drain, then write files */
-        com_wait_serial(dev, dev->serial);
-        bd12_capture_flush();
+    {   /* traced frame: write the files three presents later, after a drain. Engines record ahead and submit a
+         * frame's command lists after its present (RE9 submits its main view then); flushing at the traced frame's
+         * own present read readbacks the GPU had not written yet (zero DispatchMesh arguments, empty targets). */
+        static int countdown;
+        if (bd12_capture_pending() && !countdown) countdown = 3;
+        if (countdown && !--countdown) {
+            com_wait_serial(dev, dev->serial);
+            bd12_capture_flush();
+        }
     }
     bd12_trace_frame_advance();
+    bd12_cs_watch_report();
     if (!g_presenter) return HR_OK;
     BD12_PROF_BEGIN();
     const int presented = g_presenter(texture->image->image,
@@ -1980,12 +2000,24 @@ static uint32_t sampler_feedback_tier(void)
     return m && m->image_int64_atomics && f && f->shaderInt64 ? 90u : 0u;
 }
 
+/* DXR 1.1 is offered wherever the device has the Vulkan ray tracing extensions (rt_enabled); BEER_DXR=0 hides it.
+ * BEER_DXR_PROBE=1 additionally logs what the application asks for. */
+static int dxr_offered(ComDevice *self)
+{
+    static int env = -1;
+    if (env < 0) {
+        const char *e = getenv("BEER_DXR");
+        env = !(e && strcmp(e, "0") == 0) || getenv("BEER_DXR_PROBE") != NULL;
+    }
+    return self->bd->rt_enabled && env;
+}
+
 /* Feature level 12_2 (DirectX 12 Ultimate) needs DXR 1.1, VRS tier 2, mesh shader tier 1, sampler feedback 0.9 and
- * shader model 6.5, each actually supported here: DXR only when it is offered (rt_enabled + BEER_DXR). */
+ * shader model 6.5, each actually supported here: DXR only when it is offered (dxr_offered). */
 static int dx12_ultimate(ComDevice *self)
 {
     const BeerVulkanModern *m = self->bd->modern;
-    return m && self->bd->rt_enabled && getenv("BEER_DXR") && m->vrs_tier >= 2 && self->bd->CmdDrawMeshTasksEXT &&
+    return m && dxr_offered(self) && m->vrs_tier >= 2 && self->bd->CmdDrawMeshTasksEXT &&
            m->mesh_shader_tier >= 10 && sampler_feedback_tier() >= 90 && beer_d3d12_dxil_available() &&
            shader_model_limit(0x66) >= 0x65;
 }
@@ -2091,6 +2123,9 @@ static HR dev_check_feature_impl(ComDevice *self, uint32_t feature, void *data, 
          * Keep view instancing, barycentrics and WriteBufferImmediate disabled
          * until their command-list behavior is implemented. */
         f[1] = 1;                                                  /* CastingFullyTypedFormatSupported */
+        /* BarycentricsSupported: SV_Barycentrics through VK_KHR_fragment_shader_barycentric. RE9 builds its meshlet
+         * LOD feedback only with it; without, its streamed mesh-shader geometry (floors, walls) never loaded. */
+        f[4] = dxil && self->bd->modern && self->bd->modern->barycentrics;
         return HR_OK;
     }
     if (feature == 23 && size >= 12 && !(self->bd->rt_enabled && getenv("BEER_DXR_FEATURES"))) {   /* OPTIONS4 */
@@ -2116,9 +2151,8 @@ static HR dev_check_feature_impl(ComDevice *self, uint32_t feature, void *data, 
         f[2] = f[1] == 0 || f[1] == 100;
         return HR_OK;
     }
-    /* BEER_DXR_PROBE=1: advertise DXR 1.1 and shader model 6.6 and log what the
-     * application then asks for. Experimental; the DXR pipeline is not built yet. */
-    if (self->bd->rt_enabled && (getenv("BEER_DXR_PROBE") || getenv("BEER_DXR"))) {
+    /* DXR 1.1 (OPTIONS5) where it is offered; see dxr_offered. */
+    if (dxr_offered(self)) {
         if (feature == 27 && size >= 12) {          /* OPTIONS5 */
             memset(data, 0, size);
             ((uint32_t *)data)[2] = 11;             /* RAYTRACING_TIER_1_1 */
@@ -2565,6 +2599,7 @@ static void MS dev_create_uav(ComDevice *self, ComResource *r, ComResource *coun
     if (dest) bd12_heap_written((const void *)(uintptr_t)dest, 1,
                                 view_is_buffer(r, desc) ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
                                                         : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    if (dest) bd12_cuda_uav_created(self->bd, (const void *)(uintptr_t)dest);   /* NvAPI_D3D12_CaptureUAVInfo */
     BD12_PROF_END(BD12_PROF_VIEW);
 }
 
@@ -3949,6 +3984,7 @@ void bd12_com_debug_dump(void)
 {
     ComDevice *dev = g_com_device;
     if (!dev) return;
+    bd12_rp_snap_dump();
     for (uint32_t l = 0; l < dev->lane_count; ++l)
         fprintf(stderr, "[STACKS] bd12 lane %u submitted=%llu retired=%llu\n", l,
                 (unsigned long long)__atomic_load_n(&dev->lanes[l].submitted, __ATOMIC_ACQUIRE),

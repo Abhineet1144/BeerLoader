@@ -646,7 +646,12 @@ static BD12GraphicsPipeline *create_mesh(BD12Device *device, const BD12PsoDesc *
                                       : beer_d3d12_translate_shader((code), (size), fnv((code), (size))))
     const BeerD3D12TranslatedShader *ms = TRANSLATE(pso->ms, pso->ms_size);
     const BeerD3D12TranslatedShader *as = pso->as ? TRANSLATE(pso->as, pso->as_size) : NULL;
-    const BeerD3D12TranslatedShader *ps = pso->ps ? TRANSLATE(pso->ps, pso->ps_size) : NULL;
+    /* The pixel shader is linked to the mesh shader's outputs: locations by semantic, per-primitive attributes as
+     * PerPrimitiveEXT (D3D12 links mesh and pixel stages by semantic; Vulkan by location and qualifier). */
+    const BeerD3D12TranslatedShader *ps = !pso->ps ? NULL
+        : layout ? beer_d3d12_translate_shader_rs_linked(pso->ps, pso->ps_size, fnv(pso->ps, pso->ps_size), layout,
+                                                         pso->ms, pso->ms_size)
+                 : TRANSLATE(pso->ps, pso->ps_size);
 #undef TRANSLATE
     if (!ms || (pso->as && !as) || (pso->ps && !ps)) {
         if (!layout)

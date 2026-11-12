@@ -112,7 +112,10 @@ BD12Device *bd12_device_create(void)
     device->queue_family = beer_vulkan_queue_family();
     device->modern = modern;
     {
-        const BeerD3D12DxilCaps caps = { modern->scalar_block_layout, modern->raw_access_chains, modern->vendor_id };
+        /* BEER_DXIL_SCALAR_LAYOUT=0: dxil-spirv without scalar block layout / SSBO vectorization (diagnostic). */
+        const char *scalar_env = getenv("BEER_DXIL_SCALAR_LAYOUT");
+        const int scalar = modern->scalar_block_layout && !(scalar_env && !strcmp(scalar_env, "0"));
+        const BeerD3D12DxilCaps caps = { scalar, modern->raw_access_chains, modern->vendor_id, modern->barycentrics };
         beer_d3d12_dxil_set_caps(&caps);
     }
     pthread_mutex_init(&device->va_lock, NULL);

@@ -17,6 +17,9 @@ static struct {
     PFN_vkDestroyCuFunctionNVX destroy_function;
     PFN_vkCmdCuLaunchKernelNVX launch;
     PFN_vkGetImageViewHandleNVX view_handle;
+    PFN_vkGetImageViewHandle64NVX view_handle64;
+    PFN_vkGetImageViewAddressNVX view_address;
+    int texturing64;              /* 64-bit CUDA texturing: VK_NVX_binary_import >= 2 and VK_NVX_image_view_handle >= 3 */
 } g_cuda;
 
 #define CUDA_SHADER_MAGIC 0x43554442u   /* "BDUC" */
@@ -49,12 +52,32 @@ static int ensure_loaded(BD12Device *bd)
     LOAD(destroy_function, "vkDestroyCuFunctionNVX");
     LOAD(launch, "vkCmdCuLaunchKernelNVX");
     LOAD(view_handle, "vkGetImageViewHandleNVX");
+    LOAD(view_handle64, "vkGetImageViewHandle64NVX");
+    LOAD(view_address, "vkGetImageViewAddressNVX");
 #undef LOAD
+    {   /* 64-bit texturing (CreateCubinComputeShaderExV2, merged / independent descriptor objects) needs module
+         * texturing-mode control (binary_import rev 2) and 64-bit view handles (image_view_handle rev 3), as
+         * vkd3d-proton checks. */
+        PFN_vkGetInstanceProcAddr gipa = beer_vulkan_get_instance_proc_addr();
+        PFN_vkEnumerateDeviceExtensionProperties enumerate = gipa ?
+            (PFN_vkEnumerateDeviceExtensionProperties)gipa(bd->instance, "vkEnumerateDeviceExtensionProperties") : NULL;
+        uint32_t count = 0, binary_rev = 0, handle_rev = 0;
+        if (enumerate && enumerate(bd->physical_device, NULL, &count, NULL) == VK_SUCCESS && count) {
+            VkExtensionProperties *ext = calloc(count, sizeof(*ext));
+            if (ext && enumerate(bd->physical_device, NULL, &count, ext) == VK_SUCCESS)
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (!strcmp(ext[i].extensionName, VK_NVX_BINARY_IMPORT_EXTENSION_NAME)) binary_rev = ext[i].specVersion;
+                    if (!strcmp(ext[i].extensionName, VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME)) handle_rev = ext[i].specVersion;
+                }
+            free(ext);
+        }
+        g_cuda.texturing64 = g_cuda.view_handle64 && binary_rev >= 2 && handle_rev >= 3;
+    }
     if (g_cuda.create_module && g_cuda.destroy_module && g_cuda.create_function && g_cuda.destroy_function &&
         g_cuda.launch && g_cuda.view_handle)
         g_cuda.state = 1;
-    fprintf(stderr, "[NVAPI] CUDA interop (VK_NVX_binary_import/image_view_handle): %s\n",
-            g_cuda.state > 0 ? "ready" : "entry points missing");
+    fprintf(stderr, "[NVAPI] CUDA interop (VK_NVX_binary_import/image_view_handle): %s, 64-bit texturing %s\n",
+            g_cuda.state > 0 ? "ready" : "entry points missing", g_cuda.texturing64 ? "yes" : "no");
     return g_cuda.state > 0;
 }
 
@@ -63,17 +86,29 @@ int bd12_cuda_available(void)
     return g_com_device && ensure_loaded(g_com_device->bd);
 }
 
+int bd12_cuda_texturing64(void)
+{
+    return g_com_device && ensure_loaded(g_com_device->bd) && g_cuda.texturing64;
+}
+
 int bd12_cuda_create_shader(void *device, const void *cubin, uint32_t size, uint32_t block_x, uint32_t block_y,
-                            uint32_t block_z, uint32_t dynamic_shared, const char *name, uint64_t *shader)
+                            uint32_t block_z, uint32_t dynamic_shared, const char *name, int texturing64,
+                            uint64_t *shader)
 {
     if (shader) *shader = 0;
     BD12Device *bd = device_of(device);
     if (!bd || !cubin || !size || !shader) return BD12_NVAPI_INVALID_ARGUMENT;
     if (!ensure_loaded(bd)) return BD12_NVAPI_NOT_SUPPORTED;
+    if (texturing64 && !g_cuda.texturing64) return BD12_NVAPI_NOT_SUPPORTED;
     CudaShader *s = calloc(1, sizeof(*s));
     if (!s) return BD12_NVAPI_ERROR;
+    /* ExV2 modules take 64-bit texture/surface handles (merged and independent descriptor objects). */
+    const VkCuModuleTexturingModeCreateInfoNVX texturing = {
+        .sType = VK_STRUCTURE_TYPE_CU_MODULE_TEXTURING_MODE_CREATE_INFO_NVX, .use64bitTexturing = VK_TRUE,
+    };
     const VkCuModuleCreateInfoNVX module_info = {
-        .sType = VK_STRUCTURE_TYPE_CU_MODULE_CREATE_INFO_NVX, .dataSize = size, .pData = cubin,
+        .sType = VK_STRUCTURE_TYPE_CU_MODULE_CREATE_INFO_NVX, .pNext = texturing64 ? &texturing : NULL,
+        .dataSize = size, .pData = cubin,
     };
     VkResult result = g_cuda.create_module(bd->device, &module_info, NULL, &s->module);
     if (result == VK_SUCCESS) {
@@ -83,8 +118,9 @@ int bd12_cuda_create_shader(void *device, const void *cubin, uint32_t size, uint
         result = g_cuda.create_function(bd->device, &function_info, NULL, &s->function);
         if (result != VK_SUCCESS) g_cuda.destroy_module(bd->device, s->module, NULL);
     }
-    fprintf(stderr, "[NVAPI] CreateCubinComputeShader(%u bytes, block %ux%ux%u, shared %u, \"%s\") -> %d\n", size,
-            block_x, block_y, block_z, dynamic_shared, name ? name : "", (int)result);
+    fprintf(stderr, "[NVAPI] CreateCubinComputeShader(%u bytes, block %ux%ux%u, shared %u, \"%s\"%s) -> %d\n", size,
+            block_x, block_y, block_z, dynamic_shared, name ? name : "", texturing64 ? ", 64-bit texturing" : "",
+            (int)result);
     if (result != VK_SUCCESS) { free(s); return BD12_NVAPI_ERROR; }
     s->magic = CUDA_SHADER_MAGIC;
     s->block[0] = block_x; s->block[1] = block_y; s->block[2] = block_z;
@@ -200,4 +236,69 @@ int bd12_cuda_surface_object(void *device, uint64_t uav_descriptor, uint32_t *ha
     };
     *handle = g_cuda.view_handle(bd->device, &info);
     return BD12_NVAPI_OK;
+}
+
+/* 64-bit handles (vkGetImageViewHandle64NVX) for 64-bit-texturing modules: a texture with its sampler (merged
+ * object), a texture alone, or a surface (independent descriptor objects). */
+int bd12_cuda_view_handle64(void *device, uint64_t view_descriptor, uint64_t sampler_descriptor, int surface,
+                            uint64_t *handle)
+{
+    if (handle) *handle = 0;
+    BD12Device *bd = device_of(device);
+    const BD12Descriptor *view = (const BD12Descriptor *)(uintptr_t)view_descriptor;
+    const BD12Descriptor *sampler = (const BD12Descriptor *)(uintptr_t)sampler_descriptor;
+    if (!bd || !view || !handle) return BD12_NVAPI_INVALID_ARGUMENT;
+    if (!ensure_loaded(bd) || !g_cuda.texturing64) return BD12_NVAPI_NOT_SUPPORTED;
+    if (!view->image_view || (surface ? view->kind != BD12_DESC_UAV_IMAGE : view->kind != BD12_DESC_SRV_IMAGE))
+        return BD12_NVAPI_INVALID_ARGUMENT;
+    if (sampler && (sampler->kind != BD12_DESC_SAMPLER || !sampler->sampler)) return BD12_NVAPI_INVALID_ARGUMENT;
+    const VkImageViewHandleInfoNVX info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX, .imageView = view->image_view,
+        .descriptorType = surface ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE :
+                          sampler ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+        .sampler = sampler ? sampler->sampler : VK_NULL_HANDLE,
+    };
+    *handle = g_cuda.view_handle64(bd->device, &info);
+    return *handle ? BD12_NVAPI_OK : BD12_NVAPI_ERROR;
+}
+
+/* NvAPI_D3D12_CaptureUAVInfo: the caller's NVAPI_UAV_INFO (version, surfaceHandle, gpuVAStart, gpuVASize[, outFlags])
+ * is filled by the next CreateUnorderedAccessView on the same thread (the driver's contract, as vkd3d-proton keeps it):
+ * a buffer view's GPU address and range, or an image view's 32-bit surface handle with its address and size. */
+static __thread uint8_t *t_uav_info;
+
+int bd12_cuda_capture_uav_info(void *device, void *info)
+{
+    BD12Device *bd = device_of(device);
+    if (!bd || !info) return BD12_NVAPI_INVALID_ARGUMENT;
+    if (!ensure_loaded(bd)) return BD12_NVAPI_NOT_SUPPORTED;
+    t_uav_info = info;
+    return BD12_NVAPI_OK;
+}
+
+void bd12_cuda_uav_created(BD12Device *bd, const void *descriptor)
+{
+    uint8_t *info = t_uav_info;
+    if (!info) return;
+    t_uav_info = NULL;
+    const BD12Descriptor *d = descriptor;
+    uint32_t handle = 0;
+    uint64_t va = 0, size = 0;
+    if (d && d->kind == BD12_DESC_UAV_BUFFER) {
+        va = d->source_buffer ? d->source_buffer->va + d->offset : 0;
+        size = d->range;
+    } else if (d && d->kind == BD12_DESC_UAV_IMAGE && d->image_view && bd) {
+        const VkImageViewHandleInfoNVX hi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX,
+                                              .imageView = d->image_view,
+                                              .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE };
+        handle = g_cuda.view_handle(bd->device, &hi);
+        VkImageViewAddressPropertiesNVX address = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_ADDRESS_PROPERTIES_NVX };
+        if (g_cuda.view_address && g_cuda.view_address(bd->device, d->image_view, &address) == VK_SUCCESS) {
+            va = address.deviceAddress;
+            size = address.size;
+        }
+    }
+    memcpy(info + 4, &handle, 4);
+    memcpy(info + 8, &va, 8);
+    memcpy(info + 16, &size, 8);
 }

@@ -204,6 +204,7 @@ static void reg_seed_display_driver_locked(void)
  * loaders, located through HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore "FullPath" as on a Windows driver
  * install. Published only when the driver's copy exists; the path is the Linux directory through drive Z:.
  * BEER_NGX_PATH=<linux dir> overrides the search. */
+static const char *g_ngx_windows_path;   /* NGX core folder as a Windows path, NULL when not found */
 static void reg_seed_nvidia_ngx(void)
 {
     static const char *const candidates[] = {
@@ -222,6 +223,7 @@ static void reg_seed_nvidia_ngx(void)
     if (!chosen) return;
     static char windows_path[160];
     snprintf(windows_path, sizeof(windows_path), "Z:%s", chosen);
+    g_ngx_windows_path = windows_path;
     for (char *c = windows_path; *c; ++c) if (*c == '/') *c = '\\';
     reg_add_sz("hklm\\software\\nvidia corporation\\global\\ngxcore", "fullpath", windows_path);
     /* The kernel driver's service key exists on any NVIDIA install (Type 1 = kernel driver, Start 3 = demand). */

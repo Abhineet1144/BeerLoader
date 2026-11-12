@@ -56,8 +56,12 @@ void bd12_state_sync(uint32_t state, int is_source,
         a = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
     }
     if (state & BD12_STATE_VERTEX_AND_CONSTANT_BUFFER) {
-        s |= VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | BD12_ALL_SHADER_STAGES | bd12_mesh_stages();
-        a |= VK_ACCESS_2_UNIFORM_READ_BIT |
+        /* Root CBVs are read through their GPU address (root push: PhysicalStorageBuffer loads), which is
+         * SHADER_READ, not UNIFORM_READ; vkd3d-proton adds it for its raw-VA root CBVs too. Without it a
+         * COPY_DEST -> CONSTANT_BUFFER transition did not make the copied constants visible to those loads: RE8's
+         * RT compute looped on a stale zero count (`i > count - 1`) until the GPU timed out (Xid 109). */
+        s |= VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | BD12_ALL_SHADER_STAGES | bd12_mesh_stages() | bd12_rt_stages();
+        a |= VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT |
              VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
     }
     if (state & BD12_STATE_INDEX_BUFFER) {

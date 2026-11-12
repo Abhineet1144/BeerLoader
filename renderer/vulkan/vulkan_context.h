@@ -70,6 +70,8 @@ typedef struct {
     int scalar_block_layout;
     int raw_access_chains;     /* VK_NV_raw_access_chains shaderRawAccessChains */
     int image_int64_atomics;   /* VK_EXT_shader_image_atomic_int64 shaderImageInt64Atomics (sampler feedback maps) */
+    int low_latency;           /* VK_NV_low_latency2 + VK_KHR_present_id presentId (NVIDIA Reflex) */
+    int barycentrics;          /* VK_KHR_fragment_shader_barycentric (D3D12 SV_Barycentrics) */
     uint32_t vendor_id;
     uint32_t driver_id;        /* VkDriverId (0 when unknown) */
     int host_query_reset;
@@ -93,6 +95,14 @@ typedef struct {
     int storage_texel_buffer_offset_single_texel;
 } BeerVulkanModern;
 const BeerVulkanModern *beer_vulkan_modern(void);
+/* NVIDIA Reflex on VK_NV_low_latency2 (vulkan_presenter.c): sleep mode, frame-pacing sleep, latency markers
+ * (VkLatencyMarkerNV values) and timing reports on the presenter's swapchain. */
+int beer_vulkan_low_latency_available(void);
+int beer_vulkan_low_latency_set_mode(int enable, int boost, uint32_t minimum_interval_us);
+void beer_vulkan_low_latency_get_mode(int *enable, int *boost, uint32_t *minimum_interval_us);
+int beer_vulkan_low_latency_sleep(void);
+int beer_vulkan_low_latency_marker(uint64_t frame_id, int marker);
+uint32_t beer_vulkan_low_latency_timings(VkLatencyTimingsFrameReportNV *reports, uint32_t max);
 /* A lost Vulkan device is terminal. Callers must stop submitting work once the
  * shared context records VK_ERROR_DEVICE_LOST. */
 int beer_vulkan_device_lost(void);

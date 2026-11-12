@@ -139,6 +139,7 @@ typedef struct TranslatorApi {
 typedef struct TranslationCacheEntry {
     BeerD3D12TranslatedShader shader;
     uint64_t content_hash;
+    uint64_t link_hash;          /* nonzero: a mesh pipeline's pixel shader linked to its mesh shader's outputs */
     size_t dxbc_size;
     struct TranslationCacheEntry *next;
 } TranslationCacheEntry;
@@ -171,13 +172,18 @@ static TranslationCacheEntry **cache_bucket(uint64_t shader_hash, uint64_t layou
 }
 
 /* Caller holds g_lock. */
-static TranslationCacheEntry *cache_find_locked(uint64_t shader_hash, uint64_t chash, size_t size, uint64_t layout_hash)
+static TranslationCacheEntry *cache_find_linked_locked(uint64_t shader_hash, uint64_t chash, size_t size,
+                                                       uint64_t layout_hash, uint64_t link_hash)
 {
     for (TranslationCacheEntry *e = *cache_bucket(shader_hash, layout_hash); e; e = e->next)
         if (e->shader.shader_hash == shader_hash && e->content_hash == chash && e->dxbc_size == size &&
-            e->shader.root_layout_hash == layout_hash)
+            e->shader.root_layout_hash == layout_hash && e->link_hash == link_hash)
             return e;
     return NULL;
+}
+static TranslationCacheEntry *cache_find_locked(uint64_t shader_hash, uint64_t chash, size_t size, uint64_t layout_hash)
+{
+    return cache_find_linked_locked(shader_hash, chash, size, layout_hash, 0);
 }
 
 static void cache_entry_free(TranslationCacheEntry *e)
@@ -191,8 +197,8 @@ static void cache_entry_free(TranslationCacheEntry *e)
  * then the existing entry wins and `e` is discarded. */
 static TranslationCacheEntry *cache_insert_locked(TranslationCacheEntry *e)
 {
-    TranslationCacheEntry *existing =
-        cache_find_locked(e->shader.shader_hash, e->content_hash, e->dxbc_size, e->shader.root_layout_hash);
+    TranslationCacheEntry *existing = cache_find_linked_locked(e->shader.shader_hash, e->content_hash, e->dxbc_size,
+                                                               e->shader.root_layout_hash, e->link_hash);
     if (existing) { cache_entry_free(e); return existing; }
     TranslationCacheEntry **bucket = cache_bucket(e->shader.shader_hash, e->shader.root_layout_hash);
     e->next = *bucket;
@@ -684,7 +690,9 @@ static uint64_t disk_cache_build_key(void)
         const uint64_t caps = beer_d3d12_dxil_caps_key();   /* device-dependent dxil-spirv options */
         h = fnv64_seed((const uint8_t *)&caps, sizeof(caps), h);
     }
-    const char *opts[] = { "BEER_SPV_FLOAT_CONTROLS", "BEER_SPV_INVARIANT_POSITION", "BEER_SPV_SYNC" };
+    const char *opts[] = { "BEER_SPV_FLOAT_CONTROLS", "BEER_SPV_INVARIANT_POSITION", "BEER_SPV_SYNC",
+                           "BEER_DXIL_LEGACY_STRUCTURIZER",
+                           "BEER_DUMP_SHADERS" };   /* a dump run translates (and so dumps) every shader again */
     for (size_t i = 0; i < sizeof(opts) / sizeof(*opts); ++i) {
         const char *v = getenv(opts[i]);
         h = fnv64_seed((const uint8_t *)(v ? v : "<unset>"), strlen(v ? v : "<unset>") + 1, h);
@@ -1076,20 +1084,40 @@ static int rs_skip(uint64_t shader_hash, const uint32_t *w, size_t bytes)
 
 /* Root-signature translations (see the header). Entries carry the layout hash; a failed translation is cached too
  * (spirv NULL) so the shader is not retried for every pipeline that uses it. */
+static const BeerD3D12TranslatedShader *translate_rs(const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash,
+                                                    const BeerD3D12RootLayout *layout, const uint8_t *ms,
+                                                    size_t ms_size);
 const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
     const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash, const BeerD3D12RootLayout *layout)
 {
+    return translate_rs(dxbc, dxbc_size, shader_hash, layout, NULL, 0);
+}
+/* A mesh pipeline's pixel shader, linked to the mesh shader's outputs (beer_d3d12_dxil_translate_rs_linked). */
+const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs_linked(
+    const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash, const BeerD3D12RootLayout *layout,
+    const uint8_t *mesh_shader, size_t mesh_shader_size)
+{
+    return translate_rs(dxbc, dxbc_size, shader_hash, layout, mesh_shader, mesh_shader_size);
+}
+static const BeerD3D12TranslatedShader *translate_rs(const uint8_t *dxbc, size_t dxbc_size, uint64_t shader_hash,
+                                                    const BeerD3D12RootLayout *layout, const uint8_t *ms,
+                                                    size_t ms_size)
+{
     if (!dxbc || !layout || !layout->hash || !beer_d3d12_is_dxil(dxbc, dxbc_size)) return NULL;
+    const uint64_t link_hash = ms ? beer_d3d12_dxil_stage_link_hash(ms, ms_size) : 0;
+    if (!link_hash) ms = NULL;
     const uint64_t chash = content_hash(dxbc, dxbc_size);
     pthread_mutex_lock(&g_lock);
-    TranslationCacheEntry *found = cache_find_locked(shader_hash, chash, dxbc_size, layout->hash);
+    TranslationCacheEntry *found = cache_find_linked_locked(shader_hash, chash, dxbc_size, layout->hash, link_hash);
     pthread_mutex_unlock(&g_lock);
     if (found) return found->shader.spirv && !rs_skip(shader_hash, (const uint32_t *)found->shader.spirv,
                                                      found->shader.spirv_size) ? &found->shader : NULL;
-    const uint64_t layout_key = disk_layout_key(layout);
+    const uint64_t layout_key = link_hash ? (disk_layout_key(layout) ^ (link_hash * 0x9e3779b97f4a7c15ull)) | 1
+                                          : disk_layout_key(layout);
     TranslationCacheEntry *entry = disk_cache_load(dxbc, dxbc_size, shader_hash, layout_key);
     if (entry) {                                                       /* translated by an earlier run */
         entry->shader.root_layout_hash = layout->hash;
+        entry->link_hash = link_hash;
         pthread_mutex_lock(&g_lock);
         entry = cache_insert_locked(entry);
         pthread_mutex_unlock(&g_lock);
@@ -1100,7 +1128,9 @@ const BeerD3D12TranslatedShader *beer_d3d12_translate_shader_rs(
     if (!entry) return NULL;
     entry->content_hash = chash;
     entry->dxbc_size = dxbc_size;
-    if (beer_d3d12_dxil_translate_rs(dxbc, dxbc_size, ~0u, layout, &entry->shader)) {
+    entry->link_hash = link_hash;
+    if (ms ? beer_d3d12_dxil_translate_rs_linked(dxbc, dxbc_size, ~0u, layout, ms, ms_size, &entry->shader)
+           : beer_d3d12_dxil_translate_rs(dxbc, dxbc_size, ~0u, layout, &entry->shader)) {
         if (spirv_float_controls_enabled()) {
             size_t size = 0;
             uint32_t *patched = spirv_preserve_inf_nan((const uint32_t *)entry->shader.spirv,
