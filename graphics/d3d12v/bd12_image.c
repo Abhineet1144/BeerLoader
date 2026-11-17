@@ -213,17 +213,40 @@ static BD12Image *image_create(BD12Device *device, BD12Heap *heap,
           (1u << device->memory_type[BD12_HEAP_DEFAULT])))
         goto fail;
     if (heap) {
+        /* Placed in an application heap: the application laid the heap out with GetResourceAllocationInfo's
+         * size/alignment (bd12_image_requirements). A bigger real size here overlaps the next resource. */
+        {
+            static uint32_t checked, mismatched;
+            VkDeviceSize est_size = 0, est_align = 0;
+            if (__atomic_fetch_add(&checked, 1, __ATOMIC_RELAXED) < 200000 &&
+                bd12_image_requirements(device, desc, &est_size, &est_align) &&
+                (requirements.size > est_size || requirements.alignment > est_align) &&
+                __atomic_fetch_add(&mismatched, 1, __ATOMIC_RELAXED) < 40)
+                fprintf(stderr, "[BD12] placed image needs %llu B align %llu, but allocation info said %llu B align %llu "
+                        "(%ux%u fmt %d mips %u usage 0x%x offset 0x%llx)\n",
+                        (unsigned long long)requirements.size, (unsigned long long)requirements.alignment,
+                        (unsigned long long)est_size, (unsigned long long)est_align, desc->width, desc->height,
+                        (int)desc->format, desc->mip_levels, image->usage, (unsigned long long)offset);
+        }
         if ((offset % requirements.alignment) ||
             offset + requirements.size > heap->size)
             goto fail;
     } else {
-        VkDeviceSize size = (requirements.size + 65535) & ~(VkDeviceSize)65535;
         /* D3D12 zero-initializes committed resources. Games lean on it (accumulation
          * buffers, partially redrawn atlases), and recycled device memory otherwise shows
-         * stale pixels from earlier resources. BEER_BD12_NO_IMAGE_ZERO=1 skips the fill. */
-        heap = getenv("BEER_BD12_NO_IMAGE_ZERO") ?
-               bd12_heap_create_unzeroed(device, BD12_HEAP_DEFAULT, size) :
-               bd12_heap_create(device, BD12_HEAP_DEFAULT, size);
+         * stale pixels from earlier resources. BEER_BD12_NO_IMAGE_ZERO=1 skips the fill.
+         * Packed at the image's own alignment: rounding every committed image to 64 KiB and aligning it to a power of
+         * two of its size cost Onimusha ~1.8 GB of VRAM at the title (5.6 GB of driver memory for 3.9 GB of heaps;
+         * Wine with vkd3d-proton: 2.4 GB for the whole process). BEER_BD12_IMAGE_64K=1 restores the old layout. */
+        static int legacy = -1;
+        if (legacy < 0) legacy = getenv("BEER_BD12_IMAGE_64K") != NULL;
+        const int zero = !getenv("BEER_BD12_NO_IMAGE_ZERO");
+        if (legacy) {
+            VkDeviceSize size = (requirements.size + 65535) & ~(VkDeviceSize)65535;
+            heap = zero ? bd12_heap_create(device, BD12_HEAP_DEFAULT, size)
+                        : bd12_heap_create_unzeroed(device, BD12_HEAP_DEFAULT, size);
+        } else
+            heap = bd12_heap_create_for_image(device, requirements.size, requirements.alignment, zero);
         if (!heap) goto fail;
         image->heap = heap;
         image->owns_heap = 1;

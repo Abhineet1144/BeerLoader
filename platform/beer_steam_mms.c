@@ -542,6 +542,10 @@ static void run_job(Job *job, uint8_t *reply)
         PbIn r = { reply, reply + (got > 0 ? got : 0) };
         PbF f;
         while (got > 0 && pb_next(&r, &f) == 1) if (f.field == 2) lobby = f.v;
+        if (getenv("BEER_STEAM_DIAGNOSTICS"))
+            fprintf(stderr, "[STEAM-MMS] CreateLobby app=%u type=%d members=%d call=%llu -> bytes=%ld EResult=%d lobby=%llu\n",
+                g.appid, job->a, job->b, (unsigned long long)job->call, got, eresult,
+                (unsigned long long)lobby);
         pthread_mutex_lock(&g.lock);
         if (eresult == 1 && lobby) {
             Lobby *l = lobby_locked(lobby, 1);

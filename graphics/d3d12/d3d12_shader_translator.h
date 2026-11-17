@@ -127,4 +127,20 @@ const char *beer_d3d12_shader_translation_error(void);
 /* Releases the process-wide translation cache during final teardown/tests. */
 void beer_d3d12_shader_translator_destroy(void);
 
+/* One parameter of a DXR local root signature, i.e. the shader-record arguments that follow the 32-byte shader
+ * identifier, in declaration order (the order fixes each argument's offset in the record). */
+typedef struct BeerD3D12LocalRange {
+    uint32_t resource_class;      /* 0 SRV, 1 UAV, 2 CBV, 3 sampler */
+    uint32_t space, base_register, count;   /* count UINT32_MAX = unbounded */
+    uint32_t offset;              /* descriptors from the table start (APPEND already resolved) */
+} BeerD3D12LocalRange;
+#define BEER_D3D12_LOCAL_MAX_RANGES 8
+typedef struct BeerD3D12LocalParam {
+    uint32_t kind;                /* 0 root constants, 1 root descriptor, 2 descriptor table */
+    uint32_t resource_class;      /* root descriptor: 0 SRV, 1 UAV, 2 CBV */
+    uint32_t space, reg, words;   /* constants: words = 32-bit values */
+    uint32_t range_count;         /* descriptor table */
+    BeerD3D12LocalRange ranges[BEER_D3D12_LOCAL_MAX_RANGES];
+} BeerD3D12LocalParam;
+
 #endif

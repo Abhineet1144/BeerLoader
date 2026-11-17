@@ -316,8 +316,194 @@ static void locale_info_contract_test(void)
     for (size_t i = 0; i <= strlen(expected); ++i) assert(text[i] == (u8)expected[i]);
 }
 
+static u64 callback_test_low, callback_test_high, callback_test_import;
+static unsigned callback_test_visits;
+static u64 __attribute__((ms_abi)) callback_stack_probe(u64 hw, u32 msg, u64 wp, u64 lp,
+                                                       u64 id, u64 ref)
+{
+    u64 local;
+    WinTEB *teb;
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb));
+    assert((u64)(uintptr_t)&local >= callback_test_low && (u64)(uintptr_t)&local < callback_test_high);
+    assert(teb->StackLimit == callback_test_low && teb->StackBase == callback_test_high);
+    assert(hw == 0xd0001234 && msg == 0x8123 && wp == 0xfedcba9876543210ull);
+    assert(lp == 0x1234567887654321ull && id == 0xabcdef0123456789ull && ref == UINT64_MAX);
+    ++callback_test_visits;
+    if (callback_test_visits == 1) {
+        /* A real import reenters Beer while this callback is still live. */
+        u64 result = ((u64 (__attribute__((ms_abi)) *)(void))(uintptr_t)callback_test_import)();
+        assert(result == 0x8765432112345678ull);
+        assert(teb->StackLimit == callback_test_low && teb->StackBase == callback_test_high);
+    }
+    return 0x8765432112345678ull;
+}
+static u64 __attribute__((ms_abi)) callback_host_entry(void)
+{
+    return call_window_callback6((u64)(uintptr_t)callback_stack_probe, 0xd0001234, 0x8123,
+                                 0xfedcba9876543210ull, 0x1234567887654321ull,
+                                 0xabcdef0123456789ull, UINT64_MAX);
+}
+static void window_callback_stack_test(void)
+{
+    u64 old_gs;
+    assert(!syscall(SYS_arch_prctl, ARCH_GET_GS, &old_gs));
+    WinTEB teb = {0};
+    teb.Self = (u64)(uintptr_t)&teb;
+    void *guest = mmap(NULL, HOST_CALL_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *host = mmap(NULL, HOST_CALL_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(guest != MAP_FAILED && host != MAP_FAILED);
+    callback_test_low = (u64)(uintptr_t)guest;
+    callback_test_high = callback_test_low + HOST_CALL_STACK_SIZE;
+    g_host_call_stack_base = (u64)(uintptr_t)host;
+    g_host_call_stack_top = g_host_call_stack_real_top = g_host_call_stack_base + HOST_CALL_STACK_SIZE - 256;
+    g_teb_guest_stack_limit = callback_test_low;
+    g_teb_guest_stack_base = callback_test_high;
+    g_saved_guest_rsp = callback_test_high - 256;
+    teb.StackLimit = g_host_call_stack_base;
+    teb.StackBase = g_host_call_stack_top + 256;
+    assert(!syscall(SYS_arch_prctl, ARCH_SET_GS, &teb));
+    int slot = g_nstubs++;
+    g_snames[slot] = strdup("callback-test!nested");
+    emit_impl_thunk(slot, (u64)(uintptr_t)callback_host_entry);
+    callback_test_import = (u64)(uintptr_t)(g_tramp + slot * THUNK_SZ);
+    u64 top = g_host_call_stack_top, saved = g_saved_guest_rsp;
+    assert(call_window_callback_on_stack((u64)(uintptr_t)callback_host_entry,
+                                        0, 0, 0, 0, 0, 0, top - 256) == 0x8765432112345678ull);
+    assert(callback_test_visits == 2 && g_host_call_stack_top == top && g_saved_guest_rsp == saved);
+    assert(teb.StackLimit == g_host_call_stack_base && teb.StackBase == top + 256);
+    assert(!syscall(SYS_arch_prctl, ARCH_SET_GS, old_gs));
+    g_host_call_stack_base = g_host_call_stack_top = g_host_call_stack_real_top = 0;
+    g_saved_guest_rsp = g_teb_guest_stack_limit = g_teb_guest_stack_base = 0;
+    munmap(guest, HOST_CALL_STACK_SIZE);
+    munmap(host, HOST_CALL_STACK_SIZE);
+}
+
+static unsigned subclass_test_calls;
+static u64 __attribute__((ms_abi)) subclass_original(u64 hw, u32 msg, u64 wp, u64 lp)
+{
+    assert(hw && msg && wp == 3 && lp == 4);
+    ++subclass_test_calls;
+    return 0xfedcba9876543210ull;
+}
+static u64 __attribute__((ms_abi)) subclass_probe(u64 hw, u32 msg, u64 wp, u64 lp, u64 id, u64 ref)
+{
+    assert(id == 0x1234567887654321ull && ref == 0xabcdef0123456789ull);
+    ++subclass_test_calls;
+    assert(impl_RemoveWindowSubclass(hw, (u64)(uintptr_t)subclass_probe, id));
+    return impl_DefSubclassProc(hw, msg, wp, lp);
+}
+static void subclass_contract_test(void)
+{
+    BeerWindow *w = beer_window_new();
+    assert(w);
+    w->owner_tid = (u32)current_windows_thread_id();
+    w->proc = (u64)(uintptr_t)subclass_original;
+    u64 hw = w->hwnd, ref = 0;
+    const u64 proc = (u64)(uintptr_t)subclass_probe, id = 0x1234567887654321ull;
+    assert(!impl_SetWindowSubclass(0, proc, id, 0));
+    assert(!impl_SetWindowSubclass(hw, 0, id, 0));
+    assert(impl_SetWindowSubclass(hw, proc, id, 5));
+    assert(impl_SetWindowSubclass(hw, proc, id, 0xabcdef0123456789ull));
+    assert(impl_GetWindowSubclass(hw, proc, id, &ref) && ref == 0xabcdef0123456789ull);
+    assert(call_window_proc(hw, 0x8001, 3, 4) == 0xfedcba9876543210ull);
+    assert(subclass_test_calls == 2 && !impl_GetWindowSubclass(hw, proc, id, &ref));
+    assert(w->proc == (u64)(uintptr_t)subclass_original && !g_subclass_windows);
+    assert(impl_SetWindowSubclass(hw, proc, id, 0xabcdef0123456789ull));
+    assert(call_window_proc(hw, 0x82, 3, 4) == 0xfedcba9876543210ull);
+    assert(subclass_test_calls == 4 && !g_subclass_windows);
+    beer_window_free(hw);
+}
+
+static _Atomic unsigned mm_timer_test_calls;
+static u64 mm_timer_test_done;
+static void __attribute__((ms_abi)) mm_timer_test_callback(u32 id, u32 message, u64 user, u64 a, u64 b)
+{
+    assert(beer_win32_syscall_selector == 1);
+    beer_win32_syscall_selector = 0; /* Test function is host code, not guest imports. */
+    assert(id && !message && user == 0xabcdef0123456789ull && !a && !b);
+    WinTEB *teb;
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb));
+    u64 local;
+    assert(teb && (u64)(uintptr_t)&local >= teb->StackLimit && (u64)(uintptr_t)&local < teb->StackBase);
+    atomic_fetch_add(&mm_timer_test_calls, 1);
+    assert(!impl_timeKillEvent(id)); /* Synchronous self-cancellation must not deadlock. */
+    impl_SetEvent(mm_timer_test_done);
+}
+static void multimedia_timer_contract_test(void)
+{
+    /* Prepared workers inspect the loaded executable's TLS directory. */
+    static u8 image[sizeof(DosHdr) + sizeof(NtHdrs64)];
+    u8 *saved_image = g_img;
+    ((DosHdr *)image)->lfanew = sizeof(DosHdr);
+    g_img = image;
+    assert(!impl_timeSetEvent(0, 0, 1, 0, 0));
+    assert(!impl_timeSetEvent(1, 0, 0, 0, 0));
+    assert(!impl_timeSetEvent(1, 0, 1, 0, 0x30));
+    assert(impl_timeKillEvent(0) == 11);
+    mm_timer_test_done = impl_CreateEventW(0, 1, 0, 0);
+    assert(mm_timer_test_done);
+    u64 id = impl_timeSetEvent(5, 0, (u64)(uintptr_t)mm_timer_test_callback,
+                               0xabcdef0123456789ull, 0x101);
+    assert(id && impl_WaitForSingleObject(mm_timer_test_done, 2000) == 0);
+    /* Self-cancellation is already committed even if the worker has not yet
+     * retired the callback's record. No subsequent callback is eligible. */
+    assert(impl_timeKillEvent((u32)id) == 11);
+    assert(atomic_load(&mm_timer_test_calls) == 1);
+    assert(impl_ResetEvent(mm_timer_test_done));
+    id = impl_timeSetEvent(5, 0, mm_timer_test_done, 0, 0x111);
+    assert(id && impl_WaitForSingleObject(mm_timer_test_done, 2000) == 0);
+    assert(!impl_timeKillEvent((u32)id));
+    assert(impl_timeKillEvent((u32)id) == 11);
+    assert(impl_ResetEvent(mm_timer_test_done));
+    assert(impl_WaitForSingleObject(mm_timer_test_done, 25) == 0x102);
+    id = impl_timeSetEvent(1000, 0, mm_timer_test_done, 0, 0x10);
+    assert(id && !impl_timeKillEvent((u32)id)); /* Cancel before first expiry. */
+    assert(impl_WaitForSingleObject(mm_timer_test_done, 25) == 0x102);
+    assert(impl_CloseHandle(mm_timer_test_done));
+    g_img = saved_image;
+}
+
+static void legacy_dns_contract_test(void)
+{
+        assert(offsetof(WinHostEnt, address_type) == 16 && offsetof(WinHostEnt, address_list) == 24);
+        struct sockaddr_in addresses[2] = {{ .sin_family = AF_INET }, { .sin_family = AF_INET }};
+        assert(inet_pton(AF_INET, "192.0.2.10", &addresses[0].sin_addr) == 1);
+        assert(inet_pton(AF_INET, "192.0.2.11", &addresses[1].sin_addr) == 1);
+        struct addrinfo entries[3] = {
+                { .ai_family = AF_INET6 },
+                { .ai_family = AF_INET, .ai_addrlen = sizeof(addresses[0]),
+                    .ai_addr = (struct sockaddr *)&addresses[0], .ai_canonname = "canonical.example.test" },
+                { .ai_family = AF_INET, .ai_addrlen = sizeof(addresses[1]),
+                    .ai_addr = (struct sockaddr *)&addresses[1] }
+        };
+        entries[0].ai_next = &entries[1];
+        entries[1].ai_next = &entries[2];
+        WinHostEnt *host = (WinHostEnt *)(uintptr_t)win_hostent_from_addrinfo("alias.example.test", entries);
+        assert(host && host->address_type == 2 && host->address_length == 4 && !host->padding);
+        assert(!strcmp((char *)(uintptr_t)host->name, "canonical.example.test"));
+        assert(!*(u64 *)(uintptr_t)host->aliases);
+        u64 *list = (u64 *)(uintptr_t)host->address_list;
+        assert(list[0] && list[1] && !list[2]);
+        assert(!memcmp((void *)(uintptr_t)list[0], &addresses[0].sin_addr, 4));
+        assert(!memcmp((void *)(uintptr_t)list[1], &addresses[1].sin_addr, 4));
+        assert(list[0] != (u64)(uintptr_t)&addresses[0].sin_addr);
+        assert(!win_hostent_from_addrinfo("empty.example.test", NULL) && g_wsa_last_error == 11004);
+        u8 startup[408];
+        assert(!impl_WSAStartup(0x0202, startup));
+        host = (WinHostEnt *)(uintptr_t)impl_gethostbyname("LOCALHOST");
+        assert(host && host->address_type == 2 && host->address_length == 4);
+        assert(impl_gethostbyname("127.0.0.1"));
+        assert(!impl_gethostbyname(NULL) && g_wsa_last_error == 10014);
+        assert(!impl_WSACleanup());
+        free(g_win_hostent_storage);
+        g_win_hostent_storage = NULL;
+}
+
 int main(void)
 {
+    multimedia_timer_contract_test();
+        legacy_dns_contract_test();
+    subclass_contract_test();
     native_crt_import_ownership_test();
     locale_info_contract_test();
     winsock_ordinal_contract_test();
@@ -533,6 +719,7 @@ int main(void)
     g_tramp = mmap(NULL, (size_t)MAX_STUBS * THUNK_SZ, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(g_tramp != MAP_FAILED);
+    window_callback_stack_test();
     /* The real loader constructor already maps these headers before main. */
     for (size_t i = 0; i < sizeof(g_fake_pe_modules) / sizeof(*g_fake_pe_modules); ++i)
         assert(*(const u16 *)(uintptr_t)g_fake_pe_modules[i].base == MZ_MAGIC);
@@ -541,6 +728,15 @@ int main(void)
     g_snames[g_nstubs++] = strdup("shell32.dll!CommandLineToArgvW");
     fake_pe_exports_build();
     assert(g_fake_pe_ready);
+    u64 comctl = dll_name_to_handle("comctl32.dll", 1);
+    assert(comctl);
+    const char *subclass_exports[] = { "SetWindowSubclass", "GetWindowSubclass",
+                                       "RemoveWindowSubclass", "DefSubclassProc" };
+    for (size_t i = 0; i < 4; ++i) {
+        u64 named = impl_GetProcAddress(comctl, subclass_exports[i]);
+        assert(named && named == impl_GetProcAddress(comctl, (const char *)(uintptr_t)(410 + i)));
+        assert(find_impl(subclass_exports[i]));
+    }
     late_loader_list_test();
     int before_missing_lookup = g_nstubs;
     assert(!fake_pe_export_address(HMOD_K32, "InitializeProcThreadAttributeList"));

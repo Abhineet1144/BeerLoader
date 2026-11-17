@@ -219,6 +219,7 @@ BD12Device *bd12_device_create(void)
     device->min_uniform_alignment =
         properties.limits.minUniformBufferOffsetAlignment;
     device->max_uniform_range = properties.limits.maxUniformBufferRange;
+    device->buffer_image_granularity = properties.limits.bufferImageGranularity;
     { extern float g_bd12_timestamp_period; g_bd12_timestamp_period = properties.limits.timestampPeriod; }
     device->min_uniform_texel_alignment =
         modern->uniform_texel_buffer_offset_alignment ?
@@ -227,6 +228,20 @@ BD12Device *bd12_device_create(void)
     device->max_push_constants = properties.limits.maxPushConstantsSize;
     device->min_storage_buffer_alignment = properties.limits.minStorageBufferOffsetAlignment ?
         properties.limits.minStorageBufferOffsetAlignment : 1;
+    {   /* NVIDIA's proprietary driver advertises 16 bytes, but it only needs that alignment for vectorized SSBO
+         * access, which the translator keeps within what the shader itself guarantees on NVIDIA (conservative
+         * vectorization): storage buffers can start at any 4-byte boundary, as vkd3d-proton treats them. With 16,
+         * every raw/structured view went through dxil-spirv's offset table (a wave-op broadcast and a bounds check
+         * per access): slower, and Ghost of Tsushima's cloth solvers (524c7c2e7e8bd58d, a7c5911970ce3c99) hung the
+         * GPU there entering gameplay (Xid 109), while vkd3d-proton (4-byte, no offset table) runs them.
+         * BEER_BD12_SSBO_ALIGN=<bytes> overrides. */
+        const BeerVulkanModern *mm = beer_vulkan_modern();
+        const char *forced = getenv("BEER_BD12_SSBO_ALIGN");
+        /* Opt-in for now (BEER_BD12_SSBO_ALIGN=4): it did not cure the GoT hang and is not yet validated on
+         * RE8/RE9; vkd3d-proton's default on NVIDIA, so the intended default once validated. */
+        (void)mm;
+        if (forced && *forced && atoi(forced) > 0) device->min_storage_buffer_alignment = (uint32_t)atoi(forced);
+    }
     device->min_storage_texel_alignment =
         modern->storage_texel_buffer_offset_alignment ?
         modern->storage_texel_buffer_offset_alignment :
@@ -353,6 +368,7 @@ BD12Device *bd12_device_create(void)
      * shaders, and from system memory every such read crosses PCIe (RE9: GPU "busy" at half power). CPU writes stay
      * write-combined, as Windows upload heaps are. A small (256 MB) BAR window is left alone; BEER_BD12_UPLOAD_SYSMEM=1
      * keeps system memory. */
+    device->upload_sysmem_type = device->memory_type[BD12_HEAP_UPLOAD];
     if (!getenv("BEER_BD12_UPLOAD_SYSMEM")) {
         const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -470,8 +486,11 @@ static uint64_t pc_save_interval_ms(void)
 }
 
 /* Called after every pipeline build: hands a save to the saver thread now and then, never blocks the caller. */
+uint64_t g_bd12_live_pipelines;   /* VRAM diagnostics: VkPipelines alive (graphics + compute) */
+uint64_t g_bd12_rebar_bytes;      /* UPLOAD memory placed in resizable-BAR VRAM */
 void bd12_pipeline_cache_note_new(BD12Device *device)
 {
+    __atomic_add_fetch(&g_bd12_live_pipelines, 1, __ATOMIC_RELAXED);
     if (!device || !device->pipeline_cache || !device->pipeline_cache_path[0]) return;   /* in-memory only */
     const uint32_t fresh = __atomic_add_fetch(&device->pipeline_cache_new, 1, __ATOMIC_RELAXED);
     if (fresh < 25) return;
@@ -525,8 +544,11 @@ void bd12_device_destroy(BD12Device *device)
  * SUBALLOC_MAX are carved from large blocks, each allocated and mapped once with one buffer over it for zero
  * fills; bigger heaps keep dedicated memory. Freed ranges are reused once the heap is destroyed, which happens
  * only after the GPU finished with it. BEER_BD12_NO_SUBALLOC=1 gives every heap its own allocation. */
-#define SUBALLOC_MAX ((VkDeviceSize)32 << 20)
-#define BLOCK_DEFAULT ((VkDeviceSize)256 << 20)
+/* 8 MiB: with heaps up to 32 MiB carved from 128 MiB blocks, the leftover space per block that a big heap no longer
+ * fits (bin-packing waste) averaged ~33 MiB, ~565 MiB over 17 blocks at Onimusha's title. Bigger heaps get memory of
+ * their own (exact size); holes left in blocks stay below a few MiB. */
+#define SUBALLOC_MAX ((VkDeviceSize)8 << 20)
+#define BLOCK_DEFAULT ((VkDeviceSize)128 << 20)   /* 256 MB blocks left up to ~0.6 GB of tails and spares idle */
 #define BLOCK_HOST ((VkDeviceSize)128 << 20)
 #define SUBALLOC_MIN_ALIGN ((VkDeviceSize)64 << 10)
 
@@ -538,6 +560,7 @@ typedef struct BD12MemBlock {
     VkBuffer fill_buffer;         /* whole block, TRANSFER_DST: zero fills of DEFAULT heaps */
     VkDeviceSize size, used;
     VkDeviceSize fresh;           /* [fresh, size) never handed out: still as the driver allocated it */
+    int rebar;                    /* UPLOAD block in resizable-BAR VRAM (diagnostics) */
     MemRange *free;               /* sorted by offset, coalesced */
     uint32_t free_count, free_capacity;
 } BD12MemBlock;
@@ -630,6 +653,54 @@ static void block_give(BD12MemBlock *b, VkDeviceSize offset, VkDeviceSize size)
     }
 }
 
+extern uint64_t g_bd12_block_bytes[4], g_bd12_dedicated_bytes[4];   /* defined with the heap counters below */
+
+/* Memory type for new UPLOAD memory: resizable-BAR VRAM (fast GPU reads of constants) while VRAM has room, system
+ * memory once the process uses 80% of its budget. Engines fill VRAM to the budget with their texture pools; upload
+ * heaps kept in VRAM on top of that (~0.7 GB in Onimusha) pushed it over. */
+extern uint64_t g_bd12_rebar_bytes;
+/* Upload memory in resizable-BAR VRAM is capped (BEER_BD12_REBAR_UPLOAD_MB, default 1/16 of the VRAM heap, the
+ * heuristic vkd3d-proton uses): without a cap Onimusha kept ~1.2-1.8 GB of upload heaps in VRAM, most of Beer's
+ * VRAM overhead over vkd3d-proton. Hot constant data is created early and stays fast; later upload heaps use system
+ * memory, which is what upload heaps are on Windows without ReBAR. */
+static uint64_t rebar_upload_cap(BD12Device *device)
+{
+    static uint64_t cap;
+    if (!cap) {
+        const char *v = getenv("BEER_BD12_REBAR_UPLOAD_MB");
+        if (v && *v) cap = (uint64_t)strtoull(v, NULL, 10) << 20;
+        else {
+            const int32_t t = device->memory_type[BD12_HEAP_UPLOAD];
+            cap = t >= 0 ? device->memory.memoryHeaps[device->memory.memoryTypes[t].heapIndex].size / 16 : 0;
+        }
+        if (!cap) cap = 1;
+        fprintf(stderr, "[BD12] upload heaps in resizable-BAR VRAM capped at %llu MiB\n", (unsigned long long)(cap >> 20));
+    }
+    return cap;
+}
+
+static int32_t upload_memory_type(BD12Device *device, VkDeviceSize size)
+{
+    const int32_t rebar = device->memory_type[BD12_HEAP_UPLOAD];
+    if (rebar == device->upload_sysmem_type || device->upload_sysmem_type < 0) return rebar;
+    uint64_t pressure_budget = 0, pressure_usage = 0;
+    /* The cap only applies under VRAM pressure (usage above 60% of the budget): games with VRAM to spare (RE8 at
+     * ~5 of 14 GB) keep every upload heap in VRAM exactly as before. */
+    if (__atomic_load_n(&g_bd12_rebar_bytes, __ATOMIC_RELAXED) + size > rebar_upload_cap(device) &&
+        beer_vulkan_memory_budget(&pressure_budget, &pressure_usage) && pressure_usage > pressure_budget / 10 * 6) {
+        static int noted;
+        if (!noted++) fprintf(stderr, "[BD12] resizable-BAR upload cap reached: new upload heaps go to system memory\n");
+        return device->upload_sysmem_type;
+    }
+    uint64_t budget = 0, usage = 0;
+    if (beer_vulkan_memory_budget(&budget, &usage) && usage + size > budget / 10 * 8) {
+        static int noted;
+        if (!noted++) fprintf(stderr, "[BD12] VRAM at %llu of %llu MiB: new upload heaps go to system memory\n",
+                              (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20));
+        return device->upload_sysmem_type;
+    }
+    return rebar;
+}
 static BD12MemBlock *block_create(BD12Device *device, BD12HeapType type)
 {
     const VkDeviceSize size = type == BD12_HEAP_DEFAULT ? BLOCK_DEFAULT : BLOCK_HOST;
@@ -643,9 +714,16 @@ static BD12MemBlock *block_create(BD12Device *device, BD12HeapType type)
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = &flags,
         .allocationSize = size,
-        .memoryTypeIndex = (uint32_t)device->memory_type[type]
+        .memoryTypeIndex = (uint32_t)(type == BD12_HEAP_UPLOAD ? upload_memory_type(device, size)
+                                                               : device->memory_type[type])
     };
     if (device->vk.AllocateMemory(device->device, &allocate, NULL, &b->memory) != VK_SUCCESS) goto fail;
+    __atomic_add_fetch(&g_bd12_block_bytes[type == BD12_HEAP_DEFAULT ? 1 : 2], size, __ATOMIC_RELAXED);
+    if (type == BD12_HEAP_UPLOAD && allocate.memoryTypeIndex == (uint32_t)device->memory_type[BD12_HEAP_UPLOAD] &&
+        device->memory_type[BD12_HEAP_UPLOAD] != device->upload_sysmem_type) {
+        b->rebar = 1;
+        __atomic_add_fetch(&g_bd12_rebar_bytes, size, __ATOMIC_RELAXED);
+    }
     if (type != BD12_HEAP_DEFAULT &&
         device->vk.MapMemory(device->device, b->memory, 0, VK_WHOLE_SIZE, 0, &b->mapped) != VK_SUCCESS)
         goto fail_memory;
@@ -683,12 +761,17 @@ static void block_destroy(BD12Device *device, BD12MemBlock *b)
     if (b->fill_buffer) device->vk.DestroyBuffer(device->device, b->fill_buffer, NULL);
     if (b->mapped) device->vk.UnmapMemory(device->device, b->memory);
     device->vk.FreeMemory(device->device, b->memory, NULL);
+    __atomic_sub_fetch(&g_bd12_block_bytes[b->mapped ? 2 : 1], b->size, __ATOMIC_RELAXED);
+    if (b->rebar) __atomic_sub_fetch(&g_bd12_rebar_bytes, b->size, __ATOMIC_RELAXED);
     free(b->free);
     free(b);
 }
 
+static BD12Device *g_stats_device;   /* for bd12_mem_pool_report (VRAM diagnostics) */
+
 static BD12MemPool *mem_pools(BD12Device *device)
 {
+    g_stats_device = device;
     BD12MemPool *pools = __atomic_load_n(&device->mem_pools, __ATOMIC_ACQUIRE);
     if (pools) return pools;
     pools = calloc(4, sizeof(*pools));
@@ -709,7 +792,7 @@ static int suballoc(BD12Heap *heap, int *reused)
     BD12MemPool *pool = mem_pools(device);
     if (!pool) return 0;
     pool += heap->type;
-    const VkDeviceSize align = suballoc_alignment(heap->size);
+    const VkDeviceSize align = heap->align ? heap->align : suballoc_alignment(heap->size);
     pthread_mutex_lock(&pool->lock);
     BD12MemBlock *block = NULL;
     VkDeviceSize offset = UINT64_MAX;
@@ -909,16 +992,33 @@ void bd12_zero_flush(BD12Device *device)
 }
 
 uint64_t g_bd12_heap_live[4], g_bd12_heap_bytes[4];
+/* Driver memory behind the heaps (VRAM accounting): sub-allocation blocks per heap type, dedicated heap memory. */
+uint64_t g_bd12_block_bytes[4], g_bd12_dedicated_bytes[4];
 
 
 static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
-                                  VkDeviceSize size, int zero);
+                                  VkDeviceSize size, int zero, VkDeviceSize align);
+
+BD12Heap *bd12_heap_create_for_image(BD12Device *device, VkDeviceSize size, VkDeviceSize alignment, int zero)
+{
+    /* Buffers (placed in other heaps of the same block) and optimal images must not share a granularity page: align
+     * both ends of the image's range to bufferImageGranularity (1 KiB on NVIDIA) as well. */
+    if (alignment < 256) alignment = 256;
+    if (device->buffer_image_granularity > alignment &&
+        !(device->buffer_image_granularity & (device->buffer_image_granularity - 1)))
+        alignment = device->buffer_image_granularity;
+    size = (size + alignment - 1) & ~(alignment - 1);
+    BD12_PROF_BEGIN();
+    BD12Heap *heap = heap_create_impl(device, BD12_HEAP_DEFAULT, size, zero, alignment);
+    BD12_PROF_END(BD12_PROF_HEAP_CREATE);
+    return heap;
+}
 
 BD12Heap *bd12_heap_create(BD12Device *device, BD12HeapType type,
                            VkDeviceSize size)
 {
     BD12_PROF_BEGIN();
-    BD12Heap *heap = heap_create_impl(device, type, size, 1);
+    BD12Heap *heap = heap_create_impl(device, type, size, 1, 0);
     BD12_PROF_END(BD12_PROF_HEAP_CREATE);
     return heap;
 }
@@ -930,13 +1030,29 @@ BD12Heap *bd12_heap_create_unzeroed(BD12Device *device, BD12HeapType type,
                                     VkDeviceSize size)
 {
     BD12_PROF_BEGIN();
-    BD12Heap *heap = heap_create_impl(device, type, size, 0);
+    BD12Heap *heap = heap_create_impl(device, type, size, 0, 0);
     BD12_PROF_END(BD12_PROF_HEAP_CREATE);
     return heap;
 }
 
+/* System memory the GPU can use (not device-local, not host-visible preferred): where a DEFAULT heap goes when VRAM
+ * is full. Windows demotes such allocations to system memory instead of failing, and vkd3d-proton falls back the
+ * same way; NVIDIA's Linux driver otherwise returns VK_ERROR_OUT_OF_DEVICE_MEMORY and the game treats the
+ * E_OUTOFMEMORY as fatal (Onimusha: "Fatal D3D error (6, E_OUTOFMEMORY)" with VRAM filled to the budget). */
+static int32_t sysmem_fallback_type(BD12Device *device)
+{
+    int32_t best = -1;
+    for (uint32_t i = 0; i < device->memory.memoryTypeCount; ++i) {
+        const VkMemoryPropertyFlags f = device->memory.memoryTypes[i].propertyFlags;
+        if (!(device->buffer_memory_bits & (1u << i)) || (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) return (int32_t)i;     /* plain system memory first */
+        if (best < 0) best = (int32_t)i;
+    }
+    return best;
+}
+
 static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
-                                  VkDeviceSize size, int zero)
+                                  VkDeviceSize size, int zero, VkDeviceSize align)
 {
     if (!device || !size || type < BD12_HEAP_DEFAULT || type > BD12_HEAP_READBACK)
         return NULL;
@@ -945,6 +1061,7 @@ static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
     heap->device = device;
     heap->size = size;
     heap->type = type;
+    heap->align = align;
     int reused = 0;
     if (size <= SUBALLOC_MAX && suballoc_enabled() && suballoc(heap, &reused)) {
         /* D3D12 heaps start zeroed. A range handed out before is cleared again: on the GPU for DEFAULT heaps (as
@@ -963,10 +1080,27 @@ static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = &flags,
         .allocationSize = size,
-        .memoryTypeIndex = (uint32_t)device->memory_type[type]
+        .memoryTypeIndex = (uint32_t)(type == BD12_HEAP_UPLOAD ? upload_memory_type(device, size)
+                                                               : device->memory_type[type])
     };
     VkResult result = device->vk.AllocateMemory(device->device, &allocate, NULL,
                                                 &heap->memory);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && type == BD12_HEAP_DEFAULT) {
+        const int32_t fallback = sysmem_fallback_type(device);
+        if (fallback >= 0) {
+            allocate.memoryTypeIndex = (uint32_t)fallback;
+            result = device->vk.AllocateMemory(device->device, &allocate, NULL, &heap->memory);
+            static uint64_t demoted, demoted_bytes;
+            if (result == VK_SUCCESS) {
+                const uint64_t n = __atomic_add_fetch(&demoted, 1, __ATOMIC_RELAXED);
+                const uint64_t bytes = __atomic_add_fetch(&demoted_bytes, size, __ATOMIC_RELAXED);
+                if (n == 1 || !(n % 100))
+                    fprintf(stderr, "[BD12] VRAM full: heap of %llu KiB placed in system memory (type %d; %llu heaps, "
+                            "%llu MiB so far)\n", (unsigned long long)(size >> 10), fallback,
+                            (unsigned long long)n, (unsigned long long)(bytes >> 20));
+            }
+        }
+    }
     beer_vulkan_record_result(result, "BD12 heap allocation");
     if (result != VK_SUCCESS) {
         free(heap);
@@ -980,6 +1114,12 @@ static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
         return NULL;
     }
     if (type == BD12_HEAP_DEFAULT && zero) heap_zero_fill(heap);
+    __atomic_add_fetch(&g_bd12_dedicated_bytes[type], size, __ATOMIC_RELAXED);
+    if (type == BD12_HEAP_UPLOAD && allocate.memoryTypeIndex == (uint32_t)device->memory_type[BD12_HEAP_UPLOAD] &&
+        device->memory_type[BD12_HEAP_UPLOAD] != device->upload_sysmem_type) {
+        heap->rebar = 1;
+        __atomic_add_fetch(&g_bd12_rebar_bytes, size, __ATOMIC_RELAXED);
+    }
     __atomic_add_fetch(&g_bd12_heap_live[type], 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&g_bd12_heap_bytes[type], size, __ATOMIC_RELAXED);
     return heap;
@@ -1017,6 +1157,8 @@ static void heap_destroy_impl(BD12Heap *heap)
         heap->device->vk.DestroyBuffer(heap->device->device,
                                        heap->zero_buffer, NULL);
     heap->device->vk.FreeMemory(heap->device->device, heap->memory, NULL);
+    __atomic_sub_fetch(&g_bd12_dedicated_bytes[heap->type], heap->size, __ATOMIC_RELAXED);
+    if (heap->rebar) __atomic_sub_fetch(&g_bd12_rebar_bytes, heap->size, __ATOMIC_RELAXED);
     __atomic_sub_fetch(&g_bd12_heap_live[heap->type], 1, __ATOMIC_RELAXED);
     __atomic_sub_fetch(&g_bd12_heap_bytes[heap->type], heap->size, __ATOMIC_RELAXED);
     free(heap);
@@ -1744,4 +1886,43 @@ void bd12_prof_report(void)
     bd12_gpuprof_report();
     if (sampling) sample_report();
     last = now;
+}
+
+
+/* VRAM diagnostics for the DXGI log: DEFAULT-pool blocks, bytes in use, free bytes split into never-touched tails,
+ * gaps between heaps (alignment heads and freed holes) and wholly empty blocks. */
+void bd12_mem_pool_report(char *out, size_t size)
+{
+    out[0] = 0;
+    BD12Device *device = g_stats_device;
+    if (!device || !device->mem_pools) return;
+    BD12MemPool *pool = device->mem_pools + BD12_HEAP_DEFAULT;
+    uint64_t total = 0, used = 0, tail = 0, gaps = 0, empty = 0, small_gaps = 0, lost = 0;
+    uint32_t blocks = 0, ranges = 0;
+    pthread_mutex_lock(&pool->lock);
+    for (size_t i = 0; i < pool->count; ++i) {
+        const BD12MemBlock *b = pool->blocks[i];
+        ++blocks;
+        total += b->size;
+        used += b->used;
+        uint64_t free_total = 0;
+        for (uint32_t k = 0; k < b->free_count; ++k) free_total += b->free[k].size;
+        if (b->size > b->used + free_total) lost += b->size - b->used - free_total;   /* in no list: leaked */
+        if (!b->used) { empty += b->size; continue; }
+        tail += b->size - b->fresh;
+        gaps += free_total;                       /* all free bytes in this partly used block */
+        for (uint32_t k = 0; k < b->free_count && 0; ++k) {
+            const MemRange r = b->free[k];
+            const VkDeviceSize end = r.offset + r.size;
+            const VkDeviceSize in_fresh = end <= b->fresh ? r.size : r.offset < b->fresh ? b->fresh - r.offset : 0;
+            gaps += in_fresh;
+            if (in_fresh && in_fresh < (1u << 20)) small_gaps += in_fresh;
+            ++ranges;
+        }
+    }
+    pthread_mutex_unlock(&pool->lock);
+    snprintf(out, size, "default pool: %u blocks %llu MiB, used %llu MiB, gaps %llu MiB (%llu MiB in <1 MiB holes, "
+             "%u ranges), untouched tails %llu MiB, empty blocks %llu MiB, LOST (in no free list) %llu MiB", blocks, (unsigned long long)(total >> 20),
+             (unsigned long long)(used >> 20), (unsigned long long)(gaps >> 20), (unsigned long long)(small_gaps >> 20),
+             ranges, (unsigned long long)(tail >> 20), (unsigned long long)(empty >> 20), (unsigned long long)(lost >> 20));
 }

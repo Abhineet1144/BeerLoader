@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     void *library;
@@ -1037,6 +1038,59 @@ fail:
 
 VkInstance beer_vulkan_instance(void) { return g_context.instance; }
 VkPhysicalDevice beer_vulkan_physical_device(void) { return g_context.physical_device; }
+
+/* Device-local memory as the driver accounts it (VK_EXT_memory_budget): the budget it gives this process and what
+ * the process uses, all allocations included (heaps, swapchain, acceleration structures, descriptor buffers, driver
+ * internals). 0 when the extension is missing. Rate-limited to one driver query per 100 ms. */
+int beer_vulkan_memory_budget(uint64_t *budget, uint64_t *usage)
+{
+    static int supported = -1;
+    static PFN_vkGetPhysicalDeviceMemoryProperties2 get_props;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t cached_at, cached_budget, cached_usage;
+    if (!g_context.physical_device || !g_context.instance) return 0;
+    pthread_mutex_lock(&lock);
+    if (supported < 0) {
+        supported = 0;
+        uint32_t count = 0;
+        if (g_context.EnumerateDeviceExtensionProperties &&
+            g_context.EnumerateDeviceExtensionProperties(g_context.physical_device, NULL, &count, NULL) == VK_SUCCESS &&
+            count) {
+            VkExtensionProperties *ext = calloc(count, sizeof(*ext));
+            if (ext && g_context.EnumerateDeviceExtensionProperties(g_context.physical_device, NULL, &count, ext) ==
+                       VK_SUCCESS)
+                for (uint32_t i = 0; i < count; ++i)
+                    if (!strcmp(ext[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) supported = 1;
+            free(ext);
+        }
+        get_props = (PFN_vkGetPhysicalDeviceMemoryProperties2)g_context.GetInstanceProcAddr(
+            g_context.instance, "vkGetPhysicalDeviceMemoryProperties2");
+        if (!get_props) supported = 0;
+    }
+    int ok = 0;
+    if (supported) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        if (!cached_at || now - cached_at > 100000000ull) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT mb = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+            VkPhysicalDeviceMemoryProperties2 props = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &mb };
+            get_props(g_context.physical_device, &props);
+            uint64_t b = 0, u = 0;
+            for (uint32_t h = 0; h < props.memoryProperties.memoryHeapCount; ++h)
+                if (props.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                    b += mb.heapBudget[h];
+                    u += mb.heapUsage[h];
+                }
+            cached_at = now; cached_budget = b; cached_usage = u;
+        }
+        *budget = cached_budget;
+        *usage = cached_usage;
+        ok = cached_budget != 0;
+    }
+    pthread_mutex_unlock(&lock);
+    return ok;
+}
 VkDevice beer_vulkan_device(void) { return g_context.device; }
 VkQueue beer_vulkan_queue(void) { return g_context.queue; }
 uint32_t beer_vulkan_queue_family(void) { return g_context.queue_family; }
@@ -1097,6 +1151,21 @@ PFN_vkGetDeviceProcAddr beer_vulkan_get_device_proc_addr(void)
 void beer_vulkan_queue_lock(void) { pthread_mutex_lock(&g_queue_lock); }
 void beer_vulkan_queue_unlock(void) { pthread_mutex_unlock(&g_queue_lock); }
 uint32_t beer_vulkan_queue_count(void) { return g_context.queue_count ? g_context.queue_count : 1; }
+
+/* vkDeviceWaitIdle needs host access to every queue of the device (external synchronization): BD12 submits on
+ * several queues from several threads, so a presenter swapchain recreate or post-pass resize that called it bare
+ * raced live vkQueueSubmit2 calls (Onimusha: Xid 32 "corrupted push buffer" / Xid 13 at scene changes, right after
+ * swapchain recreates). Holds every queue lock, index order, around the wait. The caller holds none of them. */
+void beer_vulkan_device_wait_idle(VkDevice device, PFN_vkDeviceWaitIdle wait_idle)
+{
+    if (!device || !wait_idle) return;
+    const uint32_t count = beer_vulkan_queue_count();
+    pthread_mutex_lock(&g_queue_lock);                   /* index 0 and the shared default */
+    for (uint32_t i = 1; i < count; ++i) pthread_mutex_lock(&g_queue_locks[i]);
+    wait_idle(device);
+    for (uint32_t i = count; i-- > 1;) pthread_mutex_unlock(&g_queue_locks[i]);
+    pthread_mutex_unlock(&g_queue_lock);
+}
 VkQueue beer_vulkan_queue_at(uint32_t index)
 {
     return index < g_context.queue_count ? g_context.queues[index] : g_context.queue;

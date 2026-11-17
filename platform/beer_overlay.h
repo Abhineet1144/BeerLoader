@@ -9,11 +9,23 @@
 typedef struct {
     int x, y, w, h;          /* position and size on the output image, pixels */
     const uint8_t *bgra;     /* w*h*4 bytes, B G R A (straight alpha) */
-    uint64_t serial;         /* changes whenever the pixels changed */
+    uint64_t serial;         /* changes whenever the pixels changed (per slot) */
+    int slot;                /* upload region 0..BEER_OVERLAY_SLOTS-1, fixed per box */
 } BeerOverlayRect;
 
-/* Returns the number of visible boxes (0 when the overlay is hidden), filling rects[0..n). */
-int beer_overlay_frame(int out_w, int out_h, BeerOverlayRect rects[2]);
+/* Slots: 0 resource panel, 1 pinned values, 2 alert banner, 3.. mod boxes (overlay_box_set). */
+#define BEER_OVERLAY_SLOTS 12
+#define BEER_OVERLAY_MOD_BOXES (BEER_OVERLAY_SLOTS - 3)
+#define BEER_OVERLAY_REGION_BYTES (2u * 1024u * 1024u)   /* largest box bitmap per slot */
+
+/* Returns the number of visible boxes, filling rects[0..n). */
+int beer_overlay_frame(int out_w, int out_h, BeerOverlayRect rects[BEER_OVERLAY_SLOTS]);
+
+/* 1 while the overlay is shown with opacity below 100%: the presenter must blend it (post pass), not copy it. */
+int beer_overlay_translucent(void);
+
+/* Centred alert banner shown even while the overlay is hidden ("" removes it). Lines split by \n. */
+void beer_overlay_set_alert(const char *text);
 
 /* Key event from the window thread. Returns 1 when the event was the overlay hotkey and must not reach the game. */
 int beer_overlay_hotkey_event(unsigned long keysym, unsigned state, int down);

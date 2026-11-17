@@ -217,11 +217,20 @@ BeerAudioStream *beer_audio_stream_open(unsigned rate, unsigned channels, const 
     uint32_t bytes_per_second = rate * channels * (uint32_t)sizeof(int16_t);
     pa_buffer_attr attr = {
         .maxlength = bytes_per_second * 2u / 5u, /* 400 ms hard ceiling */
-        .tlength = bytes_per_second * 7u / 50u, /* target about 140 ms: headroom for a stalled mixer thread */
+        .tlength = 0,                       /* set below (BEER_AUDIO_TARGET_MS) */
         .prebuf = 0,                        /* start immediately; an underrun must not re-enter prebuffering and stall */
         .minreq = bytes_per_second / 100u, /* 10 ms refill granularity */
         .fragsize = UINT32_MAX,
     };
+    {   /* The sound server sizes the device period from the target buffer: 140 ms raised PipeWire's quantum to its
+         * 2048-frame maximum, and the device's own buffer (two periods, ~85 ms) then ate the whole WASAPI latency
+         * margin, so the stream ran empty every period (distorted sound while playing). Default 50 ms. */
+        const char *t = getenv("BEER_AUDIO_TARGET_MS");
+        unsigned ms = t && atoi(t) > 0 ? (unsigned)atoi(t) : 50u;
+        if (ms < 20) ms = 20;
+        if (ms > 400) ms = 400;
+        attr.tlength = bytes_per_second / 1000u * ms;
+    }
     int error = 0;
     s->stream = g_pulse.simple_new(NULL, "Beer", PA_STREAM_PLAYBACK, NULL, s->name, &spec, NULL, &attr, &error);
     if (!s->stream) {

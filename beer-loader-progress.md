@@ -1,5 +1,41 @@
 # Beer Loader — Active Development Context
 
+## Chained Together — solo gameplay works (2026-11-17, user confirmed)
+
+**RESOLVED:** entering gameplay returned to the title screen; it was not a crash or GPU device loss.
+User confirmed "works now" after the real local networking backend was enabled.
+
+- The earlier lobby-only diagnosis below was incomplete: the signed-in Steam session and matchmaking were
+  already initialized (the installed proxy selected app 480), but the solo listen-server path called unsupported
+  `ISteamNetworkingSockets012` methods. No `CreateLobby` call occurred at the initial failure boundary.
+- First blocker: `GetIdentity` (vtable slot 21, caller 0x14377fdf1) returned false through the shared zero stub.
+  It now returns the actual provider-session SteamID using the documented 136-byte packed
+  `SteamNetworkingIdentity` layout (type 16, payload size 8). Unknown identity still fails and clears output.
+- Next blocker, exposed after that fix: `CreateListenSocketP2P` (slot 2, caller 0x143782661) returned invalid
+  handle 0, so Unreal failed to initialize its solo listen server and returned to title.
+- Added `platform/beer_steam_networking.{c,h}`: an opt-in native GameNetworkingSockets C-API adapter, with
+  Win64 wrappers in `platform/win32_steam_matchmaking.inc`, for genuine P2P listeners and poll-group
+  creation/assignment/polling/destruction. Handles belong to Valve's real backend; no dummy socket or lobby
+  success, guest-code patch, fabricated certificate, or forced game branch was used. Guest callback options
+  are rejected rather than invoked with the wrong native ABI. Remote Steam signaling/relay authentication
+  remains unavailable: this result validates solo gameplay, not multiplayer interoperability.
+- Backend activation: `BEER_STEAM_NETWORKING_LIBRARY` points to `libGameNetworkingSockets.so`.
+  Persistent installed copy: `~/.local/share/beer/native/steam-networking/libGameNetworkingSockets.so`, alongside
+  `libprotobuf.so.32*` and both licenses. Library rebuilt with `$ORIGIN` RPATH for its adjacent protobuf runtime.
+  This is optional/explicitly enabled, not automatically enabled for all manager launches.
+  Successful diagnostic run used the temporary build `/tmp/beer-gns-build/bin/libGameNetworkingSockets.so`
+  with `LD_LIBRARY_PATH=/tmp/beer-gns-deps/root/usr/lib/x86_64-linux-gnu`, official Steam mode, existing default
+  prefix, FMOD audio and the manager's shader-cache/vkd3d-shader settings.
+- Diagnostics: `BEER_STEAM_DIAGNOSTICS=1` logs lobby requests/results, callbacks, identity and listener creation;
+  unsupported-method callers are deduplicated so per-frame SDK polling cannot hide gameplay-only calls.
+  Main evidence: `/tmp/beer-ct-transition2.log`, `/tmp/beer-ct-identity-run.log`,
+  `/tmp/beer-ct-transport-run.log`; final desktop capture `/tmp/beer-ct-result.png`.
+- Validation: loader builds, `make test-steam`, `make test-input`, identity ASan/UBSan tests, and real-library
+  resource tests passed (duplicate virtual port rejected, close/rebind, poll-group lifetime and invalid handles).
+  Final gameplay success confirmed interactively by the user; no claim of multiplayer or long-duration soak.
+- Live-run preference: user handles all inputs as soon as the window opens. Do not automate clicks/keys;
+  continue investigating for approximately a minute after launch before checking the attempt.
+
 ## WORK PLAN (read first, every session) — agreed 2026-11-11
 
 **PENDING after 2026-11-13 session (all work since 14bdfde is UNCOMMITTED).** Done that day: RE8 RT ~parity with
@@ -13,13 +49,325 @@ Proton, DLSS, DLSS FG + Reflex (XMM6 fix), RE9 DX12U mesh path (barycentrics). U
 0. **(Next session first, user 2026-11-13) Finish DXR:** local root signatures (shader-record arguments; dxil-spirv
    has `converter_add_local_root_*`) and state objects without a DXIL library (collections / config-only). DXR stays
    default-on meanwhile; Stellar Blade dies at start-up until then (see "DXR / mesh / VRS default-on" below).
-0b. **Audio crackle in the new RE Engine games (RE9, PRAGMATA, Onimusha), user 2026-11-13:** constant
-   static/noise over the sound, "like a radio in bad weather" (crackle, hiss, distortion). RE8 not reported. Suspects to
-   check: sample format/rate conversion (float32 vs int16, 48 kHz mixing), channel-mask/layout (7.1/5.1 downmix),
-   XAudio2/WASAPI buffer underruns (period vs `BEER_AUDIO_LATENCY_MS`), or clipping in the mix.
-   User detail: silence is clean; the distortion is only ON the sound while it plays ("distorted a bit"), not a
-   constant hiss => points at the samples themselves (format/bit-depth or rate conversion, wrong channel mapping or
-   downmix gain, clipping/saturation), less likely at underruns (those give gaps/clicks).
+0b. ~~Audio distortion in new RE Engine games~~ **FIXED 2026-11-14** (user confirmed clean in RE9, no audible lag).
+   Symptom: "radio in bad weather" noise/distortion ON the sound while it plays (RE9, PRAGMATA, Onimusha); silence
+   clean. Cause: the Pulse stream asked for a 140 ms target buffer, so PipeWire raised the device quantum to its
+   2048-frame max (~43 ms); the WASAPI clock (position = server-heard + BEER_AUDIO_LATENCY_MS 40 ms) counts the
+   device's own ~2-period buffer as "queued", so the stream itself held ~0 ms and PipeWire padded every quantum.
+   Proof chain: BEER_WASAPI_DUMP (new; raw client packets) sounded clean; `parec --monitor-stream=<Beer sink-input>`
+   matched the dump at 58-71 dB (bit-exact path); pw-top ERR 0; paplay of the dump during RE9 clean;
+   BEER_AUDIO_LATENCY_MS=150 clean. Fix (generic): target buffer 50 ms (`BEER_AUDIO_TARGET_MS`, 20-400) => quantum
+   512, margin 40 ms suffices. Remaining underruns only in the first ~6 s of start-up. Method: dump the client mix,
+   record ONLY Beer's stream (`--monitor-stream`; the sink monitor also had a browser stream), A/B by ear.
+0c. **WOW32 bring-up with the SIFU FitGirl installer (2026-11-14, user: "make Beer support it bit by bit").**
+   `/mnt/hdd1/Downloads/setup.exe` = Inno Setup loader (PE32) -> extracts `setup.tmp` (Delphi VCL wizard, PE32) to
+   C:\Windows\Temp\is-*.tmp and runs it with /SL5. Crashed runs leave is-*.tmp dirs there (harmless).
+   DONE (platform/wow32_win32.inc, new; platform/wow32.inc):
+   - Loader stage runs end to end: extract, hidden STATIC window + subclass, CreateProcessW child, wait, exit code,
+     cleanup. Only a crash at its own shutdown remains (eip 0x40681e, after DestroyWindow; likely RaiseException).
+   - kernel32: pseudo system modules (GetModuleHandleW, LoadLibrary* for system DLLs), GetSystemInfo (36-byte
+     layout), 32-bit critical sections (futex), Interlocked*, TLS in TEB32 slots, Local/Global heap, VirtualAlloc/
+     Free/Query below 2 GiB, SECURITY_ATTRIBUTES / PROCESS_INFORMATION / handle-array translation (Wait*/MsgWait*:
+     4-byte HANDLE arrays; the 64-bit impl read 8-byte entries and returned at once, so the loader deleted
+     setup.tmp while the child started -> child exit 1, no output), FindResource*W, disk free space, FormatMessageW,
+     GetFullPathName (32-bit lpFilePart), BSTR/VARIANT basics, ~90 forwarders.
+   - **Widening rule** `w32_widen`: sign-extend only 0xFFFF0000+ and HKEY 0x80000000..0xFF; zero-extend the rest
+     (Beer's HWND 0xD000xxxx / HDC 0xDC.. were mangled by plain sign-extension).
+   - user32: window-procedure bridges both ways (64 bridges; CREATESTRUCT/WINDOWPOS/MINMAXINFO/NCCALCSIZE/
+     STYLESTRUCT/WM_SETTEXT copied below 4 GiB), Set/GetWindowLong(GWL_WNDPROC), CallWindowProc, RegisterClass(Ex)W,
+     Peek/Get/DispatchMessageW (28-byte MSG). loader.c: predefined control classes (STATIC, BUTTON, EDIT, ...) now
+     exist with DefWindowProcW when not registered by the program (was ERROR_CLASS_DOES_NOT_EXIST).
+   NEXT: setup.tmp (child) stops at GetDC/GetDeviceCaps -> NULL call. It imports 377 more functions: user32 153,
+   gdi32 82, comctl32 35, kernel32 43, oleaut32 15, ole32 13, advapi32 12, shell32 8, mpr 5, winspool 5, version 3,
+   comdlg32 2, msimg32 1. Also needed: CreateThread/ExitThread (WOW32 threads), SEH (RaiseException/RtlUnwind,
+   FS:[0] chain; Delphi raises in normal flow), 32-bit DLL images (FitGirl's ISDone/unarc). Beer draws no standard
+   controls, so the wizard UI would be invisible: try Inno's `/VERYSILENT /SUPPRESSMSGBOXES /DIR=...` path first.
+  Chained Together: **RESOLVED 2026-11-17, user confirmed solo gameplay works.** The earlier lobby diagnosis
+  was superseded: missing SteamNetworkingSockets identity and real P2P listener/poll-group support blocked
+  the solo listen server. See the resolution at the top; multiplayer remains unverified.
+0e. **Onimusha gameplay stutter (2026-11-14, user: "investigate stutters in onimusha").** Symptom: 50-2300 ms
+   hitches while moving; otherwise 120 fps. `BEER_BD12_HITCH=40 BEER_BD12_PROF=1` (log oni_stutter1): every gameplay
+   hitch has pso>0 (e.g. pso=4066ms/7, 1258ms/28; 4-21 s of compile per 2 s window across the game's worker threads,
+   ~100-600 ms per pipeline = driver cache misses); the render thread is idle, waiting in msvcp140 (0x7ffff5b722c5,
+   condition variable) on the game's own compile job. Cause this time: all NVMe NTFS partitions mounted READ-ONLY
+   since boot (Windows fast startup / hibernation; same as 2026-11-11), so the NVIDIA cache (GLCache last written
+   2026-11-13 02:44), Beer's translation cache and the game's shader.cache2 save nothing: every new pipeline
+   compiles cold on every launch. Loader warning was present (`[SHADER-CACHE] WARNING ... not writable`).
+   RESOLVED after remount rw (user: "yeah good now"; log oni_stutter2): NVIDIA cache grew 554 -> 646 MB, pipelines
+   now hit the cache (pso=22.5ms/45, ~0.5 ms each), steady 120 fps. Leftover rare hitches 40-180 ms: one
+   vk-submit=77 ms/14 (driver), descriptor-copy/view-create bursts 2-7 ms on streaming frames. Not chased yet.
+0f. **Manager improvements (2026-11-14, user requests).**
+   - Every path setting has the exe-picker file dialog (`add_path_picker` in manager/beer_manager.py): loader binary,
+     vkd3d library, shader cache folder, Steam provider, DLSS/NGX folder, extra DLL folders (appends with ':').
+   - Symptom "overlay opacity ignored in every game except RE8": BGRA8/RGB10A2 back buffers take the direct-blit present
+     path, whose overlay was a plain buffer->image copy (opaque). Now frames with a translucent overlay go through the
+     upload image + post pass that blends (`beer_overlay_translucent()`, vulkan_presenter.c), like screenshots.
+   - **Frame breakdown** (manager "Frame…" button, manager/frame_window.py): control command
+     `gfx_frame_capture {"dir"}` (+ `gfx_frame_capture_status`) arms the BD12 trace + render-target capture for the
+     next present without env vars, writes PPMs (scale 2, depth up to 17 MP) and `done`; the window shows every pass
+     in order with stepping/playback. Depth files are now named `rt<pass>_dp<n>_...` so they sort with their pass.
+     Verified on the RE8 title (38 pictures, game kept 258 fps, two captures in a row).
+0g. **Upscaler override roadmap (2026-11-14, user order: 1, 4, then 2/3; after finishing DXR).**
+   1. Per-game internal-resolution ratio (any %, DLAA, custom WxH) + DLSS preset override for games with DLSS
+      (answer the game's optimal-settings query; RE9 first).
+      Same step (user): the low-memory guard (item 0h).
+      DONE 2026-11-14 (resolution + preset): platform/win32_ngx.inc wraps the NGX core (_nvngx.dll) exports
+      Get/AllocateParameters + CreateFeature (GetProcAddress on the guest DLL, only when an override is set);
+      replaces "DLSSOptimalSettingsCallback" with Beer's (calls the real one, then reports OutWidth/OutHeight and
+      Dynamic.Min/Max from BEER_DLSS_RATIO=<percent> or BEER_DLSS_RENDER=WxH; 0x0 = unsupported mode kept), and at
+      CreateFeature sets PerfQualityValue to the matching mode (100% = DLAA) + every DLSS.Hint.Render.Preset.* from
+      BEER_DLSS_PRESET=<letter|0>. NVSDK_NGX_Parameter vtable (MSVC reverses overloads; verified in the driver DLL
+      via RTTI .?AUNVSDK_NGX_Parameter_D3D12@@): Set 0 void* / 3 int / 4 uint / 5 double / 6 float / 7 ull, Get 8
+      void** / 11 int / 12 uint / 13 double / 14 float / 15 ull, 16 Reset; only integer slots used (loader.c no SSE).
+      Verified RE9 (Streamline): Balanced 1485x835 -> 1280x720 at 50%, DLSS created mode 0 preset K (11).
+      Live since 2026-11-14 (user): control settings dlss_ratio (milli-percent, 10..100, 0 = off) / dlss_width /
+      dlss_height / dlss_preset (-1 game, 0 DLL default, 1=A..) in beer_control.c, seeded from BEER_DLSS_*; the NGX
+      wrappers are always installed and read them on every optimal-settings query / CreateFeature, so a change applies
+      when the game next asks (switch its DLSS mode or resolution). Manager: DlssControls (override switch, 10-100%
+      slider with UP/P/B/Q/UQ/DLAA marks, custom WxH box that overrides the slider, preset) in game settings and,
+      live, in an expander on the running card (debounced "set" commands, remembered per game).
+      Bugs found while testing live (2026-11-14, Onimusha): (1) FREEZE: every control "set" called apply_time(), and
+      the first clock change makes every guest clock read take a mutex; a guest thread suspended (SuspendThread signal)
+      inside a clock read held it -> all threads asleep. Fixed: only time_scale/paused call apply_time, and
+      beer_time.c reads are lock-free (seqlock). (2) DEVICE LOST (Xid 13 SKEDCHECK36 in a compute dispatch, Streamline
+      "Failed to signal on the command queue", "Fatal D3D error (1, E_FAIL)"): render 736x414 (28.7%) is below DLSS's
+      minimum (UltraPerformance 33.3%)? NOT proven: DLSS runs below 33% elsewhere (DLSSTweaks users run 20-25%), and
+      both incidents followed an in-game video end (MF EOS) with DLSS-FG/Reflex active. A floor was added and then
+      removed on the user's objection; the reported minimum is only logged now.
+      Live size changes only reach a game when it asks DLSS again: Onimusha fetches all six mode sizes once at start
+      and caches them, so slider moves don't apply (next idea: "Apply now" = nudge the output size so the game
+      re-queries; first check whether a manual resolution change re-queries).
+      GPU faults traced to the mode switch (2026-11-14): Beer changed PerfQualityValue to the mode "matching" the size;
+      80.5% -> DLAA with a 2062x1160 input (Xid 32 freeze), 28.7% -> UltraPerformance below 853x480 (Xid 13 device
+      lost). Now the game's mode is kept, as DLSSTweaks does; only size + preset are overridden. User: live size
+      changes apply after toggling DLSS off/on in the game.
+      "No upscaling" (user, 2026-11-14): DLSS model choice "none" -> dlss_bypass (live, per frame) / BEER_DLSS_PRESET=
+      none; NVSDK_NGX_D3D12_EvaluateFeature is wrapped and, for super-sampling handles, replaced by
+      bd12_debug_stretch (vkCmdBlitImage, linear, Color subrect -> Output, GENERAL layout) in the game's command list. OPEN: find the real cause (A/B: 25%
+      with frame generation off vs on; no override through the same video transition).
+
+   4. Output above the monitor (DSR-like): offer a larger display mode, downscale in the presenter with a proper filter.
+   2. FSR 3.1 ffx-api -> DLSS (Beer-built amd_fidelityfx_dx12.dll; Beast = FSR-only test, Onimusha to A/B vs native
+      DLSS). Needs a user-supplied nvngx_dlss.dll for FSR-only games.
+   3. Split FSR DLLs (amd_fidelityfx_loader/upscaler_dx12: RE9, PRAGMATA, Forza), XeSS -> DLSS, FSR 3.0 (GoT).
+   Not planned: statically linked FSR (exe patching); FSR FG -> DLSS-G (keep game FSR FG).
+   5. **Recording/streaming (user, 2026-11-14: after the upscaler work; scope = these three only, no webcam/scenes):**
+      (a) replay buffer (last N s in memory, save on hotkey), (b) manual recording MP4/MKV (HDR = 10-bit HEVC/AV1),
+      (c) RTMP streaming (Twitch/YouTube). Capture the present image before the overlay; game-only audio from the
+      WASAPI render path (same tap as BEER_WASAPI_DUMP), optional mic via PipeWire; NVENC through dlopen'd ffmpeg 8
+      (libavcodec.so.62) or Vulkan video encode (VK_KHR_video_encode_h264/h265/av1 present); GPU RGB->NV12/P010
+      in the post pass; manager page + hotkeys. Optional at runtime (no hard ffmpeg dependency; ARM64 unaffected).
+0h. **Low-memory guard - BUILT 2026-11-14** (beer_control.c memguard_thread; overlay alert banner beer_overlay_set_alert;
+   manager warning row + Continue + desktop notification + per-game settings). Every 0.5 s: MemAvailable and the cgroup
+   room under min(memory.max, memory.high). Trigger (not in the first 10 s, not within 60 s after Continue): banner +
+   10 fps cap, then after 0.7 s the clocks freeze ("paused" parks clock-reading threads incl. the render thread, so the
+   banner is drawn first and stays as the last frame). Continue = memguard_resume or unpausing. Settings: memguard,
+   memguard_free_mb (1024), memguard_margin_mb (300), memguard_auto_resume (+512 MB / 2x margin hysteresis); env
+   BEER_MEMGUARD*, status JSON "memguard". Tested on RE8 with BEER_MEMGUARD_FREE_MB=60000: pause, status, Continue OK.
+   Manager (user, 2026-11-14): per-game "Memory" group (memory cap: systemd-run --user --scope, MemoryMax=cap,
+   MemoryHigh=94%, MemorySwapMax; same PID so tracking/control socket unchanged) + the guard settings; the DLSS and
+   Memory groups now sit above "Loader options".
+   Original idea (user, 2026-11-14; done together with upscaler step 1, the resolution override):
+   When system RAM is about to run out (MemAvailable, /proc/pressure/memory, cgroup memory.current vs max/high) or a
+   user-set amount is reached: freeze game clocks (existing "paused" setting), drop to ~10 fps, draw a "Low memory -
+   game paused" banner (even with the overlay hidden), manager notification with Continue + live memory readout; per
+   game threshold / on-off / auto-resume when memory recovers (hysteresis). Optional hard freeze (suspend the process,
+   e.g. cgroup freezer) if usage keeps climbing - then only the manager can show the message.
+0i. **Steam provider silently loses its Steam connection (2026-11-14).** Symptom: an official-session game (Onimusha
+   DEMO) fails to start from the manager: log stops at `GetISteamGenericInterface(STEAMAPPTICKET_INTERFACE_VERSION001)`
+   (hang) or steamdrmp.dll calls TerminateProcess(54). `beer-steam serve` still reported state "signed_in" but an
+   `app_ticket` request got no answer (cm_request waits 20 s). Restarting the provider fixed it (ticket in 0.4 s).
+   TODO: provider should notice a dead CM connection (heartbeat / unanswered request) and reconnect + retry, and
+   report "reconnecting" instead of signed_in; the loader should not hang the game on a stalled ticket.
+0j. **Onimusha: ~160 ms spike every ~10 s in gameplay (2026-11-14, user: "tiny spike every few seconds").**
+   Pattern: one hitch every ~1165 presents (~10 s at 120 fps with FG); presenting thread waits in sl.common.dll for
+   the GPU, 150-500 minor faults per spike; every spike directly follows `[MF] IMFSourceReader::ReadSample ... -> EOS`
+   (a looping in-world video). Cause: SetCurrentPosition restarts the ffmpeg decoders with fork() x2; forking a
+   ~5 GB, ~80-thread process copies page tables and write-protects all memory -> every game thread faults, ~150 ms
+   stall. Fix: media_foundation.c mf_spawn_ffmpeg = posix_spawnp (CLONE_VM|CLONE_VFORK, no address-space copy).
+   Ruled out on the way: malloc_trim (now logged when >2 ms: 0.0 ms), pipeline-cache save (300 s), VRAM (13.8/16 GB).
+   BEER_BD12_GPU_PROF caused a device loss in Onimusha gameplay (profiler unusable there; open).
+   After posix_spawn: 160 ms -> 40-70 ms per loop, minflt 0 (ffmpeg start + first-frame latency: the game's video
+   job waits for frame 0). Fix: a reader rewound once keeps a spare decoder pair started from the beginning
+   (MfDecoderPair spare; 1 MB video pipe so it decodes ahead); the next SetCurrentPosition swaps it in. Run 5 with the
+   wait-idle fix: 22 video loops, 0 device lost, 0 Xid. Run 6 with the spare: 21 loops, 0 device lost, 0 Xid; only 2 of
+   the last 8 loops still followed by a 40-50 ms hitch (before: nearly all). User: "much better now".
+   HANG/FAULT at scene changes (same day, several runs): GPU Xid 32 ("corrupted push buffer", 19:25 and 19:59) and
+   Xid 13 (17:26), each right after the Vulkan presenter recreated its swapchain at the same size following a video
+   EOS; the game then waits on a fence forever (SIGUSR1 dump: "bd12 lane 0 submitted=71771 retired=71445").
+   Earlier blamed on the DLSS mode switch and on the MF change, wrongly. Cause: destroy_swapchain() and the post
+   pass's prepare_images()/screenshot resize called vkDeviceWaitIdle with no queue lock, while BD12 submits on
+   several queues from other threads (vkDeviceWaitIdle requires host access to ALL queues). Fix:
+   beer_vulkan_device_wait_idle() takes every queue lock (index order) around it. Method: `kill -USR1 <pid>` prints
+   Beer's per-thread stacks/waits into the log (no ptrace needed); kernel journal for Xid.
+   Also fixed: low-memory guard counted the cgroup page cache (3.7 GB of game files) as usage -> false "close to its
+   memory cap" pauses at 5 GB real; now memory.current - (file - shmem).
+0k. **Onimusha runs out of VRAM and crashes (2026-11-15, user, own save in prefix "Onimusha").**
+   Symptoms: "Fatal D3D error (6, E_OUTOFMEMORY, 0x8007000e)" after ~1 min; nvidia-smi ~15 GB of 16 even at DLSS 50%.
+   Findings: (1) DXGI QueryVideoMemoryInfo reported only BD12 DEFAULT heap bytes (1.7 GB while 13.8 GB in use) ->
+   now the driver's VK_EXT_memory_budget usage/budget (beer_vulkan_memory_budget, 100 ms cache;
+   BEER_DXGI_HEAP_USAGE_ONLY=1 = old). (2) With real figures the game still fills to the budget: heaps ~10.5-11 GB +
+   Beer overhead ~2.4-2.8 GB (58k live pipelines ~40 KB VRAM each; upload heaps ~0.7 GB in ReBAR VRAM; block slack)
+   -> hard OOM: NVIDIA Linux refuses device-local allocations where Windows demotes to system memory.
+   Fixes (built after the run): DEFAULT heap allocation falls back to plain system memory on
+   VK_ERROR_OUT_OF_DEVICE_MEMORY ("[BD12] VRAM full: heap ... placed in system memory"), budget reported 1 GiB below
+   the driver's; BEER_BD12_RELEASE_PIPELINES=1 cut live pipelines 58k -> 19k (not default yet; decide after test).
+   New diag: the 5 s DXGI log line shows heaps + driver blocks + dedicated MiB.
+   User asked to cut Beer's ~2 GB extra (manager run, no env: process 13.1 GB = heaps 10.3 + block slack 0.6 +
+   other 2.0; the game streams past the budget, so headroom alone does little). Done: UPLOAD heaps go to system
+   memory once usage > 80% of the budget (upload_memory_type; ReBAR stays for early/hot ones); new compile-at-create
+   pipelines are warmed+released above 85% (keep_pipelines, re-checked every 64); DEFAULT sub-allocation blocks
+   256 -> 128 MB. Not done (unsafe): evicting already-live pipelines (recorded-but-unsubmitted lists reference them).
+   Beer vs Wine, same save + settings (user, 2026-11-15): title screen Wine 2.4 GB vs Beer 6.4-6.7 GB; in game Beer
+   14.3 GB. Causes found: (a) committed images rounded to 64 KiB + pow2-of-size alignment in blocks: 5.6 GB driver
+   memory for 3.9 GB heaps -> bd12_heap_create_for_image packs at the image's own alignment (>= 256 B and
+   bufferImageGranularity; BEER_BD12_IMAGE_64K=1 = old): Onimusha title 6.6 -> 5.07 GB, RE8 title 1.96 -> 1.66 GB;
+   (b) GetResourceAllocationInfo always reported >= 64 KiB for textures; D3D12 small-resource placement (4 KiB when
+   requested, not RT/DS, not MSAA, <= 64 KiB, driver alignment <= 4 KiB) now honoured, so engines packing small
+   textures into their own heaps (RE Engine) use far less. Measure Onimusha again after (b).
+   (b) did not change the title (game heaps still 3.88 GB). The Wine comparison was UNFAIR: DXVK's dxgi "Hiding
+   actual GPU" reported AMD 1002:73df (RX 6700 XT), so under Wine the game ran without DLSS/DLSS-G/Reflex/Streamline.
+   Beer with the same AMD spoof (BEER_SPOOF_GPU_*): title 3.26 GB (heaps 2.45 GB) vs Wine 2.4 GB -> Beer's real
+   overhead ~0.9 GB at the title; the NVIDIA path (DLSS + frame generation) adds ~1.8 GB on its own (5.07 GB).
+   Remaining Beer overhead: block slack (driver 3.1 GB for 2.45 GB heaps) + pipelines/descriptors.
+   GAP MOSTLY CLOSED (2026-11-15 evening): new "[DXGI] default pool: ..." diagnostic (bd12_mem_pool_report) showed
+   ~690 MB free in DEFAULT blocks at the title: 128 MB spare + ~565 MB of bin-packing waste (heaps up to 32 MiB carved
+   from 128 MiB blocks; ~33 MB per block that a big heap no longer fits; no leak, LOST 0). SUBALLOC_MAX 32 -> 8 MiB
+   (bigger heaps get exact-size memory): title (AMD spoof) 3.29 -> 2.73 GB vs Wine 2.4 GB; pool now 8 blocks, free
+   ~170 MB incl. the spare. Remaining ~0.3 GB: spare block 128 MB + non-heap ~110 MB + driver rounding.
+   In-game near full (manager run, real NVIDIA + DLSS FG): heaps 12.56 GB (game streams past budget), driver slack
+   ~0.2 GB, non-heap ~2.1 GB = mostly UPLOAD heaps in resizable-BAR VRAM (1.15 GB blocks + up to 0.68 GB dedicated);
+   19k live pipelines (~0.3 GB). New counters in the 5 s log: "[DXGI] non-heap: N live pipelines, upload in VRAM ...".
+   Fix: ReBAR upload capped at 1/16 of the VRAM heap (vkd3d-proton's heuristic; BEER_BD12_REBAR_UPLOAD_MB), applied
+   only when usage > 60% of the budget so roomy games are unchanged (user: "do not let these changes affect re8").
+   RE8 check: cap never hit, 366 fps, upload in VRAM 128 MB, 158 pipelines.
+   (older) OPEN (user, 2026-11-15: "there is still a GB difference and that needs checking"): Beer (AMD spoof) 3.26 GB vs
+   Wine 2.4 GB at the Onimusha title, same save/settings. Leads, in order: (1) sub-allocation slack: 3.1 GB driver
+   memory for 2.45 GB heaps (~0.65 GB): game heaps and buffers still use pow2-of-size alignment (up to 4 MiB) and
+   64 KiB committed-buffer rounding; per-block free lists, one spare 128 MB block per type; (2) non-heap memory
+   ~0.2 GB (pipelines, descriptor buffers, swapchain); (3) compare per-category with vkd3d-proton's own logs
+   (VKD3D_DEBUG / memory info) at the same screen. Method: Beer launch with BEER_SPOOF_GPU_NAME='AMD Radeon RX 6700 XT'
+   BEER_SPOOF_GPU_VENDOR=1002 BEER_SPOOF_GPU_DEVICE=73df BEER_SPOOF_GPU_VRAM_MB=16376 (matches DXVK's report), wait
+   45 s at the title, read the 5 s DXGI log line + nvidia-smi --query-compute-apps.
+   RESOLVED 2026-11-15 evening: the blue squares are FSR FRAME GENERATION artifacts, not the packing changes. User:
+   squares with FSR FG selected in-game, gone after switching to DLSS FG. Evidence: neither BEER_BD12_SMALL_RESOURCE=0
+   nor BEER_BD12_IMAGE_64K=1 removed them; new placement check ("[BD12] placed image needs ... but allocation info
+   said") logged 0 mismatches in gameplay; frame breakdown at the spot showed a clean G-buffer. -> see FSR FG item.
+   (old note) REGRESSION to resolve FIRST (user screenshot 2026-11-15 05:54, Kyoto bamboo area): small dark-blue squares
+   scattered over the image (texture corruption) after tonight's packing changes. No VRAM fallback was active in
+   that run (no "VRAM full"/"VRAM at" lines). Suspects: (1) D3D12 small-resource 4 KiB alignment in
+   dev_get_allocation_info (game packs small textures 4 KiB apart; overlap if the created image is larger than the
+   estimate) -> A/B with BEER_BD12_SMALL_RESOURCE=0 (switch built 05:56, NOT tested yet); (2) committed-image packing
+   (bd12_heap_create_for_image) -> A/B with BEER_BD12_IMAGE_64K=1. Same run showed the packing working: 11.15 GB
+   driver memory for 11.0 GB heaps (slack ~0.1 GB, was ~0.6). If (1): compare bd12_image_requirements() with the
+   VkMemoryRequirements of the image actually created for placed resources (log mismatches), or drop small-resource.
+
+   Also: a null-object crash at RVA 0xf541fe0 ~25 s after loading the save in my gamerun launches only (Wine OK,
+   the user's manager launch OK); CoCreateInstance of unknown CLSID 271c3902-6095-4c45-a22f-20091816ee9e now returns
+   REGDB_E_CLASSNOTREG (was E_FAIL), still crashed in gamerun -> cause open (env/timing difference vs manager).
+0l. **FSR 3 frame generation renders small dark-blue squares (Onimusha, 2026-11-15) - PARKED (user: "ignore fsr fg for now, just record"; use DLSS FG).** Symptom: scattered navy
+   ~8-16 px blocks over the frame (screenshot: Kyoto bamboo area) with FSR FG on; DLSS FG is clean. Onimusha ships
+   amd_fidelityfx_dx12.dll (FSR 3.1 ffx-api). Not memory layout (A/B switches + placement check clean). Ideas: FG
+   compute shaders (optical flow / interpolation) hitting a Beer translation or binding gap (wave intrinsics,
+   16-bit types, typed UAV loads, sampler feedback?), NaN/uninitialised resources, or present/swapchain hooks
+   (ffxReplaceSwapchainForFrameinterpolation / FSR's own swapchain proxy). Next: frame-capture with FSR FG on,
+   then BEER_BD12_CAPTURE_CS on the FG dispatches; compare with Wine (FSR FG works there with the AMD-spoofed GPU).
+0m. **General mod API in the manager (user idea, 2026-11-16; queued after the upscaler work unless moved).**
+   NOT speedrun-specific (user: e.g. "just enemy health visible in RE8"; speedrun timers are only one possible mod).
+   Building blocks over the existing per-game control socket: versioned documented protocol v1 (mem_*, obj_*,
+   overlay_*, gfx_*, post_*, set/status/key, frame capture); Python SDK `beer_mod` (read/write, pointer paths,
+   value search, overlay text/value boxes, on_frame/on_start/on_exit/hotkey events, speed/pause/cap, key injection,
+   shader-constant tweaks, screenshots); event stream (subscribe instead of polling); mod-drawn overlay boxes;
+   manager "Mods" page (~/.beer/mods/<mod>/ with manifest: name, version, games; enable per game; per-mod log;
+   settings panel generated from the manifest). Mods run out of process (cannot crash the game). Docs: reference per
+   command, SDK guide, example mods (RE8 enemy-health display, a stat watcher / practice hotkeys). Limits: addresses
+   are per game/version (use the Memory window + pointer paths); no save states; memory/input features labelled and
+   off for online/anti-cheat games.
+0d. **TLauncher (Minecraft launcher, Java) under Beer with a Windows JRE (2026-11-14, user: "try launching this with
+   loader", "implement the imports", "win jre", "continue with memory cap").** Exe:
+   `/mnt/FE5007855007443D/Users/MSI/AppData/Roaming/.minecraft/TLauncher.exe` (32-bit bootstrapper -> WoW32 layer ->
+   starts the Windows JRE `javaw.exe`, 64-bit, HotSpot 25.411 = 1.8.0_411, `/mnt/FE5007855007443D/Program Files/Java/jre-1.8`).
+   Prefix `~/.local/share/beer/prefixes/tlauncher`. Memory cap: 6 GiB cgroup + `BEER_PHYS_MB=6144` (my reading of
+   "memory cap"; ask the user if another cap was meant).
+  Capped run: use a transient SERVICE, not a scope/parent-only timeout: the parent exits in ~0.1 s and JVM
+  children detach. Delete only the prefix's stale doubleRunningProtection.txt before a fresh run (otherwise a
+  warning dialog reaches the still-incomplete Swing icon path). From the Beer directory:
+  `find "$HOME/.local/share/beer/prefixes/tlauncher" -name doubleRunningProtection.txt -delete;
+  systemd-run --user --unit=beer-tlauncher-check --wait --pipe --collect --service-type=exec
+  -p WorkingDirectory="$PWD" -p ExitType=cgroup -p RuntimeMaxSec=100 -p MemoryMax=6G -p MemorySwapMax=0
+  /usr/bin/env DISPLAY=:0 BEER_PHYS_MB=6144 "$PWD/loader" --renderer=vulkan
+  --prefix="$HOME/.local/share/beer/prefixes/tlauncher" "<TLauncher.exe>" > /tmp/tl.log 2>&1`
+   DONE:
+   - WoW32 import layer (platform/wow32.inc, wow32_win32.inc), fake module handle table, `BEER_W32_TRACE`.
+   - Java discovery through a seeded virtual registry (`reg_seed_windows_java()` in platform/win32_registry.inc).
+   - platform/win32_missing_exports(.inc/_table.inc) stubs + loader.c exports (GetDynamicTimeZoneInformation,
+     GetFriendlyIfIndex, GetIfTable, ToAscii/ToAsciiEx, ...) needed by the JVM/awt/net DLLs.
+   - Token APIs (platform/win32_advapi_misc.inc): OpenThreadToken, ImpersonateSelf, RevertToSelf, SetThreadToken
+     succeed. Before, `Files.isWritable/isReadable` were false => TLauncher created `.minecraftNNN` fallback dirs.
+   - SEH on worker threads: `beer_dispatch_stack_bounds()` (RaiseException dispatch + RtlUnwind accept the thread's
+     own stack), and RtlUnwind continues at the exception context when the walk reaches host (loader) code after a
+     directly-called handler (`host_bounce`). C++ exceptions (awt `std::bad_alloc`) are now caught; the JVM no longer dies.
+     `BEER_EXCEPTION_DIAGNOSTICS=1` also prints `[SEH] throw type:` (MSVC ThrowInfo -> type_info name).
+   - Cross-thread SendMessage (loader.c, before impl_PeekMessageW): `SentMessage` queue, `g_pump_threads[64]`,
+     `process_sent_messages()`, `thread_is_pumping()`, `send_message_to_thread()` (3 s fallback to inline). SendMessageW
+     to a window owned by another pumping thread now runs the WndProc on the owner thread (AWT needs this: running the
+     toolkit WndProc on the sender thread used the toolkit's JNIEnv => IllegalMonitorStateException => FindClass NULL
+     => `std::bad_alloc`). The AWT toolkit thread sits in WaitMessage, not Peek/GetMessage, so `impl_WaitMessage` and
+     `impl_MsgWaitForMultipleObjects` now call `process_sent_messages()` every iteration. `BEER_SENDMSG_DIAGNOSTICS=1`
+     prints `[SENDMSG] hwnd msg from owner pumping`. Verified `owner=38 pumping=1`; this fixed thread ownership
+     but did NOT by itself eliminate IllegalMonitorStateException (see stack finding below).
+   FOLLOW-UP 2026-11-18 — generic contracts only; no EXE/JRE patching or executable-name branches:
+   - Identified the hidden exception behind awt.dll's `std::bad_alloc` at RVA 0xA953F. Read-only JVM metadata and a
+     pending-exception watchpoint showed `java/lang/IllegalMonitorStateException` from objectMonitor.cpp:1820.
+     Even on the right toolkit thread, Beer called the guest WndProc on its private API host stack. HotSpot's
+     lightweight monitor ownership checks compare stack lock addresses against its recorded Windows thread stack.
+     `call_window_callback6()` now restores guest stack/TEB bounds across USER32 callbacks and reserves separate
+     host-stack space for reentrant imports; shared by window dispatch and CallWindowProc, not Java-specific.
+   - Implemented real COMCTL32 Set/Get/RemoveWindowSubclass and DefSubclassProc in platform/win32_subclass.inc,
+     including ordinals 410..413, pointer-width ref/id/results, owner checks, self-removal, nested continuations and
+     WM_NCDESTROY cleanup. Added generator ordinal coverage, not just one hand-edited lookup.
+   - Independent Java8 FrameProbe creates/shows/disposes an AWT Frame and exits 0 (~0.76 s, 124 MiB peak).
+     `/tmp/beer-frame-subclass.log`. Actual TLauncher also gets past the old component-peer failure.
+   - Next blocker was generic legacy Winsock DNS: impl_gethostbyname rejected every non-numeric name although host
+     DNS worked. It now resolves through host getaddrinfo and copies IPv4 results into a Windows-layout thread-local
+     hostent (never exposes libc's incompatible layout). Tests cover multiple copied addresses/canonical name,
+     localhost, numeric input, and error state. This is the Windows x64 path used by the JVM; do not assume PE32
+     pointer-bearing DNS/subclass APIs are covered without auditing their WoW32 wrappers.
+   - Real TLauncher then downloaded its libraries and ~83 MB runtime, started bundled Windows Java 1.8.0_281, and
+     reached JavaFX/Glass initialization. `/tmp/beer-tlauncher-dns.log` (100 s bounded run, 655 MiB peak).
+     Its next confirmed fatal was WINMM delay-load export timeSetEvent, not an OpenGL/gameplay failure.
+   - Added real timeSetEvent/timeKillEvent in platform/win32_mm_timer.inc: one Windows-prepared worker, monotonic
+     one-shot/periodic deadlines, function/event-set/event-pulse callbacks, full-width user data, self-cancellation,
+     and synchronous cancellation draining. Guest function entry enables Windows syscall interception; nonexistent
+     timer IDs return MMSYSERR_INVALPARAM. Named WINMM exports published. No fake success stub.
+   - Validation: make + make test-native-loader + full make test-input PASS; editor diagnostics clean. Real-loader
+     tests include guest-stack callback bounds + reentrant import, subclass removal/destruction and name/ordinal
+     lookup, DNS layout/copies, multimedia callback ABI/TEB bounds and cancellation. Build retains existing unrelated
+     truncation warnings. RE8 and RE9 each completed separate 75 s / 6 GiB gates, reached Vulkan swapchains and had
+     no logged crash/device loss (`/tmp/beer-re8-java-regression.log`, `/tmp/beer-re9-java-regression.log`).
+   STATE AT PAUSE / NEXT:
+   - Independent JavaFX probe with controls fails default-font loading (PrismFontLoader.loadFont NPE); removing
+     the Scene/font dependency opens a JavaFX window, gets past timeSetEvent, but its 2 s PauseTransition never
+     fires within the 35 s bounded run. Thus multimedia API contracts pass, but JavaFX pulse/message delivery is
+     NOT proven working. Logs `/tmp/beer-fx-probe.log`, `/tmp/beer-fx-timer-probe.log`; probe sources/classes in
+     `/tmp/beer-java-probe`. Trace actual timer callback -> Glass PostMessage/dispatch before guessing a fix.
+   - Last actual launcher runs (`/tmp/beer-tlauncher-mm-final.log`, `/tmp/beer-tlauncher-mm-retry.log`, each 100 s)
+     stop in Bootstrapper.fixedOnce, then Swing OptionPane Icon ClassCastException. The chosen downloaded
+     jre1.8.0_281/bin/javaw.exe is now absent: the launcher's recovery removed it after the earlier JVM failure.
+     The retries did not start a bundled-JVM child. Investigate validation/re-extraction/process-start recovery
+     instead of treating these runs as proof the bundled runtime works with timers.
+   - Review remaining generic callback syscall-selector transitions and prepared-worker DLL notification
+     serialization before claiming complete callback ABI coverage; existing non-window callbacks remain unaudited.
+     No negative-control stack run or optimized/sanitized full-loader validation was completed this session.
+   - Minecraft itself has NOT launched; no gameplay or full 32-bit API coverage claim. All bounded services stopped.
+   Known non-fatal: cmd.exe CreateProcess error=2, "Attempt to allocate stack guard pages failed", missing exports
+   `GetFinalPathNameByHandleW`, `FindFirstStreamW`, `FindNextStreamW`, `SetThreadDpiAwarenessContext`,
+   `GetHandleInformation` stub, d3d9/opengl32 absent (Java2D falls back), Swing OptionPane icons need
+   `Win32ShellFolder2` natives (LoadIcon/GetIconInfo/GetDIBits). Minecraft itself needs far more AWT/GDI/GL support.
+   Tools: Java test harness `/tmp/jt/T.java` (`javac --release 8`; run the JRE `java.exe` under the loader with
+   `--cmdline="\"Z:\\...\\java.exe\" -cp Z:\\tmp\\jt T"`, exe path must be quoted); `kill -USR1 <javaw pid>` dumps
+   `[STACKS] wtid=... api=...` wait states into the log; TLauncher classes extracted to /tmp/tlj.
+
 Others not to forget:
 - RE9: run ended with ExitProcess(-1) at re9.exe+0x9ea20ce (ask whether user-initiated); exit crash after
   Streamline shutdown (NULL read re9.exe+0x5bc1987); startup Xid 31 @0x04fa1000; camera stutter.
@@ -202,6 +550,36 @@ Claims of "faster" or "fixed" need those numbers.
      RE Engine streams by that budget). -> step 4 perf item. GoT title: to re-check.
 2. **Correctness gate:** RE9 intermittent start-up GPU fault (unattended launch loops while the user is away) and the
    GoT gameplay hang (compute 524c7c2e7e8bd58d). Done = 10 clean launches per game.
+   - 2026-11-16 (user: "work on GoT"): launch = GhostOfTsushima.exe with BEER_DLL_BUILTIN=winmm (the game folder's
+     winmm.dll makes it ExitProcess(0)); manager entry still points at the 32-bit EOSAuthLauncher.exe. Still hangs
+     entering gameplay (Xid 109 CTX SWITCH TIMEOUT). Findings:
+     * 524c7c2e7e8bd58d = cloth solver (512 threads, 1x1x1, 6x float[512] shared, barriers in uniform loops); its
+       sibling a7c5911970ce3c99 (float[1152]) hangs next when 524c is skipped (new BEER_BD12_SKIP_CS=<hash,...>).
+     * Data valid at dispatch: record via ResourceDescriptorHeap-style table 1 (12 MB upload buffer, loop count 1 at
+       +240), constraint list slot via record (21 entries, counts < 512). New snapshot tooling: BEER_BD12_SNAP_CS=1 +
+       BEER_BD12_TRACE_CS=<hash> now also copies the table-1 record (root constant .x offset), follows header+116 to
+       the constraint buffer (GPU copy) and prints the indexed heap slots (SIGUSR1).
+     * vkd3d-proton (Wine, shader dump VKD3D_SHADER_DUMP_PATH, hashes differ; matched by shape: 409ca2e0f380fe2b =
+       512 variant, 3b1df9cbc68098df = 1152) runs them in the new-game cutscene. Offline CLI
+       (third_party/dxil-spirv/build/dxil-spirv, built 2026-11-16) on its DXIL: differences were (a) structurizer
+       (Wine's vkd3d = legacy, 17 loops; Beer new, 13), (b) --ssbo-alignment 16 => offset table + 31 wave ops + 71
+       bounds checks (vkd3d uses 4 on NVIDIA proprietary: minStorageBufferOffsetAlignment workaround), (c) raw
+       access chains. Each tested in game: legacy structurizer (BEER_DXIL_LEGACY_STRUCTURIZER=1, now in the cache
+       key), 4-byte alignment (BEER_BD12_SSBO_ALIGN=4, opt-in: not validated on RE8/RE9), raw access chains
+       (BEER_VK_RAW_ACCESS_CHAINS=1): ALL STILL HANG. => not translation; runtime binding (descriptor targets, buffer
+       sizes the shader queries, texel views) or data in a buffer not yet sampled.
+     * New-game test found a separate, GENERIC FILE BUG (fixed): CreateFile mapped access only from GENERIC_READ/WRITE;
+       FILE_GENERIC_WRITE (0x120116 = FILE_WRITE_DATA|FILE_APPEND_DATA|..., no GENERIC_WRITE bit) opened files
+       READ-ONLY, so every GoT save write failed (game log "[NxSave] Failed to write to file (errorcode 0)": WriteFile
+       returned FALSE without a last error) and New Game bounced back to the menu. Fix: beer_access_wants_write/read
+       (win32_filesystem_policy.h, + tests) used for the open flags and the read-only native-hook shortcut; WriteFile
+       sets ACCESS_DENIED/DISK_FULL/WRITE_FAULT and INVALID_HANDLE instead of 0. New diag "[FILE] CreateFileW(...sav|
+       .part)" and "[FILE] WriteFile(...): not a file handle". GoT saves backed up: /mnt/hdd2/beer-backup/got-saves-1116-0325.
+     * After the file fix New Game starts, and the OPENING CUTSCENE hangs in the same shader 524c7c2e7e8bd58d (Xid 109),
+       where vkd3d-proton (Wine) runs it. => reproducible without the user's save (New Game -> cutscene).
+     * Next: capture every resource the first dispatch touches (all heap indices it reads, texel views _18/_23, the
+       RW position buffers _44), compare descriptor targets/sizes with what vkd3d binds; consider the per-draw path
+       (BEER_BD12_ROOT_PUSH=0) and texel path (BEER_BD12_SSBO=0) as A/B for the binding model.
    - GoT gameplay hang, 2026-11-11 evening findings (step 2, in progress):
      - Same hang with every SSBO policy and with `BEER_DSTORAGE_CPU=1`; checkpoints always in compute
        `524c7c2e7e8bd58d` (1x1x1, 512 threads, workgroup arrays, loops, 64-bit raw loads; it never ran before SSBO mode).
@@ -5247,3 +5625,100 @@ Other findings:
 - **Next session:** measure RE9 SSBO fps at the usual spot; retry GoT gameplay with the new dxil-spirv (its hang in
   `524c7c2e7e8bd58d` may be the same structurizer weakness miscompiling rather than aborting); then switch
   third_party/dxil-spirv to the new revision and make SSBO mode the default after RE4/PRAGMATA checks.
+
+## 2026-11-16 Mod API v1 (general mods: overlay boxes, hotkeys, memory) + RE8 enemy-health example
+
+Symptoms and keywords: mod API, mods page, beer_mod SDK, overlay_box_set, hotkey_add, mem_find, mem_read_batch,
+mem_resolve, unknown scan OOM, scan RSS jump, mod box not drawn, overlay "n" instead of newline, "?????" in overlay.
+
+- **What exists:**
+  - Docs: docs/mod-api/ (README.md quick start + manifest, sdk.md, protocol.md).
+  - SDK: mods/sdk/beer_mod.
+  - Manager: manager/mods_page.py (per-game enable, settings panel from mod.json, logs at ~/.beer/logs/mod-<id>.log); user verification confirms the Mods UI is functional.
+  - Example: mods/examples/re8-enemy-health (installed to ~/.beer/mods on first manager start).
+  - Loader commands: overlay_box_* (9 mod boxes, overlay slots 3..11), hotkey_*, mem_read_batch, mem_resolve,
+    mem_modules, mem_find.
+- **Fixed during bring-up:**
+  - `beer_json_string` dropped the backslash of every escape, so `\n` arrived as `n`. It now decodes \n \t \r \b \f
+    \uXXXX (surrogates to UTF-8). The overlay font is ASCII: each non-ASCII character is folded to one `?`.
+  - Mod box invisible after a remove/re-create: box serials restarted at 1, so both renderers' per-slot upload caches
+    (vulkan_post.c, vulkan_presenter.c) skipped the upload. Serials are now global (`render_box`).
+  - Unknown-value scan of RE8 snapshotted 1.96 G floats (7.8 GB of reserved, never-touched anon memory; RSS 2.7 to
+    8.7 GB, the cap is 9 G).
+    - Scans now skip unpopulated pages via /proc/self/pagemap. Kept: present+exclusive, swapped, file/shared.
+      mincore() is not usable: earlier /proc/self/mem reads map the zero page.
+    - Result: 381 M values, 1.2 s, about +1.4 GB file-backed. The i64 exact scan went from 3.6 s to 0.9 s.
+    - Next-scan skips chunks with no live bits.
+  - `mem_find`: up to 256 qwords in one pass (0.3 s on RE8). It does NOT touch the scan session, so mods can find
+    objects by header without wiping the Memory window's scan.
+- **RE8 enemy-health learn flow:**
+  - Keys: F8 = unknown scan / "went down", F6 = "unchanged", F7 = forget. Finishes at <=200 candidates.
+  - The header search uses mem_find over every pointer-like qword up to 0x400 before each candidate (exe-only while
+    there are >24 candidates).
+  - Simulated at the title: 212 M down to 3 candidates in 6 steps, under 2 s each.
+  - **Not yet verified on a real enemy.** If RE Engine headers are heap pointers, the learned layout lasts one session
+    (data.json `header_rva` is null). That needs a stable fingerprint.
+- RE8 75 s gate clean after the changes (re8_modapi4.log).
+- **Superseded the same day by RE Engine reflection** (user: "the actual tool immediately shows health as soon as an
+  enemy loads in"). mods/libs/reengine.py (optional helper library, outside the core SDK; manager adds mods/libs to PYTHONPATH) + docs/mod-api/reengine.md decode the TDB in the exe image.
+  - RE8: TDB v69 at re8.exe+0x8ee2830 (a second copy at +0xc4f7dd0), found with mem_find on magic|version<<32.
+  - Header: counts at +0x0c types / +0x14 fields / +0x18 type-impl / +0x1c field-impl, string-pool size at +0x50.
+    Tables at +0x60 types (80 B), +0x68 type-impl (48 B: name, namespace offsets), +0x80 fields (8 B),
+    +0x88 field-impl (12 B: attrs<<16, field type in the low 18 bits of b, name), +0xc8 string pool.
+  - Type entry: index:18 | parent:18 | declaring:18; impl index = bits 100..117 (exactly 25195 distinct, the
+    impl count); size at +0x14; +0x48 = runtime object info, whose first qword = &types[k]. Live objects hold the
+    object-info pointer at +0.
+  - Field entry: declaring:18 | field-impl:18 | offset at bit 38 (bytes, add the 0x10 object header).
+  - Dead ends: identity type->impl mapping, a murmur3 hash of names, and type-index-based field decoding all failed.
+  - Enemy health: app.DamageController (+0x10 owner via.GameObject, +0x48 app.HealthInfo {MaxHealth +0x10, Health
+    +0x14}). The GameObject name string is at +0x28 (em* enemies, pl* player, ri* pooled props). The mod looks these
+    up by name and refreshes every 1 s, with no learning.
+  - mem_read raised to 64 KiB. The SDK installs SIGTERM/SIGINT handlers plus an atexit cleanup in Mod.__init__, so
+    the manager's Stop removes boxes and hotkeys even while a mod is starting.
+- **PENDING 0n (user, 2026-11-16, before committing the mod API):** mods should be distributed as a custom-extension
+  zip (e.g. `.bmod`), not live inside the code base.
+  - The manager installs a package by unpacking it into ~/.beer/mods/<id>.
+  - The RE8 enemy-health example and the helper libraries (mods/libs, e.g. reengine.py) should become such packages
+    instead of folders in the repo.
+  - Shared helper libraries (mods/libs, e.g. reengine.py) MAY stay in the code base (user leaning, 2026-11-16).
+    They ship with Beer and are on every mod's PYTHONPATH; only the mods themselves become .bmod packages.
+  - The user will revisit this before the commit.
+  - Confirmed working in game 2026-11-16: the reengine-based RE8 enemy health display.
+- **0n implemented 2026-11-17 (GUI not yet checked by the user):**
+  - mods/sdk/beer_mod/package.py has pack/check/install/uninstall plus a CLI (`python3 -m beer_mod.package`).
+  - The manager Mods page imports the same module and adds "Install mod…" (a *.bmod file dialog), drag-and-drop of
+    .bmod files, and a per-mod Remove button with confirmation (it also drops the mod from mods-enabled.json).
+  - Installing a running mod's update stops it, waits up to 2 s so its exit cleanup finishes, then restarts it for
+    the running games.
+  - Install is staged (.install-<id>-*, skipped by discover) and keeps settings.json/data.json. It rejects absolute,
+    `..` and link entries, a missing or invalid manifest or entry, and more than 2000 files or 256 MB.
+    Zip-slip/abs/link/bad-id/no-entry cases were tested.
+  - mods/examples and install_examples() were removed from the repo. The RE8 mod source now lives in
+    /mnt/hdd2/beer-mods/src/re8-enemy-health, built as /mnt/hdd2/beer-mods/re8-enemy-health-2.1.bmod. Shared libs
+    stay in the repo under mods/libs.
+
+## 2026-11-17 Sekiro FPS unlock mod + mem_aob (array-of-bytes search)
+
+Symptoms and keywords: Sekiro 60 fps cap, frame limiter, fps unlock, AOB scan, find_pattern, mem_aob, on_exit,
+on_settings_changed.
+
+- **Launching Sekiro:** the library entry uses PREFIX=sekiro and BEER_STEAM_API_MODE=compat. With the default prefix
+  it exits with "Protection initialization failed".
+- **The cap:**
+  - Measured 59.9 fps with Beer's limiter off.
+  - 1117 copies of the f32 1/60 exist in memory. Writing the 6 copies in the exe image gave 143.9 fps; the heap
+    copies did nothing.
+  - The cap is sekiro.exe+0x11ab550: the immediate of `C7 43 18 89 88 88 3C`, i.e.
+    `mov dword [rbx+0x18], 1/60`, the frame-pacing object's target frame time.
+  - The instruction re-runs during play, so patching it changes the cap live.
+- **Mod:**
+  - Source /mnt/hdd2/beer-mods/src/sekiro-fps-unlock, package /mnt/hdd2/beer-mods/sekiro-fps-unlock-1.0.bmod.
+  - Finds the site with "44 88 6B 14 C7 43 18 ?? ?? ?? ?? 4C 89 AB" (+7) and writes 1/target.
+  - Verified at the title: 144 gives 143.9, a live settings change to 90 gives 89.9, 0 (off) gives about 1000, and
+    SIGTERM restores 59.6.
+  - Not verified: game speed above 60 fps in gameplay.
+- **New generic pieces:**
+  - Loader mem_aob {pattern with ??, module, limit}; it searches read-only code too.
+  - SDK game.find_pattern, @mod.on_exit (runs once; skipped when the game is gone) and @mod.on_settings_changed
+    (polls settings.json mtime every 1 s).
+- The library entry for Sekiro has Beer fps_limit 120, which applies on top when launched from the manager.

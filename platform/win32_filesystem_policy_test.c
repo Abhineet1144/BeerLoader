@@ -76,6 +76,10 @@ int main(void)
     assert(!beer_file_open_may_use_native_hook(0x40000000u, 3));
     assert(!beer_file_open_may_use_native_hook(0x10000000u, 3));
     assert(!beer_file_open_may_use_native_hook(0x80000000u, 2));
+    assert(!beer_file_open_may_use_native_hook(0x120116u, 3));   /* FILE_GENERIC_WRITE: writes, no GENERIC_WRITE */
+    assert(beer_access_wants_write(0x120116u) && !beer_access_wants_read(0x120116u));
+    assert(beer_access_wants_read(0x120089u) && !beer_access_wants_write(0x120089u));   /* FILE_GENERIC_READ */
+    assert(beer_access_wants_write(0x10000000u) && beer_access_wants_read(0x10000000u)); /* GENERIC_ALL */
 
     assert(beer_creation_disposition_flags(1, &flags) && flags == 3);
     assert(beer_creation_disposition_flags(2, &flags) && flags == 5);

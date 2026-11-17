@@ -33,6 +33,8 @@ from overlay_page import write_loader_file as write_overlay_loader_file  # noqa:
 from display_page import DisplayPage, post_message, load_config as load_display_config  # noqa: E402
 from display_page import write_loader_file as write_display_loader_file  # noqa: E402
 from graphics_window import GraphicsWindow, apply_saved as apply_saved_tweaks  # noqa: E402
+from frame_window import FrameWindow  # noqa: E402
+from mods_page import ModRunner, ModsPage  # noqa: E402
 from steam_page import DEFAULT_PROVIDER, SteamPage  # noqa: E402
 
 APP_ID = "dev.beer.Manager"
@@ -110,6 +112,149 @@ LAUNCH_VALUES = [
     ("ngx_path", "DLSS (NGX) runtime folder", "BEER_NGX_PATH", "Folder with nvngx.dll / _nvngx.dll when it is not found automatically"),
     ("steam_id", "Steam ID for the offline Steam API", "BEER_STEAM_ID", "SteamID64 or account number reported by Beer's offline Steam"),
 ]
+
+# DLSS overrides (platform/win32_ngx.inc, live settings dlss_* in platform/beer_control.c).
+DLSS_PRESET_CHOICES = [
+    ("Game default", None), ("DLSS default for its version", "0"), ("Preset J", "J"), ("Preset K", "K"),
+    ("Preset L", "L"), ("Preset M", "M"), ("Preset F", "F"), ("Preset E", "E"),
+    ("No upscaling (raw internal image, instant)", "none"),
+]
+DLSS_MARKS = [(33.3, "UP"), (50, "P"), (58, "B"), (66.7, "Q"), (77, "UQ"), (100, "DLAA")]
+
+
+def dlss_settings(game):
+    """A game's DLSS override as {enabled, ratio, render, preset}; older saved formats are converted."""
+    dlss = dict(game.get("dlss") or {})
+    if "res" in dlss:                                  # 2026-11-14 combo-box format
+        res, custom = dlss.pop("res"), str(dlss.pop("custom", "")).strip().lower().replace(" ", "").rstrip("%")
+        if res == "custom":
+            dlss["enabled"] = bool(custom)
+            if "x" in custom:
+                dlss["render"] = custom
+            elif custom:
+                dlss["ratio"] = float(custom)
+        elif res:
+            dlss["enabled"], dlss["ratio"] = True, float(res)
+    return {"enabled": bool(dlss.get("enabled")), "ratio": float(dlss.get("ratio") or 66.7),
+            "render": str(dlss.get("render") or ""), "preset": dlss.get("preset")}
+
+
+def parse_render_size(text):
+    m = re.fullmatch(r"\s*(\d{2,5})\s*[xX×*]\s*(\d{2,5})\s*", text or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def dlss_environment(game):
+    """BEER_DLSS_* variables for a game's saved DLSS override."""
+    d, env = dlss_settings(game), {}
+    if d["enabled"]:
+        size = parse_render_size(d["render"])
+        if size:
+            env["BEER_DLSS_RENDER"] = "%dx%d" % size
+        else:
+            env["BEER_DLSS_RATIO"] = "%g" % d["ratio"]
+    if d["preset"]:
+        env["BEER_DLSS_PRESET"] = d["preset"]
+    return env
+
+
+DLSS_PRESET_HELP = (
+    "<b>Which DLSS model to use</b>\n\n"
+    "<b>Game default</b> — whatever the game asks for.\n"
+    "<b>DLSS default for its version</b> — the model the game's DLSS DLL picks for the mode.\n\n"
+    "<b>Transformer models</b> (DLSS 4 and later; sharper, more stable, less ghosting; a little slower)\n"
+    "• <b>K</b> — the all-round best for Quality, Balanced and DLAA. Safe first choice.\n"
+    "• <b>J</b> — the first transformer model; slightly sharper than K but shimmers and ghosts more.\n"
+    "• <b>M</b> — DLSS 4.5 (DLL 310.5+); best at low internal resolutions (Performance, ~50%).\n"
+    "• <b>L</b> — DLSS 4.5 (DLL 310.5+); tuned for Ultra Performance (~33%) and 4K output.\n\n"
+    "<b>Older CNN models</b> (fastest, softer)\n"
+    "• <b>F</b> — for Ultra Performance and DLAA in DLSS 3.\n"
+    "• <b>E</b> — the last DLSS 3 default; use it if a transformer model costs too much on a slower GPU.\n\n"
+    "<b>No upscaling</b> — shows the game's raw internal-resolution image stretched to the screen, for comparison. "
+    "Switches instantly.\n\n"
+    "A model the game's DLSS version does not have falls back to its default. The DLSS DLL version is shown in "
+    "its file properties (nvngx_dlss.dll in the game folder).")
+
+
+def help_button(markup):
+    """A small "?" button that opens a popover with the given Pango markup."""
+    label = Gtk.Label(use_markup=True, wrap=True, max_width_chars=60, xalign=0, margin_top=8, margin_bottom=8,
+                      margin_start=8, margin_end=8)
+    label.set_markup(markup)
+    popover = Gtk.Popover(child=label)
+    button = Gtk.MenuButton(icon_name="help-about-symbolic", popover=popover, valign=Gtk.Align.CENTER,
+                            tooltip_text="What do these mean?")
+    button.add_css_class("flat")
+    return button
+
+
+class DlssControls:
+    """The DLSS rows (override switch, internal-resolution slider with mode marks, custom size, preset), used in the
+    game settings and, live, on the running-game card. on_change(settings) runs after every user change."""
+
+    def __init__(self, saved, on_change=None):
+        self.on_change = on_change
+        self._quiet = True
+        self.enabled = Adw.SwitchRow(title="Override internal resolution",
+                                     subtitle="The game renders at this size whatever DLSS mode it is set to")
+        self.enabled.set_active(saved["enabled"])
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 10, 100, 0.5)
+        self.scale.set_hexpand(True)
+        self.scale.set_size_request(260, -1)
+        self.scale.set_draw_value(False)
+        self.scale.set_value(saved["ratio"])
+        for value, label in DLSS_MARKS:
+            self.scale.add_mark(value, Gtk.PositionType.BOTTOM, label)
+        self.value_label = Gtk.Label(width_chars=6, xalign=1)
+        self.value_label.add_css_class("numeric")
+        self.slider_row = Adw.ActionRow(title="Internal resolution",
+                                        subtitle="Below 33% is outside DLSS's official modes; most games cope")
+        box = Gtk.Box(spacing=8, valign=Gtk.Align.CENTER, hexpand=True)
+        box.append(self.scale)
+        box.append(self.value_label)
+        self.slider_row.add_suffix(box)
+        self.custom = Adw.EntryRow(title="Custom render size, e.g. 1600x900 (overrides the slider)")
+        self.custom.set_text(saved["render"])
+        self.preset = Adw.ComboRow(title="DLSS model (render preset)",
+                                   subtitle="J, K and later are the transformer models; a DLSS version without the "
+                                            "preset uses its default",
+                                   model=Gtk.StringList.new([label for label, _v in DLSS_PRESET_CHOICES]))
+        values = [v for _l, v in DLSS_PRESET_CHOICES]
+        self.preset.set_selected(values.index(saved["preset"]) if saved["preset"] in values else 0)
+        self.preset.add_suffix(help_button(DLSS_PRESET_HELP))
+        self.rows = [self.enabled, self.slider_row, self.custom, self.preset]
+        self.scale.connect("value-changed", lambda _s: self._changed())
+        self.enabled.connect("notify::active", lambda *_a: self._changed())
+        self.custom.connect("changed", lambda _e: self._changed())
+        self.preset.connect("notify::selected", lambda *_a: self._changed())
+        self._quiet = False
+        self._update_widgets()
+
+    def _update_widgets(self):
+        on = self.enabled.get_active()
+        size = parse_render_size(self.custom.get_text())
+        self.slider_row.set_sensitive(on and not size)
+        self.custom.set_sensitive(on)
+        self.value_label.set_label("%g%%" % round(self.scale.get_value(), 1))
+        text = self.custom.get_text().strip()
+        if text and not size:
+            self.custom.add_css_class("error")
+        else:
+            self.custom.remove_css_class("error")
+
+    def _changed(self):
+        self._update_widgets()
+        if not self._quiet and self.on_change:
+            self.on_change(self.settings())
+
+    def settings(self):
+        return {"enabled": self.enabled.get_active(), "ratio": round(self.scale.get_value(), 1),
+                "render": self.custom.get_text().strip(),
+                "preset": DLSS_PRESET_CHOICES[self.preset.get_selected()][1]}
+
+
+# Loader values that hold paths get a browse button: key -> (pick a folder, list separator or None).
+PATH_VALUES = {"dll_path": (True, ":"), "ngx_path": (True, None)}
 
 BEER_HOME = os.path.expanduser("~/.beer")
 PREFIX_DIR = os.path.join(BEER_HOME, "prefixes")
@@ -254,6 +399,59 @@ def migrate_prefix(path):
     os.makedirs(PREFIX_DIR, exist_ok=True)
     shutil.move(path, target)
     return target
+
+
+def add_path_picker(row, title, folder=False, patterns=None, filter_name=None, append_sep=None, on_pick=None):
+    """Adds a browse button to an entry row: the same file dialog as the game .exe picker. folder=True picks a folder.
+    append_sep appends the pick to a separator-joined list instead of replacing the text. on_pick(path) replaces the
+    default action."""
+    button = Gtk.Button(icon_name="folder-open-symbolic" if folder else "document-open-symbolic",
+                        valign=Gtk.Align.CENTER, tooltip_text=title)
+    button.add_css_class("flat")
+
+    def picked(path):
+        if on_pick:
+            on_pick(path)
+        elif append_sep and row.get_text().strip():
+            parts = [p for p in row.get_text().split(append_sep) if p]
+            if path not in parts:
+                row.set_text(append_sep.join(parts + [path]))
+        else:
+            row.set_text(path)
+
+    def done(dialog, result):
+        try:
+            f = dialog.select_folder_finish(result) if folder else dialog.open_finish(result)
+        except GLib.Error:
+            return
+        if f and f.get_path():
+            picked(f.get_path())
+
+    def clicked(_b):
+        chooser = Gtk.FileDialog(title=title)
+        current = row.get_text().strip()
+        if append_sep and current:
+            current = current.split(append_sep)[-1]
+        start = current if folder else os.path.dirname(current)
+        if start and os.path.isdir(start):
+            chooser.set_initial_folder(Gio.File.new_for_path(start))
+        if patterns:
+            file_filter = Gtk.FileFilter()
+            file_filter.set_name(filter_name or title)
+            for pattern in patterns:
+                file_filter.add_pattern(pattern)
+            filters = Gio.ListStore.new(Gtk.FileFilter)
+            filters.append(file_filter)
+            chooser.set_filters(filters)
+        root = row.get_root()
+        parent = root if isinstance(root, Gtk.Window) else None
+        if folder:
+            chooser.select_folder(parent, None, done)
+        else:
+            chooser.open(parent, None, done)
+    button.connect("clicked", clicked)
+    row.add_suffix(button)
+    return button
 
 
 class Library:
@@ -429,6 +627,15 @@ class RunningCard(Adw.PreferencesGroup):
         self.stats = Adw.ActionRow(title="Status", subtitle="connecting…")
         self.stats.add_css_class("property")
         self.add(self.stats)
+        # Low-memory guard (platform/beer_control.c): shown while the loader holds the game paused.
+        self.memguard_row = Adw.ActionRow(title="Low memory — game paused", visible=False)
+        self.memguard_row.add_css_class("error")
+        resume = Gtk.Button(label="Continue", valign=Gtk.Align.CENTER, tooltip_text="Resume the game now")
+        resume.add_css_class("suggested-action")
+        resume.connect("clicked", lambda _b: self.control.request({"cmd": "memguard_resume"}))
+        self.memguard_row.add_suffix(resume)
+        self.add(self.memguard_row)
+        self.memguard_notified = False
 
         speed = Adw.ActionRow(title="Game speed")
         self.speed_label = Gtk.Label(label="1×", width_chars=6, xalign=1)
@@ -502,6 +709,16 @@ class RunningCard(Adw.PreferencesGroup):
         self.pause.connect("notify::active", self._on_pause)
         self.add(self.pause)
 
+        # DLSS, live: the game picks the new size up the next time it asks DLSS (changing its DLSS mode or resolution).
+        self.dlss_pending = None
+        dlss_row = Adw.ExpanderRow(title="DLSS",
+                                   subtitle="Live. Applies when the game next sets up DLSS: switch its DLSS quality "
+                                            "mode (or resolution) once in the game's menu")
+        self.dlss = DlssControls(dlss_settings(game), self._on_dlss)
+        for row in self.dlss.rows:
+            dlss_row.add_row(row)
+        self.add(dlss_row)
+
         actions = Adw.ActionRow(title="Session")
         log_button = Gtk.Button(label="Log", valign=Gtk.Align.CENTER)
         log_button.connect("clicked", lambda _b: app.show_log(self.name, self.log_path))
@@ -509,6 +726,10 @@ class RunningCard(Adw.PreferencesGroup):
         graphics = Gtk.Button(label="Graphics…", valign=Gtk.Align.CENTER, tooltip_text="Find and tweak shader constants such as light intensity")
         graphics.connect("clicked", lambda _b: GraphicsWindow(app, self.path, self.name, self.pid, self.exe).present())
         actions.add_suffix(graphics)
+        frame = Gtk.Button(label="Frame…", valign=Gtk.Align.CENTER,
+                           tooltip_text="Capture one frame and watch how the game draws it, pass by pass")
+        frame.connect("clicked", lambda _b: FrameWindow(app, self.path, self.name, self.pid, self.exe).present())
+        actions.add_suffix(frame)
         memory = Gtk.Button(label="Memory…", valign=Gtk.Align.CENTER)
         memory.connect("clicked", lambda _b: MemoryWindow(app, self.path, self.name, self.pid).present())
         actions.add_suffix(memory)
@@ -561,6 +782,25 @@ class RunningCard(Adw.PreferencesGroup):
             self._updating = False
         self.control.request({"cmd": "set", "name": "fps_limit", "value": value})
         self.remember("fps_limit", int(value))
+
+    def _on_dlss(self, settings):
+        if self.dlss_pending:
+            GLib.source_remove(self.dlss_pending)
+        self.dlss_pending = GLib.timeout_add(150, self._send_dlss, settings)
+
+    def _send_dlss(self, settings):
+        self.dlss_pending = None
+        size = parse_render_size(settings["render"]) if settings["enabled"] else None
+        ratio = settings["ratio"] if settings["enabled"] and not size else 0
+        preset = settings["preset"]
+        bypass = preset == "none"
+        preset_value = -1 if not preset or bypass else (int(preset) if preset.isdigit() else ord(preset.upper()) - 64)
+        for name, value in (("dlss_ratio", ratio), ("dlss_width", size[0] if size else 0),
+                            ("dlss_height", size[1] if size else 0), ("dlss_preset", preset_value),
+                            ("dlss_bypass", bypass)):
+            self.control.request({"cmd": "set", "name": name, "value": value})
+        self.remember("dlss", settings)
+        return False
 
     def _on_pause(self, row, _param):
         if not self._updating:
@@ -624,6 +864,23 @@ class RunningCard(Adw.PreferencesGroup):
         if not status or not status.get("ok"):
             self.stats.set_subtitle("not responding")
             return True
+        guard = status.get("memguard") or {}
+        if guard.get("active"):
+            text = "%s RAM free: %d of %d MB" % (guard.get("reason", ""), guard.get("avail_mb", 0), guard.get("total_mb", 0))
+            if guard.get("cg_limit_mb"):
+                text += " · game %d of its %d MB cap" % (guard.get("cg_used_mb", 0), guard["cg_limit_mb"])
+            self.memguard_row.set_subtitle(text + ". Close other apps, then Continue.")
+            self.memguard_row.set_visible(True)
+            if not self.memguard_notified:
+                self.memguard_notified = True
+                note = Gio.Notification.new("%s paused: low memory" % self.name)
+                note.set_body(text)
+                note.set_priority(Gio.NotificationPriority.URGENT)
+                self.app.send_notification("memguard-%d" % self.pid, note)
+        elif self.memguard_row.get_visible():
+            self.memguard_row.set_visible(False)
+            self.memguard_notified = False
+            self.app.withdraw_notification("memguard-%d" % self.pid)
         up = status["uptime_s"]
         self.stats.set_subtitle("%.0f fps · CPU %.1f%% (%.1f cores) · %d MB · %d threads · up %d:%02d" % (
             status["fps"], status["cpu_percent"], status.get("cpu_cores", 0), status["rss_mb"], status["threads"], up // 60, up % 60))
@@ -670,10 +927,8 @@ class GameDialog(Adw.Dialog):
         self.name.set_text(game.get("name", ""))
         self.exe = Adw.EntryRow(title="Executable (.exe)")
         self.exe.set_text(game.get("exe", ""))
-        browse = Gtk.Button(icon_name="document-open-symbolic", valign=Gtk.Align.CENTER)
-        browse.add_css_class("flat")
-        browse.connect("clicked", lambda _b: app.pick_exe(self._picked))
-        self.exe.add_suffix(browse)
+        add_path_picker(self.exe, "Choose the game's .exe", patterns=["*.exe", "*.EXE"],
+                        filter_name="Windows executables", on_pick=self._picked)
         self.audio = Adw.ComboRow(title="Audio backend")
         self.audio.set_model(Gtk.StringList.new(AUDIO_BACKENDS))
         self.audio.set_selected(AUDIO_BACKENDS.index(game.get("audio", "fmod")) if game.get("audio", "fmod") in AUDIO_BACKENDS else 0)
@@ -758,6 +1013,54 @@ class GameDialog(Adw.Dialog):
         page.add(hw)
         self._sync_hw_rows()
 
+        dlss_group = Adw.PreferencesGroup(
+            title="DLSS",
+            description="For games with DLSS (NVIDIA). The game renders at the internal resolution you pick and DLSS "
+                        "upscales to the game's output resolution, whatever quality mode is chosen in the game. "
+                        "Starting values; while the game runs they can be changed live on its card.")
+        self.dlss = DlssControls(dlss_settings(game))
+        for row in self.dlss.rows:
+            dlss_group.add(row)
+        page.add(dlss_group)
+        guard_group = Adw.PreferencesGroup(
+            title="Memory",
+            description="A memory cap keeps the game from using up the PC's RAM (it runs in its own systemd scope). "
+                        "The low-memory guard pauses the game with a warning before memory runs out, so you can close "
+                        "other apps and continue instead of the game or the PC being killed.")
+        saved_cap = game.get("memory_cap") or {}
+        self.cap_on = Adw.SwitchRow(title="Limit the game's memory")
+        self.cap_on.set_active(bool(saved_cap.get("enabled")))
+        self.cap_gb = Adw.SpinRow.new_with_range(1, 512, 0.5)
+        self.cap_gb.set_digits(1)
+        self.cap_gb.set_title("Memory cap (GB)")
+        self.cap_gb.set_subtitle("RAM the game may use; it is slowed a little before the cap and stopped at it")
+        self.cap_gb.set_value(float(saved_cap.get("gb", 9)))
+        self.cap_swap = Adw.SpinRow.new_with_range(0, 64, 0.5)
+        self.cap_swap.set_digits(1)
+        self.cap_swap.set_title("Swap allowed beyond the cap (GB)")
+        self.cap_swap.set_value(float(saved_cap.get("swap_gb", 1)))
+        self.cap_gb.set_sensitive(self.cap_on.get_active())
+        self.cap_swap.set_sensitive(self.cap_on.get_active())
+        self.cap_on.connect("notify::active", lambda row, _p: (self.cap_gb.set_sensitive(row.get_active()),
+                                                              self.cap_swap.set_sensitive(row.get_active())))
+        for row in (self.cap_on, self.cap_gb, self.cap_swap):
+            guard_group.add(row)
+        saved_guard = game.get("memguard") or {}
+        self.guard_on = Adw.SwitchRow(title="Low-memory guard")
+        self.guard_on.set_active(saved_guard.get("enabled", True))
+        self.guard_free = Adw.SpinRow.new_with_range(0, 65536, 128)
+        self.guard_free.set_title("Pause when free RAM drops below (MB)")
+        self.guard_free.set_subtitle("0 = never; system memory available to apps")
+        self.guard_free.set_value(float(saved_guard.get("free_mb", 1024)))
+        self.guard_margin = Adw.SpinRow.new_with_range(0, 65536, 50)
+        self.guard_margin.set_title("Pause this close to a memory cap (MB)")
+        self.guard_margin.set_subtitle("Only when the game runs under a memory limit; 0 = never")
+        self.guard_margin.set_value(float(saved_guard.get("margin_mb", 300)))
+        self.guard_auto = Adw.SwitchRow(title="Resume automatically when memory recovers")
+        self.guard_auto.set_active(bool(saved_guard.get("auto_resume", False)))
+        for row in (self.guard_on, self.guard_free, self.guard_margin, self.guard_auto):
+            guard_group.add(row)
+        page.add(guard_group)
         options = Adw.PreferencesGroup(title="Loader options", description="Every launch option the loader supports. Leave them off unless a game needs one.")
         self.presenter = Adw.ComboRow(title="Presenter", subtitle="--presenter=…", model=Gtk.StringList.new(PRESENTERS))
         presenter = game.get("presenter", "Default")
@@ -783,6 +1086,9 @@ class GameDialog(Adw.Dialog):
             row = Adw.EntryRow(title=label)
             row.set_tooltip_text(description)
             row.set_text(str(saved_values.get(key, "")))
+            if key in PATH_VALUES:
+                folder, sep = PATH_VALUES[key]
+                add_path_picker(row, label, folder=folder, append_sep=sep)
             values.add(row)
             self.value_rows[key] = row
         page.add(values)
@@ -843,6 +1149,11 @@ class GameDialog(Adw.Dialog):
             "present_mode": PRESENT_MODES[self.present_mode.get_selected()],
             "flags": {key: row.get_active() for key, row in self.flag_rows.items()},
             "values": {key: row.get_text().strip() for key, row in self.value_rows.items() if row.get_text().strip()},
+            "dlss": self.dlss.settings(),
+            "memory_cap": {"enabled": self.cap_on.get_active(), "gb": round(self.cap_gb.get_value(), 1),
+                           "swap_gb": round(self.cap_swap.get_value(), 1)},
+            "memguard": {"enabled": self.guard_on.get_active(), "free_mb": int(self.guard_free.get_value()),
+                         "margin_mb": int(self.guard_margin.get_value()), "auto_resume": self.guard_auto.get_active()},
             "steam_mode": STEAM_API_MODES[self.steam_mode.get_selected()][0],
             "gpu": {"preset": self.gpu_choices[self.gpu.get_selected()], "name": self.gpu_name.get_text().strip(),
                     "vendor": self.gpu_vendor.get_text().strip(), "device": self.gpu_device.get_text().strip(),
@@ -916,6 +1227,7 @@ class Manager(Adw.Application):
         self.lib = Library()
         self.children = {}          # pid -> (Popen, log path, name)
         self.cards = {}             # pid -> RunningCard
+        self.mod_runner = ModRunner()
 
     # -- window
     def do_activate(self):
@@ -990,6 +1302,8 @@ class Manager(Adw.Application):
         self.stack.add_titled_with_icon(self.overlay_page, "overlay", "Overlay", "view-reveal-symbolic")
         self.display_page = DisplayPage(self)
         self.stack.add_titled_with_icon(self.display_page, "display", "Display", "video-display-symbolic")
+        self.mods_page = ModsPage(self)
+        self.stack.add_titled_with_icon(self.mods_page, "mods", "Mods", "application-x-addon-symbolic")
 
         view.set_content(self.stack)
         self.toasts.set_child(view)
@@ -1252,25 +1566,6 @@ class Manager(Adw.Application):
         dialog.connect("response", done)
         dialog.present(self.window)
 
-    def pick_exe(self, callback):
-        chooser = Gtk.FileDialog(title="Choose the game's .exe")
-        exe_filter = Gtk.FileFilter()
-        exe_filter.set_name("Windows executables")
-        exe_filter.add_pattern("*.exe")
-        exe_filter.add_pattern("*.EXE")
-        filters = Gio.ListStore.new(Gtk.FileFilter)
-        filters.append(exe_filter)
-        chooser.set_filters(filters)
-
-        def done(dialog, result):
-            try:
-                f = dialog.open_finish(result)
-            except GLib.Error:
-                return
-            if f:
-                callback(f.get_path())
-        chooser.open(self.window, None, done)
-
     def show_settings(self):
         dialog = Adw.Dialog(title="Loader settings", content_width=560)
         view = Adw.ToolbarView()
@@ -1294,6 +1589,11 @@ class Manager(Adw.Application):
         language.set_selected(languages.index(current) if current in languages else 0)
         provider = Adw.EntryRow(title="Steam session provider")
         provider.set_text(self.lib.settings.get("steam_provider") or DEFAULT_PROVIDER)
+        add_path_picker(loader, "Choose the loader binary")
+        add_path_picker(vkd3d, "Choose the vkd3d-shader library", patterns=["*.so", "*.so.*"],
+                        filter_name="Shared libraries")
+        add_path_picker(cache, "Choose the shader cache folder", folder=True)
+        add_path_picker(provider, "Choose the Steam session provider")
         group.add(loader)
         group.add(vkd3d)
         group.add(cache)
@@ -1413,12 +1713,31 @@ class Manager(Adw.Application):
         for key, _label, variable, _description in LAUNCH_VALUES:
             if str(values.get(key, "")).strip():
                 env[variable] = str(values[key]).strip()
+        env.update(dlss_environment(game))
+        guard = game.get("memguard") or {}
+        if guard:
+            env["BEER_MEMGUARD"] = "1" if guard.get("enabled", True) else "0"
+            env["BEER_MEMGUARD_FREE_MB"] = str(int(guard.get("free_mb", 1024)))
+            env["BEER_MEMGUARD_MARGIN_MB"] = str(int(guard.get("margin_mb", 300)))
+            env["BEER_MEMGUARD_AUTO_RESUME"] = "1" if guard.get("auto_resume") else "0"
         if game.get("presenter", "Default") != "Default":
             cmd.append("--presenter=%s" % game["presenter"])
         if game.get("present_mode", "Default") != "Default":
             env["BEER_PRESENT_MODE"] = game["present_mode"]
         # Loader options come before the exe; everything after it is the game's own command line.
         cmd += shlex.split(game.get("args", "")) + [game["exe"]] + shlex.split(game.get("game_args", ""))
+        # Memory cap: the game runs in its own transient systemd scope (same PID, so tracking and the control socket
+        # are unchanged). MemoryHigh slightly under the cap slows the game down before the hard stop.
+        cap = game.get("memory_cap") or {}
+        if cap.get("enabled"):
+            if shutil.which("systemd-run"):
+                cap_mb = int(float(cap.get("gb", 9)) * 1024)
+                swap_mb = int(float(cap.get("swap_gb", 1)) * 1024)
+                cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                       "-p", "MemoryMax=%dM" % cap_mb, "-p", "MemoryHigh=%dM" % int(cap_mb * 0.94),
+                       "-p", "MemorySwapMax=%dM" % swap_mb, "--"] + cmd
+            else:
+                self.toast("systemd-run not found: starting without the memory cap")
         os.makedirs(LOG_DIR, exist_ok=True)
         safe = "".join(c if c.isalnum() else "_" for c in game["name"])
         log_path = os.path.join(LOG_DIR, "%s-%s.log" % (safe, time.strftime("%Y%m%d-%H%M%S")))
@@ -1515,12 +1834,17 @@ class Manager(Adw.Application):
                 card.control.request(post_message(load_display_config()))
                 self.cards[pid] = card
                 self.running_box.append(card)
+                self.mod_runner.start_for_game(pid, path, exe, name)
         for pid in list(self.cards):
             card = self.cards[pid]
             if pid not in seen or not card.refresh():
                 self.running_box.remove(card)
                 card.control.close()
                 del self.cards[pid]
+                # A card can drop for a moment while the game is busy (a failed refresh) and come back on the next
+                # poll; its mods keep running unless the game process itself is gone.
+                if not os.path.exists("/proc/%d" % pid):
+                    self.mod_runner.stop_for_game(pid)
         self.running_empty.set_visible(not self.cards)
         running = {(card.exe, card.name): pid for pid, card in self.cards.items()}
         if running != getattr(self, "running_games", None):

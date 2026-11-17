@@ -490,8 +490,11 @@ void bd12_graphics_pipeline_destroy(BD12GraphicsPipeline *gp)
 {
     if (!gp) return;
     BD12Device *device = gp->device;
-    if (gp->pipeline)
+    if (gp->pipeline) {
+        extern uint64_t g_bd12_live_pipelines;
         device->vk.DestroyPipeline(device->device, gp->pipeline, NULL);
+        __atomic_sub_fetch(&g_bd12_live_pipelines, 1, __ATOMIC_RELAXED);
+    }
     /* gp->layout and gp->set_layout are shared (bd12_shared_*_layout) or owned by the descriptor-buffer layout. */
     free(gp->bindings);
     free(gp->bindless);

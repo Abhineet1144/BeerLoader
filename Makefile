@@ -11,6 +11,7 @@ PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_e
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
 				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_sddl.c platform/win32_shell_strings.c platform/win32_variant.c platform/win32_schannel.c
+PLATFORM_SRCS += platform/beer_steam_networking.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
                renderer/vulkan/vulkan_post.c \
@@ -56,6 +57,10 @@ test-ki-dispatcher:
 	/tmp/beer-ki-dispatcher-test
 
 test-steam:
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_networking_test.c platform/beer_steam_networking.c -lpthread -ldl -o /tmp/beer-steam-networking-test
+	/tmp/beer-steam-networking-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/steam_networking_identity_test.c -o /tmp/beer-steam-networking-identity-test
+	/tmp/beer-steam-networking-identity-test
 	$(CC) $(STEAM_CFLAGS) steam/pb_test.c steam/pb.c -o /tmp/beer-steam-pb-test
 	/tmp/beer-steam-pb-test
 	$(CC) $(STEAM_CFLAGS) steam/vdf_test.c steam/vdf.c -o /tmp/beer-steam-vdf-test

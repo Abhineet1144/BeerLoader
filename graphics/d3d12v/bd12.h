@@ -88,6 +88,8 @@ struct BD12Device {
     char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     uint32_t buffer_memory_bits;
     int32_t memory_type[4];       /* indexed by BD12HeapType */
+    int32_t upload_sysmem_type;
+    VkDeviceSize buffer_image_granularity;   /* buffers and optimal images sharing a block stay this far apart */   /* system-memory UPLOAD type (memory_type[UPLOAD] may be resizable-BAR VRAM) */
     int readback_coherent;
     VkDeviceSize min_uniform_alignment;
     VkDeviceSize max_uniform_range;
@@ -150,6 +152,8 @@ typedef struct {
     uint64_t zero_value;          /* device zero-fill timeline value that covers this heap (0 = none) */
     struct BD12MemBlock *block;   /* sub-allocated from this block (bd12_heap_create), else dedicated memory */
     VkDeviceSize base;            /* offset of the heap in `memory` */
+    VkDeviceSize align;           /* sub-allocation alignment; 0 = derived from the size (any placed resource) */
+    int rebar;                    /* dedicated UPLOAD memory in resizable-BAR VRAM (counted in the ReBAR cap) */
 } BD12Heap;
 
 /* Cached typed views over a buffer range (texel-buffer SRV/UAV descriptors). Unpinned views are freed once no
@@ -732,6 +736,9 @@ BD12Heap *bd12_heap_create(BD12Device *device, BD12HeapType type,
                            VkDeviceSize size);
 BD12Heap *bd12_heap_create_unzeroed(BD12Device *device, BD12HeapType type,
                                     VkDeviceSize size);
+/* Memory for one committed image: `size` and `alignment` from its VkMemoryRequirements, packed at that alignment
+ * instead of D3D12's 64 KiB heap granularity (which multiplied the VRAM of games with many small textures). */
+BD12Heap *bd12_heap_create_for_image(BD12Device *device, VkDeviceSize size, VkDeviceSize alignment, int zero);
 void bd12_heap_destroy(BD12Heap *heap);
 /* Placed buffer. offset must satisfy the buffer's alignment (64 KiB-aligned
  * placement always does). */
@@ -1127,6 +1134,9 @@ void bd12_cmd_global_barrier(BD12CmdList *list);
 int bd12_debug_sync_all(void);
 void bd12_trace_frame_advance(void);
 int bd12_trace_active(void);
+void bd12_trace_request(void);
+int bd12_debug_stretch(void *list_iface, void *source_iface, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                       void *target_iface);
 int bd12_cs_watch_index(uint64_t hash);
 void bd12_cs_watch_count(uint64_t hash);
 void bd12_cs_watch_report(void);
@@ -1340,6 +1350,10 @@ int bd12_capture_rb_pending(void);
 void bd12_capture_rb_flush(void);
 void bd12_capture_end(void);
 void bd12_capture_flush(void);
+/* Frame breakdown (manager, gfx_frame_capture): dumps every render pass of the next frame into dir as PPM files, then
+ * writes dir/done. Returns 0 while an earlier request is still running. */
+int bd12_frame_capture_request(const char *dir);
+int bd12_frame_capture_state(void);       /* 0 idle, 1 waiting for the frame, 2 written */
 int bd12_capture_pending(void);
 
 /* DXR state objects on VK_KHR_ray_tracing_pipeline (bd12_rtpipe.c). A state object keeps its description (library
@@ -1356,11 +1370,21 @@ typedef struct BD12RtHitGroup {
     uint32_t type;                /* 0 triangles, 1 procedural */
     char any_hit[128], closest_hit[128], intersection[128];
 } BD12RtHitGroup;
+/* A local root signature associated with an export (shader or hit group name; "" = the default for exports without an
+ * explicit association). Converted at CreateStateObject, so it does not depend on the root signature object living on. */
+#define BD12_RT_LOCAL_MAX_PARAMS 32
+typedef struct BD12RtLocalSig {
+    char export_name[128];
+    uint32_t param_count;
+    BeerD3D12LocalParam params[BD12_RT_LOCAL_MAX_PARAMS];
+} BD12RtLocalSig;
 typedef struct BD12RtDesc {
     BD12RtLibrary *libraries;
     uint32_t library_count;
     BD12RtHitGroup *hit_groups;
     uint32_t hit_group_count;
+    BD12RtLocalSig *locals;
+    uint32_t local_count;
     uint32_t max_payload, max_attributes, max_recursion;
     BD12RootSignature *global_root_signature;
 } BD12RtDesc;
@@ -1369,6 +1393,8 @@ typedef struct BD12RtPipeline BD12RtPipeline;
 const uint8_t *bd12_rt_intern_blob(const uint8_t *code, size_t size);
 BD12RtPipeline *bd12_rt_pipeline_create(BD12Device *device, const BD12RtDesc *desc);   /* takes ownership of desc arrays */
 void bd12_rt_pipeline_destroy(BD12RtPipeline *pipeline);
+/* The description a state object was created from (collections are merged into the pipelines that use them). */
+const BD12RtDesc *bd12_rt_pipeline_desc(const BD12RtPipeline *pipeline);
 /* 32-byte shader identifier of an export or hit group (builds the pipeline on first use), or NULL. */
 const uint8_t *bd12_rt_pipeline_identifier(BD12RtPipeline *pipeline, const char *name);
 /* GPU checkpoints (BEER_VK_CHECKPOINTS=1): mark the next command, dump the last reached ones after a fault. */

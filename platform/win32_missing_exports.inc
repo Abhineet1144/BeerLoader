@@ -244,6 +244,18 @@ static u64 __attribute__((ms_abi)) stub_DragQueryFileW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExtractAssociatedIconW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DragFinish(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_OleUninitialize(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_OleInitialize(void){ return 0; }
+/* No file associations: SE_ERR_NOASSOC (31) with an empty result. */
+static u64 __attribute__((ms_abi)) stub_FindExecutableW(const u16 *file, const u16 *dir, u16 *result)
+{ (void)file; (void)dir; if (result) result[0] = 0; return 31; }
+/* No shell namespace: the COM-style shell entry points fail with E_FAIL and null outputs. */
+static u64 __attribute__((ms_abi)) stub_SHGetDesktopFolder(u64 *folder){ if (folder) *folder = 0; return 0x80004005u; }
+static u64 __attribute__((ms_abi)) stub_SHGetFileInfoW(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_SHGetSettings(void){ return 0; }
+/* No desktop composition is reported: S_OK with *enabled = FALSE. */
+static u64 __attribute__((ms_abi)) stub_DwmIsCompositionEnabled(u32 *enabled){ if (enabled) *enabled = 0; return 0; }
+static u64 __attribute__((ms_abi)) stub_SHCreateStreamOnFileW(u64 file, u32 mode, u64 *stream)
+{ (void)file; (void)mode; if (stream) *stream = 0; return 0x80004005u; }
 static u64 __attribute__((ms_abi)) stub_CLSIDFromProgID(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetErrorInfo(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_LdrGetProcedureAddress(void){ return 0xC0000139u; }
@@ -2017,3 +2029,128 @@ static u64 __attribute__((ms_abi)) beer_PowerUnregisterSuspendResumeNotification
 static u64 __attribute__((ms_abi)) beer_SHGetMalloc(void **out) { return beer_CoGetMalloc(1, out); }
 
 #pragma GCC diagnostic pop
+
+/* Optional AWT/Swing entry points: no printers, metafiles, IME or clipboard viewers; US keyboard layout. */
+static u64 __attribute__((ms_abi)) stub_awt_keybd_event(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_mouse_event(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetMenuState(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_AnimateWindow(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_EnumChildWindows(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_RealGetWindowClassW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_SetClassLongW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetClassLongW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetCursor(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_AppendMenuW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetClipboardFormatNameW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ValidateRgn(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetUpdateRgn(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetOpenClipboardWindow(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ChangeClipboardChain(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_SetClipboardViewer(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetComboBoxInfo(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ScrollDC(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_BeginPath(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CloseFigure(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_EndPath(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_FillPath(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_StrokePath(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_PolyBezierTo(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_AbortPath(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CreateRectRgnIndirect(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CloseEnhMetaFile(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_RemoveFontResourceExW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_AddFontResourceExW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CreateICW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_SelectClipPath(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_AbortDoc(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_EndPage(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_StartPage(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_EndDoc(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_StartDocW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetCurrentPositionEx(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetSystemPaletteEntries(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetFontData(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetCharWidthW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetTextFaceW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_PlayEnhMetaFile(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetEnhMetaFilePaletteEntries(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetEnhMetaFileHeader(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_DeleteEnhMetaFile(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CreateEnhMetaFileW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetPaletteEntries(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CreatePalette(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CreateMetaFileW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CloseMetaFile(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_OffsetWindowOrgEx(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_SetWinMetaFileBits(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_SetEnhMetaFileBits(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetEnhMetaFileBits(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_SetMetaFileBitsEx(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetMetaFileBitsEx(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_DeleteMetaFile(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ResetDCW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ExtEscape(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_SwapBuffers(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ChoosePixelFormat(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_DeviceCapabilitiesW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_StartDocPrinterW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_StartPagePrinter(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_WritePrinter(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_OpenPrinterW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetPrinterW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_EnumPrintersW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_EndPagePrinter(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_EndDocPrinter(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_FindFirstPrinterChangeNotification(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_FindNextPrinterChangeNotification(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_FindClosePrinterChangeNotification(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_DocumentPropertiesW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ClosePrinter(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ImmSetCompositionFontW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ImmGetCompositionWindow(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ImmGetCandidateWindow(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ImmDestroyContext(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CoFileTimeNow(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetHGlobalFromStream(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_DoDragDrop(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_SHGetSettings(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_PrintDlgW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CommDlgExtendedError(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetSaveFileNameW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_PageSetupDlgW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_PlaySoundW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_ImageList_GetIcon(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_SHCreateStreamOnFileW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_OleInitialize(void *reserved) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_CoGetCurrentProcess(void) { return 1; }
+static u64 __attribute__((ms_abi)) stub_awt_GetKeyboardType(u32 type) { return type == 0 ? 4 : type == 2 ? 12 : 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetNearestColor(u64 dc, u32 color) { (void)dc; return color; }
+static u64 __attribute__((ms_abi)) stub_awt_GdiSetBatchLimit(u32 limit) { return 1; }
+static u64 __attribute__((ms_abi)) stub_awt_LoadKeyboardLayoutW(const u16 *id, u32 flags) { return 0x04090409u; }
+static u64 __attribute__((ms_abi)) stub_awt_ActivateKeyboardLayout(u64 layout, u32 flags) { return 0x04090409u; }
+static u64 __attribute__((ms_abi)) stub_awt_GetKeyboardLayoutList(s32 count, u64 *list) { if (count && list) list[0] = 0x04090409u; return 1; }
+static u64 __attribute__((ms_abi)) stub_awt_VkKeyScanW(u16 ch) { if (ch >= 'a' && ch <= 'z') return (u64)(ch - 32); if (ch >= 'A' && ch <= 'Z') return (u64)(0x100 | ch); if (ch >= '0' && ch <= '9') return ch; if (ch == ' ') return 0x20; return 0xffff; }
+/* Optional entry points of the Windows JRE's native libraries (ICMP, SID lookup, GDI fonts, MIDI): not supported. */
+static u64 __attribute__((ms_abi)) stub_jre_ChangeDisplaySettingsW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_EnumFontFamiliesExA(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_getprotobyname(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_IcmpSendEcho(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_IcmpCreateFile(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_Icmp6SendEcho2(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_IcmpCloseHandle(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_IcmpSendEcho2Ex(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_Icmp6CreateFile(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_ConvertStringSidToSidW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_ConvertSidToStringSidW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_LookupAccountNameW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_LookupAccountSidW(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_LookupAccountNameA(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_LookupAccountSidA(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_TransmitFile(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_SetWindowLongPtrA(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_mixerGetNumDevs(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_midiOutGetNumDevs(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_midiInGetNumDevs(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_LsaNtStatusToWinError(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_jre_GetGlyphOutlineA(void) { return 0xffffffffu; }
+static u64 __attribute__((ms_abi)) stub_jre_RegDeleteKeyA(void) { return 5; }

@@ -240,6 +240,18 @@ static int floats_equal(float a, float b)
 
 void bd12_cbt_handle(const char *cmd, const char *request, char *out, size_t size)
 {
+    if (!strcmp(cmd, "gfx_frame_capture")) {     /* frame breakdown: {"dir": "<empty folder>"} */
+        char dir[512] = "";
+        if (!beer_json_string(request, "dir", dir, sizeof(dir)) || !dir[0]) { error_reply(out, size, "gfx_frame_capture needs dir"); return; }
+        if (!bd12_frame_capture_request(dir)) { error_reply(out, size, "a frame capture is already running"); return; }
+        snprintf(out, size, "{\"ok\":true}\n");
+        return;
+    }
+    if (!strcmp(cmd, "gfx_frame_capture_status")) {
+        static const char *names[] = { "idle", "waiting", "done" };
+        snprintf(out, size, "{\"ok\":true,\"state\":\"%s\"}\n", names[bd12_frame_capture_state() % 3]);
+        return;
+    }
     pthread_mutex_lock(&lock);
     if (!strcmp(cmd, "gfx_capture")) {
         int32_t on = 0;

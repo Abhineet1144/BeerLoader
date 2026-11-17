@@ -261,11 +261,73 @@ static void reg_seed_windows_version(void)
         reg_add_dword("hklm\\software\\microsoft\\directstorage\\overrides", "disablegpudecompression", 1);
 }
 
+/* HKLM\SOFTWARE\JavaSoft\Java Runtime Environment as a Windows JRE install records itself, so launchers that look
+ * Java up in the registry (Launch4j wrappers) find one. BEER_WINDOWS_JAVA_HOME=<linux dir> picks the JRE; otherwise
+ * the first jre*, then jdk*, under /mnt/<drive>/Program Files/Java is used. The path is given through drive Z:. */
+static void reg_seed_windows_java(void)
+{
+    static char home[PATH_MAX], windows_home[PATH_MAX + 4], version[32];
+    const char *chosen = getenv("BEER_WINDOWS_JAVA_HOME");
+    if (chosen && *chosen) snprintf(home, sizeof(home), "%s", chosen);
+    else {
+        static const char *const patterns[] = { "/mnt/*/Program Files/Java/jre*", "/mnt/*/Program Files/Java/jdk*" };
+        for (size_t i = 0; !home[0] && i < sizeof(patterns) / sizeof(*patterns); ++i) {
+            glob_t found;
+            if (glob(patterns[i], 0, NULL, &found) == 0) {
+                for (size_t k = 0; k < found.gl_pathc && !home[0]; ++k) {
+                    char probe[PATH_MAX];
+                    snprintf(probe, sizeof(probe), "%s/bin/javaw.exe", found.gl_pathv[k]);
+                    if (!access(probe, R_OK)) snprintf(home, sizeof(home), "%s", found.gl_pathv[k]);
+                }
+                globfree(&found);
+            }
+        }
+    }
+    if (!home[0]) return;
+    const char *name = strrchr(home, '/');
+    name = name ? name + 1 : home;
+    while (*name && !(*name >= '0' && *name <= '9')) ++name;       /* "jre-1.8" -> "1.8", "jdk-22" -> "22" */
+    const int is_kit = !strncmp(strrchr(home, '/') ? strrchr(home, '/') + 1 : home, "jdk", 3);
+    snprintf(version, sizeof(version), "%s", *name ? name : "1.8");
+    version[strcspn(version, "_ ")] = 0;
+    static char full_version[48];
+    {   /* "release" holds JAVA_VERSION="1.8.0_411": Windows installs record both 1.8 and 1.8.0_411 */
+        char release[PATH_MAX + 16];
+        snprintf(release, sizeof(release), "%s/release", home);
+        FILE *f = fopen(release, "r");
+        char line[160];
+        while (f && fgets(line, sizeof(line), f))
+            if (!strncmp(line, "JAVA_VERSION=\"", 14)) {
+                snprintf(full_version, sizeof(full_version), "%s", line + 14);
+                full_version[strcspn(full_version, "\"\r\n")] = 0;
+                break;
+            }
+        if (f) fclose(f);
+    }
+    snprintf(windows_home, sizeof(windows_home), "Z:%s", home);
+    for (char *c = windows_home; *c; ++c) if (*c == '/') *c = '\\';
+    static char keys[4][112];
+    static const char *const roots[2] = { "hklm\\software\\javasoft\\java runtime environment",
+                                          "hklm\\software\\javasoft\\java development kit" };
+    for (int r = 0; r < 2; ++r) {
+        if (r && !is_kit) break;
+        reg_add_sz(roots[r], "currentversion", version);
+        snprintf(keys[2 * r], sizeof(keys[0]), "%s\\%s", roots[r], version);
+        reg_add_sz(keys[2 * r], "javahome", windows_home);
+        if (full_version[0] && strcmp(full_version, version)) {
+            snprintf(keys[2 * r + 1], sizeof(keys[0]), "%s\\%s", roots[r], full_version);
+            reg_add_sz(keys[2 * r + 1], "javahome", windows_home);
+        }
+    }
+    fprintf(stderr, "[JAVA] Windows Java %s (%s) registered: %s\n", version, full_version, windows_home);
+}
+
 static void reg_seed_locked(void)
 {
     if (g_reg_value_count) return;
     reg_seed_hardware();
     reg_seed_windows_version();
+    reg_seed_windows_java();
     reg_seed_vc_runtime();
     reg_seed_nvidia_ngx();
     {   /* Launchers look for their sibling launcher through its install folder: point it at the game directory. */

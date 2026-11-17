@@ -266,14 +266,29 @@ void bd12_capture_rb_flush(void)
 
 /* ---- Render-target dump (BEER_BD12_CAPTURE_RT=1, needs CAPTURE_DIR + a traced frame) ---- */
 static uint64_t g_rt_bytes;
+/* Frame breakdown requested over the control socket: the folder, and 0 idle / 1 armed / 2 written. */
+static char g_frame_dir[512];
+static _Atomic int g_frame_state;
+int bd12_frame_capture_request(const char *dir)
+{
+    if (!dir || !*dir || strlen(dir) >= sizeof(g_frame_dir) || (g_frame_state == 1 && g_cap_count)) return 0;
+    pthread_mutex_lock(&g_lock);
+    snprintf(g_frame_dir, sizeof(g_frame_dir), "%s", dir);
+    pthread_mutex_unlock(&g_lock);
+    g_frame_state = 1;
+    bd12_trace_request();
+    return 1;
+}
+int bd12_frame_capture_state(void) { return g_frame_state; }
+
 int bd12_capture_rt_enabled(void)
 {
     static int cached = -1;
     if (cached < 0) cached = getenv("BEER_BD12_CAPTURE_RT") && getenv("BEER_BD12_CAPTURE_DIR");
-    return cached && bd12_trace_active();
+    return (cached || g_frame_state == 1) && bd12_trace_active();
 }
 
-static void bd12_capture_depth_pass(BD12CmdList *list);
+static void bd12_capture_depth_pass(BD12CmdList *list, uint32_t rt_pass);
 void bd12_capture_rt_pass(BD12CmdList *list)
 {
     if (!bd12_capture_rt_enabled()) return;
@@ -282,7 +297,7 @@ void bd12_capture_rt_pass(BD12CmdList *list)
     static uint32_t pass_seq;
     const uint32_t pass = __atomic_add_fetch(&pass_seq, 1, __ATOMIC_RELAXED);
     fprintf(stderr, "[TRACE] pass end list=%p rt%03u\n", (void *)list, pass);
-    if (list->gfx.cap_has_dsv) bd12_capture_depth_pass(list);
+    if (list->gfx.cap_has_dsv) bd12_capture_depth_pass(list, pass);
     if (getenv("BEER_BD12_CAPTURE_RT_DEPTH_ONLY")) return;
     for (uint32_t i = 0; i < list->gfx.cap_rtv_count; ++i) {
         const BD12Descriptor *d = &list->gfx.cap_rtv[i];
@@ -322,7 +337,7 @@ void bd12_capture_rt_pass(BD12CmdList *list)
 }
 
 /* Depth attachments (shadow maps): up to 6 array layers of maps up to ~2048x2048. */
-static void bd12_capture_depth_pass(BD12CmdList *list)
+static void bd12_capture_depth_pass(BD12CmdList *list, uint32_t rt_pass)
 {
     BD12Device *device = list->device;
     const BD12Descriptor *d = &list->gfx.cap_dsv;
@@ -333,7 +348,7 @@ static void bd12_capture_depth_pass(BD12CmdList *list)
     const uint32_t bpp = (fmt == 124 || fmt == 128) ? 2 : 4;
     const uint32_t w = im->desc.width >> d->view_mip ? im->desc.width >> d->view_mip : 1;
     const uint32_t h = im->desc.height >> d->view_mip ? im->desc.height >> d->view_mip : 1;
-    uint64_t max_pix = 4300000;
+    uint64_t max_pix = g_frame_state == 1 ? 17000000 : 4300000;    /* frame breakdown: scene depth up to 4K+ */
     if (getenv("BEER_BD12_CAPTURE_DEPTH_MAXPIX")) max_pix = strtoull(getenv("BEER_BD12_CAPTURE_DEPTH_MAXPIX"), NULL, 10);
     if ((uint64_t)w * h > max_pix) return;
     static uint32_t dpass;
@@ -361,7 +376,7 @@ static void bd12_capture_depth_pass(BD12CmdList *list)
             memset(c, 0, sizeof(*c));
             c->readback = rb; c->size = size; c->is_rt = 1; c->is_depth = 1;
             c->rt_w = w; c->rt_h = h; c->rt_bpp = bpp; c->rt_fmt = im->desc.format;
-            snprintf(c->name, sizeof(c->name), "dp%03u_l%u_%ux%u_vk%u_h%llx", pass, d->view_base_layer + l, w, h,
+            snprintf(c->name, sizeof(c->name), "rt%03u_dp%03u_l%u_%ux%u_vk%u_h%llx", rt_pass, pass, d->view_base_layer + l, w, h,
                      (unsigned)fmt, (unsigned long long)list->gfx.cap_hash);
             g_rt_bytes += size;
             rb = NULL;
@@ -463,7 +478,7 @@ static int rt_write_ppm(const Capture *c, const char *dir)
 {
     const uint8_t *src = c->readback->cpu;
     if (!src) return 0;
-    int scale = 4;
+    int scale = g_frame_state == 1 ? 2 : 4;      /* frame breakdown: larger pictures */
     if (getenv("BEER_BD12_CAPTURE_RT_SCALE")) scale = atoi(getenv("BEER_BD12_CAPTURE_RT_SCALE"));
     if (scale < 1) scale = 1;
     const uint32_t ow = (c->rt_w + scale - 1) / scale, oh = (c->rt_h + scale - 1) / scale;
@@ -546,7 +561,8 @@ static int rt_write_ppm(const Capture *c, const char *dir)
 /* Called at the traced frame's present after the GPU has drained. */
 void bd12_capture_flush(void)
 {
-    const char *dir = getenv("BEER_BD12_CAPTURE_DIR");
+    const int frame = g_frame_state == 1;
+    const char *dir = frame ? g_frame_dir : getenv("BEER_BD12_CAPTURE_DIR");
     if (!dir) return;
     g_rt_bytes = 0;
     seen_count = 0;
@@ -567,6 +583,13 @@ void bd12_capture_flush(void)
     }
     if (g_cap_count)
         fprintf(stderr, "[CAPTURE] wrote %u buffers to %s\n", g_cap_count, dir);
+    if (frame) {
+        char path[600];
+        snprintf(path, sizeof(path), "%s/done", dir);
+        FILE *f = fopen(path, "w");
+        if (f) { fprintf(f, "%u\n", g_cap_count); fclose(f); }
+        g_frame_state = 2;
+    }
     g_cap_count = 0;
     g_sequence = 0;
 }

@@ -11,7 +11,7 @@
 #include <string.h>
 #include <zlib.h>
 
-#define OVERLAY_REGION_BYTES (4u * 1024u * 1024u)
+#define OVERLAY_REGION_BYTES BEER_OVERLAY_REGION_BYTES
 
 #define FN(name) PFN_vk##name name
 static struct {
@@ -41,7 +41,7 @@ static struct {
     VkBuffer overlay_buffer;
     VkDeviceMemory overlay_memory;
     uint8_t *overlay_map;
-    uint64_t overlay_serial[2];
+    uint64_t overlay_serial[BEER_OVERLAY_SLOTS];
 
     VkBuffer shot_buffer;
     VkDeviceMemory shot_memory;
@@ -158,7 +158,7 @@ static int init(void)
     if (P.CreateDescriptorPool(P.device, &pool_info, NULL, &P.pool) != VK_SUCCESS) return 0;
     VkDescriptorSetAllocateInfo set_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = P.pool, .descriptorSetCount = 1, .pSetLayouts = &P.set_layout };
     if (P.AllocateDescriptorSets(P.device, &set_info, &P.set) != VK_SUCCESS) return 0;
-    if (!make_buffer(2u * OVERLAY_REGION_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &P.overlay_buffer, &P.overlay_memory, &P.overlay_map)) return 0;
+    if (!make_buffer((VkDeviceSize)BEER_OVERLAY_SLOTS * OVERLAY_REGION_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &P.overlay_buffer, &P.overlay_memory, &P.overlay_map)) return 0;
     P.ready = 1;
     fprintf(stderr, "[POST] final-image compute passes ready\n");
     return 1;
@@ -174,7 +174,7 @@ void vulkan_post_forget_upload(void)
 static int prepare_images(VkImage upload, uint32_t w, uint32_t h)
 {
     if (P.upload_for == upload && P.width == w && P.height == h && P.out_image) return 1;
-    P.DeviceWaitIdle(P.device);
+    beer_vulkan_device_wait_idle(P.device, P.DeviceWaitIdle);
     if (P.out_view) P.DestroyImageView(P.device, P.out_view, NULL);
     if (P.upload_view) P.DestroyImageView(P.device, P.upload_view, NULL);
     if (P.out_image) P.DestroyImage(P.device, P.out_image, NULL);
@@ -203,7 +203,7 @@ static int prepare_images(VkImage upload, uint32_t w, uint32_t h)
     view.image = upload;
     if (P.CreateImageView(P.device, &view, NULL, &P.upload_view) != VK_SUCCESS) return 0;
     VkDescriptorImageInfo images[2] = { { VK_NULL_HANDLE, P.upload_view, VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, P.out_view, VK_IMAGE_LAYOUT_GENERAL } };
-    VkDescriptorBufferInfo buffer = { P.overlay_buffer, 0, 2u * OVERLAY_REGION_BYTES };
+    VkDescriptorBufferInfo buffer = { P.overlay_buffer, 0, (VkDeviceSize)BEER_OVERLAY_SLOTS * OVERLAY_REGION_BYTES };
     VkWriteDescriptorSet writes[3] = {
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = P.set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &images[0] },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = P.set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &images[1] },
@@ -239,7 +239,7 @@ static int record_screenshot(VkCommandBuffer cmd, const char *path)
 {
     const size_t bytes = (size_t)P.width * P.height * 4;
     if (bytes > P.shot_capacity) {
-        if (P.shot_buffer) { P.DeviceWaitIdle(P.device); P.DestroyBuffer(P.device, P.shot_buffer, NULL); P.FreeMemory(P.device, P.shot_memory, NULL); }
+        if (P.shot_buffer) { beer_vulkan_device_wait_idle(P.device, P.DeviceWaitIdle); P.DestroyBuffer(P.device, P.shot_buffer, NULL); P.FreeMemory(P.device, P.shot_memory, NULL); }
         P.shot_buffer = VK_NULL_HANDLE; P.shot_capacity = 0;
         if (!make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &P.shot_buffer, &P.shot_memory, &P.shot_map)) return 0;
         P.shot_capacity = bytes;
@@ -265,7 +265,7 @@ VkImage vulkan_post_apply(VkCommandBuffer cmd, VkImage upload, uint32_t width, u
     if (!init() || width == 0 || height == 0) return VK_NULL_HANDLE;
     BeerPostParams params;
     const int effects = beer_post_params(&params);
-    BeerOverlayRect rects[2];
+    BeerOverlayRect rects[BEER_OVERLAY_SLOTS];
     const int boxes = beer_overlay_frame((int)output_width, (int)output_height, rects);
     char shot_path[512];
     int shot_clean = 0;
@@ -274,10 +274,11 @@ VkImage vulkan_post_apply(VkCommandBuffer cmd, VkImage upload, uint32_t width, u
     if (!prepare_images(upload, width, height)) return VK_NULL_HANDLE;
 
     /* Overlay pixels go into the storage buffer (cached per box by serial). */
-    uint32_t offsets[2] = {0, 0};
+    uint32_t offsets[BEER_OVERLAY_SLOTS] = {0};
     for (int i = 0; i < boxes; ++i) {
         const size_t bytes = (size_t)rects[i].w * rects[i].h * 4;
-        const int slot = (int)(rects[i].serial & 1u);
+        const int slot = rects[i].slot;
+        if (slot < 0 || slot >= BEER_OVERLAY_SLOTS) { rects[i].w = 0; continue; }
         if (bytes > OVERLAY_REGION_BYTES) { rects[i].w = 0; continue; }
         offsets[i] = (uint32_t)((size_t)slot * OVERLAY_REGION_BYTES / 4);
         if (P.overlay_serial[slot] != rects[i].serial) {

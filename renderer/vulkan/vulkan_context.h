@@ -34,6 +34,8 @@ int beer_vulkan_real_gpu_ids(uint32_t *vendor, uint32_t *device);
 int beer_vulkan_gpu_spoof(char *name, size_t name_size, uint32_t *vendor, uint32_t *device, uint64_t *vram_bytes);
 VkInstance beer_vulkan_instance(void);
 VkPhysicalDevice beer_vulkan_physical_device(void);
+/* Device-local budget/usage from VK_EXT_memory_budget (bytes); 0 when unavailable. */
+int beer_vulkan_memory_budget(uint64_t *budget, uint64_t *usage);
 VkDevice beer_vulkan_device(void);
 VkQueue beer_vulkan_queue(void);
 uint32_t beer_vulkan_queue_family(void);
@@ -112,6 +114,8 @@ PFN_vkGetDeviceProcAddr beer_vulkan_get_device_proc_addr(void);
 
 /* Vulkan queues require external synchronization across host threads. */
 void beer_vulkan_queue_lock(void);
+/* vkDeviceWaitIdle with every queue lock held (required: it needs host access to all queues). */
+void beer_vulkan_device_wait_idle(VkDevice device, PFN_vkDeviceWaitIdle wait_idle);
 void beer_vulkan_queue_unlock(void);
 /* Per-queue locks; index 0 (or an index past the count) is the same lock as beer_vulkan_queue_lock. */
 void beer_vulkan_queue_lock_at(uint32_t index);

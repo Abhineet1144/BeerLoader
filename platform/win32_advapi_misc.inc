@@ -5,6 +5,17 @@
  * ordinary file handles; timer-queue timers are host threads that call the guest callback with a proper TEB. */
 
 /* ---- tokens / security descriptors ---- */
+static u64 __attribute__((ms_abi)) impl_OpenThreadToken(u64 thread, u32 access, u32 open_as_self, u64 *token)
+{
+    (void)thread; (void)access; (void)open_as_self;
+    if (!token) { g_last_error = 87; return 0; }
+    *token = 0x7E0C0002ull;
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_ImpersonateSelf(u32 level) { (void)level; g_last_error = 0; return 1; }
+static u64 __attribute__((ms_abi)) impl_RevertToSelf(void) { g_last_error = 0; return 1; }
+static u64 __attribute__((ms_abi)) impl_SetThreadToken(u64 *thread, u64 token) { (void)thread; (void)token; g_last_error = 0; return 1; }
 static u64 __attribute__((ms_abi)) impl_DuplicateToken(u64 token, u32 level, u64 *out)
 {
     (void)level;

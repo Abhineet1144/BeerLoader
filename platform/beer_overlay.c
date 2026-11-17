@@ -1,3 +1,4 @@
+#define _GNU_SOURCE   /* strcasestr */
 #include "beer_overlay.h"
 #include "beer_control.h"
 #include "beer_memory.h"
@@ -9,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -56,13 +58,28 @@ static struct {
     uint64_t pin_ns;
     int pin_count;
     char pin_text[1024];
+    /* Alert banner (beer_overlay_set_alert, e.g. the low-memory guard): drawn centred even with the overlay hidden,
+     * in place of the pinned-values box (it takes that box's upload slot). */
+    Box alert_box;
+    char alert_text[512];
+    /* Mod boxes (overlay_box_set): placed and styled by mods, shown whether or not the overlay is toggled on. */
+    struct { int used, x, y; uint32_t text_color, panel_color; char id[48], owner[48], text[1024]; Box box; }
+        mods[BEER_OVERLAY_MOD_BOXES];
 } ov = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .hotkey_keysym = 0xffc7,   /* F10 */
     .panel_color = 0x12161c, .text_color = 0xe8e8e8, .accent_color = 0x8fe3a0, .opacity = 850,
     .fields = FIELD_FPS | FIELD_FRAMETIME | FIELD_CPU | FIELD_RAM | FIELD_THREADS,
     .box = { { .enabled = 1, .x = 10, .y = 10, .size = 1 }, { .enabled = 1, .x = 10, .y = 300, .size = 1 } },
+    .alert_box = { .enabled = 1, .size = 2 },
 };
+
+void beer_overlay_set_alert(const char *text)
+{
+    pthread_mutex_lock(&ov.lock);
+    snprintf(ov.alert_text, sizeof(ov.alert_text), "%s", text ? text : "");
+    pthread_mutex_unlock(&ov.lock);
+}
 
 /* Frame times (microseconds) of the most recent presents, for the graph. */
 #define FRAME_RING 240
@@ -178,7 +195,8 @@ static int render_box(Box *box, const char *text, int graph, uint64_t graph_stam
         ++col;
     }
     if (graph) {
-        /* Frame-time bars: newest on the right, green <= 16.7 ms, yellow <= 33.3 ms, red above; dim 60 fps guide line. */
+        /* Frame-time bars: newest on the right, green up to 58 fps worth (17.2 ms, so a 60 fps cap with a little jitter
+         * stays green), yellow <= 33.3 ms, red above; dim 60 fps guide line. */
         const int gx = inline_graph ? slot_x : pad;
         const int gy = inline_graph ? slot_y : pad + lines * font->cell_h + pad / 2;
         const unsigned head = atomic_load_explicit(&frame_head, memory_order_relaxed);
@@ -200,7 +218,7 @@ static int render_box(Box *box, const char *text, int graph, uint64_t graph_stam
             int bar_h = (int)((uint64_t)t * (uint64_t)graph_h / peak);
             if (bar_h < 1) bar_h = 1;
             if (bar_h > graph_h) bar_h = graph_h;
-            const uint32_t color = t <= 16700 ? ov.accent_color : t <= 33400 ? 0xe6c34a : 0xe5534b;
+            const uint32_t color = t <= 17241 ? ov.accent_color : t <= 33400 ? 0xe6c34a : 0xe5534b;
             const int x0 = gx + graph_w - 2 * (i + 1);
             if (x0 < gx) break;
             for (int y = 0; y < bar_h; ++y)
@@ -209,7 +227,10 @@ static int render_box(Box *box, const char *text, int graph, uint64_t graph_stam
         box->graph_stamp = graph_stamp;
     }
     snprintf(box->text, sizeof(box->text), "%s", text);
-    ++box->serial;
+    /* Serials are unique across all boxes: the renderers cache uploads per slot by serial, and a mod box that is
+     * removed and re-created in the same slot must not match the serial of the pixels uploaded before. */
+    static uint64_t next_serial;
+    box->serial = ++next_serial;
     const char *dump = getenv("BEER_OVERLAY_DUMP");   /* debug: writes <dir>/box<N>.ppm whenever a box is redrawn */
     if (dump) {
         char path[512];
@@ -409,7 +430,14 @@ static void build_pins(void)
     ov.pin_count = count;   /* the pinned box is only drawn while something is pinned */
 }
 
-int beer_overlay_frame(int out_w, int out_h, BeerOverlayRect rects[2])
+int beer_overlay_translucent(void)
+{
+    if (ov.alert_text[0]) return 1;
+    for (int i = 0; i < BEER_OVERLAY_MOD_BOXES; ++i) if (ov.mods[i].used && ov.mods[i].text[0]) return 1;   /* blend path: the alert must show even when the direct path is used */
+    return __atomic_load_n(&ov.visible, __ATOMIC_RELAXED) && __atomic_load_n(&ov.opacity, __ATOMIC_RELAXED) < 1000;
+}
+
+int beer_overlay_frame(int out_w, int out_h, BeerOverlayRect rects[BEER_OVERLAY_SLOTS])
 {
     pthread_mutex_lock(&ov.lock);
     int count = 0;
@@ -428,15 +456,80 @@ int beer_overlay_frame(int out_w, int out_h, BeerOverlayRect rects[2])
             if (x < 0) x = 0;
             if (y < 0) y = 0;
             if (box->w > out_w || box->h > out_h) continue;
-            rects[count++] = (BeerOverlayRect){ x, y, box->w, box->h, box->pixels, box->serial * 2 + (uint64_t)i };
+            rects[count++] = (BeerOverlayRect){ x, y, box->w, box->h, box->pixels, box->serial, i };
         }
+    }
+    if (ov.alert_text[0] && out_w > 0 && out_h > 0) {
+        Box *box = &ov.alert_box;
+        render_box(box, ov.alert_text, 0, 0);
+        if (box->pixels && box->w <= out_w && box->h <= out_h)
+            rects[count++] = (BeerOverlayRect){ (out_w - box->w) / 2, out_h / 3 - box->h / 2 > 0 ? out_h / 3 - box->h / 2 : 0,
+                                                box->w, box->h, box->pixels, box->serial, 2 };
+    }
+    for (int i = 0; i < BEER_OVERLAY_MOD_BOXES && out_w > 0 && out_h > 0; ++i) {
+        if (!ov.mods[i].used || !ov.mods[i].text[0]) continue;
+        Box *box = &ov.mods[i].box;
+        const uint32_t text = ov.text_color, panel = ov.panel_color;   /* the mod's own colours for this render */
+        if (ov.mods[i].text_color) ov.text_color = ov.mods[i].text_color & 0xffffffu;
+        if (ov.mods[i].panel_color) ov.panel_color = ov.mods[i].panel_color & 0xffffffu;
+        render_box(box, ov.mods[i].text, 0, 0);
+        ov.text_color = text;
+        ov.panel_color = panel;
+        if (!box->pixels || box->w > out_w || box->h > out_h || (size_t)box->w * box->h * 4 > BEER_OVERLAY_REGION_BYTES)
+            continue;
+        int x = (int)((long long)out_w * ov.mods[i].x / 1000), y = (int)((long long)out_h * ov.mods[i].y / 1000);
+        if (x + box->w > out_w) x = out_w - box->w;
+        if (y + box->h > out_h) y = out_h - box->h;
+        rects[count++] = (BeerOverlayRect){ x < 0 ? 0 : x, y < 0 ? 0 : y, box->w, box->h, box->pixels, box->serial, 3 + i };
     }
     pthread_mutex_unlock(&ov.lock);
     return count;
 }
 
+/* Mod hotkeys (hotkey_add): presses are counted until the mod polls them (hotkey_events), so none is missed. */
+#define MAX_MOD_HOTKEYS 32
+static struct { int used, swallow, held; unsigned long keysym; unsigned mods; uint32_t presses; char id[48], owner[48]; }
+    g_mod_keys[MAX_MOD_HOTKEYS];
+
+static unsigned long keysym_from_name(const char *name)
+{
+    if (!name || !*name) return 0;
+    if ((name[0] == 'F' || name[0] == 'f') && name[1] >= '1' && name[1] <= '9') {   /* F1..F12 */
+        const int n = atoi(name + 1);
+        if (n >= 1 && n <= 12) return 0xffbeul + (unsigned long)(n - 1);
+    }
+    if (!name[1] && ((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= '0' && name[0] <= '9'))) return (unsigned long)name[0];
+    if (!name[1] && name[0] >= 'A' && name[0] <= 'Z') return (unsigned long)(name[0] - 'A' + 'a');
+    static const struct { const char *n; unsigned long k; } named[] = {
+        { "Insert", 0xff63 }, { "Delete", 0xffff }, { "Home", 0xff50 }, { "End", 0xff57 }, { "PageUp", 0xff55 },
+        { "PageDown", 0xff56 }, { "Pause", 0xff13 }, { "ScrollLock", 0xff14 }, { "Tab", 0xff09 }, { "Space", 0x20 },
+        { "KP_Add", 0xffab }, { "KP_Subtract", 0xffad }, { "KP_Multiply", 0xffaa }, { "KP_Divide", 0xffaf },
+    };
+    for (size_t i = 0; i < sizeof(named) / sizeof(*named); ++i) if (!strcasecmp(name, named[i].n)) return named[i].k;
+    return strtoul(name, NULL, 0);
+}
+static unsigned mods_from_name(const char *text)
+{
+    unsigned mods = 0;
+    if (text && strcasestr(text, "shift")) mods |= 1u;
+    if (text && (strcasestr(text, "ctrl") || strcasestr(text, "control"))) mods |= 4u;
+    if (text && strcasestr(text, "alt")) mods |= 8u;
+    return mods;
+}
+
 int beer_overlay_hotkey_event(unsigned long keysym, unsigned state, int down)
 {
+    int swallow = 0;
+    pthread_mutex_lock(&ov.lock);
+    for (int i = 0; i < MAX_MOD_HOTKEYS; ++i) {
+        if (!g_mod_keys[i].used || g_mod_keys[i].keysym != keysym || (state & (1u | 4u | 8u)) != g_mod_keys[i].mods)
+            continue;
+        if (down && !g_mod_keys[i].held) ++g_mod_keys[i].presses;
+        g_mod_keys[i].held = down;
+        swallow |= g_mod_keys[i].swallow;
+    }
+    pthread_mutex_unlock(&ov.lock);
+    if (swallow) return 1;
     if (keysym != ov.hotkey_keysym) return 0;
     if ((state & (1u | 4u | 8u)) != ov.hotkey_mods) return 0;   /* Shift, Control, Alt */
     pthread_mutex_lock(&ov.lock);
@@ -533,6 +626,136 @@ void beer_overlay_handle(const char *cmd, const char *request, char *out, size_t
     } else if (!strcmp(cmd, "overlay_set")) {
         apply_config(request);
         config_json(out, size);
+    } else if (!strcmp(cmd, "overlay_box_set")) {
+        /* {"id", "owner", "text" (\n = new line; [a]..[/a] accent, [d] dim), "x", "y" (permille of the screen,
+         *  top-left), "size" 0-2, "text_color"/"panel_color" "rrggbb"}: create or update a mod box. */
+        char id[48] = "", owner[48] = "", text[1024] = "", color[16];
+        int32_t v;
+        if (!beer_json_string(request, "id", id, sizeof(id)) || !id[0]) {
+            snprintf(out, size, "{\"ok\":false,\"error\":\"id missing\"}\n");
+            goto done;
+        }
+        int slot = -1;
+        for (int i = 0; i < BEER_OVERLAY_MOD_BOXES; ++i) {
+            if (ov.mods[i].used && !strcmp(ov.mods[i].id, id)) { slot = i; break; }
+            if (!ov.mods[i].used && slot < 0) slot = i;
+        }
+        if (slot < 0) {
+            snprintf(out, size, "{\"ok\":false,\"error\":\"too many mod boxes (max %d)\"}\n", BEER_OVERLAY_MOD_BOXES);
+            goto done;
+        }
+        typeof(ov.mods[0]) *m = &ov.mods[slot];
+        if (!m->used) {
+            memset(m, 0, sizeof(*m));
+            m->used = 1;
+            m->x = 10; m->y = 600; m->box.size = 1; m->box.enabled = 1;
+            snprintf(m->id, sizeof(m->id), "%s", id);
+        }
+        if (beer_json_string(request, "owner", owner, sizeof(owner))) snprintf(m->owner, sizeof(m->owner), "%s", owner);
+        if (beer_json_milli(request, "x", &v)) m->x = v / 1000 < 0 ? 0 : v / 1000 > 1000 ? 1000 : v / 1000;
+        if (beer_json_milli(request, "y", &v)) m->y = v / 1000 < 0 ? 0 : v / 1000 > 1000 ? 1000 : v / 1000;
+        if (beer_json_milli(request, "size", &v)) m->box.size = v / 1000 < 0 ? 0 : v / 1000 > 2 ? 2 : v / 1000;
+        if (beer_json_string(request, "text_color", color, sizeof(color)))
+            m->text_color = color[0] ? (uint32_t)strtoul(color[0] == '#' ? color + 1 : color, NULL, 16) | 0x1000000u : 0;
+        if (beer_json_string(request, "panel_color", color, sizeof(color)))
+            m->panel_color = color[0] ? (uint32_t)strtoul(color[0] == '#' ? color + 1 : color, NULL, 16) | 0x1000000u : 0;
+        if (beer_json_string(request, "text", text, sizeof(text))) {
+            char *o = m->text, *end = m->text + sizeof(m->text) - 1;   /* markup -> the renderer's colour codes */
+            for (const char *p = text; *p && o < end;) {
+                if (!strncmp(p, "[a]", 3)) { *o++ = '\x01'; p += 3; }
+                else if (!strncmp(p, "[/a]", 4)) { *o++ = '\x02'; p += 4; }
+                else if (!strncmp(p, "[d]", 3)) { *o++ = '\x04'; p += 3; }
+                else if (!strncmp(p, "[/d]", 4)) { *o++ = '\x02'; p += 4; }
+                else if ((unsigned char)*p < 0x20 && *p != '\n') ++p;
+                else if ((unsigned char)*p >= 0x80) {        /* the font is ASCII: one '?' per non-ASCII character */
+                    *o++ = '?';
+                    ++p;
+                    while (((unsigned char)*p & 0xc0) == 0x80) ++p;
+                } else *o++ = *p++;
+            }
+            *o = 0;
+        }
+        m->box.text[0] = 0;                        /* re-render: colours or size may have changed */
+        snprintf(out, size, "{\"ok\":true,\"slot\":%d}\n", slot);
+    } else if (!strcmp(cmd, "overlay_box_remove")) {
+        char id[48] = "";
+        beer_json_string(request, "id", id, sizeof(id));
+        int removed = 0;
+        for (int i = 0; i < BEER_OVERLAY_MOD_BOXES; ++i)
+            if (ov.mods[i].used && !strcmp(ov.mods[i].id, id)) { free(ov.mods[i].box.pixels); memset(&ov.mods[i], 0, sizeof(ov.mods[i])); removed = 1; }
+        snprintf(out, size, "{\"ok\":true,\"removed\":%s}\n", removed ? "true" : "false");
+    } else if (!strcmp(cmd, "overlay_box_clear")) {   /* {"owner"}: every box of one mod ("" = all) */
+        char owner[48] = "";
+        beer_json_string(request, "owner", owner, sizeof(owner));
+        int removed = 0;
+        for (int i = 0; i < BEER_OVERLAY_MOD_BOXES; ++i)
+            if (ov.mods[i].used && (!owner[0] || !strcmp(ov.mods[i].owner, owner))) {
+                free(ov.mods[i].box.pixels); memset(&ov.mods[i], 0, sizeof(ov.mods[i])); ++removed;
+            }
+        snprintf(out, size, "{\"ok\":true,\"removed\":%d}\n", removed);
+    } else if (!strcmp(cmd, "overlay_boxes")) {
+        char *c = out;
+        c += snprintf(c, size, "{\"ok\":true,\"max\":%d,\"boxes\":[", BEER_OVERLAY_MOD_BOXES);
+        int first = 1;
+        for (int i = 0; i < BEER_OVERLAY_MOD_BOXES && (size_t)(c - out) + 200 < size; ++i)
+            if (ov.mods[i].used) {
+                c += snprintf(c, (size_t)(out + size - c), "%s{\"id\":\"%s\",\"owner\":\"%s\",\"x\":%d,\"y\":%d}", first ? "" : ",",
+                              ov.mods[i].id, ov.mods[i].owner, ov.mods[i].x, ov.mods[i].y);
+                first = 0;
+            }
+        snprintf(c, (size_t)(out + size - c), "]}\n");
+    } else if (!strcmp(cmd, "hotkey_add")) {
+        /* {"id", "key" (F1-F12, a-z, 0-9, Insert, Home, ... or an X keysym number), "mods" ("ctrl+shift"...),
+         *  "swallow" (true: the game does not see the key), "owner"} */
+        char id[48] = "", key[32] = "", mods[32] = "", owner[48] = "";
+        int32_t swallow = 0;
+        beer_json_string(request, "id", id, sizeof(id));
+        beer_json_string(request, "key", key, sizeof(key));
+        beer_json_string(request, "mods", mods, sizeof(mods));
+        beer_json_string(request, "owner", owner, sizeof(owner));
+        beer_json_milli(request, "swallow", &swallow);
+        const unsigned long keysym = keysym_from_name(key);
+        if (!id[0] || !keysym) { snprintf(out, size, "{\"ok\":false,\"error\":\"needs id and a known key\"}\n"); goto done; }
+        int slot = -1;
+        for (int i = 0; i < MAX_MOD_HOTKEYS; ++i) {
+            if (g_mod_keys[i].used && !strcmp(g_mod_keys[i].id, id)) { slot = i; break; }
+            if (!g_mod_keys[i].used && slot < 0) slot = i;
+        }
+        if (slot < 0) { snprintf(out, size, "{\"ok\":false,\"error\":\"too many hotkeys (max %d)\"}\n", MAX_MOD_HOTKEYS); goto done; }
+        g_mod_keys[slot].used = 1;
+        g_mod_keys[slot].keysym = keysym;
+        g_mod_keys[slot].mods = mods_from_name(mods);
+        g_mod_keys[slot].swallow = swallow != 0;
+        g_mod_keys[slot].presses = 0;
+        snprintf(g_mod_keys[slot].id, sizeof(g_mod_keys[slot].id), "%s", id);
+        snprintf(g_mod_keys[slot].owner, sizeof(g_mod_keys[slot].owner), "%s", owner);
+        snprintf(out, size, "{\"ok\":true,\"keysym\":%lu}\n", keysym);
+    } else if (!strcmp(cmd, "hotkey_events")) {   /* {"owner"} (optional): presses since the last poll, then reset */
+        char owner[48] = "";
+        beer_json_string(request, "owner", owner, sizeof(owner));
+        char *c = out;
+        c += snprintf(c, size, "{\"ok\":true,\"events\":[");
+        int first = 1;
+        for (int i = 0; i < MAX_MOD_HOTKEYS; ++i) {
+            if (!g_mod_keys[i].used || !g_mod_keys[i].presses || (owner[0] && strcmp(g_mod_keys[i].owner, owner))) continue;
+            c += snprintf(c, (size_t)(out + size - c), "%s{\"id\":\"%s\",\"presses\":%u}", first ? "" : ",",
+                          g_mod_keys[i].id, g_mod_keys[i].presses);
+            g_mod_keys[i].presses = 0;
+            first = 0;
+        }
+        snprintf(c, (size_t)(out + size - c), "]}\n");
+    } else if (!strcmp(cmd, "hotkey_remove") || !strcmp(cmd, "hotkey_clear")) {   /* {"id"} / {"owner"} */
+        char id[48] = "", owner[48] = "";
+        beer_json_string(request, "id", id, sizeof(id));
+        beer_json_string(request, "owner", owner, sizeof(owner));
+        int removed = 0;
+        for (int i = 0; i < MAX_MOD_HOTKEYS; ++i)
+            if (g_mod_keys[i].used && ((id[0] && !strcmp(g_mod_keys[i].id, id)) ||
+                                       (!id[0] && (!owner[0] || !strcmp(g_mod_keys[i].owner, owner))))) {
+                memset(&g_mod_keys[i], 0, sizeof(g_mod_keys[i]));
+                ++removed;
+            }
+        snprintf(out, size, "{\"ok\":true,\"removed\":%d}\n", removed);
     } else if (!strcmp(cmd, "overlay_toggle")) {
         ov.visible = !ov.visible;
         config_json(out, size);

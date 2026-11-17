@@ -47,12 +47,18 @@ typedef struct BeerD3D12RtShader {
     uint32_t stage;              /* dxil_spv_shader_stage value (8 closest hit, 9 miss, 10 any hit, 11 raygen, ...) */
     uint8_t *spirv;              /* malloc'd */
     size_t spirv_size;
+    int uses_heap;               /* reads a local-root-signature descriptor table: needs the heap mirror (set 1) */
 } BeerD3D12RtShader;
 
-/* Translates the entry points of a DXIL library. Descriptors are collected into `shared` (one binding space for the
+/* Local root signature of an entry point (by its name inside the library), or NULL when it has none. */
+typedef const BeerD3D12LocalParam *(*BeerD3D12LocalSigLookup)(void *user, const char *entry, uint32_t *count);
+
+/* Translates the entry points of a DXIL library. `local_sig` (may be NULL) gives each entry point's local root
+ * signature: its arguments are read from the shader record (dxil-spirv add_local_root_*). Descriptors are collected into `shared` (one binding space for the
  * whole pipeline: the same register always gets the same binding, bindless arrays the same push word), so every shader
  * of a state object can use one pipeline layout. `max` entries of `out` are filled; *count receives how many. */
 int beer_d3d12_dxil_translate_library(const uint8_t *container, size_t size, BeerD3D12TranslatedShader *shared,
-                                      BeerD3D12RtShader *out, uint32_t max, uint32_t *count);
+                                      BeerD3D12RtShader *out, uint32_t max, uint32_t *count,
+                                      BeerD3D12LocalSigLookup local_sig, void *local_user);
 
 #endif

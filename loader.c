@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <dirent.h>
+#include <glob.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -836,6 +837,22 @@ static int is_guest_stack_rsp(u64 rsp)
      * Windows, so their outermost frames lie within the last 0x200 bytes. Excluding them turned a fault there into
      * "[FATAL] Invalid RSP" instead of exception dispatch (PRAGMATA, RSP = StackBase-0x158). */
     return rsp > low + 0x200 && rsp <= high;
+}
+
+/* Stack window for exception dispatch: the recorded guest stack, or - for a thread whose stack was never recorded
+ * (a worker running on a native pthread stack) - the bounds the TEB describes. */
+static void beer_dispatch_stack_bounds(u64 rsp, u64 *low_out, u64 *high_out)
+{
+    u64 low = g_current_guest_stack_low ? g_current_guest_stack_low : g_guest_stack_low;
+    u64 high = g_current_guest_stack_high ? g_current_guest_stack_high : g_guest_stack_high;
+    if (rsp < low || rsp > high) {
+        u64 teb_high = 0, teb_low = 0;
+        __asm__ volatile("movq %%gs:0x8, %0" : "=r"(teb_high));
+        __asm__ volatile("movq %%gs:0x10, %0" : "=r"(teb_low));
+        if (teb_low && teb_high > teb_low && rsp >= teb_low && rsp <= teb_high) { low = teb_low; high = teb_high; }
+    }
+    *low_out = low;
+    *high_out = high;
 }
 
 static void clamp_rsp_to_entry_baseline(ucontext_t *uc, u64 rsp)
@@ -3602,6 +3619,7 @@ static u64 msvcrt_export(const char *name)
 }
 
 static u64 guest_dll_export_by_ordinal(GuestDll *dll, u32 ordinal);
+static u64 ngx_wrap_export(const GuestDll *dll, const char *name, u64 address);   /* platform/win32_ngx.inc */
 static u64 __attribute__((ms_abi))
 impl_GetProcAddress(u64 hmod, const char *procname)
 {
@@ -3707,7 +3725,7 @@ impl_GetProcAddress(u64 hmod, const char *procname)
     GuestDll *guest = guest_dll_from_handle(hmod);
     if (guest) {
         u64 address = guest_dll_export(guest, procname);
-        if (address) return address;
+        if (address) return ngx_wrap_export(guest, procname, address);
         fprintf(stderr, "[IMPL] GetProcAddress(%s, \"%s\") -> NULL (not exported by the module)\n", guest->name, procname);
         g_last_error = 127;
         return 0;
@@ -5232,6 +5250,109 @@ impl_GetAdaptersAddresses(u32 family, u32 flags, void *reserved, void *addresses
     return 0;
 }
 
+/* GetIpAddrTable: MIB_IPADDRTABLE of 24-byte MIB_IPADDRROWs, one per IPv4 address of the host (network byte order). */
+static u64 __attribute__((ms_abi))
+impl_GetIpAddrTable(u8 *table, u32 *size, u32 order)
+{
+    (void)order;
+    if (!size) return 87;
+    struct ifaddrs *interfaces = NULL;
+    if (getifaddrs(&interfaces) != 0) return 1;
+    u32 count = 0;
+    for (struct ifaddrs *a = interfaces; a; a = a->ifa_next)
+        if (a->ifa_addr && a->ifa_addr->sa_family == AF_INET) ++count;
+    const u32 needed = 4 + count * 24;
+    if (!table || *size < needed) {
+        *size = needed;
+        freeifaddrs(interfaces);
+        return 122;                                               /* ERROR_INSUFFICIENT_BUFFER */
+    }
+    *size = needed;
+    memset(table, 0, needed);
+    memcpy(table, &count, 4);
+    u32 row = 0;
+    for (struct ifaddrs *a = interfaces; a && row < count; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
+        u8 *entry = table + 4 + row++ * 24;
+        const u32 address = ((const struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr;
+        const u32 mask = a->ifa_netmask ? ((const struct sockaddr_in *)a->ifa_netmask)->sin_addr.s_addr : 0xffffffffu;
+        const u32 index = if_nametoindex(a->ifa_name), reassembly = 65535, broadcast = 1;
+        memcpy(entry, &address, 4);
+        memcpy(entry + 4, &index, 4);
+        memcpy(entry + 8, &mask, 4);
+        memcpy(entry + 12, &broadcast, 4);
+        memcpy(entry + 16, &reassembly, 4);
+        entry[22] = 1;                                            /* wType: MIB_IPADDR_PRIMARY */
+    }
+    freeifaddrs(interfaces);
+    return 0;
+}
+
+/* GetFriendlyIfIndex: interface indexes are already stable here. */
+static u64 __attribute__((ms_abi)) impl_GetFriendlyIfIndex(u32 index) { return index; }
+
+/* GetIfTable: MIB_IFTABLE of 860-byte MIB_IFROWs, one per host interface (the interface index, MTU, MAC, up/down). */
+static u64 __attribute__((ms_abi))
+impl_GetIfTable(u8 *table, u32 *size, u32 order)
+{
+    (void)order;
+    if (!size) return 87;                                         /* ERROR_INVALID_PARAMETER */
+    enum { ROW = 860, MAX_ROWS = 32 };
+    struct if_nameindex *names = if_nameindex();
+    if (!names) return 1;                                         /* ERROR_INVALID_FUNCTION */
+    u32 count = 0;
+    while (count < MAX_ROWS && names[count].if_index) ++count;
+    const u32 needed = 4 + count * ROW;
+    if (!table || *size < needed) {
+        *size = needed;
+        if_freenameindex(names);
+        return 122;                                               /* ERROR_INSUFFICIENT_BUFFER */
+    }
+    *size = needed;
+    memset(table, 0, needed);
+    memcpy(table, &count, 4);
+    const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    for (u32 i = 0; i < count; ++i) {
+        u8 *row = table + 4 + i * ROW;
+        const char *name = names[i].if_name;
+        struct ifreq request;
+        memset(&request, 0, sizeof(request));
+        snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", name);
+        u32 flags = 0, mtu = 1500;
+        u8 mac[8] = { 0 };
+        u32 mac_length = 0;
+        if (sock >= 0) {
+            if (ioctl(sock, SIOCGIFFLAGS, &request) == 0) flags = (u32)(u16)request.ifr_flags;
+            if (ioctl(sock, SIOCGIFMTU, &request) == 0 && request.ifr_mtu > 0) mtu = (u32)request.ifr_mtu;
+            if (ioctl(sock, SIOCGIFHWADDR, &request) == 0 && !(flags & IFF_LOOPBACK)) {
+                memcpy(mac, request.ifr_hwaddr.sa_data, 6);
+                mac_length = 6;
+            }
+        }
+        const u32 loopback = (flags & IFF_LOOPBACK) != 0;
+        const u32 index = names[i].if_index, type = loopback ? 24u : 6u;
+        const u32 speed = loopback ? 1073741824u : 1000000000u;
+        const u32 admin = (flags & IFF_UP) ? 1u : 2u;                   /* UP / DOWN */
+        const u32 oper = (flags & IFF_RUNNING) ? 5u : 2u;               /* OPERATIONAL / NOT_OPERATIONAL */
+        u16 *wide = (u16 *)row;
+        for (int c = 0; c < 255 && name[c]; ++c) wide[c] = (u8)name[c];
+        memcpy(row + 512, &index, 4);
+        memcpy(row + 516, &type, 4);
+        memcpy(row + 520, &mtu, 4);
+        memcpy(row + 524, &speed, 4);
+        memcpy(row + 528, &mac_length, 4);
+        memcpy(row + 532, mac, 8);
+        memcpy(row + 540, &admin, 4);
+        memcpy(row + 544, &oper, 4);
+        const u32 description_length = (u32)strnlen(name, 255) + 1;
+        memcpy(row + 600, &description_length, 4);
+        memcpy(row + 604, name, description_length - 1);
+    }
+    if (sock >= 0) close(sock);
+    if_freenameindex(names);
+    return 0;
+}
+
 /* ---- WINMM timing ---- */
 static u64 __attribute__((ms_abi)) impl_timeGetTime(void) {
     return beer_time_monotonic_ns_for(BEER_CLOCK_TICK) / 1000000u;
@@ -6091,7 +6212,26 @@ static u64 __attribute__((ms_abi)) impl_SteamUserStats(void);
 static u64 __attribute__((ms_abi)) impl_SteamUGC(void);
 static u64 __attribute__((ms_abi)) impl_SteamRemoteStorage(void);
 
-static u64 __attribute__((ms_abi)) impl_steam_offline_noop(void) { return 0; }
+static u64 __attribute__((ms_abi)) impl_steam_offline_noop(void)
+{
+    if (getenv("BEER_STEAM_DIAGNOSTICS")) {
+        /* Polling methods run every frame: bound distinct callers, not total calls,
+         * so bootstrap polling cannot hide a later gameplay-only contract. */
+        static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        static void *seen[128];
+        static size_t count;
+        void *caller = __builtin_return_address(0);
+        pthread_mutex_lock(&lock);
+        size_t i;
+        for (i = 0; i < count; ++i) if (seen[i] == caller) break;
+        if (i == count && count < sizeof(seen) / sizeof(*seen)) {
+            seen[count++] = caller;
+            fprintf(stderr, "[STEAM-OFFLINE] method caller=%p\n", caller);
+        }
+        pthread_mutex_unlock(&lock);
+    }
+    return 0;
+}
 static u64 __attribute__((ms_abi)) steam_input_offline_init(u64 self, u32 explicitly_call_run_frame)
 {
     (void)self;
@@ -6151,6 +6291,8 @@ impl_SteamInternal_CreateInterface(const char *version)
     if (strstr(lower, "steamremotestorage")) return impl_SteamRemoteStorage();
     if (beer_steam_is_offline_input_interface(lower))
         return steam_input_offline_interface();
+    if (!strcmp(lower, "steamnetworkingsockets012"))
+        return steam_networking_sockets_interface();
     /* Networking, matchmaking, server browser, parties and game search have no backend in Beer. The Steam
      * client always hands these interfaces out and its methods then report "nothing" (invalid handle or
      * API call, k_EResultNone, false, 0, no lobbies or servers); Valve's SteamAPI_Init fails outright when
@@ -7875,10 +8017,8 @@ static inline void beer_wsa_set_error(s32 error)
 /* WSAStartup is process-wide: a socket made on any thread works once some thread has started Winsock. */
 static _Atomic u32 g_wsa_startup_count;
 
-/* ---- getaddrinfo family.  Beer runs offline by default, so only addresses that need no resolver are answered:
- * a NULL node (wildcard, or loopback with AI_PASSIVE clear), "localhost" and dotted IPv4; any other name fails with
- * WSAHOST_NOT_FOUND (a zero-returning stub reported success without writing *result and the game then followed
- * the garbage pointer).  ADDRINFOA/W (x64): flags, family, socktype, protocol (int), addrlen (size_t), canonname,
+/* ---- getaddrinfo family. Names use the host resolver; wildcard, loopback and numeric IPv4 work offline.
+ * ADDRINFOA/W (x64): flags, family, socktype, protocol (int), addrlen (size_t), canonname,
  * addr, next -- note canonname comes before addr, unlike glibc. ---- */
 typedef struct { s32 flags, family, socktype, protocol; u64 addrlen; u64 canonname; u64 addr; u64 next; } WinAddrInfo;
 
@@ -8721,9 +8861,50 @@ typedef struct WinHostEnt {
 
 static __thread WinHostEnt g_win_hostent;
 static __thread char g_win_hostent_name[256];
-static __thread u8 g_win_hostent_address[16];
 static __thread u64 g_win_hostent_aliases[1];
-static __thread u64 g_win_hostent_addresses[2];
+static __thread void *g_win_hostent_storage;
+
+/* Copy resolver results: libc's hostent uses a different ABI, and resolver
+ * storage must never escape into guest code. The returned Winsock hostent is
+ * thread-local and remains valid until the next lookup on this thread. */
+static u64 win_hostent_from_addrinfo(const char *name, const struct addrinfo *found)
+{
+    size_t count = 0;
+    const char *canonical = name;
+    for (const struct addrinfo *a = found; a; a = a->ai_next) {
+        if (a->ai_family != AF_INET || !a->ai_addr || a->ai_addrlen < sizeof(struct sockaddr_in)) continue;
+        if (!count && a->ai_canonname && *a->ai_canonname) canonical = a->ai_canonname;
+        ++count;
+    }
+    if (!count) { beer_wsa_set_error(11004); return 0; } /* WSANO_DATA */
+    if (count > (SIZE_MAX - sizeof(u64)) / (sizeof(u64) + sizeof(struct in_addr))) {
+        beer_wsa_set_error(10055); return 0; /* WSAENOBUFS */
+    }
+    void *storage = realloc(g_win_hostent_storage,
+                            (count + 1) * sizeof(u64) + count * sizeof(struct in_addr));
+    if (!storage) { beer_wsa_set_error(10055); return 0; }
+    g_win_hostent_storage = storage;
+    u64 *addresses = storage;
+    struct in_addr *bytes = (struct in_addr *)(addresses + count + 1);
+    size_t i = 0;
+    for (const struct addrinfo *a = found; a; a = a->ai_next) {
+        if (a->ai_family != AF_INET || !a->ai_addr || a->ai_addrlen < sizeof(struct sockaddr_in)) continue;
+        bytes[i] = ((const struct sockaddr_in *)a->ai_addr)->sin_addr;
+        addresses[i] = (u64)(uintptr_t)&bytes[i];
+        ++i;
+    }
+    addresses[count] = 0;
+    snprintf(g_win_hostent_name, sizeof(g_win_hostent_name), "%s", canonical);
+    g_win_hostent_aliases[0] = 0;
+    g_win_hostent.name = (u64)(uintptr_t)g_win_hostent_name;
+    g_win_hostent.aliases = (u64)(uintptr_t)g_win_hostent_aliases;
+    g_win_hostent.address_type = 2; /* Windows AF_INET */
+    g_win_hostent.address_length = 4;
+    g_win_hostent.padding = 0;
+    g_win_hostent.address_list = (u64)(uintptr_t)addresses;
+    beer_wsa_set_error(0);
+    return (u64)(uintptr_t)&g_win_hostent;
+}
 
 static u64 __attribute__((ms_abi))
 impl_gethostbyname(const char *name)
@@ -8733,28 +8914,22 @@ impl_gethostbyname(const char *name)
         beer_wsa_set_error(10014); /* WSAEFAULT */
         return 0;
     }
-    struct in_addr address;
-    if (!strcmp(name, "localhost")) {
-        address.s_addr = htonl(INADDR_LOOPBACK);
-    } else if (inet_pton(AF_INET, name, &address) != 1) {
-        /* The compatibility profile has no DNS service. Fail deterministically
-         * instead of handing a host libc pointer layout to the Windows guest. */
-        beer_wsa_set_error(11001); /* WSAHOST_NOT_FOUND */
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM,
+                             .ai_flags = AI_CANONNAME }, *found = NULL;
+    int status = getaddrinfo(name, NULL, &hints, &found);
+    if (status) {
+        int error = status == EAI_AGAIN ? 11002 : status == EAI_FAIL ? 11003 :
+                    status == EAI_MEMORY ? 10055 : 11001;
+        beer_wsa_set_error(error);
+        if (getenv("BEER_NET_DIAGNOSTICS"))
+            fprintf(stderr, "[NET] gethostbyname(%s) -> %d (%s)\n", name, error, gai_strerror(status));
         return 0;
     }
-    snprintf(g_win_hostent_name, sizeof(g_win_hostent_name), "%s", name);
-    memcpy(g_win_hostent_address, &address, sizeof(address));
-    g_win_hostent_aliases[0] = 0;
-    g_win_hostent_addresses[0] = (u64)(uintptr_t)g_win_hostent_address;
-    g_win_hostent_addresses[1] = 0;
-    g_win_hostent.name = (u64)(uintptr_t)g_win_hostent_name;
-    g_win_hostent.aliases = (u64)(uintptr_t)g_win_hostent_aliases;
-    g_win_hostent.address_type = 2; /* Windows AF_INET */
-    g_win_hostent.address_length = 4;
-    g_win_hostent.padding = 0;
-    g_win_hostent.address_list = (u64)(uintptr_t)g_win_hostent_addresses;
-    beer_wsa_set_error(0);
-    return (u64)(uintptr_t)&g_win_hostent;
+    u64 result = win_hostent_from_addrinfo(name, found);
+    freeaddrinfo(found);
+    if (getenv("BEER_NET_DIAGNOSTICS"))
+        fprintf(stderr, "[NET] gethostbyname(%s) -> %s\n", name, result ? "resolved" : "no addresses");
+    return result;
 }
 
 static u64 __attribute__((ms_abi))
@@ -9887,7 +10062,7 @@ impl_CoCreateInstance(const u8 *rclsid, u64 outer, u32 ctx,
                 "clsid=%02x%02x%02x%02x-%02x%02x-%02x%02x-"
                 "%02x%02x-%02x%02x%02x%02x%02x%02x "
                 "iid=%02x%02x%02x%02x-%02x%02x-%02x%02x-"
-                "%02x%02x-%02x%02x%02x%02x%02x%02x -> E_FAIL\n",
+                "%02x%02x-%02x%02x%02x%02x%02x%02x -> REGDB_E_CLASSNOTREG\n",
                 __builtin_return_address(0), ctx,
                 class_id[3], class_id[2], class_id[1], class_id[0],
                 class_id[5], class_id[4], class_id[7], class_id[6],
@@ -9898,7 +10073,11 @@ impl_CoCreateInstance(const u8 *rclsid, u64 outer, u32 ctx,
                 interface_id[8], interface_id[9], interface_id[10], interface_id[11],
                 interface_id[12], interface_id[13], interface_id[14], interface_id[15]);
     }
-    return (u64)E_FAIL;
+    if (ppv) *ppv = NULL;
+    /* A class nobody implements is "not registered" on Windows (and Wine), never a generic failure: games test for
+     * REGDB_E_CLASSNOTREG to take their fallback path (Onimusha probes an optional media class five times while
+     * loading a save and crashed on a null object after E_FAIL; Wine, answering CLASSNOTREG, runs). */
+    return (u64)0x80040154;   /* REGDB_E_CLASSNOTREG */
 }
 
 /* ── Fake D3D11 / DXGI adapter + device ──────────────────────────────
@@ -10319,6 +10498,19 @@ dxgi_adapter_QueryVideoMemoryInfo(u64 *obj, u32 node, u32 group, u64 *info)
     if (group == 0) {
         budget = *(u64 *)(desc + 272) / 10 * 9;
         usage = __atomic_load_n(&g_bd12_heap_bytes[1], __ATOMIC_RELAXED);
+        /* The driver's own figures, as Windows reports them: every allocation of the process, not only D3D12 heaps.
+         * BD12's heap total alone said ~1.7 GB while ~13.8 GB was in use, so RE Engine streamed until VRAM really ran
+         * out and the game crashed (Onimusha). The budget is the smaller of the driver's and the reported one. */
+        uint64_t vk_budget = 0, vk_usage = 0;
+        static int heaps_only = -1;                  /* BEER_DXGI_HEAP_USAGE_ONLY=1: the old heap-only figures (A/B) */
+        if (heaps_only < 0) heaps_only = getenv("BEER_DXGI_HEAP_USAGE_ONLY") != NULL;
+        if (!heaps_only && beer_vulkan_memory_budget(&vk_budget, &vk_usage)) {
+            /* 1 GiB below the driver's figure: RE Engine fills VRAM right up to the budget, and Beer's own memory
+             * (pipelines, descriptor buffers, upload heaps in resizable BAR) needs room on top of the game's heaps. */
+            if (vk_budget > (2ull << 30)) vk_budget -= 1ull << 30;
+            if (vk_budget && vk_budget < budget) budget = vk_budget;
+            if (vk_usage > usage) usage = vk_usage;
+        }
     } else {
         budget = *(u64 *)(desc + 288);
         usage = __atomic_load_n(&g_bd12_heap_bytes[2], __ATOMIC_RELAXED) +
@@ -10328,9 +10520,36 @@ dxgi_adapter_QueryVideoMemoryInfo(u64 *obj, u32 node, u32 group, u64 *info)
     info[1] = usage;                          /* CurrentUsage */
     info[2] = budget / 2;                     /* AvailableForReservation */
     info[3] = g_dxgi_reservation[group];      /* CurrentReservation */
-    { static u32 logs[2]; if (logs[group]++ < 2)
-        fprintf(stderr, "[DXGI] QueryVideoMemoryInfo group=%u budget=%llu MiB usage=%llu MiB\n", group,
-                (unsigned long long)(budget >> 20), (unsigned long long)(usage >> 20)); }
+    {   /* first two calls, then every 5 s */
+        static u32 logs[2];
+        static u64 last_ns[2];
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const u64 now = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+        if (logs[group]++ < 2 || now - last_ns[group] > 5000000000ull) {
+            last_ns[group] = now;
+            extern uint64_t g_bd12_block_bytes[4], g_bd12_dedicated_bytes[4];
+            extern void bd12_mem_pool_report(char *out, size_t size);
+            char pool[300];
+            bd12_mem_pool_report(pool, sizeof(pool));
+            if (group == 0 && pool[0]) fprintf(stderr, "[DXGI] %s\n", pool);
+            {
+                extern uint64_t g_bd12_live_pipelines, g_bd12_rebar_bytes;
+                if (group == 0)
+                    fprintf(stderr, "[DXGI] non-heap: %llu live pipelines, upload in VRAM %llu MiB (blocks; dedicated "
+                            "upload heaps %llu MiB)\n",
+                            (unsigned long long)__atomic_load_n(&g_bd12_live_pipelines, __ATOMIC_RELAXED),
+                            (unsigned long long)(__atomic_load_n(&g_bd12_rebar_bytes, __ATOMIC_RELAXED) >> 20),
+                            (unsigned long long)(__atomic_load_n(&g_bd12_dedicated_bytes[2], __ATOMIC_RELAXED) >> 20));
+            }
+            fprintf(stderr, "[DXGI] QueryVideoMemoryInfo group=%u budget=%llu MiB usage=%llu MiB (heaps %llu MiB; "
+                    "driver memory: blocks %llu MiB + dedicated %llu MiB)\n",
+                    group, (unsigned long long)(budget >> 20), (unsigned long long)(usage >> 20),
+                    (unsigned long long)(__atomic_load_n(&g_bd12_heap_bytes[group ? 2 : 1], __ATOMIC_RELAXED) >> 20),
+                    (unsigned long long)(__atomic_load_n(&g_bd12_block_bytes[group ? 2 : 1], __ATOMIC_RELAXED) >> 20),
+                    (unsigned long long)(__atomic_load_n(&g_bd12_dedicated_bytes[group ? 2 : 1], __ATOMIC_RELAXED) >> 20));
+        }
+    }
     return S_OK;
 }
 
@@ -11049,6 +11268,19 @@ impl_GetTimeZoneInformation(WIN_TIME_ZONE_INFORMATION *zone)
     zone->bias = (s32)(-(local_as_utc - utc) / 60);
     g_last_error = 0;
     return 0; /* TIME_ZONE_ID_UNKNOWN: fixed current bias, no transition rules */
+}
+
+/* DYNAMIC_TIME_ZONE_INFORMATION: the TIME_ZONE_INFORMATION above, then the registry key name and a flag. */
+static u64 __attribute__((ms_abi))
+impl_GetDynamicTimeZoneInformation(u8 *zone)
+{
+    if (!zone) { g_last_error = 87; return 0xffffffffu; }
+    const u64 result = impl_GetTimeZoneInformation((WIN_TIME_ZONE_INFORMATION *)zone);
+    memset(zone + sizeof(WIN_TIME_ZONE_INFORMATION), 0, 128 * 2 + 1 + 3);
+    static const char name[] = "UTC";
+    u16 *key = (u16 *)(zone + sizeof(WIN_TIME_ZONE_INFORMATION));
+    for (size_t i = 0; i < sizeof(name); ++i) key[i] = (u8)name[i];
+    return result;
 }
 
 /* ---- Standard handles ---- */
@@ -13170,6 +13402,26 @@ impl_ToUnicodeEx(u32 virtual_key, u32 scan_code, const u8 *keyboard_state,
     (void)keyboard_layout;
     return (u64)(s64)beer_win32_to_unicode_us(virtual_key, keyboard_state,
                                                buffer, buffer_length);
+}
+
+/* ToAscii[Ex]: the same US translation, narrowed to the characters ASCII can hold. */
+static u64 __attribute__((ms_abi))
+impl_ToAsciiEx(u32 virtual_key, u32 scan_code, const u8 *keyboard_state, u16 *buffer, u32 flags,
+               u64 keyboard_layout)
+{
+    (void)scan_code; (void)flags; (void)keyboard_layout;
+    u16 wide[4] = { 0 };
+    const s32 count = beer_win32_to_unicode_us(virtual_key, keyboard_state, wide, 4);
+    if (count <= 0 || !buffer) return (u64)(s64)count;
+    u8 *narrow = (u8 *)buffer;
+    s32 kept = 0;
+    for (s32 i = 0; i < count && i < 2; ++i) if (wide[i] < 0x80) narrow[kept++] = (u8)wide[i];
+    return (u64)(s64)kept;
+}
+static u64 __attribute__((ms_abi))
+impl_ToAscii(u32 virtual_key, u32 scan_code, const u8 *keyboard_state, u16 *buffer, u32 flags)
+{
+    return impl_ToAsciiEx(virtual_key, scan_code, keyboard_state, buffer, flags, 0);
 }
 
 
@@ -16671,10 +16923,10 @@ static u64 create_file_a(const char *name, u32 access, u32 share, u64 sa, u32 cr
 
     int flags = 0;
     int mode  = 0644;
-    if ((access & 0xC0000000) == 0xC0000000) flags = O_RDWR;
-    else if (access & 0x80000000)            flags = O_RDONLY;
-    else if (access & 0x40000000)            flags = O_WRONLY;
-    else                                     flags = O_RDONLY;
+    {   /* GENERIC_* and the specific file rights (beer_access_wants_*: FILE_GENERIC_WRITE has no GENERIC_WRITE bit) */
+        const int wants_write = beer_access_wants_write(access), wants_read = beer_access_wants_read(access);
+        flags = wants_write ? (wants_read ? O_RDWR : O_WRONLY) : O_RDONLY;
+    }
 
     int disposition_flags = 0;
     if (!beer_creation_disposition_flags(creation, &disposition_flags)) {
@@ -16732,8 +16984,15 @@ impl_CreateFileW(const u16 *name, u32 access, u32 share, u64 security,
     }
     if (name[i]) { g_last_error = 206; return INVALID_HANDLE_VALUE64; }
     narrow[i] = 0;
-    return impl_CreateFileA(narrow, access, share, security, creation,
-                            attributes, template_file);
+    const u64 handle = impl_CreateFileA(narrow, access, share, security, creation, attributes, template_file);
+    if (i > 4 && (!strcmp(narrow + i - 4, ".sav") || !strcmp(narrow + i - 5, ".part"))) {   /* save-file diagnostics */
+        static u32 logged;
+        if (logged++ < 16)
+            fprintf(stderr, "[FILE] CreateFileW(%s, access 0x%x, share 0x%x, creation %u, attributes 0x%x) -> 0x%llx "
+                    "(error %u)\n", narrow, access, share, creation, attributes, (unsigned long long)handle,
+                    g_last_error);
+    }
+    return handle;
 }
 
 /* ---- One-time initialisation (INIT_ONCE, 8 bytes): 0 = not started, 1 = being initialised (synchronous),
@@ -19203,13 +19462,74 @@ typedef struct {
 _Static_assert(sizeof(WIN_CREATESTRUCT) == 80, "CREATESTRUCT must be 80 bytes on Win64");
 
 typedef u64 __attribute__((ms_abi)) (*GuestWndProc)(u64, u32, u64, u64);
+/* USER32 callbacks execute on the caller's Windows stack, not on the private
+ * stack used by API implementations. Runtimes can use stack addresses as lock
+ * owners and check them against the stack they recorded at thread startup. */
+static __attribute__((noinline)) u64 call_window_callback_on_stack(
+    u64 proc, u64 hwnd, u64 message, u64 wparam, u64 lparam, u64 id, u64 ref, u64 stack)
+{
+    u64 result;
+    register u64 r8 __asm__("r8") = wparam;
+    register u64 r9 __asm__("r9") = lparam;
+    __asm__ volatile(
+        "mov %%rsp, %%rbx\n"
+        "mov %[stack], %%rsp\n"
+        "sub $0x30, %%rsp\n"
+        "mov %[id], 0x20(%%rsp)\n"
+        "mov %[ref], 0x28(%%rsp)\n"
+        "call *%[proc]\n"
+        "mov %%rbx, %%rsp\n"
+        : "=a"(result), "+c"(hwnd), "+d"(message), "+r"(r8), "+r"(r9)
+        : [proc] "r"(proc), [stack] "r"(stack), [id] "r"(id), [ref] "r"(ref)
+        : "rbx", "r10", "r11", "memory", "cc"); /* loader uses -mno-sse */
+    return result;
+}
+
+static u64 call_window_callback6(u64 proc, u64 hwnd, u32 message, u64 wparam, u64 lparam,
+                                 u64 id, u64 ref)
+{
+    u64 here;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(here));
+    const u64 guest = g_saved_guest_rsp;
+    /* Direct host-side tests and callbacks already on the Windows stack need
+     * no switch. Never manufacture a stack for a thread without guest state. */
+    if (!is_current_host_call_stack_rsp(here) || !guest ||
+        guest < g_teb_guest_stack_limit || guest > g_teb_guest_stack_base ||
+        guest - g_teb_guest_stack_limit < 0x2000)
+        return ((u64 (__attribute__((ms_abi)) *)(u64, u32, u64, u64, u64, u64))
+            (uintptr_t)proc)(hwnd, message, wparam, lparam, id, ref);
+    WinTEB *teb;
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb));
+    const u64 saved_limit = teb->StackLimit, saved_base = teb->StackBase;
+    const u64 saved_top = g_host_call_stack_top;
+    const u64 saved_guest_limit = g_teb_guest_stack_limit, saved_guest_base = g_teb_guest_stack_base;
+    teb->StackLimit = saved_guest_limit;
+    teb->StackBase = saved_guest_base;
+    /* Reentrant imports must use unused host stack below this live frame. */
+    g_host_call_stack_top = (here - 0x4000) & ~(u64)15;
+    u64 result = call_window_callback_on_stack(proc, hwnd, message, wparam, lparam, id, ref,
+                                               (guest - 0x100) & ~(u64)15);
+    g_host_call_stack_top = saved_top;
+    g_saved_guest_rsp = guest;
+    g_teb_guest_stack_limit = saved_guest_limit;
+    g_teb_guest_stack_base = saved_guest_base;
+    teb->StackLimit = saved_limit;
+    teb->StackBase = saved_base;
+    return result;
+}
+
+static u64 call_window_callback(u64 proc, u64 hwnd, u32 message, u64 wparam, u64 lparam)
+{
+    return call_window_callback6(proc, hwnd, message, wparam, lparam, 0, 0);
+}
+
 static u64 call_guest_wndproc(u32 message, u64 wparam, u64 lparam)
 {
     if (message >= 0x0207 && message <= 0x020c && getenv("BEER_INPUT_DIAGNOSTICS"))
         fprintf(stderr, "[INPUT] wndproc mouse message 0x%04x wparam=0x%llx\n",
                 message, (unsigned long long)wparam);
     if (!g_window_proc) return message == 0x0081 ? 1 : 0;
-    u64 result = ((GuestWndProc)(uintptr_t)g_window_proc)(FAKE_HWND, message, wparam, lparam);
+    u64 result = call_window_callback(g_window_proc, FAKE_HWND, message, wparam, lparam);
     if (getenv("BEER_WNDPROC_DIAGNOSTICS")) {     /* every message Beer itself sends to the guest window procedure */
         static _Atomic(u32) logs;
         if (atomic_fetch_add(&logs, 1) < 400)
@@ -19225,7 +19545,7 @@ static u64 call_window_proc(u64 hwnd, u32 message, u64 wparam, u64 lparam)
     BeerWindow *w = beer_window_other(hwnd);
     if (!w) return call_guest_wndproc(message, wparam, lparam);
     if (!w->proc) return message == 0x0081 ? 1 : 0;
-    return ((GuestWndProc)(uintptr_t)w->proc)(hwnd, message, wparam, lparam);
+    return call_window_callback(w->proc, hwnd, message, wparam, lparam);
 }
 /* The registered procedure of a window class (name as wide or narrow string, or an atom); 0 when unknown. */
 static u64 window_class_proc(u64 classname)
@@ -19284,11 +19604,29 @@ static u64 create_surfaceless_window(u32 exstyle, u64 classname, u64 title, u32 
     return hwnd;
 }
 
+/* The predefined Windows control classes always exist. Beer draws no controls: unless the program registered its own
+ * class of that name, such a window gets the default window procedure (a hidden STATIC window used for messages,
+ * as Inno Setup's loader creates, then works). */
+static u64 __attribute__((ms_abi)) impl_DefWindowProcW(u64 hw, u32 msg, u64 wp, u64 lp);
+static int window_class_is_system(u64 classname)
+{
+    static const char *const names[] = { "static", "button", "edit", "listbox", "combobox", "scrollbar", "mdiclient",
+                                         "richedit20w", "richedit20a", "msctls_progress32", "#32770" };
+    if (!classname) return 0;
+    const u8 *raw = (const u8 *)(uintptr_t)classname;
+    char key[128];
+    window_class_key(classname, classname > 0xffffu && raw[0] && !raw[1], key, sizeof(key));
+    for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i)
+        if (!strcmp(key, names[i])) return 1;
+    return 0;
+}
+
 static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
                                s32 x, s32 y, s32 w, s32 h, u64 parent,
                                u64 menu, u64 inst, u64 param, const char *native_title)
 {
     u64 class_proc = window_class_proc(classname);
+    if (!class_proc && window_class_is_system(classname)) class_proc = (u64)(uintptr_t)impl_DefWindowProcW;
     if (!class_proc) class_proc = g_last_class_proc ? g_last_class_proc : g_window_proc;
     if (!class_proc) { g_last_error = 1407; return 0; }
     if (parent == (u64)-3)                                            /* HWND_MESSAGE */
@@ -21808,10 +22146,103 @@ static int take_window_message(WIN_MSG *message, u32 min, u32 max, int remove)
     return found;
 }
 
+/* ---- Messages sent (SendMessage) to a window owned by another thread ----
+ * A window procedure runs on the thread that owns the window, which Java's AWT depends on (its toolkit thread creates
+ * the frame windows for every other thread, and its JNI environment belongs to that thread). The sender queues the
+ * message and waits; the owner runs it from GetMessage/PeekMessage, as Windows does. A target that does not pump
+ * messages (nothing seen for a while) keeps the old behaviour: the sender runs the procedure itself. */
+typedef struct SentMessage {
+    struct SentMessage *next;
+    u64 hwnd, wparam, lparam, result;
+    u32 message, target;
+    int state;                                                        /* 0 queued, 1 running, 2 done */
+} SentMessage;
+#define BEER_PUMP_SLOTS 64
+static SentMessage *g_sent_head;
+static pthread_mutex_t g_sent_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_sent_cond = PTHREAD_COND_INITIALIZER;
+static struct { u32 tid; u64 ms; } g_pump_threads[BEER_PUMP_SLOTS];
+
+static u64 beer_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
+}
+static u64 send_message_local(u64 hw, u32 msg, u64 wp, u64 lp);
+static void process_sent_messages(void)
+{
+    const u32 tid = (u32)current_windows_thread_id();
+    const u64 now = beer_monotonic_ms();
+    pthread_mutex_lock(&g_sent_mutex);
+    int slot = -1;
+    for (int i = 0; i < BEER_PUMP_SLOTS; ++i) {
+        if (g_pump_threads[i].tid == tid) { slot = i; break; }
+        if (slot < 0 && (!g_pump_threads[i].tid || now - g_pump_threads[i].ms > 60000u)) slot = i;
+    }
+    if (slot >= 0) { g_pump_threads[slot].tid = tid; g_pump_threads[slot].ms = now; }
+    for (;;) {
+        SentMessage *m = g_sent_head;
+        while (m && !(m->target == tid && m->state == 0)) m = m->next;
+        if (!m) break;
+        m->state = 1;
+        pthread_mutex_unlock(&g_sent_mutex);
+        const u64 result = send_message_local(m->hwnd, m->message, m->wparam, m->lparam);
+        pthread_mutex_lock(&g_sent_mutex);
+        m->result = result;
+        m->state = 2;
+        pthread_cond_broadcast(&g_sent_cond);
+    }
+    pthread_mutex_unlock(&g_sent_mutex);
+}
+static int thread_is_pumping(u32 tid)
+{
+    const u64 now = beer_monotonic_ms();
+    int pumping = 0;
+    pthread_mutex_lock(&g_sent_mutex);
+    for (int i = 0; i < BEER_PUMP_SLOTS && !pumping; ++i)
+        pumping = g_pump_threads[i].tid == tid && now - g_pump_threads[i].ms < 2000u;
+    pthread_mutex_unlock(&g_sent_mutex);
+    return pumping;
+}
+/* Runs the message on `target`'s thread and returns its result; 0 in *ran when the target never got to it. */
+static u64 send_message_to_thread(u32 target, u64 hw, u32 msg, u64 wp, u64 lp, int *ran)
+{
+    SentMessage m = { .hwnd = hw, .wparam = wp, .lparam = lp, .message = msg, .target = target };
+    const u64 deadline = beer_monotonic_ms() + 3000u;
+    *ran = 1;
+    pthread_mutex_lock(&g_sent_mutex);
+    m.next = g_sent_head;
+    g_sent_head = &m;
+    pthread_mutex_unlock(&g_sent_mutex);
+    pthread_mutex_lock(&g_win_message_mutex);
+    pthread_cond_broadcast(&g_win_message_ready);
+    pthread_mutex_unlock(&g_win_message_mutex);
+    for (;;) {
+        process_sent_messages();                       /* messages other threads sent to this one meanwhile */
+        pthread_mutex_lock(&g_sent_mutex);
+        if (m.state == 2 || (m.state == 0 && beer_monotonic_ms() > deadline)) {
+            SentMessage **link = &g_sent_head;
+            while (*link && *link != &m) link = &(*link)->next;
+            if (*link) *link = m.next;
+            if (m.state != 2) *ran = 0;
+            pthread_mutex_unlock(&g_sent_mutex);
+            return m.result;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 2000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_sent_cond, &g_sent_mutex, &ts);
+        pthread_mutex_unlock(&g_sent_mutex);
+    }
+}
+
 static u64 __attribute__((ms_abi))
 impl_PeekMessageW(WIN_MSG *msg, u64 hw, u32 min, u32 max, u32 remove)
 {
     if (hw && hw != FAKE_HWND && !beer_window_other(hw)) return 0;
+    process_sent_messages();
     collect_native_window_events();
     collect_window_timers();
     return take_window_message(msg, min, max, (remove & 1) != 0);
@@ -21828,6 +22259,7 @@ impl_GetMessageW(WIN_MSG *msg, u64 hw, u32 min, u32 max)
                 (unsigned)current_windows_thread_id(),
                 (unsigned long long)g_dispatch_incoming_return);
     for (;;) {
+        process_sent_messages();
         collect_native_window_events();
         collect_window_timers();
         if (take_window_message(msg, min, max, 1))
@@ -21949,6 +22381,7 @@ impl_MsgWaitForMultipleObjects(u32 count, const u64 *handles,
                                 u32 wait_all, u32 timeout_ms, u32 wake_mask)
 {
     (void)wake_mask;
+    process_sent_messages();
     /* First check handle state without blocking */
     u64 r = impl_WaitForMultipleObjects(count, handles, wait_all, 0);
     if (r != 0x00000102u) /* WAIT_TIMEOUT */ return r;
@@ -21970,6 +22403,7 @@ impl_MsgWaitForMultipleObjects(u32 count, const u64 *handles,
     for (;;) {
         u64 now = monotonic_milliseconds();
         if (now >= deadline_ms) return 0x00000102u;
+        process_sent_messages();
         u64 left = deadline_ms - now;
         /* Sleep at most 4 ms at a time so we check handles at a reasonable rate */
         u64 slice = left < 4 ? left : 4;
@@ -22024,6 +22458,7 @@ impl_WaitMessage(void)
 {
     u32 tid = (u32)current_windows_thread_id();
     for (;;) {
+        process_sent_messages();
         pthread_mutex_lock(&g_win_message_mutex);
         int has_msg = 0;
         for (u32 i = 0; i < g_win_message_count && !has_msg; ++i) {
@@ -22053,7 +22488,20 @@ impl_PostQuitMessage(u32 code)
 }
 static u64 __attribute__((ms_abi))
 impl_SendMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
+{BeerWindow *owner_window = beer_window_other(hw);
+    const u32 owner = owner_window ? owner_window->owner_tid : (hw == FAKE_HWND ? g_window_thread_id : 0);
+    if (getenv("BEER_SENDMSG_DIAGNOSTICS") && owner && owner != (u32)current_windows_thread_id())
+        fprintf(stderr, "[SENDMSG] hwnd=0x%llx msg=0x%x from=%u owner=%u pumping=%d\n", (unsigned long long)hw, msg,
+                (unsigned)current_windows_thread_id(), (unsigned)owner, thread_is_pumping(owner));    if (owner && owner != (u32)current_windows_thread_id() && thread_is_pumping(owner)) {
+        int ran = 0;
+        const u64 result = send_message_to_thread(owner, hw, msg, wp, lp, &ran);
+        if (ran) return result;
+    }
+    return send_message_local(hw, msg, wp, lp);
+}
+static u64 send_message_local(u64 hw, u32 msg, u64 wp, u64 lp)
 {
+    
     if (beer_window_other(hw)) return call_window_proc(hw, msg, wp, lp);
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     if (msg == 0x0080) { /* WM_SETICON */
@@ -22151,7 +22599,7 @@ static u64 __attribute__((ms_abi))
 impl_CallWindowProcW(u64 proc, u64 hw, u32 msg, u64 wp, u64 lp)
 {
     if (!proc) return impl_DefWindowProcW(hw, msg, wp, lp);
-    return ((GuestWndProc)(uintptr_t)proc)(hw, msg, wp, lp);
+    return call_window_callback(proc, hw, msg, wp, lp);
 }
 static u64 window_long_value(s32 index)
 {
@@ -22227,6 +22675,8 @@ impl_GetWindowLongW(u64 hw, s32 idx)
 static u64 __attribute__((ms_abi))
 impl_GetWindowLongA(u64 hw, s32 idx)
     { return impl_GetWindowLongW(hw, idx); }
+
+#include "platform/win32_subclass.inc"
 
 static int window_property_key(const void *name, int wide, int *is_atom,
                                u16 *atom, u16 key[WINDOW_PROPERTY_NAME_CAPACITY])
@@ -23408,7 +23858,17 @@ impl_WriteFile(u64 h, const void *buf, u32 n, u32 *written, u64 ov)
     if      (h == (u64)(int64_t)-11 || h == (u64)(int64_t)-0xB) fd = STDOUT_FILENO;
     else if (h == (u64)(int64_t)-12 || h == (u64)(int64_t)-0xC) fd = STDERR_FILENO;
     else { fd = fh_get(h); }
-    if (fd < 0) { if (written) *written = 0; return 0; }
+    if (fd < 0) {
+        /* Not a file this process opened: ERROR_INVALID_HANDLE, as on Windows. Returning failure with last error 0
+         * made Ghost of Tsushima's save writer report "Failed to write to file (errorcode 0)". */
+        static u32 logged;
+        if (logged++ < 8)
+            fprintf(stderr, "[FILE] WriteFile(handle 0x%llx, %u bytes): not a file handle (caller %p)\n",
+                    (unsigned long long)h, n, __builtin_return_address(0));
+        if (written) *written = 0;
+        g_last_error = 6;
+        return 0;
+    }
     if (beer_pipe_is_pipe(h)) {
         if (!beer_pipe_ensure_connected(h)) { if (written) *written = 0; return 0; }
         fd = fh_get(h);
@@ -23444,6 +23904,8 @@ impl_WriteFile(u64 h, const void *buf, u32 n, u32 *written, u64 ov)
     ssize_t r = write(fd, buf, n);
     if (beer_pipe_is_pipe(h)) beer_pipe_dump("write", h, buf, r);
     if (r < 0 && beer_pipe_is_pipe(h)) g_last_error = 232;      /* ERROR_NO_DATA: the other end is closing */
+    else if (r < 0)   /* a Windows error, never 0: read-only handle -> ACCESS_DENIED, full disk -> DISK_FULL */
+        g_last_error = errno == EBADF || errno == EACCES || errno == EPERM ? 5u : errno == ENOSPC ? 112u : 29u;
     if (written) *written = (u32)(r < 0 ? 0 : r);
     return r >= 0 ? 1 : 0;
 }
@@ -23595,6 +24057,8 @@ impl_CloseThreadpoolWork(WinTPWork *w)
 }
 
 /* ---- PTP_TIMER ---- */
+#include "platform/win32_mm_timer.inc"
+
 typedef struct WinTPTimer {
     u64             cb;
     u64             ctx;
@@ -26885,6 +27349,7 @@ impl___acrt_iob_func(u32 index)
 #include "platform/win32_d3d9.inc"
 #include "platform/win32_display_config.inc"
 #include "platform/win32_nvapi.inc"
+#include "platform/win32_ngx.inc"
 #include "platform/win32_d3dkmt.inc"
 #include "platform/win32_file_search.inc"
 #include "platform/win32_missing_exports.inc"
@@ -27029,6 +27494,9 @@ static ImplEntry g_impls[] = {
     {"WinHttpGetProxyForUrl",                   (ImplFn)beer_WinHttpGetProxyForUrl},
     {"WinHttpDetectAutoProxyConfigUrl",         (ImplFn)beer_WinHttpDetectAutoProxyConfigUrl},
     {"GetAdaptersAddresses",                    (ImplFn)impl_GetAdaptersAddresses},
+    {"GetIfTable",                              (ImplFn)impl_GetIfTable},
+    {"GetFriendlyIfIndex",                      (ImplFn)impl_GetFriendlyIfIndex},
+    {"GetIpAddrTable",                          (ImplFn)impl_GetIpAddrTable},
     {"GetAdaptersInfo",                         (ImplFn)impl_GetAdaptersInfo},
     {"NotifyAddrChange",                        (ImplFn)impl_NotifyAddrChange},
     {"CancelIPChangeNotify",                    (ImplFn)impl_CancelIPChangeNotify},
@@ -27165,6 +27633,8 @@ static ImplEntry g_impls[] = {
     {"timeGetTime",                           (ImplFn)impl_timeGetTime},
     {"timeBeginPeriod",                       (ImplFn)impl_timeBeginPeriod},
     {"timeEndPeriod",                         (ImplFn)impl_timeEndPeriod},
+    {"timeSetEvent",                          (ImplFn)impl_timeSetEvent},
+    {"timeKillEvent",                         (ImplFn)impl_timeKillEvent},
     {"waveOutGetNumDevs",                     (ImplFn)impl_waveOutGetNumDevs},
     {"waveInGetNumDevs",                      (ImplFn)impl_waveInGetNumDevs},
     {"waveOutGetDevCapsA",                    (ImplFn)impl_waveOutGetDevCapsA},
@@ -27532,6 +28002,7 @@ static ImplEntry g_impls[] = {
     {"ActivateAudioInterfaceAsync",           (ImplFn)beer_ActivateAudioInterfaceAsync},
     {"GetPhysicallyInstalledSystemMemory",    (ImplFn)impl_GetPhysicallyInstalledSystemMemory},
     {"GetTimeZoneInformation",               (ImplFn)impl_GetTimeZoneInformation},
+    {"GetDynamicTimeZoneInformation",        (ImplFn)impl_GetDynamicTimeZoneInformation},
     /* Time */
     {"GetLocalTime",                          (ImplFn)impl_GetLocalTime},
     {"GetSystemTime",                         (ImplFn)impl_GetSystemTime},
@@ -27761,6 +28232,8 @@ static ImplEntry g_impls[] = {
     {"MapVirtualKeyExA",                      (ImplFn)impl_MapVirtualKeyExW},
     {"MapVirtualKeyExW",                      (ImplFn)impl_MapVirtualKeyExW},
     {"ToUnicodeEx",                           (ImplFn)impl_ToUnicodeEx},
+    {"ToAsciiEx",                             (ImplFn)impl_ToAsciiEx},
+    {"ToAscii",                               (ImplFn)impl_ToAscii},
     {"GetKeyNameTextW",                       (ImplFn)impl_GetKeyNameTextW},
     /* Format */
     {"FormatMessageA",                        (ImplFn)impl_FormatMessageA},
@@ -28003,6 +28476,10 @@ static ImplEntry g_impls[] = {
     {"GetSystemDefaultLocaleName",            (ImplFn)impl_GetSystemDefaultLocaleName},
     {"GetSystemDefaultUILanguage",            (ImplFn)impl_GetSystemDefaultUILanguage},
     {"OpenProcessToken",                      (ImplFn)impl_OpenProcessToken},
+    {"OpenThreadToken",                       (ImplFn)impl_OpenThreadToken},
+    {"ImpersonateSelf",                       (ImplFn)impl_ImpersonateSelf},
+    {"RevertToSelf",                          (ImplFn)impl_RevertToSelf},
+    {"SetThreadToken",                        (ImplFn)impl_SetThreadToken},
     {"LookupPrivilegeValueA",                 (ImplFn)impl_LookupPrivilegeValue},
     {"LookupPrivilegeValueW",                 (ImplFn)impl_LookupPrivilegeValue},
     {"AdjustTokenPrivileges",                 (ImplFn)impl_AdjustTokenPrivileges},
@@ -28177,6 +28654,10 @@ static ImplEntry g_impls[] = {
     {"DefWindowProcW",                        (ImplFn)impl_DefWindowProcW},
     {"DefWindowProcA",                        (ImplFn)impl_DefWindowProcW},
     {"CallWindowProcW",                       (ImplFn)impl_CallWindowProcW},
+    {"SetWindowSubclass",                     (ImplFn)impl_SetWindowSubclass},
+    {"GetWindowSubclass",                     (ImplFn)impl_GetWindowSubclass},
+    {"RemoveWindowSubclass",                  (ImplFn)impl_RemoveWindowSubclass},
+    {"DefSubclassProc",                       (ImplFn)impl_DefSubclassProc},
     {"SetWindowLongPtrW",                     (ImplFn)impl_SetWindowLongPtrW},
     {"GetWindowLongPtrW",                     (ImplFn)impl_GetWindowLongPtrW},
     {"GetWindowLongPtrA",                     (ImplFn)impl_GetWindowLongPtrA},
@@ -33209,10 +33690,8 @@ beer_rtl_unwind_helper(u8 *ctx, u64 target_frame, u64 target_ip,
     }
     record->flags |= BEER_EXCEPTION_UNWINDING;
     if (!target_frame) record->flags |= BEER_EXCEPTION_EXIT_UNWIND;
-    const u64 stack_low = g_current_guest_stack_low ? g_current_guest_stack_low
-                                                    : g_guest_stack_low;
-    const u64 stack_high = g_current_guest_stack_high ? g_current_guest_stack_high
-                                                      : g_guest_stack_high;
+    u64 stack_low, stack_high;
+    beer_dispatch_stack_bounds(*(u64 *)(ctx + 0x98), &stack_low, &stack_high);
     u8 current[0x4d0] __attribute__((aligned(16)));
     u8 next[0x4d0] __attribute__((aligned(16)));
     memcpy(current, ctx, sizeof(current));
@@ -33228,6 +33707,7 @@ beer_rtl_unwind_helper(u8 *ctx, u64 target_frame, u64 target_ip,
                         "(pc=0x%lx rsp=0x%lx)\n", *(u64 *)(current + 0xf8), *(u64 *)(current + 0x98));
         }
     }
+    int host_bounce = 0;
     for (u32 frame = 0; frame < 4096; ++frame) {
         /* Reached the handler call that seh_call_handler_on_guest_stack made: on Windows the walk continues through
          * the dispatcher's frames to the frame that raised; continue from the exception context. */
@@ -33236,6 +33716,21 @@ beer_rtl_unwind_helper(u8 *ctx, u64 target_frame, u64 target_ip,
             if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
                 fprintf(stderr, "[UNWIND]  through the exception dispatcher: continuing at the exception context "
                         "(pc=0x%lx rsp=0x%lx)\n", *(u64 *)(current + 0xf8), *(u64 *)(current + 0x98));
+        } else if (t_seh_exception_ctx && frame > 0 && !host_bounce) {
+            /* A handler called directly from the dispatcher (on a thread running on a native stack) returns into
+             * Beer's own code: that is the same boundary. */
+            const u64 host_pc = *(u64 *)(current + 0xf8);
+            uintptr_t image = 0; size_t image_size = 0;
+            const int in_tramp = g_tramp && host_pc >= (u64)g_tramp && host_pc < (u64)g_tramp + g_trampsz;
+            if (host_pc && !in_tramp && !beer_image_range((uintptr_t)host_pc, &image, &image_size) &&
+                !beer_unwind_lookup(host_pc, &(u64){0})) {
+                memcpy(current, t_seh_exception_ctx, sizeof(current));
+                host_bounce = 1;
+                if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
+                    fprintf(stderr, "[UNWIND]  through the dispatcher (host pc 0x%lx): continuing at the exception "
+                            "context (pc=0x%lx rsp=0x%lx)\n", host_pc, *(u64 *)(current + 0xf8),
+                            *(u64 *)(current + 0x98));
+            }
         }
         const u64 pc = *(u64 *)(current + 0xf8);
         const u64 rsp = *(u64 *)(current + 0x98);
@@ -33421,6 +33916,20 @@ beer_raise_exception_helper(u8 *ctx_in, u32 code, u32 flags, u32 nargs,
             for (int i = 0; i < 12; ++i) fprintf(stderr, " %llx", (unsigned long long)words[i]);
             fprintf(stderr, "\n");
         }
+        if (nargs >= 4 && args[2] && args[3]) {
+            /* ThrowInfo { attributes; pmfnUnwind; pForwardCompat; pCatchableTypeArray } (RVAs from the image base);
+             * the first CatchableType names the thrown type. */
+            const u8 *ti = (const u8 *)(uintptr_t)args[2];
+            const u32 cta = *(const u32 *)(ti + 12);
+            if (cta) {
+                const u8 *arr = (const u8 *)(uintptr_t)(args[3] + cta);
+                if (*(const s32 *)arr > 0) {
+                    const u8 *ct = (const u8 *)(uintptr_t)(args[3] + *(const u32 *)(arr + 4));
+                    const u8 *td = (const u8 *)(uintptr_t)(args[3] + *(const u32 *)(ct + 4));
+                    fprintf(stderr, "[SEH] throw type: %.80s\n", (const char *)(td + 16));
+                }
+            }
+        }
     }
     if (diag) fprintf(stderr, "[SEH] raise: ctx rbx=%llx rip=%llx rsp=%llx before VEH\n",
                       (unsigned long long)*(u64 *)(ctx + 0x90), (unsigned long long)*(u64 *)(ctx + 0xf8),
@@ -33428,10 +33937,8 @@ beer_raise_exception_helper(u8 *ctx_in, u32 code, u32 flags, u32 nargs,
     if (beer_veh_dispatch(&pointers)) { memcpy(ctx_in, ctx, 0x4d0); return 0; }
     if (diag) fprintf(stderr, "[SEH] raise: ctx rbx=%llx after VEH (not handled)\n",
                       (unsigned long long)*(u64 *)(ctx + 0x90));
-    const u64 stack_low = g_current_guest_stack_low ? g_current_guest_stack_low
-                                                    : g_guest_stack_low;
-    const u64 stack_high = g_current_guest_stack_high ? g_current_guest_stack_high
-                                                      : g_guest_stack_high;
+    u64 stack_low, stack_high;
+    beer_dispatch_stack_bounds(*(u64 *)(ctx + 0x98), &stack_low, &stack_high);
     u32 visited = 0;
     u8 *outer_exception_ctx = t_seh_exception_ctx;
     t_seh_exception_ctx = ctx;

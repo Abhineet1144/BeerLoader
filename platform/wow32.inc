@@ -19,6 +19,7 @@
  * callbacks into 32-bit code, threads. */
 
 #include <asm/ldt.h>
+#include <fnmatch.h>
 
 #define W32_SLOT_HOST_RSP   0x1900   /* host stack pointer to resume on when 32-bit code calls an API */
 #define W32_SLOT_HOST_FS    0x1908   /* glibc FS base of this thread */
@@ -58,6 +59,7 @@ typedef struct { const char *name; W32Fn fn; u32 arg_bytes; } W32Api;
 typedef struct {
     const char *dll, *name;
     W32Fn fn;
+    ImplFn impl;         /* generic forwarding: the 64-bit implementation called with the sign-extended arguments */
     u32 arg_bytes;       /* popped by the callee (stdcall); 0 for cdecl */
 } W32Thunk;
 
@@ -365,33 +367,71 @@ static u64 w32_unimplemented(const u32 *args)
     return 0;
 }
 
+/* Calls a 64-bit ms_abi implementation with up to 12 stdcall arguments. Each 32-bit argument is sign-extended: guest
+ * addresses stay below 2 GiB, so pointers are unchanged, while handles such as -1 and HKEY_LOCAL_MACHINE keep the
+ * 64-bit value the implementation compares against. The result is truncated to EAX. */
+typedef u64 (__attribute__((ms_abi)) *W32Impl12)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+/* A 32-bit argument as the 64-bit implementation expects it. Small negative values (pseudo handles such as
+ * GetCurrentProcess() = -1, INVALID_HANDLE_VALUE, STD_*_HANDLE, negative coordinates) and the predefined registry
+ * keys (HKEY_* = 0x80000000..) are sign-extended, as WoW64 does; everything else is zero-extended, so pointers (all
+ * below 2 GiB) and Beer's handles with the top bit set (windows 0xD000xxxx, DCs 0xDC00xxxx) keep their value. */
+static inline u64 w32_widen(u32 v)
+{
+    if (v >= 0xffff0000u || (v >= 0x80000000u && v <= 0x800000ffu)) return (u64)(s64)(s32)v;
+    return v;
+}
+static u64 w32_call_impl(ImplFn fn, const u32 *args, u32 argc)
+{
+    u64 a[12] = {0};
+    for (u32 i = 0; i < argc && i < 12; ++i) a[i] = w32_widen(args[i]);
+    return (u32)((W32Impl12)(void *)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]);
+}
+
 u64 w32_dispatch(u32 index)
 {
     u64 teb64;
     __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb64));
     if (index >= g_w32_thunk_count) {
-        fprintf(stderr, "[WOW32] bad thunk index %u\n", index);
+        const u32 bad_esp = (u32)*(u64 *)(uintptr_t)(teb64 + W32_SLOT_ESP);
+        fprintf(stderr, "[WOW32] bad thunk index %u (thunks %u) guest esp=0x%x return=0x%x\n", index,
+                g_w32_thunk_count, bad_esp, *(u32 *)(uintptr_t)bad_esp);
         _exit(3);
     }
     const W32Thunk *t = &g_w32_thunks[index];
     const u32 esp = (u32)*(u64 *)(uintptr_t)(teb64 + W32_SLOT_ESP);
     *(u64 *)(uintptr_t)(teb64 + W32_SLOT_CLEANUP) = t->arg_bytes;
     *(u64 *)(uintptr_t)(teb64 + W32_SLOT_INDEX) = index;
-    if (t->fn == w32_unimplemented) {
+    if (t->fn == w32_unimplemented && !t->impl) {
         static _Atomic(u32) reported[4096];
         if (index >= 4096 || !atomic_exchange(&reported[index], 1))
             fprintf(stderr, "[WOW32] called unimplemented %s!%s (returns 0)\n", t->dll, t->name);
     }
-    const u64 result = t->fn((const u32 *)(uintptr_t)(esp + 4));
+    const u32 *args = (const u32 *)(uintptr_t)(esp + 4);
+    static int trace = -1;
+    if (trace < 0) trace = getenv("BEER_W32_TRACE") != NULL;
+    if (trace) {
+        fprintf(stderr, "[W32T] %s!%s(0x%x,0x%x,0x%x,0x%x)", t->dll, t->name, args[0], args[1], args[2], args[3]);
+        unsigned char page_probe;
+        if (args[0] > 0x10000 && args[0] < 0x7f000000 && t->arg_bytes &&
+            mincore((void *)(uintptr_t)(args[0] & ~0xfffu), 1, &page_probe) == 0) {
+            const char *s = (const char *)(uintptr_t)args[0];
+            if (s[0] >= 32 && s[0] < 127 && s[1] >= 32 && s[1] < 127) fprintf(stderr, " \"%.80s\"", s);
+        }
+        fputc('\n', stderr);
+    }
+    const u64 result = t->impl ? w32_call_impl(t->impl, args, t->arg_bytes / 4) : t->fn(args);
     w32_teb()->LastErrorValue = g_last_error;
     return result;
 }
 
 static const W32Api *w32_find_api(const char *name);
+static u32 w32_data_import(const char *name);   /* address of an exported variable (msvcrt's _iob), 0 if not one */
 
 /* Returns the 32-bit address of a thunk for dll!name, creating it on first use. */
 static u32 w32_thunk_for(const char *dll, const char *name)
 {
+    const u32 data = w32_data_import(name);
+    if (data) return data;
     for (u32 i = 0; i < g_w32_thunk_count; ++i)
         if (!strcasecmp(g_w32_thunks[i].name, name) && !strcasecmp(g_w32_thunks[i].dll, dll))
             return (u32)(uintptr_t)(g_w32_thunk_code + 12 * i);
@@ -403,9 +443,10 @@ static u32 w32_thunk_for(const char *dll, const char *name)
     W32Thunk *t = &g_w32_thunks[g_w32_thunk_count];
     t->dll = strdup(dll);
     t->name = strdup(name);
-    t->fn = api ? api->fn : w32_unimplemented;
+    t->fn = api && api->fn ? api->fn : w32_unimplemented;
+    t->impl = api && !api->fn ? find_impl(api->name) : NULL;
     t->arg_bytes = api ? api->arg_bytes : 0;
-    if (!api) fprintf(stderr, "[WOW32] import %s!%s is not implemented\n", dll, name);
+    if (!api || (!api->fn && !t->impl)) fprintf(stderr, "[WOW32] import %s!%s is not implemented\n", dll, name);
     u8 *code = g_w32_thunk_code + 12 * g_w32_thunk_count;
     code[0] = 0xb8;                                        /* mov eax, index */
     const u32 index = g_w32_thunk_count;
@@ -425,12 +466,12 @@ static void w32_thunks_init(void)
     if (!g_w32_thunks || !code) die("WoW32: cannot allocate thunks");
     g_w32_thunk_code = code;
     g_w32_lowstub = code + 0x20000;
-    /* 64-bit: movabs rax, beer_w32_api_entry; jmp rax */
+    /* 64-bit: movabs r11, beer_w32_api_entry; jmp r11 (EAX holds the thunk index and must survive) */
     u8 *p = g_w32_lowstub;
-    p[0] = 0x48; p[1] = 0xb8;
+    p[0] = 0x49; p[1] = 0xbb;
     const u64 api_entry = (u64)(uintptr_t)beer_w32_api_entry;
     memcpy(p + 2, &api_entry, 8);
-    p[10] = 0xff; p[11] = 0xe0;
+    p[10] = 0x41; p[11] = 0xff; p[12] = 0xe3;
     /* 64-bit: movabs rcx, beer_w32_return_entry; jmp rcx (EAX/EDX hold the result) */
     u8 *r64 = g_w32_lowstub + 0x40;
     r64[0] = 0x48; r64[1] = 0xb9;
@@ -510,7 +551,818 @@ static u64 w32_GetCommandLineW(const u32 *args)
     return cached;
 }
 
+/* ---- kernel32: process, module and resource APIs ---- */
+
+#define W32_SEXT(i) w32_widen(args[i])
+
+static u64 w32_forward(const char *name, const u32 *args, u32 argc)
+{
+    const ImplFn impl = find_impl(name);
+    if (!impl) { g_last_error = 120; return 0; }            /* ERROR_CALL_NOT_IMPLEMENTED */
+    return w32_call_impl(impl, args, argc);
+}
+
+/* STARTUPINFOA: 68 bytes in a 32-bit process. */
+static u64 w32_GetStartupInfoA(const u32 *args)
+{
+    u8 *si = W32_PTR(0);
+    if (!si) return 0;
+    memset(si, 0, 68);
+    *(u32 *)(si + 0) = 68;
+    *(u16 *)(si + 48) = 1;                                  /* wShowWindow = SW_NORMAL */
+    *(u32 *)(si + 56) = (u32)impl_GetStdHandle((u32)-10);
+    *(u32 *)(si + 60) = (u32)impl_GetStdHandle((u32)-11);
+    *(u32 *)(si + 64) = (u32)impl_GetStdHandle((u32)-12);
+    return 0;
+}
+
+/* CreateProcessA: the STARTUPINFOA and PROCESS_INFORMATION layouts differ between 32 and 64 bits. */
+static u64 w32_CreateProcessA(const u32 *args)
+{
+    const u8 *si32 = W32_PTR(8);
+    u8 si64[104];
+    memset(si64, 0, sizeof(si64));
+    *(u32 *)si64 = 104;
+    if (si32) {
+        memcpy(si64 + 32, si32 + 16, 32);                   /* dwX .. dwFlags */
+        memcpy(si64 + 64, si32 + 48, 4);                    /* wShowWindow, cbReserved2 */
+        for (int i = 0; i < 3; ++i) *(u64 *)(si64 + 80 + 8 * i) = (u64)(s64)*(const s32 *)(si32 + 56 + 4 * i);
+    }
+    u8 pi64[24];
+    memset(pi64, 0, sizeof(pi64));
+    const u64 ok = beer_CreateProcessA(W32_PTR(0), W32_PTR(1), W32_PTR(2), W32_PTR(3), args[4], args[5], W32_PTR(6),
+                                       W32_PTR(7), si32 ? si64 : NULL, pi64);
+    u32 *pi32 = W32_PTR(9);
+    if (pi32) {
+        pi32[0] = (u32)*(u64 *)pi64;
+        pi32[1] = (u32)*(u64 *)(pi64 + 8);
+        pi32[2] = *(u32 *)(pi64 + 16);
+        pi32[3] = *(u32 *)(pi64 + 20);
+    }
+    return (u32)ok;
+}
+
+/* FormatMessageA with Beer's message text; FORMAT_MESSAGE_ALLOCATE_BUFFER allocates from the 32-bit heap. */
+static u64 w32_FormatMessageA(const u32 *args)
+{
+    char text[64];
+    snprintf(text, sizeof(text), "error %u", args[2]);
+    const size_t length = strlen(text);
+    if (args[0] & 0x100u) {                                 /* FORMAT_MESSAGE_ALLOCATE_BUFFER */
+        char *block = w32_heap_alloc(length + 1, 0);
+        if (!block) { g_last_error = 8; return 0; }
+        memcpy(block, text, length + 1);
+        if (args[4]) *(u32 *)W32_PTR(4) = (u32)(uintptr_t)block;
+        return length;
+    }
+    if (!args[4] || !args[5]) { g_last_error = 122; return 0; }   /* ERROR_INSUFFICIENT_BUFFER */
+    snprintf(W32_PTR(4), args[5], "%s", text);
+    return strlen(W32_PTR(4));
+}
+
+static u64 w32_LocalFree(const u32 *args) { w32_heap_free(W32_PTR(0)); return 0; }
+
+/* System modules are opaque handles here: the 64-bit module table builds trampolines for the 64-bit image, which a
+ * 32-bit process does not have. GetProcAddress on them resolves only what this layer provides. */
+static u32 w32_module_by_name(const char *path);
+static u64 w32_GetModuleHandleA(const u32 *args)
+{
+    if (!args[0]) return g_w32_image;
+    const u32 handle = w32_module_by_name(W32_PTR(0));
+    if (!handle) g_last_error = 126;                        /* ERROR_MOD_NOT_FOUND */
+    return handle;
+}
+
+/* A GetProcAddress result is a thunk, so only APIs this layer provides can be returned. */
+static u64 w32_GetProcAddress(const u32 *args)
+{
+    const char *name = W32_PTR(1);
+    if (args[1] < 0x10000 || !w32_find_api(name)) { g_last_error = 127; return 0; }   /* ERROR_PROC_NOT_FOUND */
+    return w32_thunk_for("kernel32.dll", name);
+}
+
+static u32 g_w32_unhandled_filter;
+static u64 w32_SetUnhandledExceptionFilter(const u32 *args)
+{
+    const u32 previous = g_w32_unhandled_filter;
+    g_w32_unhandled_filter = args[0];
+    return previous;
+}
+
+static u64 w32_IsWow64Process(const u32 *args)
+{
+    if (args[1]) *(u32 *)W32_PTR(1) = 1;                    /* a 32-bit process on a 64-bit system */
+    return 1;
+}
+
+/* Resources of the 32-bit image. HRSRC is the IMAGE_RESOURCE_DATA_ENTRY, HGLOBAL the data itself. */
+#define W32_RES_NOT_FOUND 0xffffffffu
+static u32 w32_res_child(const u8 *root, u32 dir_offset, u32 key, int language_level)
+{
+    const u8 *dir = root + dir_offset;
+    const u32 named = *(const u16 *)(dir + 12), ids = *(const u16 *)(dir + 14);
+    const u32 *entries = (const u32 *)(dir + 16);
+    if (language_level) {
+        u32 first = W32_RES_NOT_FOUND, neutral = W32_RES_NOT_FOUND;
+        for (u32 i = named; i < named + ids; ++i) {
+            if (first == W32_RES_NOT_FOUND) first = entries[2 * i + 1];
+            if (entries[2 * i] == key) return entries[2 * i + 1];
+            if (entries[2 * i] == 0) neutral = entries[2 * i + 1];
+        }
+        return neutral != W32_RES_NOT_FOUND ? neutral : first;
+    }
+    if (key >= 0x10000 && ((const char *)(uintptr_t)key)[0] != '#') {
+        const char *wanted = (const char *)(uintptr_t)key;
+        for (u32 i = 0; i < named; ++i) {
+            const u16 *name = (const u16 *)(root + (entries[2 * i] & 0x7fffffffu));
+            const u16 length = name[0];
+            u16 k = 0;
+            while (k < length && wanted[k] && toupper((unsigned char)wanted[k]) == toupper(name[1 + k])) ++k;
+            if (k == length && !wanted[k]) return entries[2 * i + 1];
+        }
+        return W32_RES_NOT_FOUND;
+    }
+    const u32 id = key >= 0x10000 ? (u32)atoi((const char *)(uintptr_t)key + 1) : key;
+    for (u32 i = named; i < named + ids; ++i)
+        if (entries[2 * i] == id) return entries[2 * i + 1];
+    return W32_RES_NOT_FOUND;
+}
+
+static u64 w32_FindResourceExA(const u32 *args)
+{
+    const u8 *image = (const u8 *)(uintptr_t)(args[0] ? args[0] : g_w32_image);
+    const W32NtHdrs *nt = (const W32NtHdrs *)(image + ((const DosHdr *)image)->lfanew);
+    if (!nt->opt.dirs[2].rva || !nt->opt.dirs[2].size) { g_last_error = 1812; return 0; }   /* ERROR_RESOURCE_DATA_NOT_FOUND */
+    const u8 *root = image + nt->opt.dirs[2].rva;
+    const u32 keys[2] = { args[1], args[2] };
+    u32 offset = 0;
+    for (int level = 0; level < 2; ++level) {
+        offset = w32_res_child(root, offset, keys[level], 0);
+        if (offset == W32_RES_NOT_FOUND || !(offset & 0x80000000u)) { g_last_error = 1814; return 0; }
+        offset &= 0x7fffffffu;
+    }
+    offset = w32_res_child(root, offset, args[3], 1);
+    if (offset == W32_RES_NOT_FOUND || (offset & 0x80000000u)) { g_last_error = 1814; return 0; }   /* ERROR_RESOURCE_NAME_NOT_FOUND */
+    return (u32)(uintptr_t)(root + offset);
+}
+static u64 w32_LoadResource(const u32 *args)
+{
+    if (!args[1]) { g_last_error = 87; return 0; }
+    const u8 *image = (const u8 *)(uintptr_t)(args[0] ? args[0] : g_w32_image);
+    return (u32)(uintptr_t)(image + ((const u32 *)W32_PTR(1))[0]);
+}
+static u64 w32_LockResource(const u32 *args) { return args[0]; }
+static u64 w32_SizeofResource(const u32 *args)
+{
+    if (!args[1]) { g_last_error = 87; return 0; }
+    return ((const u32 *)W32_PTR(1))[1];
+}
+
+/* ---- advapi32 ---- */
+
+static u64 w32_RegOpenKeyExA(const u32 *args)
+{
+    u64 key = 0;
+    const u64 status = impl_RegOpenKeyExA(W32_SEXT(0), W32_PTR(1), args[2], args[3], &key);
+    if (args[4]) *(u32 *)W32_PTR(4) = (u32)key;
+    return (u32)status;
+}
+
+/* ---- user32 ---- */
+
+/* MSG is 28 bytes in a 32-bit process, 48 bytes in a 64-bit one. */
+static void w32_msg_to_native(const u32 *msg32, WIN_MSG *msg)
+{
+    memset(msg, 0, sizeof(*msg));
+    msg->hwnd = w32_widen(msg32[0]);
+    msg->message = msg32[1];
+    msg->wParam = w32_widen(msg32[2]);
+    msg->lParam = w32_widen(msg32[3]);
+    msg->time = msg32[4];
+    msg->pt.x = (s32)msg32[5];
+    msg->pt.y = (s32)msg32[6];
+}
+static u64 w32_GetMessageA(const u32 *args)
+{
+    WIN_MSG msg;
+    memset(&msg, 0, sizeof(msg));
+    const u64 result = impl_GetMessageW(&msg, W32_SEXT(1), args[2], args[3]);
+    u32 *out = W32_PTR(0);
+    if (out && (s32)result != -1) {
+        out[0] = (u32)msg.hwnd; out[1] = msg.message; out[2] = (u32)msg.wParam; out[3] = (u32)msg.lParam;
+        out[4] = msg.time; out[5] = (u32)msg.pt.x; out[6] = (u32)msg.pt.y;
+    }
+    return (u32)result;
+}
+static u64 w32_DispatchMessageA(const u32 *args)
+{
+    WIN_MSG msg;
+    w32_msg_to_native(W32_PTR(0), &msg);
+    return (u32)impl_DispatchMessageW(&msg);
+}
+static u64 w32_TranslateMessage(const u32 *args)
+{
+    WIN_MSG msg;
+    w32_msg_to_native(W32_PTR(0), &msg);
+    return (u32)impl_TranslateMessage(&msg);
+}
+/* A 32-bit timer callback cannot be invoked by the 64-bit timer machinery; WM_TIMER messages still work. */
+static u64 w32_SetTimer(const u32 *args)
+{
+    if (args[3]) { g_last_error = 87; return 0; }
+    return w32_forward("SetTimer", args, 4);
+}
+/* Bitmaps in the 32-bit image's resources are not loaded; images from files are. */
+static u64 w32_LoadImageA(const u32 *args)
+{
+    if (!(args[5] & 0x10u)) { g_last_error = 1814; return 0; }     /* LR_LOADFROMFILE */
+    return w32_forward("LoadImageA", args, 6);
+}
+static u64 w32_FindWindowExA(const u32 *args) { (void)args; return 0; }   /* Beer has no other process's windows */
+static u64 w32_EnumWindows(const u32 *args) { (void)args; return 1; }     /* ...so there is nothing to enumerate */
+
+#include "wow32_win32.inc"
+
+/* ---- msvcrt: a 32-bit C runtime on top of the host libc ----
+ * FILE is msvcrt's 32-byte struct; the guest only passes the pointer around (and takes &_iob[n] for the standard
+ * streams), so each slot of a pool in low memory stands for one host FILE. */
+#define W32_FILE_SLOTS 64
+static u8 *g_w32_file_pool;
+static FILE *g_w32_file_host[W32_FILE_SLOTS];
+static pthread_mutex_t g_w32_file_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static u8 *w32_file_pool(void)
+{
+    pthread_mutex_lock(&g_w32_file_lock);
+    if (!g_w32_file_pool) {
+        g_w32_file_pool = w32_map(0, W32_FILE_SLOTS * 32, PROT_READ | PROT_WRITE);
+        if (!g_w32_file_pool) die("WoW32: no low memory for the CRT FILE table");
+        g_w32_file_host[0] = stdin; g_w32_file_host[1] = stdout; g_w32_file_host[2] = stderr;
+        for (int i = 0; i < 3; ++i) *(s32 *)(g_w32_file_pool + 32 * i + 16) = i;
+    }
+    pthread_mutex_unlock(&g_w32_file_lock);
+    return g_w32_file_pool;
+}
+static u32 w32_data_import(const char *name)
+{
+    if (!strcmp(name, "_iob") || !strcmp(name, "__imp___iob")) return (u32)(uintptr_t)w32_file_pool();
+    return 0;
+}
+static FILE *w32_host_file(u32 guest)
+{
+    const u8 *pool = w32_file_pool();
+    const uintptr_t offset = (uintptr_t)guest - (uintptr_t)pool;
+    if ((uintptr_t)guest < (uintptr_t)pool || offset >= W32_FILE_SLOTS * 32 || offset % 32) return NULL;
+    return g_w32_file_host[offset / 32];
+}
+
+static u64 w32_fopen(const u32 *args)
+{
+    char host[PATH_MAX];
+    if (!resolve_windows_host_path(W32_PTR(0), host, sizeof(host))) { errno = ENOENT; return 0; }
+    FILE *file = fopen(host, W32_PTR(1));
+    if (!file) return 0;
+    u8 *pool = w32_file_pool();
+    pthread_mutex_lock(&g_w32_file_lock);
+    for (int i = 3; i < W32_FILE_SLOTS; ++i) {
+        if (g_w32_file_host[i]) continue;
+        g_w32_file_host[i] = file;
+        memset(pool + 32 * i, 0, 32);
+        *(s32 *)(pool + 32 * i + 16) = fileno(file);
+        pthread_mutex_unlock(&g_w32_file_lock);
+        return (u32)(uintptr_t)(pool + 32 * i);
+    }
+    pthread_mutex_unlock(&g_w32_file_lock);
+    fclose(file);
+    return 0;
+}
+static u64 w32_fclose(const u32 *args)
+{
+    FILE *file = w32_host_file(args[0]);
+    if (!file) return (u32)-1;
+    const uintptr_t slot = ((uintptr_t)args[0] - (uintptr_t)g_w32_file_pool) / 32;
+    if (slot < 3) return fflush(file) ? (u32)-1 : 0;
+    pthread_mutex_lock(&g_w32_file_lock);
+    g_w32_file_host[slot] = NULL;
+    pthread_mutex_unlock(&g_w32_file_lock);
+    return (u32)fclose(file);
+}
+static u64 w32_fwrite(const u32 *args)
+{
+    FILE *file = w32_host_file(args[3]);
+    return file ? (u32)fwrite(W32_PTR(0), args[1], args[2], file) : 0;
+}
+
+/* printf-style formatting where the arguments are 32-bit stack slots (int, pointer: one slot; 64-bit integer: two).
+ * Floating-point conversions are not supported (the loader is built without SSE): their two slots are skipped. */
+static size_t w32_format(char *out, size_t capacity, const char *format, const u32 *va)
+{
+    size_t length = 0;
+#define W32_EMIT(...) do { \
+        const int n_ = snprintf(out + length, capacity - length, __VA_ARGS__); \
+        if (n_ > 0) length += (size_t)n_; \
+        if (length >= capacity) length = capacity - 1; \
+    } while (0)
+    for (; *format && length + 1 < capacity; ++format) {
+        if (*format != '%') { out[length++] = *format; out[length] = 0; continue; }
+        if (format[1] == '%') { out[length++] = '%'; out[length] = 0; ++format; continue; }
+        char spec[64];
+        size_t n = 0;
+        spec[n++] = *format++;
+        while (*format && strchr("-+ #0", *format) && n < 16) spec[n++] = *format++;
+        if (*format == '*') { n += (size_t)snprintf(spec + n, sizeof(spec) - n, "%d", (int)*va++); ++format; }
+        else while (isdigit((unsigned char)*format) && n < 24) spec[n++] = *format++;
+        if (*format == '.') {
+            spec[n++] = *format++;
+            if (*format == '*') { n += (size_t)snprintf(spec + n, sizeof(spec) - n, "%d", (int)*va++); ++format; }
+            else while (isdigit((unsigned char)*format) && n < 40) spec[n++] = *format++;
+        }
+        int wide = 0, shorts = 0;
+        if (format[0] == 'I' && format[1] == '6' && format[2] == '4') { wide = 1; format += 3; }
+        else if (format[0] == 'I' && format[1] == '3' && format[2] == '2') format += 3;
+        else if (format[0] == 'l' && format[1] == 'l') { wide = 1; format += 2; }
+        else for (; *format == 'h' || *format == 'l' || *format == 'z' || *format == 'j' || *format == 't' ||
+                    *format == 'L'; ++format)
+                 if (*format == 'h') ++shorts;
+        const char conversion = *format;
+        if (!conversion) break;
+        switch (conversion) {
+        case 'd': case 'i': {
+            long long v = wide ? (long long)(((u64)va[1] << 32) | va[0]) : (long long)(s32)va[0];
+            va += wide ? 2 : 1;
+            if (shorts == 1) v = (short)v; else if (shorts >= 2) v = (signed char)v;
+            spec[n++] = 'l'; spec[n++] = 'l'; spec[n++] = 'd'; spec[n] = 0;
+            W32_EMIT(spec, v);
+            break;
+        }
+        case 'u': case 'x': case 'X': case 'o': {
+            unsigned long long v = wide ? (((u64)va[1] << 32) | va[0]) : (unsigned long long)va[0];
+            va += wide ? 2 : 1;
+            if (shorts == 1) v = (unsigned short)v; else if (shorts >= 2) v = (unsigned char)v;
+            spec[n++] = 'l'; spec[n++] = 'l'; spec[n++] = conversion; spec[n] = 0;
+            W32_EMIT(spec, v);
+            break;
+        }
+        case 'c':
+            spec[n++] = 'c'; spec[n] = 0;
+            W32_EMIT(spec, (int)*va++);
+            break;
+        case 's': {
+            const char *text = (const char *)(uintptr_t)*va++;
+            spec[n++] = 's'; spec[n] = 0;
+            W32_EMIT(spec, text ? text : "(null)");
+            break;
+        }
+        case 'p':
+            W32_EMIT("%08X", *va++);
+            break;
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
+            va += 2;
+            break;
+        case 'n':
+            ++va;
+            break;
+        default:
+            W32_EMIT("%c", conversion);
+            break;
+        }
+    }
+#undef W32_EMIT
+    out[length] = 0;
+    return length;
+}
+
+static u64 w32_fprintf(const u32 *args)
+{
+    FILE *file = w32_host_file(args[0]);
+    if (!file) return (u32)-1;
+    char text[8192];
+    const size_t length = w32_format(text, sizeof(text), W32_PTR(1), args + 2);
+    return (u32)fwrite(text, 1, length, file);
+}
+static u64 w32_printf(const u32 *args)
+{
+    char text[8192];
+    const size_t length = w32_format(text, sizeof(text), W32_PTR(0), args + 1);
+    return (u32)fwrite(text, 1, length, stdout);
+}
+static u64 w32_puts(const u32 *args) { return puts(W32_PTR(0)) < 0 ? (u32)-1 : 1; }
+
+/* Process start-up: argv/envp for __getmainargs. */
+static u32 *g_w32_environ_cell, *g_w32_fmode_cell;      /* the variables live in 32-bit memory: the guest gets their address */
+static u32 *w32_cell(u32 **cell)
+{
+    pthread_mutex_lock(&g_w32_heap_lock);
+    if (!*cell) *cell = w32_map(0, 0x10000, PROT_READ | PROT_WRITE);
+    pthread_mutex_unlock(&g_w32_heap_lock);
+    return *cell;
+}
+static u32 *w32_build_vector(char **items, u32 count)
+{
+    u32 *vector = w32_heap_alloc(4 * (count + 1), 1);
+    if (!vector) return NULL;
+    for (u32 i = 0; i < count; ++i) vector[i] = w32_strdup(items[i]);
+    return vector;
+}
+static u64 w32_getmainargs(const u32 *args)
+{
+    /* Split the command line the way the C runtime does: blanks separate arguments, double quotes group. */
+    const char *p = (const char *)(uintptr_t)w32_GetCommandLineA(NULL);
+    char *items[256];
+    u32 count = 0;
+    while (*p && count < 255) {
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+        char *item = malloc(strlen(p) + 1);
+        size_t n = 0;
+        int quoted = 0;
+        for (; *p && (quoted || (*p != ' ' && *p != '\t')); ++p) {
+            if (*p == '"') quoted = !quoted;
+            else item[n++] = *p;
+        }
+        item[n] = 0;
+        items[count++] = item;
+    }
+    u32 *argv = w32_build_vector(items, count);
+    for (u32 i = 0; i < count; ++i) free(items[i]);
+    u32 env_count = 0;
+    while (environ && environ[env_count] && env_count < 4096) ++env_count;
+    u32 *envp = w32_build_vector(environ, env_count);
+    if (!argv || !envp) return (u32)-1;
+    *w32_cell(&g_w32_environ_cell) = (u32)(uintptr_t)envp;
+    if (args[0]) *(u32 *)W32_PTR(0) = count;
+    if (args[1]) *(u32 *)W32_PTR(1) = (u32)(uintptr_t)argv;
+    if (args[2]) *(u32 *)W32_PTR(2) = (u32)(uintptr_t)envp;
+    return 0;
+}
+static u64 w32_p_environ(const u32 *args) { (void)args; return (u32)(uintptr_t)w32_cell(&g_w32_environ_cell); }
+static u64 w32_p_fmode(const u32 *args) { (void)args; return (u32)(uintptr_t)w32_cell(&g_w32_fmode_cell); }
+static u64 w32_set_app_type(const u32 *args) { (void)args; return 0; }
+
+#define W32_ATEXIT_MAX 64
+static u32 g_w32_atexit[W32_ATEXIT_MAX];
+static u32 g_w32_atexit_count;
+static u64 w32_atexit(const u32 *args)
+{
+    if (g_w32_atexit_count >= W32_ATEXIT_MAX) return (u32)-1;
+    g_w32_atexit[g_w32_atexit_count++] = args[0];
+    return 0;
+}
+static u64 w32_onexit(const u32 *args) { return w32_atexit(args) ? 0 : args[0]; }
+static u64 w32_cexit(const u32 *args)
+{
+    (void)args;
+    while (g_w32_atexit_count) w32_call(g_w32_atexit[--g_w32_atexit_count], 0, NULL);
+    return 0;
+}
+static u32 g_w32_signal[32];
+static u64 w32_signal(const u32 *args)
+{
+    if (args[0] >= 32) { errno = EINVAL; return (u32)-1; }
+    const u32 previous = g_w32_signal[args[0]];
+    g_w32_signal[args[0]] = args[1];                        /* recorded only: Beer raises no CRT signals */
+    return previous;
+}
+
+static u64 w32_memset(const u32 *args) { memset(W32_PTR(0), (int)args[1], args[2]); return args[0]; }
+static u64 w32_strlen(const u32 *args) { return (u32)strlen(W32_PTR(0)); }
+static u64 w32_strcmp(const u32 *args) { return (u32)strcmp(W32_PTR(0), W32_PTR(1)); }
+static u64 w32_strcpy(const u32 *args) { strcpy(W32_PTR(0), W32_PTR(1)); return args[0]; }
+static u64 w32_strcat(const u32 *args) { strcat(W32_PTR(0), W32_PTR(1)); return args[0]; }
+static u64 w32_strncpy(const u32 *args) { strncpy(W32_PTR(0), W32_PTR(1), args[2]); return args[0]; }
+static u64 w32_strncat(const u32 *args) { strncat(W32_PTR(0), W32_PTR(1), args[2]); return args[0]; }
+static u64 w32_strchr(const u32 *args) { return (u32)(uintptr_t)strchr(W32_PTR(0), (int)args[1]); }
+static u64 w32_strrchr(const u32 *args) { return (u32)(uintptr_t)strrchr(W32_PTR(0), (int)args[1]); }
+static u64 w32_strstr(const u32 *args) { return (u32)(uintptr_t)strstr(W32_PTR(0), W32_PTR(1)); }
+static u64 w32_strpbrk(const u32 *args) { return (u32)(uintptr_t)strpbrk(W32_PTR(0), W32_PTR(1)); }
+static u64 w32_strtok(const u32 *args) { return (u32)(uintptr_t)strtok(W32_PTR(0), W32_PTR(1)); }
+static u64 w32_atoi(const u32 *args) { return (u32)atoi(W32_PTR(0)); }
+static u64 w32_itoa(const u32 *args)
+{
+    char *buffer = W32_PTR(1);
+    const int radix = (int)args[2];
+    if (radix < 2 || radix > 36) { buffer[0] = 0; return args[1]; }
+    char digits[40];
+    size_t n = 0;
+    const int negative = radix == 10 && (s32)args[0] < 0;
+    u32 value = negative ? (u32)(-(s64)(s32)args[0]) : args[0];
+    do { digits[n++] = "0123456789abcdefghijklmnopqrstuvwxyz"[value % (u32)radix]; value /= (u32)radix; } while (value);
+    size_t at = 0;
+    if (negative) buffer[at++] = '-';
+    while (n) buffer[at++] = digits[--n];
+    buffer[at] = 0;
+    return args[1];
+}
+
+/* Low-level I/O: CRT descriptors are host descriptors. */
+static u64 w32_open(const u32 *args)
+{
+    char host[PATH_MAX];
+    if (!resolve_windows_host_path(W32_PTR(0), host, sizeof(host))) { errno = ENOENT; return (u32)-1; }
+    const u32 mode = args[1];
+    int flags = (int)(mode & 3u);
+    if (mode & 0x08u) flags |= O_APPEND;
+    if (mode & 0x100u) flags |= O_CREAT;
+    if (mode & 0x200u) flags |= O_TRUNC;
+    if (mode & 0x400u) flags |= O_EXCL;
+    return (u32)open(host, flags | O_CLOEXEC, 0666);
+}
+static u64 w32_close(const u32 *args) { return (u32)close((int)args[0]); }
+static u64 w32_read(const u32 *args) { return (u32)read((int)args[0], W32_PTR(1), args[2]); }
+static u64 w32_setmode(const u32 *args) { (void)args; return 0x8000; }   /* _O_BINARY: text mode is not translated */
+
+static u64 w32_chdir(const u32 *args) { return impl_SetCurrentDirectoryA(W32_PTR(0)) ? 0 : (u32)-1; }
+
+static u64 w32_stat(const u32 *args)
+{
+    char host[PATH_MAX];
+    struct stat st;
+    if (!resolve_windows_host_path(W32_PTR(0), host, sizeof(host)) || stat(host, &st) != 0) {
+        errno = ENOENT;
+        return (u32)-1;
+    }
+    u8 *out = W32_PTR(1);
+    memset(out, 0, 36);                                     /* struct _stat of the 32-bit msvcrt */
+    u16 mode = S_ISDIR(st.st_mode) ? 0x4000 : 0x8000;
+    u16 permissions = 0;
+    if (st.st_mode & S_IRUSR) permissions |= 0x100;
+    if (st.st_mode & S_IWUSR) permissions |= 0x80;
+    if (S_ISDIR(st.st_mode) || (st.st_mode & S_IXUSR)) permissions |= 0x40;
+    mode |= permissions | (u16)((permissions & 0x1c0) >> 3) | (u16)((permissions & 0x1c0) >> 6);
+    *(u32 *)(out + 0) = (u32)st.st_dev;
+    *(u16 *)(out + 4) = (u16)st.st_ino;
+    *(u16 *)(out + 6) = mode;
+    *(int16_t *)(out + 8) = 1;
+    *(u32 *)(out + 16) = (u32)st.st_dev;
+    *(s32 *)(out + 20) = st.st_size > 0x7fffffff ? 0x7fffffff : (s32)st.st_size;
+    *(s32 *)(out + 24) = (s32)st.st_atime;
+    *(s32 *)(out + 28) = (s32)st.st_mtime;
+    *(s32 *)(out + 32) = (s32)st.st_ctime;
+    return 0;
+}
+
+/* _findfirst/_findnext/_findclose: struct _finddata_t is 280 bytes (attrib, 3 times, size, name[260]). */
+#define W32_FIND_MAX 16
+static struct { DIR *dir; char directory[PATH_MAX]; char pattern[260]; } g_w32_find[W32_FIND_MAX];
+static pthread_mutex_t g_w32_find_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int w32_find_next_entry(int slot, u8 *out)
+{
+    struct dirent *entry;
+    while ((entry = readdir(g_w32_find[slot].dir)) != NULL) {
+        if (fnmatch(g_w32_find[slot].pattern, entry->d_name, FNM_CASEFOLD)) continue;
+        char path[PATH_MAX + 300];
+        struct stat st;
+        snprintf(path, sizeof(path), "%s/%s", g_w32_find[slot].directory, entry->d_name);
+        if (stat(path, &st) != 0) continue;
+        memset(out, 0, 280);
+        *(u32 *)(out + 0) = S_ISDIR(st.st_mode) ? 0x10u : 0x20u;
+        if (!(st.st_mode & S_IWUSR)) *(u32 *)(out + 0) |= 0x1u;
+        *(s32 *)(out + 4) = (s32)st.st_ctime;
+        *(s32 *)(out + 8) = (s32)st.st_atime;
+        *(s32 *)(out + 12) = (s32)st.st_mtime;
+        *(u32 *)(out + 16) = st.st_size > 0xffffffffll ? 0xffffffffu : (u32)st.st_size;
+        snprintf((char *)out + 20, 260, "%s", entry->d_name);
+        return 1;
+    }
+    return 0;
+}
+static u64 w32_findfirst(const u32 *args)
+{
+    char spec[PATH_MAX], host[PATH_MAX];
+    snprintf(spec, sizeof(spec), "%s", (const char *)W32_PTR(0));
+    char *separator = NULL;
+    for (char *c = spec; *c; ++c) if (*c == '\\' || *c == '/') separator = c;
+    char pattern[260];
+    if (separator) {
+        snprintf(pattern, sizeof(pattern), "%s", separator + 1);
+        *separator = 0;
+        if (!spec[0]) snprintf(spec, sizeof(spec), "/");                     /* "\\*.txt": the root */
+        else if (spec[1] == ':' && !spec[2]) snprintf(spec + 2, sizeof(spec) - 2, "\\");   /* "C:\\*" */
+    } else {
+        snprintf(pattern, sizeof(pattern), "%s", spec);
+        snprintf(spec, sizeof(spec), ".");
+    }
+    if (!strcmp(pattern, "*.*")) snprintf(pattern, sizeof(pattern), "*");
+    if (!strcmp(spec, ".")) snprintf(host, sizeof(host), ".");
+    else if (!resolve_windows_host_path(spec, host, sizeof(host))) { errno = ENOENT; return (u32)-1; }
+    DIR *dir = opendir(host);
+    if (!dir) { errno = ENOENT; return (u32)-1; }
+    pthread_mutex_lock(&g_w32_find_lock);
+    int slot = -1;
+    for (int i = 0; i < W32_FIND_MAX && slot < 0; ++i) if (!g_w32_find[i].dir) slot = i;
+    if (slot >= 0) {
+        g_w32_find[slot].dir = dir;
+        snprintf(g_w32_find[slot].directory, sizeof(g_w32_find[slot].directory), "%s", host);
+        snprintf(g_w32_find[slot].pattern, sizeof(g_w32_find[slot].pattern), "%s", pattern);
+    }
+    pthread_mutex_unlock(&g_w32_find_lock);
+    if (slot < 0) { closedir(dir); errno = EMFILE; return (u32)-1; }
+    if (!w32_find_next_entry(slot, W32_PTR(1))) {
+        closedir(dir);
+        g_w32_find[slot].dir = NULL;
+        errno = ENOENT;
+        return (u32)-1;
+    }
+    return (u32)(slot + 1);
+}
+static u64 w32_findnext(const u32 *args)
+{
+    const int slot = (int)args[0] - 1;
+    if (slot < 0 || slot >= W32_FIND_MAX || !g_w32_find[slot].dir) { errno = EINVAL; return (u32)-1; }
+    if (w32_find_next_entry(slot, W32_PTR(1))) return 0;
+    errno = ENOENT;
+    return (u32)-1;
+}
+static u64 w32_findclose(const u32 *args)
+{
+    const int slot = (int)args[0] - 1;
+    if (slot < 0 || slot >= W32_FIND_MAX || !g_w32_find[slot].dir) { errno = EINVAL; return (u32)-1; }
+    pthread_mutex_lock(&g_w32_find_lock);
+    closedir(g_w32_find[slot].dir);
+    g_w32_find[slot].dir = NULL;
+    pthread_mutex_unlock(&g_w32_find_lock);
+    return 0;
+}
+
+/* Table: a NULL function forwards to the 64-bit implementation of the same name (arguments in bytes). */
+#define W32_FWD(name, bytes) {name, NULL, bytes}
+
 static const W32Api g_w32_apis[] = {
+    /* kernel32 (platform/wow32_win32.inc) */
+    {"GetModuleHandleW", w32_GetModuleHandleW, 4},
+    {"WaitForMultipleObjects", w32_WaitForMultipleObjects, 16},
+    {"MsgWaitForMultipleObjects", w32_MsgWaitForMultipleObjects, 20},
+    {"MsgWaitForMultipleObjectsEx", w32_MsgWaitForMultipleObjectsEx, 20},
+    {"CreateProcessW", w32_CreateProcessW, 40},
+    {"SetWindowLongW", w32_SetWindowLongW, 12}, {"GetWindowLongW", w32_GetWindowLongW, 8},
+    {"SetWindowLongA", w32_SetWindowLongW, 12}, {"GetWindowLongA", w32_GetWindowLongW, 8},
+    {"CallWindowProcW", w32_CallWindowProcW, 20}, {"CallWindowProcA", w32_CallWindowProcW, 20},
+    {"RegisterClassW", w32_RegisterClassW, 4}, {"RegisterClassExW", w32_RegisterClassExW, 4},
+    {"PeekMessageW", w32_PeekMessageW, 20}, {"GetMessageW", w32_GetMessageW, 16},
+    {"DispatchMessageW", w32_DispatchMessageW, 4}, {"TranslateMessage", w32_TranslateMessage, 4},
+    W32_FWD("CreateWindowExW", 48), W32_FWD("DefWindowProcW", 16), W32_FWD("SendMessageW", 16),
+    W32_FWD("PostMessageW", 16), W32_FWD("PostQuitMessage", 4), W32_FWD("ShowWindow", 8),
+    {"FindResourceW", w32_FindResourceW, 12}, {"FindResourceExW", w32_FindResourceExW, 16},
+    {"FindResourceA", w32_FindResourceA, 12},
+    {"GetDiskFreeSpaceW", w32_GetDiskFreeSpaceW, 20}, {"GetDiskFreeSpaceExW", w32_GetDiskFreeSpaceExW, 16},
+    {"LoadLibraryA", w32_LoadLibraryA, 4}, {"LoadLibraryW", w32_LoadLibraryW, 4},
+    {"LoadLibraryExA", w32_LoadLibraryExA, 12}, {"LoadLibraryExW", w32_LoadLibraryExW, 12},
+    {"FreeLibrary", w32_FreeLibrary, 4},
+    {"GetModuleFileNameW", w32_GetModuleFileNameW, 12},
+    {"GetSystemInfo", w32_GetSystemInfo, 4}, {"GetNativeSystemInfo", w32_GetNativeSystemInfo, 4},
+    {"InitializeCriticalSection", w32_InitializeCriticalSection, 4},
+    {"InitializeCriticalSectionAndSpinCount", w32_InitializeCriticalSectionAndSpinCount, 8},
+    {"DeleteCriticalSection", w32_DeleteCriticalSection, 4},
+    {"EnterCriticalSection", w32_EnterCriticalSection, 4},
+    {"TryEnterCriticalSection", w32_TryEnterCriticalSection, 4},
+    {"LeaveCriticalSection", w32_LeaveCriticalSection, 4},
+    {"InterlockedCompareExchange", w32_InterlockedCompareExchange, 12},
+    {"InterlockedExchange", w32_InterlockedExchange, 8},
+    {"InterlockedExchangeAdd", w32_InterlockedExchangeAdd, 8},
+    {"InterlockedIncrement", w32_InterlockedIncrement, 4},
+    {"InterlockedDecrement", w32_InterlockedDecrement, 4},
+    {"CreateFileW", w32_CreateFileW, 28}, {"CreateFileA", w32_CreateFileA, 28},
+    {"CreateEventW", w32_CreateEventW, 16}, {"CreateEventA", w32_CreateEventA, 16},
+    {"CreateMutexW", w32_CreateMutexW, 12},
+    {"CreateDirectoryW", w32_CreateDirectoryW, 8}, {"CreateDirectoryA", w32_CreateDirectoryA, 8},
+    {"TlsAlloc", w32_TlsAlloc, 0}, {"TlsFree", w32_TlsFree, 4},
+    {"TlsGetValue", w32_TlsGetValue, 4}, {"TlsSetValue", w32_TlsSetValue, 8},
+    {"LocalAlloc", w32_LocalAlloc, 8}, {"LocalReAlloc", w32_LocalReAlloc, 12}, {"LocalSize", w32_LocalSize, 4},
+    {"GlobalAlloc", w32_LocalAlloc, 8}, {"GlobalReAlloc", w32_LocalReAlloc, 12}, {"GlobalSize", w32_LocalSize, 4},
+    {"GlobalFree", w32_GlobalFree, 4}, {"GlobalLock", w32_GlobalLock, 4}, {"GlobalUnlock", w32_GlobalUnlock, 4},
+    {"GlobalHandle", w32_GlobalHandle, 4},
+    {"VirtualAlloc", w32_VirtualAlloc, 16}, {"VirtualFree", w32_VirtualFree, 12},
+    {"VirtualQuery", w32_VirtualQuery, 12},
+    {"GetFullPathNameW", w32_GetFullPathNameW, 16}, {"GetFullPathNameA", w32_GetFullPathNameA, 16},
+    {"FormatMessageW", w32_FormatMessageW, 28},
+    W32_FWD("CompareStringW", 24), W32_FWD("CompareStringA", 24),
+    W32_FWD("DeleteFileW", 4), W32_FWD("DeleteFileA", 4),
+    W32_FWD("FindFirstFileW", 8), W32_FWD("FindNextFileW", 8), W32_FWD("FindClose", 4),
+    W32_FWD("FindFirstFileA", 8), W32_FWD("FindNextFileA", 8),
+    W32_FWD("GetACP", 0), W32_FWD("GetOEMCP", 0), W32_FWD("GetCPInfo", 8),
+    W32_FWD("GetDateFormatW", 24), W32_FWD("GetTimeFormatW", 24),
+    W32_FWD("GetEnvironmentVariableW", 12), W32_FWD("SetEnvironmentVariableW", 8),
+    W32_FWD("GetFileAttributesW", 4), W32_FWD("GetFileAttributesA", 4), W32_FWD("SetFileAttributesW", 8),
+    W32_FWD("GetFileSize", 8), W32_FWD("GetFileType", 4),
+    W32_FWD("GetLocaleInfoW", 16), W32_FWD("GetLocaleInfoA", 16), W32_FWD("GetLocalTime", 4),
+    W32_FWD("GetSystemTime", 4), W32_FWD("GetThreadLocale", 0), W32_FWD("GetUserDefaultLangID", 0),
+    W32_FWD("GetUserDefaultLCID", 0), W32_FWD("GetSystemDefaultLangID", 0), W32_FWD("GetUserDefaultUILanguage", 0),
+    W32_FWD("GetVersion", 0), W32_FWD("GetVersionExW", 4), W32_FWD("GetVersionExA", 4),
+    W32_FWD("GetWindowsDirectoryW", 8), W32_FWD("GetSystemDirectoryW", 8), W32_FWD("GetTempPathW", 8),
+    W32_FWD("GetTempFileNameW", 16), W32_FWD("GetCurrentDirectoryW", 8), W32_FWD("SetCurrentDirectoryW", 4),
+    W32_FWD("lstrcpynW", 12), W32_FWD("lstrlenW", 4), W32_FWD("lstrlenA", 4), W32_FWD("lstrcpyW", 8),
+    W32_FWD("lstrcmpiW", 8), W32_FWD("lstrcmpW", 8),
+    W32_FWD("MultiByteToWideChar", 24), W32_FWD("WideCharToMultiByte", 32),
+    W32_FWD("RemoveDirectoryW", 4), W32_FWD("MoveFileW", 8), W32_FWD("MoveFileExW", 12), W32_FWD("CopyFileW", 12),
+    W32_FWD("SetEvent", 4), W32_FWD("ResetEvent", 4), W32_FWD("SignalObjectAndWait", 16),
+W32_FWD("ReleaseMutex", 4),
+    W32_FWD("SetEndOfFile", 4), W32_FWD("SetFilePointer", 16), W32_FWD("FlushFileBuffers", 4),
+    W32_FWD("SetErrorMode", 4), W32_FWD("VirtualProtect", 16), W32_FWD("EnumCalendarInfoW", 16),
+    W32_FWD("GetStringTypeW", 16), W32_FWD("LCMapStringW", 24), W32_FWD("GetUserDefaultLocaleName", 8),
+    W32_FWD("GetTickCount64", 0), W32_FWD("FileTimeToLocalFileTime", 8), W32_FWD("FileTimeToSystemTime", 8),
+    W32_FWD("SystemTimeToFileTime", 8), W32_FWD("FileTimeToDosDateTime", 12), W32_FWD("SetFileTime", 16),
+    W32_FWD("GetFileTime", 16), W32_FWD("DuplicateHandle", 28), W32_FWD("GetExitCodeThread", 8),
+    /* advapi32 */
+    {"RegOpenKeyExW", w32_RegOpenKeyExW, 20}, {"RegCreateKeyExW", w32_RegCreateKeyExW, 36},
+    {"OpenProcessToken", w32_OpenProcessToken, 12},
+    W32_FWD("RegQueryValueExW", 24), W32_FWD("RegSetValueExW", 24), W32_FWD("RegDeleteValueW", 8),
+    W32_FWD("LookupPrivilegeValueW", 12), W32_FWD("AdjustTokenPrivileges", 24),
+    /* oleaut32 */
+    {"SysAllocString", w32_SysAllocString, 4}, {"SysAllocStringLen", w32_SysAllocStringLen, 8},
+    {"SysFreeString", w32_SysFreeString, 4}, {"SysStringLen", w32_SysStringLen, 4},
+    {"SysReAllocStringLen", w32_SysReAllocStringLen, 12},
+    {"VariantInit", w32_VariantInit, 4}, {"VariantClear", w32_VariantClear, 4},
+    {"VariantCopy", w32_VariantCopy, 8}, {"VariantChangeType", w32_VariantChangeType, 16},
+    /* user32 / comctl32 */
+    {"CharNextW", w32_CharNextW, 4}, {"CharUpperBuffW", w32_CharUpperBuffW, 8},
+    {"CharLowerBuffW", w32_CharLowerBuffW, 8}, {"GetKeyboardType", w32_GetKeyboardType, 4},
+    {"InitCommonControls", w32_InitCommonControls, 0}, {"MessageBoxW", w32_MessageBoxW, 16},
+    W32_FWD("LoadStringW", 16), W32_FWD("DestroyWindow", 4), W32_FWD("ExitWindowsEx", 8),
+    /* kernel32 */
+    {"GetStartupInfoA", w32_GetStartupInfoA, 4},
+    {"CreateProcessA", w32_CreateProcessA, 40},
+    {"FormatMessageA", w32_FormatMessageA, 28},
+    {"LocalFree", w32_LocalFree, 4},
+    {"GetModuleHandleA", w32_GetModuleHandleA, 4},
+    {"GetProcAddress", w32_GetProcAddress, 8},
+    {"SetUnhandledExceptionFilter", w32_SetUnhandledExceptionFilter, 4},
+    {"IsWow64Process", w32_IsWow64Process, 8},
+    {"FindResourceExA", w32_FindResourceExA, 16},
+    {"LoadResource", w32_LoadResource, 8},
+    {"LockResource", w32_LockResource, 4},
+    {"SizeofResource", w32_SizeofResource, 8},
+    W32_FWD("CreateMutexA", 12),
+    W32_FWD("GetCurrentDirectoryA", 8),
+    W32_FWD("GetEnvironmentVariableA", 12),
+    W32_FWD("SetEnvironmentVariableA", 8),
+    W32_FWD("GetExitCodeProcess", 8),
+    W32_FWD("GetModuleFileNameA", 12),
+    W32_FWD("GlobalMemoryStatusEx", 4),
+    W32_FWD("WaitForSingleObject", 8),
+    /* advapi32 */
+    {"RegOpenKeyExA", w32_RegOpenKeyExA, 20},
+    W32_FWD("RegCloseKey", 4),
+    W32_FWD("RegEnumKeyExA", 32),
+    W32_FWD("RegQueryValueExA", 24),
+    /* shell32 / user32 */
+    W32_FWD("ShellExecuteA", 24),
+    W32_FWD("CreateWindowExA", 48),
+    {"DispatchMessageA", w32_DispatchMessageA, 4},
+    {"EnumWindows", w32_EnumWindows, 8},
+    {"FindWindowExA", w32_FindWindowExA, 16},
+    {"GetMessageA", w32_GetMessageA, 16},
+    W32_FWD("GetSystemMetrics", 4),
+    W32_FWD("GetWindowRect", 8),
+    W32_FWD("GetWindowTextA", 12),
+    W32_FWD("GetWindowThreadProcessId", 8),
+    W32_FWD("KillTimer", 8),
+    {"LoadImageA", w32_LoadImageA, 24},
+    W32_FWD("SendMessageA", 16),
+    W32_FWD("SetForegroundWindow", 4),
+    {"SetTimer", w32_SetTimer, 16},
+    W32_FWD("SetWindowPos", 28),
+    W32_FWD("ShowWindow", 8),
+    W32_FWD("UpdateWindow", 4),
+    /* msvcrt (cdecl: the caller pops the arguments) */
+    {"__getmainargs", w32_getmainargs, 0},
+    {"__p__environ", w32_p_environ, 0},
+    {"__p__fmode", w32_p_fmode, 0},
+    {"__set_app_type", w32_set_app_type, 0},
+    {"_cexit", w32_cexit, 0},
+    {"atexit", w32_atexit, 0},
+    {"_onexit", w32_onexit, 0},
+    {"signal", w32_signal, 0},
+    {"_chdir", w32_chdir, 0},
+    {"_open", w32_open, 0},
+    {"_close", w32_close, 0},
+    {"_read", w32_read, 0},
+    {"_setmode", w32_setmode, 0},
+    {"_stat", w32_stat, 0},
+    {"_findfirst", w32_findfirst, 0},
+    {"_findnext", w32_findnext, 0},
+    {"_findclose", w32_findclose, 0},
+    {"_itoa", w32_itoa, 0},
+    {"atoi", w32_atoi, 0},
+    {"fopen", w32_fopen, 0},
+    {"fclose", w32_fclose, 0},
+    {"fwrite", w32_fwrite, 0},
+    {"fprintf", w32_fprintf, 0},
+    {"printf", w32_printf, 0},
+    {"puts", w32_puts, 0},
+    {"memset", w32_memset, 0},
+    {"strlen", w32_strlen, 0},
+    {"strcmp", w32_strcmp, 0},
+    {"strcpy", w32_strcpy, 0},
+    {"strcat", w32_strcat, 0},
+    {"strncpy", w32_strncpy, 0},
+    {"strncat", w32_strncat, 0},
+    {"strchr", w32_strchr, 0},
+    {"strrchr", w32_strrchr, 0},
+    {"strstr", w32_strstr, 0},
+    {"strpbrk", w32_strpbrk, 0},
+    {"strtok", w32_strtok, 0},
+    /* previously provided */
     {"GetStdHandle", w32_GetStdHandle, 4},
     {"WriteFile", w32_WriteFile, 20},
     {"ReadFile", w32_ReadFile, 20},

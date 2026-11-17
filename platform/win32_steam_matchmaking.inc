@@ -7,6 +7,56 @@
 
 static _Atomic(int) g_steam_mms_started;
 
+#include "steam_networking_identity.h"
+#include "beer_steam_networking.h"
+
+static u64 __attribute__((ms_abi)) steam_networking_listen(u64 self, s32 port, s32 count, const void *options)
+    { (void)self; return beer_steam_networking_listen(port, count, options); }
+static u64 __attribute__((ms_abi)) steam_networking_close_listener(u64 self, u32 h)
+    { (void)self; return beer_steam_networking_close_listener(h); }
+static u64 __attribute__((ms_abi)) steam_networking_poll_group(u64 self)
+    { (void)self; return beer_steam_networking_poll_group(); }
+static u64 __attribute__((ms_abi)) steam_networking_destroy_group(u64 self, u32 h)
+    { (void)self; return beer_steam_networking_destroy_poll_group(h); }
+static u64 __attribute__((ms_abi)) steam_networking_set_group(u64 self, u32 c, u32 g)
+    { (void)self; return beer_steam_networking_set_poll_group(c, g); }
+static u64 __attribute__((ms_abi)) steam_networking_receive_group(u64 self, u32 g, void **out, s32 count)
+    { (void)self; return (u64)(s64)beer_steam_networking_receive_poll_group(g, out, count); }
+
+static u64 __attribute__((ms_abi)) steam_networking_get_identity(u64 self, void *out)
+{
+    (void)self;
+    u64 id = g_steam_api_official && steam_official_session() ? beer_steam_session_steamid() : 0;
+    int ok = beer_steam_networking_identity(out, id);
+    if (getenv("BEER_STEAM_DIAGNOSTICS"))
+        fprintf(stderr, "[STEAM-NET] GetIdentity -> %d\n", ok);
+    return (u64)ok;
+}
+
+static u64 steam_networking_sockets_interface(void)
+{
+    static u64 vtable[64];
+    static u64 object;
+    if (!object) {
+        for (size_t i = 0; i < sizeof(vtable) / sizeof(*vtable); ++i)
+            vtable[i] = (u64)(uintptr_t)impl_steam_offline_noop;
+        /* ISteamNetworkingSockets012 slot 21; session identity is independent
+         * of whether an optional local transport is installed. */
+        vtable[21] = (u64)(uintptr_t)steam_networking_get_identity;
+        if (g_steam_api_official && steam_official_session() &&
+            beer_steam_networking_start(beer_steam_session_steamid())) {
+            vtable[2] = (u64)(uintptr_t)steam_networking_listen;
+            vtable[6] = (u64)(uintptr_t)steam_networking_close_listener;
+            vtable[24] = (u64)(uintptr_t)steam_networking_poll_group;
+            vtable[25] = (u64)(uintptr_t)steam_networking_destroy_group;
+            vtable[26] = (u64)(uintptr_t)steam_networking_set_group;
+            vtable[27] = (u64)(uintptr_t)steam_networking_receive_group;
+        }
+        object = (u64)(uintptr_t)vtable;
+    }
+    return (u64)(uintptr_t)&object;
+}
+
 /* Starts matchmaking for the signed-in session and tells Steam the app is running, as the Steam client does
  * when a game initializes Steamworks. */
 static int steam_mms_start(void)
@@ -66,7 +116,15 @@ MMS_FN mm_distance_filter(u64 self, s32 filter)
 MMS_FN mm_result_count(u64 self, s32 count) { (void)self; beer_mms_set_result_count(count); return 0; }
 MMS_FN mm_lobby_by_index(u64 self, u64 *ret, s32 index)
     { (void)self; if (ret) *ret = beer_mms_lobby_by_index(index); return (u64)(uintptr_t)ret; }
-MMS_FN mm_create_lobby(u64 self, s32 type, s32 max) { (void)self; return beer_mms_create_lobby(type, max); }
+MMS_FN mm_create_lobby(u64 self, s32 type, s32 max)
+{
+    (void)self;
+    u64 call = beer_mms_create_lobby(type, max);
+    if (getenv("BEER_STEAM_DIAGNOSTICS"))
+        fprintf(stderr, "[STEAM-MMS] CreateLobby(type=%d, max=%d) -> call=%llu\n",
+                type, max, (unsigned long long)call);
+    return call;
+}
 MMS_FN mm_join_lobby(u64 self, u64 lobby) { (void)self; return beer_mms_join_lobby(lobby); }
 MMS_FN mm_leave_lobby(u64 self, u64 lobby) { (void)self; beer_mms_leave_lobby(lobby); return 0; }
 MMS_FN mm_invite(u64 self, u64 lobby, u64 user) { (void)self; return (u64)beer_mms_invite(lobby, user); }
@@ -183,6 +241,8 @@ static int steam_client_next_callback(void *message)
     memcpy(msg + 4, &id, 4);                               /* m_iCallback */
     memcpy(msg + 8, &param, 8);                            /* m_pubParam */
     memcpy(msg + 16, &size, 4);                            /* m_cubParam */
+    if (getenv("BEER_STEAM_DIAGNOSTICS"))
+        fprintf(stderr, "[STEAM-MMS] callback id=%d size=%d\n", id, size);
     return 1;
 }
 

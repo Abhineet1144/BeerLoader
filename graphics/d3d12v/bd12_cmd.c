@@ -652,6 +652,10 @@ BD12ComputePipeline *bd12_compute_pipeline_build_db(BD12Device *device, const ui
 void bd12_compute_pipeline_destroy(BD12ComputePipeline *pipeline)
 {
     if (!pipeline) return;
+    if (pipeline->pipeline) {
+        extern uint64_t g_bd12_live_pipelines;
+        __atomic_sub_fetch(&g_bd12_live_pipelines, 1, __ATOMIC_RELAXED);
+    }
     pipeline->device->vk.DestroyPipeline(pipeline->device->device,
                                          pipeline->pipeline, NULL);
     /* layout and set_layout are shared (bd12_shared_*_layout) or owned by the descriptor-buffer layout. */

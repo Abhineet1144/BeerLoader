@@ -63,7 +63,7 @@ int beer_json_milli(const char *json, const char *key, int32_t *out)
     return 1;
 }
 
-static int frame(BeerOverlayRect rects[2])
+static int frame(BeerOverlayRect rects[BEER_OVERLAY_SLOTS])
 {
     return beer_overlay_frame(1920, 1080, rects);
 }
@@ -78,7 +78,7 @@ static void set(const char *json)
 int main(void)
 {
     char out[1024];
-    BeerOverlayRect rects[2];
+    BeerOverlayRect rects[BEER_OVERLAY_SLOTS];
     const OverlayFont *font = &overlay_fonts[1];
     const int pad = font->cell_h / 3 + 2;
 

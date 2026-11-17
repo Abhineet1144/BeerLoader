@@ -168,12 +168,25 @@ static inline BeerKnownFolder beer_classify_known_folder(const void *rfid)
  * installed native NT file hook before Beer falls back to the host filesystem.
  * Mutating opens remain on the ordinary path until virtual write-through has
  * a complete handle-lifetime implementation. */
+/* Whether a CreateFile access mask asks for write / read access. Besides the GENERIC_* bits, the specific file
+ * rights count: FILE_GENERIC_WRITE (0x120116 = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+ * FILE_WRITE_ATTRIBUTES | ...) carries no GENERIC_WRITE bit, and treating it as read-only opened Ghost of Tsushima's
+ * save files read-only (every save write failed). */
+static inline int beer_access_wants_write(uint32_t access)
+{
+    return (access & (0x40000000u /* GENERIC_WRITE */ | 0x10000000u /* GENERIC_ALL */ |
+                      0x00000002u /* FILE_WRITE_DATA */ | 0x00000004u /* FILE_APPEND_DATA */)) != 0;
+}
+static inline int beer_access_wants_read(uint32_t access)
+{
+    return (access & (0x80000000u /* GENERIC_READ */ | 0x10000000u /* GENERIC_ALL */ |
+                      0x00000001u /* FILE_READ_DATA */)) != 0;
+}
+
 static inline int beer_file_open_may_use_native_hook(uint32_t access,
                                                       uint32_t creation)
 {
-    const uint32_t GENERIC_WRITE = 0x40000000u;
-    const uint32_t GENERIC_ALL = 0x10000000u;
-    return creation == 3u && !(access & (GENERIC_WRITE | GENERIC_ALL));
+    return creation == 3u && !beer_access_wants_write(access);
 }
 
 static inline int beer_creation_disposition_flags(uint32_t creation,

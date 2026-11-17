@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -963,6 +964,9 @@ typedef struct BeerMfSample {
     uint32_t stream_index;
 } BeerMfSample;
 
+/* One ffmpeg video decoder + one audio decoder over the same input, each writing to a pipe. */
+typedef struct { pid_t video_pid, audio_pid; FILE *video, *audio; } MfDecoderPair;
+
 typedef struct BeerMfSourceReader {
     void **vtable;
     _Atomic(uint32_t) references;
@@ -990,6 +994,10 @@ typedef struct BeerMfSourceReader {
     pid_t decoder_pid;
     FILE *audio_decoder_output;
     pid_t audio_decoder_pid;
+    /* A reader that was rewound once (a looping video) keeps a spare pair started from the beginning; the next
+     * rewind swaps it in instead of starting ffmpeg and waiting for its first frame (40-70 ms per loop). */
+    MfDecoderPair spare;
+    int has_spare;
     uint8_t *frame_data;
     uint32_t frame_size;
     uint32_t frame_index;
@@ -1571,10 +1579,45 @@ static void mf_probe_decoder_metadata(BeerMfSourceReader *self)
     pclose(probe);
 }
 
-static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
+extern char **environ;
+
+/* Starts ffmpeg with `out_fd` as its stdout and stderr to /dev/null. posix_spawn (clone with CLONE_VM|CLONE_VFORK in
+ * glibc) does not copy the game's address space: fork() of a multi-GB, many-threaded game copied its page tables and
+ * write-protected all of its memory, so every game thread page-faulted for ~150 ms. A game looping a short in-world
+ * video restarts its decoder at every loop (SetCurrentPosition), which made Onimusha spike every ~10 s. */
+static pid_t mf_spawn_ffmpeg(char *const argv[], int out_fd)
 {
-    if (!self->decoder_input_path) return 0;
-    mf_source_reader_stop_decoder(self);
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) return -1;
+    posix_spawn_file_actions_adddup2(&actions, out_fd, STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    sigset_t none, all;                               /* a clean signal state, as after exec from a fresh process */
+    sigemptyset(&none);
+    sigfillset(&all);
+    posix_spawnattr_setsigmask(&attr, &none);
+    posix_spawnattr_setsigdefault(&attr, &all);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    pid_t pid = -1;
+    if (posix_spawnp(&pid, "ffmpeg", &actions, &attr, argv, environ) != 0) pid = -1;
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    return pid;
+}
+
+static void mf_kill_pair(MfDecoderPair *pair)
+{
+    if (pair->video) fclose(pair->video);
+    if (pair->audio) fclose(pair->audio);
+    if (pair->video_pid > 0) { kill(pair->video_pid, SIGTERM); waitpid(pair->video_pid, NULL, 0); }
+    if (pair->audio_pid > 0) { kill(pair->audio_pid, SIGTERM); waitpid(pair->audio_pid, NULL, 0); }
+    memset(pair, 0, sizeof(*pair));
+}
+
+static int mf_spawn_pair(BeerMfSourceReader *self, MfDecoderPair *pair)
+{
+    memset(pair, 0, sizeof(*pair));
     /* Close-on-exec: otherwise every decoder started later (another reader, a seek) inherits these read ends, and a
      * decoder whose reader is gone never sees a broken pipe. dup2 onto stdout clears the flag in the child. */
     int video_pipe[2], audio_pipe[2];
@@ -1583,55 +1626,41 @@ static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
         close(video_pipe[0]); close(video_pipe[1]);
         return 0;
     }
-    pid_t video_pid = fork();
-    if (video_pid < 0) {
-        close(video_pipe[0]); close(video_pipe[1]);
-        close(audio_pipe[0]); close(audio_pipe[1]);
-        return 0;
-    }
-    if (!video_pid) {
-        dup2(video_pipe[1], STDOUT_FILENO);
-        int null_fd = open("/dev/null", O_WRONLY);
-        if (null_fd >= 0) dup2(null_fd, STDERR_FILENO);
-        close(video_pipe[0]); close(video_pipe[1]);
-        close(audio_pipe[0]); close(audio_pipe[1]);
-        execlp("ffmpeg", "ffmpeg", "-nostdin", "-v", "error", "-i",
-               self->decoder_input_path, "-map", "0:v:0", "-an", "-sn",
-               "-vsync", "0", "-pix_fmt", "nv12", "-f", "rawvideo",
-               "pipe:1", (char *)NULL);
-        _exit(127);
-    }
-    pid_t audio_pid = fork();
-    if (audio_pid < 0) {
-        close(video_pipe[0]); close(video_pipe[1]);
-        close(audio_pipe[0]); close(audio_pipe[1]);
-        kill(video_pid, SIGTERM); waitpid(video_pid, NULL, 0);
-        return 0;
-    }
-    if (!audio_pid) {
-        dup2(audio_pipe[1], STDOUT_FILENO);
-        int null_fd = open("/dev/null", O_WRONLY);
-        if (null_fd >= 0) dup2(null_fd, STDERR_FILENO);
-        close(video_pipe[0]); close(video_pipe[1]);
-        close(audio_pipe[0]); close(audio_pipe[1]);
-        execlp("ffmpeg", "ffmpeg", "-nostdin", "-v", "error", "-i",
-               self->decoder_input_path, "-map", "0:a:0", "-vn", "-sn",
-               "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1",
-               (char *)NULL);
-        _exit(127);
-    }
+    fcntl(video_pipe[0], F_SETPIPE_SZ, 1 << 20);      /* a spare decodes ahead into the pipe while it waits */
+    char *video_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-i", self->decoder_input_path, "-map", "0:v:0", "-an",
+                           "-sn", "-vsync", "0", "-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1", NULL };
+    char *audio_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-i", self->decoder_input_path, "-map", "0:a:0", "-vn",
+                           "-sn", "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1", NULL };
+    pair->video_pid = mf_spawn_ffmpeg(video_argv, video_pipe[1]);
+    pair->audio_pid = pair->video_pid > 0 ? mf_spawn_ffmpeg(audio_argv, audio_pipe[1]) : -1;
     close(video_pipe[1]);
     close(audio_pipe[1]);
-    self->decoder_output = fdopen(video_pipe[0], "rb");
-    self->audio_decoder_output = fdopen(audio_pipe[0], "rb");
-    if (!self->decoder_output || !self->audio_decoder_output) {
-        if (self->decoder_output) fclose(self->decoder_output); else close(video_pipe[0]);
-        if (self->audio_decoder_output) fclose(self->audio_decoder_output); else close(audio_pipe[0]);
-        self->decoder_output = self->audio_decoder_output = NULL;
-        kill(video_pid, SIGTERM); kill(audio_pid, SIGTERM);
-        waitpid(video_pid, NULL, 0); waitpid(audio_pid, NULL, 0);
+    if (pair->video_pid > 0 && pair->audio_pid > 0) {
+        pair->video = fdopen(video_pipe[0], "rb");
+        pair->audio = fdopen(audio_pipe[0], "rb");
+    }
+    if (!pair->video || !pair->audio) {
+        if (!pair->video) close(video_pipe[0]);
+        if (!pair->audio) close(audio_pipe[0]);
+        if (pair->video_pid < 0) pair->video_pid = 0;
+        if (pair->audio_pid < 0) pair->audio_pid = 0;
+        mf_kill_pair(pair);
         return 0;
     }
+    return 1;
+}
+
+static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
+{
+    if (!self->decoder_input_path) return 0;
+    mf_source_reader_stop_decoder(self);
+    MfDecoderPair pair;
+    if (self->has_spare) { pair = self->spare; self->has_spare = 0; memset(&self->spare, 0, sizeof(self->spare)); }
+    else if (!mf_spawn_pair(self, &pair)) return 0;
+    if (self->reset_count && !self->has_spare) self->has_spare = mf_spawn_pair(self, &self->spare);
+    self->decoder_output = pair.video;
+    self->audio_decoder_output = pair.audio;
+    const pid_t video_pid = pair.video_pid, audio_pid = pair.audio_pid;
     self->decoder_pid = video_pid;
     self->audio_decoder_pid = audio_pid;
     self->frame_index = 0;
@@ -1655,6 +1684,7 @@ mf_source_reader_free(BeerMfSourceReader *self)
 {
     {
         mf_source_reader_stop_decoder(self);
+        if (self->has_spare) { mf_kill_pair(&self->spare); self->has_spare = 0; }
         if (self->decoder_input_path) { unlink(self->decoder_input_path); free(self->decoder_input_path); }
         free(self->frame_data);
         free(self->audio_data);

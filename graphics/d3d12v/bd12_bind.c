@@ -1061,11 +1061,37 @@ static int bind_compute_db(BD12CmdList *list, BD12ComputePipeline *pso)
                                         pso->db_layout);
 }
 
+/* BEER_BD12_SKIP_CS=<hash>[,<hash>...] (diagnostic only): dispatches of these compute shaders are dropped, to
+ * check whether a hanging shader is the only blocker (e.g. GoT's cloth solver 524c7c2e7e8bd58d). */
+static int skip_compute(uint64_t hash)
+{
+    static uint64_t list[8];
+    static int count = -1;
+    if (count < 0) {
+        count = 0;
+        const char *v = getenv("BEER_BD12_SKIP_CS");
+        while (v && *v && count < 8) {
+            char *end;
+            list[count++] = strtoull(v, &end, 16);
+            v = *end == ',' ? end + 1 : NULL;
+        }
+    }
+    for (int i = 0; i < count; ++i)
+        if (list[i] == hash) {
+            static int logged;
+            if (!logged++) fprintf(stderr, "[BD12] BEER_BD12_SKIP_CS: dropping dispatches of %016llx\n",
+                                   (unsigned long long)hash);
+            return 1;
+        }
+    return 0;
+}
+
 int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
                             uint32_t z)
 {
     BD12ComputePipeline *pso = list->compute_pipeline;
     if (pso) bd12_cs_watch_count(pso->shader_hash);
+    if (pso && skip_compute(pso->shader_hash)) return 1;
     if (pso && pso->db_layout && list->compute.root_signature) {
         if (bd12_debug_sync_all()) bd12_cmd_global_barrier(list);
         bd12_cmd_end_rendering(list);

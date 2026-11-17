@@ -14,8 +14,13 @@
  * D3D12 and Vulkan agree on record alignment (32 bytes) and table alignment (64 bytes).
  *
  * All shaders of a state object share one descriptor layout: the global root signature drives set 0 exactly like a
- * compute dispatch (per-draw resolved set + the bindless heap mirror as set 1). Local root signatures are not
- * supported yet: records must be identifier-only (RE8's are). */
+ * compute dispatch (per-draw resolved set + the bindless heap mirror as set 1).
+ *
+ * Local root signatures: each shader reads its arguments from its own shader record (the bytes after the 32-byte
+ * identifier), which dxil-spirv addresses through ShaderRecordBufferKHR: root constants are read in place, root
+ * descriptors are buffer device addresses (BD12 GPU virtual addresses are real Vulkan device addresses), and
+ * descriptor tables are GPU descriptor handles turned into heap indices (handle >> 7), read from the heap mirror.
+ * The record layout is D3D12's, so the application's shader tables are used as they are. */
 
 #define RT_ALL_STAGES (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | \
                        VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR)
@@ -29,6 +34,7 @@ struct BD12RtPipeline {
     char (*group_names)[128];
     uint8_t *handles;             /* group_count * handle size */
     uint32_t handle_size;
+    int uses_mirror;              /* the heap mirror (set 1) is bound even without bindless push words */
     pthread_mutex_t lock;
 };
 
@@ -85,12 +91,51 @@ void bd12_rt_pipeline_destroy(BD12RtPipeline *p)
     for (uint32_t i = 0; i < p->desc.library_count; ++i) free(p->desc.libraries[i].exports);
     free(p->desc.libraries);
     free(p->desc.hit_groups);
+    free(p->desc.locals);
     free(p->base.bindings);
     free(p->base.bindless);
     free(p->base.binding_types);
     free(p->group_names);
     free(p->handles);
     free(p);
+}
+
+const BD12RtDesc *bd12_rt_pipeline_desc(const BD12RtPipeline *p)
+{
+    return p ? &p->desc : NULL;
+}
+
+/* Local root signature of a library entry point: its export name (after renaming), then an association with that
+ * name, with a hit group that contains it, or the default one. */
+typedef struct { const BD12RtDesc *desc; const BD12RtLibrary *lib; } LocalLookup;
+
+static const BD12RtLocalSig *local_for_export(const BD12RtDesc *d, const char *export_name)
+{
+    for (uint32_t i = 0; i < d->local_count; ++i)
+        if (d->locals[i].export_name[0] && !strcmp(d->locals[i].export_name, export_name)) return &d->locals[i];
+    for (uint32_t h = 0; h < d->hit_group_count; ++h) {
+        const BD12RtHitGroup *hg = &d->hit_groups[h];
+        if (strcmp(hg->closest_hit, export_name) && strcmp(hg->any_hit, export_name) && strcmp(hg->intersection, export_name))
+            continue;
+        for (uint32_t i = 0; i < d->local_count; ++i)
+            if (!strcmp(d->locals[i].export_name, hg->name)) return &d->locals[i];
+    }
+    for (uint32_t i = 0; i < d->local_count; ++i)
+        if (!d->locals[i].export_name[0]) return &d->locals[i];
+    return NULL;
+}
+
+static const BeerD3D12LocalParam *local_lookup(void *user, const char *entry, uint32_t *count)
+{
+    const LocalLookup *l = user;
+    const char *export_name = l->lib->export_count ? NULL : entry;
+    for (uint32_t e = 0; e < l->lib->export_count && !export_name; ++e) {
+        const char *from = l->lib->exports[e].rename_from[0] ? l->lib->exports[e].rename_from : l->lib->exports[e].name;
+        if (!strcmp(from, entry)) export_name = l->lib->exports[e].name;
+    }
+    const BD12RtLocalSig *sig = export_name ? local_for_export(l->desc, export_name) : NULL;
+    *count = sig ? sig->param_count : 0;
+    return sig && sig->param_count ? sig->params : NULL;
 }
 
 typedef struct {
@@ -144,14 +189,16 @@ static int build(BD12RtPipeline *p)
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     uint32_t group_count = 0, set_count = 0, bindless_count = 0, bindless_words = 0, copy_count = 0;
-    int ok = 0;
+    int ok = 0, uses_mirror = 0;
     if (!shared || !translated) { free(shared); free(translated); return 0; }
 
     /* 1. translate every library, keeping the exported entry points */
     for (uint32_t l = 0; l < d->library_count; ++l) {
         uint32_t count = 0;
         const BD12RtLibrary *lib = &d->libraries[l];
-        if (!beer_d3d12_dxil_translate_library(lib->code, lib->size, shared, translated, LIBRARY_ENTRIES, &count)) {
+        LocalLookup lookup = { d, lib };
+        if (!beer_d3d12_dxil_translate_library(lib->code, lib->size, shared, translated, LIBRARY_ENTRIES, &count,
+                                               local_lookup, &lookup)) {
             fprintf(stderr, "[BD12 RT] DXIL library %u could not be translated\n", l);
             goto done;
         }
@@ -175,6 +222,7 @@ static int build(BD12RtPipeline *p)
                 shader_capacity = capacity;
             }
             RtShader *s = &shaders[shader_count++];
+            if (translated[i].uses_heap) uses_mirror = 1;
             snprintf(s->name, sizeof(s->name), "%s", export_name);
             s->stage = translated[i].stage;
             s->spirv = translated[i].spirv;
@@ -240,7 +288,7 @@ static int build(BD12RtPipeline *p)
     {
         VkDescriptorSetLayout set_layouts[2] = { set_layout, VK_NULL_HANDLE };
         set_count = 1;
-        if (bindless_words) {
+        if (bindless_words || uses_mirror) {
             set_layouts[1] = bd12_mirror_layout(device);
             if (!set_layouts[1]) goto done;
             set_count = 2;
@@ -317,11 +365,13 @@ static int build(BD12RtPipeline *p)
     p->base.bindless = bindless;
     p->base.bindless_count = bindless_count;
     p->base.bindless_words = bindless_words;
+    p->uses_mirror = uses_mirror;
     copy = NULL; types = NULL; bindless = NULL;
     set_layout = VK_NULL_HANDLE; layout = VK_NULL_HANDLE; pipeline = VK_NULL_HANDLE;
     ok = 1;
     if (getenv("BEER_DXR_PROBE")) {
-        fprintf(stderr, "[BD12 RT] pipeline %p built: %u shaders, %u groups, %u descriptors (%u bindless words)\n", (void *)p, shader_count, group_count, copy_count, bindless_words);
+        fprintf(stderr, "[BD12 RT] pipeline %p built: %u shaders, %u groups, %u descriptors (%u bindless words), %u local root signatures%s\n",
+                (void *)p, shader_count, group_count, copy_count, bindless_words, d->local_count, uses_mirror ? ", local tables" : "");
         if (getenv("BEER_DXR_LIST") && copy_count <= 6) {
             for (uint32_t i = 0; i < shader_count; ++i)
                 fprintf(stderr, "[BD12 RT]   shader %s stage=%u\n", shaders[i].name, shaders[i].stage);
@@ -398,13 +448,13 @@ int bd12_cmd_dispatch_rays(BD12CmdList *list, BD12RtPipeline *p, const uint8_t *
     VkDescriptorSet set = bd12_resolve_descriptor_set(list, &list->compute, pso->bindings, pso->binding_types, pso->binding_count, pso->set_layout);
     if (capture) bd12_capture_record(list, 0, capture_hash, (uint32_t)(v[0] ? dims[0] : 0), dims[1], dims[2]);
     bd12_canary_check("DispatchRays descriptor resolve");
-    if (!set || (pso->bindless_words && !bd12_mirror_prepare(list))) {
+    if (!set || ((pso->bindless_words || p->uses_mirror) && !bd12_mirror_prepare(list))) {
         if (capture) bd12_capture_end();
         return 0;
     }
     device->vk.CmdBindPipeline(list->command_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pso->pipeline);
     device->vk.CmdBindDescriptorSets(list->command_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pso->layout, 0, 1, &set, 0, NULL);
-    if (pso->bindless_words)
+    if (pso->bindless_words || p->uses_mirror)       /* words 0: binds the heap mirror only (local tables) */
         bd12_cmd_bind_bindless(list, &list->compute, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pso->layout, RT_ALL_STAGES,
                                pso->bindless, pso->bindless_count, pso->bindless_words);
     {   /* Diagnostic: whose identifier is in the ray-generation record? */

@@ -48,6 +48,9 @@ static const VkAccessFlags2 k_all_access =
 static int g_trace_target = -2;
 static int g_trace_frame;
 static int g_trace_manual;
+static _Atomic int g_trace_requested;
+/* Traces the next present, like creating BEER_BD12_TRACE_FILE (used by the manager's frame breakdown). */
+void bd12_trace_request(void) { g_trace_requested = 1; }
 void bd12_trace_frame_advance(void)
 {
     if (g_trace_target == -2) {
@@ -65,6 +68,10 @@ void bd12_trace_frame_advance(void)
         getenv("BEER_BD12_TRACE_FILE") &&
         access(getenv("BEER_BD12_TRACE_FILE"), F_OK) == 0) {
         unlink(getenv("BEER_BD12_TRACE_FILE"));
+        g_trace_target = g_trace_frame + 1;
+    }
+    if (g_trace_requested && (g_trace_target < 0 || g_trace_frame > g_trace_target)) {
+        g_trace_requested = 0;
         g_trace_target = g_trace_frame + 1;
     }
 }

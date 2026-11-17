@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,6 +32,8 @@ static int open_mem(void)
     if (mem_fd < 0) mem_fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
     return mem_fd >= 0;
 }
+
+int beer_guest_module_info(int index, uint64_t *base, uint64_t *size, const char **name);   /* loader.c */
 
 static ssize_t read_mem(uint64_t addr, void *buf, size_t len)
 {
@@ -343,6 +346,35 @@ static int cond_ok(Type type, const uint8_t *b)
     return 1;
 }
 
+/* ---- page population ----
+ * Most of a game's read-write address space is reserved but never touched. Scanning it finds nothing and an unknown-value
+ * snapshot of it costs gigabytes, so scans skip pages that were never populated. mincore() residency is
+ * not enough: earlier reads of an untouched page map the shared zero page, which looks resident. /proc/self/pagemap
+ * tells them apart: keep pages that are swapped out, file-backed/shared, or exclusively owned by this process. */
+static int pagemap_fd = -2;
+
+/* Fills keep[i] for the `count` pages starting at the page-aligned `addr`; returns 0 when pagemap is unavailable
+ * (then every page counts as populated). */
+static int pages_populated(uint64_t addr, size_t count, uint8_t *keep)
+{
+    if (pagemap_fd == -2) pagemap_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (pagemap_fd < 0) return 0;
+    uint64_t entries[512];
+    const uint64_t page = 4096;
+    for (size_t done = 0; done < count;) {
+        const size_t n = count - done < 512 ? count - done : 512;
+        if (pread(pagemap_fd, entries, n * 8, (off_t)((addr / page + done) * 8)) != (ssize_t)(n * 8)) return 0;
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t e = entries[i];
+            const int present = (int)(e >> 63) & 1, swapped = (int)(e >> 62) & 1, file_or_shared = (int)(e >> 61) & 1,
+                      exclusive = (int)(e >> 56) & 1;
+            keep[done + i] = (uint8_t)(swapped || (present && (exclusive || file_or_shared)));
+        }
+        done += n;
+    }
+    return 1;
+}
+
 static void first_scan(Type type, const Value *wanted, int writable_only)
 {
     session_reset();
@@ -355,16 +387,23 @@ static void first_scan(Type type, const Value *wanted, int writable_only)
     const size_t region_count = read_regions(regions, 8192);
     const size_t chunk = 1u << 20, step = type_sizes[type] ? type_sizes[type] : 1;
     uint8_t *buffer = malloc(chunk + 512);
+    uint8_t populated[(1u << 20) / 4096 + 2];
     if (!buffer) { free(regions); return; }
     for (size_t i = 0; i < region_count; ++i) {
         const Region *r = &regions[i];
         if (!scannable(r, writable_only)) continue;
         for (uint64_t at = r->start; at < r->end; at += chunk) {
             const size_t want = (size_t)((r->end - at) < chunk + wanted->length ? (r->end - at) : chunk + wanted->length);
+            const size_t pages = (want + 4095) / 4096;
+            const int known = pages_populated(at, pages, populated);
+            size_t any = 0;
+            for (size_t pg = 0; known && pg < pages; ++pg) any |= populated[pg];
+            if (known && !any) continue;
             const ssize_t got = read_mem(at, buffer, want);
             if (got < (ssize_t)wanted->length) continue;
             const size_t limit = (size_t)got - wanted->length + 1;
             for (size_t k = 0; k < limit && k < chunk; k += step) {
+                if (known && !populated[k / 4096]) { k = (k | 4095) + 1 - step; continue; }   /* untouched page */
                 if (((at + k) % step) && type_sizes[type]) continue;   /* aligned for numeric types */
                 if (values_match(type, buffer + k, wanted) && cond_ok(type, buffer + k)) {
                     if (!add_candidate(at + k, buffer + k, wanted->length)) goto done;
@@ -457,14 +496,26 @@ static void first_scan_all(Type type, int writable_only)
         snap->start = r->start;
         snap->size = size;
         const size_t chunk = 1u << 20;
+        size_t populated_bytes = 0;
         for (size_t off = 0; off < size; off += chunk) {
             const size_t want = size - off < chunk ? size - off : chunk;
-            if (read_mem(r->start + off, snap->data + off, want) != (ssize_t)want) continue;   /* bits stay clear */
-            for (size_t e = off / step; e < (off + want) / step; ++e)
-                if (cond_ok(type, snap->data + e * step)) snap->bits[e / 64] |= 1ull << (e % 64);
+            /* Copy only populated pages; untouched ones stay unwritten (no disk or page cache) and their bits clear. */
+            uint8_t populated[(1u << 20) / 4096];
+            const size_t pages = (want + 4095) / 4096;
+            const int known = pages_populated(r->start + off, pages, populated);
+            for (size_t pg = 0; pg < pages; ++pg) {
+                if (known && !populated[pg]) continue;
+                const size_t a = off + pg * 4096, len = (off + want) - a < 4096 ? (off + want) - a : 4096;
+                size_t run = len;   /* extend over following populated pages: one read per run */
+                while (pg + 1 < pages && (!known || populated[pg + 1])) { ++pg; run += (off + want) - (off + pg * 4096) < 4096 ? (off + want) - (off + pg * 4096) : 4096; }
+                if (read_mem(r->start + a, snap->data + a, run) != (ssize_t)run) continue;   /* bits stay clear */
+                for (size_t e = (a + step - 1) / step; e < (a + run) / step; ++e)
+                    if (cond_ok(type, snap->data + e * step)) snap->bits[e / 64] |= 1ull << (e % 64);
+                populated_bytes += run;
+            }
         }
         for (size_t w = 0; w < (snap->elements + 63) / 64; ++w) session.snap_total += (uint64_t)__builtin_popcountll(snap->bits[w]);
-        total_bytes += size;
+        total_bytes += populated_bytes;
         ++session.snap_count;
     }
     free(regions);
@@ -505,8 +556,11 @@ static void next_scan_snapshot(const char *mode, const Value *wanted)
         Snap *snap = &session.snaps[i];
         for (size_t off = 0; off < snap->size; off += chunk) {
             const size_t want = snap->size - off < chunk ? snap->size - off : chunk;
-            const int readable = read_mem(snap->start + off, now, want) == (ssize_t)want;
             const size_t first = off / step, last = (off + want) / step;
+            uint64_t live = 0;
+            for (size_t w = first / 64; w <= (last ? (last - 1) / 64 : 0) && w < (snap->elements + 63) / 64 && !live; ++w) live |= snap->bits[w];
+            if (!live) continue;   /* nothing left to compare in this chunk */
+            const int readable = read_mem(snap->start + off, now, want) == (ssize_t)want;
             for (size_t w = first / 64; w <= (last ? (last - 1) / 64 : 0) && w < (snap->elements + 63) / 64; ++w) {
                 uint64_t bits = snap->bits[w];
                 while (bits) {
@@ -688,7 +742,7 @@ void beer_memory_handle(const char *cmd, const char *request, char *out, size_t 
         long long len;
         if (!arg_addr(request, "addr", &addr)) { error_reply(out, size, "addr missing"); goto done; }
         arg_int(request, "len", 64, &len);
-        if (len < 1 || len > 8192) { error_reply(out, size, "len must be 1..8192"); goto done; }
+        if (len < 1 || len > 65536) { error_reply(out, size, "len must be 1..65536"); goto done; }
         uint8_t *bytes = malloc((size_t)len);
         const ssize_t got = bytes ? read_mem(addr, bytes, (size_t)len) : -1;
         if (got <= 0) { free(bytes); error_reply(out, size, "unreadable address"); goto done; }
@@ -697,6 +751,224 @@ void beer_memory_handle(const char *cmd, const char *request, char *out, size_t 
         for (ssize_t i = 0; i < got; ++i) cursor += snprintf(cursor, (size_t)(out + size - cursor), "%02x", bytes[i]);
         snprintf(cursor, (size_t)(out + size - cursor), "\"}\n");
         free(bytes);
+    } else if (!strcmp(cmd, "mem_read_batch")) {
+        /* {"reads": "addr:len,addr:len,..."} (len 1..256, up to 512 reads): {"data": ["hex" or null, ...]} in order.
+         * One round trip for many small reads (a mod sampling every enemy's health each frame). */
+        char *list = malloc(32768);
+        if (!list || !beer_json_string(request, "reads", list, 32768)) { free(list); error_reply(out, size, "reads missing"); goto done; }
+        char *cursor = out, *end = out + size - 16;
+        cursor += snprintf(cursor, size, "{\"ok\":true,\"data\":[");
+        int n = 0;
+        char *save = NULL;   /* strtok_r: each control client runs on its own thread */
+        for (char *tok = strtok_r(list, ",", &save); tok && n < 512 && end - cursor > 600; tok = strtok_r(NULL, ",", &save), ++n) {
+            char *colon = strchr(tok, ':');
+            const uint64_t addr = strtoull(tok, NULL, 0);
+            long len = colon ? strtol(colon + 1, NULL, 0) : 4;
+            if (len < 1) len = 1;
+            if (len > 256) len = 256;
+            uint8_t bytes[256];
+            const ssize_t got = addr ? read_mem(addr, bytes, (size_t)len) : -1;
+            cursor += snprintf(cursor, (size_t)(end - cursor), "%s", n ? "," : "");
+            if (got != len) { cursor += snprintf(cursor, (size_t)(end - cursor), "null"); continue; }
+            *cursor++ = '"';
+            for (long i = 0; i < len; ++i) cursor += snprintf(cursor, (size_t)(end - cursor), "%02x", bytes[i]);
+            *cursor++ = '"';
+        }
+        snprintf(cursor, (size_t)(out + size - cursor), "]}\n");
+        free(list);
+    } else if (!strcmp(cmd, "mem_aob")) {
+        /* {"pattern": "44 88 6B 14 C7 43 18 ?? ?? ?? ??", "module": "game.exe" (optional; default: every readable
+         * region), "limit": 16}: array-of-bytes search with "??" wildcards, as Cheat Engine does, to find code or data
+         * by its bytes instead of a fixed address. Reply {"count", "addrs": [...]}; read-only memory is searched. */
+        char text[1024] = "", module[96] = "";
+        if (!beer_json_string(request, "pattern", text, sizeof(text)) || !text[0]) { error_reply(out, size, "pattern missing"); goto done; }
+        uint8_t pat[256], mask[256];
+        size_t plen = 0;
+        for (const char *c = text; *c && plen < sizeof(pat);) {
+            if (*c == ' ' || *c == ',') { ++c; continue; }
+            if (c[0] == '?') { pat[plen] = 0; mask[plen++] = 0; c += c[1] == '?' ? 2 : 1; continue; }
+            const int hi = hex_value(c[0]), lo = c[1] ? hex_value(c[1]) : -1;
+            if (hi < 0 || lo < 0) { error_reply(out, size, "pattern: hex bytes and ?? only"); goto done; }
+            pat[plen] = (uint8_t)(hi << 4 | lo); mask[plen++] = 1; c += 2;
+        }
+        size_t anchor_at = 0;
+        while (anchor_at < plen && !mask[anchor_at]) ++anchor_at;
+        if (!plen || anchor_at == plen) { error_reply(out, size, "pattern needs at least one fixed byte"); goto done; }
+        long long limit = 16;
+        arg_int(request, "limit", 16, &limit);
+        if (limit < 1) limit = 1;
+        if (limit > 4096) limit = 4096;
+        uint64_t lo_addr = 0, hi_addr = ~0ull;
+        if (beer_json_string(request, "module", module, sizeof(module)) && module[0]) {
+            uint64_t mbase = 0, msize = 0;
+            const char *mname = NULL;
+            int found = 0;
+            for (int i = 0; beer_guest_module_info(i, &mbase, &msize, &mname); ++i)
+                if (mname && !strcasecmp(mname, module)) { found = 1; break; }
+            if (!found) { error_reply(out, size, "module not loaded"); goto done; }
+            lo_addr = mbase; hi_addr = mbase + msize;
+        }
+        Region *regions = malloc(sizeof(Region) * 8192);
+        const size_t chunk = 1u << 20;
+        uint8_t *buffer = malloc(chunk + sizeof(pat));
+        uint64_t *hits = malloc(sizeof(uint64_t) * (size_t)limit);
+        if (!regions || !buffer || !hits) { free(regions); free(buffer); free(hits); error_reply(out, size, "out of memory"); goto done; }
+        memset(&coverage, 0, sizeof(coverage));
+        const size_t region_count = read_regions(regions, 8192);
+        uint64_t count = 0;
+        for (size_t i = 0; i < region_count; ++i) {
+            const Region *r = &regions[i];
+            if (!scannable(r, 0)) continue;
+            const uint64_t from = r->start > lo_addr ? r->start : lo_addr, to = r->end < hi_addr ? r->end : hi_addr;
+            for (uint64_t at = from; at + plen <= to; at += chunk) {
+                const size_t want = (size_t)(to - at < chunk + plen - 1 ? to - at : chunk + plen - 1);
+                const ssize_t got = read_mem(at, buffer, want);
+                if (got < (ssize_t)plen) continue;
+                const size_t last = (size_t)got - plen;
+                for (size_t k = 0; k <= last && k < chunk;) {
+                    const uint8_t *hit = memchr(buffer + k + anchor_at, pat[anchor_at], last - k + 1);
+                    if (!hit) break;
+                    k = (size_t)(hit - buffer) - anchor_at;
+                    size_t j = 0;
+                    while (j < plen && (!mask[j] || buffer[k + j] == pat[j])) ++j;
+                    if (j == plen) { if (count < (uint64_t)limit) hits[count] = at + k; ++count; }
+                    ++k;
+                }
+            }
+        }
+        char *cursor = out, *end = out + size - 32;
+        cursor += snprintf(cursor, size, "{\"ok\":true,\"count\":%llu,\"addrs\":[", (unsigned long long)count);
+        for (uint64_t a = 0; a < count && a < (uint64_t)limit && end - cursor > 40; ++a)
+            cursor += snprintf(cursor, (size_t)(end - cursor), "%s\"0x%llx\"", a ? "," : "", (unsigned long long)hits[a]);
+        snprintf(cursor, (size_t)(out + size - cursor), "]}\n");
+        free(regions);
+        free(buffer);
+        free(hits);
+    } else if (!strcmp(cmd, "mem_find")) {
+        /* {"values": "0x..,0x..", "limit": per-value address cap (default 16, max 256), "writable": true}:
+         * finds every 8-aligned qword equal to any of up to 256 values in ONE pass over populated memory, without
+         * touching the scan session (so a mod can look for object type pointers while the user scans). Reply
+         * {"results": [{"value", "count", "addrs": [...]}]} in the order given; counts are exact. */
+        char *list = malloc(8192);
+        if (!list || !beer_json_string(request, "values", list, 8192)) { free(list); error_reply(out, size, "values missing"); goto done; }
+        long long limit = 16;
+        arg_int(request, "limit", 16, &limit);
+        if (limit < 0) limit = 0;
+        if (limit > 256) limit = 256;
+        const char *w = beer_json_find(request, "writable");
+        const int writable_only = !(w && !strncmp(w, "false", 5));
+        enum { MAXV = 256, SLOTS = 1024 };
+        uint64_t values[MAXV], counts[MAXV] = { 0 };
+        int nvalues = 0;
+        short slot_of[SLOTS];
+        memset(slot_of, -1, sizeof(slot_of));
+        char *save = NULL;
+        for (char *tok = strtok_r(list, ",", &save); tok && nvalues < MAXV; tok = strtok_r(NULL, ",", &save)) {
+            const uint64_t v = strtoull(tok, NULL, 0);
+            unsigned h = (unsigned)((v * 0x9e3779b97f4a7c15ull) >> 54);
+            while (slot_of[h] >= 0 && values[slot_of[h]] != v) h = (h + 1) & (SLOTS - 1);
+            if (slot_of[h] >= 0) continue;   /* duplicate */
+            values[nvalues] = v;
+            slot_of[h] = (short)nvalues++;
+        }
+        free(list);
+        uint64_t *addrs = calloc((size_t)MAXV * (size_t)(limit ? limit : 1), sizeof(uint64_t));
+        Region *regions = malloc(sizeof(Region) * 8192);
+        const size_t chunk = 1u << 20;
+        uint64_t *buffer = malloc(chunk);
+        if (!addrs || !regions || !buffer) { free(addrs); free(regions); free(buffer); error_reply(out, size, "out of memory"); goto done; }
+        memset(&coverage, 0, sizeof(coverage));
+        const size_t region_count = read_regions(regions, 8192);
+        uint8_t populated[(1u << 20) / 4096];
+        for (size_t i = 0; i < region_count && nvalues; ++i) {
+            const Region *r = &regions[i];
+            if (!scannable(r, writable_only)) continue;
+            for (uint64_t at = r->start; at < r->end; at += chunk) {
+                const size_t want = (size_t)(r->end - at < chunk ? r->end - at : chunk);
+                const size_t pages = (want + 4095) / 4096;
+                const int known = pages_populated(at, pages, populated);
+                for (size_t pg = 0; pg < pages; ++pg) {
+                    if (known && !populated[pg]) continue;
+                    size_t run = 1;
+                    while (pg + run < pages && (!known || populated[pg + run])) ++run;
+                    const uint64_t from = at + pg * 4096;
+                    size_t bytes = run * 4096;
+                    if (from + bytes > at + want) bytes = (size_t)(at + want - from);
+                    pg += run - 1;
+                    if (read_mem(from, buffer, bytes) != (ssize_t)bytes) continue;
+                    for (size_t q = 0; q < bytes / 8; ++q) {
+                        const uint64_t v = buffer[q];
+                        unsigned h = (unsigned)((v * 0x9e3779b97f4a7c15ull) >> 54);
+                        while (slot_of[h] >= 0) {
+                            const int k = slot_of[h];
+                            if (values[k] == v) {
+                                if (counts[k] < (uint64_t)limit) addrs[(size_t)k * (size_t)limit + counts[k]] = from + q * 8;
+                                ++counts[k];
+                                break;
+                            }
+                            h = (h + 1) & (SLOTS - 1);
+                        }
+                    }
+                }
+            }
+        }
+        char *cursor = out, *end = out + size - 32;
+        cursor += snprintf(cursor, size, "{\"ok\":true,\"results\":[");
+        for (int k = 0; k < nvalues && end - cursor > 120; ++k) {
+            cursor += snprintf(cursor, (size_t)(end - cursor), "%s{\"value\":\"0x%llx\",\"count\":%llu,\"addrs\":[", k ? "," : "",
+                               (unsigned long long)values[k], (unsigned long long)counts[k]);
+            const uint64_t shown = counts[k] < (uint64_t)limit ? counts[k] : (uint64_t)limit;
+            for (uint64_t a = 0; a < shown && end - cursor > 60; ++a)
+                cursor += snprintf(cursor, (size_t)(end - cursor), "%s\"0x%llx\"", a ? "," : "",
+                                   (unsigned long long)addrs[(size_t)k * (size_t)limit + a]);
+            cursor += snprintf(cursor, (size_t)(end - cursor), "]}");
+        }
+        snprintf(cursor, (size_t)(out + size - cursor), "]}\n");
+        free(addrs);
+        free(regions);
+        free(buffer);
+    } else if (!strcmp(cmd, "mem_resolve")) {
+        /* {"base": "0x..", "module": "re8.exe" (optional: base is relative to it), "offsets": "0x10,0x8,0x2c"}:
+         * a pointer path as in Cheat Engine. addr = base (+ module); for each offset: addr = *(u64 *)addr + offset.
+         * Reply {"addr": final address, "steps": [...]}, or an error naming the step that hit unreadable memory. */
+        uint64_t addr = 0;
+        char module[96] = "", offsets[512] = "";
+        arg_addr(request, "base", &addr);
+        if (beer_json_string(request, "module", module, sizeof(module)) && module[0]) {
+            uint64_t mbase = 0, msize = 0;
+            const char *mname = NULL;
+            int found = 0;
+            for (int i = 0; beer_guest_module_info(i, &mbase, &msize, &mname); ++i)
+                if (mname && !strcasecmp(mname, module)) { found = 1; break; }
+            if (!found) { error_reply(out, size, "module not loaded"); goto done; }
+            addr += mbase;
+        }
+        beer_json_string(request, "offsets", offsets, sizeof(offsets));
+        char *cursor = out;
+        cursor += snprintf(cursor, size, "{\"ok\":true,\"steps\":[\"0x%llx\"", (unsigned long long)addr);
+        int step = 0;
+        char *save = NULL;
+        for (char *tok = strtok_r(offsets, ",", &save); tok; tok = strtok_r(NULL, ",", &save), ++step) {
+            uint64_t next = 0;
+            if (read_mem(addr, &next, 8) != 8 || !next) {
+                snprintf(out, size, "{\"ok\":false,\"error\":\"pointer %d at 0x%llx is unreadable or null\"}\n", step,
+                         (unsigned long long)addr);
+                goto done;
+            }
+            addr = next + (uint64_t)strtoll(tok, NULL, 0);
+            cursor += snprintf(cursor, (size_t)(out + size - cursor), ",\"0x%llx\"", (unsigned long long)addr);
+        }
+        snprintf(cursor, (size_t)(out + size - cursor), "],\"addr\":\"0x%llx\"}\n", (unsigned long long)addr);
+    } else if (!strcmp(cmd, "mem_modules")) {
+        /* The executable and every loaded guest DLL: {"modules": [{"name","base","size"}, ...]}. */
+        char *cursor = out, *end = out + size - 16;
+        cursor += snprintf(cursor, size, "{\"ok\":true,\"modules\":[");
+        uint64_t mbase, msize;
+        const char *mname;
+        for (int i = 0; beer_guest_module_info(i, &mbase, &msize, &mname) && end - cursor > 200; ++i)
+            cursor += snprintf(cursor, (size_t)(end - cursor), "%s{\"name\":\"%s\",\"base\":\"0x%llx\",\"size\":%llu}",
+                               i ? "," : "", mname ? mname : "?", (unsigned long long)mbase, (unsigned long long)msize);
+        snprintf(cursor, (size_t)(out + size - cursor), "]}\n");
     } else if (!strcmp(cmd, "mem_write")) {
         uint64_t addr;
         char hex[2048];

@@ -103,7 +103,7 @@ typedef struct {
     VkBuffer overlay_buffer;
     VkDeviceMemory overlay_memory;
     uint8_t *overlay_map;
-    uint64_t overlay_serial[2];
+    uint64_t overlay_serial[BEER_OVERLAY_SLOTS];
     PFN_vkCmdCopyImage CmdCopyImage;
     PFN_vkCreateSemaphore CreateSemaphore;
     PFN_vkDestroySemaphore DestroySemaphore;
@@ -147,7 +147,7 @@ static void record_direct_present(uint64_t sequence, const char *stage,
 
 static void destroy_swapchain(void)
 {
-    if (g_vk.device && g_vk.DeviceWaitIdle) g_vk.DeviceWaitIdle(g_vk.device);
+    if (g_vk.device && g_vk.DeviceWaitIdle) beer_vulkan_device_wait_idle(g_vk.device, g_vk.DeviceWaitIdle);
     if (g_vk.staging_map && g_vk.UnmapMemory)
         g_vk.UnmapMemory(g_vk.device, g_vk.staging_memory);
     g_vk.staging_map = NULL;
@@ -363,16 +363,16 @@ static int find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags required,
 /* In-game overlay: the boxes are CPU-rendered (platform/beer_overlay.c) into a persistent host-visible buffer
  * and copied onto the swapchain image after the frame was blitted into it. Called with the image in
  * TRANSFER_DST layout. Boxes are opaque; the cost while hidden is one mutex-free branch. */
-#define OVERLAY_REGION_BYTES (4u * 1024u * 1024u)
+#define OVERLAY_REGION_BYTES BEER_OVERLAY_REGION_BYTES
 static void record_overlay(VkImage destination)
 {
-    BeerOverlayRect rects[2];
+    BeerOverlayRect rects[BEER_OVERLAY_SLOTS];
     const int count = beer_overlay_frame((int)g_vk.extent.width, (int)g_vk.extent.height, rects);
     if (count <= 0) return;
     if (!g_vk.overlay_buffer) {
         VkBufferCreateInfo info = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = 2u * OVERLAY_REGION_BYTES,
+            .size = (VkDeviceSize)BEER_OVERLAY_SLOTS * OVERLAY_REGION_BYTES,
             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE
         };
@@ -393,7 +393,8 @@ static void record_overlay(VkImage destination)
         const BeerOverlayRect *r = &rects[i];
         const size_t bytes = (size_t)r->w * (size_t)r->h * 4u;
         if (bytes > OVERLAY_REGION_BYTES || r->w <= 0 || r->h <= 0) continue;
-        const int slot = (int)(r->serial & 1u);   /* box index is encoded in the serial's low bit */
+        const int slot = r->slot;                 /* fixed upload region per box */
+        if (slot < 0 || slot >= BEER_OVERLAY_SLOTS) continue;
         uint8_t *region = g_vk.overlay_map + (size_t)slot * OVERLAY_REGION_BYTES;
         if (g_vk.overlay_serial[slot] != r->serial) {
             memcpy(region, r->bgra, bytes);
@@ -1136,9 +1137,10 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
     if (beer_vulkan_device_lost()) return 0;
     if (getenv("BEER_PRESENT_SKIP_ALL")) return 1;
     /* A back buffer that is normally blitted straight to the swapchain (BGRA8, R10G10B10A2) goes through the RGBA8
-     * upload image and the post pass on a frame that takes a screenshot: the blit into it converts the format. */
+     * upload image and the post pass on a frame that takes a screenshot, or while a translucent overlay is shown (the
+     * direct path can only copy the overlay opaquely): the blit into the upload image converts the format. */
     int convert = 0;
-    if (direct_blit && beer_post_screenshot_pending()) { convert = 1; direct_blit = 0; }
+    if (direct_blit && (beer_post_screenshot_pending() || beer_overlay_translucent())) { convert = 1; direct_blit = 0; }
     record_direct_present(sequence, "enter", source_image, source_layout,
                           width, height, output_width, output_height, -1,
                           VK_SUCCESS);

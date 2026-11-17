@@ -138,6 +138,8 @@ static const char *const beer_module_exports[][2] = {
     { "combase.dll", "WindowsDuplicateString" },
     { "combase.dll", "WindowsGetStringLen" },
     { "combase.dll", "WindowsGetStringRawBuffer" },
+    { "comctl32.dll", "DefSubclassProc" },
+    { "comctl32.dll", "GetWindowSubclass" },
     { "comctl32.dll", "ImageList_Add" },
     { "comctl32.dll", "ImageList_AddMasked" },
     { "comctl32.dll", "ImageList_BeginDrag" },
@@ -157,6 +159,8 @@ static const char *const beer_module_exports[][2] = {
     { "comctl32.dll", "ImageList_SetImageCount" },
     { "comctl32.dll", "InitCommonControls" },
     { "comctl32.dll", "InitCommonControlsEx" },
+    { "comctl32.dll", "RemoveWindowSubclass" },
+    { "comctl32.dll", "SetWindowSubclass" },
     { "comctl32.dll", "TaskDialogIndirect" },
     { "comctl32.dll", "_TrackMouseEvent" },
     { "comdlg32.dll", "GetOpenFileNameW" },
@@ -2201,6 +2205,8 @@ static const char *const beer_module_exports[][2] = {
     { "winmm.dll", "timeEndPeriod" },
     { "winmm.dll", "timeGetDevCaps" },
     { "winmm.dll", "timeGetTime" },
+    { "winmm.dll", "timeKillEvent" },
+    { "winmm.dll", "timeSetEvent" },
     { "winmm.dll", "waveInAddBuffer" },
     { "winmm.dll", "waveInClose" },
     { "winmm.dll", "waveInGetNumDevs" },
@@ -2415,6 +2421,10 @@ static const struct { const char *module; const char *name; unsigned short ordin
     { "xinput1_3.dll", "XInputSetState", 3 },
     { "xinput1_3.dll", "XInputGetCapabilities", 4 },
     { "xinput1_3.dll", "XInputEnable", 5 },
+    { "comctl32.dll", "SetWindowSubclass", 410 },
+    { "comctl32.dll", "GetWindowSubclass", 411 },
+    { "comctl32.dll", "RemoveWindowSubclass", 412 },
+    { "comctl32.dll", "DefSubclassProc", 413 },
 };
 #define BEER_MODULE_ORDINAL_COUNT (sizeof(beer_module_ordinals) / sizeof(*beer_module_ordinals))
 

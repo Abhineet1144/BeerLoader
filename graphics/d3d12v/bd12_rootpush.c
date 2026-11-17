@@ -272,10 +272,17 @@ static void rp_print_meta(const BD12DescriptorHeap *heap, uint32_t index)
 #define SNAP_RING 32
 #define SNAP_ROOTS 4
 #define SNAP_BYTES 256
-#define SNAP_ENTRY (16 + SNAP_ROOTS * SNAP_BYTES)
+#define SNAP_HEAP_BYTES 512
+/* + the SM 6.6 heap record: ResourceDescriptorHeap[root constant word 2] at byte offset root constant word 0 (the
+ * pattern of GoT's hanging cloth solver 524c7c2e7e8bd58d, whose loop count is read from that record). */
+#define SNAP_CHAIN_BYTES 512   /* the constraint buffer: heap[record[header + 116]] (GPU-only in GoT) */
+#define SNAP_ENTRY (16 + SNAP_ROOTS * SNAP_BYTES + SNAP_HEAP_BYTES + SNAP_CHAIN_BYTES)
 static BD12Buffer *g_snap;
 static uint32_t g_snap_next;
-static struct { uint32_t seq, x, y, z; uint64_t va[SNAP_ROOTS]; uint32_t param[SNAP_ROOTS]; } g_snap_meta[SNAP_RING];
+static struct { uint32_t seq, x, y, z; uint64_t va[SNAP_ROOTS]; uint32_t param[SNAP_ROOTS];
+                uint32_t rc[4], heap_slot; uint64_t heap_va; int heap_ok;
+                const BD12DescriptorHeap *heap; const BD12Buffer *buffer; VkDeviceSize at;
+                uint32_t chain_slot; uint64_t chain_size; int chain_ok; } g_snap_meta[SNAP_RING];
 
 static int snap_on(void)
 {
@@ -316,6 +323,59 @@ void bd12_rp_snap_dispatch(BD12CmdList *list, const BD12BindState *state, uint64
             device->vk.CmdCopyBuffer(list->command_buffer, b->buffer, g_snap->buffer, 1, &c);
         }
         ++n;
+    }
+    for (uint32_t i = 0; i < layout->param_count; ++i)       /* the first root-constant block: words 0..3 */
+        if (layout->params[i].type == BEER_ROOT_CONSTANTS) {
+            for (int w = 0; w < 4; ++w) g_snap_meta[slot].rc[w] = state->arguments[i].constants[w];
+            break;
+        }
+    {
+        const BD12DescriptorHeap *heap = list->heaps[0];
+        uint32_t index = UINT32_MAX;
+        const uint32_t offset = g_snap_meta[slot].rc[0];
+        /* The record lives in the buffer of the first descriptor table the game set (GoT: table 1, a raw SRV). */
+        for (uint32_t i = 0; heap && i < layout->param_count && index == UINT32_MAX; ++i)
+            if (layout->params[i].type == BEER_ROOT_TABLE && state->arguments[i].value >= heap->gpu_base &&
+                state->arguments[i].value < heap->gpu_base + (uint64_t)heap->count * BD12_DESCRIPTOR_INCREMENT)
+                index = (uint32_t)((state->arguments[i].value - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT);
+        g_snap_meta[slot].heap_slot = index;
+        if (heap && index < heap->count) {
+            const BD12Descriptor *d = &heap->descriptors[index];
+            BD12Buffer *b = d->source_buffer;
+            const VkDeviceSize at = d->offset + offset;
+            if (b && at < b->size) {
+                g_snap_meta[slot].heap_va = b->va + at;
+                g_snap_meta[slot].heap_ok = 1;
+                g_snap_meta[slot].heap = heap;
+                g_snap_meta[slot].buffer = b;
+                g_snap_meta[slot].at = d->offset;
+                const VkBufferCopy c = { at, base + 16 + (VkDeviceSize)SNAP_ROOTS * SNAP_BYTES,
+                                         b->size - at < SNAP_HEAP_BYTES ? b->size - at : SNAP_HEAP_BYTES };
+                device->vk.CmdCopyBuffer(list->command_buffer, b->buffer, g_snap->buffer, 1, &c);
+                /* Follow record word +8 (header offset) + 116 to the constraint-buffer slot, read on the CPU now
+                 * (the record buffer is an upload heap), and copy that buffer's start on the GPU. */
+                if (b->cpu && at + 12 <= b->size) {
+                    uint32_t header = 0, chain = UINT32_MAX;
+                    memcpy(&header, (const uint8_t *)b->cpu + at + 8, 4);
+                    const VkDeviceSize where = d->offset + header + 116;
+                    if (where + 4 <= b->size) memcpy(&chain, (const uint8_t *)b->cpu + where, 4);
+                    g_snap_meta[slot].chain_slot = chain;
+                    if (chain < heap->count) {
+                        const BD12Descriptor *cd = &heap->descriptors[chain];
+                        BD12Buffer *cb = cd->source_buffer;
+                        if (cb && cd->offset < cb->size) {
+                            g_snap_meta[slot].chain_size = cd->range;
+                            g_snap_meta[slot].chain_ok = 1;
+                            const VkBufferCopy cc = { cd->offset,
+                                                      base + 16 + (VkDeviceSize)SNAP_ROOTS * SNAP_BYTES + SNAP_HEAP_BYTES,
+                                                      cb->size - cd->offset < SNAP_CHAIN_BYTES ? cb->size - cd->offset
+                                                                                               : SNAP_CHAIN_BYTES };
+                            device->vk.CmdCopyBuffer(list->command_buffer, cb->buffer, g_snap->buffer, 1, &cc);
+                        }
+                    }
+                }
+            }
+        }
     }
     bd12_cmd_add_memory_barrier(list, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                 VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -445,6 +505,61 @@ void bd12_rp_snap_dump(void)
                     (unsigned long long)g_snap_meta[slot].va[r]);
             for (int i = 0; i < 24; ++i) fprintf(stderr, "%s%08x", i % 4 ? " " : "  |", w[i]);
             fputc('\n', stderr);
+        }
+        fprintf(stderr, "[SNAP]   root constants %08x %08x %08x %08x; heap slot %u va 0x%llx %s\n",
+                g_snap_meta[slot].rc[0], g_snap_meta[slot].rc[1], g_snap_meta[slot].rc[2], g_snap_meta[slot].rc[3],
+                g_snap_meta[slot].heap_slot, (unsigned long long)g_snap_meta[slot].heap_va,
+                g_snap_meta[slot].heap_ok ? "" : "(no buffer)");
+        if (g_snap_meta[slot].heap_ok) {
+            const uint32_t *w = (const uint32_t *)(e + 16 + SNAP_ROOTS * SNAP_BYTES);
+            for (int row = 0; row < SNAP_HEAP_BYTES / 4; row += 16) {
+                fprintf(stderr, "[SNAP]   +%03x:", row * 4);
+                for (int i = 0; i < 16; ++i) fprintf(stderr, " %08x", w[row + i]);
+                fputc('\n', stderr);
+            }
+            /* GoT's solver reads descriptor indices out of the same buffer (record word +8 is an offset; the
+             * constraint-buffer index sits at that offset + 116, and more indices around it). Follow them while the
+             * buffer is CPU-visible, and print each indexed heap slot. */
+            if (g_snap_meta[slot].chain_ok) {
+                const uint32_t *c = (const uint32_t *)(e + 16 + SNAP_ROOTS * SNAP_BYTES + SNAP_HEAP_BYTES);
+                const uint32_t entries = (uint32_t)(g_snap_meta[slot].chain_size / 16);
+                fprintf(stderr, "[SNAP]   constraint buffer slot %u (%llu bytes, %u entries {flag, first, count, f}) at "
+                        "dispatch time:\n", g_snap_meta[slot].chain_slot, (unsigned long long)g_snap_meta[slot].chain_size,
+                        entries);
+                for (uint32_t i = 0; i < entries && i < 32; ++i)
+                    fprintf(stderr, "[SNAP]     [%2u] %08x %08x %08x %08x\n", i, c[i * 4], c[i * 4 + 1], c[i * 4 + 2],
+                            c[i * 4 + 3]);
+            } else
+                fprintf(stderr, "[SNAP]   constraint slot %u not captured\n", g_snap_meta[slot].chain_slot);
+            const BD12Buffer *b = g_snap_meta[slot].buffer;
+            const BD12DescriptorHeap *heap = g_snap_meta[slot].heap;
+            fprintf(stderr, "[SNAP]   record buffer %s (size %llu)\n", b && b->cpu ? "CPU-visible" : "GPU-only",
+                    b ? (unsigned long long)b->size : 0ull);
+            if (b && b->cpu && heap) {
+                const uint32_t header = w[2];                    /* record word +8 */
+                for (uint32_t k = 0; k < 32; ++k) {
+                    const VkDeviceSize byte = g_snap_meta[slot].at + header + 100 + k * 4;
+                    if (byte + 4 > b->size) break;
+                    uint32_t index;
+                    memcpy(&index, (const uint8_t *)b->cpu + byte, 4);
+                    if (index >= heap->count) {
+                        fprintf(stderr, "[SNAP]     header+%u = 0x%x (not a heap index)\n", 100 + k * 4, index);
+                        continue;
+                    }
+                    const BD12Descriptor *d = &heap->descriptors[index];
+                    fprintf(stderr, "[SNAP]     header+%u = slot %u: kind %d flags %u va 0x%llx offset %llu range %llu "
+                            "bufsize %llu fmt %d", 100 + k * 4, index, (int)d->kind, d->flags,
+                            d->source_buffer ? (unsigned long long)d->source_buffer->va : 0ull,
+                            (unsigned long long)d->offset, (unsigned long long)d->range,
+                            d->source_buffer ? (unsigned long long)d->source_buffer->size : 0ull, (int)d->format);
+                    if (d->source_buffer && d->source_buffer->cpu && d->offset + 64 <= d->source_buffer->size) {
+                        const uint32_t *v = (const uint32_t *)((const uint8_t *)d->source_buffer->cpu + d->offset);
+                        fprintf(stderr, " | %08x %08x %08x %08x %08x %08x %08x %08x", v[0], v[1], v[2], v[3], v[4], v[5],
+                                v[6], v[7]);
+                    }
+                    fputc('\n', stderr);
+                }
+            }
         }
     }
 }

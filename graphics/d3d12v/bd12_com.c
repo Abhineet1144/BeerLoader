@@ -1191,6 +1191,10 @@ static HR present_epilogue(ComQueue *q, ComResource *texture)
             com_wait_serial(dev, dev->serial);
             bd12_capture_flush();
         }
+        /* A frame breakdown whose frame drew no render pass (compute-only, or not a D3D12 frame): finish it empty. */
+        static int frame_wait;
+        frame_wait = bd12_frame_capture_state() == 1 && !bd12_capture_pending() ? frame_wait + 1 : 0;
+        if (frame_wait > 8) { frame_wait = 0; bd12_capture_flush(); }
     }
     bd12_trace_frame_advance();
     bd12_cs_watch_report();
@@ -2726,7 +2730,7 @@ static uint64_t texture_size_estimate(ComDevice *dev, const uint8_t *desc,
     if (!image_desc_from(&tmp, &image_desc) ||
         !bd12_image_requirements(dev->bd, &image_desc, &size, &vk_align))
         return 0;
-    if (vk_align > *alignment) *alignment = vk_align;
+    *alignment = vk_align ? vk_align : 1;            /* the driver's own; the caller applies D3D12's rules */
     return size;
 }
 
@@ -2735,21 +2739,36 @@ static void *MS dev_get_allocation_info(ComDevice *self, uint64_t *result,
                                         const uint8_t *descs)
 {
     (void)mask;
-    uint64_t total = 0, max_align = 65536;
+    uint64_t total = 0, max_align = 0;
     for (uint32_t i = 0; i < count; ++i) {
         const uint8_t *d = descs + (size_t)i * 56;
         uint64_t align = 65536, size;
+        const uint64_t req = rd64(d + 8);
         if (rd32(d) == 1) {
             size = rd64(d + 16);
+            if (req > align) align = req;
         } else {
-            size = texture_size_estimate(self, d, &align);
-            if (!size) size = 65536;
+            uint64_t vk_align = 65536;
+            size = texture_size_estimate(self, d, &vk_align);
+            if (!size) { size = 65536; vk_align = 65536; }
+            /* D3D12 small-resource placement: a texture that asks for 4 KiB alignment gets it when it is not a render
+             * target or depth buffer, not multisampled, and fits in 64 KiB at that alignment (and the driver needs no
+             * more). Everything else: 64 KiB, 4 MiB for MSAA, or what the driver needs. Always reporting 64 KiB made
+             * engines that pack thousands of small textures into their own heaps (RE Engine) use up to 16x the
+             * memory: Onimusha's heaps were ~1.5 GB bigger than under vkd3d-proton at the title. */
+            const uint32_t samples = rd32(d + 36), flags = rd32(d + 48);
+            static int small_off = -1;            /* BEER_BD12_SMALL_RESOURCE=0: always 64 KiB (A/B) */
+            if (small_off < 0) { const char *v = getenv("BEER_BD12_SMALL_RESOURCE"); small_off = v && !strcmp(v, "0"); }
+            const int small = !small_off && req == 4096 && !(flags & 3) && samples <= 1 && vk_align <= 4096 &&
+                              align_up(size, 4096) <= 65536;
+            align = small ? 4096 : (samples > 1 ? 4194304 : 65536);
+            if (!small && req > align) align = req;
+            if (vk_align > align) align = vk_align;
         }
-        uint64_t req = rd64(d + 8);
-        if (req > align) align = req;
         if (align > max_align) max_align = align;
         total = align_up(total, align) + align_up(size, align);
     }
+    if (!max_align) max_align = 65536;
     result[0] = align_up(total, max_align);
     result[1] = max_align;
     return result;
@@ -3160,6 +3179,29 @@ static void dxr_dump_state_object(const uint8_t *desc)
                 fprintf(f, " \"%s\"", a);
             }
             fprintf(f, "\n");
+        } else if (st == 8 && sd) {
+            dxr_ascii((const uint8_t *)(uintptr_t)rd64(sd), a, sizeof(a));
+            fprintf(f, " DXIL_ASSOCIATION subobject \"%s\" exports:", a);
+            const uint8_t *names = (const uint8_t *)(uintptr_t)rd64(sd + 16);
+            for (uint32_t k = 0; names && k < rd32(sd + 8) && k < 64; ++k) {
+                dxr_ascii((const uint8_t *)(uintptr_t)rd64(names + k * 8), b, sizeof(b));
+                fprintf(f, " \"%s\"", b);
+            }
+            fprintf(f, "\n");
+        } else if (st == 6 && sd) {
+            fprintf(f, " EXISTING_COLLECTION object=%p exports=%u\n", (void *)(uintptr_t)rd64(sd), rd32(sd + 8));
+            const uint8_t *exports = (const uint8_t *)(uintptr_t)rd64(sd + 16);
+            for (uint32_t k = 0; exports && k < rd32(sd + 8) && k < 64; ++k) {
+                dxr_ascii((const uint8_t *)(uintptr_t)rd64(exports + k * 24), a, sizeof(a));
+                dxr_ascii((const uint8_t *)(uintptr_t)rd64(exports + k * 24 + 8), b, sizeof(b));
+                fprintf(f, "      export \"%s\" rename-from \"%s\"\n", a, b);
+            }
+        } else if (st == 0 && sd) {
+            fprintf(f, " STATE_OBJECT_CONFIG flags=0x%x\n", rd32(sd));
+        } else if (st == 12 && sd) {
+            fprintf(f, " PIPELINE_CONFIG1 max recursion=%u flags=0x%x\n", rd32(sd), rd32(sd + 4));
+        } else if (st == 3 && sd) {
+            fprintf(f, " NODE_MASK 0x%x\n", rd32(sd));
         } else fprintf(f, "\n");
     }
     fclose(f);
@@ -3245,6 +3287,66 @@ static HR inert_state_object(ComDevice *self, const uint8_t *riid, void **out)
     return hr;
 }
 
+/* A local root signature as the shader-record arguments the translator needs (declaration order). Appended table
+ * ranges get their real offset from the table start. Returns 0 when a parameter cannot be expressed. */
+static int local_sig_from_rs(const BD12RootSignature *rs, BD12RtLocalSig *out)
+{
+    out->param_count = 0;
+    if (!rs) return 1;
+    if (rs->parameter_count > BD12_RT_LOCAL_MAX_PARAMS) return 0;
+    if (rs->static_count) {
+        static int logged;
+        if (logged++ < 3) fprintf(stderr, "[BD12 RT] local root signature with %u static samplers: not supported yet\n", rs->static_count);
+    }
+    for (uint32_t k = 0; k < rs->parameter_count; ++k) {
+        const BD12RootParameter *rp = &rs->parameters[k];
+        BeerD3D12LocalParam *lp = &out->params[out->param_count++];
+        memset(lp, 0, sizeof(*lp));
+        lp->space = rp->space;
+        lp->reg = rp->shader_register;
+        switch (rp->type) {
+        case 1: lp->kind = 0; lp->words = rp->dword_count; break;                 /* 32-bit constants */
+        case 2: lp->kind = 1; lp->resource_class = 2; break;                      /* root CBV */
+        case 3: lp->kind = 1; lp->resource_class = 0; break;                      /* root SRV */
+        case 4: lp->kind = 1; lp->resource_class = 1; break;                      /* root UAV */
+        case 0: {                                                                  /* descriptor table */
+            lp->kind = 2;
+            if (rp->range_count > BEER_D3D12_LOCAL_MAX_RANGES) return 0;
+            uint32_t next = 0;
+            for (uint32_t r = 0; r < rp->range_count; ++r) {
+                const BD12DescriptorRange *dr = &rp->ranges[r];
+                const uint32_t offset = dr->offset == BD12_RANGE_APPEND ? next : dr->offset;
+                lp->ranges[r] = (BeerD3D12LocalRange){ dr->type, dr->space, dr->base_register, dr->count, offset };
+                next = dr->count == UINT32_MAX ? offset : offset + dr->count;
+            }
+            lp->range_count = rp->range_count;
+            break;
+        }
+        default: return 0;
+        }
+    }
+    return 1;
+}
+
+static int add_local(BD12RtDesc *d, uint32_t *capacity, const char *export_name, const BD12RtLocalSig *sig)
+{
+    for (uint32_t i = 0; i < d->local_count; ++i)     /* the first association of an export wins */
+        if (!strcmp(d->locals[i].export_name, export_name)) return 1;
+    if (d->local_count == *capacity) {
+        const uint32_t grown_capacity = *capacity ? *capacity * 2 : 8;
+        BD12RtLocalSig *grown = realloc(d->locals, grown_capacity * sizeof(*grown));
+        if (!grown) return 0;
+        d->locals = grown;
+        *capacity = grown_capacity;
+    }
+    BD12RtLocalSig *l = &d->locals[d->local_count++];
+    *l = *sig;
+    snprintf(l->export_name, sizeof(l->export_name), "%s", export_name);
+    return 1;
+}
+
+static const BD12RtDesc *collection_desc(const void *object);   /* below: the ID3D12StateObject of a collection */
+
 static HR MS dev_create_state_object(ComDevice *self, const uint8_t *desc,
                                      const uint8_t *riid, void **out)
 {
@@ -3258,9 +3360,29 @@ static HR MS dev_create_state_object(ComDevice *self, const uint8_t *desc,
     memset(&d, 0, sizeof(d));
     d.max_recursion = 1;
     ComObj *global_rs = NULL;
-    d.libraries = calloc(count ? count : 1, sizeof(*d.libraries));
-    d.hit_groups = calloc(count ? count : 1, sizeof(*d.hit_groups));
-    if (!d.libraries || !d.hit_groups) goto fail;
+    uint32_t library_capacity = count, hit_group_capacity = count, local_capacity = 0;
+    /* Existing collections (UE5 builds one per shader, then the pipeline from them) add their contents. */
+    for (uint32_t i = 0; subs && i < count; ++i) {
+        const uint8_t *sd = (const uint8_t *)(uintptr_t)rd64(subs + i * 16 + 8);
+        const BD12RtDesc *c = rd32(subs + i * 16) == 6 && sd ? collection_desc((const void *)(uintptr_t)rd64(sd)) : NULL;
+        if (c) { library_capacity += c->library_count; hit_group_capacity += c->hit_group_count; }
+    }
+    BD12RtLocalSig *pending = calloc(count ? count : 1, sizeof(*pending));   /* converted local root signatures */
+    uint8_t *pending_state = calloc(count ? count : 1, 1);                     /* 1 converted, 2 also associated */
+    d.libraries = calloc(library_capacity ? library_capacity : 1, sizeof(*d.libraries));
+    d.hit_groups = calloc(hit_group_capacity ? hit_group_capacity : 1, sizeof(*d.hit_groups));
+    if (!d.libraries || !d.hit_groups || !pending || !pending_state) goto fail;
+    for (uint32_t i = 0; subs && i < count; ++i) {      /* local root signatures first: associations refer to them */
+        const uint8_t *sd = (const uint8_t *)(uintptr_t)rd64(subs + i * 16 + 8);
+        if (rd32(subs + i * 16) != 2 || !sd) continue;
+        ComRootSig *crs = (ComRootSig *)(uintptr_t)rd64(sd);
+        if (!local_sig_from_rs(crs ? crs->rs : NULL, &pending[i])) {
+            fprintf(stderr, "[BD12 RT] local root signature with %u parameters cannot be expressed\n",
+                    crs && crs->rs ? crs->rs->parameter_count : 0);
+            goto fail;
+        }
+        pending_state[i] = 1;
+    }
     for (uint32_t i = 0; subs && i < count; ++i) {
         const uint32_t st = rd32(subs + i * 16);
         const uint8_t *sd = (const uint8_t *)(uintptr_t)rd64(subs + i * 16 + 8);
@@ -3299,12 +3421,57 @@ static HR MS dev_create_state_object(ComDevice *self, const uint8_t *desc,
         } else if (st == 1) {
             ComRootSig *crs = (ComRootSig *)(uintptr_t)rd64(sd);
             if (crs) { global_rs = &crs->obj; d.global_root_signature = crs->rs; }
-        } else if (st == 2) {
-            ComRootSig *crs = (ComRootSig *)(uintptr_t)rd64(sd);
-            if (crs && crs->rs && crs->rs->parameter_count)
-                fprintf(stderr, "[BD12 RT] local root signature with %u parameters is not supported yet\n", crs->rs->parameter_count);
+        } else if (st == 7) {                            /* SUBOBJECT_TO_EXPORTS_ASSOCIATION */
+            const uint8_t *target = (const uint8_t *)(uintptr_t)rd64(sd);
+            const uint32_t n = rd32(sd + 8);
+            const uint8_t *names = (const uint8_t *)(uintptr_t)rd64(sd + 16);
+            for (uint32_t j = 0; target && j < count; ++j) {
+                if (subs + j * 16 != target || rd32(target) != 2 || !pending_state[j]) continue;
+                pending_state[j] = 2;
+                if (!n || !names) { if (!add_local(&d, &local_capacity, "", &pending[j])) goto fail; }
+                for (uint32_t k = 0; k < n && names; ++k) {
+                    char name[128];
+                    dxr_ascii((const uint8_t *)(uintptr_t)rd64(names + k * 8), name, sizeof(name));
+                    if (!add_local(&d, &local_capacity, name, &pending[j])) goto fail;
+                }
+            }
+        } else if (st == 8) {
+            static int logged;
+            if (logged++ < 3) fprintf(stderr, "[BD12 RT] association to a subobject defined in DXIL: not supported yet\n");
+        } else if (st == 6) {                            /* EXISTING_COLLECTION */
+            const BD12RtDesc *c = collection_desc((const void *)(uintptr_t)rd64(sd));
+            if (!c) { fprintf(stderr, "[BD12 RT] existing collection %p is not a Beer state object\n", (void *)(uintptr_t)rd64(sd)); goto fail; }
+            if (rd32(sd + 8)) {
+                static int logged;
+                if (logged++ < 3) fprintf(stderr, "[BD12 RT] existing collection with an export list: every export is used\n");
+            }
+            for (uint32_t k = 0; k < c->library_count; ++k) {
+                BD12RtLibrary *lib = &d.libraries[d.library_count];
+                *lib = c->libraries[k];
+                lib->exports = NULL;
+                if (c->libraries[k].export_count) {
+                    lib->exports = malloc(c->libraries[k].export_count * sizeof(*lib->exports));
+                    if (!lib->exports) goto fail;
+                    memcpy(lib->exports, c->libraries[k].exports, c->libraries[k].export_count * sizeof(*lib->exports));
+                }
+                d.library_count++;
+            }
+            for (uint32_t k = 0; k < c->hit_group_count; ++k) d.hit_groups[d.hit_group_count++] = c->hit_groups[k];
+            for (uint32_t k = 0; k < c->local_count; ++k)
+                if (!add_local(&d, &local_capacity, c->locals[k].export_name, &c->locals[k])) goto fail;
+            if (c->max_payload > d.max_payload) d.max_payload = c->max_payload;
+            if (c->max_attributes > d.max_attributes) d.max_attributes = c->max_attributes;
+            if (c->max_recursion > d.max_recursion) d.max_recursion = c->max_recursion;
+            if (!d.global_root_signature) d.global_root_signature = c->global_root_signature;
         }
     }
+    /* A local root signature with no association is the default for exports that have none. */
+    for (uint32_t j = 0; subs && j < count; ++j)
+        if (pending_state[j] == 1 && pending[j].param_count && !add_local(&d, &local_capacity, "", &pending[j])) goto fail;
+    free(pending);
+    free(pending_state);
+    pending = NULL;
+    pending_state = NULL;
     if (!d.library_count) goto fail;
     ComStateObject *so = calloc(1, sizeof(*so));
     if (!so) goto fail;
@@ -3340,7 +3507,21 @@ fail:
     for (uint32_t i = 0; i < d.library_count; ++i) free(d.libraries[i].exports);
     free(d.libraries);
     free(d.hit_groups);
+    free(d.locals);
+    free(pending);
+    free(pending_state);
     return beer_fake_caps() ? inert_state_object(self, riid, out) : HR_E_FAIL;
+}
+
+/* The description of a state object the application passes back as an existing collection: either of its two
+ * interfaces (ID3D12StateObject or ID3D12StateObjectProperties). */
+static const BD12RtDesc *collection_desc(const void *object)
+{
+    if (!object) return NULL;
+    void **vtable = *(void ***)object;
+    const ComStateObject *so = vtable == so_vtable8 ? (const ComStateObject *)object :
+                               vtable == so_props_vtable ? SO_FROM_PROPS((void **)object) : NULL;
+    return so && so->rt ? bd12_rt_pipeline_desc(so->rt) : NULL;
 }
 static HR MS dev_create_committed1(ComDevice *self, const uint8_t *props,
                                    uint32_t flags, const uint8_t *desc,
@@ -3405,7 +3586,7 @@ static HR MS dev_meta_command_invalid(void) { return HR_E_INVALIDARG; }
 static void *dev_allocation_info_strided(ComDevice *self, uint64_t *result, uint32_t mask, uint32_t count,
                                          const uint8_t *descs, size_t stride, uint64_t *info1)
 {
-    uint64_t total = 0, max_align = 65536;
+    uint64_t total = 0, max_align = 0;
     for (uint32_t i = 0; i < count; ++i) {
         uint64_t one[2];
         if (stride == 64) t_desc1 = descs + (size_t)i * stride;   /* GetResourceAllocationInfo2: DESC1 */
@@ -3416,6 +3597,7 @@ static void *dev_allocation_info_strided(ComDevice *self, uint64_t *result, uint
         total = offset + one[0];
         if (one[1] > max_align) max_align = one[1];
     }
+    if (!max_align) max_align = 65536;
     result[0] = align_up(total, max_align);
     result[1] = max_align;
     return result;

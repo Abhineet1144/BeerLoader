@@ -165,6 +165,20 @@ static int keep_pipelines(void)
     }
     if (forced >= 0) return forced;
     if (atomic_load(&tight)) return 0;
+    /* VRAM: a live VkPipeline also holds shader code in device memory (~40 KB on NVIDIA; Onimusha keeps 17-58k).
+     * Above 85% of the VRAM budget new compile-at-create pipelines are warmed into the cache and released; they are
+     * rebuilt (a cache hit) when first bound. Re-evaluated every 64 creations; not sticky. */
+    static _Atomic int vram_tight;
+    if (!(atomic_load(&checks) & 63)) {
+        uint64_t vram_budget = 0, vram_usage = 0;
+        const int now_tight = beer_vulkan_memory_budget(&vram_budget, &vram_usage) &&
+                              vram_usage > vram_budget / 100 * 85;
+        if (now_tight && !atomic_exchange(&vram_tight, 1))
+            fprintf(stderr, "[BD12] VRAM at %llu of %llu MiB: new pipelines are warmed into the cache and released\n",
+                    (unsigned long long)(vram_usage >> 20), (unsigned long long)(vram_budget >> 20));
+        else if (!now_tight) atomic_store(&vram_tight, 0);
+    }
+    if (atomic_load(&vram_tight)) { atomic_fetch_add(&checks, 1); return 0; }
     if (!budget || (atomic_fetch_add(&checks, 1) & 63)) return 1;
     const uint64_t resident = process_resident_bytes();
     if (resident > budget) {
@@ -1763,3 +1777,34 @@ void *com_list_vtable_[80] = {
      * only: no-op) */
     [77] = cl_set_shading_rate, [78] = cl_set_shading_rate_image, [79] = cl_dispatch_mesh,
 };
+
+/* DLSS "no upscaling" (platform/win32_ngx.inc): stretches the source region (x, y, w, h) of `source` over the whole of
+ * `target` with linear filtering, recorded into the open command list `list_iface`. Both are D3D12 colour textures in
+ * BD12's GENERAL layout; returns 0 (nothing recorded) for anything else. */
+int bd12_debug_stretch(void *list_iface, void *source_iface, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                       void *target_iface)
+{
+    ComList *list = list_iface;
+    ComResource *source = source_iface, *target = target_iface;
+    if (!list || !source || !target || list->obj.kind != COM_LIST || source->obj.kind != COM_RESOURCE ||
+        target->obj.kind != COM_RESOURCE || !list->open || !list->cur || !source->image || !target->image)
+        return 0;
+    BD12Image *src = source->image, *dst = target->image;
+    if (!(src->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || !(dst->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ||
+        src->desc.samples > 1 || dst->desc.samples > 1)
+        return 0;
+    if (!w || x + w > src->desc.width) { x = 0; w = src->desc.width; }
+    if (!h || y + h > src->desc.height) { y = 0; h = src->desc.height; }
+    BD12CmdList *cmd = list->cur;
+    bd12_cmd_global_barrier(cmd);
+    const VkImageBlit region = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { { (int32_t)x, (int32_t)y, 0 }, { (int32_t)(x + w), (int32_t)(y + h), 1 } },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = { { 0, 0, 0 }, { (int32_t)dst->desc.width, (int32_t)dst->desc.height, 1 } },
+    };
+    cmd->device->vk.CmdBlitImage(cmd->command_buffer, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image,
+                                 VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
+    bd12_cmd_global_barrier(cmd);
+    return 1;
+}

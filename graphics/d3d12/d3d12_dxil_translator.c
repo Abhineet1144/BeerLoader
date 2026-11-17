@@ -32,7 +32,10 @@ void beer_d3d12_dxil_set_caps(const BeerD3D12DxilCaps *caps)
 
 uint64_t beer_d3d12_dxil_caps_key(void)
 {
-    return ((uint64_t)g_caps.vendor_id << 32) | ((uint64_t)!!g_caps.barycentrics << 2) |
+    /* The structurizer choice changes the SPIR-V too: part of the translation-cache key. */
+    static int legacy = -1;
+    if (legacy < 0) { const char *v = getenv("BEER_DXIL_LEGACY_STRUCTURIZER"); legacy = v && *v && strcmp(v, "0"); }
+    return ((uint64_t)g_caps.vendor_id << 32) | ((uint64_t)!!legacy << 3) | ((uint64_t)!!g_caps.barycentrics << 2) |
            ((uint64_t)!!g_caps.raw_access_chains << 1) | (uint64_t)!!g_caps.scalar_block_layout;
 }
 
@@ -146,6 +149,12 @@ static struct {
     void (*converter_set_cbv_remapper)(dxil_spv_converter, dxil_spv_cbv_remapper_cb, void *);
     void (*converter_set_stage_input_remapper)(dxil_spv_converter, dxil_spv_shader_stage_io_remapper_cb, void *);
     dxil_spv_result (*converter_add_option)(dxil_spv_converter, const dxil_spv_option_base *);
+    void (*converter_add_local_root_constants)(dxil_spv_converter, unsigned, unsigned, unsigned);
+    void (*converter_add_local_root_descriptor)(dxil_spv_converter, dxil_spv_resource_class, unsigned, unsigned);
+    void (*converter_add_local_root_descriptor_table)(dxil_spv_converter, dxil_spv_resource_class, unsigned, unsigned,
+                                                      unsigned, unsigned);
+    dxil_spv_result (*converter_begin_local_root_descriptor_table)(dxil_spv_converter);
+    dxil_spv_result (*converter_end_local_root_descriptor_table)(dxil_spv_converter);
     dxil_spv_result (*converter_run)(dxil_spv_converter);
     dxil_spv_result (*converter_get_compiled_spirv)(dxil_spv_converter, dxil_spv_compiled_spirv *);
     void (*begin_thread_allocator_context)(void);
@@ -174,6 +183,11 @@ static int load_symbols(void)
     LOAD(converter_set_cbv_remapper);
     LOAD(converter_set_stage_input_remapper);
     LOAD(converter_add_option);
+    LOAD(converter_add_local_root_constants);
+    LOAD(converter_add_local_root_descriptor);
+    LOAD(converter_add_local_root_descriptor_table);
+    LOAD(converter_begin_local_root_descriptor_table);
+    LOAD(converter_end_local_root_descriptor_table);
     LOAD(converter_run);
     LOAD(converter_get_compiled_spirv);
     LOAD(begin_thread_allocator_context);
@@ -243,7 +257,29 @@ typedef struct {
     int accel_ok;                /* ray tracing acceleration structures are allowed */
     int ssbo;                    /* raw/structured buffers become storage buffers (second attempt) */
     const BeerD3D12RootLayout *rl;   /* root-signature translation (beer_d3d12_dxil_translate_rs) */
+    const BeerD3D12LocalParam *local; /* ray tracing: local root signature of the entry point being translated */
+    uint32_t local_count;
+    int local_heap;              /* a local descriptor table was used: the pipeline needs the heap mirror */
 } Collect;
+
+/* A register inside a descriptor table of the entry point's local root signature: dxil-spirv reads the table's GPU
+ * descriptor handle from the shader record and turns it into a heap index (handle >> 7: BD12 handles are
+ * heap window + index * 128), so the resource is a plain heap access (set 1, binding = heap class). */
+static int local_table_class(const Collect *c, uint32_t resource_class, const dxil_spv_d3d_binding *d)
+{
+    for (uint32_t i = 0; i < c->local_count; ++i) {
+        const BeerD3D12LocalParam *p = &c->local[i];
+        if (p->kind != 2) continue;
+        for (uint32_t r = 0; r < p->range_count; ++r) {
+            const BeerD3D12LocalRange *rr = &p->ranges[r];
+            if (rr->resource_class == resource_class && rr->space == d->register_space &&
+                d->register_index >= rr->base_register &&
+                (rr->count == UINT32_MAX || d->register_index - rr->base_register < rr->count))
+                return 1;
+        }
+    }
+    return 0;
+}
 
 #define PUSH_WORDS_PER_STAGE 4u
 #define COMPUTE_PUSH_WORDS 32u
@@ -331,6 +367,25 @@ static int bindless_class(const dxil_spv_d3d_binding *d, uint32_t type)
  * register fields; the index then comes straight from the shader. */
 #define HEAP_CLASS_CBV 4u
 #define HEAP_CLASS_SAMPLER 5u
+
+/* A register of a local descriptor table (local_table_class): a heap access whose index dxil-spirv computes from the
+ * shader record, so no push word and no descriptor entry. */
+static int local_table_binding(Collect *c, uint32_t type, const dxil_spv_d3d_binding *d, dxil_spv_vulkan_binding *out)
+{
+    if (!c->local_count || !local_table_class(c, type, d)) return 0;
+    const uint32_t heap_class = type == BEER_D3D12_SHADER_DESCRIPTOR_CBV ? HEAP_CLASS_CBV :
+                                type == BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER ? HEAP_CLASS_SAMPLER :
+                                (uint32_t)bindless_class(d, type);
+    const int untyped = d->kind == DXIL_SPV_RESOURCE_KIND_RAW_BUFFER || d->kind == DXIL_SPV_RESOURCE_KIND_STRUCTURED_BUFFER;
+    memset(out, 0, sizeof(*out));
+    out->set = 1;
+    out->binding = heap_class;
+    out->bindless.use_heap = DXIL_SPV_TRUE;
+    out->descriptor_type = heap_class == HEAP_CLASS_CBV ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_UBO :
+                           untyped ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER : DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
+    c->local_heap = 1;
+    return 1;
+}
 
 static int is_heap_access(const dxil_spv_d3d_binding *d)
 {
@@ -561,6 +616,7 @@ static dxil_spv_bool srv_cb(void *user, const dxil_spv_d3d_binding *d,
     }
     Collect *c = user;
     memset(out, 0, sizeof(*out));
+    if (local_table_binding(c, BEER_D3D12_SHADER_DESCRIPTOR_SRV, d, &out->buffer_binding)) return DXIL_SPV_TRUE;
     if (d->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE) {
         if (!c->accel_ok) { c->failed = 1; return DXIL_SPV_FALSE; }
         fill(c, BEER_D3D12_SHADER_DESCRIPTOR_SRV, &out->buffer_binding, d);
@@ -578,6 +634,7 @@ static dxil_spv_bool sampler_cb(void *user, const dxil_spv_d3d_binding *d,
                                 dxil_spv_vulkan_binding *out)
 {
     Collect *c = user;
+    if (local_table_binding(c, BEER_D3D12_SHADER_DESCRIPTOR_SAMPLER, d, out)) return DXIL_SPV_TRUE;
     if (c->rl) {
         if (is_heap_access(d)) {
             rs_heap(c, out, HEAP_CLASS_SAMPLER, c->rl->zero_word, 0, DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY);
@@ -628,6 +685,7 @@ static dxil_spv_bool uav_cb_impl(void *user, const dxil_spv_uav_d3d_binding *d,
 {
     Collect *c = user;
     memset(out, 0, sizeof(*out));
+    if (local_table_binding(c, BEER_D3D12_SHADER_DESCRIPTOR_UAV, &d->d3d_binding, &out->buffer_binding)) return DXIL_SPV_TRUE;
     if (c->rl) {
         /* Hidden counters need the storage-buffer heap: the counter's address is read from the slot's metadata and
          * the atomic goes through it (physical storage buffer). Without it: per-draw path. */
@@ -666,6 +724,7 @@ static dxil_spv_bool cbv_cb(void *user, const dxil_spv_d3d_binding *d,
     Collect *c = user;
     memset(out, 0, sizeof(*out));
     out->push_constant = DXIL_SPV_FALSE;
+    if (local_table_binding(c, BEER_D3D12_SHADER_DESCRIPTOR_CBV, d, &out->vulkan.uniform_binding)) return DXIL_SPV_TRUE;
     if (c->rl) {
         if (is_heap_access(d)) {
             rs_heap(c, &out->vulkan.uniform_binding, HEAP_CLASS_CBV, c->rl->zero_word, 0,
@@ -869,7 +928,7 @@ static int dxil_translate(const uint8_t *container, size_t size, uint32_t stage_
     dxil_spv_converter converter = NULL;
     /* accel_ok: inline ray queries (DXR 1.1) in ordinary compute/pixel shaders bind an acceleration structure SRV too;
      * refusing it dropped RE8's ray-traced shadow/AO passes, which left the lighting black. */
-    Collect collect = { out, stage_namespace, 0, 0, 0, PUSH_WORDS_PER_STAGE, 1, 0, layout };
+    Collect collect = { out, stage_namespace, 0, 0, 0, PUSH_WORDS_PER_STAGE, 1, 0, layout, NULL, 0, 0 };
     /* Diagnostic BEER_DXIL_FORCE_SSBO=1: raw/structured buffers as storage buffers from the start (the retry mode
      * below), as vkd3d-proton translates them on NVIDIA; isolates texel-buffer view problems. */
     if (!layout && getenv("BEER_DXIL_FORCE_SSBO")) collect.ssbo = 1;
@@ -989,7 +1048,8 @@ done:
 #define RT_PUSH_WORDS 16u
 
 int beer_d3d12_dxil_translate_library(const uint8_t *container, size_t size, BeerD3D12TranslatedShader *shared,
-                                      BeerD3D12RtShader *out, uint32_t max, uint32_t *count)
+                                      BeerD3D12RtShader *out, uint32_t max, uint32_t *count,
+                                      BeerD3D12LocalSigLookup local_sig, void *local_user)
 {
     *count = 0;
     pthread_mutex_lock(&g_lock);
@@ -998,7 +1058,7 @@ int beer_d3d12_dxil_translate_library(const uint8_t *container, size_t size, Bee
     g.begin_thread_allocator_context();
     g.set_thread_log_callback(log_cb, NULL);
     dxil_spv_parsed_blob blob = NULL;
-    Collect collect = { shared, 0, 0, 0, 0, RT_PUSH_WORDS, 1, 0, NULL };
+    Collect collect = { shared, 0, 0, 0, 0, RT_PUSH_WORDS, 1, 0, NULL, NULL, 0, 0 };
     unsigned entries = 0;
     if (g.parse_dxil_blob(container, size, &blob) != DXIL_SPV_SUCCESS ||
         g.parsed_blob_get_num_entry_points(blob, &entries) != DXIL_SPV_SUCCESS) {
@@ -1028,6 +1088,28 @@ int beer_d3d12_dxil_translate_library(const uint8_t *container, size_t size, Bee
             dxil_spv_option_sbt_descriptor_size_log2 sbt = { { DXIL_SPV_OPTION_SBT_DESCRIPTOR_SIZE_LOG2 }, 7, 7 };
             g.converter_add_option(converter, &sbt.base);
         }
+        /* Local root signature: its arguments follow the identifier in the shader record, in declaration order
+         * (constants 4 bytes each, root descriptors and tables 8 bytes, 8-byte aligned; dxil-spirv lays them out
+         * as D3D12 does). */
+        collect.local = local_sig ? local_sig(local_user, demangled, &collect.local_count) : NULL;
+        if (!collect.local) collect.local_count = 0;
+        collect.local_heap = 0;
+        for (uint32_t p = 0; p < collect.local_count; ++p) {
+            const BeerD3D12LocalParam *lp = &collect.local[p];
+            if (lp->kind == 0)
+                g.converter_add_local_root_constants(converter, lp->space, lp->reg, lp->words);
+            else if (lp->kind == 1)
+                g.converter_add_local_root_descriptor(converter, (dxil_spv_resource_class)lp->resource_class, lp->space, lp->reg);
+            else {
+                g.converter_begin_local_root_descriptor_table(converter);
+                for (uint32_t r = 0; r < lp->range_count; ++r) {
+                    const BeerD3D12LocalRange *rr = &lp->ranges[r];
+                    g.converter_add_local_root_descriptor_table(converter, (dxil_spv_resource_class)rr->resource_class, rr->space,
+                                                                rr->base_register, rr->count, rr->offset);
+                }
+                g.converter_end_local_root_descriptor_table(converter);
+            }
+        }
         if (guarded_converter_run(g.converter_run, converter) != DXIL_SPV_SUCCESS || collect.failed) {
             fprintf(stderr, "[DXIL] conversion of %s failed%s\n", demangled, collect.failed ? " (unsupported resource)" : "");
             g.converter_free(converter);
@@ -1043,6 +1125,7 @@ int beer_d3d12_dxil_translate_library(const uint8_t *container, size_t size, Bee
         if (!shader->spirv) { g.converter_free(converter); goto done; }
         memcpy(shader->spirv, spirv.data, spirv.size);
         shader->spirv_size = spirv.size;
+        shader->uses_heap = collect.local_heap;
         ++*count;
         g.converter_free(converter);
     }

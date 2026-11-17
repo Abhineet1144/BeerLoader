@@ -47,7 +47,7 @@ def export_ordinals(path):
 
 
 # DLLs whose programs import by ordinal (OLEAUT32's Automation and WS2_32's Winsock ordinals are a fixed Windows ABI).
-ORDINAL_DLLS = ["oleaut32", "ws2_32", "d3d12", "mmdevapi", "xinput1_4", "xinput1_3"]   # d3d12: UE resolves D3D12CreateDevice as ordinal 101; UE delay-loads XInputGetState as XINPUT1_4 #2
+ORDINAL_DLLS = ["oleaut32", "ws2_32", "d3d12", "mmdevapi", "xinput1_4", "xinput1_3", "comctl32"]   # comctl32: standard subclass helpers 410..413
 
 
 def export_names(path):

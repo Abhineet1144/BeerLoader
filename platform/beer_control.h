@@ -30,6 +30,9 @@ uint64_t beer_control_frames(void);
 uint64_t beer_control_uptime_s(void);
 int beer_control_time_scale_milli(void);
 int beer_control_paused(void);
+/* Live DLSS overrides: ratio in milli-percent (0 = off), exact render size (0 = off), preset (-1 = game's choice). */
+void beer_control_dlss(int32_t *ratio_milli_percent, int32_t *width, int32_t *height, int32_t *preset);
+int beer_control_dlss_bypass(void);   /* 1: DLSS evaluation replaced by a plain stretch of the input (comparison) */
 void beer_control_proc_stats(uint64_t *cpu_ticks, uint64_t *rss_kb, uint64_t *threads);
 
 #endif

@@ -8,6 +8,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define S_OK UINT64_C(0)
 #define S_FALSE UINT64_C(1)
@@ -84,6 +85,7 @@ struct BeerWasapi {
     size_t acquired_capacity;
     int float_staging;            /* the engine mixes floats in place: sticky once seen (a packet's tail can be silent) */
     int float_client;             /* initialised with a 32-bit float format: every packet is converted to PCM16 */
+    FILE *dump;                   /* BEER_WASAPI_DUMP output, opened on the first packet */
     uint8_t *acquired_buffer;
     atomic_uint_fast64_t submitted_frames;
     BeerAudioStream *stream;      /* this client's own sound-server stream */
@@ -829,6 +831,32 @@ static void diagnose_render_packet(const BeerWasapi *owner, uint32_t frames,
             float_nan_or_inf, staging_tail_nonzero);
 }
 
+/* BEER_WASAPI_DUMP=<dir>: every released packet as the client wrote it (float clients: interleaved f32 before the
+ * PCM16 conversion; silent packets as zeros) to <dir>/wasapi-<pid>-<stream>.raw, to tell a damaged game mix from
+ * damage done on the way to the sound server. */
+static void dump_render_packet(BeerWasapi *owner, uint32_t frames, uint32_t flags)
+{
+    static const char *dir;
+    static int checked;
+    if (!checked) { dir = getenv("BEER_WASAPI_DUMP"); checked = 1; }
+    if (!dir || !*dir || !frames) return;
+    if (!owner->dump) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/wasapi-%d-%p-%uch-%uhz-%s.raw", dir, (int)getpid(), (void *)owner,
+                 owner->format.channels, owner->format.rate, owner->float_client ? "f32" : "s16");
+        owner->dump = fopen(path, "wb");
+        if (!owner->dump) return;
+        fprintf(stderr, "[WASAPI] dumping released packets to %s\n", path);
+    }
+    const size_t bytes = (size_t)frames * owner->format.channels * (owner->float_client ? 4u : 2u);
+    if (flags & 2u) {
+        static const uint8_t zero[4096];
+        for (size_t left = bytes; left; ) { size_t n = left < sizeof(zero) ? left : sizeof(zero); fwrite(zero, 1, n, owner->dump); left -= n; }
+    } else {
+        fwrite(owner->acquired_buffer, 1, bytes, owner->dump);
+    }
+}
+
 static uint64_t __attribute__((ms_abi)) render_release_buffer(void *self,
                                                                uint32_t frames,
                                                                uint32_t flags)
@@ -838,6 +866,7 @@ static uint64_t __attribute__((ms_abi)) render_release_buffer(void *self,
         return AUDCLNT_E_OUT_OF_ORDER;
     size_t bytes = (size_t)frames * owner->format.block_align;
     diagnose_render_packet(owner, frames, flags, bytes);
+    dump_render_packet(owner, frames, flags);
     if (frames) {
         /* A silent packet still has to reach the sound server as zeros: dropping it starves the stream and the
          * restart after the gap clicks. */
