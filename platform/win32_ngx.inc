@@ -292,6 +292,52 @@ static int ngx_is_sr_handle(u64 handle)
     return 0;
 }
 
+/* Every NGX feature the game creates (super resolution, frame generation, ray reconstruction, ...): which ones a
+ * title really uses, and whether they were created. Handles map to their feature for the evaluation counts. */
+static struct { u64 handle; u64 feature; u64 evaluations; } g_ngx_features[32];
+static const char *ngx_feature_name(u64 feature)
+{
+    switch (feature) {
+    case 1: return "super resolution";
+    case 11: return "frame generation";
+    case 12: return "deep DVC";
+    case 13: return "ray reconstruction";
+    default: return "other";
+    }
+}
+static void ngx_log_create(u64 feature, u64 params, u64 handle_out, u32 result)
+{
+    u32 in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+    if (params) {
+        ngx_get_u32(params, "Width", &in_w);
+        ngx_get_u32(params, "Height", &in_h);
+        ngx_get_u32(params, "OutWidth", &out_w);
+        ngx_get_u32(params, "OutHeight", &out_h);
+    }
+    fprintf(stderr, "[NGX] CreateFeature %llu (%s): render %ux%u -> output %ux%u -> 0x%x\n", (unsigned long long)feature,
+            ngx_feature_name(feature), in_w, in_h, out_w, out_h, result);
+    const u64 handle = result == NGX_RESULT_SUCCESS && handle_out ? *(u64 *)(uintptr_t)handle_out : 0;
+    if (!handle) return;
+    for (int i = 0; i < 32; ++i)
+        if (!g_ngx_features[i].handle || g_ngx_features[i].handle == handle) {
+            g_ngx_features[i].handle = handle;
+            g_ngx_features[i].feature = feature;
+            g_ngx_features[i].evaluations = 0;
+            return;
+        }
+}
+static void ngx_count_evaluation(u64 handle)
+{
+    for (int i = 0; i < 32 && g_ngx_features[i].handle; ++i)
+        if (g_ngx_features[i].handle == handle) {
+            const u64 n = ++g_ngx_features[i].evaluations;
+            if (n == 1 || n % 3000 == 0)
+                fprintf(stderr, "[NGX] EvaluateFeature %llu (%s): %llu evaluations\n", (unsigned long long)g_ngx_features[i].feature,
+                        ngx_feature_name(g_ngx_features[i].feature), (unsigned long long)n);
+            return;
+        }
+}
+
 #define NGX_CREATE_WRAPPER(i) \
     static u32 __attribute__((ms_abi)) ngx_create_##i(u64 cmd, u64 feature, u64 params, u64 handle) \
     { \
@@ -301,6 +347,7 @@ static int ngx_is_sr_handle(u64 handle)
         if (feature == NGX_FEATURE_SUPER_SAMPLING) fprintf(stderr, "[NGX] CreateFeature returned 0x%x\n", result); \
         if (feature == NGX_FEATURE_SUPER_SAMPLING && result != NGX_RESULT_SUCCESS) \
             fprintf(stderr, "[NGX] DLSS create failed: 0x%x\n", result); \
+        ngx_log_create(feature, params, handle, result); \
         if (i == 0 && feature == NGX_FEATURE_SUPER_SAMPLING && result == NGX_RESULT_SUCCESS) ngx_note_handle(handle); \
         return result; \
     }
@@ -315,6 +362,7 @@ static u32 (__attribute__((ms_abi)) *const g_ngx_create_wrappers[NGX_CREATE_EXPO
 static u64 g_ngx_real_evaluate;
 static u32 __attribute__((ms_abi)) ngx_evaluate(u64 cmd, u64 handle, u64 params, u64 progress)
 {
+    ngx_count_evaluation(handle);
     if (beer_control_dlss_bypass() && params && ngx_is_sr_handle(handle)) {
         const u64 color = ngx_get_resource(params, "Color"), output = ngx_get_resource(params, "Output");
         u32 x = 0, y = 0, w = 0, h = 0;

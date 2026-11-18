@@ -1,7 +1,11 @@
 """Frame breakdown: how the game builds one frame, step by step.
 
-Beer records the next presented frame of a D3D12 game and saves what every render pass drew (its colour targets and
-its depth buffer) as small pictures. This window shows them in order, so you can watch the frame come together:
+Beer records the next presented frame of a D3D12 game and saves pictures of it. Three modes:
+  - Render passes: what every render pass drew (its colour targets and its depth buffer) when the pass ended.
+  - Passes + compute: also the images every compute dispatch wrote (lighting, ray tracing, post-processing in
+    compute shaders never show up as render passes).
+  - Every draw and dispatch: a reduced picture after every single draw and dispatch (colour only, capped at about
+    1,500 steps). This window shows them in order, so you can watch the frame come together:
 shadow maps, the G-buffer (albedo, normals, material), lighting, transparent effects, post-processing and the UI.
 Captures live in ~/.beer/frames/<game>-<time>/ (PPM pictures, one per target per pass) only while they are shown:
 a new capture deletes the previous one, and closing the window (or opening it again) deletes the game's captures.
@@ -23,9 +27,13 @@ from memory_window import MemClient  # noqa: E402
 
 FRAME_DIR = storage.path("frames")
 WAIT_SECONDS = 20
+MODES = [("passes", "Render passes", "Colour targets and depth at the end of every render pass"),
+         ("compute", "Passes + compute", "Also the images every compute dispatch wrote"),
+         ("all", "Every draw and dispatch", "A smaller picture after every draw and dispatch (colour only)")]
 
-# rt012_a0_1280x720_vk97_h<pso>.ppm (colour target 0 of pass 12) and rt012_dp005_l0_2560x1440_vk126_h<pso>.ppm (its depth).
-NAME_RE = re.compile(r"^rt(\d+)_(?:a(\d+)|dp\d+_l(\d+))_(\d+)x(\d+)_vk(\d+)_h([0-9a-f]+)\.ppm$")
+# rt0012_a0_1280x720_vk97_h<pso>.ppm (colour target 0 of step 12), rt0012_dp005_l0_2560x1440_vk126_h<pso>.ppm (its depth)
+# and cs0013_u2_1280x720_vk97_h<cs>.ppm (UAV u2 written by the compute dispatch of step 13). Steps share one counter.
+NAME_RE = re.compile(r"^(rt|cs)(\d+)_(?:a(\d+)|u(\d+)|dp\d+_l(\d+))_(\d+)x(\d+)_vk(\d+)_h([0-9a-f]+)\.ppm$")
 
 VK_FORMAT_NAMES = {
     37: "RGBA8", 43: "RGBA8 sRGB", 44: "BGRA8", 50: "BGRA8 sRGB", 64: "RGB10A2", 97: "RGBA16F", 109: "RGBA32F",
@@ -49,25 +57,32 @@ def read_steps(folder):
         m = NAME_RE.match(name)
         if not m:
             continue
-        depth = m.group(2) is None
-        steps.append({"pass": int(m.group(1)), "depth": depth, "index": int(m.group(3) if depth else m.group(2)),
-                      "w": int(m.group(4)), "h": int(m.group(5)), "fmt": int(m.group(6)),
+        compute = m.group(1) == "cs"
+        depth = m.group(5) is not None
+        index = m.group(5) if depth else m.group(4) if compute else m.group(3)
+        steps.append({"pass": int(m.group(2)), "depth": depth, "compute": compute, "index": int(index),
+                      "w": int(m.group(6)), "h": int(m.group(7)), "fmt": int(m.group(8)),
                       "path": os.path.join(folder, name)})
-    # Within a pass: depth first (it is filled while drawing), then colour targets in order.
+    # Within a step: depth first (it is filled while drawing), then colour targets / UAVs in order.
     steps.sort(key=lambda s: (s["pass"], 0 if s["depth"] else 1, s["index"]))
     return steps
 
 
 def describe(step):
     fmt = VK_FORMAT_NAMES.get(step["fmt"], "format %d" % step["fmt"])
-    what = ("Depth" + (" layer %d" % step["index"] if step["index"] else "")) if step["depth"] else \
-        ("Colour target %d" % step["index"])
+    if step.get("compute"):
+        what = "Compute output u%d" % step["index"]
+    else:
+        what = ("Depth" + (" layer %d" % step["index"] if step["index"] else "")) if step["depth"] else \
+            ("Colour target %d" % step["index"])
     return what, "%d×%d · %s" % (step["w"], step["h"], fmt)
 
 
 def guess_role(step, frame_w, frame_h):
     """A friendly hint about what a target probably is (heuristic; engines differ)."""
     w, h, fmt = step["w"], step["h"], step["fmt"]
+    if step.get("compute"):
+        return "compute (lighting, ray tracing or post effects?)" if frame_w and w * 2 >= frame_w else ""
     if step["depth"]:
         if w == h or (frame_w and w != frame_w and h != frame_h):
             return "shadow map?"
@@ -83,8 +98,11 @@ def guess_role(step, frame_w, frame_h):
     return ""
 
 
-def texture_for(path):
+def texture_for(path, width=None):
+    """The picture, or a thumbnail `width` pixels wide (a capture can hold ~1,500 steps)."""
     try:
+        if width:
+            return Gdk.Texture.new_for_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(path, width, -1, True))
         return Gdk.Texture.new_for_pixbuf(GdkPixbuf.Pixbuf.new_from_file(path))
     except GLib.Error:
         return None
@@ -109,6 +127,9 @@ class FrameWindow(Adw.Window):
         self.capture_button.set_tooltip_text("Record the next frame the game draws, pass by pass")
         self.capture_button.connect("clicked", self._capture)
         header.pack_start(self.capture_button)
+        self.mode = Gtk.DropDown.new_from_strings([label for _key, label, _tip in MODES])
+        self.mode.set_tooltip_text("\n".join("%s: %s" % (label, tip) for _key, label, tip in MODES))
+        header.pack_start(self.mode)
         self.open_button = Gtk.Button(icon_name="folder-open-symbolic", tooltip_text="Open the capture folder")
         self.open_button.connect("clicked", self._open_folder)
         self.open_button.set_sensitive(False)
@@ -116,6 +137,10 @@ class FrameWindow(Adw.Window):
         self.depth_toggle = Gtk.ToggleButton(label="Depth", active=True, tooltip_text="Show depth buffers and shadow maps")
         self.depth_toggle.connect("toggled", lambda _b: self._show_steps())
         header.pack_end(self.depth_toggle)
+        self.compute_toggle = Gtk.ToggleButton(label="Compute", active=True,
+                                               tooltip_text="Show the images compute dispatches wrote")
+        self.compute_toggle.connect("toggled", lambda _b: self._show_steps())
+        header.pack_end(self.compute_toggle)
         view.add_top_bar(header)
 
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
@@ -212,7 +237,8 @@ class FrameWindow(Adw.Window):
         self.capture_button.set_sensitive(False)
         self.capture_button.set_label("Recording…")
         self.folder = folder
-        self.client.ask({"cmd": "gfx_frame_capture", "dir": folder}, self._capture_started)
+        self.capture_mode = MODES[self.mode.get_selected()][0]
+        self.client.ask({"cmd": "gfx_frame_capture", "dir": folder, "mode": self.capture_mode}, self._capture_started)
 
     def _capture_started(self, reply):
         if not reply or not reply.get("ok"):
@@ -230,7 +256,8 @@ class FrameWindow(Adw.Window):
             self._clear(keep=self.folder)
             self._load(self.folder)
             return False
-        if time.monotonic() - self.wait_started > WAIT_SECONDS:
+        limit = WAIT_SECONDS * (6 if getattr(self, "capture_mode", "") == "all" else 1)   # thousands of pictures
+        if time.monotonic() - self.wait_started > limit:
             self._capture_finished()
             shutil.rmtree(self.folder, ignore_errors=True)
             self.toasts.add_toast(Adw.Toast(title="No frame was recorded. Is the game drawing with D3D12, "
@@ -248,7 +275,7 @@ class FrameWindow(Adw.Window):
         self.open_button.set_sensitive(True)
         self.all_steps = read_steps(folder)
         if not self.all_steps:
-            self.status.set_title("Nothing was drawn in render passes")
+            self.status.set_title("Nothing could be saved from this frame")
             self.status.set_description("The captured frame had no render pass Beer could save (for example a frame "
                                         "drawn only with compute shaders, or targets in formats it cannot show yet). "
                                         "Try again in another scene.")
@@ -260,13 +287,17 @@ class FrameWindow(Adw.Window):
         if not getattr(self, "all_steps", None):
             return
         show_depth = self.depth_toggle.get_active()
-        self.steps = [s for s in self.all_steps if show_depth or not s["depth"]]
-        colour = [s for s in self.all_steps if not s["depth"]]
+        show_compute = self.compute_toggle.get_active()
+        self.steps = [s for s in self.all_steps
+                      if (show_depth or not s["depth"]) and (show_compute or not s.get("compute"))]
+        colour = [s for s in self.all_steps if not s["depth"] and not s.get("compute")]
         biggest = max(colour, key=lambda s: s["w"] * s["h"]) if colour else None
         self.frame_w, self.frame_h = (biggest["w"], biggest["h"]) if biggest else (0, 0)
-        passes = len({s["pass"] for s in self.all_steps})
-        self.summary.set_label("%d render passes, %d pictures · %s · click a picture to step through the frame" % (
-            passes, len(self.all_steps), os.path.basename(self.folder)))
+        passes = len({s["pass"] for s in self.all_steps if not s.get("compute")})
+        dispatches = len({s["pass"] for s in self.all_steps if s.get("compute")})
+        self.summary.set_label("%d render steps, %d compute steps, %d pictures · %s · click a picture to step "
+                               "through the frame" % (passes, dispatches, len(self.all_steps),
+                                                      os.path.basename(self.folder)))
         while (child := self.flow.get_first_child()) is not None:
             self.flow.remove(child)
         for number, step in enumerate(self.steps, 1):
@@ -277,12 +308,12 @@ class FrameWindow(Adw.Window):
     def _card(self, number, step):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True, height_request=120)
-        texture = texture_for(step["path"])
+        texture = texture_for(step["path"], 240)
         if texture:
             picture.set_paintable(texture)
         frame = Gtk.Frame(child=picture)
         what, info = describe(step)
-        title = Gtk.Label(label="%d. Pass %d · %s" % (number, step["pass"], what), xalign=0,
+        title = Gtk.Label(label="%d. %s %d · %s" % (number, "Dispatch" if step.get("compute") else "Pass", step["pass"], what), xalign=0,
                           ellipsize=3)  # Pango.EllipsizeMode.END
         title.add_css_class("heading")
         role = guess_role(step, self.frame_w, self.frame_h)
@@ -307,7 +338,8 @@ class FrameWindow(Adw.Window):
         self.picture.set_paintable(texture)
         what, info = describe(step)
         role = guess_role(step, self.frame_w, self.frame_h)
-        self.step_title.set_label("Step %d of %d · Pass %d · %s" % (self.current + 1, len(self.steps), step["pass"], what))
+        self.step_title.set_label("Step %d of %d · %s %d · %s" % (self.current + 1, len(self.steps),
+                                                                  "Dispatch" if step.get("compute") else "Pass", step["pass"], what))
         self.step_info.set_label(info + (" · " + role if role else "") + " · " + os.path.basename(step["path"]))
         if int(self.scrub.get_value()) != self.current:
             self.scrub.set_value(self.current)

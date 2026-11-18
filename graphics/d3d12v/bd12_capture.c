@@ -39,7 +39,20 @@ typedef struct {
     int is_rt, is_depth;
     uint32_t rt_w, rt_h, rt_bpp;
     VkFormat rt_fmt;
+    int prescaled;                /* already reduced on the GPU (frame breakdown "every step"): written 1:1 */
+    VkImage tmp_image;            /* the reduced copy, freed after the readback */
+    VkDeviceMemory tmp_memory;
+    BD12Device *device;
 } Capture;
+
+static void capture_free_tmp(Capture *c)
+{
+    if (!c->tmp_image || !c->device) return;
+    c->device->vk.DestroyImage(c->device->device, c->tmp_image, NULL);
+    c->device->vk.FreeMemory(c->device->device, c->tmp_memory, NULL);
+    c->tmp_image = VK_NULL_HANDLE;
+    c->tmp_memory = VK_NULL_HANDLE;
+}
 
 /* Command lists are recorded on several threads: per-dispatch state is
  * thread-local, the shared capture list is locked. */
@@ -269,15 +282,191 @@ static uint64_t g_rt_bytes;
 /* Frame breakdown requested over the control socket: the folder, and 0 idle / 1 armed / 2 written. */
 static char g_frame_dir[512];
 static _Atomic int g_frame_state;
-int bd12_frame_capture_request(const char *dir)
+/* What one frame breakdown records: 0 render passes (colour targets and depth when a pass ends), 1 also compute
+ * dispatches (the images each one wrote), 2 every draw and dispatch (reduced pictures, no depth). */
+static _Atomic int g_frame_mode;
+static uint32_t g_step_seq;       /* one sequence for passes, draws and dispatches: the pictures sort in recording order */
+int bd12_frame_capture_request(const char *dir, int mode)
 {
     if (!dir || !*dir || strlen(dir) >= sizeof(g_frame_dir) || (g_frame_state == 1 && g_cap_count)) return 0;
     pthread_mutex_lock(&g_lock);
     snprintf(g_frame_dir, sizeof(g_frame_dir), "%s", dir);
     pthread_mutex_unlock(&g_lock);
+    g_frame_mode = mode < 0 ? 0 : mode > 2 ? 2 : mode;
     g_frame_state = 1;
     bd12_trace_request();
     return 1;
+}
+
+static int frame_mode_active(int at_least)
+{
+    return g_frame_state == 1 && g_frame_mode >= at_least && bd12_trace_active();
+}
+
+static void image_barrier(BD12CmdList *list, VkImage image, VkImageLayout from, VkImageLayout to,
+                          VkAccessFlags2 src, VkAccessFlags2 dst)
+{
+    const VkImageMemoryBarrier2 b = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, .srcAccessMask = src,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, .dstAccessMask = dst,
+        .oldLayout = from, .newLayout = to,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+    };
+    const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                                   .pImageMemoryBarriers = &b };
+    list->device->vk.CmdPipelineBarrier2(list->command_buffer, &dep);
+}
+
+/* One colour image (mip, layer) into host memory for the frame breakdown, reduced by `down` on the GPU first (a
+ * nearest-neighbour blit into a small image) so thousands of steps fit the readback budget. */
+static void capture_color(BD12CmdList *list, const BD12Image *im, uint32_t mip, uint32_t layer, int down,
+                          const char *prefix, uint64_t hash)
+{
+    BD12Device *device = list->device;
+    if (!im || im->desc.samples > 1 || im->desc.type == VK_IMAGE_TYPE_3D) return;
+    uint32_t block = 0;
+    bd12_format_block(im->desc.format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, NULL, &block);
+    const uint32_t w = im->desc.width >> mip ? im->desc.width >> mip : 1;
+    const uint32_t h = im->desc.height >> mip ? im->desc.height >> mip : 1;
+    if (!block || w < 16 || h < 16) return;                 /* tiny lookup images: not worth a picture */
+    if (down > 1 && (w / down < 8 || h / down < 8)) down = 1;
+    if (down > 1) {
+        /* A blit needs BLIT_SRC/BLIT_DST support for the format (integer and packed storage formats often lack it:
+         * the driver crashed blitting one). Without it the image is copied at full size instead. */
+        VkFormatProperties props = { 0 };
+        if (device->get_format_properties) device->get_format_properties(device->physical_device, im->desc.format, &props);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        if ((props.optimalTilingFeatures & need) != need) down = 1;
+    }
+    const uint32_t ow = down > 1 ? w / down : w, oh = down > 1 ? h / down : h;
+    const VkDeviceSize size = (VkDeviceSize)ow * oh * block;
+    if (size > (64ull << 20)) return;
+    pthread_mutex_lock(&g_lock);
+    const int room = g_rt_bytes + size <= (3ull << 30) && g_cap_count < MAX_CAPTURES;
+    if (room) g_rt_bytes += size;
+    pthread_mutex_unlock(&g_lock);
+    if (!room) return;
+    BD12Buffer *rb = bd12_buffer_create_committed(device, BD12_HEAP_READBACK, size);
+    if (!rb) return;
+    VkImage tmp = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    bd12_cmd_end_rendering(list);
+    bd12_cmd_global_barrier(list);
+    if (down > 1) {
+        const VkImageCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = im->desc.format,
+            .extent = { ow, oh, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+        };
+        VkMemoryRequirements req;
+        if (device->vk.CreateImage(device->device, &info, NULL, &tmp) == VK_SUCCESS) {
+            device->vk.GetImageMemoryRequirements(device->device, tmp, &req);
+            uint32_t type = (uint32_t)device->memory_type[BD12_HEAP_DEFAULT];
+            if (!(req.memoryTypeBits & (1u << type))) type = (uint32_t)__builtin_ctz(req.memoryTypeBits);
+            const VkMemoryAllocateInfo alloc = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                                 .allocationSize = req.size, .memoryTypeIndex = type };
+            if (device->vk.AllocateMemory(device->device, &alloc, NULL, &memory) != VK_SUCCESS ||
+                device->vk.BindImageMemory(device->device, tmp, memory, 0) != VK_SUCCESS) {
+                if (memory) device->vk.FreeMemory(device->device, memory, NULL);
+                device->vk.DestroyImage(device->device, tmp, NULL);
+                tmp = VK_NULL_HANDLE; memory = VK_NULL_HANDLE;
+            }
+        }
+        if (!tmp) { bd12_buffer_destroy(rb); return; }
+        image_barrier(list, tmp, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        const VkImageBlit blit = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+            .srcOffsets = { { 0, 0, 0 }, { (int32_t)w, (int32_t)h, 1 } },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstOffsets = { { 0, 0, 0 }, { (int32_t)ow, (int32_t)oh, 1 } }
+        };
+        device->vk.CmdBlitImage(list->command_buffer, im->image, VK_IMAGE_LAYOUT_GENERAL, tmp,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        image_barrier(list, tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        const VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                           .imageExtent = { ow, oh, 1 } };
+        device->vk.CmdCopyImageToBuffer(list->command_buffer, tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb->buffer, 1, &region);
+    } else {
+        const VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+                                           .imageExtent = { w, h, 1 } };
+        device->vk.CmdCopyImageToBuffer(list->command_buffer, im->image, VK_IMAGE_LAYOUT_GENERAL, rb->buffer, 1, &region);
+    }
+    bd12_cmd_global_barrier(list);
+    pthread_mutex_lock(&g_lock);
+    if (g_cap_count < MAX_CAPTURES) {
+        Capture *c = &g_caps[g_cap_count++];
+        memset(c, 0, sizeof(*c));
+        c->readback = rb; c->size = size; c->is_rt = 1;
+        c->rt_w = ow; c->rt_h = oh; c->rt_bpp = block; c->rt_fmt = im->desc.format;
+        c->prescaled = down > 1;
+        c->tmp_image = tmp; c->tmp_memory = memory; c->device = device;
+        snprintf(c->name, sizeof(c->name), "%s_%ux%u_vk%u_h%llx", prefix, ow, oh, (unsigned)im->desc.format,
+                 (unsigned long long)hash);   /* the size actually saved */
+        rb = NULL; tmp = VK_NULL_HANDLE; memory = VK_NULL_HANDLE;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (rb) bd12_buffer_destroy(rb);
+    if (tmp) { device->vk.DestroyImage(device->device, tmp, NULL); device->vk.FreeMemory(device->device, memory, NULL); }
+}
+
+/* Frame breakdown, compute steps: the images a dispatch writes are the UAV images its root signature's descriptor
+ * tables reach in the bound heap (heap-indexed SM 6.6 UAVs and root UAVs, which are buffers, are not seen). */
+void bd12_capture_dispatch_step(BD12CmdList *list, const BD12BindState *state, uint64_t hash)
+{
+    if (!frame_mode_active(1) || !state || !state->root_signature || !list->heaps[0]) return;
+    const BD12RootSignature *rs = state->root_signature;
+    const BD12DescriptorHeap *heap = list->heaps[0];
+    struct { const BD12Image *image; uint32_t mip, layer, reg; } found[8];
+    uint32_t n = 0;
+    for (uint32_t p = 0; p < rs->parameter_count && n < 8; ++p) {
+        const BD12RootParameter *rp = &rs->parameters[p];
+        if (rp->type != BD12_ROOT_TABLE) continue;
+        const uint64_t handle = state->arguments[p].value;
+        if (handle < heap->gpu_base) continue;
+        const uint64_t first = (handle - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT;
+        uint32_t next = 0;
+        for (uint32_t r = 0; r < rp->range_count && n < 8; ++r) {
+            const BD12DescriptorRange *dr = &rp->ranges[r];
+            const uint32_t offset = dr->offset == BD12_RANGE_APPEND ? next : dr->offset;
+            next = dr->count == UINT32_MAX ? offset : offset + dr->count;
+            if (dr->type != BD12_RANGE_UAV) continue;
+            const uint32_t count = dr->count == UINT32_MAX || dr->count > 8 ? 8 : dr->count;
+            for (uint32_t i = 0; i < count && n < 8; ++i) {
+                const uint64_t k = first + offset + i;
+                if (k >= heap->count) break;
+                const BD12Descriptor *d = &heap->descriptors[k];
+                if (d->kind != BD12_DESC_UAV_IMAGE || !d->image) continue;
+                int dup = 0;
+                for (uint32_t j = 0; j < n; ++j) dup |= found[j].image == d->image && found[j].mip == d->view_mip;
+                if (dup) continue;
+                found[n].image = d->image; found[n].mip = d->view_mip; found[n].layer = d->view_base_layer;
+                found[n].reg = dr->base_register + i;
+                ++n;
+            }
+        }
+    }
+    if (!n) return;
+    const uint32_t step = __atomic_add_fetch(&g_step_seq, 1, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < n; ++i) {
+        const BD12Image *im = found[i].image;
+        const uint32_t w = im->desc.width >> found[i].mip ? im->desc.width >> found[i].mip : 1;
+        const uint32_t h = im->desc.height >> found[i].mip ? im->desc.height >> found[i].mip : 1;
+        (void)w; (void)h;
+        char prefix[64];
+        snprintf(prefix, sizeof(prefix), "cs%04u_u%u", step, found[i].reg);
+        capture_color(list, im, found[i].mip, found[i].layer, g_frame_mode >= 2 ? 4 : 2, prefix, hash);
+    }
+}
+
+/* Frame breakdown "every step": a draw ends its rendering scope, so the pass capture records its targets now. */
+void bd12_capture_draw_step(BD12CmdList *list)
+{
+    if (frame_mode_active(2)) bd12_cmd_end_rendering(list);
 }
 int bd12_frame_capture_state(void) { return g_frame_state; }
 
@@ -294,9 +483,23 @@ void bd12_capture_rt_pass(BD12CmdList *list)
     if (!bd12_capture_rt_enabled()) return;
     if (getenv("BEER_BD12_CAPTURE_DEBUG")) fprintf(stderr, "[CAPTURE] rt pass rtv=%u dsv=%d\n", list->gfx.cap_rtv_count, list->gfx.cap_has_dsv);
     BD12Device *device = list->device;
-    static uint32_t pass_seq;
-    const uint32_t pass = __atomic_add_fetch(&pass_seq, 1, __ATOMIC_RELAXED);
-    fprintf(stderr, "[TRACE] pass end list=%p rt%03u\n", (void *)list, pass);
+    const uint32_t pass = __atomic_add_fetch(&g_step_seq, 1, __ATOMIC_RELAXED);
+    if (!(g_frame_state == 1 && g_frame_mode >= 2))   /* every-step mode: thousands of lines and depth copies */
+        fprintf(stderr, "[TRACE] pass end list=%p rt%03u\n", (void *)list, pass);
+    if (g_frame_state == 1 && g_frame_mode >= 2) {
+        /* Every step: reduced colour targets only. */
+        for (uint32_t i = 0; i < list->gfx.cap_rtv_count; ++i) {
+            const BD12Descriptor *d = &list->gfx.cap_rtv[i];
+            if (d->kind != BD12_DESC_RTV || !d->image) continue;
+            const uint32_t w = d->image->desc.width >> d->view_mip ? d->image->desc.width >> d->view_mip : 1;
+            const uint32_t h = d->image->desc.height >> d->view_mip ? d->image->desc.height >> d->view_mip : 1;
+            (void)w; (void)h;
+            char prefix[64];
+            snprintf(prefix, sizeof(prefix), "rt%04u_a%u", pass, i);
+            capture_color(list, d->image, d->view_mip, d->view_base_layer, 4, prefix, list->gfx.cap_hash);
+        }
+        return;
+    }
     if (list->gfx.cap_has_dsv) bd12_capture_depth_pass(list, pass);
     if (getenv("BEER_BD12_CAPTURE_RT_DEPTH_ONLY")) return;
     for (uint32_t i = 0; i < list->gfx.cap_rtv_count; ++i) {
@@ -326,7 +529,7 @@ void bd12_capture_rt_pass(BD12CmdList *list)
             memset(c, 0, sizeof(*c));
             c->readback = rb; c->size = size; c->is_rt = 1;
             c->rt_w = w; c->rt_h = h; c->rt_bpp = block; c->rt_fmt = im->desc.format;
-            snprintf(c->name, sizeof(c->name), "rt%03u_a%u_%ux%u_vk%u_h%llx", pass, i, w, h,
+            snprintf(c->name, sizeof(c->name), "rt%04u_a%u_%ux%u_vk%u_h%llx", pass, i, w, h,
                      (unsigned)im->desc.format, (unsigned long long)list->gfx.cap_hash);
             g_rt_bytes += size;
             rb = NULL;
@@ -376,7 +579,7 @@ static void bd12_capture_depth_pass(BD12CmdList *list, uint32_t rt_pass)
             memset(c, 0, sizeof(*c));
             c->readback = rb; c->size = size; c->is_rt = 1; c->is_depth = 1;
             c->rt_w = w; c->rt_h = h; c->rt_bpp = bpp; c->rt_fmt = im->desc.format;
-            snprintf(c->name, sizeof(c->name), "rt%03u_dp%03u_l%u_%ux%u_vk%u_h%llx", rt_pass, pass, d->view_base_layer + l, w, h,
+            snprintf(c->name, sizeof(c->name), "rt%04u_dp%03u_l%u_%ux%u_vk%u_h%llx", rt_pass, pass, d->view_base_layer + l, w, h,
                      (unsigned)fmt, (unsigned long long)list->gfx.cap_hash);
             g_rt_bytes += size;
             rb = NULL;
@@ -478,7 +681,7 @@ static int rt_write_ppm(const Capture *c, const char *dir)
 {
     const uint8_t *src = c->readback->cpu;
     if (!src) return 0;
-    int scale = g_frame_state == 1 ? 2 : 4;      /* frame breakdown: larger pictures */
+    int scale = c->prescaled ? 1 : g_frame_state == 1 ? 2 : 4;      /* frame breakdown: larger pictures */
     if (getenv("BEER_BD12_CAPTURE_RT_SCALE")) scale = atoi(getenv("BEER_BD12_CAPTURE_RT_SCALE"));
     if (scale < 1) scale = 1;
     const uint32_t ow = (c->rt_w + scale - 1) / scale, oh = (c->rt_h + scale - 1) / scale;
@@ -572,6 +775,7 @@ void bd12_capture_flush(void)
             if (!rt_write_ppm(c, dir))
                 fprintf(stderr, "[CAPTURE] unhandled render-target format %u (%s)\n", (unsigned)c->rt_fmt, c->name);
             bd12_buffer_destroy(c->readback);
+            capture_free_tmp(c);
             continue;
         }
         char path[512];

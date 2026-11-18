@@ -337,12 +337,23 @@ void bd12_cmd_build_as(BD12CmdList *list, const void *desc)
         }
     }
     const VkAccelerationStructureBuildRangeInfoKHR *range_ptr = ranges;
-    bd12_cmd_global_barrier(list);
+    /* Only the application's barriers order builds (D3D12 semantics: independent builds overlap; its UAV barriers and
+     * state transitions include the build stage, bd12_state_sync). A full drain before and after every build used
+     * to serialise RE9's ~240 BLAS refits per frame (path tracing 25 -> 27-33 fps, GPU power 123 -> 167 W).
+     * BEER_BD12_AS_BARRIERS=full brings the drains back. */
+    static int app_barriers = -1;
+    if (app_barriers < 0) { const char *v = getenv("BEER_BD12_AS_BARRIERS"); app_barriers = !(v && !strcmp(v, "full")); }
+    if (!app_barriers) bd12_cmd_global_barrier(list);
+    else bd12_cmd_end_rendering(list);
     /* GPU checkpoint kind 200: AS build (a = destination VA, b = 1 TLAS / 2 BLAS + 4 update, w = descriptor count). */
     bd12_ckpt_mark(list, 200u, d->dest, (in->type == RT_TLAS ? 1u : 2u) | (src ? 4u : 0u), in->num_descs, 0, 0);
+    /* BEER_BD12_GPU_PROF: AS builds are their own entries (they used to land on the operation before them):
+     * tag 0x<1 TLAS / 2 BLAS><1 update><descs, 4 digits, capped>. */
+    bd12_gpuprof_mark(list, 200u, (uint64_t)(in->type == RT_TLAS ? 1u : 2u) << 20 | (uint64_t)(src ? 1u : 0u) << 16 |
+                                  (in->num_descs > 0xffffu ? 0xffffu : in->num_descs));
     device->vk_rt.CmdBuildAccelerationStructuresKHR(list->command_buffer, 1, &info,
                                                     &range_ptr);
-    bd12_cmd_global_barrier(list);
+    if (!app_barriers) bd12_cmd_global_barrier(list);
 done:
     free(geoms);
     free(counts);
@@ -377,6 +388,7 @@ void bd12_cmd_copy_as(BD12CmdList *list, uint64_t dst_va, uint64_t src_va,
     };
     bd12_cmd_global_barrier(list);
     bd12_ckpt_mark(list, 201u, dst_va, src_va, mode, 0, 0);   /* GPU checkpoint kind 201: AS copy */
+    bd12_gpuprof_mark(list, 201u, mode);
     device->vk_rt.CmdCopyAccelerationStructureKHR(list->command_buffer, &info);
     bd12_cmd_global_barrier(list);
 }

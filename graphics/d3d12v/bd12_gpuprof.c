@@ -232,7 +232,8 @@ void bd12_gpuprof_report(void)
     fprintf(stderr, "[GPU PROF] measured %.1f ms of GPU time in this window\n", total / 1e6);
     for (int i = 0; i < 20 && snapshot[i].calls; ++i) {
         const uint32_t kind = (uint32_t)(snapshot[i].tag >> 56);
-        const char *name = kind < 10 ? names[kind] : kind == 100 ? "dispatch" : kind == 101 ? "dispatch-ind" : "other";
+        const char *name = kind < 10 ? names[kind] : kind == 100 ? "dispatch" : kind == 101 ? "dispatch-ind" :
+                           kind == 200 ? "as-build" : kind == 201 ? "as-copy" : "other";
         fprintf(stderr, "[GPU PROF]   %5.1f%% %8.2f ms %7llu x %-12s %014llx\n", total ? 100.0 * snapshot[i].ns / total : 0,
                 snapshot[i].ns / 1e6, (unsigned long long)snapshot[i].calls, name,
                 (unsigned long long)(snapshot[i].tag & 0x00ffffffffffffffull));

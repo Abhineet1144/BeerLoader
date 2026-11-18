@@ -210,6 +210,42 @@ typedef struct {
     u32 LastErrorValue;                               /* +0x34 */
 } W32Teb;
 
+typedef struct {
+    u32 start, end, index, callbacks, zero_fill, characteristics;
+} W32TlsDirectory;
+
+/* Static image TLS is distinct from the dynamic TlsAlloc slots at TEB+0xe10.
+ * PE32 TLS directory addresses are relocated VAs, and vector entries are DWORDs. */
+static int w32_static_tls_init(W32Teb *teb, const u8 *image, size_t image_size,
+                               const DataDir *dir)
+{
+    if (!dir->size) return 1;
+    const uintptr_t base = (uintptr_t)image;
+    if (dir->size < sizeof(W32TlsDirectory) || dir->rva > image_size ||
+        sizeof(W32TlsDirectory) > image_size - dir->rva) return 0;
+    const W32TlsDirectory *tls = (const void *)(image + dir->rva);
+    if (tls->end < tls->start || tls->index < base ||
+        (u64)tls->index + 4 > base + image_size) return 0;
+    const size_t initialized = (size_t)tls->end - tls->start;
+    if (initialized && (tls->start < base || (u64)tls->end > base + image_size)) return 0;
+    const unsigned align_code = (tls->characteristics >> 20) & 15;
+    if (align_code == 15) return 0; /* reserved IMAGE_SCN_ALIGN encoding */
+    size_t alignment = align_code ? (size_t)1 << (align_code - 1) : 16;
+    if (alignment < 16) alignment = 16;
+    const u64 bytes = (u64)initialized + tls->zero_fill;
+    if (bytes > W32_LIMIT || bytes + alignment > W32_LIMIT) return 0;
+    /* One executable module, static slot zero. PE32 DLL loading is not yet
+     * supported. mmap zeroes the tail, including an empty TLS template. */
+    u32 *vector = w32_map(0, (size_t)bytes + alignment, PROT_READ | PROT_WRITE);
+    if (!vector) return 0;
+    u8 *block = (u8 *)(((uintptr_t)(vector + 1) + alignment - 1) & ~(alignment - 1));
+    if (initialized) memcpy(block, (const void *)(uintptr_t)tls->start, initialized);
+    vector[0] = (u32)(uintptr_t)block;
+    *(u32 *)(uintptr_t)tls->index = 0;
+    teb->ThreadLocalStoragePointer = (u32)(uintptr_t)vector;
+    return 1;
+}
+
 /* Sets up the calling host thread for 32-bit code: a TEB64 (GS) and TEB32 (FS selector) below 4 GiB, and a guest
  * stack of `stack_size` bytes. Returns the initial guest ESP. */
 static u32 w32_thread_init(size_t stack_size)
@@ -238,6 +274,14 @@ static u32 w32_thread_init(size_t stack_size)
     teb32->UniqueProcess = (u32)teb64->UniqueProcess;
     teb32->UniqueThread = (u32)teb64->UniqueThread;
     teb32->Peb = g_w32_peb;
+
+    const u8 *image = (const u8 *)(uintptr_t)g_w32_image;
+    if (image) {
+        const W32NtHdrs *nt = (const void *)(image + ((const DosHdr *)image)->lfanew);
+        if (nt->opt.rva_count > 9 &&
+            !w32_static_tls_init(teb32, image, nt->opt.size_of_image, &nt->opt.dirs[9]))
+            die("WoW32: invalid or unavailable static TLS");
+    }
 
     pthread_mutex_lock(&g_w32_lock);
     const int entry = g_w32_next_ldt++;
@@ -637,7 +681,16 @@ static u64 w32_GetModuleHandleA(const u32 *args)
 static u64 w32_GetProcAddress(const u32 *args)
 {
     const char *name = W32_PTR(1);
-    if (args[1] < 0x10000 || !w32_find_api(name)) { g_last_error = 127; return 0; }   /* ERROR_PROC_NOT_FOUND */
+    if (args[1] < 0x10000 || !w32_find_api(name)) {
+        if (getenv("BEER_W32_TRACE")) {
+            if (args[1] < 0x10000)
+                fprintf(stderr, "[WOW32] GetProcAddress(0x%x, #%u): unavailable\n", args[0], args[1]);
+            else
+                fprintf(stderr, "[WOW32] GetProcAddress(0x%x, %s): unavailable\n", args[0], name);
+        }
+        g_last_error = 127;
+        return 0;
+    }   /* ERROR_PROC_NOT_FOUND */
     return w32_thunk_for("kernel32.dll", name);
 }
 
@@ -1199,10 +1252,18 @@ static const W32Api g_w32_apis[] = {
     {"SetWindowLongA", w32_SetWindowLongW, 12}, {"GetWindowLongA", w32_GetWindowLongW, 8},
     {"CallWindowProcW", w32_CallWindowProcW, 20}, {"CallWindowProcA", w32_CallWindowProcW, 20},
     {"RegisterClassW", w32_RegisterClassW, 4}, {"RegisterClassExW", w32_RegisterClassExW, 4},
+    {"GetClassInfoW", w32_GetClassInfoW, 12},
     {"PeekMessageW", w32_PeekMessageW, 20}, {"GetMessageW", w32_GetMessageW, 16},
     {"DispatchMessageW", w32_DispatchMessageW, 4}, {"TranslateMessage", w32_TranslateMessage, 4},
     W32_FWD("CreateWindowExW", 48), W32_FWD("DefWindowProcW", 16), W32_FWD("SendMessageW", 16),
     W32_FWD("PostMessageW", 16), W32_FWD("PostQuitMessage", 4), W32_FWD("ShowWindow", 8),
+    W32_FWD("SetWindowTextW", 8),
+    W32_FWD("RegisterWindowMessageW", 4), W32_FWD("GlobalAddAtomW", 4),
+    W32_FWD("RegisterClipboardFormatW", 4),
+        W32_FWD("SendNotifyMessageW", 16), W32_FWD("SendNotifyMessageA", 16),
+        {"AllocateAndInitializeSid", w32_AllocateAndInitializeSid, 44},
+        {"FreeSid", w32_FreeSid, 4},
+        W32_FWD("CheckTokenMembership", 12),
     {"FindResourceW", w32_FindResourceW, 12}, {"FindResourceExW", w32_FindResourceExW, 16},
     {"FindResourceA", w32_FindResourceA, 12},
     {"GetDiskFreeSpaceW", w32_GetDiskFreeSpaceW, 20}, {"GetDiskFreeSpaceExW", w32_GetDiskFreeSpaceExW, 16},
@@ -1277,7 +1338,23 @@ W32_FWD("ReleaseMutex", 4),
     /* user32 / comctl32 */
     {"CharNextW", w32_CharNextW, 4}, {"CharUpperBuffW", w32_CharUpperBuffW, 8},
     {"CharLowerBuffW", w32_CharLowerBuffW, 8}, {"GetKeyboardType", w32_GetKeyboardType, 4},
+    {"CharLowerW", w32_CharLowerW, 4},
+    W32_FWD("OleInitialize", 4), W32_FWD("OleUninitialize", 0),
+    W32_FWD("CoInitialize", 4),
     {"InitCommonControls", w32_InitCommonControls, 0}, {"MessageBoxW", w32_MessageBoxW, 16},
+    /* HDC/HGDIOBJ values are opaque 32-bit handles. These signatures contain
+     * no pointer-sized structure members or callback arguments. */
+    W32_FWD("GetDC", 4), W32_FWD("GetWindowDC", 4), W32_FWD("ReleaseDC", 8),
+    W32_FWD("GetDeviceCaps", 8),
+    W32_FWD("CreatePalette", 4), W32_FWD("GetStockObject", 4),
+    W32_FWD("CreateFontIndirectW", 4),
+    {"GetObjectW", w32_GetObjectW, 12},
+    W32_FWD("GetKeyboardLayout", 4),
+    {"GetKeyboardLayoutList", w32_GetKeyboardLayoutList, 8},
+    {"ImmIsIME", w32_ImmIsIME, 4},
+    W32_FWD("LoadIconW", 8), W32_FWD("LoadCursorW", 8), W32_FWD("MulDiv", 12),
+    W32_FWD("SystemParametersInfoW", 16),
+    W32_FWD("SetClassLongW", 12), W32_FWD("GetSystemMenu", 8), W32_FWD("DeleteMenu", 12),
     W32_FWD("LoadStringW", 16), W32_FWD("DestroyWindow", 4), W32_FWD("ExitWindowsEx", 8),
     /* kernel32 */
     {"GetStartupInfoA", w32_GetStartupInfoA, 4},
@@ -1516,6 +1593,22 @@ static void __attribute__((noreturn)) beer_wow32_main(const char *path)
     u64 teb64;
     __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb64));
     *(u64 *)(uintptr_t)(teb64 + W32_SLOT_ESP) = esp;
+    if (nt->opt.rva_count > 9 && nt->opt.dirs[9].size) {
+        const W32TlsDirectory *tls = (const void *)(image + nt->opt.dirs[9].rva);
+        if (tls->callbacks) {
+            const u32 argv[3] = {g_w32_image, 1, 0}; /* DLL_PROCESS_ATTACH */
+            uintptr_t cursor = tls->callbacks;
+            const uintptr_t end = (uintptr_t)image + nt->opt.size_of_image;
+            for (;;) {
+                if (cursor < (uintptr_t)image || cursor + 4 > end)
+                    die("WoW32: invalid TLS callback array");
+                const u32 callback = *(const u32 *)cursor;
+                if (!callback) break;
+                w32_call(callback, 3, argv);
+                cursor += 4;
+            }
+        }
+    }
     fprintf(stderr, "[WOW32] entry 0x%x, stack top 0x%x\n", g_w32_image + nt->opt.entry_rva, esp);
     const u32 code = w32_call(g_w32_image + nt->opt.entry_rva, 0, NULL);
     impl_ExitProcess(code);

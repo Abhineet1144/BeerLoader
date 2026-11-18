@@ -1352,7 +1352,9 @@ void bd12_capture_end(void);
 void bd12_capture_flush(void);
 /* Frame breakdown (manager, gfx_frame_capture): dumps every render pass of the next frame into dir as PPM files, then
  * writes dir/done. Returns 0 while an earlier request is still running. */
-int bd12_frame_capture_request(const char *dir);
+int bd12_frame_capture_request(const char *dir, int mode);   /* 0 passes, 1 + compute, 2 every draw/dispatch */
+void bd12_capture_dispatch_step(BD12CmdList *list, const BD12BindState *state, uint64_t hash);
+void bd12_capture_draw_step(BD12CmdList *list);
 int bd12_frame_capture_state(void);       /* 0 idle, 1 waiting for the frame, 2 written */
 int bd12_capture_pending(void);
 
@@ -1395,6 +1397,7 @@ BD12RtPipeline *bd12_rt_pipeline_create(BD12Device *device, const BD12RtDesc *de
 void bd12_rt_pipeline_destroy(BD12RtPipeline *pipeline);
 /* The description a state object was created from (collections are merged into the pipelines that use them). */
 const BD12RtDesc *bd12_rt_pipeline_desc(const BD12RtPipeline *pipeline);
+void bd12_rt_stats_take(uint64_t *dispatches, uint64_t *rays);   /* DispatchRays calls/rays since the last take */
 /* 32-byte shader identifier of an export or hit group (builds the pipeline on first use), or NULL. */
 const uint8_t *bd12_rt_pipeline_identifier(BD12RtPipeline *pipeline, const char *name);
 /* GPU checkpoints (BEER_VK_CHECKPOINTS=1): mark the next command, dump the last reached ones after a fault. */

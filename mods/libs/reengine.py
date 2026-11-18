@@ -21,6 +21,7 @@ import json
 import os
 import re as _re
 import struct
+import time
 
 from beer_mod import ModError
 
@@ -80,8 +81,13 @@ class Type:
 
     @property
     def object_info(self):
-        """The value every live instance of exactly this class holds in its first qword."""
-        return self._re._type_u64(self.index, self._re.L["type_object_info"])
+        """The value every live instance of exactly this class holds in its first qword. Read live: the engine fills
+        it in when the class is first used, which may be after the tables were loaded."""
+        cached = self._re._type_u64(self.index, self._re.L["type_object_info"])
+        if cached:
+            return cached
+        live = self._re.game.read_ptr(self._re.types_ptr + self.index * self._re.L["type_size"] + self._re.L["type_object_info"])
+        return live or 0
 
     @property
     def fields(self):
@@ -111,10 +117,19 @@ class Type:
 
 
 class REEngine:
-    def __init__(self, game, progress=None):
+    def __init__(self, game, progress=None, wait=180.0):
+        """Waits up to `wait` seconds for the game to set up its type database: a mod may start the moment the game
+        does, before the database's tables are in place."""
         self.game = game
         self.progress = progress or (lambda text: None)
-        self._locate()
+        deadline = time.monotonic() + wait
+        while True:
+            if self._locate():
+                break
+            if time.monotonic() > deadline:
+                raise ModError("the RE Engine type database never became ready (game still loading?)")
+            self.progress("waiting for the game to finish starting...")
+            time.sleep(1.0)
         self._load_tables()
         self._names = {}
         self._by_name = None
@@ -132,12 +147,29 @@ class REEngine:
         hits = sorted((addr, value >> 32) for value, (_, addrs) in found.items() for addr in addrs
                       if base <= addr < base + size)
         if not hits:
-            raise ModError("no RE Engine type database found in %s (not an RE Engine game?)" % exe_name)
-        self.tdb, self.version = hits[0]
-        if self.version not in LAYOUTS:
-            raise ModError("RE Engine TDB version %d is not supported yet (supported: %s)" %
-                           (self.version, ", ".join(map(str, LAYOUTS))))
-        self.L = LAYOUTS[self.version]
+            return False                          # not there yet (or not an RE Engine game: the wait ends it)
+        for addr, version in hits:
+            if version not in LAYOUTS:
+                raise ModError("RE Engine TDB version %d is not supported yet (supported: %s)" %
+                               (version, ", ".join(map(str, LAYOUTS))))
+            if self._header_ready(addr, LAYOUTS[version], base, size):
+                self.tdb, self.version, self.L = addr, version, LAYOUTS[version]
+                return True
+        return False                              # found, but its tables are not set up yet
+
+    def _header_ready(self, addr, L, base, size):
+        """Counts are set and every table pointer points into the executable image (the copy the game uses)."""
+        header = self.game.read_bytes(addr, 0x100)
+        if not header or len(header) < 0x100:
+            return False
+        u32 = lambda off: struct.unpack_from("<I", header, off)[0]
+        u64 = lambda off: struct.unpack_from("<Q", header, off)[0]
+        if not u32(L["count_types"]) or not u32(L["count_fields"]):
+            return False
+        for key in ("ptr_types", "ptr_type_impl", "ptr_fields", "ptr_field_impl", "ptr_strings"):
+            if not base <= u64(L[key]) < base + size:
+                return False
+        return True
 
     def _read_block(self, addr, size):
         data, chunk = bytearray(), 65536

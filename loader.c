@@ -10485,6 +10485,7 @@ dxgi_adapter_GetDesc2(u64 *obj, u8 *desc)
  * game without a budget. Local = device memory (live DEFAULT heaps), non-local
  * = system memory (UPLOAD/READBACK heaps). */
 extern uint64_t g_bd12_heap_bytes[4];
+void bd12_rt_stats_take(uint64_t *dispatches, uint64_t *rays);   /* bd12_rtpipe.c */
 static u64 g_dxgi_reservation[2];
 
 static u64 __attribute__((ms_abi))
@@ -22156,6 +22157,7 @@ typedef struct SentMessage {
     u64 hwnd, wparam, lparam, result;
     u32 message, target;
     int state;                                                        /* 0 queued, 1 running, 2 done */
+    int notify;                                                       /* heap-owned, no waiting sender */
 } SentMessage;
 #define BEER_PUMP_SLOTS 64
 static SentMessage *g_sent_head;
@@ -22186,9 +22188,15 @@ static void process_sent_messages(void)
         while (m && !(m->target == tid && m->state == 0)) m = m->next;
         if (!m) break;
         m->state = 1;
+        if (m->notify) {
+            SentMessage **link = &g_sent_head;
+            while (*link != m) link = &(*link)->next;
+            *link = m->next;
+        }
         pthread_mutex_unlock(&g_sent_mutex);
         const u64 result = send_message_local(m->hwnd, m->message, m->wparam, m->lparam);
         pthread_mutex_lock(&g_sent_mutex);
+        if (m->notify) { free(m); continue; }
         m->result = result;
         m->state = 2;
         pthread_cond_broadcast(&g_sent_cond);
@@ -22524,6 +22532,74 @@ impl_PostMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     /* PostMessage targets the window's owning thread, not the calling thread. */
     return queue_window_message(msg, wp, lp);
+}
+
+/* Notify messages are sent, not posted: the receiver executes them while
+ * pumping even when its posted-message filter excludes their message ID. */
+static u64 __attribute__((ms_abi))
+impl_SendNotifyMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
+{
+    /* Standard messages carrying pointers cannot outlive this call. Custom
+     * WM_USER+ protocols are the caller's responsibility, as on Windows. */
+    switch (msg) {
+    case 0x0001: case 0x000c: case 0x000d: case 0x0024: case 0x002b:
+    case 0x002c: case 0x002d: case 0x0039: case 0x0046: case 0x0047:
+    case 0x004a: case 0x004e: case 0x0053: case 0x007c: case 0x007d:
+    case 0x0081: case 0x0083: case 0x0087: case 0x0214: case 0x0216:
+    case 0x0220: case 0x0229: case 0x0233: case 0x0308: case 0x0309:
+    case 0x030b: case 0x030c:
+        g_last_error = 1159; /* ERROR_MESSAGE_SYNC_ONLY */
+        return 0;
+    case 0x001a: case 0x001b: /* optional setting/device-mode strings */
+        if (lp) { g_last_error = 1159; return 0; }
+        break;
+    default: break;
+    }
+    if (hw == 0xffffu) { /* HWND_BROADCAST: top-level, not message-only windows */
+        u64 windows[BEER_MAX_WINDOWS];
+        size_t count = 0;
+        pthread_mutex_lock(&g_beer_windows_mtx);
+        for (size_t i = 0; i < BEER_MAX_WINDOWS; ++i) {
+            const BeerWindow *w = &g_beer_windows[i];
+            if (w->used && !(w->style & 0x40000000u) && w->parent != (u64)-3)
+                windows[count++] = w->hwnd;
+        }
+        pthread_mutex_unlock(&g_beer_windows_mtx);
+        u64 ok = 1;
+        for (size_t i = 0; i < count; ++i)
+            if (!impl_SendNotifyMessageW(windows[i], msg, wp, lp)) ok = 0;
+        return ok;
+    }
+    pthread_mutex_lock(&g_beer_windows_mtx);
+    const BeerWindow *window = beer_window_find(hw);
+    u32 owner = window ? window->owner_tid : 0;
+    const int valid = window != NULL;
+    pthread_mutex_unlock(&g_beer_windows_mtx);
+    if (!valid) { g_last_error = 1400; return 0; }
+    if (!owner || owner == (u32)current_windows_thread_id()) {
+        (void)send_message_local(hw, msg, wp, lp);
+        return 1; /* BOOL success, not the procedure's LRESULT */
+    }
+    SentMessage *m = calloc(1, sizeof(*m));
+    if (!m) { g_last_error = 8; return 0; }
+    *m = (SentMessage){ .hwnd = hw, .message = msg, .wparam = wp,
+        .lparam = lp, .target = owner, .notify = 1 };
+    pthread_mutex_lock(&g_sent_mutex);
+    SentMessage **tail = &g_sent_head;
+    unsigned queued = 0;
+    while (*tail) { ++queued; tail = &(*tail)->next; }
+    if (queued >= 10000) {
+        pthread_mutex_unlock(&g_sent_mutex);
+        free(m);
+        g_last_error = 1816; /* ERROR_NOT_ENOUGH_QUOTA */
+        return 0;
+    }
+    *tail = m;
+    pthread_mutex_unlock(&g_sent_mutex);
+    pthread_mutex_lock(&g_win_message_mutex);
+    pthread_cond_broadcast(&g_win_message_ready);
+    pthread_mutex_unlock(&g_win_message_mutex);
+    return 1;
 }
 
 static u64 __attribute__((ms_abi))
@@ -28646,6 +28722,8 @@ static ImplEntry g_impls[] = {
     {"DispatchMessageA",                      (ImplFn)impl_DispatchMessageW},
     {"PostQuitMessage",                       (ImplFn)impl_PostQuitMessage},
     {"SendMessageW",                          (ImplFn)impl_SendMessageW},
+    {"SendNotifyMessageW",                    (ImplFn)impl_SendNotifyMessageW},
+    {"SendNotifyMessageA",                    (ImplFn)impl_SendNotifyMessageW},
     {"SendMessageA",                          (ImplFn)impl_SendMessageW},
     {"PostMessageW",                          (ImplFn)impl_PostMessageW},
     {"PostMessageA",                          (ImplFn)impl_PostMessageW},
@@ -37508,13 +37586,21 @@ static int beer_present_bd12_image(uint64_t image, uint32_t layout,
             if (ns) {
                 const uint64_t fps_x10 = (uint64_t)window_frames * 10000000000ull / ns;
                 const uint64_t us = ns / 1000u / window_frames;
+                uint64_t rt_dispatches = 0, rt_rays = 0;
+                bd12_rt_stats_take(&rt_dispatches, &rt_rays);
+                char rt[96] = "";
+                if (rt_dispatches)   /* ray tracing load per frame: DispatchRays calls and launched rays */
+                    snprintf(rt, sizeof(rt), ", rays %llu.%llu M/frame in %llu dispatches/frame",
+                             (unsigned long long)(rt_rays / window_frames / 1000000u),
+                             (unsigned long long)(rt_rays / window_frames / 100000u % 10u),
+                             (unsigned long long)(rt_dispatches / window_frames));
                 fprintf(stderr,
-                        "[BD12 FPS] %llu.%llu fps (%llu.%03llu ms/frame, %u frames, worst %llu ms, %u over 50 ms)\n",
+                        "[BD12 FPS] %llu.%llu fps (%llu.%03llu ms/frame, %u frames, worst %llu ms, %u over 50 ms%s)\n",
                         (unsigned long long)(fps_x10 / 10),
                         (unsigned long long)(fps_x10 % 10),
                         (unsigned long long)(us / 1000),
                         (unsigned long long)(us % 1000), window_frames,
-                        (unsigned long long)(worst_ns / 1000000), hitches);
+                        (unsigned long long)(worst_ns / 1000000), hitches, rt);
             }
             window_start_ns = now;
             window_frames = 0;

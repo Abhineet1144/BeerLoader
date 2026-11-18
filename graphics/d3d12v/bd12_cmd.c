@@ -51,6 +51,22 @@ void bd12_state_sync(uint32_t state, int is_source,
 {
     VkPipelineStageFlags2 s = 0;
     VkAccessFlags2 a = 0;
+    /* Acceleration-structure builds read their inputs (vertices, indices, instance descriptions: shader-resource or
+     * generic-read state) and write the structures (unordered access, synchronised with UAV barriers), so with ray
+     * tracing on those states include the build stage and acceleration-structure access, as in vkd3d-proton. The
+     * application's own barriers then order builds, and independent builds may overlap. */
+    static int rt = -1;
+    if (rt < 0) rt = beer_vulkan_ray_tracing_enabled() ? 1 : 0;
+    if (rt && (state & 0x400000u)) {                       /* RAYTRACING_ACCELERATION_STRUCTURE */
+        s |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | BD12_ALL_SHADER_STAGES | bd12_rt_stages();
+        a |= VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    }
+    if (rt && (state & (BD12_STATE_UNORDERED_ACCESS | BD12_STATE_NON_PIXEL_SHADER_RESOURCE |
+                        BD12_STATE_VERTEX_AND_CONSTANT_BUFFER | BD12_STATE_INDEX_BUFFER))) {
+        s |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        a |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        if (state & BD12_STATE_UNORDERED_ACCESS) a |= VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    }
     if (state == BD12_STATE_COMMON) {
         s = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         a = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -367,7 +383,17 @@ void bd12_cmd_copy_buffer(BD12CmdList *list, BD12Buffer *dst,
         .dstOffset = dst_offset,
         .size = size
     };
-    bd12_cmd_record_flight_op(list, BD12_FLIGHT_COPY_BUFFER, 0, size, 0, 0, 0);
+    /* The "hash" of a buffer copy says what kind of copy it is (BEER_BD12_GPU_PROF groups by it):
+     * 0x<src heap><dst heap><src host-visible><dst host-visible><log2 size, 2 digits>, heap 1 default 2 upload
+     * 3 readback 0 committed/other. */
+    uint64_t kind_tag = 0;
+    {
+        uint32_t log2 = 0;
+        while (log2 < 63 && (1ull << (log2 + 1)) <= size) ++log2;
+        kind_tag = (uint64_t)(src->heap ? src->heap->type & 0xf : 0) << 20 | (uint64_t)(dst->heap ? dst->heap->type & 0xf : 0) << 16 |
+                   (uint64_t)(src->cpu != NULL) << 12 | (uint64_t)(dst->cpu != NULL) << 8 | log2;
+    }
+    bd12_cmd_record_flight_op(list, BD12_FLIGHT_COPY_BUFFER, kind_tag, size, 0, 0, 0);
     list->device->vk.CmdCopyBuffer(list->command_buffer, src->buffer,
                                    dst->buffer, 1, &region);
 }
@@ -486,8 +512,10 @@ void bd12_cmd_uav_barrier_buffer(BD12CmdList *list, BD12Buffer *buffer)
     VkPipelineStageFlags2 stage;
     VkAccessFlags2 access;
     bd12_state_sync(BD12_STATE_UNORDERED_ACCESS, 0, &stage, &access);
-    buffer_barrier(list, buffer, stage, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                   stage, access);
+    /* A UAV barrier on an acceleration structure's buffer orders the builds that wrote it. */
+    const VkAccessFlags2 written = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+        (beer_vulkan_ray_tracing_enabled() ? VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR : 0);
+    buffer_barrier(list, buffer, stage, written, stage, access);
 }
 
 /* A UAV barrier without a resource, mapped as vkd3d-proton maps it: one memory barrier over the UNORDERED_ACCESS state,

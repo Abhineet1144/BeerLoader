@@ -15,6 +15,61 @@ static u64 w32_call_impl_out(const char *name, const u32 *args, u32 argc, u32 ou
     return (u32)((W32Impl12)(void *)impl)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]);
 }
 
+/* LOGFONTW/LOGPEN have fixed-width fields, but BITMAP and LOGBRUSH contain
+ * pointers/ULONG_PTR. Never let the native GetObject overwrite a PE32 buffer. */
+static u64 w32_GetObjectW(const u32 *args)
+{
+    u8 native[96] = {0}, out[92] = {0};
+    u64 object = w32_widen(args[0]);
+    u32 type = beer_GetObjectType(object);
+    s32 size = (s32)args[1];
+    int full;
+    if (type == 6) full = 92; /* OBJ_FONT */
+    else if (type == 1) full = 16; /* OBJ_PEN */
+    else if (type == 2) full = 12; /* OBJ_BRUSH */
+    else if (type == 7) full = beer_GetObjectW(object, 0, NULL) > 32 ? 84 : 24;
+    else return 0;
+    if (!args[2]) return full;
+    if (size <= 0 || !beer_GetObjectW(object, sizeof(native), native)) return 0;
+    if (type == 7) {
+        u64 bits;
+        memcpy(&bits, native + 24, sizeof(bits));
+        if (bits > UINT32_MAX) { g_last_error = 50; return 0; }
+        if (size < 24) return 0;
+        memcpy(out, native, 20);
+        u32 pointer = (u32)bits;
+        memcpy(out + 20, &pointer, 4);
+        if (full == 84 && size >= 84) memcpy(out + 24, native + 32, 52);
+        else full = 24;
+    } else memcpy(out, native, (size_t)full);
+    int copied = size < full ? size : full;
+    memcpy(W32_PTR(2), out, (size_t)copied);
+    return copied;
+}
+
+/* SID bytes have the same layout on both ABIs, but PSID* is a DWORD output
+ * and its allocation must remain addressable by the PE32 caller. */
+static u64 w32_AllocateAndInitializeSid(const u32 *args)
+{
+    const u8 count = (u8)args[1];
+    if (!args[0] || !args[10] || count > 8) { g_last_error = 87; return 0; }
+    u8 *sid = w32_heap_alloc(8u + 4u * count, 1);
+    if (!sid) { g_last_error = 8; return 0; }
+    sid[0] = 1;
+    sid[1] = count;
+    memcpy(sid + 2, W32_PTR(0), 6);
+    memcpy(sid + 8, args + 2, 4u * count);
+    const u32 pointer = (u32)(uintptr_t)sid;
+    memcpy(W32_PTR(10), &pointer, sizeof(pointer));
+    return 1;
+}
+
+static u64 w32_FreeSid(const u32 *args)
+{
+    if (args[0]) w32_heap_free(W32_PTR(0));
+    return 0;
+}
+
 /* ---- modules ---- */
 
 /* System DLLs are opaque pseudo handles (no 32-bit images of them exist); GetProcAddress on them hands out thunks. */
@@ -845,6 +900,48 @@ static u64 w32_register_class(const u32 *c, int ex)
 }
 static u64 w32_RegisterClassW(const u32 *args) { return w32_register_class(W32_PTR(0), 0); }
 static u64 w32_RegisterClassExW(const u32 *args) { return w32_register_class(W32_PTR(0), 1); }
+
+static u64 w32_GetClassInfoW(const u32 *args)
+{
+    if (!args[2]) { g_last_error = 87; return 0; }
+    WIN_WNDCLASSEX wc;
+    if (!impl_GetClassInfoExW(args[0], args[1], &wc)) return 0;
+    /* Strings registered through this ABI already reside in low memory. */
+    if (wc.lpszMenuName > UINT32_MAX || wc.lpszClassName > UINT32_MAX) {
+        g_last_error = 50;
+        return 0;
+    }
+    u32 out[10] = { wc.style, w32_proc_from_native(wc.lpfnWndProc),
+        (u32)wc.cbClsExtra, (u32)wc.cbWndExtra, (u32)wc.hInstance,
+        (u32)wc.hIcon, (u32)wc.hCursor, (u32)wc.hbrBackground,
+        (u32)wc.lpszMenuName, (u32)wc.lpszClassName };
+    memcpy(W32_PTR(2), out, sizeof(out));
+    return 1;
+}
+
+static u64 w32_CharLowerW(const u32 *args)
+{
+    if (args[0] <= 0xffffu) return (u16)towlower((u16)args[0]);
+    u16 *text = W32_PTR(0);
+    for (size_t i = 0; text[i]; ++i) text[i] = (u16)towlower(text[i]);
+    return args[0];
+}
+
+static u64 w32_GetKeyboardLayoutList(const u32 *args)
+{
+    s32 count = (s32)args[0];
+    if (count < 0 || (count && !args[1])) { g_last_error = 87; return 0; }
+    if (count) *(u32 *)W32_PTR(1) = (u32)impl_GetKeyboardLayout(0);
+    return 1; /* Same single installed layout as GetKeyboardLayout. */
+}
+
+static u64 w32_ImmIsIME(const u32 *args)
+{
+    (void)args;
+    /* No IME layouts are installed: the layout registry exposed above contains
+     * only the ordinary keyboard returned by GetKeyboardLayout. */
+    return 0;
+}
 
 /* MSG-based message functions (W): MSG is 28 bytes in 32-bit code. */
 static void w32_msg_from_native(const WIN_MSG *msg, u32 *out)

@@ -1030,6 +1030,7 @@ int bd12_cmd_draw(BD12CmdList *list, uint32_t vertex_count,
         vertex_count, instance_count, 0);
     list->device->vk.CmdDraw(list->command_buffer, vertex_count, instance_count,
                              first_vertex, first_instance);
+    bd12_capture_draw_step(list);
     return 1;
 }
 
@@ -1047,6 +1048,7 @@ int bd12_cmd_draw_indexed(BD12CmdList *list, uint32_t index_count,
     list->device->vk.CmdDrawIndexed(list->command_buffer, index_count,
                                     instance_count, first_index, base_vertex,
                                     first_instance);
+    bd12_capture_draw_step(list);
     return 1;
 }
 
@@ -1058,6 +1060,7 @@ int bd12_cmd_draw_indirect(BD12CmdList *list, BD12Buffer *args,
         list->gfx.pipeline->shader_hash, count, count, stride ? stride : 16, 0);
     list->device->vk.CmdDrawIndirect(list->command_buffer, args->buffer, offset,
                                      count, stride ? stride : 16);
+    bd12_capture_draw_step(list);
     return 1;
 }
 
@@ -1072,6 +1075,7 @@ int bd12_cmd_draw_indexed_indirect(BD12CmdList *list, BD12Buffer *args,
     bd12_ckpt_args(args->va + offset, 0);
     list->device->vk.CmdDrawIndexedIndirect(list->command_buffer, args->buffer,
                                             offset, count, stride ? stride : 20);
+    bd12_capture_draw_step(list);
     return 1;
 }
 
@@ -1087,6 +1091,7 @@ int bd12_cmd_draw_indirect_count(BD12CmdList *list, BD12Buffer *args,
     list->device->vk.CmdDrawIndirectCount(
         list->command_buffer, args->buffer, offset, count_buffer->buffer,
         count_offset, max_count, stride ? stride : 16);
+    bd12_capture_draw_step(list);
     return 1;
 }
 
@@ -1187,6 +1192,7 @@ int bd12_cmd_draw_indexed_indirect_count(
     list->device->vk.CmdDrawIndexedIndirectCount(
         list->command_buffer, args->buffer, offset, count_buffer->buffer,
         count_offset, max_count, stride ? stride : 20);
+    bd12_capture_draw_step(list);
     return 1;
 }
 

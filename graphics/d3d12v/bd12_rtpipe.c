@@ -422,6 +422,14 @@ const uint8_t *bd12_rt_pipeline_identifier(BD12RtPipeline *p, const char *name)
     return NULL;
 }
 
+/* Ray tracing load (the [BD12 FPS] line): DispatchRays calls and launched rays since the last take. */
+static uint64_t g_rt_dispatches, g_rt_rays;
+void bd12_rt_stats_take(uint64_t *dispatches, uint64_t *rays)
+{
+    *dispatches = __atomic_exchange_n(&g_rt_dispatches, 0, __ATOMIC_RELAXED);
+    *rays = __atomic_exchange_n(&g_rt_rays, 0, __ATOMIC_RELAXED);
+}
+
 /* D3D12_DISPATCH_RAYS_DESC: raygen record {va, size}, then miss, hit group and callable tables {va, size, stride}, then
  * width, height, depth. */
 int bd12_cmd_dispatch_rays(BD12CmdList *list, BD12RtPipeline *p, const uint8_t *desc)
@@ -493,6 +501,8 @@ int bd12_cmd_dispatch_rays(BD12CmdList *list, BD12RtPipeline *p, const uint8_t *
     bd12_canary_check("DispatchRays bind");
     bd12_ckpt_mark(list, 202u, v[0], 0, dims[0], dims[1], dims[2]);   /* GPU checkpoint kind 202: DispatchRays */
     device->vk_rt.CmdTraceRaysKHR(list->command_buffer, &raygen, &miss, &hit, &callable, dims[0], dims[1], dims[2]);
+    __atomic_add_fetch(&g_rt_dispatches, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_rt_rays, (uint64_t)dims[0] * dims[1] * dims[2], __ATOMIC_RELAXED);
     bd12_canary_check("vkCmdTraceRays");
     if (capture) {
         bd12_capture_record(list, 1, capture_hash, dims[0], dims[1], dims[2]);

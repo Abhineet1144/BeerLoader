@@ -1107,6 +1107,7 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
         record_dispatch(list, x, y, z, 0);
         list->device->vk.CmdDispatch(list->command_buffer, x, y, z);
         bd12_rp_snap_uav_after(list, &list->compute, pso->shader_hash, x, y, z);
+        bd12_capture_dispatch_step(list, &list->compute, pso->shader_hash);
         return 1;
     }
     if (!pso || !pso->set_layout || (!list->compute.root_signature && !list->resolve_hook)) {
@@ -1160,6 +1161,7 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
         }
         bd12_capture_end();
     }
+    bd12_capture_dispatch_step(list, &list->compute, pso->shader_hash);
     return 1;
 }
 
@@ -1177,6 +1179,7 @@ int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
         if (!bind_compute_db(list, pso)) return 0;
         record_dispatch(list, 0, 0, 0, 1);
         list->device->vk.CmdDispatchIndirect(list->command_buffer, args->buffer, offset);
+        bd12_capture_dispatch_step(list, &list->compute, pso->shader_hash);
         return 1;
     }
     if (!pso || !pso->set_layout || (!list->compute.root_signature && !list->resolve_hook)) return 0;
@@ -1204,6 +1207,7 @@ int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
                                pso->bindless, pso->bindless_count,
                                pso->bindless_words);
     device->vk.CmdDispatchIndirect(list->command_buffer, args->buffer, offset);
+    bd12_capture_dispatch_step(list, &list->compute, pso->shader_hash);
     return 1;
 }
 

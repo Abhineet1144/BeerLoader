@@ -2094,6 +2094,8 @@ static const char *const beer_module_exports[][2] = {
     { "user32.dll", "SendInput" },
     { "user32.dll", "SendMessageA" },
     { "user32.dll", "SendMessageW" },
+        { "user32.dll", "SendNotifyMessageA" },
+        { "user32.dll", "SendNotifyMessageW" },
     { "user32.dll", "SetActiveWindow" },
     { "user32.dll", "SetCapture" },
     { "user32.dll", "SetCaretPos" },

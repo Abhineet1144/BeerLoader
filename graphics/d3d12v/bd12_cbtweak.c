@@ -243,7 +243,10 @@ void bd12_cbt_handle(const char *cmd, const char *request, char *out, size_t siz
     if (!strcmp(cmd, "gfx_frame_capture")) {     /* frame breakdown: {"dir": "<empty folder>"} */
         char dir[512] = "";
         if (!beer_json_string(request, "dir", dir, sizeof(dir)) || !dir[0]) { error_reply(out, size, "gfx_frame_capture needs dir"); return; }
-        if (!bd12_frame_capture_request(dir)) { error_reply(out, size, "a frame capture is already running"); return; }
+        char mode_text[16] = "passes";
+        beer_json_string(request, "mode", mode_text, sizeof(mode_text));
+        const int mode = !strcmp(mode_text, "compute") ? 1 : !strcmp(mode_text, "all") ? 2 : 0;
+        if (!bd12_frame_capture_request(dir, mode)) { error_reply(out, size, "a frame capture is already running"); return; }
         snprintf(out, size, "{\"ok\":true}\n");
         return;
     }

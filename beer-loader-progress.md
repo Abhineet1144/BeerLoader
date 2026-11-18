@@ -77,11 +77,94 @@ Proton, DLSS, DLSS FG + Reflex (XMM6 fix), RE9 DX12U mesh path (barycentrics). U
      STYLESTRUCT/WM_SETTEXT copied below 4 GiB), Set/GetWindowLong(GWL_WNDPROC), CallWindowProc, RegisterClass(Ex)W,
      Peek/Get/DispatchMessageW (28-byte MSG). loader.c: predefined control classes (STATIC, BUTTON, EDIT, ...) now
      exist with DefWindowProcW when not registered by the program (was ERROR_CLASS_DOES_NOT_EXIST).
-   NEXT: setup.tmp (child) stops at GetDC/GetDeviceCaps -> NULL call. It imports 377 more functions: user32 153,
+  Previous boundary: setup.tmp (child) stopped at GetDC/GetDeviceCaps -> NULL call. It imports 377 more functions: user32 153,
    gdi32 82, comctl32 35, kernel32 43, oleaut32 15, ole32 13, advapi32 12, shell32 8, mpr 5, winspool 5, version 3,
    comdlg32 2, msimg32 1. Also needed: CreateThread/ExitThread (WOW32 threads), SEH (RaiseException/RtlUnwind,
    FS:[0] chain; Delphi raises in normal flow), 32-bit DLL images (FitGirl's ISDone/unarc). Beer draws no standard
    controls, so the wizard UI would be invisible: try Inno's `/VERYSILENT /SUPPRESSMSGBOXES /DIR=...` path first.
+   FOLLOW-UP 2026-11-19 (user paused TLauncher to work on this installer):
+   - Reproduced against `/mnt/hdd1/Downloads/setup.exe` in isolated prefix
+     `~/.local/share/beer/prefixes/installer-test`. All launches used transient services with ExitType=cgroup,
+     RuntimeMaxSec=65, MemoryMax=6G, MemorySwapMax=0 and BEER_PHYS_MB=6144; no automatic installer clicks or install.
+   - Important general ABI finding: an unknown import currently receives a zero-returning thunk with arg_bytes=0.
+     For stdcall APIs with arguments this leaves the guest stack unbalanced. The resulting later EIP=0/stack-data
+     jumps were NOT all independent missing function pointers. Do not guess missing signatures or claim the
+     unsupported-import policy itself is fixed; this session adds known signatures only.
+   - Added PE32 forwarding for existing GetDC/GetWindowDC/ReleaseDC/GetDeviceCaps, CreatePalette/GetStockObject,
+     CreateFontIndirectW, LoadIconW/LoadCursorW, MulDiv, SystemParametersInfoW, GetKeyboardLayout, SetWindowTextW,
+     plus existing OLE initialization and class/menu compatibility handlers with correct stdcall argument bytes.
+     Some existing shared handlers (OLE/menu/class icon behavior) remain limited/stubs; exposing them is not a
+     claim of full COM/menu support. No title-specific branches, guest EXE edits, or failure bypasses.
+   - Added custom PE32 GetObjectW marshaling: LOGFONTW92/LOGPEN16 fixed layouts, LOGBRUSH12, BITMAP24/DIBSECTION84.
+     Refuses to truncate bitmap data pointers above 4 GiB. Added WNDCLASSW40 output marshaling with guest/native
+     WndProc identity conversion; CharLowerW character/string semantics; GetKeyboardLayoutList uses 4-byte HKL
+     output slots (native output slots are 8 bytes). ImmIsIME returns false coherently with the single ordinary
+     installed keyboard layout; this resolved an actual unguarded dynamic lookup/call in Delphi initialization.
+   - BEER_W32_TRACE now names unresolved GetProcAddress requests. Debugger read-only child-following runs showed
+     the later balanced-stack null call returned to 0x53aecc (ImmIsIME wrapper). Diagnostic files:
+     `/tmp/beer-setup-baseline.log`, `/tmp/beer-setup-gdi.log`, `/tmp/beer-setup-keyboard.log`,
+     `/tmp/beer-setup-gdb2.log`; `/tmp/beer-setup-child.core` is an investigation dump, not a guest patch.
+   - Latest run `/tmp/beer-setup-title.log`: child passes VCL initialization, creates hidden application windows,
+     sets title, opens source installer, seeks to overlay offset0x5a0027 and reads/decompresses metadata (including
+     64 MiB VirtualAlloc). Then faults at child EIP0x425042 reading0x8 (EAX/EBX0). Root cause NOT established:
+     examine original fault and surrounding Delphi exception state before blaming decompression or payload.
+     Parent shutdown fault at0x40681e remains (was reproduced, not resolved). No visible wizard/install success.
+   - Regression coverage in tests/native_loader_contract_test.c: exact API argument byte counts, DC/DPI and signed
+     MulDiv forwarding, LOGFONT/brush/bitmap/class-info and keyboard-list canaries, short bitmap rejection,
+     procedure identity round-trip and CharLowerW. make test-native-loader and full make test-input passed;
+     final test rerun below/terminal log `/tmp/beer-setup-final-contract.log`. Changes are WoW32-scoped; no new
+     RE8/RE9 live gates performed for this increment. Concurrent unrelated graphics/NGX edits were left untouched.
+   FOLLOW-UP, same date ("continue a bit more"):
+   - Identified why the metadata lists were null: Delphi's own unit runner had completed only33 of153 units.
+     GlobalAddAtomW and RegisterWindowMessageW had actually executed with unknown-import arg_bytes0 and damaged
+     its stack. Correct4-byte forwarders to existing implementations move initialization to unit51. This was
+     NOT evidence that the loader should run CRT constructors itself: the executable already runs its own units.
+   - Next real fault0x4090ce reads static TLS through FS:[0x2c], which was null. Implemented PE32 executable TLS:
+     relocated directory VAs, DWORD vector/index0 (separate from dynamic TlsAlloc slots), copied template,
+     zero-filled tail, PE alignment, bounded template/index checks, per-thread setup, and process-attach TLS
+     callbacks before entry. PE32 DLL loading/thread creation remain unsupported; this is not full WoW64 TLS.
+   - Added observed RegisterClipboardFormatW4 forwarding and CoInitialize4 forwarding to existing compatibility
+     handler (not full COM). Native-loader tests now cover TLS template contents,64-byte alignment, zero-fill,
+     distinct thread blocks, malformed ranges/index/alignment/oversize and no-directory behavior.
+   - Verified new live core: unit counter0x553af8=0x99 (153), list globals0x556eac populated. Old metadata fault
+     0x425042 is passed. Parent also now exits via ExitProcess(139), propagating the failed child result, instead
+     of the old cleanup0x40681e fault; consistent with TLS being required there too, not a shutdown bypass.
+   - Current first observed failing call: missing SendNotifyMessageW(hwnd0xd0000001,msg0x496,wparam0x2711,0),
+     leaves16 argument bytes on stack and child jumps into stack0x1010ff78. Latest logs:
+     `/tmp/beer-setup-more-final.log`, `/tmp/beer-setup-more-core.log`; `/tmp/beer-setup-child.core` now describes
+     THIS boundary (overwrites the prior metadata dump). Missing AllocateAndInitializeSid was also called and
+     remains unsupported; must marshal its PSID* output to32 bits, not forward a native8-byte output pointer.
+   - make test-native-loader passes including the final new signatures; full make test-input passes after TLS
+     changes. git diff --check/editor diagnostics clean. All live services retained65s/6GiB caps and no inputs.
+     No visible wizard or installation success. Unrelated concurrent graphics/NGX/loader edits left untouched.
+   FOLLOW-UP, same date ("continue a bit moree"):
+   - Implemented SendNotifyMessageW/A in shared USER32 and exported it with16-byte PE32 signatures. Same-owner
+     calls run synchronously and return BOOL success, not WndProc LRESULT. Other-owner calls allocate bounded
+     heap-owned sent messages and return without waiting or executing on the wrong thread. Owner pumps deliver
+     them through process_sent_messages, not the posted-message queue/filter. Broadcast snapshots top-level
+     windows excluding child/message-only windows; common system pointer messages reject ERROR_MESSAGE_SYNC_ONLY.
+     This remains process-local like the existing window registry: cross-process HWND routing is not implemented.
+   - Added PE32 AllocateAndInitializeSid44/FreeSid4 using the low-memory heap and exactly4-byte PSID* output.
+     Exposed existing CheckTokenMembership12 (BOOL* output is already fixed-width); it follows the shared
+     elevation/membership model, not an installer-specific administrator bypass. Dynamic membership lookup now
+     succeeds rather than entering the installer's unsupported OpenThreadToken fallback.
+   - Notification tests cover zero-LRESULT returning TRUE, invalid handles, pointer-message rejection, broadcast
+     exclusions, and barrier-coordinated real worker delivery without a posted message despite a filtering pump.
+     SID tests cover authority/subauthority bytes, zero-count SID, count>8 rejection, pointer/output canaries,
+     FreeSid and actual shared administrator membership result. API bytes and USER32 export ownership checked.
+   - Final run `/tmp/beer-setup-notify-final.log`: notification and SID paths passed. Child reads more embedded
+     resources, then calls missing CreateDIBSection(dc0xdc000001,info0x15360ba0,usage0,bits_out0x1010fd90,...).
+     It returns0 and Delphi raises0x0eedfade through missing PE32 RaiseException; unknown-thunk cleanup then jumps
+     to EIP1. The initiating failure is unavailable DIB creation, not proof of corrupt compressed metadata.
+     No visible wizard or installation. All launches65s/6GiB service-capped, no automated inputs/install flags.
+   - make test-native-loader, make test-input, make test-native-sync PASS; editor diagnostics and diff-check clean.
+     Logs `/tmp/beer-setup-notify-final-tests.log`, `/tmp/beer-setup-notify-input.log`, `/tmp/beer-setup-notify-sync.log`.
+     No RE8/RE9 live gates in this increment; unrelated concurrent edits preserved. Shared native message dispatch
+     changed, so full-game gates remain desirable before calling this broadly regression-tested.
+   NEXT: genuine PE32 CreateDIBSection needs low-address pixels and4-byte ppvBits output; native backend currently
+   allocates pixels itself and ignores section/offset (do not silently truncate/copy disconnected pixel storage).
+   Proper PE32 RaiseException/SEH remains necessary; do not make exceptions return success. Other real APIs,
+   worker threads/DLL loading and unknown-stdcall failure policy remain. TLauncher stays on hold.
   Chained Together: **RESOLVED 2026-11-17, user confirmed solo gameplay works.** The earlier lobby diagnosis
   was superseded: missing SteamNetworkingSockets identity and real P2P listener/poll-group support blocked
   the solo listen server. See the resolution at the top; multiplayer remains unverified.
@@ -5722,3 +5805,116 @@ on_settings_changed.
   - SDK game.find_pattern, @mod.on_exit (runs once; skipped when the game is gone) and @mod.on_settings_changed
     (polls settings.json mtime every 1 s).
 - The library entry for Sekiro has Beer fps_limit 120, which applies on top when launched from the manager.
+
+- **PENDING 0o (user, 2026-11-19):** RE9 path tracing is still slow and noisy compared with Proton and Windows.
+  Queued after the Stellar Blade DXR work.
+
+## 2026-11-19 DXR: local root signatures + collections. Stellar Blade starts with DXR on (user: "works perfectly")
+
+Symptoms and keywords: "RayTracingDevice->CreateStateObject failed (D3D12RayTracing.cpp:359)", libraries=0,
+EXISTING_COLLECTION, local root signature, shader record, UE5 ray tracing.
+
+- **Cause:** UE5 makes one COLLECTION state object per shader (raygen, miss, hit group), then a RAYTRACING_PIPELINE
+  built only from EXISTING_COLLECTION subobjects. Beer required a DXIL library in the same state object and had no
+  local root signatures.
+  - UE's local root signature: root SRV t0/t1 space 2 plus 4 root constants b0 space 2. The raygen's is empty.
+- **Implemented:**
+  - bd12_com.c dev_create_state_object:
+    - local root signatures are converted to BeerD3D12LocalParam, with appended table ranges resolved;
+    - SUBOBJECT_TO_EXPORTS associations are explicit per export; NumExports=0 and unassociated signatures become the
+      default;
+    - EXISTING_COLLECTION merges the collection's libraries (deep copy of exports), hit groups, locals and configs;
+      the collection is recognised by either of its vtables (collection_desc).
+    - Not yet supported, and logged: DXIL-defined associations (type 8), collection export lists, and static
+      samplers in local root signatures.
+  - d3d12_dxil_translator.c: beer_d3d12_dxil_translate_library takes a local-signature lookup per entry point.
+    - It calls dxil-spirv add_local_root_constants/_descriptor/_descriptor_table (begin/end).
+    - Local table registers become heap accesses (set 1, binding = heap class, use_heap), and
+      BeerD3D12RtShader.uses_heap is set.
+  - bd12_rtpipe.c:
+    - the entry name goes through the export rename, then an association, then a hit group containing it, then the
+      default;
+    - with uses_mirror, the layout includes the mirror set and the dispatch binds it even with 0 bindless words.
+  - The shader-record layout is D3D12's; the 32-byte Vulkan handle equals the identifier size. Root descriptors are
+    buffer device addresses (BD12 VAs are vkGetBufferDeviceAddress). Table handles >> 7 give heap indices
+    (handle = heap window + index*128).
+  - BEER_DXR_DUMP now also prints EXISTING_COLLECTION, DXIL_ASSOCIATION, STATE_OBJECT_CONFIG, PIPELINE_CONFIG1 and
+    NODE_MASK.
+- **Result:**
+  - SB builds its pipelines from collections ("3 local root signatures") and no longer aborts.
+  - One unattended run reached device lost about 2 minutes in, with no ray dispatch ever issued, so it was not the DXR
+    path; the Xid was lost to a reboot.
+  - The user then played and saw no device loss: "works perfectly".
+  - Not yet run after these changes: the RE8 gate and the RE9 smoke check (they share the RT translator).
+
+## 2026-11-19 RE9 path tracing: findings + AS builds no longer drained (PENDING 0o, partly)
+
+Symptoms and keywords: RE9 path tracing slow, noisy, 25 fps against Proton ~60 rendered (120 with FG), DLSS Ray
+Reconstruction, low GPU power, BLAS refit, CmdBuildAccelerationStructures barriers, GPU PROF copy-buf 16 ms.
+
+- **New diagnostics:**
+  - NGX logs every CreateFeature (id/name/render->output/result) plus evaluation counts (1 SR, 11 FG, 13 RR).
+  - [BD12 FPS] appends rays/dispatches per frame when DispatchRays is used.
+  - GPU PROF tags buffer copies by kind: 0x<src heap><dst heap><src host><dst host><log2 size>.
+  - GPU PROF gives AS builds their own entries ("as-build", 0x<1 TLAS/2 BLAS><update><descs>) and AS copies
+    ("as-copy"). Builds used to be charged to the op before them: the bogus "16 ms upload->default copy" was
+    really the BLAS refits.
+- **Findings:**
+  - RR is created (feature 13) and evaluates fine, so it is not missing.
+  - The render size follows the game's DLSS mode: Ultra Performance 853x480, Performance 1280x720, Balanced
+    1485x835 at 1440p.
+  - RE9 PT uses inline ray queries (0 DispatchRays) and no NVAPI RT extensions (no GetRaytracingCaps, SER or OMM
+    queries).
+  - VRAM 11.7/13.7 GB with no fallback; the CPU is not saturated; there is no async compute; cross-queue waits are
+    not held (they pass once the signal is queued).
+  - GPU at P0 2700 MHz but 97% busy at only 123 W of 285.
+  - Per frame (profiler, ~48 ms GPU): ~240 BLAS update builds (~13 ms serialised), PT dispatch bcc3d56fa7bc6c
+    5.7 ms, dispatch-ind 76ec92b1acd9b4 2x1.9 ms, ~58 clears 3.4 ms, dispatch f36486d2503cea ~790x, plus a long
+    tail.
+  - Barriers per 2 s window: 24.8k, of which 3.2k are full drains (~85 per frame; sources not yet split:
+    aliasing, AS copies, COMMON transitions).
+- **Fix (now default):**
+  - bd12_state_sync adds the AS build stage plus AS read/write to the UAV/SRV/CBV/index states, and maps
+    RAYTRACING_ACCELERATION_STRUCTURE (0x400000). Buffer UAV barriers include AS_WRITE.
+  - bd12_cmd_build_as no longer drains before and after every build (BEER_BD12_AS_BARRIERS=full restores it).
+  - RE9 PT: 25 -> 27-33 fps, power 123 -> 167 W, GPU utilisation ~62%. No visual change (user).
+  - RE8 80 s gate OK (title, 139-172 fps). RE8 RT gameplay and Stellar Blade were not re-run with it.
+- **Next (proposed):**
+  - Wine/vkd3d-proton oracle run at the same spot: per-shader GPU times + VKD3D_SHADER_DUMP_PATH SPIR-V of
+    bcc3d56fa7bc6c / 76ec92b1acd9b4 / f36486d2503cea, diffed against Beer's translation. This should cover both
+    the slowness and the noise (RR works, so suspect PT shader translation).
+  - Batch consecutive AS builds into one vkCmdBuildAccelerationStructuresKHR, as vkd3d-proton does.
+  - Split the ~85 full drains per frame by call site.
+
+## 2026-11-19 Frame breakdown: three modes (passes / + compute / every draw and dispatch)
+
+Symptoms and keywords: frame capture, frame breakdown, gfx_frame_capture mode, compute outputs, per-draw capture,
+CmdBlitImage driver crash.
+
+- **Protocol:** gfx_frame_capture {dir, mode: "passes" (default, unchanged) | "compute" | "all"}.
+  - All steps share one counter (g_step_seq), so render passes, draws and dispatches sort in recording order.
+  - Files: rt####_a<i>_… (colour), rt####_dp…_l… (depth), cs####_u<reg>_… (compute UAV image).
+- **compute mode:** after every dispatch (root-push, per-draw and indirect paths), bd12_capture_dispatch_step walks
+  the root signature's UAV table ranges into list->heaps[0] descriptors (BD12_DESC_UAV_IMAGE), up to 8 images,
+  saved at half size.
+  - Not seen: SM 6.6 heap-indexed UAVs and root UAVs (buffers).
+- **all mode:** every draw ends its rendering scope (bd12_capture_draw_step). The pass capture then records the
+  bound colour targets at quarter size; no depth.
+  - The reduction is a GPU blit into a temporary image, freed after the readback. Formats without BLIT_SRC/DST fall
+    back to a full-size copy: blitting such a format crashed the NVIDIA driver (libnvidia-glcore +0xdc41e5).
+  - Budget: 3 GB / 4096 captures, so later steps are dropped once it is full.
+- **Manager frame_window.py:** mode dropdown, Compute toggle, 240 px thumbnails in the grid, 2-minute wait in the
+  all mode.
+- **RE8 title test:**
+  - passes: 2.5 s, 29 colour + 6 depth.
+  - compute: 5.5 s, 45 colour + 14 depth + 21 compute (the HDR lighting buffer looks right).
+  - all: 19.5 s, 1244 colour + 9 compute (the budget was likely reached).
+  - Game back to 213 fps afterwards, no crash.
+- **2026-11-19: ~/.wine is NOT a valid RE9 comparison.** It reports an AMD GPU (user; it also renders wrongly).
+  - RE9 loads a different shader package there: vkd3d dump 2953x SM 6.2 + 214x SM 6.6, against Beer's 2224x SM 6.6.
+    Not one DXIL program or ILDN name overlaps.
+  - The only valid PT oracle is Steam Proton on NVIDIA. Steam launch option:
+    `VKD3D_SHADER_DUMP_PATH=<dir> VKD3D_SHADER_CACHE_PATH=<empty dir> %command%`. A fresh cache dir forces the
+    translation that dumps.
+  - vkd3d dumps only on a translation, never on a cache hit (libs/vkd3d-shader/dxil.c).
+  - Match shaders by the DXBC container hash at offset 4: identical blobs give identical hashes.

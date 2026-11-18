@@ -414,6 +414,71 @@ static void subclass_contract_test(void)
     beer_window_free(hw);
 }
 
+static unsigned notify_calls;
+static u32 notify_expected_tid;
+static u64 __attribute__((ms_abi)) notify_probe(u64 hw, u32 msg, u64 wp, u64 lp)
+{
+    assert(hw && msg == 0x8042 && wp == 3 && lp == 4);
+    assert(current_windows_thread_id() == notify_expected_tid);
+    ++notify_calls;
+    return 0; /* Successful notification must still return TRUE. */
+}
+typedef struct { u64 hwnd; pthread_barrier_t ready, pump; } NotifyWorker;
+static void *notify_worker(void *arg)
+{
+    NotifyWorker *worker = arg;
+    BeerWindow *w = beer_window_find(worker->hwnd);
+    assert(w);
+    w->owner_tid = (u32)current_windows_thread_id();
+    notify_expected_tid = w->owner_tid;
+    pthread_barrier_wait(&worker->ready);
+    pthread_barrier_wait(&worker->pump);
+    WIN_MSG msg;
+    /* Sent notifications execute despite a nonmatching posted-message filter
+     * and do not appear in the posted queue. */
+    assert(!impl_PeekMessageW(&msg, 0, 0x9000, 0x9001, 1));
+    return NULL;
+}
+static void notify_message_contract_test(void)
+{
+    assert(find_impl("SendNotifyMessageW") == (ImplFn)impl_SendNotifyMessageW);
+    int exported = 0;
+    for (size_t i = 0; i < sizeof(beer_module_exports) / sizeof(*beer_module_exports); ++i)
+        if (!strcmp(beer_module_exports[i][0], "user32.dll") &&
+            !strcmp(beer_module_exports[i][1], "SendNotifyMessageW")) exported = 1;
+    assert(exported);
+    BeerWindow *w = beer_window_new();
+    assert(w);
+    const u64 hw = w->hwnd;
+    w->owner_tid = notify_expected_tid = (u32)current_windows_thread_id();
+    w->proc = (u64)(uintptr_t)notify_probe;
+    assert(impl_SendNotifyMessageW(hw, 0x8042, 3, 4) == 1 && notify_calls == 1);
+    assert(!impl_SendNotifyMessageW(0x1234, 0x8042, 3, 4) && g_last_error == 1400);
+    assert(!impl_SendNotifyMessageW(hw, 0x000c, 0, 1) && g_last_error == 1159);
+    assert(impl_SendNotifyMessageW(0xffff, 0x8042, 3, 4) == 1 && notify_calls == 2);
+    w->style = 0x40000000u;
+    assert(impl_SendNotifyMessageW(0xffff, 0x8042, 3, 4) == 1 && notify_calls == 2);
+    w->style = 0;
+    w->parent = (u64)-3;
+    assert(impl_SendNotifyMessageW(0xffff, 0x8042, 3, 4) == 1 && notify_calls == 2);
+    w->parent = 0;
+    NotifyWorker worker = {.hwnd = hw};
+    pthread_barrier_init(&worker.ready, NULL, 2);
+    pthread_barrier_init(&worker.pump, NULL, 2);
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, notify_worker, &worker));
+    pthread_barrier_wait(&worker.ready);
+    assert(impl_SendNotifyMessageW(hw, 0x8042, 3, 4) == 1);
+    assert(notify_calls == 2); /* No wrong-thread fallback, no pumping required. */
+    assert(g_sent_head && g_sent_head->notify);
+    pthread_barrier_wait(&worker.pump);
+    pthread_join(thread, NULL);
+    assert(notify_calls == 3 && !g_sent_head);
+    pthread_barrier_destroy(&worker.ready);
+    pthread_barrier_destroy(&worker.pump);
+    beer_window_free(hw);
+}
+
 static _Atomic unsigned mm_timer_test_calls;
 static u64 mm_timer_test_done;
 static void __attribute__((ms_abi)) mm_timer_test_callback(u32 id, u32 message, u64 user, u64 a, u64 b)
@@ -499,11 +564,305 @@ static void legacy_dns_contract_test(void)
         g_win_hostent_storage = NULL;
 }
 
+static void wow32_sid_contract_test(void)
+{
+    u32 *b = w32_heap_alloc(32, 1);
+    assert(b);
+    const u8 authority[6] = {0, 0, 0, 0, 0, 5};
+    memcpy(b, authority, 6);
+    b[5] = 0xa1b2c3d4;
+    u32 args[11] = {(u32)(uintptr_t)b, 2, 32, 544, 0, 0, 0, 0, 0, 0,
+                    (u32)(uintptr_t)(b + 4)};
+    assert(w32_AllocateAndInitializeSid(args));
+    assert(b[4] && b[5] == 0xa1b2c3d4);
+    const u8 *sid = (void *)(uintptr_t)b[4];
+    assert(sid[0] == 1 && sid[1] == 2 && !memcmp(sid + 2, authority, 6));
+    u32 sub[2];
+    memcpy(sub, sid + 8, sizeof(sub));
+    assert(sub[0] == 32 && sub[1] == 544);
+    u32 member_args[] = {0, b[4], (u32)(uintptr_t)(b + 6)};
+    b[7] = 0xa1b2c3d4;
+    assert(w32_call_impl(find_impl("CheckTokenMembership"), member_args, 3) == 1);
+    assert(b[6] == (u32)beer_process_elevated() && b[7] == 0xa1b2c3d4);
+    u32 free_args[] = {b[4]};
+    assert(!w32_FreeSid(free_args));
+    b[4] = 0x12345678;
+    args[1] = 9;
+    assert(!w32_AllocateAndInitializeSid(args) && g_last_error == 87);
+    assert(b[4] == 0x12345678 && b[5] == 0xa1b2c3d4);
+    args[1] = 0;
+    assert(w32_AllocateAndInitializeSid(args));
+    sid = (void *)(uintptr_t)b[4];
+    assert(sid[0] == 1 && !sid[1]);
+    free_args[0] = b[4];
+    assert(!w32_FreeSid(free_args));
+    args[10] = 0;
+    assert(!w32_AllocateAndInitializeSid(args) && g_last_error == 87);
+    w32_heap_free(b);
+}
+
+static void wow32_static_tls_contract_test(void)
+{
+    u8 *image = w32_heap_alloc(512, 1);
+    assert(image);
+    W32Teb teb = {0};
+    DataDir dir = {.rva = 32, .size = sizeof(W32TlsDirectory)};
+    W32TlsDirectory *tls = (void *)(image + dir.rva);
+    tls->start = (u32)(uintptr_t)(image + 128);
+    tls->end = tls->start + 4;
+    tls->index = (u32)(uintptr_t)(image + 64);
+    tls->zero_fill = 28;
+    tls->characteristics = 7u << 20; /* 64-byte alignment */
+    memcpy(image + 128, "TLS!", 4);
+    *(u32 *)(image + 64) = 0xdeadbeef;
+    assert(w32_static_tls_init(&teb, image, 512, &dir));
+    assert(*(u32 *)(image + 64) == 0);
+    u32 *vector = (void *)(uintptr_t)teb.ThreadLocalStoragePointer;
+    u8 *block = (void *)(uintptr_t)vector[0];
+    assert(vector[0] && !(vector[0] & 63) && !memcmp(block, "TLS!", 4));
+    for (size_t i = 4; i < 32; ++i) assert(!block[i]);
+    block[0] = 'x';
+    W32Teb second = {0};
+    assert(w32_static_tls_init(&second, image, 512, &dir));
+    u32 *second_vector = (void *)(uintptr_t)second.ThreadLocalStoragePointer;
+    assert(second_vector[0] != vector[0]);
+    assert(!memcmp((const void *)(uintptr_t)second_vector[0], "TLS!", 4));
+    assert(!munmap(vector, 0x10000) && !munmap(second_vector, 0x10000));
+
+    teb.ThreadLocalStoragePointer = 0;
+    tls->end = tls->start - 1;
+    assert(!w32_static_tls_init(&teb, image, 512, &dir));
+    tls->end = tls->start + 4;
+    tls->index = (u32)(uintptr_t)(image + 510);
+    assert(!w32_static_tls_init(&teb, image, 512, &dir));
+    tls->index = (u32)(uintptr_t)(image + 64);
+    tls->characteristics = 15u << 20;
+    assert(!w32_static_tls_init(&teb, image, 512, &dir));
+    tls->characteristics = 0;
+    tls->zero_fill = UINT32_MAX;
+    assert(!w32_static_tls_init(&teb, image, 512, &dir));
+    dir.rva = 510;
+    assert(!w32_static_tls_init(&teb, image, 512, &dir));
+    dir.size = 0;
+    assert(w32_static_tls_init(&teb, image, 512, &dir));
+    assert(!teb.ThreadLocalStoragePointer);
+    w32_heap_free(image);
+}
+
+static void wow32_ui_contract_test(void)
+{
+    const W32Api expected[] = {
+        {"GetDC", NULL, 4}, {"GetWindowDC", NULL, 4}, {"ReleaseDC", NULL, 8},
+        {"GetDeviceCaps", NULL, 8}, {"CreatePalette", NULL, 4},
+        {"GetStockObject", NULL, 4}, {"LoadIconW", NULL, 8}, {"LoadCursorW", NULL, 8},
+        {"MulDiv", NULL, 12}, {"SystemParametersInfoW", NULL, 16},
+        {"CreateFontIndirectW", NULL, 4}, {"GetKeyboardLayout", NULL, 4},
+        {"SetClassLongW", NULL, 12}, {"GetSystemMenu", NULL, 8}, {"DeleteMenu", NULL, 12},
+        {"OleInitialize", NULL, 4}, {"OleUninitialize", NULL, 0}, {"CoInitialize", NULL, 4},
+        {"GetObjectW", w32_GetObjectW, 12}, {"GetClassInfoW", w32_GetClassInfoW, 12},
+        {"CharLowerW", w32_CharLowerW, 4}, {"GetKeyboardLayoutList", w32_GetKeyboardLayoutList, 8},
+        {"ImmIsIME", w32_ImmIsIME, 4}, {"SetWindowTextW", NULL, 8},
+        {"RegisterWindowMessageW", NULL, 4}, {"GlobalAddAtomW", NULL, 4},
+        {"RegisterClipboardFormatW", NULL, 4},
+        {"SendNotifyMessageW", NULL, 16}, {"SendNotifyMessageA", NULL, 16},
+        {"AllocateAndInitializeSid", w32_AllocateAndInitializeSid, 44}, {"FreeSid", w32_FreeSid, 4},
+        {"CheckTokenMembership", NULL, 12}
+    };
+    for (size_t i = 0; i < sizeof(expected) / sizeof(*expected); ++i) {
+        const W32Api *api = w32_find_api(expected[i].name);
+        assert(api && api->arg_bytes == expected[i].arg_bytes && api->fn == expected[i].fn);
+        if (!api->fn) assert(find_impl(api->name));
+    }
+
+    /* No thunk initialization, GS/TEB access, or entry into guest code. All
+     * pointer-valued PE32 arguments and embedded pointers live below 2 GiB. */
+    struct Wow32UiBuffers {
+        u32 logfont[23];
+        u32 font[24];               /* LOGFONTW: 92 bytes, then canary. */
+        u32 brush[4];               /* LOGBRUSH32: 12 bytes, then canary. */
+        u32 bitmap[7];              /* BITMAP32: 24 bytes, then canary. */
+        u32 layouts[2];             /* HKL32: 4 bytes, then canary. */
+        u32 parameter[2];
+        u32 window_class[10];
+        u32 class_info[11];         /* WNDCLASS32: 40 bytes, then canary. */
+        u16 class_name[40];
+        u16 text[8];
+    } *b = w32_heap_alloc(sizeof(*b), 1);
+    assert(b && (uintptr_t)b > 0xffffu && (uintptr_t)b + sizeof(*b) <= 0x80000000ull);
+    const u32 canary = 0xa1b2c3d4u;
+    b->font[23] = b->brush[3] = b->bitmap[6] = b->layouts[1] = canary;
+    b->class_info[10] = b->parameter[1] = canary;
+
+    u32 args[4] = {0};
+    u64 dc = w32_call_impl(find_impl("GetDC"), args, 1);
+    assert(dc && dc <= UINT32_MAX);
+    args[0] = (u32)dc;
+    args[1] = 88; /* LOGPIXELSX */
+    assert(w32_call_impl(find_impl("GetDeviceCaps"), args, 2) == 96);
+    args[1] = 90; /* LOGPIXELSY */
+    assert(w32_call_impl(find_impl("GetDeviceCaps"), args, 2) == 96);
+    args[0] = 0;
+    args[1] = (u32)dc;
+    assert(w32_call_impl(find_impl("ReleaseDC"), args, 2) == 1);
+    args[0] = 0;
+    dc = w32_call_impl(find_impl("GetWindowDC"), args, 1);
+    assert(dc && dc <= UINT32_MAX);
+    args[0] = (u32)dc;
+    args[1] = 88;
+    assert(w32_call_impl(find_impl("GetDeviceCaps"), args, 2) == 96);
+    args[0] = 0;
+    args[1] = (u32)dc;
+    assert(w32_call_impl(find_impl("ReleaseDC"), args, 2) == 1);
+
+    const struct { s32 number, numerator, denominator, result; } muldiv[] = {
+        {21, 10, 3, 70}, {-21, 10, 1, -210}, {21, -10, 1, -210},
+        {21, 10, -1, -210}, {-21, -10, 1, 210}
+    };
+    for (size_t i = 0; i < sizeof(muldiv) / sizeof(*muldiv); ++i) {
+        args[0] = (u32)muldiv[i].number;
+        args[1] = (u32)muldiv[i].numerator;
+        args[2] = (u32)muldiv[i].denominator;
+        assert(w32_call_impl(find_impl("MulDiv"), args, 3) == (u32)muldiv[i].result);
+    }
+    args[0] = 0x000e; /* SPI_GETKEYBOARDSPEED: getter only. */
+    args[1] = 0;
+    args[2] = (u32)(uintptr_t)b->parameter;
+    args[3] = 0;
+    assert(w32_call_impl(find_impl("SystemParametersInfoW"), args, 4) == 1);
+    assert(b->parameter[0] == 31 && b->parameter[1] == canary);
+
+    b->logfont[0] = (u32)-19;
+    b->logfont[4] = 700;
+    ((u8 *)b->logfont)[20] = 1; /* italic */
+    ((u8 *)b->logfont)[23] = 1; /* DEFAULT_CHARSET */
+    const u16 face[] = {'A', 'r', 'i', 'a', 'l', 0};
+    memcpy((u8 *)b->logfont + 28, face, sizeof(face));
+    u64 font = beer_CreateFontIndirectW((const u8 *)b->logfont);
+    assert(font && font <= UINT32_MAX);
+    args[0] = (u32)(uintptr_t)b->logfont;
+    u64 forwarded_font = w32_call_impl(find_impl("CreateFontIndirectW"), args, 1);
+    assert(forwarded_font && forwarded_font <= UINT32_MAX);
+    u32 native_font[23];
+    assert(beer_GetObjectW(font, sizeof(native_font), native_font) == 92);
+    assert((s32)native_font[0] == -19 && native_font[4] == 700);
+    u64 fonts[] = {font, forwarded_font};
+    for (size_t i = 0; i < sizeof(fonts) / sizeof(*fonts); ++i) {
+        args[0] = (u32)fonts[i];
+        args[1] = args[2] = 0;
+        assert(w32_GetObjectW(args) == 92); /* Null output size query. */
+        args[1] = 92;
+        args[2] = (u32)(uintptr_t)b->font;
+        assert(w32_GetObjectW(args) == 92);
+        assert(!memcmp(b->font, native_font, 92) && b->font[23] == canary);
+    }
+    args[0] = 0; /* WHITE_BRUSH */
+    u64 brush = beer_GetStockObject(0);
+    assert(brush && brush <= UINT32_MAX);
+    assert(w32_call_impl(find_impl("GetStockObject"), args, 1) == brush);
+    args[0] = (u32)brush;
+    args[1] = args[2] = 0;
+    assert(w32_GetObjectW(args) == 12);
+    args[1] = 12;
+    args[2] = (u32)(uintptr_t)b->brush;
+    assert(w32_GetObjectW(args) == 12);
+    assert(b->brush[0] == 0 && b->brush[1] == 0xffffff && b->brush[2] == 0);
+    assert(b->brush[3] == canary);
+
+    u64 bitmap = beer_CreateCompatibleBitmap(0, 3, 2);
+    assert(bitmap && bitmap <= UINT32_MAX);
+    args[0] = (u32)bitmap;
+    args[1] = args[2] = 0;
+    assert(w32_GetObjectW(args) == 24);
+    memset(b->bitmap, 0xa5, 24);
+    args[1] = 23; /* A partial BITMAP must not be written. */
+    args[2] = (u32)(uintptr_t)b->bitmap;
+    assert(!w32_GetObjectW(args));
+    for (size_t i = 0; i < 6; ++i) assert(b->bitmap[i] == 0xa5a5a5a5u);
+    assert(b->bitmap[6] == canary);
+    args[1] = 24;
+    assert(w32_GetObjectW(args) == 24);
+    assert(b->bitmap[0] == 0 && b->bitmap[1] == 3 && b->bitmap[2] == 2);
+    assert(b->bitmap[3] == 12 && b->bitmap[4] == (32u << 16 | 1u));
+    assert(b->bitmap[5] == 0 && b->bitmap[6] == canary);
+
+    args[0] = 0;
+    u64 layout = w32_call_impl(find_impl("GetKeyboardLayout"), args, 1);
+    assert(layout);
+    args[1] = 0;
+    assert(w32_GetKeyboardLayoutList(args) == 1);
+    args[0] = 1;
+    args[1] = (u32)(uintptr_t)b->layouts;
+    assert(w32_GetKeyboardLayoutList(args) == 1);
+    assert(b->layouts[0] == layout && b->layouts[1] == canary);
+    u32 ime_args[] = {(u32)layout};
+    assert(!w32_ImmIsIME(ime_args));
+    args[0] = (u32)-1;
+    assert(!w32_GetKeyboardLayoutList(args) && g_last_error == 87);
+    assert(b->layouts[1] == canary);
+    args[0] = 1;
+    args[1] = 0;
+    assert(!w32_GetKeyboardLayoutList(args) && g_last_error == 87);
+
+    args[0] = 'Q';
+    assert(w32_CharLowerW(args) == 'q');
+    args[0] = '7';
+    assert(w32_CharLowerW(args) == '7');
+    const u16 mixed[] = {'A', 'b', 'Z', '9', '!', 0, 0x55aa, 0xaa55};
+    memcpy(b->text, mixed, sizeof(mixed));
+    args[0] = (u32)(uintptr_t)b->text;
+    assert(w32_CharLowerW(args) == args[0]);
+    assert(b->text[0] == 'a' && b->text[1] == 'b' && b->text[2] == 'z');
+    assert(b->text[3] == '9' && b->text[4] == '!' && !b->text[5]);
+    assert(b->text[6] == 0x55aa && b->text[7] == 0xaa55);
+
+    /* Registration builds a host bridge for this opaque guest address, but
+     * neither registration nor GetClassInfo executes the callback. Restore
+     * only the class slot and registration globals touched by this fixture. */
+    const char class_name[] = "BeerWow32UiContractFixture";
+    for (size_t i = 0; i < sizeof(class_name); ++i) b->class_name[i] = (u8)class_name[i];
+    int saved_count = g_window_class_count;
+    assert(saved_count < MAX_WINDOW_CLASSES);
+    __typeof__(g_window_classes[0]) saved_slot = g_window_classes[saved_count];
+    u64 saved_proc = g_window_proc, saved_last_proc = g_last_class_proc;
+    u64 saved_instance = g_window_instance, saved_icon = g_window_icon;
+    u64 saved_small_icon = g_window_small_icon;
+    u32 saved_registerclass = g_api_registerclass;
+    const u32 fields[] = {3, 0x123450, 8, 12, 0x400000, 0x20000001,
+        0x20000002, (u32)brush, 101, (u32)(uintptr_t)b->class_name};
+    memcpy(b->window_class, fields, sizeof(fields));
+    assert(w32_register_class(b->window_class, 0));
+    assert(g_window_class_count == saved_count + 1);
+    assert(g_window_classes[saved_count].info.lpfnWndProc != fields[1]);
+    assert(w32_proc_from_native(g_window_classes[saved_count].info.lpfnWndProc) == fields[1]);
+    args[0] = fields[4];
+    args[1] = fields[9];
+    args[2] = (u32)(uintptr_t)b->class_info;
+    assert(w32_GetClassInfoW(args) == 1);
+    assert(!memcmp(b->class_info, fields, 40) && b->class_info[10] == canary);
+    args[2] = 0;
+    assert(!w32_GetClassInfoW(args) && g_last_error == 87);
+    pthread_mutex_lock(&g_window_class_lock);
+    g_window_classes[saved_count] = saved_slot;
+    g_window_class_count = saved_count;
+    pthread_mutex_unlock(&g_window_class_lock);
+    g_window_proc = saved_proc;
+    g_last_class_proc = saved_last_proc;
+    g_window_instance = saved_instance;
+    g_window_icon = saved_icon;
+    g_window_small_icon = saved_small_icon;
+    g_api_registerclass = saved_registerclass;
+    assert(beer_DeleteObject(bitmap));
+    assert(beer_DeleteObject(forwarded_font));
+    assert(beer_DeleteObject(font));
+    w32_heap_free(b);
+}
+
 int main(void)
 {
     multimedia_timer_contract_test();
         legacy_dns_contract_test();
     subclass_contract_test();
+    notify_message_contract_test();
     native_crt_import_ownership_test();
     locale_info_contract_test();
     winsock_ordinal_contract_test();
@@ -772,6 +1131,9 @@ int main(void)
         == BEER_STATUS_NOT_IMPLEMENTED);
     assert(fake_pe_export_address(HMOD_NTDLL, "RtlCreateHeap") >=
         HMOD_NTDLL + FAKE_PE_TEXT_RVA + count * FAKE_PE_STUB_SLOT);
+    wow32_ui_contract_test();
+    wow32_static_tls_contract_test();
+    wow32_sid_contract_test();
     puts("native loader ABI/interoperability: PASS");
     return 0;
 }
