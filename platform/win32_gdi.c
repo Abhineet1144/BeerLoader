@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <errno.h>
+#include <limits.h>
+#include <sys/mman.h>
 
 #include "overlay_font.h"
 #include "win32_resource.h"
@@ -28,7 +31,15 @@ static void rgn_free(Rgn *r);
 typedef struct {
     int w, h, bpp, stride, topdown, is_dib;
     uint8_t *bits;
+    size_t mapping_len;          /* nonzero: pixels owned by mmap, not malloc */
 } Surface;
+
+static void surface_release(Surface *s)
+{
+    if (s->mapping_len) munmap(s->bits, s->mapping_len);
+    else free(s->bits);
+    memset(s, 0, sizeof(*s));
+}
 
 typedef struct {
     int type, stock;
@@ -86,7 +97,7 @@ static void obj_free(uint64_t handle)
 {
     Obj *o = obj_get(handle);
     if (!o) return;
-    if (o->type == OBJ_BITMAP) free(o->surface.bits);
+    if (o->type == OBJ_BITMAP) surface_release(&o->surface);
     if (o->type == OBJ_REGION) rgn_free(o->region);
     free(o);
     g_objects[handle - OBJ_BASE - 1] = NULL;
@@ -202,7 +213,7 @@ static void window_surface_ensure(void)
         h = state.client_height;
     }
     if (g_window.bits && g_window.w == w && g_window.h == h) return;
-    free(g_window.bits);
+    surface_release(&g_window);
     memset(&g_window, 0, sizeof(g_window));
     surface_alloc(&g_window, w, h, 32, 1);
 }
@@ -303,7 +314,7 @@ static int decode_dib(const uint8_t *info, const uint8_t *bits_override, Surface
             case 8: { uint32_t i = row[x]; if (i < colors) px |= (uint32_t)palette[i*4] | (uint32_t)palette[i*4+1] << 8 | (uint32_t)palette[i*4+2] << 16; break; }
             case 4: { uint32_t i = (row[x/2] >> ((x & 1) ? 0 : 4)) & 15; if (i < colors) px |= (uint32_t)palette[i*4] | (uint32_t)palette[i*4+1] << 8 | (uint32_t)palette[i*4+2] << 16; break; }
             case 1: { uint32_t i = (row[x/8] >> (7 - (x & 7))) & 1; if (i < colors) px |= (uint32_t)palette[i*4] | (uint32_t)palette[i*4+1] << 8 | (uint32_t)palette[i*4+2] << 16; break; }
-            default: free(out->bits); out->bits = NULL; return 0;
+            default: surface_release(out); return 0;
             }
             s_put(out, x, y, px);
         }
@@ -559,8 +570,9 @@ static uint64_t bitmap_from_surface(Surface *s)
 {
     uint64_t h = obj_new(OBJ_BITMAP);
     Obj *o = obj_get(h);
-    if (!o) { free(s->bits); return 0; }
+    if (!o) { surface_release(s); return 0; }
     o->surface = *s;
+    memset(s, 0, sizeof(*s)); /* ownership transferred to the bitmap */
     return h;
 }
 
@@ -798,26 +810,78 @@ uint64_t GDI_MS beer_CreateBitmap(int width, int height, uint32_t planes, uint32
     return h;
 }
 
-uint64_t GDI_MS beer_CreateDIBSection(uint64_t dc, const void *info, uint32_t usage, void **bits,
-                                      uint64_t section, uint32_t offset)
+static uint64_t create_dib_section(const void *info, void **bits, int low32)
 {
-    (void)dc; (void)usage; (void)section; (void)offset;
     if (bits) *bits = NULL;
-    if (!info) return 0;
+    if (!info) { errno = EINVAL; return 0; }
     Bih h;
     memcpy(&h, info, sizeof(h));
-    if (h.size < 40 || (h.bit_count != 32 && h.bit_count != 24) || (h.compression != 0 && h.compression != 3))
+    if (h.size < 40 || h.height == INT_MIN ||
+        (h.bit_count != 32 && h.bit_count != 24) || (h.compression != 0 && h.compression != 3)) {
+        errno = EINVAL;
         return 0;
+    }
+    if (low32 && h.compression == 3) {
+        uint32_t masks[3];
+        memcpy(masks, (const uint8_t *)info + 40, sizeof(masks));
+        if (masks[0] != 0xff0000 || masks[1] != 0xff00 || masks[2] != 0xff) {
+            errno = ENOTSUP; return 0;
+        }
+    }
     Surface s = {0};
-    if (!surface_alloc(&s, h.width, h.height < 0 ? -h.height : h.height, h.bit_count, h.height < 0)) return 0;
+    int height = h.height < 0 ? -h.height : h.height;
+    if (low32) {
+        if (h.planes != 1 || h.width <= 0 || h.width > 16384 || height <= 0 || height > 16384) {
+            errno = EINVAL; return 0;
+        }
+        s.w = h.width; s.h = height; s.bpp = h.bit_count; s.topdown = h.height < 0;
+        s.stride = ((s.w * s.bpp + 31) / 32) * 4;
+        size_t bytes = (size_t)s.stride * (size_t)s.h;
+        void *pixels = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+        if (pixels == MAP_FAILED) return 0;
+        if ((uintptr_t)pixels + bytes > 0x80000000ull) {
+            munmap(pixels, bytes); errno = ENOMEM; return 0;
+        }
+        s.bits = pixels;
+        s.mapping_len = bytes;
+    } else if (!surface_alloc(&s, h.width, height, h.bit_count, h.height < 0)) return 0;
     s.is_dib = 1;
     void *pixels = s.bits;
     LOCK();
     gdi_init();
     uint64_t handle = bitmap_from_surface(&s);
     UNLOCK();
+    if (!handle) errno = ENOMEM;
     if (handle && bits) *bits = pixels;
     return handle;
+}
+
+uint64_t GDI_MS beer_CreateDIBSection(uint64_t dc, const void *info, uint32_t usage, void **bits,
+                                      uint64_t section, uint32_t offset)
+{
+    (void)dc; (void)usage; (void)section; (void)offset;
+    return create_dib_section(info, bits, 0);
+}
+
+/* Internal PE32 path: same live bitmap storage, different allocator/owner.
+ * Section-backed DIBs and palette-index input are not supported here. */
+uint64_t beer_gdi_create_dib_section_low32(const void *info, void **bits)
+{
+    return create_dib_section(info, bits, 1);
+}
+
+uint32_t GDI_MS beer_GetDIBColorTable(uint64_t dc, uint32_t first, uint32_t count, void *colors)
+{
+    (void)first; (void)count; (void)colors;
+    LOCK();
+    Surface *s = dc_surface(dc_get(dc));
+    /* All DIB sections currently supported by this backend are true-color
+     * 24/32bpp, which have no RGBQUAD color table. Never fabricate entries or
+     * overwrite the caller's buffer. Indexed DIB creation remains unsupported. */
+    if (!s || !s->is_dib) errno = EINVAL;
+    UNLOCK();
+    return 0;
 }
 
 int GDI_MS beer_DeleteDC(uint64_t dc)
@@ -1210,7 +1274,7 @@ int GDI_MS beer_StretchDIBits(uint64_t dc, int xd, int yd, int wd, int hd, int x
         mark_dirty(d, s);
         lines = hs < 0 ? -hs : hs;
     }
-    free(src.bits);
+    surface_release(&src);
     UNLOCK();
     return lines;
 }

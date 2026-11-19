@@ -242,6 +242,10 @@ static pthread_mutex_t g_tls_array_mtx = PTHREAD_MUTEX_INITIALIZER;
 /* ── Globals ────────────────────────────────────────────────────── */
 static u8    *g_img     = NULL;   /* image base in our VA space    */
 static u64    g_img_size = 0;     /* loaded PE OptionalHeader.SizeOfImage */
+static int g_process_elevated;
+static int beer_security_init(const u8 *image, size_t size);
+static int beer_security_file_level(const char *path);
+static int beer_process_elevated(void);
 static u64    g_delta   = 0;      /* relocation delta              */
 static u32   *g_app_icon_pixels;
 static int    g_app_icon_width;
@@ -13457,7 +13461,7 @@ impl_FormatMessageW(u32 flags, u64 src, u32 msgid, u32 langid,
  * window keeps comparing against it, while messages, window procedures, DestroyWindow and window longs work per HWND.
  * UE's splash screen needs this: its window lives on its own thread, and WM_DESTROY posted to it must reach that
  * thread and that window's procedure. Message-only windows (parent HWND_MESSAGE) never take the native surface. */
-#define BEER_MAX_WINDOWS 64
+#define BEER_MAX_WINDOWS 512
 typedef struct {
     int used, visible;
     u64 hwnd, proc, userdata, instance, parent;
@@ -13578,8 +13582,10 @@ static void beer_other_paint_free(BeerWindow *w)
     w->paint_dc = w->paint_bitmap = 0;
     w->paint_w = w->paint_h = 0;
 }
+static void beer_ctl_destroy(u64 hwnd);
 static void beer_window_free(u64 hwnd)
 {
+    beer_ctl_destroy(hwnd);
     pthread_mutex_lock(&g_beer_windows_mtx);
     BeerWindow *w = beer_window_find(hwnd);
     if (w) w->used = 0;
@@ -13707,6 +13713,7 @@ static u64 register_window_class(const WIN_WNDCLASSEX *window_class, const char 
 /* GetClassInfoEx(instance, class, WNDCLASSEX *): a class registered in this process. Beer provides no
  * system control classes (BUTTON, EDIT, ...), so those report ERROR_CLASS_DOES_NOT_EXIST. The class
  * name pointer returned is the caller's own. */
+static u64 window_system_class_proc(u64 classname);
 static u64 get_class_info(u64 instance, u64 class_name, WIN_WNDCLASSEX *out, int wide)
 {
     (void)instance;
@@ -13722,7 +13729,18 @@ static u64 get_class_info(u64 instance, u64 class_name, WIN_WNDCLASSEX *out, int
             found = 1;
         }
     pthread_mutex_unlock(&g_window_class_lock);
-    if (!found) { g_last_error = 1411; return 0; }      /* ERROR_CLASS_DOES_NOT_EXIST */
+    if (!found) {
+        /* Predefined control classes (BUTTON, EDIT, LISTBOX, ...) exist in every process: programs fetch their window
+         * procedure to subclass it (Delphi's VCL keeps it as the control's default procedure). */
+        const u64 proc = window_system_class_proc(class_name);
+        if (!proc) { g_last_error = 1411; return 0; }      /* ERROR_CLASS_DOES_NOT_EXIST */
+        memset(out, 0, sizeof(*out));
+        out->cbSize = sizeof(*out);
+        out->style = 0x8;                                    /* CS_DBLCLKS */
+        out->lpfnWndProc = proc;
+        out->hbrBackground = 6;                              /* COLOR_WINDOW + 1 */
+        out->lpszClassName = class_name;
+    }
     return 1;                                            /* stable class atom, as RegisterClassEx returns */
 }
 static u64 __attribute__((ms_abi)) impl_GetClassInfoExW(u64 instance, u64 class_name, WIN_WNDCLASSEX *out)
@@ -19609,7 +19627,13 @@ static u64 create_surfaceless_window(u32 exstyle, u64 classname, u64 title, u32 
  * class of that name, such a window gets the default window procedure (a hidden STATIC window used for messages,
  * as Inno Setup's loader creates, then works). */
 static u64 __attribute__((ms_abi)) impl_DefWindowProcW(u64 hw, u32 msg, u64 wp, u64 lp);
+#include "platform/win32_controls.inc"
+static u64 window_system_class_proc(u64 classname);
 static int window_class_is_system(u64 classname)
+{
+    return window_system_class_proc(classname) != 0;
+}
+static u64 window_system_class_proc(u64 classname)
 {
     static const char *const names[] = { "static", "button", "edit", "listbox", "combobox", "scrollbar", "mdiclient",
                                          "richedit20w", "richedit20a", "msctls_progress32", "#32770" };
@@ -19618,7 +19642,7 @@ static int window_class_is_system(u64 classname)
     char key[128];
     window_class_key(classname, classname > 0xffffu && raw[0] && !raw[1], key, sizeof(key));
     for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i)
-        if (!strcmp(key, names[i])) return 1;
+        if (!strcmp(key, names[i])) return beer_system_control_proc(key);
     return 0;
 }
 
@@ -19627,7 +19651,7 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
                                u64 menu, u64 inst, u64 param, const char *native_title)
 {
     u64 class_proc = window_class_proc(classname);
-    if (!class_proc && window_class_is_system(classname)) class_proc = (u64)(uintptr_t)impl_DefWindowProcW;
+    if (!class_proc) class_proc = window_system_class_proc(classname);
     if (!class_proc) class_proc = g_last_class_proc ? g_last_class_proc : g_window_proc;
     if (!class_proc) { g_last_error = 1407; return 0; }
     if (parent == (u64)-3)                                            /* HWND_MESSAGE */
@@ -19992,7 +20016,7 @@ static u64 __attribute__((ms_abi))
 impl_IsWindow(u64 hw) { return beer_window_other(hw) != NULL || (hw == FAKE_HWND && xwayland_window_exists()); }
 static u64 __attribute__((ms_abi))
 impl_SetWindowTextW(u64 hw, u64 txt) {
-    if (beer_window_other(hw)) return 1;
+    if (beer_window_other(hw)) return call_window_proc(hw, 0x000c, 0, txt) ? 1 : 1;   /* WM_SETTEXT */
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     char title[512];
     window_title_from_wide((const u16 *)(uintptr_t)txt, title, sizeof(title));
@@ -20004,6 +20028,36 @@ impl_SetWindowTextA(u64 hw, u64 txt) {
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     return xwayland_window_set_title((const char *)(uintptr_t)txt);
 }
+static u64 __attribute__((ms_abi))
+impl_GetWindowTextW(u64 hw, u16 *buffer, s32 capacity)
+{
+    if (!buffer || capacity <= 0) return 0;
+    if (!beer_window_other(hw) && hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    buffer[0] = 0;
+    return call_window_proc(hw, 0x000d, (u64)(u32)capacity, (u64)(uintptr_t)buffer) & 0xffffffffu;
+}
+static u64 __attribute__((ms_abi))
+impl_GetWindowTextLengthW(u64 hw)
+{
+    if (!beer_window_other(hw) && hw != FAKE_HWND) { g_last_error = 1400; return 0; }
+    return call_window_proc(hw, 0x000e, 0, 0) & 0xffffffffu;
+}
+static u64 __attribute__((ms_abi))
+impl_GetWindowTextA(u64 hw, char *buffer, s32 capacity)
+{
+    if (!buffer || capacity <= 0) return 0;
+    const u64 length = impl_GetWindowTextLengthW(hw);
+    u16 *wide = malloc((length + 2) * sizeof(u16));
+    if (!wide) return 0;
+    const u64 n = impl_GetWindowTextW(hw, wide, (s32)(length + 1));
+    u64 out = 0;
+    for (; out < n && out + 1 < (u64)capacity; ++out) buffer[out] = wide[out] < 0x100 ? (char)wide[out] : '?';
+    buffer[out] = 0;
+    free(wide);
+    return out;
+}
+static u64 __attribute__((ms_abi))
+impl_GetWindowTextLengthA(u64 hw) { return impl_GetWindowTextLengthW(hw); }
 static int resize_native_from_outer(s32 x, s32 y, s32 w, s32 h,
                                     int move, int resize)
 {
@@ -22529,6 +22583,8 @@ impl_PostMessageW(u64 hw, u32 msg, u64 wp, u64 lp)
 {
     BeerWindow *other = beer_window_other(hw);
     if (other) return queue_message_for_thread(other->owner_tid, hw, msg, wp, lp);
+    /* PostMessage(NULL, ...) is a thread message for the calling thread (Application.Terminate's WM_QUIT). */
+    if (!hw) return queue_message_for_thread((u32)current_windows_thread_id(), 0, msg, wp, lp);
     if (hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     /* PostMessage targets the window's owning thread, not the calling thread. */
     return queue_window_message(msg, wp, lp);
@@ -22624,13 +22680,24 @@ impl_DefWindowProcW(u64 hw, u32 msg, u64 wp, u64 lp)
             if (!(flags & 0x0001)) call_window_proc(hw, 0x0005, 0, (u64)(u16)cx | ((u64)(u16)cy << 16));
             return 0;
         }
-        return msg == 0x0081 || msg == 0x0014 || msg == 0x0086 ? 1 : 0; /* NCCREATE, ERASEBKGND, NCACTIVATE */
+        switch (msg) {
+        case 0x0081: beer_ctl_on_create(hw, (const WIN_CREATESTRUCT *)(uintptr_t)lp); return 1;   /* NCCREATE */
+        case 0x000c: beer_ctl_set_text(hw, (const u16 *)(uintptr_t)lp); return 1;                /* WM_SETTEXT */
+        case 0x000d: return beer_ctl_get_text(hw, (u16 *)(uintptr_t)lp, wp);                     /* WM_GETTEXT */
+        case 0x000e: return beer_ctl_get_text(hw, NULL, 0);                                      /* WM_GETTEXTLENGTH */
+        default: break;
+        }
+        return msg == 0x0014 || msg == 0x0086 ? 1 : 0;                  /* ERASEBKGND, NCACTIVATE */
     }
     if (hw != FAKE_HWND) return 0;
     switch (msg) {
+        case 0x000c: beer_ctl_set_text(hw, (const u16 *)(uintptr_t)lp); return 1;                /* WM_SETTEXT */
+        case 0x000d: return beer_ctl_get_text(hw, (u16 *)(uintptr_t)lp, wp);                     /* WM_GETTEXT */
+        case 0x000e: return beer_ctl_get_text(hw, NULL, 0);                                      /* WM_GETTEXTLENGTH */
         case 0x0010: /* WM_CLOSE */
             return impl_DestroyWindow(hw);
         case 0x0081: /* WM_NCCREATE */
+            beer_ctl_on_create(hw, (const WIN_CREATESTRUCT *)(uintptr_t)lp);
             return 1;
         case 0x000f: /* WM_PAINT */
             /* Default handling: validate the whole client area to stop the
@@ -27950,6 +28017,11 @@ static ImplEntry g_impls[] = {
     {"GetKeyNameTextW",                       (ImplFn)impl_GetKeyNameTextW},
     {"GetKeyNameTextA",                       (ImplFn)impl_GetKeyNameTextA},
     {"HidP_GetCaps",                          (ImplFn)impl_HidP_GetCaps},
+    {"RegCreateKeyExW", (ImplFn)impl_RegCreateKeyExW}, {"RegCreateKeyExA", (ImplFn)impl_RegCreateKeyExA},
+    {"RegSetValueExW", (ImplFn)impl_RegSetValueExW}, {"RegSetValueExA", (ImplFn)impl_RegSetValueExA},
+    {"RegDeleteValueW", (ImplFn)impl_RegDeleteValueW}, {"RegDeleteValueA", (ImplFn)impl_RegDeleteValueA},
+    {"RegDeleteKeyW", (ImplFn)impl_RegDeleteKeyW}, {"RegDeleteKeyA", (ImplFn)impl_RegDeleteKeyA},
+    {"RegDeleteKeyExW", (ImplFn)impl_RegDeleteKeyExW}, {"RegDeleteKeyExA", (ImplFn)impl_RegDeleteKeyExA},
     {"RegQueryInfoKeyW",                      (ImplFn)impl_RegQueryInfoKeyW},
     {"RegQueryInfoKeyA",                      (ImplFn)impl_RegQueryInfoKeyA},
     {"RegEnumKeyExW",                         (ImplFn)impl_RegEnumKeyExW},
@@ -28593,6 +28665,10 @@ static ImplEntry g_impls[] = {
     {"SystemParametersInfoA",                 (ImplFn)impl_SystemParametersInfoA},
     {"SystemParametersInfoW",                 (ImplFn)impl_SystemParametersInfoW},
     {"SetWindowTextW",                        (ImplFn)impl_SetWindowTextW},
+    {"GetWindowTextW",                        (ImplFn)impl_GetWindowTextW},
+    {"GetWindowTextA",                        (ImplFn)impl_GetWindowTextA},
+    {"GetWindowTextLengthW",                  (ImplFn)impl_GetWindowTextLengthW},
+    {"GetWindowTextLengthA",                  (ImplFn)impl_GetWindowTextLengthA},
     {"SetWindowTextA",                        (ImplFn)impl_SetWindowTextA},
     {"MoveWindow",                            (ImplFn)impl_MoveWindow},
     {"SetWindowPos",                          (ImplFn)impl_SetWindowPos},
@@ -28622,6 +28698,7 @@ static ImplEntry g_impls[] = {
     {"DrawTextA", (ImplFn)beer_DrawTextA},
     {"GetWindowDC", (ImplFn)beer_GetWindowDC},
     {"CreateCompatibleDC", (ImplFn)beer_CreateCompatibleDC},
+    {"GetDIBColorTable", (ImplFn)beer_GetDIBColorTable},
     {"CreateCompatibleBitmap", (ImplFn)beer_CreateCompatibleBitmap},
     {"CreateBitmap", (ImplFn)beer_CreateBitmap},
     {"CreateDIBSection", (ImplFn)beer_CreateDIBSection},
@@ -29724,6 +29801,8 @@ static int pe_resource_data_by_id(const u8 *root, size_t resource_size,
     *size = entry->size;
     return 1;
 }
+
+#include "platform/win32_process_security.inc"
 
 static void pe_load_application_icon(void)
 {
@@ -31638,9 +31717,10 @@ static void *alloc_teb_for_thread(void)
     memset(tls_array, 0, (size_t)TLS_SLOTS * sizeof(u64));
 
     /* Copy the executable's implicit TLS initializer data (slot 0). */
-    NtHdrs64 *nt = (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew);
-    DataDir  *tls_dir = &nt->opt.dirs[9]; /* IMAGE_DIRECTORY_ENTRY_TLS */
-    if (tls_dir->size) {
+    /* A 32-bit (WoW32) process has no PE32+ image here: its threads build their own TEB32 and TLS vector. */
+    NtHdrs64 *nt = g_img ? (NtHdrs64 *)(g_img + ((DosHdr *)g_img)->lfanew) : NULL;
+    DataDir  *tls_dir = nt ? &nt->opt.dirs[9] : NULL; /* IMAGE_DIRECTORY_ENTRY_TLS */
+    if (tls_dir && tls_dir->size) {
         TLS_DIR64 *td = (TLS_DIR64 *)(g_img + tls_dir->rva);
         u64 raw_sz = td->EndAddr - td->StartAddr;
         u64 total_sz = raw_sz + td->SizeOfZeroFill;
@@ -38066,6 +38146,8 @@ int main(int argc, char **argv)
         g_win32_syscalls = 0;
     }
     pe_load(exe);
+    if (!beer_security_init(g_img, g_img_size))
+        die("Process security initialization failed (Windows error %u)", g_last_error);
     beer_proc_register();
     beer_inherit_install();
     beer_overlay_init();

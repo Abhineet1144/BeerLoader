@@ -161,10 +161,193 @@ Proton, DLSS, DLSS FG + Reflex (XMM6 fix), RE9 DX12U mesh path (barycentrics). U
      Logs `/tmp/beer-setup-notify-final-tests.log`, `/tmp/beer-setup-notify-input.log`, `/tmp/beer-setup-notify-sync.log`.
      No RE8/RE9 live gates in this increment; unrelated concurrent edits preserved. Shared native message dispatch
      changed, so full-game gates remain desirable before calling this broadly regression-tested.
-   NEXT: genuine PE32 CreateDIBSection needs low-address pixels and4-byte ppvBits output; native backend currently
-   allocates pixels itself and ignores section/offset (do not silently truncate/copy disconnected pixel storage).
-   Proper PE32 RaiseException/SEH remains necessary; do not make exceptions return success. Other real APIs,
-   worker threads/DLL loading and unknown-stdcall failure policy remain. TLauncher stays on hold.
+   FOLLOW-UP, same date ("continue this"):
+   - Implemented real anonymous PE32 CreateDIBSection24: separate low32 GDI creation path uses MAP_32BIT pixels
+     shared directly by the guest and GDI. Surface records mmap length and releases with munmap on DeleteObject
+     and bitmap-object allocation failure. Existing native DIB path keeps calloc/free. All surface cleanup sites
+     use a single release helper; successful bitmap creation transfers ownership. No disconnected pixel copies.
+   - Supported24/32bpp BI_RGB and canonical RGB bitfields only, top-down/bottom-up, DWORD row alignment. Rejects
+     section-backed/palette-index/unsupported masks rather than silently pretending support; ignores offset when
+     section is null per API. Bounds height before abs(INT_MIN), limits dimensions and checks whole low pixel range.
+     Wrapper writes exactly4 ppvBits bytes (also clears on failure). GetObjectW now returns actual low pixel pointer.
+   - Added PE32 CreateCompatibleDC4/SelectObject8/DeleteDC4/DeleteObject4 forwarding. Implemented and exported
+     GetDIBColorTable16: supported true-color DIBs have no table, so returns0 without overwriting RGBQUAD buffer;
+     indexed DIBs remain unsupported. Installer successfully loads two resource DIBs rather than raising there.
+   - Following modal error path required real PE32 EnumThreadWindows12 (snapshots actual owner-thread top-level
+     windows, excludes child/message-only, revalidates liveness before callbacks, does not hold lock in guest).
+     Added observed activation/visibility/enabled/validity signatures via existing shared handlers. Enumeration
+     callback bridge exercised live; host tests cover invalid callback and empty enumeration only.
+   - Latest `/tmp/beer-setup-dib-clean.log`: readable application error "You must be logged in as an administrator
+     when installing this program." Bootstrapper raw manifest contains requestedExecutionLevel=requireAdministrator.
+     Shared beer_process_elevated currently scans only g_img/g_img_size; PE32 uses g_w32_image instead. Token/image
+     manifest context and parent-to-child elevation propagation need proper generic investigation (no forced TRUE
+     or installer-name bypass added). After dialog cleanup Delphi invokes missing RaiseException(0x0eedfade),
+     unknown thunk unbalances stack and faults at EIP0x0eedfade. No working wizard or installation success.
+   - Native-loader tests verify24/32bpp, both orientations, zeroed pixels, guest writes seen by GetPixel and SetPixel
+     seen through guest pointer, DIBSECTION32 pointer/canaries, actual unmapping on deletion (mincore ENOMEM),
+     native allocation compatibility, invalid height, section/mask rejection and ignored anonymous offset.
+     make test-input PASS (includes native-loader); final reviewed native-loader rerun PASS. Logs
+     `/tmp/beer-setup-dib-input.log`, `/tmp/beer-setup-dib-reviewed-tests.log`. Editor/diff checks clean.
+     Runs65s/6GiB service-capped, no automated inputs. Shared GDI changes: RE8/RE9 live gates not run this increment.
+   FOLLOW-UP, same date ("continue", token/resource increment):
+   - Replaced lazy whole-native-image substring elevation scan with explicit architecture-neutral guest token
+     initialization before TLS/entry. Bounded RT_MANIFEST24/ID1 extraction handles PE32 and PE32+; runtime
+     libexpat.so.1 parses actual XML (quotes/whitespace/comments/namespaces/UTF-16), rejecting malformed XML/DTD.
+     Expat is required when a selected manifest exists; absence fails explicitly, never guessed elevation.
+   - Initial host launches retain the existing guest compatibility policy for requireAdministrator/highestAvailable;
+     this is NOT UAC consent or Linux/root elevation. CreateProcess inherits an explicit primary token independently
+     of handle inheritance, replaces stale private environment metadata, consumes it before guest code, and fails
+     on environment-allocation failure instead of spawning with lost token state. A standard caller requesting a
+     requireAdministrator child gets ERROR_ELEVATION_REQUIRED740; asInvoker preserves the parent's token.
+   - Live confirms bootstrapper manifest level3 and actual extracted setup.tmp manifest level1 (asInvoker).
+     Child inherits administrator guest token; old administrator-required dialog is passed without forcing
+     CheckTokenMembership or adding executable-specific logic. Next native crash was FindResourceW narrowing a
+     host stack string pointer through u32. Internal resource keys now retain uintptr_t; guest inputs stay DWORD.
+     Added observed FreeResource4 forwarding to the existing obsolete Win32 no-op (unknown thunk damaged stack).
+   - New tests cover both PE header formats, mapped/raw resource extraction, actual XML vs comments, UTF-16,
+     malformed XML/DTD/ranges, explicit true/false inheritance and stale environment replacement. SID membership
+     now tested against independently controlled token states, not the queried function itself. Named resource
+     tests exercise FindResourceW/ExW with host stack strings above4GiB and verify FreeResource4 signature.
+   - Native-loader final PASS; full input final PASS after all changes (/tmp/beer-security-final-input.log).
+     Editor diagnostics and git diff --check clean. Live /tmp/beer-setup-token-final.log passes resource lookup, writes embedded
+     DLL bytes to temporary file, then calls unsupported GetFileVersionInfoSizeW and RaiseException. Child exits139;
+     no working wizard/install success. All runs65s/6GiB cgroup-capped, no automated inputs/install flags; no game gates.
+   FOLLOW-UP 2026-11-20 ("continue", version-resource increment):
+   - Exposed GetFileVersionInfoSizeW/A8 and GetFileVersionInfoW/A16 through the existing shared implementation.
+     VerQueryValueW16 marshals its native pointer output through a temporary into exactly4 guest bytes;
+     VS_FIXEDFILEINFO and DWORD length/handle outputs already have fixed-width layouts. VerQueryValueA is NOT
+     exposed yet: the existing shared ANSI query doesn't convert Unicode string values to ANSI, so blindly
+     forwarding it would advertise incorrect string semantics.
+   - Fixed a shared backend bug: beer_pe_version_resource required a >=240-byte optional header even for
+     ordinary PE32 files (224 bytes), so extracted32-bit DLL metadata was rejected. Reads only the necessary
+     architecture-specific header fields, validates magic/directory count and bounds tree entries/leaf records
+     against resource size; RVA ranges must be raw-file-backed, not zero-filled virtual tails or overflowing spans.
+     Query parsing also bounds full values and terminated keys; key length is checked before comparing paths.
+   - Added independent PE32/PE32+ fixtures with known version2.3.4.5, malformed/truncated headers/directories/data,
+     query node overruns/unterminated keys and long subkey paths. Real PE32 wrapper tests check retrieved bytes,
+     DWORD output canaries, query pointer identity, and all five new stdcall cleanup sizes.
+   - Verified /tmp/beer-setup-version-final.log: extracted _shfoldr.dll version size0x394, GetFileVersionInfoW and
+     VerQueryValueW all pass. Next actual failure is LoadLibraryW of the extracted DLL: PE32 DLL image loading is
+     unsupported, then Delphi raises0x0eedfade through missing PE32 RaiseException and child exits139. This is
+     NOT another version-resource failure or proof of a new corrupt metadata block. Read-only objdump confirms
+     embedded SHFOLDER.dll is PE32 with real imports, HIGHLOW relocations and SHGetFolderPathA/W exports.
+   - Build, final full make test-input (includes native-loader), standalone version ASan/UBSan tests PASS.
+     Logs /tmp/beer-version-final-build.log, /tmp/beer-version-final-input.log. Editor diagnostics/diff-check clean.
+     Live65s/6GiB cgroup caps retained; no automated inputs/install flags, no guest patches/fake DLL handles,
+     no working wizard/install and no RE8/RE9 live gates in this increment. TLauncher remains paused.
+   FOLLOW-UP 2026-11-20 ("continue", PE32 DLL-loader core):
+   - Added separate wow32_dll.inc module registry and bounded i386 DLL mapper; does not touch native PE32+
+     globals or replace the executable image. Checks file/header/section/directory bounds, keeps full zero-filled
+     image storage below2GiB, applies HIGHLOW relocations, rejects unsupported relocation types when relocating,
+     and sets final per-page protections from section flags (no blanket RWX mapping).
+   - Resolves direct named/ordinal exports with bounded arrays/strings; forwarder strings fail explicitly instead
+     of becoming code pointers. Binds only known-signature system imports; unknown/ordinal imports and guest-DLL
+     dependencies fail before DllMain, with actual missing symbol diagnostics, never unknown arg_bytes0 thunks.
+     Static DLL TLS and delay imports are explicitly unsupported; executable static TLS remains unchanged.
+   - Calls actual PE32 DllMain attach/detach through w32_call, publishes module for lookup during attach, handles
+     FALSE attach with detach/rollback/error1114, reference-counts loads and unmaps on final FreeLibrary. Separate
+     recursive loader mutex serializes registry/refcounts and callbacks; recursive self-load during incomplete
+     attach is rejected for now. LoadLibraryEx nonzero flags/file handles fail50 rather than silently ignoring them.
+     GetModuleHandleA/W, GetProcAddress, FreeLibrary and GetModuleFileNameW recognize real DLL modules. ANSI
+     GetModuleFileNameA for real DLL handles and broader DLL search/dependency behavior remain incomplete.
+   - Added genuine i386 machine-code DLL fixtures: occupied preferred base forces relocation; DllMain writes
+     through relocated data pointer and calls an imported API across32/64 mode; named and ordinal exports execute
+     and return expected42. Tests cover attach-once/refcounts, detach side effects, actual munmap, attach rejection,
+     bad sections/relocations/imports/entry, TLS/delay rejection, forwarder rejection, final RX permissions and four
+     concurrent native refcount workers while a baseline reference is held. Child process isolates TEB/GS/LDT setup.
+   - Live /tmp/beer-setup-dll.log maps/relocates the actual extracted _shfoldr.dll and reaches strict import binding.
+     First missing PE32 surface is KERNEL32!EnumResourceLanguagesW (error127), so DLL initialization is correctly
+     withheld; installer then invokes still-missing RaiseException and exits139. The target DLL is NOT successfully
+     loaded yet; no working wizard/install. No guest patches, fake module handles, automatic clicks/install flags.
+   - Final build and full make test-input including all DLL contracts PASS (/tmp/beer-dll-final-build.log,
+     /tmp/beer-dll-final-input.log). Editor/diff checks clean. Live65s/6GiB cgroup caps retained; no game gates.
+   FOLLOW-UP 2026-11-20 (SEH + _shfoldr + idp.dll findings; uncommitted, build OK, no tests added yet):
+   - Added PE32 SEH (platform/wow32.inc w32_RaiseException/w32_RtlUnwind): FS:[0] chain walk with guest
+     EXCEPTION_RECORD/CONTEXT32 (cdecl handler via w32_call), unwinding pops frames, unhandled filter then exit.
+     Live: Delphi 0x0eedfade exceptions reach its handlers, MessageBox "Failed to load DLL" shown, no crash.
+     Hardware faults (SIGSEGV in guest) are still NOT dispatched to SEH (w32_fault just exits).
+   - Added EnumResourceTypes/Names/LanguagesW (wow32_win32.inc), FindFirstFile/NextFile/Close handle table
+     (native handle is a 64-bit pointer; the zero-extended u32 handle crashed FindNextFileW at 0x5cb8d7b0),
+     lstrcatA/lstrcpyA/ExpandEnvironmentStrings*/Get{System,Windows}DirectoryA/DisableThreadLibraryCalls forwards,
+     RegOpenKeyA/RegCreateKeyExA/RegSetValueExA (ANSI->wide), IsBadWritePtr (/proc/self/maps), 32-bit
+     SECURITY_DESCRIPTOR (20 bytes)/ACL helpers (InitializeSecurityDescriptor, SetSecurityDescriptorDacl, InitializeAcl,
+     AddAccessAllowedAce, GetAce), SetFileSecurityW (validated, NOT applied), LookupAccountSidW (ERROR_NONE_MAPPED).
+   - Live result (scratchpad run3): _shfoldr.dll now loads+attaches, wizard window "setup" created and shown. NEXT
+     blocker: extracted idp.dll (Inno Download Plugin, 225 KB, copy kept at scratchpad/cap/idp.dll) imports WININET.dll
+     (13: InternetOpenW/ConnectW/ReadFile/CloseHandle/SetOptionW/QueryOptionW/CrackUrlW/ErrorDlg, HttpOpenRequestW/
+     SendRequestW/QueryInfoW, FtpOpenFileW/GetFileSize) -> "dependency WININET.dll is not a supported system module",
+     LoadLibrary error 126, Delphi "Runtime Error (at -1:0)". Beer has no wininet at all (only WinHTTP).
+     Also missing for it: CreateThread/ExitThread/ResumeThread, HeapCreate/Destroy, Get/FreeEnvironmentStrings(A/W),
+     Console APIs (GetConsoleCP/Mode/OutputCP, WriteConsoleA/W), SetStdHandle, SetHandleCount, EnumSystemLocalesA,
+     IsValidLocale/CodePage, LCMapStringA, GetStringTypeA, UnhandledExceptionFilter, user32 DialogBoxParamW/EndDialog/
+     GetDlgItem/GetParent/GetDesktopWindow/MapWindowPoints/MessageBeep/MoveWindow/RedrawWindow, gdi32 GetTextExtentPoint32W.
+   - Teardown crash: unknown imports (CoUninitialize, GlobalDeleteAtom, LocalFileTimeToFileTime, SetFileTime) still
+     get arg_bytes=0 thunks and unbalance the stack (final eip=0x1010fd08 after GlobalDeleteAtom): add signatures.
+   - Plan: add WININET system module (honest stubs returning failure/ERROR_INTERNET_* are acceptable since the
+     installer only downloads optionally, or real WinHTTP-backed), then CreateThread, then the missing list.
+   FOLLOW-UP 2026-11-20 (installer now INSTALLS: reaches file copy; silent run; all 8 extracted DLLs attach):
+   Reproduce: `systemd-run --user --wait --pipe -p RuntimeMaxSec=65 -p MemoryMax=6G ... ./loader --prefix=<installer-test>
+   /mnt/hdd1/Downloads/setup.exe /VERYSILENT /SUPPRESSMSGBOXES /LOG=Z:\\mnt\\hdd1\\Games\\inno.log /DIR=Z:\\mnt\\hdd1\\Games\\x`
+   (the Inno /LOG file is UTF-8 and names the exact failing step; BEER_W32_TRACE=1 prints every API call with esp).
+   - SEH done (see entry above). New: BEER_W32_DUMP=<hexaddr>:<hexlen>:<file> dumps guest memory when a fatal signal hits.
+   - **Address space layout changed**: anonymous low allocations (heap arenas, stacks, TEBs, views) now go TOP-DOWN from
+     0x7e000000 (g_w32_top); the range below stays free so DLLs get their preferred base. Packed DLLs (BASS.dll hard-codes
+     0x11000000) are not relocatable; a bump allocator from 0x10000000 had been occupying exactly that. Initial ESP now leaves
+     0x1000 bytes of headroom (code reads caller frames; the TEB64 sits right above the stack).
+   - **Standard controls as data** (platform/win32_controls.inc, shared loader): per-window state for window text
+     (WM_SETTEXT/GETTEXT/GETTEXTLENGTH in DefWindowProc, GetWindowText A/W + length), LISTBOX/COMBOBOX item lists (LB_*/CB_*),
+     BUTTON check state + BM_CLICK, PROGRESS range/pos, EDIT basics. Nothing is drawn. Predefined classes now answer
+     GetClassInfo (Delphi keeps their wndproc as DefWndProc) -- symptom before: "List item and visible item count
+     mismatch". BEER_MAX_WINDOWS 64 -> 512. Bridges (32-bit wndproc -> native) 64 -> 256 and the generated macro that
+     indexed them by octal-looking tokens (10,11.. instead of 8,9..) is replaced by generated per-slot functions
+     (symptom: eip=0 in a wndproc after 8 subclassed windows). PostMessage(NULL,...) is now a thread message (WM_QUIT).
+   - PE32 DLL support: static TLS (W32_TLS_SLOTS=64 vector per thread, slot 0 = exe, DLL slots registered at load, TLS callbacks
+     on attach), data imports (_iob, _adjust_fdiv), VirtualQuery AllocationBase for images, system pseudo-modules now have an
+     in-memory PE image with a sorted export table at their pseudo handle (packers walk exports instead of GetProcAddress),
+     GetModuleHandleEx, CreateThread (guest threads: TEB32 created in the Beer thread body), file mappings placed below 4 GiB.
+   - ~600 imports given signatures (platform/wow32_signatures.inc generated table + wow32_crt.inc): unknown imports used to get
+     arg_bytes=0 thunks and corrupt the stack; known-unsupported ones now return a defined failure with correct cleanup.
+     WININET (fails like an unreachable network), winmm/msacm32 (no devices), uxtheme (no theme active), imm32, flat scroll
+     bars, msvcrt incl. x87 results (math in platform/wow32_math.c, built with SSE; operands/results move through FLD/FSTP,
+     _ftol/_CIxxx supported), 32-bit SECURITY_DESCRIPTOR/ACL helpers, FindFirstFile handle table, LoadString A/W from the
+     module's own RT_STRING resources (the native one returned 0 for guest modules, so every message text was empty).
+   - Tests: tests/native_loader_contract_test.c gained wow32_controls_contract_test; static TLS test adapted. PASS.
+   - CURRENT STATE: setup reaches "Installing the file" (writes unins000.exe/.dat) and then stops at
+     `The source file "C:\Windows\Temp\is-*.tmp\vc_redist.x86.exe" does not exist` (log: "64-bit Windows: No" although
+     IsWow64Process returns TRUE and Wow64Disable/RevertWow64FsRedirection now exist -- Inno 5.5.1 still decides "No"; its
+     x86 vs x64 redist branch follows from that). Not understood yet: what else Inno's IsWin64 test needs (check
+     GetNativeSystemInfo layout bytes, GetProcAddress results at start-up, IsWow64Process2).
+   - Open / not done: ISDone unpacking of fg-01.bin (17 GB, never reached), hardware faults (SIGSEGV/SIGFPE in guest) are not
+     dispatched to SEH, GetThreadContext/toolhelp/IOCP/COM objects unsupported, no drawing of any control (UI invisible),
+     CreateThread'd guest threads only tested through contracts (ExitThread from a guest thread untested), SetFileTime and
+     SetNamedSecurityInfo are accepted without effect, ordinal imports of shell32 (#175) unavailable.
+   FOLLOW-UP 2026-11-20 (later: install flow runs to ISDone/unarc; Inno /LOG based):
+   - "64-bit Windows: No" was Inno 5.5.1 requiring GetSystemWow64DirectoryA + RegDeleteKeyExA/Wow64 FS-redirection procs
+     (now present) -> "Yes". Beer registry is now WRITABLE in memory (RegCreateKeyEx/SetValueEx/DeleteValue/DeleteKey, A+W;
+     the old stubs returned 5 and made Inno abort at AppCompatFlags\Layers); not persisted yet. ProgramFilesDir*/CommonFilesDir*
+     seeded. IShellLink/IPersistFile COM object for 32-bit callers (wow32_shelllink.inc; Save writes a small text file, Linux has
+     no .lnk). Silent run with `/COMPONENTS= /TASKS=` completes "Installation process succeeded" (files, shortcut, uninstaller).
+   - Default selection still tries to copy {tmp}\vc_redist.x86.exe/x64 (IDP download components, nothing downloads): with
+     `BEER_MSGBOX_AUTO=ignore` (new knob: answers message boxes without showing them; "abort" cancels) the run passes them.
+     Note: unsuppressed message boxes open a real Beer dialog and wait for a click (a /VERYSILENT run looks hung).
+   - Fixed: alloc_teb_for_thread dereferenced g_img (NULL in WoW32) when ISDone created a thread; GetModuleFileNameA for DLL
+     modules (ISDone derives unarc.dll's folder from it; it was loading from a stale temp dir); LoadStringA/W; PostMessage(NULL).
+   - msvcrt surface for unarc.dll (stdio, fd I/O, wide file ops, time, sscanf, setjmp/longjmp in the msvcrt jump-buffer layout,
+     _pctype/__mb_cur_max data, atoms). `python3 chk.py` style check: every import of the extracted PE32 DLLs must be in
+     wow32*.inc (done for all 26 DLLs incl. unarc.dll, CLS-*.dll, zlib1.dll, packjpg_dll*.dll).
+   - CURRENT STOP: ISDone's worker thread (unarc.dll 0x61080000) probes the largest VirtualAlloc(MEM_RESERVE) block by halving
+     from 0x7fffffff; our top-down low allocator (g_w32_top only moves down, floor 0x20000000) succeeds at 0x20000000, the
+     guest frees it, then the thread jumps to eip=0x7fff (fault after VirtualFree(0x20000000) at unarc rva 0xaaf4).
+     Not diagnosed: the address-space probe likely needs a real first-fit/reuse allocator (freed regions should lower
+     fragmentation) and maybe a larger usable range (LARGEADDRESSAWARE is not honoured; limit 0x7fff0000); the follow-up
+     crash needs unarc disassembly around the callers of rva 0xaad2/0xaa98 (alloc/free wrappers). Repro: MSGAUTO=ignore, run with
+     /VERYSILENT /LOG=... /DIR=Z:\mnt\hdd1\Games\x; BEER_W32_TRACE=1 prints api calls with esp and return addresses.
+   - Not done: the actual game unpack (17 GB fg-0*.bin) never started; GUI wizard invisible (no drawing); persistence of the
+     registry; Run entries (cmd.exe, QuickSFV.EXE case-insensitive CreateProcess, ShellExecute) fail with codes 2/120.
+   NEXT: PE32 resource-enumeration callbacks and remaining real _shfoldr imports, plus proper RaiseException/SEH;
+   do not treat the later damaged EIP as root cause.
+   Resource-string pointer-width paths (LoadStringW capacity0), indexed DIBs/sections,
+   worker threads/DLL loading and unknown-stdcall failure policy remain incomplete. TLauncher stays on hold.
   Chained Together: **RESOLVED 2026-11-17, user confirmed solo gameplay works.** The earlier lobby diagnosis
   was superseded: missing SteamNetworkingSockets identity and real P2P listener/poll-group support blocked
   the solo listen server. See the resolution at the top; multiplayer remains unverified.

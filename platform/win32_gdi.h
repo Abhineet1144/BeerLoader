@@ -41,6 +41,9 @@ uint64_t GDI_MS beer_CreateCompatibleBitmap(uint64_t dc, int width, int height);
 uint64_t GDI_MS beer_CreateBitmap(int width, int height, uint32_t planes, uint32_t bits, const void *data);
 uint64_t GDI_MS beer_CreateDIBSection(uint64_t dc, const void *info, uint32_t usage, void **bits,
                                       uint64_t section, uint32_t offset);
+/* Anonymous RGB DIB for PE32; failure sets errno, pixels are released by DeleteObject. */
+uint64_t beer_gdi_create_dib_section_low32(const void *info, void **bits);
+uint32_t GDI_MS beer_GetDIBColorTable(uint64_t dc, uint32_t first, uint32_t count, void *colors);
 int GDI_MS beer_DeleteDC(uint64_t dc);
 int GDI_MS beer_DeleteObject(uint64_t object);
 uint64_t GDI_MS beer_SelectObject(uint64_t dc, uint64_t object);

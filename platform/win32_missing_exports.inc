@@ -1228,21 +1228,11 @@ static u64 __attribute__((ms_abi)) beer_AllocateAndInitializeSid(const u8 *autho
     return 1;
 }
 static u64 __attribute__((ms_abi)) beer_FreeSid(void *sid) { if (sid) impl_LocalFree(sid); return 0; }
-/* Windows starts an executable whose manifest requests requireAdministrator (or highestAvailable, for an
- * administrator account) elevated; anything else runs with a standard user token. */
+/* Initialized once, before guest callbacks, independently of image bitness.
+ * This is a guest token only: it never grants host/Linux privileges. */
 static int beer_process_elevated(void)
 {
-    static int elevated = -1;
-    if (elevated >= 0) return elevated;
-    elevated = 0;
-    if (g_img && g_img_size) {
-        static const char *const levels[] = { "level=\"requireAdministrator\"", "level=\"highestAvailable\"",
-                                              "level='requireAdministrator'", "level='highestAvailable'" };
-        for (size_t i = 0; i < sizeof(levels) / sizeof(*levels) && !elevated; ++i)
-            elevated = memmem(g_img, g_img_size, levels[i], strlen(levels[i])) != NULL;
-    }
-    if (elevated) fprintf(stderr, "[TOKEN] manifest requests elevation: the process token is an elevated administrator\n");
-    return elevated;
+    return g_process_elevated;
 }
 
 /* Members: Everyone (S-1-1-0), Users (S-1-5-32-545), Authenticated Users (S-1-5-11), Interactive (S-1-5-4), and

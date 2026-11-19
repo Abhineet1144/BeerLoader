@@ -248,6 +248,7 @@ static const char *const beer_module_exports[][2] = {
     { "gdi32.dll", "GetDCOrgEx" },
     { "gdi32.dll", "GetDIBits" },
     { "gdi32.dll", "GetDeviceCaps" },
+    { "gdi32.dll", "GetDIBColorTable" },
     { "gdi32.dll", "GetMapMode" },
     { "gdi32.dll", "GetObjectA" },
     { "gdi32.dll", "GetObjectType" },

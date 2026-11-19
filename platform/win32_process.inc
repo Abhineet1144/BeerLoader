@@ -351,12 +351,14 @@ static char **beer_inherit_environment(const char *extra)
 {
     size_t n = 0;
     while (environ[n]) ++n;
-    char **env = calloc(n + 2, sizeof(*env));
+    char **env = calloc(n + 3, sizeof(*env));
     if (!env) return NULL;
     size_t k = 0;
     for (size_t i = 0; i < n; ++i)
-        if (strncmp(environ[i], "BEER_INHERITED_HANDLES=", 23)) env[k++] = environ[i];
+        if (strncmp(environ[i], "BEER_INHERITED_HANDLES=", 23) &&
+            strncmp(environ[i], "_BEER_PRIMARY_TOKEN=", 20)) env[k++] = environ[i];
     if (extra) env[k++] = (char *)extra;
+    env[k++] = beer_process_elevated() ? "_BEER_PRIMARY_TOKEN=1" : "_BEER_PRIMARY_TOKEN=0";
     env[k] = NULL;
     return env;
 }
@@ -464,6 +466,11 @@ static u64 beer_create_process(const char *application, const char *command_line
             found = 1;
     }
     if (!found) { g_last_error = 2; return 0; }        /* ERROR_FILE_NOT_FOUND */
+    /* CreateProcess inherits the primary token, even without handle inheritance.
+     * Unlike an initial host launch it must never auto-elevate a child. */
+    int level = beer_security_file_level(host);
+    if (level < 0) { g_last_error = 193; return 0; }
+    if (level == 3 && !beer_process_elevated()) { g_last_error = 740; return 0; }
     {
         unsigned char magic[2] = {0, 0};
         FILE *f = fopen(host, "rb");
@@ -502,7 +509,12 @@ static u64 beer_create_process(const char *application, const char *command_line
     BeerInherit inherit;
     int have_inherit = inherit_handles && g_inheritable_handles && beer_inherit_prepare(&inherit);
     char **env = beer_inherit_environment(have_inherit ? inherit.env : NULL);
-    int rc = posix_spawn(&pid, self, have_inherit ? &inherit.actions : NULL, NULL, argv, env ? env : environ);
+    if (!env) {
+        if (have_inherit) beer_inherit_release(&inherit);
+        g_last_error = 8;
+        return 0;
+    }
+    int rc = posix_spawn(&pid, self, have_inherit ? &inherit.actions : NULL, NULL, argv, env);
     free(env);
     if (have_inherit) beer_inherit_release(&inherit);
     if (rc != 0) { g_last_error = 5; return 0; }       /* ERROR_ACCESS_DENIED */

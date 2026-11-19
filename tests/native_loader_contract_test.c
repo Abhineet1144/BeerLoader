@@ -4,6 +4,8 @@
 #include "../loader.c"
 #undef main
 #include <assert.h>
+#include "pe_version_fixture.h"
+#include "wow32_dll_contract.inc"
 
 static int native_veh_calls;
 typedef struct { WIN_CS *cs; pthread_barrier_t tried; } CriticalSectionContender;
@@ -564,6 +566,80 @@ static void legacy_dns_contract_test(void)
         g_win_hostent_storage = NULL;
 }
 
+static void wow32_dib_contract_test(void)
+{
+    u32 enum_args[] = {UINT32_MAX, 0, 0};
+    assert(!w32_EnumThreadWindows(enum_args) && g_last_error == 87);
+    enum_args[1] = 0x1234;
+    assert(w32_EnumThreadWindows(enum_args)); /* No windows belonging to this thread. */
+    struct {
+        u32 info[13], bits, guard;
+        u32 object[21], object_guard;
+    } *b = w32_heap_alloc(sizeof(*b), 1);
+    assert(b);
+    b->guard = b->object_guard = 0xa1b2c3d4;
+    b->info[0] = 40; b->info[1] = 3;
+    u32 args[6] = {0, (u32)(uintptr_t)b->info, 0, (u32)(uintptr_t)&b->bits, 0, 0};
+    u64 dc = beer_CreateCompatibleDC(0);
+    assert(dc);
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        int topdown = mode & 1, bpp = mode & 2 ? 24 : 32;
+        b->info[2] = topdown ? (u32)-2 : 2;
+        b->info[3] = 1u | ((u32)bpp << 16);
+        u64 bitmap = w32_CreateDIBSection(args);
+        assert(bitmap && b->bits && b->guard == 0xa1b2c3d4);
+        const size_t stride = 12;
+        u8 *pixels = (void *)(uintptr_t)b->bits;
+        for (size_t i = 0; i < 24; ++i) assert(!pixels[i]);
+        u64 previous = beer_SelectObject(dc, bitmap);
+        u32 colors[2] = {0xa1b2c3d4, 0x12345678};
+        assert(!beer_GetDIBColorTable(dc, 0, 2, colors));
+        assert(colors[0] == 0xa1b2c3d4 && colors[1] == 0x12345678);
+        size_t first_row = topdown ? 0 : stride;
+        pixels[first_row] = 0x33;
+        pixels[first_row + 1] = 0x22;
+        pixels[first_row + 2] = 0x11;
+        assert(beer_GetPixel(dc, 0, 0) == 0x332211);
+        assert(beer_SetPixel(dc, 1, 0, 0x665544) == 0x665544);
+        size_t second_pixel = first_row + bpp / 8;
+        assert(pixels[second_pixel] == 0x66 && pixels[second_pixel + 1] == 0x55 &&
+               pixels[second_pixel + 2] == 0x44);
+        u32 object_args[] = {(u32)bitmap, 84, (u32)(uintptr_t)b->object};
+        assert(w32_GetObjectW(object_args) == 84);
+        assert(b->object[5] == b->bits && b->object[6] == 40);
+        assert(b->object[7] == 3 && b->object[8] == b->info[2]);
+        assert(b->object_guard == 0xa1b2c3d4);
+        beer_SelectObject(dc, previous);
+        assert(beer_DeleteObject(bitmap));
+        unsigned char resident;
+        errno = 0;
+        assert(mincore(pixels, 4096, &resident) == -1 && errno == ENOMEM);
+    }
+    b->info[2] = 0x80000000u;
+    b->bits = 123;
+    assert(!w32_CreateDIBSection(args) && !b->bits && b->guard == 0xa1b2c3d4);
+    b->info[2] = 2;
+    args[4] = 1; /* Do not silently ignore section-backed requests. */
+    assert(!w32_CreateDIBSection(args) && g_last_error == 50 && !b->bits);
+    args[4] = 0;
+    args[5] = 123; /* Ignored for anonymous DIBs. */
+    u64 offset_bitmap = w32_CreateDIBSection(args);
+    assert(offset_bitmap && beer_DeleteObject(offset_bitmap));
+    args[5] = 0;
+    b->info[4] = 3;
+    assert(!w32_CreateDIBSection(args) && g_last_error == 50);
+    b->info[10] = 0xff0000; b->info[11] = 0xff00; b->info[12] = 0xff;
+    u64 bitmap = w32_CreateDIBSection(args);
+    assert(bitmap && beer_DeleteObject(bitmap));
+    assert(beer_DeleteDC(dc));
+    /* Native allocator path still creates/deletes a normal live DIB. */
+    void *native_bits = NULL;
+    b->info[4] = 0;
+    bitmap = beer_CreateDIBSection(0, b->info, 0, &native_bits, 0, 0);
+    assert(bitmap && native_bits && beer_DeleteObject(bitmap));
+    w32_heap_free(b);
+}
+
 static void wow32_sid_contract_test(void)
 {
     u32 *b = w32_heap_alloc(32, 1);
@@ -582,8 +658,13 @@ static void wow32_sid_contract_test(void)
     assert(sub[0] == 32 && sub[1] == 544);
     u32 member_args[] = {0, b[4], (u32)(uintptr_t)(b + 6)};
     b[7] = 0xa1b2c3d4;
-    assert(w32_call_impl(find_impl("CheckTokenMembership"), member_args, 3) == 1);
-    assert(b[6] == (u32)beer_process_elevated() && b[7] == 0xa1b2c3d4);
+    int saved_token = g_process_elevated;
+    for (int token = 0; token <= 1; ++token) {
+        g_process_elevated = token;
+        assert(w32_call_impl(find_impl("CheckTokenMembership"), member_args, 3) == 1);
+        assert(b[6] == (u32)token && b[7] == 0xa1b2c3d4);
+    }
+    g_process_elevated = saved_token;
     u32 free_args[] = {b[4]};
     assert(!w32_FreeSid(free_args));
     b[4] = 0x12345678;
@@ -627,7 +708,8 @@ static void wow32_static_tls_contract_test(void)
     u32 *second_vector = (void *)(uintptr_t)second.ThreadLocalStoragePointer;
     assert(second_vector[0] != vector[0]);
     assert(!memcmp((const void *)(uintptr_t)second_vector[0], "TLS!", 4));
-    assert(!munmap(vector, 0x10000) && !munmap(second_vector, 0x10000));
+    w32_heap_free(vector);                              /* the vector is a 32-bit heap block (DLL slots follow slot 0) */
+    w32_heap_free(second_vector);
 
     teb.ThreadLocalStoragePointer = 0;
     tls->end = tls->start - 1;
@@ -649,6 +731,61 @@ static void wow32_static_tls_contract_test(void)
     w32_heap_free(image);
 }
 
+/* Standard controls keep their state as data: list boxes, check state, progress bars and window text. */
+static void wow32_controls_contract_test(void)
+{
+    const u64 list = 0xD0000F01u, button = 0xD0000F02u, bar = 0xD0000F03u, sorted = 0xD0000F04u;
+    const u16 a[] = u"alpha", b[] = u"Beta", c[] = u"gamma", prefix[] = u"be";
+    u16 text[16];
+    assert(beer_ctl_listbox_proc(list, 0x180, 0, (u64)(uintptr_t)a) == 0);      /* LB_ADDSTRING */
+    assert(beer_ctl_listbox_proc(list, 0x180, 0, (u64)(uintptr_t)b) == 1);
+    assert(beer_ctl_listbox_proc(list, 0x181, 1, (u64)(uintptr_t)c) == 1);      /* LB_INSERTSTRING before "Beta" */
+    assert(beer_ctl_listbox_proc(list, 0x18B, 0, 0) == 3);                      /* LB_GETCOUNT */
+    assert(beer_ctl_listbox_proc(list, 0x189, 1, (u64)(uintptr_t)text) == 5);   /* LB_GETTEXT = "gamma" */
+    assert(!memcmp(text, c, sizeof(c)));
+    assert(beer_ctl_listbox_proc(list, 0x18A, 2, 0) == 4);                      /* LB_GETTEXTLEN("Beta") */
+    assert(beer_ctl_listbox_proc(list, 0x18F, (u64)(s64)-1, (u64)(uintptr_t)prefix) == 2);   /* FINDSTRING is case-blind */
+    assert(beer_ctl_listbox_proc(list, 0x1A2, (u64)(s64)-1, (u64)(uintptr_t)prefix) == (u64)(s64)-1);  /* exact: none */
+    assert(beer_ctl_listbox_proc(list, 0x188, 0, 0) == (u64)(s64)-1);           /* no selection yet */
+    assert(beer_ctl_listbox_proc(list, 0x186, 2, 0) == 2 && beer_ctl_listbox_proc(list, 0x188, 0, 0) == 2);
+    assert(beer_ctl_listbox_proc(list, 0x19A, 2, 0x1234) == 1);                 /* LB_SETITEMDATA */
+    assert(beer_ctl_listbox_proc(list, 0x199, 2, 0) == 0x1234);
+    assert(beer_ctl_listbox_proc(list, 0x182, 0, 0) == 2);                      /* LB_DELETESTRING leaves 2 */
+    assert(beer_ctl_listbox_proc(list, 0x188, 0, 0) == 1);                      /* the selection moved with its item */
+    assert(beer_ctl_listbox_proc(list, 0x189, 7, (u64)(uintptr_t)text) == (u64)(s64)-1);
+    assert(beer_ctl_listbox_proc(list, 0x184, 0, 0) == 0 && beer_ctl_listbox_proc(list, 0x18B, 0, 0) == 0);
+    beer_ctl_destroy(list);
+    assert(beer_ctl_listbox_proc(list, 0x18B, 0, 0) == 0);                      /* a destroyed window starts empty */
+    beer_ctl_destroy(list);
+
+    WIN_CREATESTRUCT sort_style = { .style = 0x2 /* LBS_SORT */ };
+    beer_ctl_on_create(sorted, &sort_style);
+    assert(beer_ctl_listbox_proc(sorted, 0x180, 0, (u64)(uintptr_t)c) == 0);
+    assert(beer_ctl_listbox_proc(sorted, 0x180, 0, (u64)(uintptr_t)a) == 0);    /* sorts before "gamma" */
+    assert(beer_ctl_listbox_proc(sorted, 0x180, 0, (u64)(uintptr_t)b) == 1);    /* between alpha and gamma */
+    beer_ctl_destroy(sorted);
+
+    assert(beer_ctl_button_proc(button, 0xF0, 0, 0) == 0);                      /* BM_GETCHECK */
+    beer_ctl_button_proc(button, 0xF1, 1, 0);                                   /* BM_SETCHECK */
+    assert(beer_ctl_button_proc(button, 0xF0, 0, 0) == 1);
+    beer_ctl_destroy(button);
+
+    beer_ctl_progress_proc(bar, 0x406, 10, 50);                                 /* PBM_SETRANGE32 */
+    assert(beer_ctl_progress_proc(bar, 0x402, 30, 0) == 0);                     /* PBM_SETPOS returns the old one */
+    assert(beer_ctl_progress_proc(bar, 0x408, 0, 0) == 30);
+    beer_ctl_progress_proc(bar, 0x404, 5, 0);
+    beer_ctl_progress_proc(bar, 0x405, 0, 0);                                   /* PBM_STEPIT */
+    assert(beer_ctl_progress_proc(bar, 0x408, 0, 0) == 35);
+    beer_ctl_destroy(bar);
+
+    const u16 title[] = u"Setup - Test";
+    beer_ctl_set_text(bar, title);
+    assert(beer_ctl_get_text(bar, NULL, 0) == 12);
+    assert(beer_ctl_get_text(bar, text, 6) == 5 && text[5] == 0 && !memcmp(text, title, 10));   /* truncated, terminated */
+    beer_ctl_destroy(bar);
+    assert(beer_ctl_get_text(bar, NULL, 0) == 0);
+}
+
 static void wow32_ui_contract_test(void)
 {
     const W32Api expected[] = {
@@ -660,6 +797,14 @@ static void wow32_ui_contract_test(void)
         {"SetClassLongW", NULL, 12}, {"GetSystemMenu", NULL, 8}, {"DeleteMenu", NULL, 12},
         {"OleInitialize", NULL, 4}, {"OleUninitialize", NULL, 0}, {"CoInitialize", NULL, 4},
         {"GetObjectW", w32_GetObjectW, 12}, {"GetClassInfoW", w32_GetClassInfoW, 12},
+        {"CreateDIBSection", w32_CreateDIBSection, 24},
+        {"CreateCompatibleDC", NULL, 4}, {"SelectObject", NULL, 8},
+        {"GetActiveWindow", NULL, 0}, {"SetActiveWindow", NULL, 4},
+        {"IsWindowVisible", NULL, 4},
+        {"IsWindow", NULL, 4},
+        {"IsWindowEnabled", NULL, 4}, {"EnableWindow", NULL, 8},
+        {"EnumThreadWindows", w32_EnumThreadWindows, 12},
+        {"DeleteDC", NULL, 4}, {"DeleteObject", NULL, 4}, {"GetDIBColorTable", NULL, 16},
         {"CharLowerW", w32_CharLowerW, 4}, {"GetKeyboardLayoutList", w32_GetKeyboardLayoutList, 8},
         {"ImmIsIME", w32_ImmIsIME, 4}, {"SetWindowTextW", NULL, 8},
         {"RegisterWindowMessageW", NULL, 4}, {"GlobalAddAtomW", NULL, 4},
@@ -855,6 +1000,190 @@ static void wow32_ui_contract_test(void)
     assert(beer_DeleteObject(forwarded_font));
     assert(beer_DeleteObject(font));
     w32_heap_free(b);
+}
+
+static void wow32_version_contract_test(void)
+{
+    u8 *memory = w32_heap_alloc(4096, 1);
+    assert(memory);
+    char *path = (void *)memory;
+    strcpy(path, "/tmp/beer-version-abi-XXXXXX");
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    u8 fixture[1024];
+    version_fixture_build(fixture, 0);
+    assert(write(fd, fixture, sizeof(fixture)) == sizeof(fixture));
+    close(fd);
+    u16 *wide_path = (void *)(memory + 256);
+    for (size_t i = 0; i <= strlen(path); ++i) wide_path[i] = (u8)path[i];
+    u32 *output = (void *)(memory + 512);
+    output[0] = 0x12345678; output[1] = 0xaabbccdd;
+    u32 size_args[] = {(u32)(uintptr_t)wide_path, (u32)(uintptr_t)output};
+    assert(w32_call_impl(find_impl("GetFileVersionInfoSizeW"), size_args, 2) == 92);
+    assert(!output[0] && output[1] == 0xaabbccdd);
+    size_args[0] = (u32)(uintptr_t)path;
+    assert(w32_call_impl(find_impl("GetFileVersionInfoSizeA"), size_args, 2) == 92);
+    u8 *block = memory + 1024;
+    u32 info_args[] = {(u32)(uintptr_t)wide_path, 0, 92, (u32)(uintptr_t)block};
+    assert(w32_call_impl(find_impl("GetFileVersionInfoW"), info_args, 4));
+    assert(!memcmp(block, fixture + 640, 92));
+    info_args[0] = (u32)(uintptr_t)path;
+    assert(w32_call_impl(find_impl("GetFileVersionInfoA"), info_args, 4));
+    const u16 root[] = {'\\', 0};
+    u16 *query = (void *)(memory + 768);
+    memcpy(query, root, sizeof(root));
+    u32 query_args[] = {(u32)(uintptr_t)block, (u32)(uintptr_t)query,
+                         (u32)(uintptr_t)output, (u32)(uintptr_t)(output + 2)};
+    output[0] = 0; output[1] = 0xaabbccdd;
+    output[2] = 0; output[3] = 0x99887766;
+    assert(w32_VerQueryValueW(query_args));
+    assert(output[0] == (u32)(uintptr_t)(block + 40) && output[1] == 0xaabbccdd);
+    assert(output[2] == 52 && output[3] == 0x99887766);
+    assert(*(u32 *)(uintptr_t)output[0] == 0xfeef04bd);
+    query_args[0] = 0;
+    assert(!w32_VerQueryValueW(query_args) && g_last_error == 87);
+    assert(output[1] == 0xaabbccdd && output[3] == 0x99887766);
+    const char *names[] = {"GetFileVersionInfoSizeW", "GetFileVersionInfoSizeA",
+                           "GetFileVersionInfoW", "GetFileVersionInfoA", "VerQueryValueW"};
+    const u32 bytes[] = {8, 8, 16, 16, 16};
+    for (size_t n = 0; n < sizeof(names) / sizeof(*names); ++n) {
+        int found = 0;
+        for (size_t i = 0; i < sizeof(g_w32_apis) / sizeof(g_w32_apis[0]); ++i)
+            if (!strcmp(g_w32_apis[i].name, names[n])) {
+                assert(g_w32_apis[i].arg_bytes == bytes[n]);
+                found = 1;
+            }
+        assert(found);
+    }
+    assert(!unlink(path));
+    w32_heap_free(memory);
+}
+
+static void wow32_named_resource_contract_test(void)
+{
+    u8 *image = w32_heap_alloc(4096, 1);
+    assert(image);
+    ((DosHdr *)image)->lfanew = 0x80;
+    W32NtHdrs *nt = (void *)(image + 0x80);
+    nt->opt.dirs[2] = (DataDir){0x400, 0x400};
+    u8 *root = image + 0x400;
+    ((ResourceDir *)root)->id_count = 1;
+    *(ResourceEntry *)(root + 16) = (ResourceEntry){10, 0x80000020};
+    ((ResourceDir *)(root + 32))->named_count = 1;
+    *(ResourceEntry *)(root + 48) = (ResourceEntry){0x80000080, 0x80000040};
+    ((ResourceDir *)(root + 64))->id_count = 1;
+    *(ResourceEntry *)(root + 80) = (ResourceEntry){1033, 96};
+    *(ResourceData *)(root + 96) = (ResourceData){0x600, 4, 0, 0};
+    const u16 resource_name[] = {4, 'T', 'E', 'S', 'T'};
+    memcpy(root + 128, resource_name, sizeof(resource_name));
+    u16 *guest_name = (void *)(image + 0x900);
+    const u16 name[] = {'t', 'e', 's', 't', 0};
+    memcpy(guest_name, name, sizeof(name));
+    u32 module = (u32)(uintptr_t)image, guest = (u32)(uintptr_t)guest_name;
+    u32 args[] = {module, guest, 10};
+    assert(w32_FindResourceW(args) == module + 0x460);
+    u32 ex[] = {module, 10, guest, 1033};
+    assert(w32_FindResourceExW(ex) == module + 0x460);
+    char host_name[] = "TEST";
+    assert((uintptr_t)host_name > UINT32_MAX);
+    assert(w32_find_resource(module, 10, (uintptr_t)host_name, 1033) == module + 0x460);
+    u32 free_args[] = {module + 0x600};
+    assert(!w32_call_impl(find_impl("FreeResource"), free_args, 1));
+    int found = 0;
+    for (size_t i = 0; i < sizeof(g_w32_apis) / sizeof(g_w32_apis[0]); ++i)
+        if (!strcmp(g_w32_apis[i].name, "FreeResource")) {
+            assert(g_w32_apis[i].arg_bytes == 4);
+            found = 1;
+        }
+    assert(found);
+    w32_heap_free(image);
+}
+
+static void process_security_contract_test(void)
+{
+    static const char xml[] =
+        "<?xml version='1.0'?><assembly xmlns='urn:schemas-microsoft-com:asm.v1'>"
+        "<!-- level='asInvoker' -->"
+        "<trustInfo xmlns='urn:schemas-microsoft-com:asm.v3'><security><requestedPrivileges>"
+        "<requestedExecutionLevel uiAccess='false' level = 'requireAdministrator'/>"
+        "</requestedPrivileges></security></trustInfo></assembly>";
+    assert(beer_manifest_xml_level((const u8 *)xml, strlen(xml)) == 3);
+    const char *comment = "<assembly><!-- <requestedExecutionLevel level='requireAdministrator'/> --></assembly>";
+    assert(beer_manifest_xml_level((const u8 *)comment, strlen(comment)) == 0);
+    const char *bad = "<assembly><trustInfo>";
+    assert(beer_manifest_xml_level((const u8 *)bad, strlen(bad)) == -1);
+    const char *dtd = "<!DOCTYPE assembly [<!ENTITY x 'test'>]><assembly/>";
+    assert(beer_manifest_xml_level((const u8 *)dtd, strlen(dtd)) == -1);
+    /* A UTF-16LE BOM and XML declaration are handled by the real XML parser. */
+    u16 utf16[512] = {0xfeff};
+    for (size_t i = 0; i < strlen(xml); ++i) utf16[i + 1] = (u8)xml[i];
+    /* The declaration has no encoding attribute, so BOM selects UTF-16. */
+    assert(beer_manifest_xml_level((const u8 *)utf16, (strlen(xml) + 1) * 2) == 3);
+    int saved_token = g_process_elevated;
+    const char *prior = getenv("_BEER_PRIMARY_TOKEN");
+    char *saved_env = prior ? strdup(prior) : NULL;
+    for (int bitness = 0; bitness < 2; ++bitness) {
+        u8 image[4096] = {0};
+        *(u16 *)image = MZ_MAGIC;
+        *(u32 *)(image + 0x3c) = 0x80;
+        *(u32 *)(image + 0x80) = PE_SIG;
+        *(u16 *)(image + 0x86) = 1;
+        size_t opt = 0x98, dirs = bitness ? 112 : 96;
+        *(u16 *)(image + 0x94) = dirs + 128;
+        *(u16 *)(image + opt) = bitness ? PE32PLUS : 0x10b;
+        *(u32 *)(image + opt + dirs - 4) = 16;
+        DataDir *resources = (void *)(image + opt + dirs + 16);
+        *resources = (DataDir){0x400, 0x800};
+        u8 *root = image + 0x400;
+        ((ResourceDir *)root)->id_count = 1;
+        *(ResourceEntry *)(root + 16) = (ResourceEntry){24, 0x80000020};
+        ((ResourceDir *)(root + 32))->id_count = 1;
+        *(ResourceEntry *)(root + 48) = (ResourceEntry){1, 0x80000040};
+        ((ResourceDir *)(root + 64))->id_count = 1;
+        *(ResourceEntry *)(root + 80) = (ResourceEntry){1033, 96};
+        *(ResourceData *)(root + 96) = (ResourceData){0x480, sizeof(xml) - 1, 0, 0};
+        memcpy(root + 128, xml, sizeof(xml));
+        SecHdr *section = (void *)(image + opt + dirs + 128);
+        section->vrva = section->raw_off = 0x400;
+        section->raw_sz = 0x800;
+        assert(beer_security_image_level(image, sizeof(image), 1) == 3);
+        assert(beer_security_image_level(image, sizeof(image), 0) == 3);
+        unsetenv("_BEER_PRIMARY_TOKEN");
+        assert(beer_security_init(image, sizeof(image)) && beer_process_elevated() == 1);
+        setenv("_BEER_PRIMARY_TOKEN", "0", 1);
+        assert(!beer_security_init(image, sizeof(image)) && g_last_error == 740);
+        assert(!getenv("_BEER_PRIMARY_TOKEN"));
+        setenv("_BEER_PRIMARY_TOKEN", "1", 1);
+        assert(beer_security_init(image, sizeof(image)) && beer_process_elevated() == 1);
+        /* Remove the manifest: explicit false must override stale true state;
+         * explicit true must survive an asInvoker/no-manifest child. */
+        resources->rva = resources->size = 0;
+        for (int token = 0; token <= 1; ++token) {
+            setenv("_BEER_PRIMARY_TOKEN", token ? "1" : "0", 1);
+            assert(beer_security_init(image, sizeof(image)) && beer_process_elevated() == token);
+            setenv("_BEER_PRIMARY_TOKEN", "stale", 1);
+            char **env = beer_inherit_environment(NULL);
+            assert(env);
+            int seen = 0;
+            for (size_t i = 0; env[i]; ++i) {
+                if (strncmp(env[i], "_BEER_PRIMARY_TOKEN=", 20)) continue;
+                assert(!strcmp(env[i], token ? "_BEER_PRIMARY_TOKEN=1" : "_BEER_PRIMARY_TOKEN=0"));
+                ++seen;
+            }
+            assert(seen == 1);
+            free(env);
+        }
+        unsetenv("_BEER_PRIMARY_TOKEN");
+        assert(beer_security_init(image, sizeof(image)) && beer_process_elevated() == 0);
+        setenv("_BEER_PRIMARY_TOKEN", "invalid", 1);
+        assert(!beer_security_init(image, sizeof(image)) && g_last_error == 13);
+        resources->rva = sizeof(image) - 1;
+        resources->size = 128;
+        assert(beer_security_image_level(image, sizeof(image), 1) == -1);
+    }
+    g_process_elevated = saved_token;
+    if (saved_env) { setenv("_BEER_PRIMARY_TOKEN", saved_env, 1); free(saved_env); }
+    else unsetenv("_BEER_PRIMARY_TOKEN");
 }
 
 int main(void)
@@ -1133,7 +1462,13 @@ int main(void)
         HMOD_NTDLL + FAKE_PE_TEXT_RVA + count * FAKE_PE_STUB_SLOT);
     wow32_ui_contract_test();
     wow32_static_tls_contract_test();
+    wow32_controls_contract_test();
     wow32_sid_contract_test();
+    wow32_dib_contract_test();
+    process_security_contract_test();
+    wow32_named_resource_contract_test();
+    wow32_version_contract_test();
+    wow32_dll_contract_test();
     puts("native loader ABI/interoperability: PASS");
     return 0;
 }

@@ -15,6 +15,18 @@ static u64 w32_call_impl_out(const char *name, const u32 *args, u32 argc, u32 ou
     return (u32)((W32Impl12)(void *)impl)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]);
 }
 
+/* VERSIONINFO is fixed-width data. VerQueryValue's returned pointer is not:
+ * translate it through a native temporary, never write eight bytes to LPVOID*. */
+static u64 w32_VerQueryValueW(const u32 *args)
+{
+    u64 value = 0;
+    u64 result = w32_call_impl_out("VerQueryValueW", args, 4, 2, &value);
+    if (!result) return 0;
+    if (value > UINT32_MAX) { g_last_error = 50; return 0; }
+    if (args[2]) *(u32 *)W32_PTR(2) = (u32)value;
+    return result;
+}
+
 /* LOGFONTW/LOGPEN have fixed-width fields, but BITMAP and LOGBRUSH contain
  * pointers/ULONG_PTR. Never let the native GetObject overwrite a PE32 buffer. */
 static u64 w32_GetObjectW(const u32 *args)
@@ -45,6 +57,47 @@ static u64 w32_GetObjectW(const u32 *args)
     int copied = size < full ? size : full;
     memcpy(W32_PTR(2), out, (size_t)copied);
     return copied;
+}
+
+static u64 w32_EnumThreadWindows(const u32 *args)
+{
+    if (!args[1]) { g_last_error = 87; return 0; }
+    u32 windows[BEER_MAX_WINDOWS];
+    size_t count = 0;
+    pthread_mutex_lock(&g_beer_windows_mtx);
+    for (size_t i = 0; i < BEER_MAX_WINDOWS; ++i) {
+        const BeerWindow *w = &g_beer_windows[i];
+        if (w->used && w->owner_tid == args[0] && !(w->style & 0x40000000u) &&
+            w->parent != (u64)-3)
+            windows[count++] = (u32)w->hwnd;
+    }
+    pthread_mutex_unlock(&g_beer_windows_mtx);
+    for (size_t i = 0; i < count; ++i) {
+        /* Do not hold the window-table lock across guest callbacks. */
+        pthread_mutex_lock(&g_beer_windows_mtx);
+        const BeerWindow *w = beer_window_find(windows[i]);
+        const int live = w && w->owner_tid == args[0] && !(w->style & 0x40000000u) &&
+                         w->parent != (u64)-3;
+        pthread_mutex_unlock(&g_beer_windows_mtx);
+        if (!live) continue;
+        const u32 argv[] = {windows[i], args[2]};
+        if (!w32_call(args[1], 2, argv)) return 0;
+    }
+    return 1;
+}
+
+static u64 w32_CreateDIBSection(const u32 *args)
+{
+    if (args[3]) *(u32 *)W32_PTR(3) = 0;
+    if (args[2] || args[4]) { g_last_error = 50; return 0; }
+    void *bits = NULL;
+    u64 bitmap = beer_gdi_create_dib_section_low32(W32_PTR(1), &bits);
+    if (!bitmap) {
+        g_last_error = errno == ENOMEM ? 8 : errno == ENOTSUP ? 50 : 87;
+        return 0;
+    }
+    if (args[3]) *(u32 *)W32_PTR(3) = (u32)(uintptr_t)bits;
+    return (u32)bitmap;
 }
 
 /* SID bytes have the same layout on both ABIs, but PSID* is a DWORD output
@@ -79,7 +132,7 @@ static const struct { const char *name; u32 handle; } g_w32_system_modules[] = {
     {"ole32", 0xFF090000u}, {"comctl32", 0xFF0D0000u}, {"gdi32", 0xFF110000u}, {"version", 0xFF150000u},
     {"shlwapi", 0xFF190000u}, {"comdlg32", 0xFF1D0000u}, {"uxtheme", 0xFF210000u}, {"winmm", 0xFF250000u},
     {"imm32", 0xFF290000u}, {"userenv", 0xFF2D0000u}, {"mpr", 0xFF310000u}, {"netapi32", 0xFF350000u},
-    {"dwmapi", 0xFF390000u}, {"setupapi", 0xFF3D0000u}, {"crypt32", 0xFF410000u}, {"wintrust", 0xFF450000u},
+    {"dwmapi", 0xFF390000u}, {"setupapi", 0xFF3D0000u}, {"crypt32", 0xFF410000u}, {"wintrust", 0xFF450000u}, {"wininet", 0xFF490000u}, {"msacm32", 0xFF4D0000u},
 };
 
 static int w32_is_system_module(u32 handle)
@@ -104,7 +157,12 @@ static u32 w32_module_by_name(const char *path)
     char key[64];
     w32_module_key(path, key, sizeof(key));
     for (size_t i = 0; i < sizeof(g_w32_system_modules) / sizeof(*g_w32_system_modules); ++i)
-        if (!strcasecmp(key, g_w32_system_modules[i].name)) return g_w32_system_modules[i].handle;
+        if (!strcasecmp(key, g_w32_system_modules[i].name)) {
+            w32_sysmod_ensure_image(g_w32_system_modules[i].handle);     /* headers + exports for manual walkers */
+            return g_w32_system_modules[i].handle;
+        }
+    u32 loaded = w32_dll_by_name(path);
+    if (loaded) return loaded;
     /* The executable itself, by name. */
     char self[PATH_MAX];
     if (impl_GetModuleFileNameA(0, self, sizeof(self))) {
@@ -132,17 +190,19 @@ static u64 w32_GetModuleHandleW(const u32 *args)
     return handle;
 }
 
-/* Only system DLLs load: loading 32-bit DLL images is not implemented yet (reported, ERROR_MOD_NOT_FOUND). */
+/* System pseudo modules retain their existing policy; other DLLs are real PE32 images. */
 static u64 w32_load_library(const char *name)
 {
     const u32 handle = w32_module_by_name(name);
-    if (handle) return handle;
-    fprintf(stderr, "[WOW32] LoadLibrary(\"%s\"): 32-bit DLL images are not supported yet\n", name);
-    g_last_error = 126;
-    return 0;
+    if (handle && !w32_dll_path(handle)) return handle;
+    return w32_dll_load(name);
 }
 static u64 w32_LoadLibraryA(const u32 *args) { return args[0] ? w32_load_library(W32_PTR(0)) : 0; }
-static u64 w32_LoadLibraryExA(const u32 *args) { return args[0] ? w32_load_library(W32_PTR(0)) : 0; }
+static u64 w32_LoadLibraryExA(const u32 *args)
+{
+    if (args[1] || args[2]) { g_last_error = 50; return 0; }
+    return w32_LoadLibraryA(args);
+}
 static u64 w32_LoadLibraryW(const u32 *args)
 {
     if (!args[0]) return 0;
@@ -150,11 +210,33 @@ static u64 w32_LoadLibraryW(const u32 *args)
     w32_narrow(W32_PTR(0), name, sizeof(name));
     return w32_load_library(name);
 }
-static u64 w32_LoadLibraryExW(const u32 *args) { return w32_LoadLibraryW(args); }
-static u64 w32_FreeLibrary(const u32 *args) { (void)args; return 1; }
+static u64 w32_LoadLibraryExW(const u32 *args)
+{
+    if (args[1] || args[2]) { g_last_error = 50; return 0; }
+    return w32_LoadLibraryW(args);
+}
+static u64 w32_FreeLibrary(const u32 *args)
+{
+    if (w32_is_system_module(args[0])) return 1;
+    return w32_dll_free(args[0]);
+}
 
 static u64 w32_GetModuleFileNameW(const u32 *args)
 {
+    const char *dll_path = w32_dll_path(args[0]);
+    if (dll_path) {
+        /* Canonical host paths are addressable through Beer's Z: drive. */
+        if (!args[2]) { g_last_error = 122; return 0; }
+        u16 *out = W32_PTR(1);
+        for (u32 i = 0; i < args[2]; ++i) {
+            char c = i == 0 ? 'Z' : i == 1 ? ':' : dll_path[i - 2];
+            out[i] = c == '/' ? '\\' : (u8)c;
+            if (!c) return i;
+        }
+        out[args[2] - 1] = 0;
+        g_last_error = 122;
+        return args[2];
+    }
     if (args[0] && args[0] != g_w32_image && !w32_is_system_module(args[0])) { g_last_error = 126; return 0; }
     /* System pseudo modules report their System32 path, as on Windows; the executable reports its own. */
     if (args[0] && args[0] != g_w32_image) {
@@ -463,9 +545,19 @@ static u64 w32_VirtualQuery(const u32 *args)
         mbi[3] = base + size - page;
         mbi[4] = 0x1000; mbi[5] = 0x04; mbi[6] = 0x20000;    /* MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE */
     } else if (mincore((void *)(uintptr_t)page, 0x1000, &probe) == 0) {
-        mbi[0] = page; mbi[1] = page; mbi[2] = 0x40;
-        mbi[3] = 0x1000; mbi[4] = 0x1000; mbi[5] = 0x40;     /* mapped: image or Beer's own, committed */
-        mbi[6] = page >= g_w32_image && page < g_w32_image + 0x10000000u ? 0x1000000u : 0x20000u;
+        u32 image_base = 0, image_size = 0;
+        if (g_w32_image) {
+            const u8 *exe = (const u8 *)(uintptr_t)g_w32_image;
+            const W32NtHdrs *nt = (const W32NtHdrs *)(exe + ((const DosHdr *)exe)->lfanew);
+            if (page >= g_w32_image && page - g_w32_image < nt->opt.size_of_image) {
+                image_base = g_w32_image; image_size = nt->opt.size_of_image;
+            }
+        }
+        if (!image_base) w32_dll_image_range(page, &image_base, &image_size);
+        mbi[0] = page; mbi[1] = image_base ? image_base : page; mbi[2] = 0x40;
+        mbi[3] = image_base ? image_base + image_size - page : 0x1000;
+        mbi[4] = 0x1000; mbi[5] = 0x40;                       /* mapped, committed */
+        mbi[6] = image_base ? 0x1000000u : 0x20000u;          /* MEM_IMAGE / MEM_PRIVATE */
     } else {
         mbi[0] = page; mbi[3] = 0x10000; mbi[4] = 0x10000; mbi[5] = 0x01;   /* MEM_FREE */
     }
@@ -645,25 +737,23 @@ static u64 w32_MessageBoxW(const u32 *args)
 
 static u64 w32_FindResourceExA(const u32 *args);
 /* A resource name/type argument: an integer ID below 0x10000, else a string; narrowed into `buffer`. */
-static u32 w32_res_name(u32 value, char *buffer, size_t size)
+static uintptr_t w32_res_name(u32 value, char *buffer, size_t size)
 {
     if (value < 0x10000) return value;
     w32_narrow((const u16 *)(uintptr_t)value, buffer, size);
-    return (u32)(uintptr_t)buffer;
+    return (uintptr_t)buffer;
 }
 static u64 w32_FindResourceExW(const u32 *args)
 {
     char type[256], name[256];
-    const u32 narrowed[4] = { args[0], w32_res_name(args[1], type, sizeof(type)), w32_res_name(args[2], name, sizeof(name)),
-                              args[3] };
-    return w32_FindResourceExA(narrowed);
+    return w32_find_resource(args[0], w32_res_name(args[1], type, sizeof(type)),
+                             w32_res_name(args[2], name, sizeof(name)), args[3]);
 }
 static u64 w32_FindResourceW(const u32 *args)         /* (module, name, type) */
 {
     char type[256], name[256];
-    const u32 narrowed[4] = { args[0], w32_res_name(args[2], type, sizeof(type)), w32_res_name(args[1], name, sizeof(name)),
-                              0 };
-    return w32_FindResourceExA(narrowed);
+    return w32_find_resource(args[0], w32_res_name(args[2], type, sizeof(type)),
+                             w32_res_name(args[1], name, sizeof(name)), 0);
 }
 static u64 w32_FindResourceA(const u32 *args)
 {
@@ -706,7 +796,7 @@ static u64 w32_GetDiskFreeSpaceExW(const u32 *args)
  * code with the message parameters translated; a 64-bit procedure handed back to 32-bit code (GetWindowLong,
  * SetWindowLong's previous value) becomes the original 32-bit address, or a 32-bit thunk for Beer's own procedure. */
 
-#define W32_BRIDGES 64
+#define W32_BRIDGES 256
 static u32 g_w32_bridge_proc[W32_BRIDGES];
 
 /* lParam structures of the messages Beer itself sends, copied into 32-bit memory for the call and back after it. */
@@ -791,19 +881,301 @@ static u32 w32_wndproc_call(u32 proc, u64 hwnd, u32 message, u64 wparam, u64 lpa
     return result;
 }
 
-/* Results are sign-extended to 64 bits: LRESULT -1 (WM_CREATE failure) must stay -1. */
+/* Results are sign-extended to 64 bits: LRESULT -1 (WM_CREATE failure) must stay -1.
+ * Bridge n forwards to the 32-bit procedure stored in g_w32_bridge_proc[n] (generated: one function per slot). */
 #define W32_BRIDGE(n) \
     static u64 __attribute__((ms_abi)) w32_bridge_##n(u64 hwnd, u32 message, u64 wparam, u64 lparam) \
     { return (u64)(s64)(s32)w32_wndproc_call(g_w32_bridge_proc[n], hwnd, message, wparam, lparam); }
-#define W32_BRIDGE8(n) W32_BRIDGE(n##0) W32_BRIDGE(n##1) W32_BRIDGE(n##2) W32_BRIDGE(n##3) \
-                       W32_BRIDGE(n##4) W32_BRIDGE(n##5) W32_BRIDGE(n##6) W32_BRIDGE(n##7)
-W32_BRIDGE8(0) W32_BRIDGE8(1) W32_BRIDGE8(2) W32_BRIDGE8(3) W32_BRIDGE8(4) W32_BRIDGE8(5) W32_BRIDGE8(6) W32_BRIDGE8(7)
-#define W32_BRIDGE_REF8(n) w32_bridge_##n##0, w32_bridge_##n##1, w32_bridge_##n##2, w32_bridge_##n##3, \
-                           w32_bridge_##n##4, w32_bridge_##n##5, w32_bridge_##n##6, w32_bridge_##n##7
+W32_BRIDGE(0)
+W32_BRIDGE(1)
+W32_BRIDGE(2)
+W32_BRIDGE(3)
+W32_BRIDGE(4)
+W32_BRIDGE(5)
+W32_BRIDGE(6)
+W32_BRIDGE(7)
+W32_BRIDGE(8)
+W32_BRIDGE(9)
+W32_BRIDGE(10)
+W32_BRIDGE(11)
+W32_BRIDGE(12)
+W32_BRIDGE(13)
+W32_BRIDGE(14)
+W32_BRIDGE(15)
+W32_BRIDGE(16)
+W32_BRIDGE(17)
+W32_BRIDGE(18)
+W32_BRIDGE(19)
+W32_BRIDGE(20)
+W32_BRIDGE(21)
+W32_BRIDGE(22)
+W32_BRIDGE(23)
+W32_BRIDGE(24)
+W32_BRIDGE(25)
+W32_BRIDGE(26)
+W32_BRIDGE(27)
+W32_BRIDGE(28)
+W32_BRIDGE(29)
+W32_BRIDGE(30)
+W32_BRIDGE(31)
+W32_BRIDGE(32)
+W32_BRIDGE(33)
+W32_BRIDGE(34)
+W32_BRIDGE(35)
+W32_BRIDGE(36)
+W32_BRIDGE(37)
+W32_BRIDGE(38)
+W32_BRIDGE(39)
+W32_BRIDGE(40)
+W32_BRIDGE(41)
+W32_BRIDGE(42)
+W32_BRIDGE(43)
+W32_BRIDGE(44)
+W32_BRIDGE(45)
+W32_BRIDGE(46)
+W32_BRIDGE(47)
+W32_BRIDGE(48)
+W32_BRIDGE(49)
+W32_BRIDGE(50)
+W32_BRIDGE(51)
+W32_BRIDGE(52)
+W32_BRIDGE(53)
+W32_BRIDGE(54)
+W32_BRIDGE(55)
+W32_BRIDGE(56)
+W32_BRIDGE(57)
+W32_BRIDGE(58)
+W32_BRIDGE(59)
+W32_BRIDGE(60)
+W32_BRIDGE(61)
+W32_BRIDGE(62)
+W32_BRIDGE(63)
+W32_BRIDGE(64)
+W32_BRIDGE(65)
+W32_BRIDGE(66)
+W32_BRIDGE(67)
+W32_BRIDGE(68)
+W32_BRIDGE(69)
+W32_BRIDGE(70)
+W32_BRIDGE(71)
+W32_BRIDGE(72)
+W32_BRIDGE(73)
+W32_BRIDGE(74)
+W32_BRIDGE(75)
+W32_BRIDGE(76)
+W32_BRIDGE(77)
+W32_BRIDGE(78)
+W32_BRIDGE(79)
+W32_BRIDGE(80)
+W32_BRIDGE(81)
+W32_BRIDGE(82)
+W32_BRIDGE(83)
+W32_BRIDGE(84)
+W32_BRIDGE(85)
+W32_BRIDGE(86)
+W32_BRIDGE(87)
+W32_BRIDGE(88)
+W32_BRIDGE(89)
+W32_BRIDGE(90)
+W32_BRIDGE(91)
+W32_BRIDGE(92)
+W32_BRIDGE(93)
+W32_BRIDGE(94)
+W32_BRIDGE(95)
+W32_BRIDGE(96)
+W32_BRIDGE(97)
+W32_BRIDGE(98)
+W32_BRIDGE(99)
+W32_BRIDGE(100)
+W32_BRIDGE(101)
+W32_BRIDGE(102)
+W32_BRIDGE(103)
+W32_BRIDGE(104)
+W32_BRIDGE(105)
+W32_BRIDGE(106)
+W32_BRIDGE(107)
+W32_BRIDGE(108)
+W32_BRIDGE(109)
+W32_BRIDGE(110)
+W32_BRIDGE(111)
+W32_BRIDGE(112)
+W32_BRIDGE(113)
+W32_BRIDGE(114)
+W32_BRIDGE(115)
+W32_BRIDGE(116)
+W32_BRIDGE(117)
+W32_BRIDGE(118)
+W32_BRIDGE(119)
+W32_BRIDGE(120)
+W32_BRIDGE(121)
+W32_BRIDGE(122)
+W32_BRIDGE(123)
+W32_BRIDGE(124)
+W32_BRIDGE(125)
+W32_BRIDGE(126)
+W32_BRIDGE(127)
+W32_BRIDGE(128)
+W32_BRIDGE(129)
+W32_BRIDGE(130)
+W32_BRIDGE(131)
+W32_BRIDGE(132)
+W32_BRIDGE(133)
+W32_BRIDGE(134)
+W32_BRIDGE(135)
+W32_BRIDGE(136)
+W32_BRIDGE(137)
+W32_BRIDGE(138)
+W32_BRIDGE(139)
+W32_BRIDGE(140)
+W32_BRIDGE(141)
+W32_BRIDGE(142)
+W32_BRIDGE(143)
+W32_BRIDGE(144)
+W32_BRIDGE(145)
+W32_BRIDGE(146)
+W32_BRIDGE(147)
+W32_BRIDGE(148)
+W32_BRIDGE(149)
+W32_BRIDGE(150)
+W32_BRIDGE(151)
+W32_BRIDGE(152)
+W32_BRIDGE(153)
+W32_BRIDGE(154)
+W32_BRIDGE(155)
+W32_BRIDGE(156)
+W32_BRIDGE(157)
+W32_BRIDGE(158)
+W32_BRIDGE(159)
+W32_BRIDGE(160)
+W32_BRIDGE(161)
+W32_BRIDGE(162)
+W32_BRIDGE(163)
+W32_BRIDGE(164)
+W32_BRIDGE(165)
+W32_BRIDGE(166)
+W32_BRIDGE(167)
+W32_BRIDGE(168)
+W32_BRIDGE(169)
+W32_BRIDGE(170)
+W32_BRIDGE(171)
+W32_BRIDGE(172)
+W32_BRIDGE(173)
+W32_BRIDGE(174)
+W32_BRIDGE(175)
+W32_BRIDGE(176)
+W32_BRIDGE(177)
+W32_BRIDGE(178)
+W32_BRIDGE(179)
+W32_BRIDGE(180)
+W32_BRIDGE(181)
+W32_BRIDGE(182)
+W32_BRIDGE(183)
+W32_BRIDGE(184)
+W32_BRIDGE(185)
+W32_BRIDGE(186)
+W32_BRIDGE(187)
+W32_BRIDGE(188)
+W32_BRIDGE(189)
+W32_BRIDGE(190)
+W32_BRIDGE(191)
+W32_BRIDGE(192)
+W32_BRIDGE(193)
+W32_BRIDGE(194)
+W32_BRIDGE(195)
+W32_BRIDGE(196)
+W32_BRIDGE(197)
+W32_BRIDGE(198)
+W32_BRIDGE(199)
+W32_BRIDGE(200)
+W32_BRIDGE(201)
+W32_BRIDGE(202)
+W32_BRIDGE(203)
+W32_BRIDGE(204)
+W32_BRIDGE(205)
+W32_BRIDGE(206)
+W32_BRIDGE(207)
+W32_BRIDGE(208)
+W32_BRIDGE(209)
+W32_BRIDGE(210)
+W32_BRIDGE(211)
+W32_BRIDGE(212)
+W32_BRIDGE(213)
+W32_BRIDGE(214)
+W32_BRIDGE(215)
+W32_BRIDGE(216)
+W32_BRIDGE(217)
+W32_BRIDGE(218)
+W32_BRIDGE(219)
+W32_BRIDGE(220)
+W32_BRIDGE(221)
+W32_BRIDGE(222)
+W32_BRIDGE(223)
+W32_BRIDGE(224)
+W32_BRIDGE(225)
+W32_BRIDGE(226)
+W32_BRIDGE(227)
+W32_BRIDGE(228)
+W32_BRIDGE(229)
+W32_BRIDGE(230)
+W32_BRIDGE(231)
+W32_BRIDGE(232)
+W32_BRIDGE(233)
+W32_BRIDGE(234)
+W32_BRIDGE(235)
+W32_BRIDGE(236)
+W32_BRIDGE(237)
+W32_BRIDGE(238)
+W32_BRIDGE(239)
+W32_BRIDGE(240)
+W32_BRIDGE(241)
+W32_BRIDGE(242)
+W32_BRIDGE(243)
+W32_BRIDGE(244)
+W32_BRIDGE(245)
+W32_BRIDGE(246)
+W32_BRIDGE(247)
+W32_BRIDGE(248)
+W32_BRIDGE(249)
+W32_BRIDGE(250)
+W32_BRIDGE(251)
+W32_BRIDGE(252)
+W32_BRIDGE(253)
+W32_BRIDGE(254)
+W32_BRIDGE(255)
 typedef u64 (__attribute__((ms_abi)) *W32Bridge)(u64, u32, u64, u64);
 static const W32Bridge g_w32_bridges[W32_BRIDGES] = {
-    W32_BRIDGE_REF8(0), W32_BRIDGE_REF8(1), W32_BRIDGE_REF8(2), W32_BRIDGE_REF8(3),
-    W32_BRIDGE_REF8(4), W32_BRIDGE_REF8(5), W32_BRIDGE_REF8(6), W32_BRIDGE_REF8(7),
+    w32_bridge_0, w32_bridge_1, w32_bridge_2, w32_bridge_3, w32_bridge_4, w32_bridge_5, w32_bridge_6, w32_bridge_7,
+    w32_bridge_8, w32_bridge_9, w32_bridge_10, w32_bridge_11, w32_bridge_12, w32_bridge_13, w32_bridge_14, w32_bridge_15,
+    w32_bridge_16, w32_bridge_17, w32_bridge_18, w32_bridge_19, w32_bridge_20, w32_bridge_21, w32_bridge_22, w32_bridge_23,
+    w32_bridge_24, w32_bridge_25, w32_bridge_26, w32_bridge_27, w32_bridge_28, w32_bridge_29, w32_bridge_30, w32_bridge_31,
+    w32_bridge_32, w32_bridge_33, w32_bridge_34, w32_bridge_35, w32_bridge_36, w32_bridge_37, w32_bridge_38, w32_bridge_39,
+    w32_bridge_40, w32_bridge_41, w32_bridge_42, w32_bridge_43, w32_bridge_44, w32_bridge_45, w32_bridge_46, w32_bridge_47,
+    w32_bridge_48, w32_bridge_49, w32_bridge_50, w32_bridge_51, w32_bridge_52, w32_bridge_53, w32_bridge_54, w32_bridge_55,
+    w32_bridge_56, w32_bridge_57, w32_bridge_58, w32_bridge_59, w32_bridge_60, w32_bridge_61, w32_bridge_62, w32_bridge_63,
+    w32_bridge_64, w32_bridge_65, w32_bridge_66, w32_bridge_67, w32_bridge_68, w32_bridge_69, w32_bridge_70, w32_bridge_71,
+    w32_bridge_72, w32_bridge_73, w32_bridge_74, w32_bridge_75, w32_bridge_76, w32_bridge_77, w32_bridge_78, w32_bridge_79,
+    w32_bridge_80, w32_bridge_81, w32_bridge_82, w32_bridge_83, w32_bridge_84, w32_bridge_85, w32_bridge_86, w32_bridge_87,
+    w32_bridge_88, w32_bridge_89, w32_bridge_90, w32_bridge_91, w32_bridge_92, w32_bridge_93, w32_bridge_94, w32_bridge_95,
+    w32_bridge_96, w32_bridge_97, w32_bridge_98, w32_bridge_99, w32_bridge_100, w32_bridge_101, w32_bridge_102, w32_bridge_103,
+    w32_bridge_104, w32_bridge_105, w32_bridge_106, w32_bridge_107, w32_bridge_108, w32_bridge_109, w32_bridge_110, w32_bridge_111,
+    w32_bridge_112, w32_bridge_113, w32_bridge_114, w32_bridge_115, w32_bridge_116, w32_bridge_117, w32_bridge_118, w32_bridge_119,
+    w32_bridge_120, w32_bridge_121, w32_bridge_122, w32_bridge_123, w32_bridge_124, w32_bridge_125, w32_bridge_126, w32_bridge_127,
+    w32_bridge_128, w32_bridge_129, w32_bridge_130, w32_bridge_131, w32_bridge_132, w32_bridge_133, w32_bridge_134, w32_bridge_135,
+    w32_bridge_136, w32_bridge_137, w32_bridge_138, w32_bridge_139, w32_bridge_140, w32_bridge_141, w32_bridge_142, w32_bridge_143,
+    w32_bridge_144, w32_bridge_145, w32_bridge_146, w32_bridge_147, w32_bridge_148, w32_bridge_149, w32_bridge_150, w32_bridge_151,
+    w32_bridge_152, w32_bridge_153, w32_bridge_154, w32_bridge_155, w32_bridge_156, w32_bridge_157, w32_bridge_158, w32_bridge_159,
+    w32_bridge_160, w32_bridge_161, w32_bridge_162, w32_bridge_163, w32_bridge_164, w32_bridge_165, w32_bridge_166, w32_bridge_167,
+    w32_bridge_168, w32_bridge_169, w32_bridge_170, w32_bridge_171, w32_bridge_172, w32_bridge_173, w32_bridge_174, w32_bridge_175,
+    w32_bridge_176, w32_bridge_177, w32_bridge_178, w32_bridge_179, w32_bridge_180, w32_bridge_181, w32_bridge_182, w32_bridge_183,
+    w32_bridge_184, w32_bridge_185, w32_bridge_186, w32_bridge_187, w32_bridge_188, w32_bridge_189, w32_bridge_190, w32_bridge_191,
+    w32_bridge_192, w32_bridge_193, w32_bridge_194, w32_bridge_195, w32_bridge_196, w32_bridge_197, w32_bridge_198, w32_bridge_199,
+    w32_bridge_200, w32_bridge_201, w32_bridge_202, w32_bridge_203, w32_bridge_204, w32_bridge_205, w32_bridge_206, w32_bridge_207,
+    w32_bridge_208, w32_bridge_209, w32_bridge_210, w32_bridge_211, w32_bridge_212, w32_bridge_213, w32_bridge_214, w32_bridge_215,
+    w32_bridge_216, w32_bridge_217, w32_bridge_218, w32_bridge_219, w32_bridge_220, w32_bridge_221, w32_bridge_222, w32_bridge_223,
+    w32_bridge_224, w32_bridge_225, w32_bridge_226, w32_bridge_227, w32_bridge_228, w32_bridge_229, w32_bridge_230, w32_bridge_231,
+    w32_bridge_232, w32_bridge_233, w32_bridge_234, w32_bridge_235, w32_bridge_236, w32_bridge_237, w32_bridge_238, w32_bridge_239,
+    w32_bridge_240, w32_bridge_241, w32_bridge_242, w32_bridge_243, w32_bridge_244, w32_bridge_245, w32_bridge_246, w32_bridge_247,
+    w32_bridge_248, w32_bridge_249, w32_bridge_250, w32_bridge_251, w32_bridge_252, w32_bridge_253, w32_bridge_254, w32_bridge_255,
 };
 
 /* The thunk entry behind a 32-bit address, when it is one of this layer's thunks; NULL otherwise. */
@@ -873,6 +1245,30 @@ static u64 w32_GetWindowLongW(const u32 *args)
     return (s32)args[1] == -4 ? w32_proc_from_native(value) : (u32)value;
 }
 
+/* A 32-bit CREATESTRUCT (12 DWORDs) as the native 64-bit structure Beer's own window procedures expect. */
+static void w32_createstruct_native(const u32 *c, WIN_CREATESTRUCT *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->lpCreateParams = c[0]; out->hInstance = c[1]; out->hMenu = c[2]; out->hwndParent = w32_widen(c[3]);
+    out->cy = (s32)c[4]; out->cx = (s32)c[5]; out->y = (s32)c[6]; out->x = (s32)c[7]; out->style = (s32)c[8];
+    out->lpszName = c[9]; out->lpszClass = c[10]; out->dwExStyle = c[11];
+}
+/* Calls a native 64-bit window procedure for a 32-bit caller, translating lParam structures that differ in size. */
+static u64 w32_call_native_proc(u64 (__attribute__((ms_abi)) *proc)(u64, u32, u64, u64), u64 hwnd, u32 message,
+                                u64 wparam, u64 lparam)
+{
+    if ((message == 0x0081 || message == 0x0001) && lparam) {          /* WM_NCCREATE / WM_CREATE */
+        WIN_CREATESTRUCT native;
+        w32_createstruct_native((const u32 *)(uintptr_t)lparam, &native);
+        return (u32)proc(hwnd, message, wparam, (u64)(uintptr_t)&native);
+    }
+    return (u32)proc(hwnd, message, wparam, lparam);
+}
+static u64 w32_DefWindowProcW(const u32 *args)
+{
+    return w32_call_native_proc((void *)impl_DefWindowProcW, w32_widen(args[0]), args[1], w32_widen(args[2]),
+                                w32_widen(args[3]));
+}
 static u64 w32_CallWindowProcW(const u32 *args)
 {
     const u32 proc = args[0];
@@ -880,7 +1276,7 @@ static u64 w32_CallWindowProcW(const u32 *args)
     if (!proc) return (u32)impl_DefWindowProcW(hwnd, args[2], wparam, lparam);
     const W32Thunk *t = w32_thunk_at(proc);
     if (t && t->impl)
-        return (u32)((u64 (__attribute__((ms_abi)) *)(u64, u32, u64, u64))(void *)t->impl)(hwnd, args[2], wparam, lparam);
+        return w32_call_native_proc((void *)t->impl, hwnd, args[2], wparam, lparam);
     return w32_call(proc, 4, args + 1);
 }
 
@@ -1018,3 +1414,546 @@ static u64 w32_wait_handles(const char *name, const u32 *args, u32 argc, u32 cou
 static u64 w32_WaitForMultipleObjects(const u32 *args) { return w32_wait_handles("WaitForMultipleObjects", args, 4, 0, 1); }
 static u64 w32_MsgWaitForMultipleObjects(const u32 *args) { return w32_wait_handles("MsgWaitForMultipleObjects", args, 5, 0, 1); }
 static u64 w32_MsgWaitForMultipleObjectsEx(const u32 *args) { return w32_wait_handles("MsgWaitForMultipleObjectsEx", args, 5, 0, 1); }
+
+/* EnumResource{Types,Names,Languages}W: walks the PE32 resource directory and calls the 32-bit callback for each
+ * entry; a FALSE return stops the enumeration. Named entries are copied to NUL-terminated heap strings. */
+static u32 w32_res_entry_key(const u8 *root, u32 raw, u16 **to_free)
+{
+    *to_free = NULL;
+    if (!(raw & 0x80000000u)) return raw;
+    const u16 *name = (const u16 *)(root + (raw & 0x7fffffffu));
+    const u16 length = name[0];
+    u16 *copy = w32_heap_alloc((size_t)(length + 1) * 2, 1);
+    if (!copy) return 0;
+    memcpy(copy, name + 1, (size_t)length * 2);
+    *to_free = copy;
+    return (u32)(uintptr_t)copy;
+}
+/* level 0 = types, 1 = names (inside `type`), 2 = languages (inside `type` and `name`). */
+static u64 w32_enum_resources(u32 module, int level, u32 type, u32 name, u32 proc, u32 lparam)
+{
+    const u8 *image = (const u8 *)(uintptr_t)(module ? module : g_w32_image);
+    const W32NtHdrs *nt = (const W32NtHdrs *)(image + ((const DosHdr *)image)->lfanew);
+    if (!proc) { g_last_error = 87; return 0; }
+    if (!nt->opt.dirs[2].rva || !nt->opt.dirs[2].size) { g_last_error = 1812; return 0; }
+    const u8 *root = image + nt->opt.dirs[2].rva;
+    u32 offset = 0;
+    char tbuf[256], nbuf[256];
+    const uintptr_t keys[2] = { w32_res_name(type, tbuf, sizeof(tbuf)), w32_res_name(name, nbuf, sizeof(nbuf)) };
+    for (int l = 0; l < level; ++l) {
+        offset = w32_res_child(root, offset, keys[l], 0);
+        if (offset == W32_RES_NOT_FOUND || !(offset & 0x80000000u)) {
+            g_last_error = l == 0 ? 1813 : 1814;           /* ERROR_RESOURCE_TYPE/NAME_NOT_FOUND */
+            return 0;
+        }
+        offset &= 0x7fffffffu;
+    }
+    const u16 *dir = (const u16 *)(root + offset);
+    const u32 count = (u32)dir[6] + dir[7];
+    const u32 *entries = (const u32 *)(root + offset + 16);
+    for (u32 i = 0; i < count; ++i) {
+        u16 *tmp;
+        const u32 key = w32_res_entry_key(root, entries[2 * i], &tmp);
+        u32 argv[5]; u32 argc;
+        if (level == 0)      { argv[0] = module; argv[1] = key; argv[2] = lparam; argc = 3; }
+        else if (level == 1) { argv[0] = module; argv[1] = type; argv[2] = key; argv[3] = lparam; argc = 4; }
+        else                 { argv[0] = module; argv[1] = type; argv[2] = name; argv[3] = key & 0xffff;
+                               argv[4] = lparam; argc = 5; }
+        const u32 keep = w32_call(proc, argc, argv);
+        if (tmp) w32_heap_free(tmp);
+        if (!keep) break;
+    }
+    return 1;
+}
+static u64 w32_EnumResourceTypesW(const u32 *a)     { return w32_enum_resources(a[0], 0, 0, 0, a[1], a[2]); }
+static u64 w32_EnumResourceNamesW(const u32 *a)     { return w32_enum_resources(a[0], 1, a[1], 0, a[2], a[3]); }
+static u64 w32_EnumResourceLanguagesW(const u32 *a) { return w32_enum_resources(a[0], 2, a[1], a[2], a[3], a[4]); }
+
+/* ---- FindFirstFile handles: the native handle is a 64-bit pointer, so the guest gets a table index ---- */
+#define W32_FINDH_MAX  256
+#define W32_FINDH_BASE 0x7c000000u
+static u64 g_w32_findh[W32_FINDH_MAX];
+static pthread_mutex_t g_w32_findh_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef u64 (__attribute__((ms_abi)) *W32Impl2)(u64, u64);
+static u64 w32_findh_first(const char *name, const u32 *args)
+{
+    const ImplFn impl = find_impl(name);
+    if (!impl) { g_last_error = 120; return 0xffffffffu; }
+    const u64 native = ((W32Impl2)(void *)impl)(args[0], args[1]);
+    if (native == (u64)-1 || native == 0) return 0xffffffffu;
+    pthread_mutex_lock(&g_w32_findh_lock);
+    for (u32 i = 0; i < W32_FINDH_MAX; ++i) if (!g_w32_findh[i]) {
+        g_w32_findh[i] = native;
+        pthread_mutex_unlock(&g_w32_findh_lock);
+        return W32_FINDH_BASE + i;
+    }
+    pthread_mutex_unlock(&g_w32_findh_lock);
+    ((W32Impl2)(void *)find_impl("FindClose"))(native, 0);
+    g_last_error = 4;                                       /* ERROR_TOO_MANY_OPEN_FILES */
+    return 0xffffffffu;
+}
+static u64 w32_findh_get(u32 handle, int release)
+{
+    if (handle < W32_FINDH_BASE || handle >= W32_FINDH_BASE + W32_FINDH_MAX) return 0;
+    pthread_mutex_lock(&g_w32_findh_lock);
+    const u64 native = g_w32_findh[handle - W32_FINDH_BASE];
+    if (release) g_w32_findh[handle - W32_FINDH_BASE] = 0;
+    pthread_mutex_unlock(&g_w32_findh_lock);
+    return native;
+}
+static u64 w32_FindFirstFileW(const u32 *args) { return w32_findh_first("FindFirstFileW", args); }
+static u64 w32_FindFirstFileA(const u32 *args) { return w32_findh_first("FindFirstFileA", args); }
+static u64 w32_findh_next(const char *name, const u32 *args)
+{
+    const u64 native = w32_findh_get(args[0], 0);
+    if (!native) { g_last_error = 6; return 0; }            /* ERROR_INVALID_HANDLE */
+    return (u32)((W32Impl2)(void *)find_impl(name))(native, args[1]);
+}
+static u64 w32_FindNextFileW(const u32 *args) { return w32_findh_next("FindNextFileW", args); }
+static u64 w32_FindNextFileA(const u32 *args) { return w32_findh_next("FindNextFileA", args); }
+static u64 w32_FindClose(const u32 *args)
+{
+    const u64 native = w32_findh_get(args[0], 1);
+    if (!native) { g_last_error = 6; return 0; }
+    return (u32)((W32Impl2)(void *)find_impl("FindClose"))(native, 0);
+}
+
+/* ---- advapi32 ANSI registry entry points (widened to the wide implementations) ---- */
+static u16 *w32_widen_ansi(u32 text, u32 length /* bytes, or 0xffffffff for NUL-terminated */)
+{
+    if (!text) return NULL;
+    const char *s = (const char *)(uintptr_t)text;
+    if (length == 0xffffffffu) length = (u32)strlen(s);
+    u16 *w = w32_heap_alloc((size_t)(length + 1) * 2, 1);
+    if (!w) return NULL;
+    for (u32 i = 0; i < length; ++i) w[i] = (unsigned char)s[i];
+    return w;
+}
+static u64 w32_RegOpenKeyA(const u32 *args)                 /* (key, subkey, result) */
+{
+    u16 *sub = w32_widen_ansi(args[1], 0xffffffffu);
+    const u32 call[5] = { args[0], (u32)(uintptr_t)sub, 0, 0xF003Fu, args[2] };
+    const u64 r = w32_RegOpenKeyExW(call);
+    if (sub) w32_heap_free(sub);
+    return r;
+}
+static u64 w32_RegCreateKeyExA(const u32 *args)
+{
+    u16 *sub = w32_widen_ansi(args[1], 0xffffffffu), *cls = w32_widen_ansi(args[3], 0xffffffffu);
+    u32 call[9];
+    memcpy(call, args, sizeof(call));
+    call[1] = (u32)(uintptr_t)sub; call[3] = (u32)(uintptr_t)cls;
+    const u64 r = w32_RegCreateKeyExW(call);
+    if (sub) w32_heap_free(sub);
+    if (cls) w32_heap_free(cls);
+    return r;
+}
+static u64 w32_RegSetValueExA(const u32 *args)              /* (key, name, reserved, type, data, size) */
+{
+    u16 *name = w32_widen_ansi(args[1], 0xffffffffu);
+    u32 call[6];
+    memcpy(call, args, sizeof(call));
+    call[1] = (u32)(uintptr_t)name;
+    u16 *data = NULL;
+    if ((args[3] == 1 || args[3] == 2 || args[3] == 7) && args[4]) {   /* REG_SZ / EXPAND_SZ / MULTI_SZ */
+        data = w32_widen_ansi(args[4], args[5]);
+        call[4] = (u32)(uintptr_t)data;
+        call[5] = args[5] * 2;
+    }
+    const u64 r = w32_forward("RegSetValueExW", call, 6);
+    if (name) w32_heap_free(name);
+    if (data) w32_heap_free(data);
+    return r;
+}
+
+/* ---- security descriptors/ACLs: 32-bit layouts (SECURITY_DESCRIPTOR is 20 bytes here, 40 natively) ---- */
+static u64 w32_InitializeSecurityDescriptor(const u32 *args)
+{
+    u8 *sd = W32_PTR(0);
+    if (!sd || args[1] != 1) { g_last_error = args[0] ? 1306 : 87; return 0; }   /* ERROR_UNKNOWN_REVISION */
+    memset(sd, 0, 20);
+    sd[0] = 1;
+    return 1;
+}
+static u64 w32_SetSecurityDescriptorDacl(const u32 *args)   /* (sd, present, dacl, defaulted) */
+{
+    u8 *sd = W32_PTR(0);
+    if (!sd || sd[0] != 1) { g_last_error = 1338; return 0; }                    /* ERROR_INVALID_SECURITY_DESCR */
+    u16 *control = (u16 *)(sd + 2);
+    if (!args[1]) { *control &= (u16)~0x4u; return 1; }
+    *control |= 0x4u;
+    *control = args[3] ? (u16)(*control | 0x8u) : (u16)(*control & ~0x8u);
+    *(u32 *)(sd + 16) = args[2];
+    return 1;
+}
+/* Linux file permissions have no Windows ACL model: the descriptor is validated and accepted, not applied. */
+static u64 w32_SetFileSecurityW(const u32 *args)
+{
+    const u8 *sd = W32_PTR(2);
+    if (!args[0] || !sd || sd[0] != 1) { g_last_error = 87; return 0; }
+    return 1;
+}
+static u64 w32_InitializeAcl(const u32 *args)               /* (acl, size, revision) */
+{
+    u8 *acl = W32_PTR(0);
+    if (!acl || args[1] < 8 || args[1] > 0xffffu || args[2] < 2 || args[2] > 4) { g_last_error = 87; return 0; }
+    memset(acl, 0, 8);
+    acl[0] = (u8)args[2];
+    *(u16 *)(acl + 2) = (u16)args[1];
+    return 1;
+}
+static u64 w32_AddAccessAllowedAce(const u32 *args)         /* (acl, revision, mask, sid) */
+{
+    u8 *acl = W32_PTR(0);
+    const u8 *sid = W32_PTR(3);
+    if (!acl || !sid || sid[0] != 1 || sid[1] > 15) { g_last_error = 87; return 0; }
+    const u32 sid_len = 8 + 4u * sid[1], size = 8 + sid_len;
+    u16 *acl_size = (u16 *)(acl + 2), *count = (u16 *)(acl + 4);
+    u32 used = 8;
+    for (u16 i = 0; i < *count; ++i) used += *(u16 *)(acl + used + 2);
+    if (used + size > *acl_size) { g_last_error = 122; return 0; }               /* ERROR_INSUFFICIENT_BUFFER */
+    u8 *ace = acl + used;
+    ace[0] = 0; ace[1] = 0;                                 /* ACCESS_ALLOWED_ACE_TYPE, no flags */
+    *(u16 *)(ace + 2) = (u16)size;
+    *(u32 *)(ace + 4) = args[2];
+    memcpy(ace + 8, sid, sid_len);
+    ++*count;
+    return 1;
+}
+static u64 w32_GetAce(const u32 *args)                      /* (acl, index, ace**) */
+{
+    u8 *acl = W32_PTR(0);
+    if (!acl || !args[2]) { g_last_error = 87; return 0; }
+    const u16 count = *(u16 *)(acl + 4);
+    if (args[1] >= count) { g_last_error = 87; return 0; }
+    u32 at = 8;
+    for (u32 i = 0; i < args[1]; ++i) at += *(u16 *)(acl + at + 2);
+    *(u32 *)W32_PTR(2) = (u32)(uintptr_t)(acl + at);
+    return 1;
+}
+static u64 w32_LookupAccountSidW(const u32 *args)
+{
+    (void)args;
+    g_last_error = 1332;                                    /* ERROR_NONE_MAPPED: Beer has no account database */
+    return 0;
+}
+
+/* IsBadWritePtr: true when any byte of the range is not in a writable mapping. */
+static u64 w32_IsBadWritePtr(const u32 *args)
+{
+    const uintptr_t start = args[0], end = start + args[1];
+    if (!args[1]) return 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 1;
+    char line[512];
+    uintptr_t covered = start;
+    while (covered < end && fgets(line, sizeof(line), maps)) {
+        unsigned long lo, hi; char perms[8];
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3) continue;
+        if (covered >= lo && covered < hi) {
+            if (perms[1] != 'w') break;
+            covered = hi;
+        }
+    }
+    fclose(maps);
+    return covered < end;
+}
+
+/* ---- guest threads: a Beer thread whose body creates the TEB32 and runs the 32-bit start routine ---- */
+typedef struct { u32 start, param; size_t stack; } W32ThreadStart;
+static u64 __attribute__((ms_abi)) w32_thread_body(u64 ctx_pointer)
+{
+    W32ThreadStart ctx = *(W32ThreadStart *)(uintptr_t)ctx_pointer;
+    free((void *)(uintptr_t)ctx_pointer);
+    u64 beer_teb;
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(beer_teb));
+    w32_thread_init(ctx.stack);                             /* TEB64+TEB32 below 4 GiB, GS now points at them */
+    const u32 code = w32_call(ctx.start, 1, &ctx.param);
+    syscall(SYS_arch_prctl, ARCH_SET_GS, beer_teb);         /* the thread wrapper's own cleanup needs its TEB */
+    return code;
+}
+static u64 w32_CreateThread(const u32 *args)   /* (attributes, stack, start, parameter, flags, id*) */
+{
+    W32ThreadStart *ctx = malloc(sizeof(*ctx));
+    if (!ctx) { g_last_error = 8; return 0; }
+    ctx->start = args[2]; ctx->param = args[3];
+    size_t stack = args[1];
+    if (stack < (256u << 10)) stack = 1u << 20;             /* the guest stack lives below 4 GiB: keep it modest */
+    ctx->stack = stack;
+    u32 id = 0;
+    const u64 handle = impl_CreateThread(0, args[1], (u64)(uintptr_t)w32_thread_body, (u64)(uintptr_t)ctx, args[4], &id);
+    if (!handle) { free(ctx); return 0; }
+    if (args[5]) *(u32 *)W32_PTR(5) = id;
+    return (u32)handle;
+}
+
+/* ---- WININET: Beer has no WinINet. Every entry point fails the way an unreachable network does, so a program
+ * that downloads optionally (Inno Download Plugin) loads and then reports a failed download. ---- */
+#define W32_ERROR_INTERNET_CANNOT_CONNECT 12029
+static u64 w32_wininet_fail(const u32 *args)
+{
+    (void)args;
+    g_last_error = W32_ERROR_INTERNET_CANNOT_CONNECT;
+    return 0;
+}
+
+/* ---- process heaps: one shared 32-bit allocator; HeapCreate hands out distinct handles over it ---- */
+static u64 w32_HeapCreate(const u32 *args) { (void)args; return 0x00030000u; }
+static u64 w32_HeapDestroy(const u32 *args) { return args[0] != 0; }   /* blocks stay in the shared arena */
+
+/* ---- environment blocks: copied into the 32-bit heap (the native block is a 64-bit pointer) ---- */
+static u64 w32_env_block(int wide)
+{
+    void *native = wide ? (void *)impl_GetEnvironmentStringsW() : (void *)impl_GetEnvironmentStringsA();
+    if (!native) return 0;
+    size_t size = 0;
+    if (wide) { const u16 *p = native; while (p[size] || p[size + 1]) ++size; size = (size + 2) * 2; }
+    else { const char *p = native; while (p[size] || p[size + 1]) ++size; size += 2; }
+    void *copy = w32_heap_alloc(size, 0);
+    if (copy) memcpy(copy, native, size);
+    impl_FreeEnvironmentStrings((u64)(uintptr_t)native);
+    return (u32)(uintptr_t)copy;
+}
+static u64 w32_GetEnvironmentStrings(const u32 *args)  { (void)args; return w32_env_block(0); }
+static u64 w32_GetEnvironmentStringsW(const u32 *args) { (void)args; return w32_env_block(1); }
+static u64 w32_FreeEnvironmentStrings(const u32 *args) { if (args[0]) w32_heap_free(W32_PTR(0)); return 1; }
+
+/* ---- small kernel32/user32/oleaut32 entries whose native versions do not fit a 32-bit call ---- */
+static u64 w32_UnhandledExceptionFilter(const u32 *args)
+{
+    if (g_w32_unhandled_filter) return w32_call(g_w32_unhandled_filter, 1, args);
+    return 1;                                               /* EXCEPTION_EXECUTE_HANDLER */
+}
+static u64 w32_LocalFileTimeToFileTime(const u32 *args)
+{
+    if (!args[0] || !args[1]) { g_last_error = 87; return 0; }
+    memcpy(W32_PTR(1), W32_PTR(0), 8);                      /* Beer's local time zone is UTC */
+    return 1;
+}
+/* Linux keeps no creation time and Beer's file handles carry no timestamp path: the call succeeds without changing
+ * the times (installers set them cosmetically). */
+static u64 w32_SetFileTime(const u32 *args) { (void)args; return 1; }
+static u64 w32_EnumSystemLocalesA(const u32 *args)         /* (proc, flags): reports the one locale Beer has */
+{
+    if (!args[0]) { g_last_error = 87; return 0; }
+    char *id = w32_heap_alloc(16, 0);
+    if (!id) { g_last_error = 8; return 0; }
+    snprintf(id, 16, "00000409");
+    const u32 argv[1] = { (u32)(uintptr_t)id };
+    w32_call(args[0], 1, argv);
+    w32_heap_free(id);
+    return 1;
+}
+static u64 w32_EnumCalendarInfoW(const u32 *args) { (void)args; g_last_error = 120; return 0; }
+static u64 w32_SignalObjectAndWait(const u32 *args) { (void)args; g_last_error = 120; return 0xffffffffu; }
+static u64 w32_ExitWindowsEx(const u32 *args) { (void)args; g_last_error = 5; return 0; }
+static u64 w32_DialogBoxParamW(const u32 *args) { (void)args; g_last_error = 1813; return 0xffffffffu; }
+/* SAFEARRAY has a different layout in a 32-bit process: not supported yet. */
+static u64 w32_SafeArrayCreate(const u32 *args) { (void)args; g_last_error = 120; return 0; }
+static u64 w32_SafeArrayHresult(const u32 *args) { (void)args; return 0x80070057u; }   /* E_INVALIDARG */
+
+/* ---- stack-balanced failures for imports without a 32-bit-safe implementation (see wow32_signatures.inc) ---- */
+static u64 w32_unsupported(const u32 *args) { (void)args; g_last_error = 120; return 0; }   /* ERROR_CALL_NOT_IMPLEMENTED */
+static u64 w32_unsupported_hr(const u32 *args)   /* HRESULT functions; an out pointer, if any, is cleared by the caller's init */
+{
+    (void)args;
+    return 0x80004001u;                                     /* E_NOTIMPL */
+}
+static u64 w32_unsupported_net(const u32 *args) { (void)args; return 50; }                /* ERROR_NOT_SUPPORTED */
+
+/* user32/gdi32/ole32 entries with 32-bit layouts that differ from the native ones. */
+static u64 w32_BeginPaint(const u32 *args)                 /* PAINTSTRUCT: 64 bytes here, 72 natively */
+{
+    u8 native[72] = {0};
+    const u64 hdc = impl_BeginPaint(w32_widen(args[0]), (void *)native);
+    u32 *ps = W32_PTR(1);
+    if (ps) {
+        ps[0] = (u32)hdc; ps[1] = *(u32 *)(native + 8);
+        memcpy(ps + 2, native + 12, 16);                    /* rcPaint */
+        ps[6] = *(u32 *)(native + 28); ps[7] = *(u32 *)(native + 32);
+        memset(ps + 8, 0, 32);
+    }
+    return (u32)hdc;
+}
+static u64 w32_EndPaint(const u32 *args)
+{
+    u8 native[72] = {0};
+    const u32 *ps = W32_PTR(1);
+    if (ps) {
+        *(u64 *)native = w32_widen(ps[0]); *(u32 *)(native + 8) = ps[1];
+        memcpy(native + 12, ps + 2, 16);
+    }
+    return (u32)impl_EndPaint(w32_widen(args[0]), (void *)native);
+}
+static u64 w32_PeekMessageA(const u32 *args) { return w32_PeekMessageW(args); }
+static u64 w32_SendMessageTimeoutW(const u32 *args)        /* (hwnd, msg, wp, lp, flags, timeout, DWORD_PTR*) */
+{
+    const u64 r = w32_forward("SendMessageW", args, 4);
+    if (args[6]) *(u32 *)W32_PTR(6) = (u32)r;
+    return 1;
+}
+static u64 w32_WaitForMultipleObjectsEx(const u32 *args) { return w32_wait_handles("WaitForMultipleObjectsEx", args, 5, 0, 1); }
+static u64 w32_CoTaskMemAlloc(const u32 *args) { return (u32)(uintptr_t)w32_heap_alloc(args[0] ? args[0] : 1, 0); }
+static u64 w32_IsEqualGUID(const u32 *args) { return args[0] && args[1] && !memcmp(W32_PTR(0), W32_PTR(1), 16); }
+static u64 w32_EqualSid(const u32 *args)
+{
+    const u8 *a = W32_PTR(0), *b = W32_PTR(1);
+    if (!a || !b || a[1] > 15 || a[1] != b[1]) return 0;
+    return !memcmp(a, b, 8 + 4u * a[1]);
+}
+static u64 w32_IsWindowUnicode(const u32 *args) { (void)args; return 1; }
+static u64 w32_GetDlgCtrlID(const u32 *args) { (void)args; return 0; }
+
+/* ---- file mappings: the guest can only address the low 4 GiB, so views are placed there explicitly ---- */
+static u64 w32_CreateFileMappingA(const u32 *args) { return w32_call_sa("CreateFileMappingA", args, 6, 1); }
+static u64 w32_CreateFileMappingW(const u32 *args) { return w32_call_sa("CreateFileMappingW", args, 6, 1); }
+static u64 w32_MapViewOfFileEx(const u32 *args)   /* (mapping, access, offset_high, offset_low, bytes, base) */
+{
+    const u32 access = args[1];
+    const u32 protection = (access & 0x20u) ? 0x40u : ((access & 0x2u) || (access & 0xF001Fu) == 0xF001Fu) ? 0x04u
+                         : (access & 0x1u) ? 0x08u : 0x02u;
+    int64_t offset = (int64_t)(((u64)args[2] << 32) | args[3]);
+    uintptr_t candidate = args[5] ? args[5] : 0;
+    uint32_t status = 0;
+    void *address = NULL;
+    size_t size = 0;
+    for (int attempt = 0; attempt < 8192; ++attempt) {
+        if (!args[5]) {
+            pthread_mutex_lock(&g_w32_lock);
+            const uintptr_t span = args[4] ? ((uintptr_t)args[4] + 0xffffu) & ~(uintptr_t)0xffffu : 0x1000000u;
+            candidate = (g_w32_top - span) & ~(uintptr_t)0xffffu;
+            g_w32_top = candidate;                          /* each probe moves down; a failed one is just skipped */
+            pthread_mutex_unlock(&g_w32_lock);
+            if (candidate < 0x20000000) break;
+        }
+        address = (void *)candidate;
+        size = args[4];
+        status = beer_nt_section_map(w32_widen(args[0]), &address, 0, &offset, &size, 1, 0, protection);
+        if (status == 0 || args[5] || status == BEER_STATUS_INVALID_HANDLE) break;
+    }
+    if (status) { g_last_error = status == BEER_STATUS_INVALID_HANDLE ? 6u : 8u; return 0; }
+    if ((uintptr_t)address + size > W32_LIMIT) {            /* does not fit below 2 GiB: undo */
+        beer_nt_section_unmap(address);
+        g_last_error = 8;
+        return 0;
+    }
+    pthread_mutex_lock(&g_w32_lock);
+    if (!args[5] && (uintptr_t)address < g_w32_top) g_w32_top = (uintptr_t)address;
+    pthread_mutex_unlock(&g_w32_lock);
+    g_last_error = 0;
+    return (u32)(uintptr_t)address;
+}
+static u64 w32_MapViewOfFile(const u32 *args)
+{
+    const u32 full[6] = { args[0], args[1], args[2], args[3], args[4], 0 };
+    return w32_MapViewOfFileEx(full);
+}
+
+static u64 w32_CharNextA(const u32 *args)
+{
+    const unsigned char *s = W32_PTR(0);
+    return s && *s ? args[0] + 1 : args[0];                 /* single-byte code page */
+}
+static u64 w32_GetDiskFreeSpaceA(const u32 *args)
+{
+    u16 *wide = w32_widen_ansi(args[0], 0xffffffffu);
+    u32 call[5];
+    memcpy(call, args, sizeof(call));
+    call[0] = (u32)(uintptr_t)wide;
+    const u64 r = w32_GetDiskFreeSpaceW(call);
+    if (wide) w32_heap_free(wide);
+    return r;
+}
+static u64 w32_VariantChangeTypeEx(const u32 *args)
+{
+    fprintf(stderr, "[WOW32] VariantChangeTypeEx(vt %u -> %u) is not implemented\n",
+            args[1] ? *(const u16 *)W32_PTR(1) : 0, args[4] & 0xffff);
+    return 0x80020005u;                                     /* DISP_E_TYPEMISMATCH */
+}
+static u64 w32_lstrcpynA(const u32 *args)                   /* (dest, source, max) */
+{
+    char *dst = W32_PTR(0);
+    const char *src = W32_PTR(1);
+    if (!dst || !src || (s32)args[2] <= 0) return 0;
+    s32 i = 0;
+    for (; i < (s32)args[2] - 1 && src[i]; ++i) dst[i] = src[i];
+    dst[i] = 0;
+    return args[0];
+}
+static u64 w32_LoadStringA(const u32 *args)                 /* (module, id, buffer, size) */
+{
+    char *buffer = W32_PTR(2);
+    if (!buffer || !args[3]) { g_last_error = 87; return 0; }
+    const u32 record = (u32)w32_find_resource(args[0], 6 /* RT_STRING */, args[1] / 16 + 1, 0);
+    if (!record) return 0;
+    const u8 *image = (const u8 *)(uintptr_t)(args[0] ? args[0] : g_w32_image);
+    const u16 *block = (const u16 *)(image + ((const u32 *)(uintptr_t)record)[0]);
+    const u32 block_chars = ((const u32 *)(uintptr_t)record)[1] / 2;
+    u32 at = 0;
+    for (u32 i = 0; i < args[1] % 16; ++i) {
+        if (at >= block_chars) { g_last_error = 1814; return 0; }
+        at += 1 + block[at];
+    }
+    if (at >= block_chars) { g_last_error = 1814; return 0; }
+    u32 length = block[at];
+    if (at + 1 + length > block_chars) length = block_chars - at - 1;
+    if (!length) { g_last_error = 1814; buffer[0] = 0; return 0; }
+    if (length > args[3] - 1) length = args[3] - 1;
+    for (u32 i = 0; i < length; ++i) buffer[i] = block[at + 1 + i] < 0x100 ? (char)block[at + 1 + i] : '?';
+    buffer[length] = 0;
+    return length;
+}
+
+/* ANSI entry points over their wide siblings: string arguments (bit mask) are widened into the 32-bit heap. */
+static u64 w32_via_wide(const char *name, const u32 *args, u32 argc, u32 string_mask)
+{
+    u32 call[8];
+    u16 *owned[8] = {0};
+    memcpy(call, args, argc * 4);
+    for (u32 i = 0; i < argc; ++i)
+        if (string_mask & (1u << i)) { owned[i] = w32_widen_ansi(args[i], 0xffffffffu); call[i] = (u32)(uintptr_t)owned[i]; }
+    const u64 r = w32_forward(name, call, argc);
+    for (u32 i = 0; i < argc; ++i) if (owned[i]) w32_heap_free(owned[i]);
+    return r;
+}
+static u64 w32_MoveFileA(const u32 *args)        { return w32_via_wide("MoveFileW", args, 2, 3); }
+static u64 w32_MoveFileExA(const u32 *args)      { return w32_via_wide("MoveFileExW", args, 3, 3); }
+static u64 w32_RemoveDirectoryA(const u32 *args) { return w32_via_wide("RemoveDirectoryW", args, 1, 1); }
+static u64 w32_DeleteFileA(const u32 *args) { return w32_via_wide("DeleteFileW", args, 1, 1); }
+static u64 w32_RegDeleteNotSupported(const u32 *args) { (void)args; return 120; }   /* Beer's registry has no delete yet */
+/* GetTimeFormat: the system default time format ("HH:mm:ss"); custom picture strings are not interpreted. */
+static u64 w32_time_format(const u32 *args, int wide)       /* (locale, flags, SYSTEMTIME*, format, buffer, size) */
+{
+    const u16 *t = W32_PTR(2);
+    u16 h, m, s;
+    if (t) { h = t[4]; m = t[5]; s = t[6]; }
+    else { const time_t now = time(NULL); struct tm tm; localtime_r(&now, &tm); h = tm.tm_hour; m = tm.tm_min; s = tm.tm_sec; }
+    char text[16];
+    snprintf(text, sizeof(text), "%02u:%02u:%02u", h % 100, m % 100, s % 100);
+    const u32 need = (u32)strlen(text) + 1;
+    if (!args[5]) return need;
+    if (args[5] < need) { g_last_error = 122; return 0; }
+    for (u32 i = 0; i < need; ++i) {
+        if (wide) ((u16 *)W32_PTR(4))[i] = (unsigned char)text[i]; else ((char *)W32_PTR(4))[i] = text[i];
+    }
+    return need;
+}
+static u64 w32_GetTimeFormatA(const u32 *args) { return w32_time_format(args, 0); }
+static u64 w32_GetTimeFormatW(const u32 *args) { return w32_time_format(args, 1); }
+
+/* ---- UxTheme / IMM / flat scroll bars / pointer encoding ----
+ * Beer draws no visual styles: no theme is active, so theme handles are NULL and every query fails the way an
+ * unthemed Windows session's does. (VCL calls IsThemeActive through a pointer it resolved at start-up.) */
+static u64 w32_zero(const u32 *args) { (void)args; return 0; }
+static u64 w32_E_FAIL(const u32 *args) { (void)args; return 0x80004005u; }
+static u64 w32_identity(const u32 *args) { return args[0]; }       /* Encode/DecodePointer: no encoding */
+static u64 w32_FlsAlloc(const u32 *args) { (void)args; return w32_TlsAlloc(args); }
+static u64 w32_FlsFree(const u32 *args) { return w32_TlsFree(args); }
+static u64 w32_FlsGetValue(const u32 *args) { return w32_TlsGetValue(args); }
+static u64 w32_FlsSetValue(const u32 *args) { return w32_TlsSetValue(args); }
+static u64 w32_GetSystemWow64DirectoryW(const u32 *args) { (void)args; g_last_error = 120; return 0; }
+static u64 w32_VirtualQueryEx(const u32 *args)             /* (process, address, buffer, length): own process only */
+{
+    if (args[0] != 0xffffffffu) { g_last_error = 5; return 0; }
+    return w32_VirtualQuery(args + 1);
+}

@@ -36,17 +36,20 @@ loader.o: loader.c platform/beer_env.h graphics/d3d11/d3d11_compat.h \
  platform/steam_networking_identity.h platform/beer_steam_networking.h \
  platform/win32_wmi.inc platform/win32_wic.inc platform/win32_tsf.h \
  platform/win32_full_path.h platform/win32_sddl.h \
- platform/win32_advapi_misc.inc platform/win32_subclass.inc \
- platform/win32_mm_timer.inc platform/win32_process.inc \
- platform/win32_d3d9.inc platform/win32_display_config.inc \
- platform/win32_nvapi.inc platform/../graphics/d3d12v/bd12_cuda.h \
- platform/win32_ngx.inc platform/win32_d3dkmt.inc \
- platform/win32_file_search.inc platform/win32_missing_exports.inc \
- platform/win32_native_info.inc platform/win32_native_sync.inc \
- platform/win32_uxtheme.inc platform/win32_user_misc.inc \
- platform/win32_crypt32.inc platform/win32_missing_exports_table.inc \
- platform/beer_extra_exports.inc platform/wow32.inc \
- platform/wow32_win32.inc
+ platform/win32_advapi_misc.inc platform/win32_controls.inc \
+ platform/win32_subclass.inc platform/win32_mm_timer.inc \
+ platform/win32_process.inc platform/win32_d3d9.inc \
+ platform/win32_display_config.inc platform/win32_nvapi.inc \
+ platform/../graphics/d3d12v/bd12_cuda.h platform/win32_ngx.inc \
+ platform/win32_d3dkmt.inc platform/win32_file_search.inc \
+ platform/win32_missing_exports.inc platform/win32_native_info.inc \
+ platform/win32_native_sync.inc platform/win32_uxtheme.inc \
+ platform/win32_user_misc.inc platform/win32_crypt32.inc \
+ platform/win32_missing_exports_table.inc platform/beer_extra_exports.inc \
+ platform/win32_process_security.inc platform/wow32.inc \
+ platform/wow32_win32.inc platform/wow32_math.h platform/wow32_crt.inc \
+ platform/wow32_shelllink.inc platform/wow32_signatures.inc \
+ platform/wow32_dll.inc
 platform/beer_env.h:
 graphics/d3d11/d3d11_compat.h:
 graphics/d3d12/d3d12_shader_translator.h:
@@ -127,6 +130,7 @@ platform/win32_tsf.h:
 platform/win32_full_path.h:
 platform/win32_sddl.h:
 platform/win32_advapi_misc.inc:
+platform/win32_controls.inc:
 platform/win32_subclass.inc:
 platform/win32_mm_timer.inc:
 platform/win32_process.inc:
@@ -145,5 +149,11 @@ platform/win32_user_misc.inc:
 platform/win32_crypt32.inc:
 platform/win32_missing_exports_table.inc:
 platform/beer_extra_exports.inc:
+platform/win32_process_security.inc:
 platform/wow32.inc:
 platform/wow32_win32.inc:
+platform/wow32_math.h:
+platform/wow32_crt.inc:
+platform/wow32_shelllink.inc:
+platform/wow32_signatures.inc:
+platform/wow32_dll.inc:

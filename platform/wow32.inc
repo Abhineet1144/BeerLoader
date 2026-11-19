@@ -15,8 +15,8 @@
  *   Windows x64 TEB uses), reached GS-relative from the assembly entry points.
  *
  * Milestone 1 (this file): PE32 executables, relocations, imports bound to thunks, TEB32/PEB32, a 32-bit heap, a
- * first set of kernel32 functions, and fault reporting. Not yet: 32-bit DLL loading, SEH (FS:[0] frames),
- * callbacks into 32-bit code, threads. */
+ * first set of kernel32 functions, and fault reporting. Limited real DLL loading is in wow32_dll.inc;
+ * callbacks use w32_call. Not yet: SEH (FS:[0] frames), DLL static TLS, guest worker threads. */
 
 #include <asm/ldt.h>
 #include <fnmatch.h>
@@ -70,9 +70,18 @@ static u8 *g_w32_lowstub;               /* 64-bit code below 4 GiB the 32-bit st
 static u32 g_w32_return_stub;           /* 32-bit address: returning here ends a host->guest call */
 static u32 g_w32_image;                 /* the executable's base */
 static u32 g_w32_peb;
-static uintptr_t g_w32_next = 0x10000000;   /* bump pointer for anonymous low allocations */
+/* Anonymous low allocations (heaps, stacks, TEBs, views) are placed top-down from here, so the range below stays
+ * free for DLLs that insist on their preferred base: packed DLLs such as BASS.dll are not relocatable. */
+static uintptr_t g_w32_top = 0x7e000000;
 static pthread_mutex_t g_w32_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_w32_next_ldt = 16;
+static u32 w32_dll_by_name(const char *name);
+static u32 w32_dll_load(const char *name);
+static u32 w32_dll_proc(u32 module, uintptr_t name);
+static int w32_dll_free(u32 module);
+static const char *w32_dll_path(u32 module);
+static void w32_sysmod_ensure_image(u32 handle);
+static int w32_dll_image_range(u32 address, u32 *base, u32 *size);
 
 extern char beer_w32_api_entry[], beer_w32_return_entry[];
 u64 beer_w32_call32(u32 entry, u32 esp);   /* runs 32-bit code at `entry` on stack `esp` until it returns to the
@@ -89,10 +98,10 @@ static void *w32_map(uintptr_t want, size_t size, int prot)
         if (p != MAP_FAILED) return p;
     }
     pthread_mutex_lock(&g_w32_lock);
-    for (uintptr_t at = g_w32_next; at + size <= W32_LIMIT; at += 0x10000) {
+    for (uintptr_t at = (g_w32_top - size) & ~(uintptr_t)0xffff; at >= 0x20000000 && at < g_w32_top; at -= 0x10000) {
         void *p = mmap((void *)at, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (p != MAP_FAILED) {
-            g_w32_next = at + size;
+            g_w32_top = at;
             pthread_mutex_unlock(&g_w32_lock);
             return p;
         }
@@ -215,11 +224,21 @@ typedef struct {
 } W32TlsDirectory;
 
 /* Static image TLS is distinct from the dynamic TlsAlloc slots at TEB+0xe10.
- * PE32 TLS directory addresses are relocated VAs, and vector entries are DWORDs. */
-static int w32_static_tls_init(W32Teb *teb, const u8 *image, size_t image_size,
-                               const DataDir *dir)
+ * PE32 TLS directory addresses are relocated VAs, and vector entries are DWORDs. Every thread has a vector of
+ * W32_TLS_SLOTS blocks: slot 0 is the executable's, the next ones belong to DLLs with a TLS directory (the DLL
+ * loader registers them and writes the slot into the DLL's own index variable). A thread gets a copy of every
+ * template that is registered when it starts; threads already running when a DLL is loaded only get the current
+ * thread's block. */
+static W32Teb *w32_teb(void);
+#define W32_TLS_SLOTS 64
+typedef struct { u32 start, initialized, total, alignment; int live; } W32TlsModule;
+static W32TlsModule g_w32_tls_modules[W32_TLS_SLOTS];
+static u32 g_w32_tls_count = 1;                       /* slot 0 is the executable */
+static pthread_mutex_t g_w32_tls_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int w32_tls_parse(const u8 *image, size_t image_size, const DataDir *dir, W32TlsModule *out,
+                         const W32TlsDirectory **tls_out)
 {
-    if (!dir->size) return 1;
     const uintptr_t base = (uintptr_t)image;
     if (dir->size < sizeof(W32TlsDirectory) || dir->rva > image_size ||
         sizeof(W32TlsDirectory) > image_size - dir->rva) return 0;
@@ -234,15 +253,61 @@ static int w32_static_tls_init(W32Teb *teb, const u8 *image, size_t image_size,
     if (alignment < 16) alignment = 16;
     const u64 bytes = (u64)initialized + tls->zero_fill;
     if (bytes > W32_LIMIT || bytes + alignment > W32_LIMIT) return 0;
-    /* One executable module, static slot zero. PE32 DLL loading is not yet
-     * supported. mmap zeroes the tail, including an empty TLS template. */
-    u32 *vector = w32_map(0, (size_t)bytes + alignment, PROT_READ | PROT_WRITE);
+    *out = (W32TlsModule){ .start = tls->start, .initialized = (u32)initialized, .total = (u32)bytes,
+                           .alignment = (u32)alignment, .live = 1 };
+    *tls_out = tls;
+    return 1;
+}
+static u32 w32_tls_new_block(const W32TlsModule *m)
+{
+    u8 *raw = w32_heap_alloc((size_t)m->total + m->alignment, 1);
+    if (!raw) return 0;
+    u8 *block = (u8 *)(((uintptr_t)raw + m->alignment - 1) & ~(uintptr_t)(m->alignment - 1));
+    if (m->initialized) memcpy(block, (const void *)(uintptr_t)m->start, m->initialized);
+    return (u32)(uintptr_t)block;
+}
+static int w32_static_tls_init(W32Teb *teb, const u8 *image, size_t image_size, const DataDir *dir)
+{
+    W32TlsModule exe = {0};
+    const W32TlsDirectory *tls = NULL;
+    if (dir->size && !w32_tls_parse(image, image_size, dir, &exe, &tls)) return 0;
+    pthread_mutex_lock(&g_w32_tls_lock);
+    const u32 modules = g_w32_tls_count;
+    pthread_mutex_unlock(&g_w32_tls_lock);
+    if (!dir->size && modules <= 1) return 1;            /* no static TLS anywhere: no vector */
+    u32 *vector = w32_heap_alloc(W32_TLS_SLOTS * sizeof(u32), 1);
     if (!vector) return 0;
-    u8 *block = (u8 *)(((uintptr_t)(vector + 1) + alignment - 1) & ~(alignment - 1));
-    if (initialized) memcpy(block, (const void *)(uintptr_t)tls->start, initialized);
-    vector[0] = (u32)(uintptr_t)block;
-    *(u32 *)(uintptr_t)tls->index = 0;
+    if (dir->size) {
+        pthread_mutex_lock(&g_w32_tls_lock);
+        g_w32_tls_modules[0] = exe;
+        pthread_mutex_unlock(&g_w32_tls_lock);
+        vector[0] = w32_tls_new_block(&exe);
+        if (!vector[0]) { w32_heap_free(vector); return 0; }
+        *(u32 *)(uintptr_t)tls->index = 0;
+    }
+    pthread_mutex_lock(&g_w32_tls_lock);
+    for (u32 i = 1; i < g_w32_tls_count; ++i)
+        if (g_w32_tls_modules[i].live) vector[i] = w32_tls_new_block(&g_w32_tls_modules[i]);
+    pthread_mutex_unlock(&g_w32_tls_lock);
     teb->ThreadLocalStoragePointer = (u32)(uintptr_t)vector;
+    return 1;
+}
+/* A DLL's TLS directory (addresses already relocated): takes the next slot, stores it in the DLL's index variable
+ * and gives the calling thread its block. Returns the TLS callback array address (0 = none) in *callbacks. */
+static int w32_tls_register_dll(const u8 *image, size_t image_size, const DataDir *dir, u32 *slot_out, u32 *callbacks)
+{
+    W32TlsModule module; const W32TlsDirectory *tls;
+    if (!w32_tls_parse(image, image_size, dir, &module, &tls)) return 0;
+    pthread_mutex_lock(&g_w32_tls_lock);
+    if (g_w32_tls_count >= W32_TLS_SLOTS) { pthread_mutex_unlock(&g_w32_tls_lock); return 0; }
+    const u32 slot = g_w32_tls_count++;
+    g_w32_tls_modules[slot] = module;
+    pthread_mutex_unlock(&g_w32_tls_lock);
+    *(u32 *)(uintptr_t)tls->index = slot;
+    u32 *vector = (u32 *)(uintptr_t)w32_teb()->ThreadLocalStoragePointer;
+    if (vector) vector[slot] = w32_tls_new_block(&module);
+    *slot_out = slot;
+    *callbacks = tls->callbacks;
     return 1;
 }
 
@@ -296,7 +361,7 @@ static u32 w32_thread_init(size_t stack_size)
     *(u64 *)(tebs + W32_SLOT_HOST_FS) = host_fs;
     if (syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)(uintptr_t)teb64) != 0)
         die("WoW32: ARCH_SET_GS: %s", strerror(errno));
-    return (u32)(uintptr_t)(stack + stack_size - 16);
+    return (u32)(uintptr_t)(stack + stack_size - 0x1000);   /* headroom above ESP: code reads caller frames (kernel32 start-up) there */
 }
 
 static W32Teb *w32_teb(void)
@@ -454,12 +519,25 @@ u64 w32_dispatch(u32 index)
     static int trace = -1;
     if (trace < 0) trace = getenv("BEER_W32_TRACE") != NULL;
     if (trace) {
-        fprintf(stderr, "[W32T] %s!%s(0x%x,0x%x,0x%x,0x%x)", t->dll, t->name, args[0], args[1], args[2], args[3]);
-        unsigned char page_probe;
-        if (args[0] > 0x10000 && args[0] < 0x7f000000 && t->arg_bytes &&
-            mincore((void *)(uintptr_t)(args[0] & ~0xfffu), 1, &page_probe) == 0) {
-            const char *s = (const char *)(uintptr_t)args[0];
-            if (s[0] >= 32 && s[0] < 127 && s[1] >= 32 && s[1] < 127) fprintf(stderr, " \"%.80s\"", s);
+        fprintf(stderr, "[W32T] %s!%s(0x%x,0x%x,0x%x,0x%x) esp=%x", t->dll, t->name, args[0], args[1], args[2], args[3], esp);
+        fprintf(stderr, " ret=%x", *(const u32 *)(uintptr_t)esp);
+        char probe[82];
+        if (args[0] > 0x10000 && args[0] < 0x7f000000 && t->arg_bytes) {
+            /* process_vm_readv fails cleanly on unmapped and PROT_NONE pages, unlike a direct read. */
+            struct iovec local = { probe, 80 }, remote = { (void *)(uintptr_t)args[0], 80 };
+            ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+            if (got < 2) { remote.iov_len = local.iov_len = 2; got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0); }
+            if (got >= 2) {
+                probe[got] = 0;
+                if (probe[0] >= 32 && probe[0] < 127 && probe[1] >= 32 && probe[1] < 127) fprintf(stderr, " \"%.80s\"", probe);
+                else if (got >= 4 && probe[0] >= 32 && probe[0] < 127 && !probe[1] && probe[2] >= 32 && probe[2] < 127 && !probe[3]) {
+                    char narrow[81];                       /* a UTF-16 string: print it narrowed */
+                    size_t k = 0;
+                    for (; k < 80 && (size_t)(2 * k + 1) < (size_t)got && probe[2 * k]; ++k) narrow[k] = probe[2 * k];
+                    narrow[k] = 0;
+                    fprintf(stderr, " L\"%s\"", narrow);
+                }
+            }
         }
         fputc('\n', stderr);
     }
@@ -680,7 +758,20 @@ static u64 w32_GetModuleHandleA(const u32 *args)
 /* A GetProcAddress result is a thunk, so only APIs this layer provides can be returned. */
 static u64 w32_GetProcAddress(const u32 *args)
 {
+    if (w32_dll_path(args[0])) {
+        const u32 address = w32_dll_proc(args[0], args[1]);
+        if (!address && getenv("BEER_W32_TRACE"))
+            fprintf(stderr, "[WOW32 DLL] GetProcAddress(%s, %s) failed (error %u)\n", w32_dll_path(args[0]),
+                    args[1] < 0x10000 ? "ordinal" : (const char *)W32_PTR(1), g_last_error);
+        return address;
+    }
     const char *name = W32_PTR(1);
+    if (args[1] >= 0x10000) {                       /* a bad name pointer fails the call instead of faulting */
+        char probe[2];
+        struct iovec local = { probe, 1 }, remote = { (void *)(uintptr_t)args[1], 1 };
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 1) { g_last_error = 998; return 0; }   /* ERROR_NOACCESS */
+    }
+    if (args[1] >= 0x10000) { const u32 data = w32_data_import(name); if (data) return data; }   /* exported variables */
     if (args[1] < 0x10000 || !w32_find_api(name)) {
         if (getenv("BEER_W32_TRACE")) {
             if (args[1] < 0x10000)
@@ -702,6 +793,83 @@ static u64 w32_SetUnhandledExceptionFilter(const u32 *args)
     return previous;
 }
 
+/* ---- structured exception handling (FS:[0] chain), as Windows x86 does it ----
+ * RaiseException builds EXCEPTION_RECORD/CONTEXT in guest memory and calls each registered handler (cdecl: record,
+ * frame, context, dispatcher) until one returns ExceptionContinueExecution (0). RtlUnwind calls the handlers of the
+ * frames up to the target with EXCEPTION_UNWINDING and pops them; Delphi/MSVC handlers then transfer control
+ * themselves after RtlUnwind returns. Hardware faults are not dispatched here yet. */
+#define W32_EXC_NONCONTINUABLE 1u
+#define W32_EXC_UNWINDING      2u
+#define W32_EXC_EXIT_UNWIND    4u
+#define W32_CONTEXT_SIZE       0x2cc
+static int w32_seh_frame_ok(u32 frame)
+{
+    const W32Teb *teb = w32_teb();
+    return !(frame & 3) && frame >= teb->StackLimit && (u64)frame + 8 <= teb->StackBase;
+}
+static u64 w32_RaiseException(const u32 *args)
+{
+    u64 teb64;
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb64));
+    const u32 esp = (u32)*(u64 *)(uintptr_t)(teb64 + W32_SLOT_ESP);
+    u32 *rec = w32_heap_alloc(80, 1);
+    u8 *ctx = w32_heap_alloc(W32_CONTEXT_SIZE, 1);
+    u32 *disp = w32_heap_alloc(16, 1);
+    if (!rec || !ctx || !disp) die("WoW32: out of memory raising an exception");
+    const u32 nparams = args[2] > 15 ? 15 : args[2];
+    rec[0] = args[0]; rec[1] = args[1] & 1; rec[2] = 0; rec[3] = *(const u32 *)(uintptr_t)esp; rec[4] = nparams;
+    if (args[3]) for (u32 i = 0; i < nparams; ++i) rec[5 + i] = ((const u32 *)W32_PTR(3))[i];
+    *(u32 *)(ctx + 0) = 0x10007;                                /* CONTEXT_i386 | CONTROL | INTEGER | SEGMENTS */
+    *(u32 *)(ctx + 0x9c) = (u32)*(u64 *)(uintptr_t)(teb64 + W32_SLOT_EDI);
+    *(u32 *)(ctx + 0xa0) = (u32)*(u64 *)(uintptr_t)(teb64 + W32_SLOT_ESI);
+    *(u32 *)(ctx + 0xa4) = (u32)*(u64 *)(uintptr_t)(teb64 + W32_SLOT_EBX);
+    *(u32 *)(ctx + 0xb4) = (u32)*(u64 *)(uintptr_t)(teb64 + W32_SLOT_EBP);
+    *(u32 *)(ctx + 0xb8) = rec[3];
+    *(u32 *)(ctx + 0xbc) = W32_USER32_CS;
+    *(u32 *)(ctx + 0xc4) = esp + 4;
+    *(u32 *)(ctx + 0xc8) = W32_USER_DS;
+    u32 frame = w32_teb()->ExceptionList;
+    while (frame != 0xffffffffu) {
+        if (!w32_seh_frame_ok(frame)) { fprintf(stderr, "[WOW32] corrupt SEH chain at 0x%x\n", frame); break; }
+        const u32 handler = ((const u32 *)(uintptr_t)frame)[1], next = ((const u32 *)(uintptr_t)frame)[0];
+        const u32 argv[4] = { (u32)(uintptr_t)rec, frame, (u32)(uintptr_t)ctx, (u32)(uintptr_t)disp };
+        if (getenv("BEER_W32_TRACE")) fprintf(stderr, "[WOW32] SEH 0x%08x: frame 0x%x handler 0x%x\n", rec[0], frame, handler);
+        if (w32_call(handler, 4, argv) == 0) {
+            if (rec[1] & W32_EXC_NONCONTINUABLE) die("WoW32: handler continued a noncontinuable exception");
+            w32_heap_free(rec); w32_heap_free(ctx); w32_heap_free(disp);
+            return 0;
+        }
+        frame = next;
+    }
+    if (g_w32_unhandled_filter) {
+        const u32 ep[2] = { (u32)(uintptr_t)rec, (u32)(uintptr_t)ctx };
+        const u32 info = (u32)(uintptr_t)ep;
+        if ((s32)w32_call(g_w32_unhandled_filter, 1, &info) == -1) return 0;   /* EXCEPTION_CONTINUE_EXECUTION */
+    }
+    fprintf(stderr, "[WOW32] unhandled exception 0x%08x at 0x%08x\n", rec[0], rec[3]);
+    impl_ExitProcess(rec[0]);
+    return 0;
+}
+static u64 w32_RtlUnwind(const u32 *args)   /* (targetFrame, targetIp, exceptionRecord, returnValue) */
+{
+    u32 *rec = W32_PTR(2);
+    u32 local[20];
+    if (!rec) { memset(local, 0, sizeof(local)); local[0] = 0xC0000027u; rec = local; }   /* STATUS_UNWIND */
+    rec[1] |= W32_EXC_UNWINDING | (args[0] ? 0 : W32_EXC_EXIT_UNWIND);
+    u8 ctx[W32_CONTEXT_SIZE] = {0};
+    u32 disp[4] = {0};
+    u32 frame = w32_teb()->ExceptionList;
+    while (frame != 0xffffffffu && frame != args[0]) {
+        if (!w32_seh_frame_ok(frame)) break;
+        const u32 handler = ((const u32 *)(uintptr_t)frame)[1], next = ((const u32 *)(uintptr_t)frame)[0];
+        const u32 argv[4] = { (u32)(uintptr_t)rec, frame, (u32)(uintptr_t)ctx, (u32)(uintptr_t)disp };
+        w32_call(handler, 4, argv);
+        w32_teb()->ExceptionList = next;
+        frame = next;
+    }
+    return 0;
+}
+
 static u64 w32_IsWow64Process(const u32 *args)
 {
     if (args[1]) *(u32 *)W32_PTR(1) = 1;                    /* a 32-bit process on a 64-bit system */
@@ -710,7 +878,7 @@ static u64 w32_IsWow64Process(const u32 *args)
 
 /* Resources of the 32-bit image. HRSRC is the IMAGE_RESOURCE_DATA_ENTRY, HGLOBAL the data itself. */
 #define W32_RES_NOT_FOUND 0xffffffffu
-static u32 w32_res_child(const u8 *root, u32 dir_offset, u32 key, int language_level)
+static u32 w32_res_child(const u8 *root, u32 dir_offset, uintptr_t key, int language_level)
 {
     const u8 *dir = root + dir_offset;
     const u32 named = *(const u16 *)(dir + 12), ids = *(const u16 *)(dir + 14);
@@ -741,22 +909,28 @@ static u32 w32_res_child(const u8 *root, u32 dir_offset, u32 key, int language_l
     return W32_RES_NOT_FOUND;
 }
 
-static u64 w32_FindResourceExA(const u32 *args)
+/* Internal keys may point to narrowed strings on the 64-bit host stack. They
+ * must retain uintptr_t width; only the public guest ABI uses DWORD pointers. */
+static u64 w32_find_resource(u32 module, uintptr_t type, uintptr_t name, u32 language)
 {
-    const u8 *image = (const u8 *)(uintptr_t)(args[0] ? args[0] : g_w32_image);
+    const u8 *image = (const u8 *)(uintptr_t)(module ? module : g_w32_image);
     const W32NtHdrs *nt = (const W32NtHdrs *)(image + ((const DosHdr *)image)->lfanew);
     if (!nt->opt.dirs[2].rva || !nt->opt.dirs[2].size) { g_last_error = 1812; return 0; }   /* ERROR_RESOURCE_DATA_NOT_FOUND */
     const u8 *root = image + nt->opt.dirs[2].rva;
-    const u32 keys[2] = { args[1], args[2] };
+    const uintptr_t keys[2] = { type, name };
     u32 offset = 0;
     for (int level = 0; level < 2; ++level) {
         offset = w32_res_child(root, offset, keys[level], 0);
         if (offset == W32_RES_NOT_FOUND || !(offset & 0x80000000u)) { g_last_error = 1814; return 0; }
         offset &= 0x7fffffffu;
     }
-    offset = w32_res_child(root, offset, args[3], 1);
+    offset = w32_res_child(root, offset, language, 1);
     if (offset == W32_RES_NOT_FOUND || (offset & 0x80000000u)) { g_last_error = 1814; return 0; }   /* ERROR_RESOURCE_NAME_NOT_FOUND */
     return (u32)(uintptr_t)(root + offset);
+}
+static u64 w32_FindResourceExA(const u32 *args)
+{
+    return w32_find_resource(args[0], args[1], args[2], args[3]);
 }
 static u64 w32_LoadResource(const u32 *args)
 {
@@ -856,9 +1030,25 @@ static u8 *w32_file_pool(void)
     pthread_mutex_unlock(&g_w32_file_lock);
     return g_w32_file_pool;
 }
+static u32 w32_crt_pctype_table(void);
 static u32 w32_data_import(const char *name)
 {
     if (!strcmp(name, "_iob") || !strcmp(name, "__imp___iob")) return (u32)(uintptr_t)w32_file_pool();
+    if (!strcmp(name, "_pctype") || !strcmp(name, "__imp___pctype")) {            /* pointer to the ctype word table */
+        static u32 location;
+        if (!location) { location = (u32)(uintptr_t)w32_heap_alloc(4, 1); *(u32 *)(uintptr_t)location = w32_crt_pctype_table(); }
+        return location;
+    }
+    if (!strcmp(name, "__mb_cur_max") || !strcmp(name, "__imp___mb_cur_max")) {   /* one-byte code page */
+        static u32 location;
+        if (!location) { location = (u32)(uintptr_t)w32_heap_alloc(4, 1); *(u32 *)(uintptr_t)location = 1; }
+        return location;
+    }
+    if (!strcmp(name, "_adjust_fdiv") || !strcmp(name, "__imp__adjust_fdiv")) {      /* Pentium FDIV bug flag: no bug */
+        static u32 location;
+        if (!location) location = (u32)(uintptr_t)w32_heap_alloc(4, 1);
+        return location;
+    }
     return 0;
 }
 static FILE *w32_host_file(u32 guest)
@@ -962,6 +1152,11 @@ static size_t w32_format(char *out, size_t capacity, const char *format, const u
             break;
         case 's': {
             const char *text = (const char *)(uintptr_t)*va++;
+            if (text) {                                  /* an unreadable pointer prints as (null) instead of faulting */
+                char probe;
+                struct iovec local = { &probe, 1 }, remote = { (void *)text, 1 };
+                if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 1) text = NULL;
+            }
             spec[n++] = 's'; spec[n] = 0;
             W32_EMIT(spec, text ? text : "(null)");
             break;
@@ -1241,6 +1436,11 @@ static u64 w32_findclose(const u32 *args)
 /* Table: a NULL function forwards to the 64-bit implementation of the same name (arguments in bytes). */
 #define W32_FWD(name, bytes) {name, NULL, bytes}
 
+static u64 w32_VirtualQueryEx(const u32 *args);
+#include "wow32_math.h"
+#include "wow32_crt.inc"
+#include "wow32_shelllink.inc"
+#include "wow32_signatures.inc"
 static const W32Api g_w32_apis[] = {
     /* kernel32 (platform/wow32_win32.inc) */
     {"GetModuleHandleW", w32_GetModuleHandleW, 4},
@@ -1255,17 +1455,25 @@ static const W32Api g_w32_apis[] = {
     {"GetClassInfoW", w32_GetClassInfoW, 12},
     {"PeekMessageW", w32_PeekMessageW, 20}, {"GetMessageW", w32_GetMessageW, 16},
     {"DispatchMessageW", w32_DispatchMessageW, 4}, {"TranslateMessage", w32_TranslateMessage, 4},
-    W32_FWD("CreateWindowExW", 48), W32_FWD("DefWindowProcW", 16), W32_FWD("SendMessageW", 16),
+    W32_FWD("CreateWindowExW", 48), {"DefWindowProcW", w32_DefWindowProcW, 16}, W32_FWD("SendMessageW", 16),
     W32_FWD("PostMessageW", 16), W32_FWD("PostQuitMessage", 4), W32_FWD("ShowWindow", 8),
     W32_FWD("SetWindowTextW", 8),
     W32_FWD("RegisterWindowMessageW", 4), W32_FWD("GlobalAddAtomW", 4),
     W32_FWD("RegisterClipboardFormatW", 4),
+    W32_FWD("GetActiveWindow", 0), W32_FWD("SetActiveWindow", 4),
+    W32_FWD("IsWindowVisible", 4),
+    W32_FWD("IsWindow", 4),
+    W32_FWD("IsWindowEnabled", 4), W32_FWD("EnableWindow", 8),
+    {"EnumThreadWindows", w32_EnumThreadWindows, 12},
         W32_FWD("SendNotifyMessageW", 16), W32_FWD("SendNotifyMessageA", 16),
         {"AllocateAndInitializeSid", w32_AllocateAndInitializeSid, 44},
         {"FreeSid", w32_FreeSid, 4},
         W32_FWD("CheckTokenMembership", 12),
     {"FindResourceW", w32_FindResourceW, 12}, {"FindResourceExW", w32_FindResourceExW, 16},
     {"FindResourceA", w32_FindResourceA, 12},
+    W32_FWD("GetFileVersionInfoSizeW", 8), W32_FWD("GetFileVersionInfoSizeA", 8),
+    W32_FWD("GetFileVersionInfoW", 16), W32_FWD("GetFileVersionInfoA", 16),
+    {"VerQueryValueW", w32_VerQueryValueW, 16},
     {"GetDiskFreeSpaceW", w32_GetDiskFreeSpaceW, 20}, {"GetDiskFreeSpaceExW", w32_GetDiskFreeSpaceExW, 16},
     {"LoadLibraryA", w32_LoadLibraryA, 4}, {"LoadLibraryW", w32_LoadLibraryW, 4},
     {"LoadLibraryExA", w32_LoadLibraryExA, 12}, {"LoadLibraryExW", w32_LoadLibraryExW, 12},
@@ -1298,9 +1506,366 @@ static const W32Api g_w32_apis[] = {
     {"GetFullPathNameW", w32_GetFullPathNameW, 16}, {"GetFullPathNameA", w32_GetFullPathNameA, 16},
     {"FormatMessageW", w32_FormatMessageW, 28},
     W32_FWD("CompareStringW", 24), W32_FWD("CompareStringA", 24),
-    W32_FWD("DeleteFileW", 4), W32_FWD("DeleteFileA", 4),
-    W32_FWD("FindFirstFileW", 8), W32_FWD("FindNextFileW", 8), W32_FWD("FindClose", 4),
-    W32_FWD("FindFirstFileA", 8), W32_FWD("FindNextFileA", 8),
+    W32_FWD("DeleteFileW", 4),
+    {"FindFirstFileW", w32_FindFirstFileW, 8}, {"FindNextFileW", w32_FindNextFileW, 8}, {"FindClose", w32_FindClose, 4},
+    {"FindFirstFileA", w32_FindFirstFileA, 8}, {"FindNextFileA", w32_FindNextFileA, 8},
+    W32_SIG_FWD W32_SIG_FAIL W32_SIG_HR W32_SIG_WNET
+    {"BeginPaint", w32_BeginPaint, 8}, {"EndPaint", w32_EndPaint, 8}, {"PeekMessageA", w32_PeekMessageA, 20},
+    {"SendMessageTimeoutW", w32_SendMessageTimeoutW, 28},
+    {"WaitForMultipleObjectsEx", w32_WaitForMultipleObjectsEx, 20},
+    {"CoTaskMemAlloc", w32_CoTaskMemAlloc, 4}, {"IsEqualGUID", w32_IsEqualGUID, 8}, {"EqualSid", w32_EqualSid, 8},
+    {"IsWindowUnicode", w32_IsWindowUnicode, 4}, {"GetDlgCtrlID", w32_GetDlgCtrlID, 4},
+    {"CreateFileMappingA", w32_CreateFileMappingA, 24}, {"CreateFileMappingW", w32_CreateFileMappingW, 24},
+    {"MapViewOfFile", w32_MapViewOfFile, 20}, {"MapViewOfFileEx", w32_MapViewOfFileEx, 24},
+    W32_FWD("UnmapViewOfFile", 4), W32_FWD("FlushViewOfFile", 8),
+    W32_FWD("OpenFileMappingA", 12), W32_FWD("OpenFileMappingW", 12),
+    W32_FWD("GetDriveTypeA", 4),
+    {"CharNextA", w32_CharNextA, 4}, {"lstrcpynA", w32_lstrcpynA, 12}, {"LoadStringA", w32_LoadStringA, 16},
+    {"GetDiskFreeSpaceA", w32_GetDiskFreeSpaceA, 20}, {"EnumCalendarInfoA", w32_EnumCalendarInfoW, 16},
+    {"VariantChangeTypeEx", w32_VariantChangeTypeEx, 24},
+
+    /* second batch: imports of the extracted ISDone/idp/innocallback DLLs */
+    W32_FWD("CreateFontIndirectA", 4),
+    W32_FWD("GetDateFormatA", 24),
+    W32_FWD("lstrcmpiA", 8),
+    W32_FWD("SetCurrentDirectoryA", 4),
+    W32_FWD("SetThreadPriority", 8),
+    W32_FWD("SuspendThread", 4),
+    W32_FWD("TerminateThread", 8),
+    W32_FWD("WritePrivateProfileStringA", 16),
+    W32_FWD("SHGetDesktopFolder", 4),
+    W32_FWD("SHGetPathFromIDListA", 8),
+    W32_FWD("CharLowerBuffA", 8),
+    W32_FWD("CopyImage", 20),
+    W32_FWD("DefWindowProcA", 16),
+    W32_FWD("DrawTextA", 20),
+    W32_FWD("LoadCursorA", 8),
+    W32_FWD("LoadIconA", 8),
+    W32_FWD("PostMessageA", 16),
+    W32_FWD("ValidateRect", 8),
+    {"GetTimeFormatA", w32_GetTimeFormatA, 24}, {"GetTimeFormatW", w32_GetTimeFormatW, 24},
+    {"DeleteFileA", w32_DeleteFileA, 4}, {"RegDeleteValueW", w32_RegDeleteNotSupported, 8}, {"RegDeleteKeyW", w32_RegDeleteNotSupported, 8},
+    {"MoveFileA", w32_MoveFileA, 8},
+    {"MoveFileExA", w32_MoveFileExA, 12},
+    {"RemoveDirectoryA", w32_RemoveDirectoryA, 4},
+    {"SHGetFileInfoA", w32_unsupported, 20},
+    W32_FWD("GetWindowTextLengthA", 4), W32_FWD("GetWindowTextLengthW", 4),
+    {"OemToCharA", w32_unsupported, 8},
+    {"ReadProcessMemory", w32_unsupported, 20},
+    {"NtQueryInformationFile", w32_unsupported, 20},
+    {"GetClassInfoA", w32_unsupported, 12},
+    {"RegisterClassA", w32_unsupported, 4},
+    {"SHGetDataFromIDListA", w32_unsupported, 20},
+    {"SHGetSpecialFolderLocation", w32_unsupported, 12},
+    {"NtQuerySystemInformation", w32_unsupported, 16},
+    /* uxtheme, imm32, flat scroll bar and pointer-encoding entries (see w32_zero / w32_E_FAIL) */
+    {"IsThemeActive", w32_zero, 0},
+    {"IsAppThemed", w32_zero, 0},
+    {"OpenThemeData", w32_zero, 8},
+    {"GetWindowTheme", w32_zero, 4},
+    {"GetThemeAppProperties", w32_zero, 0},
+    {"GetThemeSysBool", w32_zero, 8},
+    {"GetThemeSysColor", w32_zero, 8},
+    {"GetThemeSysColorBrush", w32_zero, 8},
+    {"GetThemeSysSize", w32_zero, 8},
+    {"IsThemeBackgroundPartiallyTransparent", w32_zero, 12},
+    {"IsThemeDialogTextureEnabled", w32_zero, 4},
+    {"IsThemePartDefined", w32_zero, 12},
+    {"EnableTheming", w32_zero, 4},
+    {"SetThemeAppProperties", w32_zero, 4},
+    {"CloseThemeData", w32_zero, 4},
+    {"SetWindowTheme", w32_zero, 12},
+    {"EnableThemeDialogTexture", w32_zero, 8},
+    {"ImmGetContext", w32_zero, 4},
+    {"ImmReleaseContext", w32_zero, 8},
+    {"ImmGetCompositionStringW", w32_zero, 16},
+    {"ImmGetConversionStatus", w32_zero, 12},
+    {"ImmNotifyIME", w32_zero, 16},
+    {"ImmSetCompositionFontW", w32_zero, 8},
+    {"ImmSetCompositionWindow", w32_zero, 8},
+    {"ImmSetConversionStatus", w32_zero, 12},
+    {"ImmSetOpenStatus", w32_zero, 8},
+    {"FlatSB_EnableScrollBar", w32_zero, 16},
+    {"FlatSB_GetScrollProp", w32_zero, 12},
+    {"FlatSB_GetScrollRange", w32_zero, 16},
+    {"FlatSB_SetScrollRange", w32_zero, 20},
+    {"FlatSB_ShowScrollBar", w32_zero, 12},
+    {"UninitializeFlatSB", w32_zero, 4},
+    {"DrawThemeBackground", w32_E_FAIL, 24},
+    {"DrawThemeEdge", w32_E_FAIL, 32},
+    {"DrawThemeIcon", w32_E_FAIL, 28},
+    {"DrawThemeParentBackground", w32_E_FAIL, 12},
+    {"DrawThemeText", w32_E_FAIL, 36},
+    {"GetCurrentThemeName", w32_E_FAIL, 20},
+    {"GetThemeBackgroundContentRect", w32_E_FAIL, 24},
+    {"GetThemeBackgroundExtent", w32_E_FAIL, 24},
+    {"GetThemeBackgroundRegion", w32_E_FAIL, 24},
+    {"GetThemeBool", w32_E_FAIL, 20},
+    {"GetThemeColor", w32_E_FAIL, 20},
+    {"GetThemeDocumentationProperty", w32_E_FAIL, 16},
+    {"GetThemeEnumValue", w32_E_FAIL, 20},
+    {"GetThemeFilename", w32_E_FAIL, 24},
+    {"GetThemeFont", w32_E_FAIL, 24},
+    {"GetThemeInt", w32_E_FAIL, 20},
+    {"GetThemeIntList", w32_E_FAIL, 20},
+    {"GetThemeMargins", w32_E_FAIL, 28},
+    {"GetThemeMetric", w32_E_FAIL, 28},
+    {"GetThemePartSize", w32_E_FAIL, 28},
+    {"GetThemePosition", w32_E_FAIL, 20},
+    {"GetThemePropertyOrigin", w32_E_FAIL, 20},
+    {"GetThemeRect", w32_E_FAIL, 20},
+    {"GetThemeString", w32_E_FAIL, 24},
+    {"GetThemeSysFont", w32_E_FAIL, 12},
+    {"GetThemeSysInt", w32_E_FAIL, 12},
+    {"GetThemeSysString", w32_E_FAIL, 16},
+    {"GetThemeTextExtent", w32_E_FAIL, 36},
+    {"GetThemeTextMetrics", w32_E_FAIL, 20},
+    {"HitTestThemeBackground", w32_E_FAIL, 40},
+    {"EncodePointer", w32_identity, 4}, {"DecodePointer", w32_identity, 4},
+    {"FlsAlloc", w32_FlsAlloc, 4}, {"FlsFree", w32_FlsFree, 4}, {"FlsGetValue", w32_FlsGetValue, 4},
+    {"FlsSetValue", w32_FlsSetValue, 8}, {"GetSystemWow64DirectoryW", w32_GetSystemWow64DirectoryW2, 8}, {"GetSystemWow64DirectoryA", w32_GetSystemWow64DirectoryA, 8},
+    W32_FWD("CopyRect", 8), W32_FWD("UnionRect", 12), W32_FWD("CharUpperA", 4), W32_FWD("GetAncestor", 8),
+    W32_FWD("SystemParametersInfoA", 16),
+    {"wsprintfA", w32_wsprintfA, 0},
+    {"IsBadReadPtr", w32_IsBadReadPtr, 8}, {"IsBadCodePtr", w32_IsBadCodePtr, 4},
+    {"GetModuleHandleExA", w32_GetModuleHandleExA, 12}, {"GetModuleHandleExW", w32_GetModuleHandleExW, 12},
+    {"SetWindowTextA", w32_SetWindowTextA, 8}, {"OpenEventA", w32_OpenEventA, 12},
+    {"TrackMouseEvent", w32_TrackMouseEvent, 4}, {"mixerOpen", w32_mmsys_nodriver, 20},
+    {"acmStreamSize", w32_acm_notpossible, 16}, {"ExtCreateRegion", w32_unsupported, 12},
+    {"GetObjectA", w32_unsupported, 12}, {"UpdateLayeredWindow", w32_unsupported, 36},
+    {"QueueUserAPC", w32_unsupported, 12},
+    {"AreFileApisANSI", w32_AreFileApisANSI, 0}, {"GetDiskFreeSpaceExA", w32_GetDiskFreeSpaceExA, 16},
+    {"SetThreadAffinityMask", w32_SetThreadAffinityMask, 8},
+    {"FreeLibraryAndExitThread", w32_FreeLibraryAndExitThread, 8},
+    /* kernel32 batch: native forwards, then stack-balanced failures */
+    W32_FWD("WaitForSingleObjectEx", 12),
+    W32_FWD("PulseEvent", 4),
+    W32_FWD("CreateSemaphoreA", 16),
+    W32_FWD("CreateSemaphoreW", 16),
+    W32_FWD("ReleaseSemaphore", 12),
+    W32_FWD("GetFileSizeEx", 8),
+    W32_FWD("SetFilePointerEx", 20),
+    W32_FWD("GetFileAttributesExW", 12),
+    W32_FWD("GetFileAttributesExA", 12),
+    W32_FWD("SleepEx", 8),
+    W32_FWD("GetThreadPriority", 4),
+    W32_FWD("LocalLock", 4),
+    W32_FWD("LocalUnlock", 4),
+    W32_FWD("GlobalMemoryStatus", 4),
+    W32_FWD("OutputDebugStringA", 4),
+    W32_FWD("OutputDebugStringW", 4),
+    W32_FWD("GetTempPathA", 8),
+    W32_FWD("GetTempFileNameA", 16),
+    W32_FWD("GetTimeZoneInformation", 4),
+    W32_FWD("GetComputerNameA", 8),
+    W32_FWD("lstrcmpA", 8),
+    W32_FWD("OpenThread", 12),
+    W32_FWD("GetProcessAffinityMask", 12),
+    W32_FWD("GetProcessTimes", 20),
+    W32_FWD("GetThreadTimes", 20),
+    W32_FWD("CharToOemA", 8),
+    W32_FWD("timeGetTime", 0),
+    W32_FWD("timeBeginPeriod", 4),
+    W32_FWD("timeEndPeriod", 4),
+    W32_FWD("SetFileAttributesA", 8),
+    W32_FWD("GetLogicalDriveStringsA", 8),
+    W32_FWD("GetLogicalDriveStringsW", 8),
+    W32_FWD("GetVolumeInformationA", 32),
+    W32_FWD("GetVolumeInformationW", 32),
+    W32_FWD("GetLongPathNameW", 12),
+    W32_FWD("CopyFileA", 12),
+    W32_FWD("CopyFileExW", 24),
+    W32_FWD("GetSystemDefaultLCID", 0),
+    W32_FWD("GetSystemDefaultUILanguage", 0),
+    W32_FWD("IsBadStringPtrA", 8),
+    W32_FWD("IsBadStringPtrW", 8),
+    W32_FWD("CancelIo", 4),
+    W32_FWD("GetConsoleScreenBufferInfo", 8),
+    W32_FWD("AllocConsole", 0),
+    W32_FWD("FreeConsole", 0),
+    W32_FWD("SetConsoleTitleA", 4),
+    W32_FWD("GetSystemPowerStatus", 4),
+    W32_FWD("SetThreadExecutionState", 4),
+    W32_FWD("GetCurrentPackageId", 8),
+    {"GetThreadContext", w32_unsupported, 8},
+    {"GetStartupInfoW", w32_unsupported, 4},
+    {"CreateToolhelp32Snapshot", w32_unsupported, 8},
+    {"Process32First", w32_unsupported, 8},
+    {"Process32Next", w32_unsupported, 8},
+    {"Module32First", w32_unsupported, 8},
+    {"Module32Next", w32_unsupported, 8},
+    {"Thread32First", w32_unsupported, 8},
+    {"Thread32Next", w32_unsupported, 8},
+    {"CreateIoCompletionPort", w32_unsupported, 16},
+    {"GetQueuedCompletionStatus", w32_unsupported, 20},
+    {"PostQueuedCompletionStatus", w32_unsupported, 16},
+    {"EnumResourceNamesA", w32_unsupported, 16},
+    {"FindFirstFileExW", w32_unsupported, 24},
+    {"ReadFileEx", w32_unsupported, 20},
+    {"WriteFileEx", w32_unsupported, 20},
+    {"CreateDirectoryExW", w32_unsupported, 12},
+    {"WinExec", w32_unsupported, 8},
+    {"SearchPathA", w32_unsupported, 24},
+    {"SearchPathW", w32_unsupported, 24},
+    {"GetNumberFormatA", w32_unsupported, 24},
+    {"GetCurrencyFormatA", w32_unsupported, 24},
+    {"Wow64DisableWow64FsRedirection", w32_Wow64DisableFsRedirection, 4},
+    {"Wow64RevertWow64FsRedirection", w32_one, 4},
+    {"GetSystemWindowsDirectoryA", w32_unsupported, 8},
+    {"GetProcessWorkingSetSize", w32_unsupported, 12},
+    {"SetProcessWorkingSetSize", w32_unsupported, 12},
+    {"GetPrivateProfileStringA", w32_unsupported, 24},
+    {"GetPrivateProfileIntA", w32_unsupported, 16},
+    {"GetPrivateProfileIntW", w32_unsupported, 16},
+    {"GetPrivateProfileSectionA", w32_unsupported, 16},
+    {"WritePrivateProfileSectionA", w32_unsupported, 12},
+    {"GetLargestConsoleWindowSize", w32_unsupported, 4},
+    {"RtlMoveMemory", w32_RtlMoveMemory, 12}, {"RtlZeroMemory", w32_RtlZeroMemory, 8}, {"RtlFillMemory", w32_RtlFillMemory, 12},
+    {"IsDBCSLeadByte", w32_IsDBCSLeadByte, 4}, {"IsDBCSLeadByteEx", w32_IsDBCSLeadByteEx, 8},
+    {"HeapValidate", w32_HeapOneArgOk, 12}, {"HeapLock", w32_HeapOneArgOk, 4}, {"HeapUnlock", w32_HeapOneArgOk, 4},
+    {"HeapCompact", w32_HeapCompact, 8}, {"SetConsoleCtrlHandler", w32_ConsoleCtrlHandler, 8},
+    {"GetShortPathNameA", w32_PathPassThroughA, 12}, {"GetLongPathNameA", w32_PathPassThroughA, 12},
+    {"PropVariantClear", w32_zero, 4},
+    /* winmm / msacm32 without devices */
+    {"mixerGetLineControlsA", w32_mmsys_nodriver, 16},
+    {"mixerGetControlDetailsA", w32_mmsys_nodriver, 12},
+    {"mixerGetLineInfoA", w32_mmsys_nodriver, 12},
+    {"mixerGetDevCapsA", w32_mmsys_nodriver, 12},
+    {"mixerSetControlDetails", w32_mmsys_nodriver, 12},
+    {"mixerClose", w32_mmsys_nodriver, 4},
+    {"mixerGetID", w32_mmsys_nodriver, 12},
+    {"mixerMessage", w32_mmsys_nodriver, 16},
+    {"waveOutOpen", w32_mmsys_nodriver, 24},
+    {"waveOutClose", w32_mmsys_nodriver, 4},
+    {"waveOutWrite", w32_mmsys_nodriver, 12},
+    {"waveOutPrepareHeader", w32_mmsys_nodriver, 12},
+    {"waveOutUnprepareHeader", w32_mmsys_nodriver, 12},
+    {"waveOutReset", w32_mmsys_nodriver, 4},
+    {"waveOutPause", w32_mmsys_nodriver, 4},
+    {"waveOutRestart", w32_mmsys_nodriver, 4},
+    {"waveOutGetPosition", w32_mmsys_nodriver, 12},
+    {"waveOutGetDevCapsA", w32_mmsys_nodriver, 12},
+    {"waveOutSetVolume", w32_mmsys_nodriver, 8},
+    {"waveOutGetVolume", w32_mmsys_nodriver, 8},
+    {"waveOutGetErrorTextA", w32_mmsys_nodriver, 12},
+    {"waveOutBreakLoop", w32_mmsys_nodriver, 4},
+    {"waveOutMessage", w32_mmsys_nodriver, 16},
+    {"waveInOpen", w32_mmsys_nodriver, 24},
+    {"waveInClose", w32_mmsys_nodriver, 4},
+    {"waveInAddBuffer", w32_mmsys_nodriver, 12},
+    {"waveInPrepareHeader", w32_mmsys_nodriver, 12},
+    {"waveInUnprepareHeader", w32_mmsys_nodriver, 12},
+    {"waveInStart", w32_mmsys_nodriver, 4},
+    {"waveInStop", w32_mmsys_nodriver, 4},
+    {"waveInReset", w32_mmsys_nodriver, 4},
+    {"waveInGetDevCapsA", w32_mmsys_nodriver, 12},
+    {"waveInGetPosition", w32_mmsys_nodriver, 12},
+    {"waveInMessage", w32_mmsys_nodriver, 16},
+    {"timeSetEvent", w32_mmsys_nodriver, 20},
+    {"timeKillEvent", w32_mmsys_nodriver, 4},
+    {"mixerGetNumDevs", w32_zero, 0},
+    {"waveOutGetNumDevs", w32_zero, 0},
+    {"waveInGetNumDevs", w32_zero, 0},
+    {"acmStreamOpen", w32_acm_notpossible, 32},
+    {"acmStreamClose", w32_acm_notpossible, 8},
+    {"acmStreamConvert", w32_acm_notpossible, 12},
+    {"acmStreamPrepareHeader", w32_acm_notpossible, 12},
+    {"acmStreamUnprepareHeader", w32_acm_notpossible, 12},
+    {"acmFormatSuggest", w32_acm_notpossible, 20},
+    {"acmFormatTagDetailsA", w32_acm_notpossible, 12},
+    {"acmDriverEnum", w32_acm_notpossible, 12},
+    {"acmMetrics", w32_acm_notpossible, 12},
+    {"acmFormatEnumA", w32_acm_notpossible, 16},
+    {"acmDriverClose", w32_acm_notpossible, 8},
+    {"acmDriverOpen", w32_acm_notpossible, 12},
+    {"acmDriverDetailsA", w32_acm_notpossible, 12},
+    {"acmFormatDetailsA", w32_acm_notpossible, 12},
+    {"acmDriverID", w32_acm_notpossible, 12},
+    {"acmDriverMessage", w32_acm_notpossible, 16},
+    {"timeGetDevCaps", w32_timeGetDevCaps, 8},
+    {"_strdup", w32_crt_strdup, 0}, {"_wcsdup", w32_crt_wcsdup, 0}, {"strtoul", w32_crt_strtoul, 0},
+    {"_strnicmp", w32_crt_strnicmp, 0}, {"memchr", w32_crt_memchr, 0}, {"qsort", w32_crt_qsort, 0},
+    {"_initterm", w32_crt_initterm, 0}, {"??2@YAPAXI@Z", w32_crt_new, 0}, {"??3@YAXPAX@Z", w32_crt_delete, 0},
+    {"_ftol", w32_crt_ftol, 0}, {"_ftol2", w32_crt_ftol, 0}, {"_ftol2_sse", w32_crt_ftol, 0},
+    {"floor", w32_crt_floor, 0}, {"ceil", w32_crt_ceil, 0}, {"sqrt", w32_crt_sqrt, 0}, {"fabs", w32_crt_fabs, 0},
+    {"sin", w32_crt_sin, 0}, {"cos", w32_crt_cos, 0}, {"tan", w32_crt_tan, 0}, {"atan", w32_crt_atan, 0},
+    {"exp", w32_crt_exp, 0}, {"log", w32_crt_log, 0}, {"log10", w32_crt_log10, 0}, {"pow", w32_crt_pow, 0},
+    {"atan2", w32_crt_atan2, 0}, {"fmod", w32_crt_fmod, 0}, {"ldexp", w32_crt_ldexp, 0},
+    {"_CIfloor", w32_crt_CIfloor, 0}, {"_CIceil", w32_crt_CIceil, 0}, {"_CIsqrt", w32_crt_CIsqrt, 0},
+    {"_CIsin", w32_crt_CIsin, 0}, {"_CIcos", w32_crt_CIcos, 0}, {"_CItan", w32_crt_CItan, 0},
+    {"_CIatan", w32_crt_CIatan, 0}, {"_CIexp", w32_crt_CIexp, 0}, {"_CIlog", w32_crt_CIlog, 0},
+    {"_CIlog10", w32_crt_CIlog10, 0}, {"_CIpow", w32_crt_CIpow, 0}, {"_CIatan2", w32_crt_CIatan2, 0},
+    {"InternetOpenA", w32_wininet_fail, 20}, {"InternetConnectA", w32_wininet_fail, 32},
+    {"HttpOpenRequestA", w32_wininet_fail, 32}, {"HttpSendRequestA", w32_wininet_fail, 20},
+    {"HttpQueryInfoA", w32_wininet_fail, 20}, {"InternetCrackUrlA", w32_wininet_fail, 16},
+    {"InternetSetOptionA", w32_wininet_fail, 16}, {"InternetQueryOptionA", w32_wininet_fail, 16},
+    {"InternetReadFileExA", w32_wininet_fail, 16}, {"InternetSetFilePointer", w32_wininet_fail, 16},
+    {"InternetGetConnectedState", w32_wininet_connected, 8}, {"FtpCommandA", w32_wininet_fail, 24},
+    {"FtpOpenFileA", w32_wininet_fail, 20},
+    W32_FWD("SHGetFolderPathW", 20), W32_FWD("SHGetFolderPathA", 20), W32_FWD("SHGetSpecialFolderPathW", 16),
+    W32_FWD("SHGetSpecialFolderPathA", 16), W32_FWD("SHCreateDirectoryExW", 12),
+    {"SHPathPrepareForWriteW", w32_zero, 16}, {"SHAutoComplete", w32_zero, 8},
+    {"GetNamedSecurityInfoW", w32_unsupported, 32}, {"SetNamedSecurityInfoW", w32_zero, 28},
+    {"RegDeleteKeyExA", w32_RegDeleteNotSupported, 16}, {"RegDeleteKeyExW", w32_RegDeleteNotSupported, 16},
+    W32_SL_API_ENTRIES
+    {"CoCreateInstance", w32_CoCreateInstance, 20},
+    /* msvcrt stdio/low-level/time (cdecl) */
+    {"atof", w32_crt_atof, 0}, {"clock", w32_crt_clock, 0}, {"exit", w32_crt_exit, 0}, {"_assert", w32_crt_assert, 0},
+    {"clearerr", w32_crt_clearerr, 0}, {"fputc", w32_crt_fputc, 0}, {"_flsbuf", w32_crt_flsbuf, 0},
+    {"fread", w32_crt_fread, 0}, {"fseek", w32_crt_fseek, 0}, {"ftell", w32_crt_ftell, 0}, {"rewind", w32_crt_rewind, 0},
+    {"_fdopen", w32_crt_fdopen, 0}, {"remove", w32_crt_remove, 0}, {"_wremove", w32_crt_wremove, 0},
+    {"_wrmdir", w32_crt_wrmdir, 0}, {"_wmkdir", w32_crt_wmkdir, 0}, {"_wrename", w32_crt_wrename, 0},
+    {"_access", w32_crt_access, 0}, {"_waccess", w32_crt_waccess, 0}, {"_wopen", w32_crt_wopen, 0},
+    {"_write", w32_crt_write, 0}, {"_dup", w32_crt_dup, 0}, {"_dup2", w32_crt_dup2, 0}, {"_pipe", w32_crt_pipe, 0},
+    {"_filelengthi64", w32_crt_filelengthi64, 0}, {"_lseeki64", w32_crt_lseeki64, 0},
+    {"_get_osfhandle", w32_crt_get_osfhandle, 0}, {"raise", w32_crt_raise, 0}, {"strerror", w32_crt_strerror, 0},
+    {"_vsnprintf", w32_crt_vsnprintf, 0}, {"_lrotr", w32_crt_lrotr, 0}, {"wcschr", w32_crt_wcschr, 0},
+    {"wcsrchr", w32_crt_wcsrchr, 0}, {"_wcslwr", w32_crt_wcslwr, 0}, {"gmtime", w32_crt_gmtime, 0},
+    {"localtime", w32_crt_localtime, 0}, {"strftime", w32_crt_strftime, 0}, {"sscanf", w32_crt_sscanf, 0},
+    {"_beginthreadex", w32_crt_beginthreadex, 0}, {"_isctype", w32_crt_isctype, 0},
+    {"AddAtomA", w32_AddAtomA, 4}, {"FindAtomA", w32_FindAtomA, 4}, {"GetAtomNameA", w32_GetAtomNameA, 12},
+    {"GetConsoleTitleA", w32_ConsoleTitle, 8}, {"GetConsoleTitleW", w32_ConsoleTitle, 8},
+    {"SetConsoleTitleW", w32_one, 4}, {"GetConsoleWindow", w32_nullptr, 0}, {"CoInitializeEx", w32_zero, 8},
+    {"CharToOemW", w32_one, 8}, {"OemToCharW", w32_one, 8}, {"FindWindowA", w32_nullptr, 8},
+    {"GetCaretPos", w32_zero, 4}, {"GetClipboardOwner", w32_nullptr, 0}, {"GetClipboardViewer", w32_nullptr, 0},
+    {"GetInputState", w32_zero, 0}, {"GetMessageTime", w32_zero, 0}, {"GetOpenClipboardWindow", w32_nullptr, 0},
+    {"GetProcessWindowStation", w32_nullptr, 0},
+    {"_setjmp3", w32_crt_setjmp3, 0}, {"_setjmp", w32_crt_setjmp3, 0}, {"longjmp", w32_crt_longjmp, 0},
+    {"CreateThread", w32_CreateThread, 24}, W32_FWD("ExitThread", 4), W32_FWD("ResumeThread", 4),
+    {"HeapCreate", w32_HeapCreate, 12}, {"HeapDestroy", w32_HeapDestroy, 4},
+    {"GetEnvironmentStrings", w32_GetEnvironmentStrings, 0}, {"GetEnvironmentStringsW", w32_GetEnvironmentStringsW, 0},
+    {"GetEnvironmentStringsA", w32_GetEnvironmentStrings, 0},
+    {"FreeEnvironmentStringsA", w32_FreeEnvironmentStrings, 4}, {"FreeEnvironmentStringsW", w32_FreeEnvironmentStrings, 4},
+    W32_FWD("GetConsoleCP", 0), W32_FWD("GetConsoleMode", 8), W32_FWD("GetConsoleOutputCP", 0),
+    W32_FWD("WriteConsoleA", 20), W32_FWD("WriteConsoleW", 20), W32_FWD("SetStdHandle", 8), W32_FWD("SetHandleCount", 4),
+    {"EnumSystemLocalesA", w32_EnumSystemLocalesA, 8}, W32_FWD("IsValidLocale", 8), W32_FWD("IsValidCodePage", 4),
+    W32_FWD("LCMapStringA", 24), W32_FWD("GetStringTypeA", 20),
+    {"UnhandledExceptionFilter", w32_UnhandledExceptionFilter, 4},
+    {"DialogBoxParamW", w32_DialogBoxParamW, 20}, W32_FWD("EndDialog", 8), W32_FWD("GetDlgItem", 8),
+    W32_FWD("GetParent", 4), W32_FWD("GetDesktopWindow", 0), W32_FWD("MapWindowPoints", 16), W32_FWD("MessageBeep", 4),
+    W32_FWD("MoveWindow", 24), W32_FWD("RedrawWindow", 16), W32_FWD("GetTextExtentPoint32W", 16),
+    W32_FWD("CoUninitialize", 0), W32_FWD("GlobalDeleteAtom", 4),
+    {"LocalFileTimeToFileTime", w32_LocalFileTimeToFileTime, 8}, {"SetFileTime", w32_SetFileTime, 16},
+    {"EnumCalendarInfoW", w32_EnumCalendarInfoW, 16}, {"SignalObjectAndWait", w32_SignalObjectAndWait, 16},
+    {"ExitWindowsEx", w32_ExitWindowsEx, 8},
+    {"SafeArrayCreate", w32_SafeArrayCreate, 12}, {"SafeArrayGetUBound", w32_SafeArrayHresult, 12},
+    {"SafeArrayGetLBound", w32_SafeArrayHresult, 12}, {"SafeArrayPtrOfIndex", w32_SafeArrayHresult, 12},
+    {"InternetOpenW", w32_wininet_fail, 20}, {"InternetConnectW", w32_wininet_fail, 32},
+    {"InternetCloseHandle", w32_wininet_fail, 4}, {"InternetSetOptionW", w32_wininet_fail, 16},
+    {"InternetQueryOptionW", w32_wininet_fail, 16}, {"InternetCrackUrlW", w32_wininet_fail, 16},
+    {"InternetReadFile", w32_wininet_fail, 16}, {"InternetErrorDlg", w32_wininet_fail, 20},
+    {"HttpOpenRequestW", w32_wininet_fail, 32}, {"HttpSendRequestW", w32_wininet_fail, 20},
+    {"HttpQueryInfoW", w32_wininet_fail, 20}, {"FtpOpenFileW", w32_wininet_fail, 20},
+    {"FtpGetFileSize", w32_wininet_fail, 8},
+    W32_FWD("DisableThreadLibraryCalls", 4), W32_FWD("ExpandEnvironmentStringsA", 12),
+    W32_FWD("ExpandEnvironmentStringsW", 12), W32_FWD("GetSystemDirectoryA", 8), W32_FWD("GetWindowsDirectoryA", 8),
+    W32_FWD("lstrcatA", 8), W32_FWD("lstrcpyA", 8), {"IsBadWritePtr", w32_IsBadWritePtr, 8},
+    {"RegOpenKeyA", w32_RegOpenKeyA, 12}, {"RegCreateKeyExA", w32_RegCreateKeyExA, 36},
+    {"RegSetValueExA", w32_RegSetValueExA, 24},
+    {"InitializeSecurityDescriptor", w32_InitializeSecurityDescriptor, 8},
+    {"SetSecurityDescriptorDacl", w32_SetSecurityDescriptorDacl, 16}, {"SetFileSecurityW", w32_SetFileSecurityW, 12},
+    {"InitializeAcl", w32_InitializeAcl, 12}, {"AddAccessAllowedAce", w32_AddAccessAllowedAce, 16},
+    {"GetAce", w32_GetAce, 12}, {"LookupAccountSidW", w32_LookupAccountSidW, 28},
     W32_FWD("GetACP", 0), W32_FWD("GetOEMCP", 0), W32_FWD("GetCPInfo", 8),
     W32_FWD("GetDateFormatW", 24), W32_FWD("GetTimeFormatW", 24),
     W32_FWD("GetEnvironmentVariableW", 12), W32_FWD("SetEnvironmentVariableW", 8),
@@ -1327,7 +1892,7 @@ W32_FWD("ReleaseMutex", 4),
     /* advapi32 */
     {"RegOpenKeyExW", w32_RegOpenKeyExW, 20}, {"RegCreateKeyExW", w32_RegCreateKeyExW, 36},
     {"OpenProcessToken", w32_OpenProcessToken, 12},
-    W32_FWD("RegQueryValueExW", 24), W32_FWD("RegSetValueExW", 24), W32_FWD("RegDeleteValueW", 8),
+    W32_FWD("RegQueryValueExW", 24), W32_FWD("RegSetValueExW", 24),
     W32_FWD("LookupPrivilegeValueW", 12), W32_FWD("AdjustTokenPrivileges", 24),
     /* oleaut32 */
     {"SysAllocString", w32_SysAllocString, 4}, {"SysAllocStringLen", w32_SysAllocStringLen, 8},
@@ -1349,13 +1914,16 @@ W32_FWD("ReleaseMutex", 4),
     W32_FWD("CreatePalette", 4), W32_FWD("GetStockObject", 4),
     W32_FWD("CreateFontIndirectW", 4),
     {"GetObjectW", w32_GetObjectW, 12},
+    {"CreateDIBSection", w32_CreateDIBSection, 24},
+    W32_FWD("CreateCompatibleDC", 4), W32_FWD("SelectObject", 8),
+    W32_FWD("DeleteDC", 4), W32_FWD("DeleteObject", 4), W32_FWD("GetDIBColorTable", 16),
     W32_FWD("GetKeyboardLayout", 4),
     {"GetKeyboardLayoutList", w32_GetKeyboardLayoutList, 8},
     {"ImmIsIME", w32_ImmIsIME, 4},
     W32_FWD("LoadIconW", 8), W32_FWD("LoadCursorW", 8), W32_FWD("MulDiv", 12),
     W32_FWD("SystemParametersInfoW", 16),
     W32_FWD("SetClassLongW", 12), W32_FWD("GetSystemMenu", 8), W32_FWD("DeleteMenu", 12),
-    W32_FWD("LoadStringW", 16), W32_FWD("DestroyWindow", 4), W32_FWD("ExitWindowsEx", 8),
+    {"LoadStringW", w32_LoadStringW, 16}, W32_FWD("DestroyWindow", 4), W32_FWD("ExitWindowsEx", 8),
     /* kernel32 */
     {"GetStartupInfoA", w32_GetStartupInfoA, 4},
     {"CreateProcessA", w32_CreateProcessA, 40},
@@ -1364,17 +1932,21 @@ W32_FWD("ReleaseMutex", 4),
     {"GetModuleHandleA", w32_GetModuleHandleA, 4},
     {"GetProcAddress", w32_GetProcAddress, 8},
     {"SetUnhandledExceptionFilter", w32_SetUnhandledExceptionFilter, 4},
+    {"RaiseException", w32_RaiseException, 16}, {"RtlUnwind", w32_RtlUnwind, 16},
+    {"EnumResourceTypesW", w32_EnumResourceTypesW, 12}, {"EnumResourceNamesW", w32_EnumResourceNamesW, 16},
+    {"EnumResourceLanguagesW", w32_EnumResourceLanguagesW, 20},
     {"IsWow64Process", w32_IsWow64Process, 8},
     {"FindResourceExA", w32_FindResourceExA, 16},
     {"LoadResource", w32_LoadResource, 8},
     {"LockResource", w32_LockResource, 4},
+    W32_FWD("FreeResource", 4), /* Win32 obsolete no-op; resources belong to the module. */
     {"SizeofResource", w32_SizeofResource, 8},
     W32_FWD("CreateMutexA", 12),
     W32_FWD("GetCurrentDirectoryA", 8),
     W32_FWD("GetEnvironmentVariableA", 12),
     W32_FWD("SetEnvironmentVariableA", 8),
     W32_FWD("GetExitCodeProcess", 8),
-    W32_FWD("GetModuleFileNameA", 12),
+    {"GetModuleFileNameA", w32_GetModuleFileNameA, 12},
     W32_FWD("GlobalMemoryStatusEx", 4),
     W32_FWD("WaitForSingleObject", 8),
     /* advapi32 */
@@ -1428,6 +2000,15 @@ W32_FWD("ReleaseMutex", 4),
     {"printf", w32_printf, 0},
     {"puts", w32_puts, 0},
     {"memset", w32_memset, 0},
+    {"malloc", w32_crt_malloc, 0}, {"calloc", w32_crt_calloc, 0}, {"free", w32_crt_free, 0},
+    {"realloc", w32_crt_realloc, 0}, {"memcpy", w32_crt_memcpy, 0}, {"memmove", w32_crt_memmove, 0},
+    {"memcmp", w32_crt_memcmp, 0}, {"strncmp", w32_crt_strncmp, 0}, {"_stricmp", w32_crt_stricmp, 0},
+    {"toupper", w32_crt_toupper, 0}, {"tolower", w32_crt_tolower, 0}, {"abort", w32_crt_abort, 0},
+    {"_errno", w32_crt_errno, 0}, {"fflush", w32_crt_fflush, 0}, {"vfprintf", w32_crt_vfprintf, 0},
+    {"sprintf", w32_crt_sprintf, 0}, {"_snprintf", w32_crt_snprintf, 0},
+    {"wcslen", w32_crt_wcslen, 0}, {"wcscpy", w32_crt_wcscpy, 0}, {"wcscat", w32_crt_wcscat, 0},
+    {"wcscmp", w32_crt_wcscmp, 0}, {"wcsstr", w32_crt_wcsstr, 0}, {"__dllonexit", w32_crt_dllonexit, 0},
+    W32_FWD("SetWindowRgn", 12),
     {"strlen", w32_strlen, 0},
     {"strcmp", w32_strcmp, 0},
     {"strcpy", w32_strcpy, 0},
@@ -1474,6 +2055,8 @@ static const W32Api *w32_find_api(const char *name)
         if (!strcmp(g_w32_apis[i].name, name)) return &g_w32_apis[i];
     return NULL;
 }
+
+#include "wow32_dll.inc"
 
 /* ---- PE32 image loading ---- */
 
@@ -1548,6 +2131,8 @@ static void w32_fault(int sig, siginfo_t *info, void *uctx)
         __asm__ volatile("wrfsbase %0" : : "r"(host_fs));
     }
     const ucontext_t *uc = uctx;
+    fprintf(stderr, "[WOW32] gs base 0x%llx, TEB64.Self 0x%llx\n", (unsigned long long)teb64,
+            teb64 ? *(unsigned long long *)(uintptr_t)(teb64 + 0x30) : 0ull);
     fprintf(stderr, "[WOW32] fatal signal %d at eip=0x%llx cs=0x%llx fault address %p (eax=%llx ebx=%llx ecx=%llx "
                     "edx=%llx esi=%llx edi=%llx ebp=%llx esp=%llx)\n",
             sig, (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
@@ -1556,6 +2141,19 @@ static void w32_fault(int sig, siginfo_t *info, void *uctx)
             (unsigned long long)uc->uc_mcontext.gregs[REG_RCX], (unsigned long long)uc->uc_mcontext.gregs[REG_RDX],
             (unsigned long long)uc->uc_mcontext.gregs[REG_RSI], (unsigned long long)uc->uc_mcontext.gregs[REG_RDI],
             (unsigned long long)uc->uc_mcontext.gregs[REG_RBP], (unsigned long long)uc->uc_mcontext.gregs[REG_RSP]);
+    if (getenv("BEER_W32_DUMP")) {                           /* BEER_W32_DUMP=<hex address>:<hex length>:<file> */
+        unsigned long long dump_at = 0, dump_len = 0; char dump_file[256];
+        if (sscanf(getenv("BEER_W32_DUMP"), "%llx:%llx:%255s", &dump_at, &dump_len, dump_file) == 3) {
+            FILE *f = fopen(dump_file, "wb");
+            if (f) { fwrite((void *)(uintptr_t)dump_at, 1, dump_len, f); fclose(f); }
+        }
+    }
+    if ((uc->uc_mcontext.gregs[REG_CSGSFS] & 0xffff) == W32_USER32_CS) {
+        const u32 *stack = (const u32 *)(uintptr_t)(uint32_t)uc->uc_mcontext.gregs[REG_RSP];
+        fprintf(stderr, "[WOW32] 32-bit stack:");
+        for (int i = 0; i < 12; ++i) fprintf(stderr, " %08x", stack[i]);
+        fprintf(stderr, "\n");
+    }
     _exit(128 + sig);
 }
 
@@ -1587,6 +2185,8 @@ static void __attribute__((noreturn)) beer_wow32_main(const char *path)
     *(u16 *)(peb + 0xac) = 19045;                          /* OSBuildNumber */
     *(u32 *)(peb + 0xb0) = 2;                              /* OSPlatformId */
     const W32NtHdrs *nt = (const W32NtHdrs *)(image + ((const DosHdr *)image)->lfanew);
+    if (!beer_security_init(image, nt->opt.size_of_image))
+        die("WoW32: process security initialization failed (Windows error %u)", g_last_error);
     size_t stack = nt->opt.stack_reserve ? nt->opt.stack_reserve : (1u << 20);
     if (stack < (1u << 20)) stack = 1u << 20;
     const u32 esp = w32_thread_init(stack);

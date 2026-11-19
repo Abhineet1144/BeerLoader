@@ -2,10 +2,14 @@
  * normal Windows install (Steam client location and "running" state). Keys are matched
  * case-insensitively; Wow6432Node is folded away. Values the guest writes are not persisted. */
 /* type: 1 REG_SZ (text), 3 REG_BINARY (the low bin_size bytes of qword), 4 REG_DWORD (dword), 11 REG_QWORD. */
-typedef struct { const char *path; const char *name; u32 type; char text[160]; u32 dword; u64 qword; u32 bin_size; }
+/* Values the guest writes (RegSetValueEx) keep their data in `blob` (text types as UTF-16LE) and own path/name. A value
+ * named "\x01key" only marks that an empty key exists (RegCreateKeyEx) and is invisible to queries. */
+typedef struct { const char *path; const char *name; u32 type; char text[160]; u32 dword; u64 qword; u32 bin_size;
+                 u8 *blob; u32 blob_size; }
     BeerRegValue;
+#define BEER_REG_HIDDEN(v) ((v)->name[0] == 1)
 
-#define BEER_REG_MAX_VALUES 128
+#define BEER_REG_MAX_VALUES 2048
 #define BEER_REG_MAX_HANDLES 64
 static BeerRegValue g_reg_values[BEER_REG_MAX_VALUES];
 static int g_reg_value_count;
@@ -42,6 +46,13 @@ static void reg_add_binary(const char *path, const char *name, u64 value, u32 by
  * Returns the size in bytes. */
 static u32 reg_value_bytes(const BeerRegValue *v, int wide, void *out)
 {
+    if (v->blob) {                                       /* written by the guest */
+        const int text = v->type == 1 || v->type == 2 || v->type == 7;
+        if (!text || wide) { if (out && v->blob_size) memcpy(out, v->blob, v->blob_size); return v->blob_size; }
+        const u32 chars = v->blob_size / 2;               /* ANSI view of a UTF-16 string */
+        if (out) for (u32 c = 0; c < chars; ++c) { const u16 w = ((const u16 *)v->blob)[c]; ((char *)out)[c] = w < 0x100 ? (char)w : '?'; }
+        return chars;
+    }
     switch (v->type) {
     case 4:  if (out) memcpy(out, &v->dword, 4); return 4;
     case 11: if (out) memcpy(out, &v->qword, 8); return 8;
@@ -255,6 +266,16 @@ static void reg_seed_windows_version(void)
     reg_add_sz(nt, "currenttype", "Multiprocessor Free");
     reg_add_sz(nt, "systemroot", "C:\\Windows");
     reg_add_sz(nt, "pathname", "C:\\Windows");
+    /* Program Files locations as a 64-bit Windows records them (Inno Setup and other installers read these; the
+     * registry has no separate 32/64-bit views, so the 64-bit view's values are the ones stored). */
+    static const char cv[] = "hklm\\software\\microsoft\\windows\\currentversion";
+    reg_add_sz(cv, "programfilesdir", "C:\\Program Files");
+    reg_add_sz(cv, "programfilesdir (x86)", "C:\\Program Files (x86)");
+    reg_add_sz(cv, "programw6432dir", "C:\\Program Files");
+    reg_add_sz(cv, "commonfilesdir", "C:\\Program Files\\Common Files");
+    reg_add_sz(cv, "commonfilesdir (x86)", "C:\\Program Files (x86)\\Common Files");
+    reg_add_sz(cv, "commonw6432dir", "C:\\Program Files\\Common Files");
+    reg_add_sz(cv, "programfilespath", "C:\\Program Files");
     reg_add_sz("hklm\\software\\microsoft\\directx", "version", "4.09.00.0904");
     /* Diagnostic BEER_DSTORAGE_CPU=1: DirectStorage's documented override that keeps decompression on the CPU. */
     if (getenv("BEER_DSTORAGE_CPU"))
@@ -558,7 +579,7 @@ static u64 reg_query_info(u64 key, u32 *class_chars, u32 *subkeys, u32 *max_subk
     for (int k = 0; k < count; ++k) if (lengths[k] > longest_key) longest_key = (u32)lengths[k];
     for (int i = 0; i < g_reg_value_count; ++i) {
         const BeerRegValue *v = &g_reg_values[i];
-        if (strcmp(v->path, path)) continue;
+        if (strcmp(v->path, path) || BEER_REG_HIDDEN(v)) continue;
         value_count++;
         if (strlen(v->name) > longest_name) longest_name = (u32)strlen(v->name);
         u32 data = reg_value_bytes(v, wide, NULL);
@@ -658,7 +679,7 @@ impl_RegEnumValueW(u64 key, u32 index, u16 *name, u32 *name_chars, u32 *reserved
     BeerRegValue *found = NULL;
     u32 seen = 0;
     for (int k = 0; k < g_reg_value_count && !found; ++k)
-        if (!strcmp(g_reg_values[k].path, path) && seen++ == index) found = &g_reg_values[k];
+        if (!strcmp(g_reg_values[k].path, path) && !BEER_REG_HIDDEN(&g_reg_values[k]) && seen++ == index) found = &g_reg_values[k];
     if (!found) { pthread_mutex_unlock(&g_reg_mutex); return 259; }                  /* ERROR_NO_MORE_ITEMS */
     size_t length = strlen(found->name);
     if (length + 1 > *name_chars) { pthread_mutex_unlock(&g_reg_mutex); return 234; } /* ERROR_MORE_DATA */
@@ -678,3 +699,188 @@ impl_RegEnumValueW(u64 key, u32 index, u16 *name, u32 *name_chars, u32 *reserved
     pthread_mutex_unlock(&g_reg_mutex);
     return status;
 }
+
+
+/* ---- writing: RegCreateKeyEx / RegSetValueEx / RegDelete* (in memory for the life of the process) ---- */
+static void reg_lower_name(const char *in, char *out, size_t cap)
+{
+    size_t i = 0;
+    for (; in && in[i] && i + 1 < cap; ++i) out[i] = (in[i] >= 'A' && in[i] <= 'Z') ? (char)(in[i] + 32) : in[i];
+    out[i] = 0;
+}
+static BeerRegValue *reg_find_locked(const char *path, const char *lname)
+{
+    for (int k = 0; k < g_reg_value_count; ++k)
+        if (!strcmp(g_reg_values[k].path, path) && !strcmp(g_reg_values[k].name, lname)) return &g_reg_values[k];
+    return NULL;
+}
+static void reg_free_value(BeerRegValue *v)
+{
+    if (v->blob) { free(v->blob); free((void *)v->path); free((void *)v->name); }
+    memset(v, 0, sizeof(*v));
+}
+static void reg_remove_value_locked(BeerRegValue *v)
+{
+    BeerRegValue *last = &g_reg_values[g_reg_value_count - 1];
+    reg_free_value(v);
+    if (v != last) { *v = *last; memset(last, 0, sizeof(*last)); }
+    --g_reg_value_count;
+}
+static u64 reg_set_locked(const char *path, const char *lname, u32 type, const void *data, u32 size)
+{
+    BeerRegValue *v = reg_find_locked(path, lname);
+    if (v && !v->blob) { reg_remove_value_locked(v); v = NULL; }          /* overwrite a seeded value */
+    if (!v) {
+        if (g_reg_value_count >= BEER_REG_MAX_VALUES) return 8;            /* ERROR_NOT_ENOUGH_MEMORY */
+        v = &g_reg_values[g_reg_value_count];
+        memset(v, 0, sizeof(*v));
+        v->path = strdup(path); v->name = strdup(lname);
+        if (!v->path || !v->name) { free((void *)v->path); free((void *)v->name); memset(v, 0, sizeof(*v)); return 8; }
+        ++g_reg_value_count;
+    }
+    u8 *copy = malloc(size ? size : 1);
+    if (!copy) return 8;
+    if (size) memcpy(copy, data, size);
+    free(v->blob);
+    v->blob = copy; v->blob_size = size; v->type = type;
+    return 0;
+}
+static u64 reg_create(u64 key, const char *subkey, u64 *result, u32 *disposition)
+{
+    pthread_mutex_lock(&g_reg_mutex);
+    reg_seed_locked();
+    char path[192];
+    u64 status = 6;
+    if (reg_key_path(key, path, sizeof(path))) {
+        if (subkey) reg_append_path(path, sizeof(path), subkey);
+        const int existed = reg_key_exists_locked(path);
+        status = 0;
+        if (!existed) status = reg_set_locked(path, "\x01key", 0, NULL, 0);          /* marker value */
+        if (!status) {
+            if (disposition) *disposition = existed ? 2u : 1u;                      /* OPENED_EXISTING / CREATED_NEW */
+            status = 5;
+            for (int i = 0; i < BEER_REG_MAX_HANDLES; ++i)
+                if (!g_reg_open_paths[i][0]) {
+                    snprintf(g_reg_open_paths[i], sizeof(g_reg_open_paths[i]), "%s", path);
+                    if (result) *result = 0x7100u + (u64)i;
+                    status = 0;
+                    break;
+                }
+            if (status) status = 8;
+        }
+    }
+    pthread_mutex_unlock(&g_reg_mutex);
+    return status;
+}
+static void reg_to_utf16(const char *in, u32 bytes, u16 *out)
+{
+    for (u32 i = 0; i < bytes; ++i) out[i] = (unsigned char)in[i];
+}
+static u64 reg_set_value(u64 key, const char *name, u32 type, const void *data, u32 size, int wide)
+{
+    if (!data && size) return 87;
+    char path[192], lname[96];
+    reg_lower_name(name ? name : "", lname, sizeof(lname));
+    pthread_mutex_lock(&g_reg_mutex);
+    reg_seed_locked();
+    u64 status = 6;
+    if (reg_key_path(key, path, sizeof(path)) && reg_key_exists_locked(path)) {
+        const int text = type == 1 || type == 2 || type == 7;
+        if (text && !wide) {                                    /* stored as UTF-16 */
+            u16 *tmp = malloc(((size_t)size + 1) * 2);
+            if (!tmp) { pthread_mutex_unlock(&g_reg_mutex); return 8; }
+            reg_to_utf16(data, size, tmp);
+            status = reg_set_locked(path, lname, type, tmp, size * 2);
+            free(tmp);
+        } else status = reg_set_locked(path, lname, type, data, size);
+    }
+    pthread_mutex_unlock(&g_reg_mutex);
+    return status;
+}
+static u64 __attribute__((ms_abi))
+impl_RegCreateKeyExW(u64 key, const u16 *sub, u32 reserved, const u16 *cls, u32 options, u32 sam, void *sa,
+                     u64 *result, u32 *disposition)
+{
+    (void)reserved; (void)cls; (void)options; (void)sam; (void)sa;
+    char narrow[192];
+    reg_narrow(sub, narrow, sizeof(narrow));
+    return reg_create(key, narrow, result, disposition);
+}
+static u64 __attribute__((ms_abi))
+impl_RegCreateKeyExA(u64 key, const char *sub, u32 reserved, const char *cls, u32 options, u32 sam, void *sa,
+                     u64 *result, u32 *disposition)
+{
+    (void)reserved; (void)cls; (void)options; (void)sam; (void)sa;
+    return reg_create(key, sub, result, disposition);
+}
+static u64 __attribute__((ms_abi))
+impl_RegSetValueExW(u64 key, const u16 *name, u32 reserved, u32 type, const u8 *data, u32 size)
+{
+    (void)reserved;
+    char narrow[96];
+    reg_narrow(name, narrow, sizeof(narrow));
+    return reg_set_value(key, narrow, type, data, size, 1);
+}
+static u64 __attribute__((ms_abi))
+impl_RegSetValueExA(u64 key, const char *name, u32 reserved, u32 type, const u8 *data, u32 size)
+{
+    (void)reserved;
+    return reg_set_value(key, name, type, data, size, 0);
+}
+static u64 reg_delete_value(u64 key, const char *name)
+{
+    char path[192], lname[96];
+    reg_lower_name(name ? name : "", lname, sizeof(lname));
+    pthread_mutex_lock(&g_reg_mutex);
+    reg_seed_locked();
+    u64 status = 6;
+    if (reg_key_path(key, path, sizeof(path))) {
+        BeerRegValue *v = reg_find_locked(path, lname);
+        status = 2;
+        if (v && !BEER_REG_HIDDEN(v)) { reg_remove_value_locked(v); status = 0; }
+    }
+    pthread_mutex_unlock(&g_reg_mutex);
+    return status;
+}
+static u64 __attribute__((ms_abi)) impl_RegDeleteValueW(u64 key, const u16 *name)
+{
+    char narrow[96];
+    reg_narrow(name, narrow, sizeof(narrow));
+    return reg_delete_value(key, narrow);
+}
+static u64 __attribute__((ms_abi)) impl_RegDeleteValueA(u64 key, const char *name) { return reg_delete_value(key, name); }
+/* RegDeleteKey: the key and everything below it (Windows requires no subkeys for RegDeleteKey, but installers
+ * only delete what they created, and RegDeleteTree callers expect the subtree to go). */
+static u64 reg_delete_key(u64 key, const char *subkey)
+{
+    char path[192];
+    pthread_mutex_lock(&g_reg_mutex);
+    reg_seed_locked();
+    u64 status = 6;
+    if (reg_key_path(key, path, sizeof(path))) {
+        if (subkey) reg_append_path(path, sizeof(path), subkey);
+        status = 2;
+        const size_t n = strlen(path);
+        for (int k = 0; k < g_reg_value_count;) {
+            const char *p = g_reg_values[k].path;
+            if (!strncmp(p, path, n) && (p[n] == 0 || p[n] == '\\')) {
+                if (!g_reg_values[k].blob) { ++k; status = 5; continue; }      /* seeded system keys are protected */
+                reg_remove_value_locked(&g_reg_values[k]);
+                if (status == 2) status = 0;
+            } else ++k;
+        }
+    }
+    pthread_mutex_unlock(&g_reg_mutex);
+    return status;
+}
+static u64 __attribute__((ms_abi)) impl_RegDeleteKeyW(u64 key, const u16 *sub)
+{
+    char narrow[192];
+    reg_narrow(sub, narrow, sizeof(narrow));
+    return reg_delete_key(key, narrow);
+}
+static u64 __attribute__((ms_abi)) impl_RegDeleteKeyA(u64 key, const char *sub) { return reg_delete_key(key, sub); }
+static u64 __attribute__((ms_abi)) impl_RegDeleteKeyExW(u64 key, const u16 *sub, u32 sam, u32 reserved)
+    { (void)sam; (void)reserved; return impl_RegDeleteKeyW(key, sub); }
+static u64 __attribute__((ms_abi)) impl_RegDeleteKeyExA(u64 key, const char *sub, u32 sam, u32 reserved)
+    { (void)sam; (void)reserved; return impl_RegDeleteKeyA(key, sub); }

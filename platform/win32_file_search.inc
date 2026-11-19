@@ -878,6 +878,23 @@ static void beer_log_guest_stack(const char *tag)
     }
     free(stack_copy);
 }
+/* BEER_MSGBOX_AUTO=ignore|abort answers message boxes without showing them (unattended installs and tests):
+ * "ignore" takes the permissive choice (Ignore, Yes, OK), "abort" the cancelling one (Abort, No, Cancel). */
+static int beer_message_box_auto(u32 type, u64 *answer)
+{
+    const char *mode = getenv("BEER_MSGBOX_AUTO");
+    if (!mode || !*mode) return 0;
+    const int permissive = !strcmp(mode, "ignore");
+    switch (type & 0xF) {
+    case 2: *answer = permissive ? 5 : 3; break;             /* Abort/Retry/Ignore */
+    case 3: *answer = permissive ? 6 : 2; break;             /* Yes/No/Cancel */
+    case 4: *answer = permissive ? 6 : 7; break;             /* Yes/No */
+    case 5: *answer = permissive ? 4 : 2; break;             /* Retry/Cancel */
+    case 1: *answer = permissive ? 1 : 2; break;             /* OK/Cancel */
+    default: *answer = 1; break;
+    }
+    return 1;
+}
 static u64 beer_message_box_result(u32 type)
 {
     switch (type & 0xF) {
@@ -920,6 +937,7 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxA(u64 owner, const char *text,
             }
         }
     }
+    { u64 automatic; if (beer_message_box_auto(type, &automatic)) return automatic; }
     int chosen = beer_message_box_dialog(title, text, type);
     return chosen >= 0 ? (u64)chosen : beer_message_box_result(type);
 }
@@ -931,6 +949,7 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxW(u64 owner, const u16 *text, 
     reg_narrow(title, t, sizeof(t)); reg_narrow(text, c, sizeof(c));
     fprintf(stderr, "[MSGBOX] \"%s\": %s\n", t, c);
     beer_log_guest_stack("MSGBOX");
+    { u64 automatic; if (beer_message_box_auto(type, &automatic)) return automatic; }
     int chosen = beer_message_box_dialog(t, c, type);
     return chosen >= 0 ? (u64)chosen : beer_message_box_result(type);
 }

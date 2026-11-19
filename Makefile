@@ -10,7 +10,7 @@ MEDIA_SRCS = media/media_foundation.c
 PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_winhttp_url.c platform/win32_winhttp.c platform/win32_full_path.c platform/win32_gdi.c platform/win32_gdiplus.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
-				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_sddl.c platform/win32_shell_strings.c platform/win32_variant.c platform/win32_schannel.c
+				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_sddl.c platform/win32_shell_strings.c platform/win32_variant.c platform/win32_schannel.c platform/wow32_math.c
 PLATFORM_SRCS += platform/beer_steam_networking.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
@@ -120,6 +120,9 @@ platform/win32_gdiplus.o: platform/win32_gdiplus.c platform/win32_gdiplus.h plat
 	$(CC) $(D3D12_ABI_CFLAGS) -O2 -Iplatform -c $< -o $@
 
 # VARIANT conversions use floating point.
+platform/wow32_math.o: platform/wow32_math.c platform/wow32_math.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
+
 platform/win32_variant.o: platform/win32_variant.c platform/win32_variant.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iplatform -c $< -o $@
 
