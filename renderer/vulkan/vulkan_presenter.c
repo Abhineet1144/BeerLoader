@@ -1125,6 +1125,7 @@ int vulkan_presenter_present_resource_rgba8(void *display, unsigned long window,
 }
 
 int beer_post_screenshot_pending(void);
+int beer_capture_active(void);
 
 int vulkan_presenter_present_image(void *display, unsigned long window,
                                    uint64_t source_image, uint32_t source_layout,
@@ -1138,9 +1139,10 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
     if (getenv("BEER_PRESENT_SKIP_ALL")) return 1;
     /* A back buffer that is normally blitted straight to the swapchain (BGRA8, R10G10B10A2) goes through the RGBA8
      * upload image and the post pass on a frame that takes a screenshot, or while a translucent overlay is shown (the
-     * direct path can only copy the overlay opaquely): the blit into the upload image converts the format. */
+     * direct path can only copy the overlay opaquely), and on every frame while a recording or stream runs: the blit
+     * into the upload image converts the format. */
     int convert = 0;
-    if (direct_blit && (beer_post_screenshot_pending() || beer_overlay_translucent())) { convert = 1; direct_blit = 0; }
+    if (direct_blit && (beer_post_screenshot_pending() || beer_overlay_translucent() || beer_capture_active())) { convert = 1; direct_blit = 0; }
     record_direct_present(sequence, "enter", source_image, source_layout,
                           width, height, output_width, output_height, -1,
                           VK_SUCCESS);

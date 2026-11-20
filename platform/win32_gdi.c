@@ -52,7 +52,7 @@ typedef struct {
 
 #define OBJ_MAX 8192
 #define OBJ_BASE 0xD1000000ULL
-#define DC_MAX 256
+#define DC_MAX 2048
 #define DC_BASE 0xDC100000ULL
 
 typedef struct {
@@ -60,6 +60,11 @@ typedef struct {
     uint64_t bitmap, font, brush, pen;
     uint32_t text_color, bk_color, text_align;
     int bk_mode;
+    int pos_x, pos_y;            /* MoveToEx / LineTo current position (logical) */
+    int rop2;                    /* SetROP2 mode; 0 = R2_COPYPEN (13) */
+    /* Mapping (MM_TEXT): device = logical - window origin + viewport origin. Clip rectangle in device pixels. */
+    int win_x, win_y, view_x, view_y;
+    int clip_on, clip_l, clip_t, clip_r, clip_b;
 } Dc;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -230,6 +235,25 @@ static Surface *dc_surface(Dc *dc)
     return bmp && bmp->surface.bits ? &bmp->surface : NULL;
 }
 
+/* The clip rectangle of the DC being drawn to (set by dc_begin, under the GDI lock): writes outside it are dropped. */
+static const Surface *g_clip_surface;
+static int g_clip_l, g_clip_t, g_clip_r, g_clip_b;
+/* Starts drawing to a DC: its clip rectangle applies to the surface's pixel writes until dc_end. */
+static void dc_begin(const Dc *d, const Surface *s)
+{
+    g_clip_surface = NULL;
+    if (!d || !s || !d->clip_on) return;
+    g_clip_surface = s;
+    g_clip_l = d->clip_l; g_clip_t = d->clip_t; g_clip_r = d->clip_r; g_clip_b = d->clip_b;
+}
+static void dc_end(void) { g_clip_surface = NULL; }
+static int dc_dx(const Dc *d) { return d ? d->view_x - d->win_x : 0; }
+static int dc_dy(const Dc *d) { return d ? d->view_y - d->win_y : 0; }
+static int clip_contains(const Surface *d, int x, int y, int w, int h)
+{
+    return d != g_clip_surface || (x >= g_clip_l && y >= g_clip_t && x + w <= g_clip_r && y + h <= g_clip_b);
+}
+
 static uint32_t s_get(const Surface *s, int x, int y)
 {
     int row = s->topdown ? y : s->h - 1 - y;
@@ -240,6 +264,8 @@ static uint32_t s_get(const Surface *s, int x, int y)
 
 static void s_put(Surface *s, int x, int y, uint32_t px)
 {
+    if (s == g_clip_surface && (x < g_clip_l || y < g_clip_t || x >= g_clip_r || y >= g_clip_b)) return;
+    if (x < 0 || y < 0 || x >= s->w || y >= s->h) return;
     int row = s->topdown ? y : s->h - 1 - y;
     uint8_t *p = s->bits + (size_t)row * s->stride + (size_t)x * (s->bpp / 8);
     p[0] = (uint8_t)px; p[1] = (uint8_t)(px >> 8); p[2] = (uint8_t)(px >> 16);
@@ -346,18 +372,22 @@ static uint32_t apply_rop(uint32_t rop, uint32_t s, uint32_t d, uint32_t p)
     }
 }
 
+/* GetSysColor: the Windows 10 default colours (COLORREF), COLOR_SCROLLBAR (0) .. COLOR_MENUBAR (30). */
+static const uint32_t g_sys_colors[31] = {
+    0xC8C8C8, 0x000000, 0xD1B499, 0xDBCDBF, 0xF0F0F0, 0xFFFFFF, 0x646464, 0x000000, 0x000000, 0x000000,
+    0xB4B4B4, 0xFCF7F4, 0xABABAB, 0xD77800, 0xFFFFFF, 0xF0F0F0, 0xA0A0A0, 0x6D6D6D, 0x000000, 0x000000,
+    0xFFFFFF, 0x696969, 0xE3E3E3, 0x000000, 0xE1FFFF, 0xB5B5B5, 0xCC6600, 0xEAD1B9, 0xF2E4D7, 0xFF9933,
+    0xF0F0F0,
+};
+uint32_t beer_gdi_sys_color(int index)
+{
+    return index >= 0 && index < 31 ? g_sys_colors[index] : 0;
+}
 static uint32_t brush_pixel(uint64_t hbrush)
 {
     Obj *b = obj_get(hbrush);
     if (b && b->type == OBJ_BRUSH) return from_colorref(b->color);
-    if (hbrush >= 1 && hbrush <= 31) {          /* COLOR_xxx + 1 */
-        switch (hbrush - 1) {
-        case 5: return 0xFFFFFFFFu;             /* COLOR_WINDOW */
-        case 8: return 0xFF000000u;             /* COLOR_WINDOWTEXT */
-        case 1: return from_colorref(0x6e3d1d); /* COLOR_BACKGROUND stays dark */
-        default: return from_colorref(0xF0F0F0);
-        }
-    }
+    if (hbrush >= 1 && hbrush <= 31) return from_colorref(g_sys_colors[hbrush - 1]);   /* COLOR_xxx + 1 */
     return 0xFFFFFFFFu;
 }
 
@@ -371,7 +401,8 @@ static void blit_generic(Dc *ddc, Surface *d, int dx, int dy, int dw, int dh, co
     /* Fast path: unscaled 32bpp copy. */
     if (need_src && rop == 0x00CC0020 && adw == sw && adh == sh && dw > 0 && dh > 0 && sw > 0 && sh > 0 &&
         d->bpp == 32 && s->bpp == 32 && d->topdown == s->topdown && sx >= 0 && sy >= 0 &&
-        sx + sw <= s->w && sy + sh <= s->h && dx >= 0 && dy >= 0 && dx + dw <= d->w && dy + dh <= d->h) {
+        sx + sw <= s->w && sy + sh <= s->h && dx >= 0 && dy >= 0 && dx + dw <= d->w && dy + dh <= d->h &&
+        clip_contains(d, dx, dy, dw, dh)) {
         for (int y = 0; y < dh; ++y) {
             int sr = s->topdown ? sy + y : s->h - 1 - (sy + y);
             int dr = d->topdown ? dy + y : d->h - 1 - (dy + y);
@@ -414,24 +445,15 @@ static int do_stretch(uint64_t hdst, int x, int y, int w, int h, uint64_t hsrc, 
         s = dc_surface(sd);
         if (!s) return 0;
     }
-    blit_generic(dd, d, x, y, w, h, s, sx, sy, sw, sh, rop);
+    dc_begin(dd, d);
+    blit_generic(dd, d, x + dc_dx(dd), y + dc_dy(dd), w, h, s, sx + dc_dx(sd), sy + dc_dy(sd), sw, sh, rop);
+    dc_end();
     mark_dirty(dd, d);
     return 1;
 }
 
 /* ------------------------------------------------------------------- text */
 
-static const OverlayFont *font_for(uint64_t hfont, int *height_out)
-{
-    Obj *f = obj_get(hfont);
-    int height = 16;
-    if (f && f->type == OBJ_FONT) memcpy(&height, f->logfont, 4);
-    int h = height < 0 ? -height : height;
-    if (!h) h = 16;
-    int idx = h <= 15 ? 0 : h <= 22 ? 1 : 2;
-    if (height_out) *height_out = overlay_fonts[idx].cell_h;
-    return &overlay_fonts[idx];
-}
 
 static void draw_glyph(Surface *s, int x, int y, const OverlayFont *font, unsigned ch, uint32_t color_px)
 {
@@ -455,21 +477,23 @@ static void draw_glyph(Surface *s, int x, int y, const OverlayFont *font, unsign
     }
 }
 
-static int text_width(const OverlayFont *font, int count) { return count * font->cell_w; }
+
+#include "win32_gdi_text.inc"
 
 static void draw_text(Dc *dc, Surface *s, int x, int y, const uint16_t *text, int count, uint64_t hfont)
 {
-    int cell_h;
-    const OverlayFont *font = font_for(hfont, &cell_h);
-    int width = text_width(font, count);
+    GdiFont *font = gf_for(hfont);
+    const int cell_h = font->height;
+    int width = gf_width(font, text, count);
     uint32_t align = dc->text_align;
     if ((align & 6) == 6) x -= width / 2;
     else if (align & 2) x -= width;
-    if ((align & 24) == 24) y -= cell_h - cell_h / 5;
+    if ((align & 24) == 24) y -= font->ascent;                                  /* TA_BASELINE */
     else if (align & 8) y -= cell_h;
     if (dc->bk_mode == 2) fill_rect_px(s, x, y, x + width, y + cell_h, from_colorref(dc->bk_color));
     uint32_t color = from_colorref(dc->text_color);
-    for (int i = 0; i < count; ++i) draw_glyph(s, x + i * font->cell_w, y, font, text[i], color);
+    gf_draw(font, s, x, y, text, count, color);
+    if (gf_underline(hfont)) fill_rect_px(s, x, y + font->ascent + 1, x + width, y + font->ascent + 2, color);
 }
 
 static int wlen(const uint16_t *t, int count)
@@ -545,9 +569,9 @@ int beer_gdi_paint_standard_control(const char *class_name, const uint16_t *text
 
         int count = 0;
         while (text[count] && count < 1023) ++count;
-        int cell_h = 0;
-        const OverlayFont *font = font_for(dc->font, &cell_h);
-        int text_x = x + (is_button ? (width - text_width(font, count)) / 2 : 0);
+        GdiFont *font = gf_for(dc->font);
+        const int cell_h = font->height;
+        int text_x = x + (is_button ? (width - gf_width(font, text, count)) / 2 : 0);
         int text_y = y + (height - cell_h) / 2;
         uint32_t saved_background = dc->bk_color;
         int saved_mode = dc->bk_mode;
@@ -576,8 +600,72 @@ static uint64_t bitmap_from_surface(Surface *s)
     return h;
 }
 
+/* A 13x13 classic check box or radio button cell of OBM_CHECKBOXES. */
+static void obm_check_cell(Surface *s, int x0, int y0, int radio, int checked, int pushed, int disabled)
+{
+    const uint32_t face = from_colorref(pushed || disabled ? 0xF0F0F0 : 0xFFFFFF);
+    const uint32_t ink = from_colorref(disabled ? 0xA0A0A0 : 0x333333);
+    fill_rect_px(s, x0, y0, x0 + 13, y0 + 13, from_colorref(0xF0F0F0));
+    if (radio) {
+        for (int y = 0; y < 13; ++y)
+            for (int x = 0; x < 13; ++x) {
+                const int dx = 2 * x - 12, dy = 2 * y - 12, d = dx * dx + dy * dy;   /* doubled offsets from the centre */
+                if (d <= 100) s_put(s, x0 + x, y0 + y, face);
+                if (d > 100 && d <= 144) s_put(s, x0 + x, y0 + y, ink);
+                if (checked && d <= 24) s_put(s, x0 + x, y0 + y, ink);
+            }
+        return;
+    }
+    fill_rect_px(s, x0, y0, x0 + 13, y0 + 13, face);
+    fill_rect_px(s, x0, y0, x0 + 13, y0 + 1, ink); fill_rect_px(s, x0, y0 + 12, x0 + 13, y0 + 13, ink);
+    fill_rect_px(s, x0, y0, x0 + 1, y0 + 13, ink); fill_rect_px(s, x0 + 12, y0, x0 + 13, y0 + 13, ink);
+    if (checked)
+        for (int i = 0; i < 7; ++i) {
+            const int x = x0 + 3 + i, y = i < 3 ? y0 + 5 + i : y0 + 7 - (i - 2);
+            fill_rect_px(s, x, y, x + 1, y + 2, ink);
+        }
+}
+/* System (OEM) bitmaps, LoadBitmap(NULL, OBM_*): the classic check boxes Inno Setup sizes its lists from. */
+static uint64_t obm_bitmap(uint32_t id)
+{
+    Surface s = {0};
+    int w = 0, h = 0;
+    if (id == 32759) { w = 52; h = 39; }                       /* OBM_CHECKBOXES: 4 x 3 cells of 13 x 13 */
+    else if (id == 32760) { w = 13; h = 13; }                  /* OBM_CHECK */
+    else return 0;
+    if (!surface_alloc(&s, w, h, 32, 1)) return 0;
+    fill_rect_px(&s, 0, 0, w, h, from_colorref(0xF0F0F0));
+    if (id == 32759) {
+        /* columns: unchecked, checked, radio off, radio on; rows: normal, pushed, disabled */
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 4; ++col)
+                obm_check_cell(&s, col * 13, row * 13, col >= 2, col & 1, row == 1, row == 2);
+    } else {
+        for (int i = 0; i < 7; ++i) fill_rect_px(&s, 3 + i, i < 3 ? 5 + i : 7 - (i - 2), 4 + i, (i < 3 ? 5 + i : 7 - (i - 2)) + 2,
+                                                 from_colorref(0));
+    }
+    return bitmap_from_surface(&s);
+}
+/* A bitmap from a packed DIB (a RT_BITMAP resource: BITMAPINFOHEADER, palette, bits). */
+uint64_t beer_gdi_bitmap_from_dib(const uint8_t *dib, uint32_t size)
+{
+    if (!dib || size < 40) return 0;
+    Surface s = {0};
+    LOCK();
+    gdi_init();
+    uint64_t h = decode_dib(dib, NULL, &s) ? bitmap_from_surface(&s) : 0;
+    UNLOCK();
+    return h;
+}
 uint64_t GDI_MS beer_LoadBitmapW(uint64_t instance, uint64_t name)
 {
+    if (!instance && name >= 32734 && name <= 32767) {
+        LOCK();
+        gdi_init();
+        const uint64_t h = obm_bitmap((uint32_t)name);
+        UNLOCK();
+        return h;
+    }
     uint64_t res = beer_resource_find(instance, name, 2 /* RT_BITMAP */, 0);
     uint32_t size = 0;
     const uint8_t *data = res ? beer_resource_data(instance, res, &size) : NULL;
@@ -623,7 +711,13 @@ int GDI_MS beer_FillRect(uint64_t dc, const int32_t *rect, uint64_t brush)
     LOCK();
     Dc *d = dc_get(dc);
     Surface *s = dc_surface(d);
-    if (s) { fill_rect_px(s, rect[0], rect[1], rect[2], rect[3], brush_pixel(brush)); mark_dirty(d, s); }
+    if (s) {
+        const int dx = dc_dx(d), dy = dc_dy(d);
+        dc_begin(d, s);
+        fill_rect_px(s, rect[0] + dx, rect[1] + dy, rect[2] + dx, rect[3] + dy, brush_pixel(brush));
+        dc_end();
+        mark_dirty(d, s);
+    }
     UNLOCK();
     return s != NULL;
 }
@@ -632,9 +726,9 @@ int GDI_MS beer_FillRect(uint64_t dc, const int32_t *rect, uint64_t brush)
 static int draw_text_block(Dc *d, Surface *s, int32_t *rect, const uint16_t *text, int n, uint32_t format,
                            int draw, int *out_width)
 {
-    int cell_h;
     uint64_t hfont = d->font;
-    const OverlayFont *font = font_for(hfont, &cell_h);
+    GdiFont *font = gf_for(hfont);
+    const int cell_h = font->height;
     int box_w = rect[2] - rect[0];
     uint16_t clean[1024];
     int m = 0;
@@ -644,22 +738,31 @@ static int draw_text_block(Dc *d, Surface *s, int32_t *rect, const uint16_t *tex
     }
     /* Split into lines. */
     int line_start[256], line_len[256], lines = 0;
-    int start = 0;
+    int start = 0, last_space = -1;
+    const int wrap = (format & 0x10) && !(format & 0x20) && box_w > 0;   /* DT_WORDBREAK without DT_SINGLELINE */
     for (int i = 0; i <= m && lines < 255; ++i) {
         int is_break = i == m || (!(format & 0x20) && clean[i] == '\n');
-        int too_wide = (format & 0x10) && !(format & 0x20) && box_w > 0 &&
-                       (i - start + 1) * font->cell_w > box_w && i < m && clean[i] == ' ';
-        if (is_break || too_wide) {
+        if (!is_break && wrap && gf_width(font, clean + start, i - start + 1) > box_w && i > start) {
+            /* Too wide: break at the last space on the line (the space is dropped), else inside the word. */
+            const int cut = last_space > start ? last_space : i;
+            line_start[lines] = start; line_len[lines] = cut - start; ++lines;
+            start = last_space > start ? last_space + 1 : i;
+            last_space = -1;
+            if (lines >= 255) break;
+        }
+        if (is_break) {
             int len = i - start;
             if (len > 0 && clean[start + len - 1] == '\r') --len;
             line_start[lines] = start; line_len[lines] = len; ++lines;
             start = i + 1;
-        }
+            last_space = -1;
+        } else if (clean[i] == ' ') last_space = i;
     }
     if (!lines) { line_start[0] = 0; line_len[0] = 0; lines = 1; }
     int total_h = lines * cell_h, max_w = 0;
     for (int l = 0; l < lines; ++l)
-        if (text_width(font, line_len[l]) > max_w) max_w = text_width(font, line_len[l]);
+        if (gf_width(font, clean + line_start[l], line_len[l]) > max_w)
+            max_w = gf_width(font, clean + line_start[l], line_len[l]);
     if (out_width) *out_width = max_w;
     if (!draw) return total_h;
     int y = rect[1];
@@ -668,7 +771,7 @@ static int draw_text_block(Dc *d, Surface *s, int32_t *rect, const uint16_t *tex
     uint32_t saved_align = d->text_align;
     d->text_align = 0;
     for (int l = 0; l < lines; ++l, y += cell_h) {
-        int w = text_width(font, line_len[l]);
+        int w = gf_width(font, clean + line_start[l], line_len[l]);
         int x = rect[0];
         if (format & 1) x = rect[0] + (box_w - w) / 2;
         else if (format & 2) x = rect[2] - w;
@@ -689,10 +792,31 @@ int GDI_MS beer_DrawTextW(uint64_t dc, const uint16_t *text, int count, int32_t 
         int n = wlen(text, count), width = 0;
         if (format & 0x400) { /* DT_CALCRECT */
             height = draw_text_block(d, s, rect, text, n, format, 0, &width);
+            if (getenv("BEER_GDI_DIAGNOSTICS")) {
+                Obj *fo = obj_get(d->font);
+                int32_t lf_height = 0;
+                if (fo && fo->type == OBJ_FONT) memcpy(&lf_height, fo->logfont, 4);
+                GdiFont *gf = gf_for(d->font);
+                char face_name[33] = {0};
+                if (fo && fo->type == OBJ_FONT)
+                    for (int k = 0; k < 32; ++k) { uint16_t ch = 0; memcpy(&ch, fo->logfont + 28 + 2 * k, 2);
+                        if (!ch) break; face_name[k] = ch < 128 ? (char)ch : '?'; }
+                fprintf(stderr, "[GDI] DrawText CALCRECT dc=0x%llx font=0x%llx '%s' lfHeight=%d em=%d h=%d n=%d fmt=0x%x -> %dx%d\n",
+                        (unsigned long long)dc, (unsigned long long)d->font, face_name, lf_height, gf->em, gf->height, n,
+                        format, width, height);
+            }
             rect[3] = rect[1] + height;
             if (!((format & 0x10) && rect[2] - rect[0] > 0 && width > rect[2] - rect[0])) rect[2] = rect[0] + width;
         } else {
-            height = draw_text_block(d, s, rect, text, n, format, 1, &width);
+            int32_t device[4] = { rect[0] + dc_dx(d), rect[1] + dc_dy(d), rect[2] + dc_dx(d), rect[3] + dc_dy(d) };
+            if (getenv("BEER_GDI_TEXT_TRACE") && n >= 3 && text[0] == (uint16_t)getenv("BEER_GDI_TEXT_TRACE")[0] &&
+                text[1] == (uint16_t)getenv("BEER_GDI_TEXT_TRACE")[1])
+                fprintf(stderr, "[GDI] DrawText dc=0x%llx rect=%d,%d-%d,%d origin=%d,%d clip=%d:%d,%d-%d,%d surface=%dx%d\n",
+                        (unsigned long long)dc, rect[0], rect[1], rect[2], rect[3], dc_dx(d), dc_dy(d), d->clip_on,
+                        d->clip_l, d->clip_t, d->clip_r, d->clip_b, s->w, s->h);
+            dc_begin(d, s);
+            height = draw_text_block(d, s, device, text, n, format, 1, &width);
+            dc_end();
             mark_dirty(d, s);
         }
     }
@@ -1122,10 +1246,9 @@ int GDI_MS beer_GetTextExtentPoint32W(uint64_t dc, const uint16_t *text, int cou
     if (!size) return 0;
     LOCK();
     Dc *d = dc_get(dc);
-    int cell_h = 0;
-    const OverlayFont *font = font_for(d ? d->font : 0, &cell_h);
-    size[0] = text_width(font, text ? wlen(text, count) : 0);
-    size[1] = cell_h;
+    GdiFont *font = gf_for(d ? d->font : 0);
+    size[0] = text ? gf_width(font, text, wlen(text, count)) : 0;
+    size[1] = font->height;
     UNLOCK();
     return 1;
 }
@@ -1135,14 +1258,14 @@ int GDI_MS beer_GetTextExtentPoint32A(uint64_t dc, const char *text, int count, 
     if (!size) return 0;
     int n = 0;
     while (text && (count < 0 ? text[n] : n < count)) ++n;
-    uint16_t blank[1] = {0};
-    (void)blank;
+    uint16_t wide[1024];
+    if (n > 1023) n = 1023;
+    for (int i = 0; i < n; ++i) wide[i] = (uint8_t)text[i];
     LOCK();
     Dc *d = dc_get(dc);
-    int cell_h = 0;
-    const OverlayFont *font = font_for(d ? d->font : 0, &cell_h);
-    size[0] = text_width(font, n);
-    size[1] = cell_h;
+    GdiFont *font = gf_for(d ? d->font : 0);
+    size[0] = gf_width(font, wide, n);
+    size[1] = font->height;
     UNLOCK();
     return 1;
 }
@@ -1152,14 +1275,24 @@ int GDI_MS beer_GetTextMetricsW(uint64_t dc, uint8_t *metrics)
     if (!metrics) return 0;
     LOCK();
     Dc *d = dc_get(dc);
-    int cell_h = 0;
-    const OverlayFont *font = font_for(d ? d->font : 0, &cell_h);
-    int32_t v[11] = { cell_h, cell_h - cell_h / 5, cell_h / 5, 0, 0, font->cell_w, font->cell_w, 400, 0, 96, 96 };
+    GdiFont *font = gf_for(d ? d->font : 0);
+    Obj *o = obj_get(d ? d->font : 0);
+    int32_t weight = 400;
+    if (o && o->type == OBJ_FONT) memcpy(&weight, o->logfont + 16, 4);
+    if (!weight) weight = 400;
+    const int em = font->em < 0 ? font->height * 4 / 5 : font->em;
+    /* tmHeight, tmAscent, tmDescent, tmInternalLeading, tmExternalLeading, tmAveCharWidth, tmMaxCharWidth, tmWeight,
+     * tmOverhang, tmDigitizedAspectX/Y */
+    int32_t v[11] = { font->height, font->ascent, font->descent, font->height > em ? font->height - em : 0, 0,
+                      font->avg_width, font->max_width, weight, 0, 96, 96 };
     memset(metrics, 0, 60);
     memcpy(metrics, v, 44);
-    uint16_t chars[4] = { 32, 126, '?', ' ' };
+    uint16_t chars[4] = { 32, 0xfffc, '?', ' ' };
     memcpy(metrics + 44, chars, 8);
-    metrics[56] = 1; /* TMPF_FIXED_PITCH is cleared for variable; report fixed pitch family */
+    if (o && o->type == OBJ_FONT) { metrics[52] = o->logfont[20]; metrics[53] = o->logfont[21]; metrics[54] = o->logfont[22]; }
+    /* tmPitchAndFamily: TMPF_FIXED_PITCH (1) is set for a variable-pitch font; TMPF_VECTOR | TMPF_TRUETYPE */
+    metrics[55] = (uint8_t)((font->fixed ? 0 : 1) | (font->overlay ? 0 : 6) | (font->fixed ? 0x30 : 0x20));
+    metrics[56] = o && o->type == OBJ_FONT ? o->logfont[23] : 0;                  /* tmCharSet */
     UNLOCK();
     return 1;
 }
@@ -1170,7 +1303,12 @@ int GDI_MS beer_TextOutW(uint64_t dc, int x, int y, const uint16_t *text, int co
     LOCK();
     Dc *d = dc_get(dc);
     Surface *s = dc_surface(d);
-    if (d && s) { draw_text(d, s, x, y, text, wlen(text, count), d->font); mark_dirty(d, s); }
+    if (d && s) {
+        dc_begin(d, s);
+        draw_text(d, s, x + dc_dx(d), y + dc_dy(d), text, wlen(text, count), d->font);
+        dc_end();
+        mark_dirty(d, s);
+    }
     UNLOCK();
     return s != NULL;
 }
@@ -1192,14 +1330,17 @@ int GDI_MS beer_ExtTextOutW(uint64_t dc, int x, int y, uint32_t options, const i
     Dc *d = dc_get(dc);
     Surface *s = dc_surface(d);
     if (d && s) {
+        const int ox = dc_dx(d), oy = dc_dy(d);
+        dc_begin(d, s);
         if ((options & 2 /* ETO_OPAQUE */) && rect)
-            fill_rect_px(s, rect[0], rect[1], rect[2], rect[3], from_colorref(d->bk_color));
+            fill_rect_px(s, rect[0] + ox, rect[1] + oy, rect[2] + ox, rect[3] + oy, from_colorref(d->bk_color));
         if (text && count) {
             int saved = d->bk_mode;
             if (options & 2) d->bk_mode = 1;
-            draw_text(d, s, x, y, text, (int)count, d->font);
+            draw_text(d, s, x + ox, y + oy, text, (int)count, d->font);
             d->bk_mode = saved;
         }
+        dc_end();
         mark_dirty(d, s);
     }
     UNLOCK();
@@ -1238,6 +1379,8 @@ int GDI_MS beer_Rectangle(uint64_t dc, int left, int top, int right, int bottom)
     Surface *s = dc_surface(d);
     if (d && s) {
         Obj *brush = obj_get(d->brush), *pen = obj_get(d->pen);
+        left += dc_dx(d); right += dc_dx(d); top += dc_dy(d); bottom += dc_dy(d);
+        dc_begin(d, s);
         int hollow = brush && brush->style == 1;
         int no_pen = pen && pen->style == 5;
         if (!hollow) fill_rect_px(s, left, top, right, bottom, from_colorref(brush ? brush->color : 0xFFFFFF));
@@ -1248,10 +1391,178 @@ int GDI_MS beer_Rectangle(uint64_t dc, int left, int top, int right, int bottom)
             fill_rect_px(s, left, top, left + 1, bottom, c);
             fill_rect_px(s, right - 1, top, right, bottom, c);
         }
+        dc_end();
         mark_dirty(d, s);
     }
     UNLOCK();
     return s != NULL;
+}
+
+/* ---- current position and lines (Delphi draws bevels and frames with MoveTo/LineTo) ---- */
+int GDI_MS beer_MoveToEx(uint64_t dc, int x, int y, int32_t *previous)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    if (d) {
+        if (previous) { previous[0] = d->pos_x; previous[1] = d->pos_y; }
+        d->pos_x = x; d->pos_y = y;
+    }
+    UNLOCK();
+    return d != NULL;
+}
+int GDI_MS beer_GetCurrentPositionEx(uint64_t dc, int32_t *point)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    if (d && point) { point[0] = d->pos_x; point[1] = d->pos_y; }
+    UNLOCK();
+    return d != NULL && point != NULL;
+}
+/* A line from the current position to (x, y), excluding the end point, in the pen's colour and width. */
+int GDI_MS beer_LineTo(uint64_t dc, int x, int y)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    Surface *s = dc_surface(d);
+    if (d && s) {
+        Obj *pen = obj_get(d->pen);
+        if (!(pen && pen->style == 5)) {                                    /* PS_NULL draws nothing */
+            const uint32_t c = from_colorref(pen ? pen->color : 0);
+            const int width = pen && pen->width > 1 ? pen->width : 1, half = width / 2;
+            const int ox = dc_dx(d), oy = dc_dy(d), ex = x + ox, ey = y + oy;
+            int x0 = d->pos_x + ox, y0 = d->pos_y + oy;
+            const int dx = abs(ex - x0), dy = -abs(ey - y0), sx = x0 < ex ? 1 : -1, sy = y0 < ey ? 1 : -1;
+            int err = dx + dy;
+            dc_begin(d, s);
+            while (x0 != ex || y0 != ey) {
+                fill_rect_px(s, x0 - half, y0 - half, x0 - half + width, y0 - half + width, c);
+                const int e2 = 2 * err;
+                if (e2 >= dy) { err += dy; x0 += sx; }
+                if (e2 <= dx) { err += dx; y0 += sy; }
+            }
+            dc_end();
+            mark_dirty(d, s);
+        }
+    }
+    if (d) { d->pos_x = x; d->pos_y = y; }
+    UNLOCK();
+    return d != NULL;
+}
+int GDI_MS beer_SetROP2(uint64_t dc, int mode)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    int previous = 0;
+    if (d) { previous = d->rop2 ? d->rop2 : 13; d->rop2 = mode; }
+    UNLOCK();
+    return previous;
+}
+int GDI_MS beer_GetROP2(uint64_t dc)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    const int mode = d ? (d->rop2 ? d->rop2 : 13) : 0;
+    UNLOCK();
+    return mode;
+}
+/* Clipping: the DC's surface, narrowed by its clip rectangle. GetClipBox reports it in logical coordinates;
+ * Delphi only paints a graphic control (TLabel, Inno's TBitmapImage) whose rectangle RectVisible reports. */
+int GDI_MS beer_GetClipBox(uint64_t dc, int32_t *rect)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    Surface *s = dc_surface(d);
+    int l = 0, t = 0, r = s ? s->w : 0, b = s ? s->h : 0;
+    if (d && d->clip_on) {
+        if (d->clip_l > l) l = d->clip_l;
+        if (d->clip_t > t) t = d->clip_t;
+        if (d->clip_r < r) r = d->clip_r;
+        if (d->clip_b < b) b = d->clip_b;
+    }
+    const int dx = dc_dx(d), dy = dc_dy(d);
+    UNLOCK();
+    if (!rect) return 0;
+    if (r <= l || b <= t) { rect[0] = rect[1] = rect[2] = rect[3] = 0; return 1; }   /* NULLREGION */
+    rect[0] = l - dx; rect[1] = t - dy; rect[2] = r - dx; rect[3] = b - dy;
+    return 2;                                                                       /* SIMPLEREGION */
+}
+int GDI_MS beer_RectVisible(uint64_t dc, const int32_t *rect)
+{
+    int32_t clip[4];
+    if (!rect || beer_GetClipBox(dc, clip) != 2) return 0;
+    const int32_t l = rect[0] < rect[2] ? rect[0] : rect[2], r = rect[0] < rect[2] ? rect[2] : rect[0];
+    const int32_t t = rect[1] < rect[3] ? rect[1] : rect[3], b = rect[1] < rect[3] ? rect[3] : rect[1];
+    return l < clip[2] && r > clip[0] && t < clip[3] && b > clip[1];
+}
+int GDI_MS beer_PtVisible(uint64_t dc, int x, int y)
+{
+    int32_t clip[4];
+    return beer_GetClipBox(dc, clip) == 2 && x >= clip[0] && y >= clip[1] && x < clip[2] && y < clip[3];
+}
+/* Window and viewport origins (MM_TEXT). mode: 1 offset, 2 viewport, 4 only report. */
+static int origin_op(uint64_t dc, int x, int y, int mode, int32_t *previous)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    if (d) {
+        int *px = (mode & 2) ? &d->view_x : &d->win_x, *py = (mode & 2) ? &d->view_y : &d->win_y;
+        if (previous) { previous[0] = *px; previous[1] = *py; }
+        if (mode & 4) { }
+        else if (mode & 1) { *px += x; *py += y; }
+        else { *px = x; *py = y; }
+    }
+    UNLOCK();
+    return d != NULL;
+}
+int GDI_MS beer_SetWindowOrgEx(uint64_t dc, int x, int y, int32_t *previous) { return origin_op(dc, x, y, 0, previous); }
+int GDI_MS beer_OffsetWindowOrgEx(uint64_t dc, int x, int y, int32_t *previous) { return origin_op(dc, x, y, 1, previous); }
+int GDI_MS beer_GetWindowOrgEx(uint64_t dc, int32_t *point) { return origin_op(dc, 0, 0, 4, point); }
+int GDI_MS beer_SetViewportOrgEx(uint64_t dc, int x, int y, int32_t *previous) { return origin_op(dc, x, y, 2, previous); }
+int GDI_MS beer_OffsetViewportOrgEx(uint64_t dc, int x, int y, int32_t *previous) { return origin_op(dc, x, y, 3, previous); }
+int GDI_MS beer_GetViewportOrgEx(uint64_t dc, int32_t *point) { return origin_op(dc, 0, 0, 6, point); }
+/* IntersectClipRect / ExcludeClipRect (logical coordinates): the clip stays one rectangle; an excluded rectangle that
+ * covers a whole side shrinks it, any other exclusion is ignored (over-painting such areas is harmless here). */
+static int clip_result(const Dc *d) { return d->clip_r > d->clip_l && d->clip_b > d->clip_t ? 2 : 1; }
+static void clip_init(Dc *d, const Surface *s)
+{
+    if (!d->clip_on) { d->clip_on = 1; d->clip_l = 0; d->clip_t = 0; d->clip_r = s->w; d->clip_b = s->h; }
+}
+int GDI_MS beer_IntersectClipRect(uint64_t dc, int l, int t, int r, int b)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    Surface *s = dc_surface(d);
+    int result = 0;
+    if (d && s) {
+        l += dc_dx(d); r += dc_dx(d); t += dc_dy(d); b += dc_dy(d);
+        clip_init(d, s);
+        if (l > d->clip_l) d->clip_l = l;
+        if (t > d->clip_t) d->clip_t = t;
+        if (r < d->clip_r) d->clip_r = r;
+        if (b < d->clip_b) d->clip_b = b;
+        result = clip_result(d);
+    }
+    UNLOCK();
+    return result;
+}
+int GDI_MS beer_ExcludeClipRect(uint64_t dc, int l, int t, int r, int b)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    Surface *s = dc_surface(d);
+    int result = 0;
+    if (d && s) {
+        l += dc_dx(d); r += dc_dx(d); t += dc_dy(d); b += dc_dy(d);
+        clip_init(d, s);
+        const int spans_x = l <= d->clip_l && r >= d->clip_r, spans_y = t <= d->clip_t && b >= d->clip_b;
+        if (spans_x && t <= d->clip_t && b > d->clip_t) d->clip_t = b;
+        else if (spans_x && b >= d->clip_b && t < d->clip_b) d->clip_b = t;
+        else if (spans_y && l <= d->clip_l && r > d->clip_l) d->clip_l = r;
+        else if (spans_y && r >= d->clip_r && l < d->clip_r) d->clip_r = l;
+        result = clip_result(d);
+    }
+    UNLOCK();
+    return result;
 }
 
 int GDI_MS beer_StretchDIBits(uint64_t dc, int xd, int yd, int wd, int hd, int xs, int ys, int ws, int hs,
@@ -1270,7 +1581,9 @@ int GDI_MS beer_StretchDIBits(uint64_t dc, int xd, int yd, int wd, int hd, int x
         Bih h;
         memcpy(&h, info, sizeof(h));
         int sy = h.height > 0 ? src.h - ys - hs : ys;
-        blit_generic(d, s, xd, yd, wd, hd, &src, xs, sy, ws, hs, rop);
+        dc_begin(d, s);
+        blit_generic(d, s, xd + dc_dx(d), yd + dc_dy(d), wd, hd, &src, xs, sy, ws, hs, rop);
+        dc_end();
         mark_dirty(d, s);
         lines = hs < 0 ? -hs : hs;
     }
@@ -1293,8 +1606,11 @@ uint32_t GDI_MS beer_SetPixel(uint64_t dc, int x, int y, uint32_t color)
     Dc *d = dc_get(dc);
     Surface *s = dc_surface(d);
     uint32_t result = 0xFFFFFFFFu;
+    x += dc_dx(d); y += dc_dy(d);
     if (s && x >= 0 && y >= 0 && x < s->w && y < s->h) {
+        dc_begin(d, s);
         s_put(s, x, y, from_colorref(color));
+        dc_end();
         mark_dirty(d, s);
         result = color;
     }
@@ -1308,6 +1624,7 @@ uint32_t GDI_MS beer_GetPixel(uint64_t dc, int x, int y)
     Dc *d = dc_get(dc);
     Surface *s = dc_surface(d);
     uint32_t result = 0xFFFFFFFFu;
+    x += dc_dx(d); y += dc_dy(d);
     if (s && x >= 0 && y >= 0 && x < s->w && y < s->h) result = to_colorref(s_get(s, x, y));
     UNLOCK();
     return result;
@@ -1320,8 +1637,48 @@ int GDI_MS beer_GdiFlush(void)
 }
 
 int GDI_MS beer_SetStretchBltMode(uint64_t dc, int mode) { (void)dc; (void)mode; return 1; }
-int GDI_MS beer_SaveDC(uint64_t dc) { (void)dc; return 1; }
-int GDI_MS beer_RestoreDC(uint64_t dc, int saved) { (void)dc; (void)saved; return 1; }
+/* SaveDC/RestoreDC: a stack of DC states (objects, colours, modes, position, origins, clip) per DC. Delphi saves the
+ * DC around each graphic control it paints with a moved origin and a clip rectangle. */
+#define DC_SAVE_DEPTH 32
+static struct DcSaves { Dc state[DC_SAVE_DEPTH]; int depth; } *g_dc_saves[DC_MAX + 1];
+static struct DcSaves *dc_saves(uint64_t dc, int create)
+{
+    size_t index;
+    if (dc == 0 || dc == BEER_GDI_WINDOW_DC) index = DC_MAX;
+    else if (dc >= DC_BASE && dc < DC_BASE + DC_MAX) index = (size_t)(dc - DC_BASE);
+    else return NULL;
+    if (!g_dc_saves[index] && create) g_dc_saves[index] = calloc(1, sizeof(struct DcSaves));
+    return g_dc_saves[index];
+}
+int GDI_MS beer_SaveDC(uint64_t dc)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    struct DcSaves *saves = d ? dc_saves(dc, 1) : NULL;
+    int level = 0;
+    if (saves && saves->depth < DC_SAVE_DEPTH) { saves->state[saves->depth++] = *d; level = saves->depth; }
+    UNLOCK();
+    return level;
+}
+int GDI_MS beer_RestoreDC(uint64_t dc, int saved)
+{
+    LOCK();
+    Dc *d = dc_get(dc);
+    struct DcSaves *saves = d ? dc_saves(dc, 0) : NULL;
+    int ok = 0;
+    if (saves && saves->depth > 0) {
+        const int level = saved < 0 ? saves->depth + saved + 1 : saved;    /* negative: relative to the top */
+        if (level >= 1 && level <= saves->depth) {
+            const int used = d->used, is_window = d->is_window;
+            *d = saves->state[level - 1];
+            d->used = used; d->is_window = is_window;
+            saves->depth = level - 1;
+            ok = 1;
+        }
+    }
+    UNLOCK();
+    return ok;
+}
 
 int GDI_MS beer_AlphaBlend(uint64_t dst, int x, int y, int w, int h, uint64_t src, int sx, int sy, int sw, int sh,
                            uint32_t blend)

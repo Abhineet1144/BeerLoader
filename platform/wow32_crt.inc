@@ -381,7 +381,7 @@ static u64 w32_crt_ftell(const u32 *args)  { FILE *f = w32_host_file(args[0]); r
 static u64 w32_crt_rewind(const u32 *args) { FILE *f = w32_host_file(args[0]); if (f) rewind(f); return 0; }
 static u64 w32_crt_fdopen(const u32 *args)                  /* (fd, mode): a pool slot over the host fd */
 {
-    FILE *file = fdopen((int)args[0], W32_PTR(1));
+    FILE *file = fdopen(w32_fd(args[0]), W32_PTR(1));
     if (!file) return 0;
     u8 *pool = w32_file_pool();
     pthread_mutex_lock(&g_w32_file_lock);
@@ -442,25 +442,59 @@ static u64 w32_crt_wopen(const u32 *args)                   /* (path, flags, mod
     if (mode & 0x400u) flags |= O_EXCL;
     return (u32)open(host, flags | O_CLOEXEC, 0666);
 }
-static u64 w32_crt_write(const u32 *args)  { return (u32)write((int)args[0], W32_PTR(1), args[2]); }
-static u64 w32_crt_dup(const u32 *args)    { return (u32)dup((int)args[0]); }
-static u64 w32_crt_dup2(const u32 *args)   { return (u32)dup2((int)args[0], (int)args[1]); }
+/* _write writes everything (a blocking pipe takes the whole buffer, as WriteFile does); a host write can stop early
+ * when a signal arrives, and unarc treats a short count as a broken pipe. */
+static u64 w32_crt_write(const u32 *args)
+{
+    const int fd = w32_fd(args[0]);
+    const u8 *data = W32_PTR(1);
+    u32 done = 0;
+    while (done < args[2]) {
+        const ssize_t n = write(fd, data + done, args[2] - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return done ? done : (u32)-1;
+        done += (u32)n;
+    }
+    return done;
+}
+static u64 w32_crt_dup(const u32 *args)
+{
+    const int fd = w32_fd(args[0]);
+    return fd < 0 ? (u32)-1 : (u32)fcntl(fd, F_DUPFD_CLOEXEC, 3);
+}
+static u64 w32_crt_dup2(const u32 *args)                    /* MSVCRT: 0 on success */
+{
+    const int from = w32_fd(args[0]);
+    const int to = (int)args[1];
+    if (from < 0 || to < 0) { errno = EBADF; return (u32)-1; }
+    if (to <= 2) {
+        const int copy = fcntl(from, F_DUPFD_CLOEXEC, 3);
+        if (copy < 0) return (u32)-1;
+        pthread_mutex_lock(&g_w32_std_lock);
+        const int old = g_w32_std[to];
+        g_w32_std[to] = copy;
+        pthread_mutex_unlock(&g_w32_std_lock);
+        if (old >= 0) close(old);
+        return 0;
+    }
+    return dup3(from, to, O_CLOEXEC) < 0 ? (u32)-1 : 0;   /* children get std streams explicitly */
+}
 static u64 w32_crt_pipe(const u32 *args)                    /* (int fds[2], size, textmode) */
 {
     int fds[2];
-    if (pipe(fds)) return (u32)-1;
+    if (pipe2(fds, O_CLOEXEC)) return (u32)-1;           /* never leaked into a child: it would hold its own pipe open */
     ((s32 *)W32_PTR(0))[0] = fds[0]; ((s32 *)W32_PTR(0))[1] = fds[1];
     return 0;
 }
 static u64 w32_crt_filelengthi64(const u32 *args)
 {
     struct stat st;
-    return fstat((int)args[0], &st) ? (u64)(s64)-1 : (u64)st.st_size;
+    return fstat(w32_fd(args[0]), &st) ? (u64)(s64)-1 : (u64)st.st_size;
 }
 static u64 w32_crt_lseeki64(const u32 *args)                /* (fd, int64 offset, whence) -> int64 in EDX:EAX */
 {
     const s64 offset = (s64)(((u64)args[2] << 32) | args[1]);
-    return (u64)lseek((int)args[0], offset, (int)args[3]);
+    return (u64)lseek(w32_fd(args[0]), offset, (int)args[3]);
 }
 /* A Win32 HANDLE for a CRT descriptor: the handle table is separate from host descriptors, so none is available. */
 static u64 w32_crt_get_osfhandle(const u32 *args) { (void)args; errno = EBADF; return (u32)-1; }

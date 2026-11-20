@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/file.h>
 #include <sys/random.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -40,6 +41,7 @@
 #include <poll.h>
 #include <netinet/tcp.h>
 #include <spawn.h>
+#include <fnmatch.h>
 #include <netdb.h>
 #include <linux/futex.h>
 #include <arpa/inet.h>
@@ -90,6 +92,7 @@
 #include "beer_control.h"
 #include "beer_overlay.h"
 #include "beer_post.h"
+#include "beer_capture.h"
 #include "vulkan_bridge.h"
 #include "win32_nt_section.h"
 #include "win32_virtual_memory.h"
@@ -2830,6 +2833,13 @@ static const char *configure_guest_process_path(const char *exe)
     g_exe_path_storage[1] = ':';
     for (size_t i = 0; i <= host_len; ++i)
         g_exe_path_storage[i + 2] = resolved[i] == '/' ? '\\' : resolved[i];
+    {   /* Started by CreateProcess under a differently cased name: the program sees the name its parent used. */
+        const char *spelled = getenv("_BEER_IMAGE_NAME");
+        char *base = strrchr(g_exe_path_storage, '\\');
+        if (spelled && base && strlen(base + 1) == strlen(spelled) && !strcasecmp(base + 1, spelled))
+            memcpy(base + 1, spelled, strlen(spelled));
+        unsetenv("_BEER_IMAGE_NAME");
+    }
     size_t guest_len = host_len + 2;
     for (size_t i = 0; i <= guest_len; ++i) g_exe_path_w[i] = (u8)g_exe_path_storage[i];
 
@@ -3517,17 +3527,27 @@ static int is_real_kernel32_export(const char *name)
 /* Legacy msvcrt.dll resolves into the bundled UCRT. Entry points UCRT only provides inline (the printf/scanf
  * families) are bridged to its __stdio_common_* functions with small guest-side thunks; C++ operator new/delete and
  * terminate map to the UCRT functions behind them. msvcrt internals with no UCRT export (_lock, __dllonexit, ...)
- * are host implementations (see win32_missing_exports.inc). */
+ * are host implementations (see win32_missing_exports.inc).
+ *
+ * msvcrt's own surface on top (MinGW-w64 programs link against it: RAZOR's rz-1.03.7-stdio.exe):
+ *  - data exports (_acmdln, _fmode, __argc, _environ, __initenv, ...) are Beer's variables (MsvcrtData): argc,
+ *    argv and the environment are the UCRT's, published by __getmainargs/__wgetmainargs;
+ *  - stdin/stdout/stderr are msvcrt's _iob array (48-byte FILE stride, reached through __iob_func or _iob): every
+ *    FILE * argument of a bridged stream function is translated from that array to the UCRT stream
+ *    (__acrt_iob_func), other FILE pointers (fopen) are the UCRT's own and pass through. */
 typedef struct {
     const char *name, *target;
     /* Arguments of the target call: 'C' = the constant, 'A' = the caller's argument #n, 'V' = the address of the
-     * caller's argument #n (a va_list over the variable arguments that start there). */
+     * caller's argument #n (a va_list over the variable arguments that start there), 'F' = the caller's argument #n
+     * as a FILE * (msvcrt _iob entries become UCRT streams), 'S' = the UCRT standard stream #n. */
     struct { char kind; u64 value; } args[7];
     int count;
 } MsvcrtBridge;
 #define MB_C(v) { 'C', (u64)(v) }
 #define MB_A(n) { 'A', (u64)(n) }
 #define MB_V(n) { 'V', (u64)(n) }
+#define MB_F(n) { 'F', (u64)(n) }
+#define MB_S(n) { 'S', (u64)(n) }
 /* __stdio_common options: 1 legacy vsprintf NUL termination, 2 standard snprintf behaviour, 4 legacy wide specifiers
  * (%s is a wide string in the wide functions, as in msvcrt). */
 static const MsvcrtBridge g_msvcrt_bridges[] = {
@@ -3546,27 +3566,149 @@ static const MsvcrtBridge g_msvcrt_bridges[] = {
     { "_snprintf_s",  "__stdio_common_vsnprintf_s",   { MB_C(0), MB_A(0), MB_A(1), MB_A(2), MB_A(3), MB_C(0), MB_V(4) }, 7 },
     { "sscanf",       "__stdio_common_vsscanf",       { MB_C(2), MB_A(0), MB_C(-1), MB_A(1), MB_C(0), MB_V(2) }, 6 },
     { "swscanf",      "__stdio_common_vswscanf",      { MB_C(2), MB_A(0), MB_C(-1), MB_A(1), MB_C(0), MB_V(2) }, 6 },
+    /* Stream output and input. */
+    { "printf",       "__stdio_common_vfprintf",      { MB_C(0), MB_S(1), MB_A(0), MB_C(0), MB_V(1) }, 5 },
+    { "vprintf",      "__stdio_common_vfprintf",      { MB_C(0), MB_S(1), MB_A(0), MB_C(0), MB_A(1) }, 5 },
+    { "fprintf",      "__stdio_common_vfprintf",      { MB_C(0), MB_F(0), MB_A(1), MB_C(0), MB_V(2) }, 5 },
+    { "vfprintf",     "__stdio_common_vfprintf",      { MB_C(0), MB_F(0), MB_A(1), MB_C(0), MB_A(2) }, 5 },
+    { "wprintf",      "__stdio_common_vfwprintf",     { MB_C(4), MB_S(1), MB_A(0), MB_C(0), MB_V(1) }, 5 },
+    { "vwprintf",     "__stdio_common_vfwprintf",     { MB_C(4), MB_S(1), MB_A(0), MB_C(0), MB_A(1) }, 5 },
+    { "fwprintf",     "__stdio_common_vfwprintf",     { MB_C(4), MB_F(0), MB_A(1), MB_C(0), MB_V(2) }, 5 },
+    { "vfwprintf",    "__stdio_common_vfwprintf",     { MB_C(4), MB_F(0), MB_A(1), MB_C(0), MB_A(2) }, 5 },
+    { "scanf",        "__stdio_common_vfscanf",       { MB_C(2), MB_S(0), MB_A(0), MB_C(0), MB_V(1) }, 5 },
+    { "fscanf",       "__stdio_common_vfscanf",       { MB_C(2), MB_F(0), MB_A(1), MB_C(0), MB_V(2) }, 5 },
+    { "wscanf",       "__stdio_common_vfwscanf",      { MB_C(2), MB_S(0), MB_A(0), MB_C(0), MB_V(1) }, 5 },
+    { "fwscanf",      "__stdio_common_vfwscanf",      { MB_C(2), MB_F(0), MB_A(1), MB_C(0), MB_V(2) }, 5 },
+    /* FILE * functions UCRT exports under the same name: the stream argument is translated. */
+    { "fwrite",   "fwrite",   { MB_A(0), MB_A(1), MB_A(2), MB_F(3) }, 4 },
+    { "fread",    "fread",    { MB_A(0), MB_A(1), MB_A(2), MB_F(3) }, 4 },
+    { "fflush",   "fflush",   { MB_F(0) }, 1 },
+    { "fclose",   "fclose",   { MB_F(0) }, 1 },
+    { "fputs",    "fputs",    { MB_A(0), MB_F(1) }, 2 },
+    { "fputc",    "fputc",    { MB_A(0), MB_F(1) }, 2 },
+    { "putc",     "putc",     { MB_A(0), MB_F(1) }, 2 },
+    { "fputws",   "fputws",   { MB_A(0), MB_F(1) }, 2 },
+    { "fputwc",   "fputwc",   { MB_A(0), MB_F(1) }, 2 },
+    { "putwc",    "putwc",    { MB_A(0), MB_F(1) }, 2 },
+    { "ungetc",   "ungetc",   { MB_A(0), MB_F(1) }, 2 },
+    { "ungetwc",  "ungetwc",  { MB_A(0), MB_F(1) }, 2 },
+    { "fgets",    "fgets",    { MB_A(0), MB_A(1), MB_F(2) }, 3 },
+    { "fgetws",   "fgetws",   { MB_A(0), MB_A(1), MB_F(2) }, 3 },
+    { "fgetc",    "fgetc",    { MB_F(0) }, 1 },
+    { "getc",     "getc",     { MB_F(0) }, 1 },
+    { "fgetwc",   "fgetwc",   { MB_F(0) }, 1 },
+    { "getwc",    "getwc",    { MB_F(0) }, 1 },
+    { "setvbuf",  "setvbuf",  { MB_F(0), MB_A(1), MB_A(2), MB_A(3) }, 4 },
+    { "setbuf",   "setbuf",   { MB_F(0), MB_A(1) }, 2 },
+    { "ferror",   "ferror",   { MB_F(0) }, 1 },
+    { "feof",     "feof",     { MB_F(0) }, 1 },
+    { "clearerr", "clearerr", { MB_F(0) }, 1 },
+    { "rewind",   "rewind",   { MB_F(0) }, 1 },
+    { "fseek",    "fseek",    { MB_F(0), MB_A(1), MB_A(2) }, 3 },
+    { "ftell",    "ftell",    { MB_F(0) }, 1 },
+    { "fgetpos",  "fgetpos",  { MB_F(0), MB_A(1) }, 2 },
+    { "fsetpos",  "fsetpos",  { MB_F(0), MB_A(1) }, 2 },
+    { "_fseeki64", "_fseeki64", { MB_F(0), MB_A(1), MB_A(2) }, 3 },
+    { "_ftelli64", "_ftelli64", { MB_F(0) }, 1 },
+    { "_fileno",  "_fileno",  { MB_F(0) }, 1 },
+    { "fileno",   "_fileno",  { MB_F(0) }, 1 },
+    { "_lock_file",   "_lock_file",   { MB_F(0) }, 1 },
+    { "_unlock_file", "_unlock_file", { MB_F(0) }, 1 },
+    { "_fputchar", "fputc",   { MB_A(0), MB_S(1) }, 2 },
+    { "putchar",  "fputc",    { MB_A(0), MB_S(1) }, 2 },
+    { "putwchar", "fputwc",   { MB_A(0), MB_S(1) }, 2 },
+    { "getchar",  "fgetc",    { MB_S(0) }, 1 },
+    { "getwchar", "fgetwc",   { MB_S(0) }, 1 },
 };
 static const char *const g_msvcrt_aliases[][2] = {
     { "??2@YAPEAX_K@Z", "malloc" }, { "??_U@YAPEAX_K@Z", "malloc" },     /* operator new / new[] */
     { "??3@YAXPEAX@Z", "free" },    { "??_V@YAXPEAX@Z", "free" },        /* operator delete / delete[] */
     { "?terminate@@YAXXZ", "terminate" },
+    { "__set_app_type", "_set_app_type" },
+    { "_setjmp", "__intrinsic_setjmp" }, { "_setjmpex", "__intrinsic_setjmpex" },   /* (jmp_buf, frame) on x64 */
 };
+
+/* msvcrt's _iob: stdin, stdout, stderr as 48-byte msvcrt FILEs (_ptr, _cnt, _base, _flag, _file, _charbuf, _bufsiz,
+ * _tmpfname). Only their addresses matter: g_msvcrt_iob_map[offset >> 4] is the UCRT stream behind an offset. */
+#define MSVCRT_FILE_SIZE 48
+static u8 g_msvcrt_iob[3 * MSVCRT_FILE_SIZE] __attribute__((aligned(16)));
+static u64 g_msvcrt_iob_map[9];
+static u64 g_msvcrt_ucrt_streams[3];
+/* msvcrt's exported variables; argc/argv/environment are set by __getmainargs/__wgetmainargs (__initenv is
+ * _environ as start-up left it, as in msvcrt). */
+typedef struct {
+    char *acmdln; u16 *wcmdln; s32 fmode, commode; s32 argc; char **argv; u16 **wargv; char **environ_a;
+    u16 **environ_w;
+} MsvcrtData;
+static MsvcrtData g_msvcrt_data;
+static u64 __attribute__((ms_abi)) impl_GetCommandLineA(void);
+static u64 __attribute__((ms_abi)) impl_GetCommandLineW(void);
+
+typedef u64 (__attribute__((ms_abi)) *MsvcrtFn0)(void);
+typedef u64 (__attribute__((ms_abi)) *MsvcrtFn1)(u64);
+
+static int msvcrt_streams_ready(GuestDll *ucrt)
+{
+    if (g_msvcrt_ucrt_streams[1]) return 1;
+    const u64 iob_func = guest_dll_export(ucrt, "__acrt_iob_func");
+    if (!iob_func) return 0;
+    for (u32 i = 0; i < 3; ++i) {
+        g_msvcrt_ucrt_streams[i] = ((MsvcrtFn1)iob_func)(i);
+        memset(g_msvcrt_iob + i * MSVCRT_FILE_SIZE, 0, MSVCRT_FILE_SIZE);
+        memcpy(g_msvcrt_iob + i * MSVCRT_FILE_SIZE + 24, &i, 4);                       /* _file */
+        for (u32 k = 0; k < 3; ++k) g_msvcrt_iob_map[i * 3 + k] = g_msvcrt_ucrt_streams[i];
+    }
+    /* A program whose standard output is a pipe its Beer parent reads (_BEER_GUEST_STDOUT): msvcrt's stdout stream
+     * goes to standard error, as observed under Wine, and only what the program writes with WriteFile to its
+     * STD_OUTPUT_HANDLE reaches the pipe. RAZOR's stdio decoder (rz-1.03.7-stdio.exe, run by unarc with
+     * "e -y $stdio$") writes its data with WriteFile and its banner and once-a-second progress with puts/printf +
+     * fflush(stdout); with both on the pipe the progress text landed inside the decoded stream and srep rejected it. */
+    if (getenv("_BEER_GUEST_STDOUT")) {
+        g_msvcrt_ucrt_streams[1] = g_msvcrt_ucrt_streams[2];
+        for (u32 k = 0; k < 3; ++k) g_msvcrt_iob_map[3 + k] = g_msvcrt_ucrt_streams[2];
+    }
+    return 1;
+}
+
+/* puts/_putws on msvcrt's stdout stream (see msvcrt_streams_ready), used when that is not the UCRT's stdout. */
+static u64 g_msvcrt_fn_fputs, g_msvcrt_fn_fputc, g_msvcrt_fn_fputws, g_msvcrt_fn_fputwc;
+typedef u64 (__attribute__((ms_abi)) *MsvcrtFn2)(u64, u64);
+static u64 __attribute__((ms_abi)) beer_msvcrt_puts(const char *text)
+{
+    const u64 stream = g_msvcrt_ucrt_streams[1];
+    if (((MsvcrtFn2)g_msvcrt_fn_fputs)((u64)(uintptr_t)text, stream) == (u64)(u32)-1) return (u32)-1;
+    return ((MsvcrtFn2)g_msvcrt_fn_fputc)('\n', stream) == (u64)(u32)-1 ? (u32)-1 : 0;
+}
+static u64 __attribute__((ms_abi)) beer_msvcrt_putws(const u16 *text)
+{
+    const u64 stream = g_msvcrt_ucrt_streams[1];
+    if (((MsvcrtFn2)g_msvcrt_fn_fputws)((u64)(uintptr_t)text, stream) == (u64)(u32)-1) return 0xFFFF;
+    return ((MsvcrtFn2)g_msvcrt_fn_fputwc)('\n', stream) == 0xFFFF ? 0xFFFF : 0;
+}
+
+/* Guest-side code page for bridge and constant thunks. */
+static u8 *msvcrt_code_alloc(size_t size)
+{
+    static u8 *page;
+    static size_t used;
+    if (!page) {
+        page = mmap(NULL, 0x8000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) page = NULL;
+    }
+    if (!page || used + size > 0x8000) return NULL;
+    u8 *code = page + used;
+    used += (size + 15) & ~(size_t)15;
+    return code;
+}
 
 /* Emits: spill rcx/rdx/r8/r9 to their home slots (the caller's arguments are then contiguous above the return
  * address), build the target's arguments, call it and return its result. */
 static u64 msvcrt_bridge_thunk(const MsvcrtBridge *bridge, u64 target)
 {
-    static u8 *page;
-    static size_t used;
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&lock);
-    if (!page) {
-        page = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (page == MAP_FAILED) page = NULL;
-    }
-    if (!page || used + 256 > 0x4000) { pthread_mutex_unlock(&lock); return 0; }
-    u8 *code = page + used, *w = code;
+    u8 *code = msvcrt_code_alloc(512), *w = code;
+    if (!code) { pthread_mutex_unlock(&lock); return 0; }
     static const u8 spill[] = { 0x48, 0x89, 0x4C, 0x24, 0x08,  0x48, 0x89, 0x54, 0x24, 0x10,
                                 0x4C, 0x89, 0x44, 0x24, 0x18,  0x4C, 0x89, 0x4C, 0x24, 0x20,
                                 0x48, 0x83, 0xEC, 0x48 };                     /* ...; sub rsp, 0x48 */
@@ -3574,11 +3716,25 @@ static u64 msvcrt_bridge_thunk(const MsvcrtBridge *bridge, u64 target)
     static const u8 to_register[4][3] = { { 0x48, 0x89, 0xC1 }, { 0x48, 0x89, 0xC2 },
                                           { 0x49, 0x89, 0xC0 }, { 0x49, 0x89, 0xC1 } };   /* mov rcx/rdx/r8/r9, rax */
     for (int j = 0; j < bridge->count; ++j) {
-        const u64 value = bridge->args[j].value;
+        const char kind = bridge->args[j].kind;
+        u64 value = bridge->args[j].value;
+        if (kind == 'S') { value = g_msvcrt_ucrt_streams[value < 3 ? value : 1]; }
         const u32 slot = 0x50u + 8u * (u32)value;                            /* caller argument n after sub rsp */
-        if (bridge->args[j].kind == 'C') { *w++ = 0x48; *w++ = 0xB8; memcpy(w, &value, 8); w += 8; }
-        else { *w++ = 0x48; *w++ = bridge->args[j].kind == 'A' ? 0x8B : 0x8D; *w++ = 0x84; *w++ = 0x24;
+        if (kind == 'C' || kind == 'S') { *w++ = 0x48; *w++ = 0xB8; memcpy(w, &value, 8); w += 8; }
+        else { *w++ = 0x48; *w++ = kind == 'V' ? 0x8D : 0x8B; *w++ = 0x84; *w++ = 0x24;
                memcpy(w, &slot, 4); w += 4; }                                /* mov/lea rax, [rsp+slot] */
+        if (kind == 'F') {
+            const u64 base = (u64)(uintptr_t)g_msvcrt_iob, map = (u64)(uintptr_t)g_msvcrt_iob_map;
+            const u32 span = sizeof(g_msvcrt_iob);
+            *w++ = 0x49; *w++ = 0xBA; memcpy(w, &base, 8); w += 8;          /* mov r10, _iob */
+            *w++ = 0x49; *w++ = 0x89; *w++ = 0xC3;                           /* mov r11, rax */
+            *w++ = 0x4D; *w++ = 0x29; *w++ = 0xD3;                           /* sub r11, r10 */
+            *w++ = 0x49; *w++ = 0x81; *w++ = 0xFB; memcpy(w, &span, 4); w += 4;   /* cmp r11, span */
+            *w++ = 0x73; *w++ = 18;                                          /* jae past the lookup */
+            *w++ = 0x49; *w++ = 0xC1; *w++ = 0xEB; *w++ = 0x04;             /* shr r11, 4 */
+            *w++ = 0x49; *w++ = 0xBA; memcpy(w, &map, 8); w += 8;           /* mov r10, map */
+            *w++ = 0x4B; *w++ = 0x8B; *w++ = 0x04; *w++ = 0xDA;             /* mov rax, [r10 + r11*8] */
+        }
         if (j < 4) { memcpy(w, to_register[j], 3); w += 3; }
         else { *w++ = 0x48; *w++ = 0x89; *w++ = 0x44; *w++ = 0x24; *w++ = (u8)(0x20 + 8 * (j - 4)); }  /* mov [rsp+..], rax */
     }
@@ -3586,8 +3742,16 @@ static u64 msvcrt_bridge_thunk(const MsvcrtBridge *bridge, u64 target)
     *w++ = 0xFF; *w++ = 0xD0;                                                 /* call rax */
     *w++ = 0x48; *w++ = 0x83; *w++ = 0xC4; *w++ = 0x48;                       /* add rsp, 0x48 */
     *w++ = 0xC3;
-    used += ((size_t)(w - code) + 15) & ~(size_t)15;
     pthread_mutex_unlock(&lock);
+    return (u64)(uintptr_t)code;
+}
+
+/* A function returning a constant (__iob_func, __lconv_init). */
+static u64 msvcrt_const_thunk(u64 value)
+{
+    u8 *code = msvcrt_code_alloc(16);
+    if (!code) return 0;
+    code[0] = 0x48; code[1] = 0xB8; memcpy(code + 2, &value, 8); code[10] = 0xC3;   /* mov rax, value; ret */
     return (u64)(uintptr_t)code;
 }
 
@@ -3602,24 +3766,136 @@ static GuestDll *msvcrt_ucrt(void)
     return ucrt;
 }
 
+/* __getmainargs(&argc, &argv, &envp, expand_wildcards, &startupinfo) and the wide form, from the UCRT's start-up
+ * functions. */
+static u64 g_msvcrt_fn_configure_argv[2], g_msvcrt_fn_init_environment[2], g_msvcrt_fn_argc,
+           g_msvcrt_fn_argv[2], g_msvcrt_fn_environ[2];
+static u64 msvcrt_getmainargs_common(int wide, s32 *argc, u64 *argv, u64 *envp, s32 wildcards)
+{
+    if (!g_msvcrt_fn_configure_argv[wide] || !g_msvcrt_fn_argc || !g_msvcrt_fn_argv[wide] ||
+        !g_msvcrt_fn_environ[wide]) return (u64)-1;
+    if (((MsvcrtFn1)g_msvcrt_fn_configure_argv[wide])(wildcards ? 2 : 1)) return (u64)-1;
+    if (g_msvcrt_fn_init_environment[wide]) ((MsvcrtFn0)g_msvcrt_fn_init_environment[wide])();
+    const u64 env = *(u64 *)(uintptr_t)((MsvcrtFn0)g_msvcrt_fn_environ[wide])();
+    const s32 count = *(s32 *)(uintptr_t)((MsvcrtFn0)g_msvcrt_fn_argc)();
+    const u64 vector = *(u64 *)(uintptr_t)((MsvcrtFn0)g_msvcrt_fn_argv[wide])();
+    if (argc) *argc = count;
+    if (argv) *argv = vector;
+    if (envp) *envp = env;
+    g_msvcrt_data.argc = count;
+    if (wide) { g_msvcrt_data.wargv = (u16 **)(uintptr_t)vector; g_msvcrt_data.environ_w = (u16 **)(uintptr_t)env; }
+    else { g_msvcrt_data.argv = (char **)(uintptr_t)vector; g_msvcrt_data.environ_a = (char **)(uintptr_t)env; }
+    return 0;
+}
+static u64 __attribute__((ms_abi)) beer_msvcrt_getmainargs(s32 *argc, u64 *argv, u64 *envp, s32 wildcards, void *si)
+    { (void)si; return msvcrt_getmainargs_common(0, argc, argv, envp, wildcards); }
+static u64 __attribute__((ms_abi)) beer_msvcrt_wgetmainargs(s32 *argc, u64 *argv, u64 *envp, s32 wildcards, void *si)
+    { (void)si; return msvcrt_getmainargs_common(1, argc, argv, envp, wildcards); }
+/* An exe's _onexit (MinGW's atexit) runs at exit like the UCRT's own atexit functions. */
+static u64 g_msvcrt_fn_crt_atexit;
+static u64 __attribute__((ms_abi)) beer_msvcrt_exe_onexit(u64 function)
+{
+    if (!g_msvcrt_fn_crt_atexit) return function;
+    return ((MsvcrtFn1)g_msvcrt_fn_crt_atexit)(function) ? 0 : function;
+}
+
+static void emit_impl_thunk(int idx, u64 fn_ptr);
+static u64 msvcrt_host_entry(const char *name, u64 implementation)
+{
+    static struct { const char *name; u64 entry; } made[8];
+    for (size_t i = 0; i < 8 && made[i].name; ++i) if (!strcmp(made[i].name, name)) return made[i].entry;
+    if (g_nstubs >= MAX_STUBS) return 0;
+    g_snames[g_nstubs] = strdup(name);
+    emit_impl_thunk(g_nstubs, implementation);
+    const u64 entry = (u64)(g_tramp + g_nstubs * THUNK_SZ);
+    ++g_nstubs;
+    for (size_t i = 0; i < 8; ++i) if (!made[i].name) { made[i].name = name; made[i].entry = entry; break; }
+    return entry;
+}
+
 static u64 msvcrt_export(const char *name)
 {
     GuestDll *ucrt = msvcrt_ucrt();
     if (!ucrt || !name) return 0;
     for (size_t i = 0; i < sizeof(g_msvcrt_aliases) / sizeof(*g_msvcrt_aliases); ++i)
         if (!strcmp(name, g_msvcrt_aliases[i][0])) return guest_dll_export(ucrt, g_msvcrt_aliases[i][1]);
-    u64 direct = guest_dll_export(ucrt, name);
-    if (direct) return direct;
-    static struct { const char *name; u64 thunk; } made[32];
+    /* Data exports. Beer's own variables: the UCRT's __p_ accessors cannot run before the guest's TEB exists. */
+    if (!g_msvcrt_data.acmdln) {
+        g_msvcrt_data.acmdln = (char *)(uintptr_t)impl_GetCommandLineA();
+        g_msvcrt_data.wcmdln = (u16 *)(uintptr_t)impl_GetCommandLineW();
+    }
+    static const struct { const char *name; size_t offset; } data[] = {
+        { "_acmdln", offsetof(MsvcrtData, acmdln) }, { "_wcmdln", offsetof(MsvcrtData, wcmdln) },
+        { "_fmode", offsetof(MsvcrtData, fmode) }, { "_commode", offsetof(MsvcrtData, commode) },
+        { "__argc", offsetof(MsvcrtData, argc) }, { "__argv", offsetof(MsvcrtData, argv) },
+        { "__wargv", offsetof(MsvcrtData, wargv) }, { "_environ", offsetof(MsvcrtData, environ_a) },
+        { "_wenviron", offsetof(MsvcrtData, environ_w) }, { "__initenv", offsetof(MsvcrtData, environ_a) },
+        { "__winitenv", offsetof(MsvcrtData, environ_w) },
+    };
+    for (size_t i = 0; i < sizeof(data) / sizeof(*data); ++i)
+        if (!strcmp(name, data[i].name)) return (u64)(uintptr_t)&g_msvcrt_data + data[i].offset;
+    if (!strcmp(name, "_iob") || !strcmp(name, "__iob_func")) {
+        if (!msvcrt_streams_ready(ucrt)) return 0;
+        if (name[1] == 'i') return (u64)(uintptr_t)g_msvcrt_iob;
+        static u64 iob_func;
+        if (!iob_func) iob_func = msvcrt_const_thunk((u64)(uintptr_t)g_msvcrt_iob);
+        return iob_func;
+    }
+    if (!strcmp(name, "__lconv_init")) {
+        static u64 lconv_init;
+        if (!lconv_init) lconv_init = msvcrt_const_thunk(0);
+        return lconv_init;
+    }
+    if (!strcmp(name, "__getmainargs") || !strcmp(name, "__wgetmainargs")) {
+        g_msvcrt_fn_configure_argv[0] = guest_dll_export(ucrt, "_configure_narrow_argv");
+        g_msvcrt_fn_configure_argv[1] = guest_dll_export(ucrt, "_configure_wide_argv");
+        g_msvcrt_fn_init_environment[0] = guest_dll_export(ucrt, "_initialize_narrow_environment");
+        g_msvcrt_fn_init_environment[1] = guest_dll_export(ucrt, "_initialize_wide_environment");
+        g_msvcrt_fn_argc = guest_dll_export(ucrt, "__p___argc");
+        g_msvcrt_fn_argv[0] = guest_dll_export(ucrt, "__p___argv");
+        g_msvcrt_fn_argv[1] = guest_dll_export(ucrt, "__p___wargv");
+        g_msvcrt_fn_environ[0] = guest_dll_export(ucrt, "__p__environ");
+        g_msvcrt_fn_environ[1] = guest_dll_export(ucrt, "__p__wenviron");
+        return name[2] == 'w' ? msvcrt_host_entry("__wgetmainargs", (u64)beer_msvcrt_wgetmainargs)
+                              : msvcrt_host_entry("__getmainargs", (u64)beer_msvcrt_getmainargs);
+    }
+    if ((!strcmp(name, "puts") || !strcmp(name, "_putws")) && getenv("_BEER_GUEST_STDOUT") &&
+        msvcrt_streams_ready(ucrt)) {
+        g_msvcrt_fn_fputs = guest_dll_export(ucrt, "fputs");
+        g_msvcrt_fn_fputc = guest_dll_export(ucrt, "fputc");
+        g_msvcrt_fn_fputws = guest_dll_export(ucrt, "fputws");
+        g_msvcrt_fn_fputwc = guest_dll_export(ucrt, "fputwc");
+        if (g_msvcrt_fn_fputs && g_msvcrt_fn_fputc && g_msvcrt_fn_fputws && g_msvcrt_fn_fputwc)
+            return name[0] == 'p' ? msvcrt_host_entry("puts", (u64)beer_msvcrt_puts)
+                                  : msvcrt_host_entry("_putws", (u64)beer_msvcrt_putws);
+    }
+    /* Bridges first: the FILE * functions share their UCRT export's name. */
+    static struct { const char *name; u64 thunk; } made[128];
+    static pthread_mutex_t made_lock = PTHREAD_MUTEX_INITIALIZER;
     for (size_t i = 0; i < sizeof(g_msvcrt_bridges) / sizeof(*g_msvcrt_bridges); ++i) {
         if (strcmp(name, g_msvcrt_bridges[i].name)) continue;
-        for (size_t k = 0; k < 32 && made[k].name; ++k) if (!strcmp(made[k].name, name)) return made[k].thunk;
+        pthread_mutex_lock(&made_lock);
+        for (size_t k = 0; k < 128 && made[k].name; ++k)
+            if (!strcmp(made[k].name, name)) { const u64 thunk = made[k].thunk; pthread_mutex_unlock(&made_lock); return thunk; }
         u64 target = guest_dll_export(ucrt, g_msvcrt_bridges[i].target);
-        u64 thunk = target ? msvcrt_bridge_thunk(&g_msvcrt_bridges[i], target) : 0;
-        for (size_t k = 0; k < 32; ++k) if (!made[k].name) { made[k].name = name; made[k].thunk = thunk; break; }
+        u64 thunk = target && msvcrt_streams_ready(ucrt) ? msvcrt_bridge_thunk(&g_msvcrt_bridges[i], target) : 0;
+        if (!thunk) thunk = guest_dll_export(ucrt, name);
+        for (size_t k = 0; k < 128; ++k) if (!made[k].name) { made[k].name = g_msvcrt_bridges[i].name; made[k].thunk = thunk; break; }
+        pthread_mutex_unlock(&made_lock);
         return thunk;
     }
-    return 0;
+    return guest_dll_export(ucrt, name);
+}
+
+/* The main exe's msvcrt.dll imports: msvcrt_export, with _onexit running at exit. */
+static u64 msvcrt_exe_export(const char *name)
+{
+    if (name && !strcmp(name, "_onexit")) {
+        GuestDll *ucrt = msvcrt_ucrt();
+        g_msvcrt_fn_crt_atexit = ucrt ? guest_dll_export(ucrt, "_crt_atexit") : 0;
+        if (g_msvcrt_fn_crt_atexit) return msvcrt_host_entry("_onexit", (u64)beer_msvcrt_exe_onexit);
+    }
+    return msvcrt_export(name);
 }
 
 static u64 guest_dll_export_by_ordinal(GuestDll *dll, u32 ordinal);
@@ -3771,6 +4047,18 @@ impl_GetProcAddress(u64 hmod, const char *procname)
     g_last_error = 127; /* ERROR_PROC_NOT_FOUND */
     fprintf(stderr, "[IMPL] GetProcAddress(0x%lx, \"%s\") -> NULL (export not found)\n",
             hmod, procname);
+    /* BEER_GETPROC_DISCOVER=1 (diagnostics only): hand out a logging stub instead, so one run lists every missing
+     * name a loader stub resolves (UPX and similar stubs give up at the first NULL). Never for normal runs: see above. */
+    if (getenv("BEER_GETPROC_DISCOVER") && g_nstubs < MAX_STUBS) {
+        char label[300];
+        snprintf(label, sizeof(label), "DISCOVER!%s", procname);
+        g_snames[g_nstubs] = strdup(label);
+        emit_thunk(g_nstubs);
+        const u64 addr = (u64)(g_tramp + g_nstubs * THUNK_SZ);
+        g_nstubs++;
+        fprintf(stderr, "[DISCOVER] missing export %s\n", procname);
+        return addr;
+    }
     return 0;
 }
 
@@ -11303,10 +11591,48 @@ impl_GetStdHandle(u32 n) {
 /* ---- Code pages / locale ---- */
 static u64 __attribute__((ms_abi)) impl_GetACP(void)    { return 1252; }
 static u64 __attribute__((ms_abi)) impl_GetOEMCP(void)  { return 437; }
-static u64 __attribute__((ms_abi)) impl_GetCPInfo(u32 cp, u64 *info)
-    { (void)cp; if(info){memset(info,0,12);*(u32*)info=1;}return 1; }
 static u64 __attribute__((ms_abi)) impl_IsValidCodePage(u32 cp)
     { return (cp==1252||cp==65001||cp==437)?1:0; }
+/* CP_ACP / CP_OEMCP / CP_THREAD_ACP resolve to the code pages above; 0 for one Beer does not have. */
+static u32 codepage_resolve(u32 cp)
+{
+    if (cp == 0 || cp == 3) return 1252;                   /* CP_ACP, CP_THREAD_ACP */
+    if (cp == 1) return 437;                               /* CP_OEMCP */
+    return impl_IsValidCodePage(cp) ? cp : 0;
+}
+/* CPINFO (MaxCharSize, DefaultChar[2], LeadByte[12]): single-byte code pages, '?' as the default character. */
+static u64 __attribute__((ms_abi)) impl_GetCPInfo(u32 cp, u64 *info)
+{
+    if (!info) { g_last_error = 87; return 0; }
+    const u32 page = codepage_resolve(cp);
+    u8 *out = (u8 *)info;
+    memset(out, 0, 18);
+    const u32 max = page == 65001 ? 4u : 1u;
+    memcpy(out, &max, 4);
+    out[4] = '?';
+    return 1;
+}
+/* CPINFOEX: CPINFO, then UnicodeDefaultChar, CodePage and CodePageName[MAX_PATH] (UTF-16 for W, ANSI for A). Delphi's
+ * RTL asks for it while a DLL initialises (RAZOR's razor.dll). */
+static int codepage_info_ex(u32 cp, u8 *info, int wide)
+{
+    const u32 page = codepage_resolve(cp);
+    if (!info || !page) { g_last_error = 87; return 0; }
+    const char *name = page == 65001 ? "65001 (UTF-8)" : page == 437 ? "437   (OEM - United States)"
+                                                         : "1252  (ANSI - Latin I)";
+    memset(info, 0, wide ? 24 + 520 : 24 + 260);
+    impl_GetCPInfo(page, (u64 *)info);
+    const u16 unicode_default = '?';
+    memcpy(info + 18, &unicode_default, 2);
+    memcpy(info + 20, &page, 4);
+    for (size_t i = 0; name[i]; ++i) {
+        if (wide) { const u16 c = (u8)name[i]; memcpy(info + 24 + 2 * i, &c, 2); }
+        else info[24 + i] = (u8)name[i];
+    }
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_GetCPInfoExW(u32 cp, u32 flags, u8 *info) { (void)flags; return (u64)codepage_info_ex(cp, info, 1); }
+static u64 __attribute__((ms_abi)) impl_GetCPInfoExA(u32 cp, u32 flags, u8 *info) { (void)flags; return (u64)codepage_info_ex(cp, info, 0); }
 
 /* ---- Module file names ---- */
 static u64 __attribute__((ms_abi))
@@ -11434,8 +11760,8 @@ static int g_event_cnt = 1;
 static int g_event_free[MAX_EVENTS];
 static unsigned g_event_free_head, g_event_free_tail;
 
-/* Named events (CreateEvent with a name, OpenEvent) within this process. Sharing an event with
- * another process is not supported, so opening one created elsewhere fails as "not found". */
+/* Named events (CreateEvent with a name, OpenEvent): this table finds the ones this process already holds; every
+ * named event is also visible to the user's other Beer processes (see named_event_file). */
 #define MAX_EVENT_NAMES 1024
 static struct { int id; char name[260]; } g_event_names[MAX_EVENT_NAMES];
 
@@ -11593,6 +11919,95 @@ static u64 named_event_find_locked(const char *name)
     return 0;
 }
 
+/* Named events are shared by all of the user's Beer processes, like a Windows session namespace: the state is the
+ * shared-event page (see event_make_shared) in a file under $XDG_RUNTIME_DIR/beer/objects. Every process that holds
+ * the event keeps a shared flock on that file, so a file nobody holds is the leftover of an exited process: Windows
+ * deletes a named object with its last handle. (FitGirl's CLS-*.dll hands work to a 64-bit helper process through
+ * IOEvent_<n>/IOCompleteEvent_<n>.) Page: [0] signaled, [1] wake sequence, [2] manual reset, [3] magic. */
+#define NAMED_EVENT_MAGIC 0x42455654u
+static void named_event_path(const char *name, char *path, size_t size)
+{
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    size_t n = runtime && *runtime ? (size_t)snprintf(path, size, "%s/beer", runtime)
+                                   : (size_t)snprintf(path, size, "/tmp/beer-%d", (int)getuid());
+    mkdir(path, 0700);
+    n += (size_t)snprintf(path + n, size - n, "/objects");
+    mkdir(path, 0700);
+    if (!strncmp(name, "Global\\", 7)) name += 7;
+    else if (!strncmp(name, "Local\\", 6)) name += 6;
+    n += (size_t)snprintf(path + n, size - n, "/event-");
+    for (; *name && n + 4 < size; ++name) {
+        const unsigned char c = (unsigned char)*name;
+        if (isalnum(c) || c == '-' || c == '_' || c == '.') path[n++] = (char)c;
+        else n += (size_t)snprintf(path + n, size - n, "%%%02x", c);
+    }
+    path[n] = 0;
+}
+/* The event's file with a lock held: shared when it already existed, exclusive when this call made it (*created: the
+ * caller initialises the page, then downgrades to a shared lock). -1 when it does not exist (create = 0) or fails. */
+static int named_event_file(const char *name, int create, int *created)
+{
+    char path[600];
+    named_event_path(name, path, sizeof(path));
+    *created = 0;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+            if (flock(fd, LOCK_EX | LOCK_NB) == 0) {        /* nobody holds it: a leftover */
+                if (!create) { unlink(path); close(fd); return -1; }
+                if (ftruncate(fd, 0) != 0 || ftruncate(fd, 4096) != 0) { close(fd); return -1; }
+                *created = 1;
+                return fd;
+            }
+            if (flock(fd, LOCK_SH) == 0) return fd;          /* held elsewhere: waits until its creator initialised it */
+            close(fd);
+            return -1;
+        }
+        if (!create) return -1;
+        fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0) { if (errno == EEXIST) continue; return -1; }
+        if (flock(fd, LOCK_EX) != 0 || ftruncate(fd, 4096) != 0) { unlink(path); close(fd); return -1; }
+        *created = 1;
+        return fd;
+    }
+    return -1;
+}
+/* A local event slot on the named event's shared page. Takes ownership of fd. */
+static u64 named_event_attach(int fd, int created, int manual, int initial)
+{
+    void *map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) { close(fd); g_last_error = 8; return 0; }
+    volatile u32 *page = map;
+    if (created) {
+        page[0] = initial ? 1u : 0u;
+        page[1] = 0;
+        page[2] = manual ? 1u : 0u;
+        __atomic_store_n(&page[3], NAMED_EVENT_MAGIC, __ATOMIC_RELEASE);
+        flock(fd, LOCK_SH);                                 /* initialised: others may open it now */
+    } else {
+        manual = page[2] != 0;
+    }
+    const u64 handle = event_alloc(manual, 0);
+    if (!handle) { munmap(map, 4096); close(fd); return 0; }
+    WinEvent *ev = &g_events[handle - 0x60000000u];
+    pthread_mutex_lock(&ev->mtx);
+    ev->shared = page;
+    ev->shared_fd = fd;
+    pthread_mutex_unlock(&ev->mtx);
+    return handle;
+}
+static void named_event_remember(u64 handle, const char *name)
+{
+    pthread_mutex_lock(&g_event_table_mtx);
+    for (int i = 0; i < MAX_EVENT_NAMES; i++)
+        if (!g_event_names[i].id || !g_events[g_event_names[i].id].used) {
+            g_event_names[i].id = (int)(handle - 0x60000000u);
+            snprintf(g_event_names[i].name, sizeof(g_event_names[i].name), "%s", name);
+            break;
+        }
+    pthread_mutex_unlock(&g_event_table_mtx);
+}
+
 static u64 named_event_create(const char *name, int manual, int initial)
 {
     if (!name || !*name) { g_last_error = 0; return event_alloc(manual, initial); }
@@ -11604,7 +12019,16 @@ static u64 named_event_create(const char *name, int manual, int initial)
         g_last_error = 183;                               /* ERROR_ALREADY_EXISTS, with a valid handle */
         return existing;
     }
-    u64 handle = event_alloc(manual, initial);
+    int created = 0;
+    const int fd = named_event_file(name, 1, &created);
+    if (fd >= 0) {
+        const u64 shared = named_event_attach(fd, created, manual, initial);
+        if (!shared) return 0;
+        named_event_remember(shared, name);
+        g_last_error = created ? 0 : 183;
+        return shared;
+    }
+    u64 handle = event_alloc(manual, initial);            /* no runtime directory: this process only */
     if (!handle) return 0;
     pthread_mutex_lock(&g_event_table_mtx);
     for (int i = 0; i < MAX_EVENT_NAMES; i++)
@@ -11625,7 +12049,16 @@ static u64 named_event_open(const char *name, u32 inherit)
     pthread_mutex_lock(&g_event_table_mtx);
     u64 existing = named_event_find_locked(name);
     pthread_mutex_unlock(&g_event_table_mtx);
-    if (!existing) { g_last_error = 2; return 0; }          /* ERROR_FILE_NOT_FOUND */
+    if (!existing) {                                       /* created by another process? */
+        int created = 0;
+        const int fd = named_event_file(name, 0, &created);
+        if (fd < 0) { g_last_error = 2; return 0; }        /* ERROR_FILE_NOT_FOUND */
+        const u64 shared = named_event_attach(fd, 0, 0, 0);
+        if (!shared) return 0;
+        named_event_remember(shared, name);
+        g_last_error = 0;
+        return shared;
+    }
     if (!dup_ref_add(existing)) { g_last_error = 8; return 0; }
     g_last_error = 0;
     return existing;
@@ -12373,8 +12806,18 @@ beer_wait_single_raw(u64 h, u32 ms)
     if (mid >= 0) { u64 r = win_mutex_wait(mid, ms); g_dbg_wait_kind = 0; return r; }
 
     int eid = event_id_from_handle(h);
+    struct timespec event_start;
+    clock_gettime(CLOCK_MONOTONIC, &event_start);
+event_shared_wait:
     if (eid >= 0 && g_events[eid].shared) {
-        const u64 r = shared_event_wait(&g_events[eid], ms);
+        u32 left = ms;
+        if (ms != 0 && ms != 0xFFFFFFFFu) {             /* time already spent in a local wait before the switch */
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const s64 spent = (s64)(now.tv_sec - event_start.tv_sec) * 1000 + (now.tv_nsec - event_start.tv_nsec) / 1000000;
+            left = spent >= (s64)ms ? 0 : ms - (u32)spent;
+        }
+        const u64 r = shared_event_wait(&g_events[eid], left);
         g_dbg_wait_kind = 0;
         return r;
     }
@@ -12382,6 +12825,7 @@ beer_wait_single_raw(u64 h, u32 ms)
         WinEvent *ev = &g_events[eid];
         int rc = 0;
         pthread_mutex_lock(&ev->mtx);
+        if (ev->shared) { pthread_mutex_unlock(&ev->mtx); goto event_shared_wait; }
         ++ev->waiter_count;
         if (ms == 0xFFFFFFFFu) {
             if (!ev->signaled && getenv("BEER_WAIT_DIAGNOSTICS")) {
@@ -12396,14 +12840,21 @@ beer_wait_single_raw(u64 h, u32 ms)
                             (unsigned long long)g_dispatch_incoming_return,
                             (unsigned long long)ev->last_signaler_rip);
             }
-            while (!ev->signaled) pthread_cond_wait(&ev->cv, &ev->mtx);
+            while (!ev->signaled && !ev->shared) pthread_cond_wait(&ev->cv, &ev->mtx);
         } else if (ms == 0) {
             if (!ev->signaled) rc = ETIMEDOUT;
         } else {
             struct timespec ts;
             if (calc_abs_deadline(&ts, ms) != 0) rc = ETIMEDOUT;
-            while (!rc && !ev->signaled)
+            while (!rc && !ev->signaled && !ev->shared)
                 rc = pthread_cond_timedwait(&ev->cv, &ev->mtx, &ts);
+        }
+        /* CreateProcess moved the event into a shared page meanwhile (event_make_shared): SetEvent now signals the
+         * page, so the wait continues there; the page took over the local state. */
+        if (ev->shared && rc != ETIMEDOUT) {
+            if (ev->waiter_count) --ev->waiter_count;
+            pthread_mutex_unlock(&ev->mtx);
+            goto event_shared_wait;
         }
         if (!rc && ev->signaled && !ev->manual_reset) ev->signaled = 0;
         if (ev->waiter_count) --ev->waiter_count;
@@ -12976,10 +13427,16 @@ static u64 __attribute__((ms_abi)) impl_GetTickCount64(void) { return impl_GetTi
 static int fh_get(u64 h);
 
 static u64 __attribute__((ms_abi)) impl_GetFileType(u64 handle) {
-    /* FILE_TYPE_DISK=1, FILE_TYPE_CHAR=2, FILE_TYPE_UNKNOWN=0. */
+    /* FILE_TYPE_DISK=1, FILE_TYPE_CHAR=2, FILE_TYPE_PIPE=3, FILE_TYPE_UNKNOWN=0. A standard handle is what its
+     * descriptor is: the CRT buffers a redirected stdout fully and only a terminal line by line (RAZOR's stdio
+     * decoder writes its banner with puts and its data with WriteFile on the same stdout pipe). */
     if ((int64_t)handle == -10 || (int64_t)handle == -11 || (int64_t)handle == -12) {
         g_last_error = 0;
-        return 2;
+        struct stat st;
+        const int fd = (int)(-10 - (int64_t)handle);
+        if (isatty(fd) || fstat(fd, &st) != 0) return 2;
+        if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)) return 3;
+        return S_ISREG(st.st_mode) || S_ISBLK(st.st_mode) ? 1 : 2;
     }
     if (fh_get(handle) >= 0) {
         g_last_error = 0;
@@ -13471,7 +13928,16 @@ typedef struct {
     u64 paint_dc, paint_bitmap;   /* GDI canvas for BeginPaint/GetDC (a memory DC with a client-sized bitmap) */
     s32 paint_w, paint_h;
     int paint_posted;             /* a WM_PAINT is queued and not yet answered by BeginPaint */
+    u64 nc_dc, nc_bitmap;         /* the frame and caption Beer draws for a captioned top-level window */
+    s32 nc_w, nc_h;
+    int dragging;                 /* the caption is being dragged: offset of the pointer from the window origin */
+    s32 drag_dx, drag_dy;
+    s64 z;                        /* stacking among siblings: higher is in front */
 } BeerWindow;
+static s64 g_window_z_top, g_window_z_bottom;    /* the next z for HWND_TOP / HWND_BOTTOM */
+/* Places a window in its siblings' stacking order (SetWindowPos hWndInsertAfter): HWND_TOP (0), HWND_BOTTOM (1),
+ * HWND_TOPMOST / NOTOPMOST (-1 / -2: the top), or directly behind the window `after`. */
+static void beer_window_restack(u64 hwnd, u64 after);
 static BeerWindow g_beer_windows[BEER_MAX_WINDOWS];
 static u64 g_native_hwnd;                       /* window owning the native surface; 0 = none */
 static u64 g_swapchain_hwnd;                    /* the window a DXGI swap chain presents to (0 = none yet) */
@@ -13520,9 +13986,29 @@ static void beer_window_note_swapchain(u64 hwnd)
  * A window that never paints gets no surface, so hidden helper windows never appear as empty boxes. Showing,
  * resizing or invalidating a visible window queues WM_PAINT to its thread, as Windows does. */
 static int queue_message_for_thread(u32 owner, u64 hwnd, u32 message, u64 wparam, u64 lparam);
+/* Non-client area of a Beer-drawn window: a top-level window with a caption (WS_CAPTION, also with WS_POPUP, as
+ * Delphi dialogs have it) gets a Windows 10 style 31-pixel title bar and a 1-pixel border; other windows have none
+ * (the client area is the window). */
+#define BEER_NC_CAPTION 31
+static void beer_window_nc(const BeerWindow *w, s32 *l, s32 *t, s32 *r, s32 *b)
+{
+    *l = *t = *r = *b = 0;
+    if (!w || ((w->style & 0x40000000u) && w->parent)) return;                    /* child windows: none */
+    if ((w->style & 0x00C00000u) == 0x00C00000u) { *l = *r = *b = 1; *t = BEER_NC_CAPTION; }
+    else if (w->style & 0x00C00000u) { *l = *r = *b = *t = 1; }                     /* WS_BORDER / WS_DLGFRAME */
+    if (w->w - *l - *r < 1 || w->h - *t - *b < 1) *l = *t = *r = *b = 0;
+}
+static void beer_window_client_size(const BeerWindow *w, s32 *cw, s32 *ch)
+{
+    s32 l, t, r, b;
+    beer_window_nc(w, &l, &t, &r, &b);
+    *cw = w->w - l - r; *ch = w->h - t - b;
+}
 static u64 beer_other_paint_dc(BeerWindow *w)
 {
-    const s32 width = w->w > 0 ? w->w : 1, height = w->h > 0 ? w->h : 1;
+    s32 cw, ch;
+    beer_window_client_size(w, &cw, &ch);
+    const s32 width = cw > 0 ? cw : 1, height = ch > 0 ? ch : 1;
     if (!w->paint_dc) w->paint_dc = beer_CreateCompatibleDC(0);
     if (w->paint_dc && (width != w->paint_w || height != w->paint_h || !w->paint_bitmap)) {
         const u64 bitmap = beer_CreateCompatibleBitmap(0, width, height);
@@ -13535,50 +14021,228 @@ static u64 beer_other_paint_dc(BeerWindow *w)
     }
     return w->paint_dc;
 }
+/* Child windows (WS_CHILD) of a Beer-drawn window live in their parent's client area (no frame of their own), in
+ * parent client coordinates; only the top-level window has a native surface, onto which each visible descendant's
+ * canvas is composited (later windows above earlier ones). */
+static int beer_window_is_child(const BeerWindow *w) { return w && (w->style & 0x40000000u) && w->parent; }
+static BeerWindow *beer_window_top(BeerWindow *w)
+{
+    for (int depth = 0; w && beer_window_is_child(w) && depth < 64; ++depth) {
+        BeerWindow *parent = beer_window_other(w->parent);
+        if (!parent) break;
+        w = parent;
+    }
+    return w;
+}
+/* Screen position of a window's client origin; 0 when it is not a Beer-drawn window. */
+static int beer_window_screen_origin(BeerWindow *w, s32 *x, s32 *y)
+{
+    s32 ox = 0, oy = 0;
+    for (int depth = 0; w && depth < 64; ++depth) {
+        s32 l, t, r, b;
+        beer_window_nc(w, &l, &t, &r, &b);
+        ox += w->x + l; oy += w->y + t;
+        if (!beer_window_is_child(w)) { *x = ox; *y = oy; return 1; }
+        w = beer_window_other(w->parent);
+    }
+    return 0;
+}
+/* Visible with every ancestor visible. */
+static int beer_window_shown(BeerWindow *w)
+{
+    for (int depth = 0; w && depth < 64; ++depth) {
+        if (!w->visible) return 0;
+        if (!beer_window_is_child(w)) return 1;
+        w = beer_window_other(w->parent);
+    }
+    return 0;
+}
+static u64 beer_ctl_get_text(u64 hwnd, u16 *buffer, u64 capacity);
+/* A window's text as UTF-8 (the native window title). */
+static void beer_window_title_utf8(u64 hwnd, char *out, size_t capacity)
+{
+    u16 text[256];
+    text[0] = 0;
+    beer_ctl_get_text(hwnd, text, 256);
+    size_t n = 0;
+    for (size_t i = 0; text[i] && n + 4 < capacity; ++i) {
+        const u32 c = text[i];
+        if (c < 0x80) out[n++] = (char)c;
+        else if (c < 0x800) { out[n++] = (char)(0xc0 | (c >> 6)); out[n++] = (char)(0x80 | (c & 0x3f)); }
+        else { out[n++] = (char)(0xe0 | (c >> 12)); out[n++] = (char)(0x80 | ((c >> 6) & 0x3f));
+               out[n++] = (char)(0x80 | (c & 0x3f)); }
+    }
+    out[n] = 0;
+}
+/* The frame of a captioned window: border, title bar with the window text, and a close button (drawn with GDI into
+ * the window's frame canvas, then copied into the composed pixels). */
+static void beer_window_draw_frame(BeerWindow *w, uint32_t *pixels)
+{
+    if (!w->nc_dc) w->nc_dc = beer_CreateCompatibleDC(0);
+    if (!w->nc_dc) return;
+    if (!w->nc_bitmap || w->nc_w != w->w || w->nc_h != BEER_NC_CAPTION) {
+        const u64 bitmap = beer_CreateCompatibleBitmap(0, w->w, BEER_NC_CAPTION);
+        if (!bitmap) return;
+        beer_SelectObject(w->nc_dc, bitmap);
+        if (w->nc_bitmap) beer_DeleteObject(w->nc_bitmap);
+        w->nc_bitmap = bitmap; w->nc_w = w->w; w->nc_h = BEER_NC_CAPTION;
+    }
+    s32 l, t, r, b;
+    beer_window_nc(w, &l, &t, &r, &b);
+    const u64 dc = w->nc_dc;
+    const int32_t bar[4] = { 0, 0, w->w, BEER_NC_CAPTION };
+    const u64 white = beer_CreateSolidBrush(0xFFFFFF);
+    beer_FillRect(dc, bar, white);
+    beer_DeleteObject(white);
+    u16 title[256];
+    title[0] = 0;
+    beer_ctl_get_text(w->hwnd, title, 256);
+    beer_SetBkMode(dc, 1);
+    beer_SetTextColor(dc, 0);
+    beer_SelectObject(dc, beer_GetStockObject(17));                                     /* DEFAULT_GUI_FONT */
+    int32_t text_rect[4] = { 10, 0, w->w - 50, BEER_NC_CAPTION };
+    beer_DrawTextW(dc, title, -1, text_rect, 0x0020 | 0x0004 | 0x0800 | 0x8000);     /* single, vcenter, ellipsis */
+    if (w->style & 0x00080000u) {                                                       /* WS_SYSMENU: close button */
+        const u64 ink = beer_CreateSolidBrush(0x000000);
+        const s32 cx = w->w - 23, cy = BEER_NC_CAPTION / 2;
+        for (int i = -5; i <= 5; ++i) {
+            const int32_t a[4] = { cx + i, cy + i, cx + i + 1, cy + i + 1 }, c[4] = { cx + i, cy - i, cx + i + 1, cy - i + 1 };
+            beer_FillRect(dc, a, ink); beer_FillRect(dc, c, ink);
+        }
+        beer_DeleteObject(ink);
+    }
+    uint32_t *bar_px = malloc((size_t)w->w * BEER_NC_CAPTION * 4u);
+    if (bar_px && beer_gdi_read_dc_argb(dc, 0, 0, w->w, BEER_NC_CAPTION, bar_px, NULL) && t >= BEER_NC_CAPTION)
+        memcpy(pixels, bar_px, (size_t)w->w * BEER_NC_CAPTION * 4u);
+    free(bar_px);
+    const uint32_t border = 0xff7a7a7au;
+    for (s32 x = 0; x < w->w; ++x) { pixels[x] = border; pixels[(size_t)(w->h - 1) * (size_t)w->w + (size_t)x] = border; }
+    for (s32 y = 0; y < w->h; ++y) { pixels[(size_t)y * (size_t)w->w] = border; pixels[(size_t)y * (size_t)w->w + (size_t)w->w - 1] = border; }
+}
+static void beer_compose_children(u64 parent, uint32_t *dst, s32 dst_w, s32 dst_h, s32 ox, s32 oy,
+                                  s32 clip_l, s32 clip_t, s32 clip_r, s32 clip_b, int depth)
+{
+    if (depth > 32) return;
+    BeerWindow *kids[BEER_MAX_WINDOWS];
+    int count = 0;
+    for (int i = 0; i < BEER_MAX_WINDOWS; ++i) {
+        BeerWindow *c = &g_beer_windows[i];
+        if (c->used && c->parent == parent && beer_window_is_child(c) && c->visible && c->w > 0 && c->h > 0)
+            kids[count++] = c;
+    }
+    for (int i = 1; i < count; ++i)                                   /* stacking order: bottom first */
+        for (int j = i; j > 0 && kids[j - 1]->z > kids[j]->z; --j) {
+            BeerWindow *t = kids[j]; kids[j] = kids[j - 1]; kids[j - 1] = t;
+        }
+    for (int k = 0; k < count; ++k) {
+        BeerWindow *c = kids[k];
+        const s32 cx = ox + c->x, cy = oy + c->y;
+        s32 l = cx > clip_l ? cx : clip_l, t = cy > clip_t ? cy : clip_t;
+        s32 r = cx + c->w < clip_r ? cx + c->w : clip_r, b = cy + c->h < clip_b ? cy + c->h : clip_b;
+        if (l >= r || t >= b) continue;
+        if (c->paint_dc) {
+            uint32_t *px = malloc((size_t)c->w * (size_t)c->h * 4u);
+            if (px && beer_gdi_read_dc_argb(c->paint_dc, 0, 0, c->w, c->h, px, NULL))
+                for (s32 y = t; y < b; ++y)
+                    for (s32 x = l; x < r; ++x)
+                        dst[(size_t)y * (size_t)dst_w + (size_t)x] = px[(size_t)(y - cy) * (size_t)c->w + (size_t)(x - cx)];
+            free(px);
+        }
+        beer_compose_children(c->hwnd, dst, dst_w, dst_h, cx, cy, l, t, r, b, depth + 1);
+    }
+    (void)dst_h;
+}
 static void beer_other_present(BeerWindow *w)
 {
-    if (!w->paint_dc || w->w <= 0 || w->h <= 0 || w->exstyle & 0x00080000u) return;   /* layered: UpdateLayeredWindow */
+    w = beer_window_top(w);
+    if (!w || w->w <= 0 || w->h <= 0 || w->exstyle & 0x00080000u) return;   /* layered: UpdateLayeredWindow */
+    if (!w->paint_dc && !beer_window_shown(w)) return;
     uint32_t *pixels = malloc((size_t)w->w * (size_t)w->h * 4u);
     if (!pixels) return;
-    if (beer_gdi_read_dc_argb(w->paint_dc, 0, 0, w->w, w->h, pixels, NULL)) {
-        for (size_t i = 0, n = (size_t)w->w * (size_t)w->h; i < n; ++i) pixels[i] |= 0xff000000u;
-        const char *dump = getenv("BEER_DUMP_POPUPS");                /* diagnostic: <dir>/popup-<hwnd>.ppm */
-        if (dump && *dump) {
-            char path[512];
-            snprintf(path, sizeof(path), "%s/popup-%llx.ppm", dump, (unsigned long long)w->hwnd);
-            FILE *f = fopen(path, "wb");
-            if (f) {
-                fprintf(f, "P6\n%d %d\n255\n", w->w, w->h);
-                for (size_t i = 0, n = (size_t)w->w * (size_t)w->h; i < n; ++i) {
-                    const unsigned char rgb[3] = { (unsigned char)(pixels[i] >> 16), (unsigned char)(pixels[i] >> 8),
-                                                   (unsigned char)pixels[i] };
-                    fwrite(rgb, 1, 3, f);
-                }
-                fclose(f);
+    s32 l, t, r, b;
+    beer_window_nc(w, &l, &t, &r, &b);
+    const s32 cw = w->w - l - r, ch = w->h - t - b;
+    for (size_t i = 0, n = (size_t)w->w * (size_t)w->h; i < n; ++i) pixels[i] = 0xfff0f0f0u;      /* COLOR_BTNFACE */
+    if (l || t) beer_window_draw_frame(w, pixels);
+    if (w->paint_dc && cw > 0 && ch > 0) {
+        uint32_t *client = malloc((size_t)cw * (size_t)ch * 4u);
+        if (client && beer_gdi_read_dc_argb(w->paint_dc, 0, 0, cw, ch, client, NULL))
+            for (s32 y = 0; y < ch; ++y)
+                memcpy(pixels + (size_t)(y + t) * (size_t)w->w + (size_t)l, client + (size_t)y * (size_t)cw, (size_t)cw * 4u);
+        free(client);
+    }
+    pthread_mutex_lock(&g_beer_windows_mtx);
+    beer_compose_children(w->hwnd, pixels, w->w, w->h, l, t, l, t, l + cw, t + ch, 0);
+    pthread_mutex_unlock(&g_beer_windows_mtx);
+    for (size_t i = 0, n = (size_t)w->w * (size_t)w->h; i < n; ++i) pixels[i] |= 0xff000000u;
+    const char *dump = getenv("BEER_DUMP_POPUPS");                    /* diagnostic: <dir>/popup-<hwnd>.ppm */
+    if (dump && *dump) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/popup-%llx.ppm", dump, (unsigned long long)w->hwnd);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", w->w, w->h);
+            for (size_t i = 0, n = (size_t)w->w * (size_t)w->h; i < n; ++i) {
+                const unsigned char rgb[3] = { (unsigned char)(pixels[i] >> 16), (unsigned char)(pixels[i] >> 8),
+                                               (unsigned char)pixels[i] };
+                fwrite(rgb, 1, 3, f);
             }
+            fclose(f);
         }
-        if (!w->surface) {
+    }
+    if (!w->surface) {
+        /* A captioned window is one of the program's dialogs: a managed window (keyboard focus, taskbar). Popups,
+         * menus and tooltips stay override-redirect surfaces. */
+        s32 l2, t2, r2, b2;
+        beer_window_nc(w, &l2, &t2, &r2, &b2);
+        if (t2 >= BEER_NC_CAPTION && !getenv("BEER_DIALOG_POPUP_SURFACES")) {
+            char title[512];
+            beer_window_title_utf8(w->hwnd, title, sizeof(title));
+            w->surface = xwayland_surface_create_window(w->x, w->y, w->w, w->h, title);
+        } else {
             w->surface = xwayland_surface_create(w->x, w->y, w->w, w->h);
-            fprintf(stderr, "[WIN] painted window 0x%llx %dx%d at %d,%d -> surface %d\n", (unsigned long long)w->hwnd,
-                    w->w, w->h, w->x, w->y, w->surface);
         }
-        if (w->surface) {
-            xwayland_surface_update(w->surface, w->x, w->y, w->w, w->h, pixels);
-            xwayland_surface_show(w->surface, w->visible);
-        }
+        fprintf(stderr, "[WIN] painted window 0x%llx %dx%d at %d,%d -> surface %d\n", (unsigned long long)w->hwnd,
+                w->w, w->h, w->x, w->y, w->surface);
+    } else if (xwayland_surface_is_managed(w->surface)) {
+        char title[512];
+        beer_window_title_utf8(w->hwnd, title, sizeof(title));
+        xwayland_surface_set_title(w->surface, title);
+    }
+    if (w->surface) {
+        xwayland_surface_update(w->surface, w->x, w->y, w->w, w->h, pixels);
+        xwayland_surface_show(w->surface, w->visible);
     }
     free(pixels);
 }
+/* Queues WM_PAINT to a visible window and to each of its visible descendants (Windows paints every invalid window). */
 static void beer_other_post_paint(BeerWindow *w)
 {
-    if (!w->visible || w->w <= 0 || w->h <= 0 || (w->exstyle & 0x00080000u) || w->paint_posted) return;
-    w->paint_posted = 1;
-    queue_message_for_thread(w->owner_tid, w->hwnd, 0x000f, 0, 0);                    /* WM_PAINT */
+    if (!w || !beer_window_shown(w) || w->w <= 0 || w->h <= 0 || (w->exstyle & 0x00080000u)) return;
+    if (!w->paint_posted) {
+        w->paint_posted = 1;
+        queue_message_for_thread(w->owner_tid, w->hwnd, 0x000f, 0, 0);                /* WM_PAINT */
+    }
+    for (int i = 0; i < BEER_MAX_WINDOWS; ++i) {
+        BeerWindow *c = &g_beer_windows[i];
+        if (c->used && c->parent == w->hwnd && beer_window_is_child(c) && c->visible) beer_other_post_paint(c);
+    }
+}
+/* A window changed visibility or place: its top-level window is composited again (and repainted when shown). */
+static void beer_other_refresh(BeerWindow *w)
+{
+    BeerWindow *top = beer_window_top(w);
+    if (!top) return;
+    if (beer_window_shown(w)) beer_other_post_paint(w);
+    beer_other_present(top);
 }
 static void beer_other_paint_free(BeerWindow *w)
 {
     if (w->paint_dc) beer_DeleteDC(w->paint_dc);
     if (w->paint_bitmap) beer_DeleteObject(w->paint_bitmap);
+    if (w->nc_dc) beer_DeleteDC(w->nc_dc);
+    if (w->nc_bitmap) beer_DeleteObject(w->nc_bitmap);
+    w->nc_dc = w->nc_bitmap = 0;
     w->paint_dc = w->paint_bitmap = 0;
     w->paint_w = w->paint_h = 0;
 }
@@ -13850,7 +14514,8 @@ impl_ShowWindow(u64 hw, u32 cmd) {
         }
         if (other->surface) xwayland_surface_show(other->surface, visible);
         if (was_visible != visible) call_window_proc(hw, 0x0018, (u64)visible, 0);
-        if (visible) beer_other_post_paint(other);
+        if (beer_window_is_child(other)) { if (was_visible != visible) beer_other_refresh(other); }
+        else if (visible) beer_other_post_paint(other);
         return (u64)was_visible;
     }
     if (hw != FAKE_HWND || !xwayland_window_exists()) {
@@ -13924,8 +14589,30 @@ impl_ShowWindow(u64 hw, u32 cmd) {
 static u64 __attribute__((ms_abi))
 impl_IsWindowEnabled(u64 hwnd)
 {
-    if (beer_window_other(hwnd)) return 1;
+    BeerWindow *other = beer_window_other(hwnd);
+    if (other) return !(other->style & 0x08000000u);                 /* WS_DISABLED */
     return hwnd == FAKE_HWND && xwayland_window_exists();
+}
+/* EnableWindow: WS_DISABLED on and off, WM_ENABLE on a change, redrawn (a dialog's OK button is enabled once a valid
+ * choice is made). Returns nonzero when the window was disabled before. */
+static u64 __attribute__((ms_abi)) impl_GetFocus(void);
+static u64 __attribute__((ms_abi)) impl_SetFocus(u64 hw);
+static void beer_other_post_paint(BeerWindow *w);
+static u64 beer_enable_window(u64 hwnd, u32 enable)
+{
+    BeerWindow *other = beer_window_other(hwnd);
+    if (!other) return 0;
+    const int was_disabled = (other->style & 0x08000000u) != 0;
+    if (getenv("BEER_WINDOW_DIAGNOSTICS"))
+        fprintf(stderr, "[WIN] EnableWindow(0x%llx, %u) was %s\n", (unsigned long long)hwnd, enable,
+                was_disabled ? "disabled" : "enabled");
+    if (enable) other->style &= ~0x08000000u; else other->style |= 0x08000000u;
+    if (was_disabled != !enable) {
+        call_window_proc(hwnd, 0x000A, enable ? 1 : 0, 0);           /* WM_ENABLE */
+        if (!enable && impl_GetFocus() == hwnd) impl_SetFocus(0);
+        beer_other_post_paint(other);
+    }
+    return (u64)was_disabled;
 }
 
 static u64 __attribute__((ms_abi))
@@ -13949,6 +14636,18 @@ impl_IsIconic(u64 hwnd)
     return 0;
 }
 
+/* Windows 10's user-interface font as a LOGFONTW (92 bytes): Segoe UI, 9 pt at 96 dpi. */
+static void beer_default_ui_logfont(u8 *lf, s32 weight)
+{
+    memset(lf, 0, 92);
+    const s32 height = -12;
+    memcpy(lf, &height, 4);
+    memcpy(lf + 16, &weight, 4);
+    lf[23] = 1;                                       /* DEFAULT_CHARSET */
+    lf[26] = 5;                                       /* CLEARTYPE_QUALITY */
+    static const char face[] = "Segoe UI";
+    for (size_t i = 0; face[i]; ++i) { const u16 c = (u8)face[i]; memcpy(lf + 28 + 2 * i, &c, 2); }
+}
 static u64 __attribute__((ms_abi))
 impl_SystemParametersInfoW(u32 action, u32 parameter, void *value, u32 update)
 {
@@ -14017,8 +14716,18 @@ impl_SystemParametersInfoW(u32 action, u32 parameter, void *value, u32 update)
         if (cb >= 16) *(s32*)((u8*)value + 12) = 17; /* iScrollHeight */
         if (cb >= 20) *(s32*)((u8*)value + 16) = 17; /* iCaptionWidth */
         if (cb >= 24) *(s32*)((u8*)value + 20) = 19; /* iCaptionHeight */
+        /* The fonts (LOGFONTW, the same in 32- and 64-bit code): caption, small caption, menu, status, message. */
+        static const u32 font_offsets[5] = { 24, 124, 224, 316, 408 };
+        for (int i = 0; i < 5; ++i)
+            if (cb >= font_offsets[i] + 92) beer_default_ui_logfont((u8 *)value + font_offsets[i], i == 0 ? 400 : 400);
+        if (cb >= 120) { *(s32*)((u8*)value + 116) = 17; *(s32*)((u8*)value + 120) = 17; }   /* small caption */
+        if (cb >= 224) { *(s32*)((u8*)value + 216) = 19; *(s32*)((u8*)value + 220) = 19; }   /* menu */
         return 1;
     }
+    case 0x001F: /* SPI_GETICONTITLELOGFONT: the font under desktop icons and in Explorer's lists */
+        if (!value) { g_last_error = 87; return 0; }
+        beer_default_ui_logfont((u8 *)value, 400);
+        return 1;
 
     /* ---- Wheel scrolling ---- */
     /* SPI_GETWHEELSCROLLLINES = 0x0068 conflicts with SPI_GETFLATMENU above;
@@ -14057,6 +14766,38 @@ impl_SystemParametersInfoW(u32 action, u32 parameter, void *value, u32 update)
 static u64 __attribute__((ms_abi))
 impl_SystemParametersInfoA(u32 action, u32 parameter, void *value, u32 update)
 {
+    /* The font queries carry LOGFONTA (60 bytes: the face name is 32 chars): convert from the wide answer. */
+    if (action == 0x001F && value) {
+        u8 wide[92];
+        const u64 r = impl_SystemParametersInfoW(action, parameter, wide, update);
+        memcpy(value, wide, 28);
+        for (int i = 0; i < 32; ++i) ((u8 *)value)[28 + i] = wide[28 + 2 * i];
+        return r;
+    }
+    if (action == 0x0029 && value) {                  /* NONCLIENTMETRICSA: five 60-byte LOGFONTAs */
+        const u32 cb = *(const u32 *)value;
+        u8 wide[504];
+        memset(wide, 0, sizeof(wide));
+        *(u32 *)wide = sizeof(wide);
+        const u64 r = impl_SystemParametersInfoW(action, parameter, wide, update);
+        u8 *out = value;
+        memset(out + 4, 0, cb > 4 ? cb - 4 : 0);
+        /* metrics before each font, then the font converted: A offsets 24/92/160/228/288... laid out in order */
+        size_t a = 4, w = 4;
+        const u32 font_w[5] = { 24, 124, 224, 316, 408 };
+        for (int f = 0; f < 5; ++f) {
+            const size_t metrics = font_w[f] - w;           /* the ints before this font */
+            if (a + metrics <= cb) memcpy(out + a, wide + w, metrics);
+            a += metrics; w += metrics;
+            if (a + 60 <= cb) {
+                memcpy(out + a, wide + w, 28);
+                for (int i = 0; i < 32; ++i) out[a + 28 + i] = wide[w + 28 + 2 * i];
+            }
+            a += 60; w += 92;
+        }
+        if (a + 4 <= cb) memcpy(out + a, wide + w, 4);     /* iPaddedBorderWidth */
+        return r;
+    }
     return impl_SystemParametersInfoW(action, parameter, value, update);
 }
 
@@ -16557,6 +17298,89 @@ static u32 profile_copy_wide(const char *value, u16 *output, u32 capacity)
     return (u32)copied;
 }
 
+/* Profile (.ini) lookups. A file name without a directory is in the Windows directory, as on Windows. Returns 1 with
+ * the value (quotes removed) when the key exists in the section. */
+static int profile_lookup(const char *section, const char *key, const char *filename, char *value, size_t capacity)
+{
+    if (!section || !key || !filename || !value || !capacity) return 0;
+    value[0] = 0;
+    char windows_name[PATH_MAX], host_path[PATH_MAX];
+    if (!strpbrk(filename, "\\/:")) {
+        snprintf(windows_name, sizeof(windows_name), "C:\\Windows\\%s", filename);
+        filename = windows_name;
+    }
+    if (!resolve_windows_host_path(filename, host_path, sizeof(host_path))) return 0;
+    FILE *file = fopen(host_path, "r");
+    if (!file) return 0;
+
+    char *line = NULL;
+    size_t line_capacity = 0;
+    int in_section = 0, found_key = 0;
+    while (getline(&line, &line_capacity, file) >= 0) {
+        char *text = line;
+        if ((u8)text[0] == 0xEF && (u8)text[1] == 0xBB && (u8)text[2] == 0xBF) text += 3;   /* UTF-8 BOM */
+        trim_ascii(text);
+        if (!text[0] || text[0] == ';' || text[0] == '#') continue;
+        if (text[0] == '[') {
+            char *end = strchr(text + 1, ']');
+            if (!end) { in_section = 0; continue; }
+            *end = 0;
+            trim_ascii(text + 1);
+            in_section = strcasecmp(text + 1, section) == 0;
+            continue;
+        }
+        if (!in_section) continue;
+        char *equals = strchr(text, '=');
+        if (!equals) continue;
+        *equals = 0;
+        trim_ascii(text);
+        if (strcasecmp(text, key) != 0) continue;
+        char *found = equals + 1;
+        trim_ascii(found);
+        size_t length = strlen(found);
+        if (length >= 2 && ((found[0] == '"' && found[length - 1] == '"') ||
+                            (found[0] == '\'' && found[length - 1] == '\''))) {
+            found[length - 1] = 0;
+            ++found;
+        }
+        if (!found_key) snprintf(value, capacity, "%s", found);    /* the first occurrence wins, as on Windows */
+        found_key = 1;
+    }
+    free(line);
+    fclose(file);
+    return found_key;
+}
+
+static u32 profile_copy_ansi(const char *value, char *output, u32 capacity)
+{
+    size_t length = value ? strlen(value) : 0;
+    if (!output || capacity == 0) return 0;
+    size_t copied = length < (size_t)capacity - 1 ? length : (size_t)capacity - 1;
+    memcpy(output, value ? value : "", copied);
+    output[copied] = 0;
+    return (u32)copied;
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetPrivateProfileStringA(const char *section, const char *key, const char *fallback, char *output, u32 capacity,
+                              const char *filename)
+{
+    if (!output || capacity == 0) return 0;
+    if (!filename) filename = "win.ini";
+    if (!section || !key) {                                  /* section/key enumeration is not implemented */
+        output[0] = 0;
+        if (capacity > 1) output[1] = 0;
+        g_last_error = 120;
+        return 0;
+    }
+    char value[4096], trimmed[1024];
+    if (profile_lookup(section, key, filename, value, sizeof(value))) return profile_copy_ansi(value, output, capacity);
+    snprintf(trimmed, sizeof(trimmed), "%s", fallback ? fallback : "");
+    trim_ascii(trimmed);
+    g_last_error = 2;
+    return profile_copy_ansi(trimmed, output, capacity);
+}
+
 static u64 __attribute__((ms_abi))
 impl_GetPrivateProfileStringW(const u16 *section_w, const u16 *key_w,
                               const u16 *default_w, u16 *output, u32 capacity,
@@ -16579,48 +17403,30 @@ impl_GetPrivateProfileStringW(const u16 *section_w, const u16 *key_w,
         g_last_error = 120; /* ERROR_CALL_NOT_IMPLEMENTED */
         return 0;
     }
-
-    char host_path[PATH_MAX];
-    if (!resolve_windows_host_path(filename, host_path, sizeof(host_path)))
-        return profile_copy_wide(fallback, output, capacity);
-    FILE *file = fopen(host_path, "r");
-    if (!file) return profile_copy_wide(fallback, output, capacity);
-
-    char *line = NULL;
-    size_t line_capacity = 0;
-    int in_section = 0;
     char value[4096];
-    value[0] = 0;
-    while (getline(&line, &line_capacity, file) >= 0) {
-        trim_ascii(line);
-        if (!line[0] || line[0] == ';' || line[0] == '#') continue;
-        if (line[0] == '[') {
-            char *end = strchr(line + 1, ']');
-            if (!end) { in_section = 0; continue; }
-            *end = 0;
-            trim_ascii(line + 1);
-            in_section = strcasecmp(line + 1, section) == 0;
-            continue;
-        }
-        if (!in_section) continue;
-        char *equals = strchr(line, '=');
-        if (!equals) continue;
-        *equals = 0;
-        trim_ascii(line);
-        if (strcasecmp(line, key) != 0) continue;
-        char *found = equals + 1;
-        trim_ascii(found);
-        size_t length = strlen(found);
-        if (length >= 2 && ((found[0] == '"' && found[length - 1] == '"') ||
-                            (found[0] == '\'' && found[length - 1] == '\''))) {
-            found[length - 1] = 0;
-            ++found;
-        }
-        snprintf(value, sizeof(value), "%s", found);
-    }
-    free(line);
-    fclose(file);
-    return profile_copy_wide(value[0] ? value : fallback, output, capacity);
+    if (profile_lookup(section, key, filename, value, sizeof(value))) return profile_copy_wide(value, output, capacity);
+    trim_ascii(fallback);
+    return profile_copy_wide(fallback, output, capacity);
+}
+
+/* GetPrivateProfileInt: the value's leading decimal number (signed), or the default when the key is absent. */
+static u64 profile_int(const char *section, const char *key, s32 fallback, const char *filename)
+{
+    char value[4096];
+    if (!profile_lookup(section, key, filename ? filename : "win.ini", value, sizeof(value))) return (u32)fallback;
+    return (u32)(s32)strtol(value, NULL, 10);
+}
+static u64 __attribute__((ms_abi))
+impl_GetPrivateProfileIntA(const char *section, const char *key, s32 fallback, const char *filename)
+    { return profile_int(section, key, fallback, filename); }
+static u64 __attribute__((ms_abi))
+impl_GetPrivateProfileIntW(const u16 *section_w, const u16 *key_w, s32 fallback, const u16 *filename_w)
+{
+    char section[256], key[256], filename[PATH_MAX];
+    if (!wide_ascii_copy(section_w, section, sizeof(section)) || !wide_ascii_copy(key_w, key, sizeof(key)) ||
+        !wide_ascii_copy(filename_w ? filename_w : (const u16 *)u"win.ini", filename, sizeof(filename)))
+        return (u32)fallback;
+    return profile_int(section, key, fallback, filename);
 }
 
 static u64 __attribute__((ms_abi))
@@ -17983,6 +18789,7 @@ impl_CloseHandle(u64 h)
 {
     int tid = thread_id_from_handle(h);
     if (tid < 0 && dup_ref_release(h)) return 1;       /* a duplicate handle: the object stays open */
+    handle_set_inheritable(h, 0);                      /* a later object reusing this value starts uninheritable */
     if (tid >= 0) {
         WinThread *t = &g_threads[tid];
         pthread_mutex_lock(&t->mtx);
@@ -18351,9 +19158,53 @@ static void beer_pipe_dump(const char *dir, u64 h, const void *buf, ssize_t n)
     fputc('\n', stderr);
 }
 
+/* Diagnostics: BEER_STDIO_TEE_DIR=<dir> copies what the program reads from standard input and writes to standard
+ * output to <dir>/<pid>-<image>.{in,out} (comparing a pipeline stage's input and output with a reference run). */
+static void beer_stdio_tee(int stream, const void *data, ssize_t size)
+{
+    static int fds[2] = { -2, -2 };
+    if (stream < 0 || stream > 1 || size <= 0) return;
+    if (fds[stream] == -2) {
+        const char *dir = getenv("BEER_STDIO_TEE_DIR");
+        fds[stream] = -1;
+        if (dir && *dir) {
+            char path[PATH_MAX];
+            const char *image = g_exe_path ? strrchr(g_exe_path, '\\') : NULL;
+            snprintf(path, sizeof(path), "%s/%d-%s.%s", dir, (int)getpid(), image ? image + 1 : "exe",
+                     stream ? "out" : "in");
+            fds[stream] = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        }
+    }
+    if (fds[stream] < 0) return;
+    for (ssize_t done = 0; done < size;) {
+        const ssize_t part = write(fds[stream], (const u8 *)data + done, (size_t)(size - done));
+        if (part < 0 && errno == EINTR) continue;
+        if (part <= 0) break;
+        done += part;
+    }
+}
+
 static u64 __attribute__((ms_abi))
 impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
 {
+    if (h == (u64)(int64_t)-10) {
+        /* STD_INPUT_HANDLE: the process's standard input (WriteFile maps -11/-12 the same way). A parent that hands
+         * a child a pipe as stdin (unarc feeding rz-1.03.7-stdio.exe) expects ReadFile to read it. At the end of a
+         * pipe ReadFile fails with ERROR_BROKEN_PIPE; at the end of a file it succeeds with 0 bytes. */
+        ssize_t got;
+        do { got = read(STDIN_FILENO, buf, n); } while (got < 0 && errno == EINTR);
+        beer_stdio_tee(0, buf, got);
+        if (done) *done = got > 0 ? (u32)got : 0;
+        if (overlapped) { overlapped->Internal = got < 0 ? 0xC0000185u : 0; overlapped->InternalHigh = got > 0 ? (u64)got : 0; }
+        if (got < 0) { g_last_error = 6; return 0; }
+        struct stat st;
+        if (got == 0 && fstat(STDIN_FILENO, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) {
+            g_last_error = 109;
+            return 0;
+        }
+        g_last_error = 0;
+        return 1;
+    }
     int fd = fh_get(h);
     if (fd < 0 || (!buf && n)) {
         if (done) *done = 0;
@@ -19211,8 +20062,12 @@ impl_GetWindowRect(u64 hwnd, WIN_RECT *rect) {
     }
     XwaylandWindowState state;
     BeerWindow *other = beer_window_other(hwnd);
-    if (other) {
-        rect->left = other->x; rect->top = other->y; rect->right = other->x + other->w; rect->bottom = other->y + other->h;
+    if (other) {                                     /* the window's own origin: its client origin less its frame */
+        s32 ox = other->x, oy = other->y, l, t, r, b;
+        beer_window_screen_origin(other, &ox, &oy);
+        beer_window_nc(other, &l, &t, &r, &b);
+        ox -= l; oy -= t;
+        rect->left = ox; rect->top = oy; rect->right = ox + other->w; rect->bottom = oy + other->h;
         return 1;
     }
     if (hwnd != FAKE_HWND || !xwayland_window_get_state(&state)) {
@@ -19235,7 +20090,8 @@ impl_GetClientRect(u64 hwnd, WIN_RECT *rect) {
     if (!rect) { g_last_error = 87; return 0; }
     BeerWindow *other = beer_window_other(hwnd);
     if (other) {
-        rect->left = 0; rect->top = 0; rect->right = other->w; rect->bottom = other->h;
+        rect->left = 0; rect->top = 0;
+        beer_window_client_size(other, &rect->right, &rect->bottom);
         static _Atomic(u32) logs;
         if (atomic_fetch_add(&logs, 1) < 16)
             fprintf(stderr, "[WIN] GetClientRect(other 0x%llx) -> %dx%d\n", (unsigned long long)hwnd, other->w, other->h);
@@ -19603,6 +20459,8 @@ static u64 create_surfaceless_window(u32 exstyle, u64 classname, u64 title, u32 
     w->x = (u32)x == 0x80000000u ? 0 : x; w->y = (u32)y == 0x80000000u ? 0 : y;
     w->w = (u32)width == 0x80000000u ? 0 : width; w->h = (u32)height == 0x80000000u ? 0 : height;
     w->visible = (style & 0x10000000u) != 0;                          /* WS_VISIBLE */
+    /* A new child window is at the bottom of its siblings, a new top-level window at the top (CreateWindowEx). */
+    w->z = (style & 0x40000000u) ? --g_window_z_bottom : ++g_window_z_top;
     WIN_CREATESTRUCT create = {
         .lpCreateParams = param, .hInstance = inst, .hMenu = menu, .hwndParent = parent,
         .cy = w->h, .cx = w->w, .y = w->y, .x = w->x, .style = (s32)style,
@@ -19612,9 +20470,9 @@ static u64 create_surfaceless_window(u32 exstyle, u64 classname, u64 title, u32 
     const u64 nccreate = call_window_proc(hwnd, 0x0081, 0, (u64)(uintptr_t)&create);
     const u64 created = nccreate ? call_window_proc(hwnd, 0x0001, 0, (u64)(uintptr_t)&create) : 0;
     if (getenv("BEER_WINDOW_DIAGNOSTICS"))
-        fprintf(stderr, "[WIN]   surfaceless 0x%llx proc=0x%llx NCCREATE->0x%llx CREATE->0x%llx\n",
+        fprintf(stderr, "[WIN]   surfaceless 0x%llx proc=0x%llx NCCREATE->0x%llx CREATE->0x%llx %dx%d at %d,%d parent 0x%llx\n",
                 (unsigned long long)hwnd, (unsigned long long)proc, (unsigned long long)nccreate,
-                (unsigned long long)created);
+                (unsigned long long)created, w->w, w->h, w->x, w->y, (unsigned long long)parent);
     if (!nccreate || (s64)created == -1) {
         call_window_proc(hwnd, 0x0082, 0, 0);
         beer_window_free(hwnd);
@@ -19636,7 +20494,8 @@ static int window_class_is_system(u64 classname)
 static u64 window_system_class_proc(u64 classname)
 {
     static const char *const names[] = { "static", "button", "edit", "listbox", "combobox", "scrollbar", "mdiclient",
-                                         "richedit20w", "richedit20a", "msctls_progress32", "#32770" };
+                                         "richedit20w", "richedit20a", "richedit50w", "msctls_progress32", "#32770",
+                                         "systreeview32" };
     if (!classname) return 0;
     const u8 *raw = (const u8 *)(uintptr_t)classname;
     char key[128];
@@ -19670,6 +20529,11 @@ static u64 create_guest_window(u32 exstyle, u64 classname, u64 title, u32 style,
         return create_surfaceless_window(exstyle, classname, title, style, x, y, w, h, parent, menu, inst,
                                          param, class_proc);
 
+    /* A child window (WS_CHILD) of a Beer-drawn window, such as a dialog's controls, lives in its parent's client
+     * area and is composited onto the parent's surface (beer_other_present). It used to take the native surface. */
+    if ((style & 0x40000000u) && parent && beer_window_other(parent) && !getenv("BEER_SINGLE_WINDOW"))
+        return create_surfaceless_window(exstyle, classname, title, style, x, y, w, h, parent, menu, inst,
+                                         param, class_proc);
     /* Built-in USER32 child controls occupy rectangles in their parent's
      * client area. They must not replace or resize the process's native
      * top-level window. Beer currently has one native top-level surface, so
@@ -20077,6 +20941,34 @@ static int resize_native_from_outer(s32 x, s32 y, s32 w, s32 h,
 /* SetWindowPos/MoveWindow on a window without the native surface: WM_WINDOWPOSCHANGING (the window may adjust the
  * values), the new rectangle, WM_WINDOWPOSCHANGED (whose default handling sends WM_MOVE / WM_SIZE), as Windows does.
  * Dialog frameworks lay out their content and drop shadows from these messages. */
+static void beer_window_restack(u64 hwnd, u64 after)
+{
+    pthread_mutex_lock(&g_beer_windows_mtx);
+    BeerWindow *self = beer_window_find(hwnd);
+    BeerWindow *target = after > 1 && after != (u64)-1 && after != (u64)-2 ? beer_window_find(after) : NULL;
+    if (!self) { pthread_mutex_unlock(&g_beer_windows_mtx); return; }
+    if (!target || target == self || target->parent != self->parent) {
+        if (after == 1) self->z = --g_window_z_bottom; else self->z = ++g_window_z_top;
+        pthread_mutex_unlock(&g_beer_windows_mtx);
+        return;
+    }
+    /* Behind `target`: renumber the siblings bottom to top with self inserted just below target. */
+    BeerWindow *siblings[BEER_MAX_WINDOWS];
+    int count = 0;
+    for (int i = 0; i < BEER_MAX_WINDOWS; ++i) {
+        BeerWindow *c = &g_beer_windows[i];
+        if (c->used && c != self && c->parent == self->parent) siblings[count++] = c;
+    }
+    for (int i = 1; i < count; ++i)
+        for (int j = i; j > 0 && siblings[j - 1]->z > siblings[j]->z; --j) {
+            BeerWindow *t = siblings[j]; siblings[j] = siblings[j - 1]; siblings[j - 1] = t;
+        }
+    for (int i = 0; i < count; ++i) {
+        if (siblings[i] == target) self->z = ++g_window_z_top;
+        siblings[i]->z = ++g_window_z_top;
+    }
+    pthread_mutex_unlock(&g_beer_windows_mtx);
+}
 static void beer_other_window_pos(BeerWindow *other, u64 hw, u64 after, s32 x, s32 y, s32 w, s32 h, u32 flags)
 {
     struct { u64 hwnd, after; s32 x, y, cx, cy; u32 flags; u32 pad; } pos = {
@@ -20086,12 +20978,23 @@ static void beer_other_window_pos(BeerWindow *other, u64 hw, u64 after, s32 x, s
     if (!moved) pos.flags |= 0x0002;
     if (!sized) pos.flags |= 0x0001;
     call_window_proc(hw, 0x0046, 0, (u64)(uintptr_t)&pos);             /* WM_WINDOWPOSCHANGING */
+    {   /* A drop-down combo box is only its box; the height asked for is the drop-down list's. */
+        pthread_mutex_lock(&g_beer_ctl_mtx);
+        BeerCtl *c = beer_ctl_get(hw, 0);
+        if (c && c->is_combo && (other->style & 3) >= 2 && !(pos.flags & 0x0001) && pos.cy > BEER_COMBO_BOX_H) {
+            c->dropped_h = pos.cy;
+            pos.cy = BEER_COMBO_BOX_H;
+        }
+        pthread_mutex_unlock(&g_beer_ctl_mtx);
+    }
     other->x = pos.x; other->y = pos.y; other->w = pos.cx; other->h = pos.cy;
+    const int restacked = !(flags & 0x0004);                            /* not SWP_NOZORDER */
+    if (restacked) beer_window_restack(hw, after);
     if (flags & 0x0040) other->visible = 1;                             /* SWP_SHOWWINDOW */
     if (flags & 0x0080) other->visible = 0;                             /* SWP_HIDEWINDOW */
     {
         static _Atomic(u32) logs;
-        if (atomic_fetch_add(&logs, 1) < 32)
+        if (atomic_fetch_add(&logs, 1) < 32 || getenv("BEER_WINDOW_DIAGNOSTICS"))
             fprintf(stderr, "[WIN] position other 0x%llx -> %dx%d at %d,%d flags=0x%x visible=%d ex=0x%x\n",
                     (unsigned long long)hw, other->w, other->h, other->x, other->y, flags, other->visible,
                     other->exstyle);
@@ -20103,7 +21006,8 @@ static void beer_other_window_pos(BeerWindow *other, u64 hw, u64 after, s32 x, s
     }
     if ((pos.flags & 0x0003) != 0x0003 || (flags & 0x00c0))
         call_window_proc(hw, 0x0047, 0, (u64)(uintptr_t)&pos);         /* WM_WINDOWPOSCHANGED */
-    if (sized || (flags & 0x0040)) beer_other_post_paint(other);
+    if (beer_window_is_child(other)) { if (moved || sized || (flags & 0x00c0) || restacked) beer_other_refresh(other); }
+    else if (sized || (flags & 0x0040)) beer_other_post_paint(other);
 }
 
 static u64 __attribute__((ms_abi))
@@ -20204,10 +21108,11 @@ impl_BeginPaint(u64 hw, BEER_PAINTSTRUCT *ps)
         const u64 dc = beer_other_paint_dc(other);
         memset(ps, 0, sizeof(*ps));
         ps->hdc = dc;
-        ps->fErase = 1;
-        ps->rc_right = other->w;
-        ps->rc_bottom = other->h;
+        beer_window_client_size(other, &ps->rc_right, &ps->rc_bottom);
         other->paint_posted = 0;
+        /* The background is erased first (WM_ERASEBKGND; Delphi forms fill their colour there). fErase stays set when
+         * the window did not erase it. */
+        ps->fErase = dc ? call_window_proc(hw, 0x0014, dc, 0) == 0 : 1;
         static _Atomic(u32) logs;
         if (atomic_fetch_add(&logs, 1) < 8)
             fprintf(stderr, "[WIN] BeginPaint(other 0x%llx) %dx%d dc=0x%llx\n", (unsigned long long)hw, other->w,
@@ -20684,7 +21589,12 @@ static u64 __attribute__((ms_abi))
 impl_ScreenToClient(u64 hwnd, WIN_POINT *point)
 {
     BeerWindow *other = beer_window_other(hwnd);
-    if (other && point) { point->x -= other->x; point->y -= other->y; return 1; }   /* frameless: client = window */
+    if (other && point) {
+        s32 ox = other->x, oy = other->y;
+        beer_window_screen_origin(other, &ox, &oy);
+        point->x -= ox; point->y -= oy;
+        return 1;
+    }
     if (hwnd != FAKE_HWND || !point) { g_last_error = hwnd == FAKE_HWND ? 87 : 1400; return 0; }
     XwaylandWindowState state;
     if (!xwayland_window_get_state(&state)) { g_last_error = 1400; return 0; }
@@ -20715,7 +21625,12 @@ static u64 __attribute__((ms_abi))
 impl_ClientToScreen(u64 hwnd, WIN_POINT *point)
 {
     BeerWindow *other = beer_window_other(hwnd);
-    if (other && point) { point->x += other->x; point->y += other->y; return 1; }
+    if (other && point) {
+        s32 ox = other->x, oy = other->y;
+        beer_window_screen_origin(other, &ox, &oy);
+        point->x += ox; point->y += oy;
+        return 1;
+    }
     if (hwnd != FAKE_HWND || !point) { g_last_error = hwnd == FAKE_HWND ? 87 : 1400; return 0; }
     XwaylandWindowState state;
     if (!xwayland_window_get_state(&state)) { g_last_error = 1400; return 0; }
@@ -20727,6 +21642,15 @@ impl_ClientToScreen(u64 hwnd, WIN_POINT *point)
 static u64 __attribute__((ms_abi))
 impl_MapWindowPoints(u64 from, u64 to, WIN_POINT *points, u32 count)
 {
+    /* Beer-drawn windows (dialogs and their controls) on either side: through screen coordinates. */
+    if ((from && beer_window_other(from)) || (to && beer_window_other(to))) {
+        WIN_POINT origin = { 0, 0 };
+        if (from && from != FAKE_DESKTOP_HWND) impl_ClientToScreen(from, &origin);
+        if (to && to != FAKE_DESKTOP_HWND) impl_ScreenToClient(to, &origin);
+        for (u32 i = 0; points && i < count; ++i) { points[i].x += origin.x; points[i].y += origin.y; }
+        g_last_error = 0;
+        return ((u64)(u16)origin.y << 16) | (u16)origin.x;
+    }
     const int from_window = from == FAKE_HWND, to_window = to == FAKE_HWND;
     if ((from && !from_window && from != FAKE_DESKTOP_HWND) || (to && !to_window && to != FAKE_DESKTOP_HWND)) {
         g_last_error = 1400;
@@ -21174,8 +22098,8 @@ impl_SetCapture(u64 hw)
         if (atomic_fetch_add(&logs, 1) < 40)
             fprintf(stderr, "[INPUT] SetCapture(0x%llx)\n", (unsigned long long)hw);
     }
-    if (hw != FAKE_HWND) return 0;
-    return atomic_exchange(&g_mouse_capture_hwnd, FAKE_HWND);     /* the previous capture window */
+    if (hw != FAKE_HWND && !beer_window_other(hw)) return 0;
+    return atomic_exchange(&g_mouse_capture_hwnd, hw);            /* the previous capture window */
 }
 static u64 __attribute__((ms_abi))
 impl_ReleaseCapture(void)
@@ -21196,6 +22120,31 @@ static u64 __attribute__((ms_abi))
 impl_WindowFromPoint(u64 packed)
 {
     const s32 x = (s32)(u32)packed, y = (s32)(u32)(packed >> 32);
+    /* A shown Beer-drawn window (a dialog with its own surface) under the point, then its deepest visible child. */
+    u64 drawn = 0;
+    pthread_mutex_lock(&g_beer_windows_mtx);
+    for (int i = 0; i < BEER_MAX_WINDOWS; ++i) {
+        BeerWindow *w = &g_beer_windows[i];
+        if (!w->used || !w->surface || !w->visible || beer_window_is_child(w)) continue;
+        if (x >= w->x && y >= w->y && x < w->x + w->w && y < w->y + w->h && w->hwnd > drawn) drawn = w->hwnd;
+    }
+    for (int depth = 0; drawn && depth < 32; ++depth) {
+        s32 ox = 0, oy = 0;
+        BeerWindow *parent = beer_window_other(drawn);
+        if (!parent || !beer_window_screen_origin(parent, &ox, &oy)) break;
+        u64 hit = 0;
+        s64 hit_z = 0;
+        for (int i = 0; i < BEER_MAX_WINDOWS; ++i) {
+            const BeerWindow *c = &g_beer_windows[i];
+            if (!c->used || c->parent != drawn || !beer_window_is_child(c) || !c->visible) continue;
+            if (x - ox >= c->x && y - oy >= c->y && x - ox < c->x + c->w && y - oy < c->y + c->h && (!hit || c->z > hit_z))
+                { hit = c->hwnd; hit_z = c->z; }
+        }
+        if (!hit) break;
+        drawn = hit;
+    }
+    pthread_mutex_unlock(&g_beer_windows_mtx);
+    if (drawn) return drawn;
     WIN_RECT rect;
     const int visible = impl_IsWindowVisible(FAKE_HWND) != 0, have_rect = impl_GetWindowRect(FAKE_HWND, &rect) != 0;
     const u64 result = visible && have_rect && x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
@@ -21211,9 +22160,30 @@ impl_WindowFromPoint(u64 packed)
     }
     return result;
 }
+/* Keyboard focus on a Beer-drawn window (a dialog control): Delphi only acts on a click when the control it gave the
+ * focus to on WM_LBUTTONDOWN reports it with GetFocus. */
+static _Atomic(u64) g_other_focus;
+static u64 beer_focus_other(u64 hw)
+{
+    const u64 previous = atomic_exchange(&g_other_focus, hw);
+    if (previous == hw) return previous;
+    if (previous && beer_window_other(previous)) call_window_proc(previous, 0x0008, hw, 0);   /* WM_KILLFOCUS */
+    if (hw) call_window_proc(hw, 0x0007, previous, 0);                                      /* WM_SETFOCUS */
+    return previous;
+}
 static u64 __attribute__((ms_abi))
 impl_SetFocus(u64 hw)
 {
+    if (hw && beer_window_other(hw)) {
+        BeerWindow *w = beer_window_other(hw);
+        if (w->style & 0x08000000u) return 0;                                               /* disabled */
+        const u64 previous = beer_focus_other(hw);
+        return previous ? previous : (g_window_focused ? FAKE_HWND : 0);
+    }
+    if (atomic_load(&g_other_focus)) {
+        const u64 previous = beer_focus_other(0);
+        if (!hw) return previous;
+    }
     if (hw && hw != FAKE_HWND) { g_last_error = 1400; return 0; }
     u64 previous = g_window_focused ? FAKE_HWND : 0;
     if (hw == FAKE_HWND && xwayland_window_focus_lost_by_user()) {
@@ -21241,7 +22211,12 @@ impl_SetFocus(u64 hw)
     return previous;
 }
 static u64 __attribute__((ms_abi))
-impl_GetFocus(void) { return g_window_focused ? FAKE_HWND : 0; }
+impl_GetFocus(void)
+{
+    const u64 other = atomic_load(&g_other_focus);
+    if (other && beer_window_other(other)) return other;
+    return g_window_focused ? FAKE_HWND : 0;
+}
 static u64 __attribute__((ms_abi))
 impl_GetActiveWindow(void) { return g_window_focused ? FAKE_HWND : 0; }
 static u64 __attribute__((ms_abi))
@@ -21639,13 +22614,140 @@ static void beer_route_surface_event(const XwaylandEvent *event)
             hwnd = g_beer_windows[i].hwnd;
             owner = g_beer_windows[i].owner_tid;
         }
+    if (hwnd && event->type == XWAYLAND_EVENT_CONFIGURE) {             /* the window manager placed the dialog */
+        BeerWindow *top = beer_window_other(hwnd);
+        if (top) { top->x = event->x; top->y = event->y; }
+        pthread_mutex_unlock(&g_beer_windows_mtx);
+        return;
+    }
+    if (hwnd && event->type == XWAYLAND_EVENT_CLOSE) {                 /* closed from the window manager */
+        pthread_mutex_unlock(&g_beer_windows_mtx);
+        queue_message_for_thread(owner, hwnd, 0x0010, 0, 0);          /* WM_CLOSE */
+        return;
+    }
+    if (event->type == XWAYLAND_EVENT_FOCUS_IN || event->type == XWAYLAND_EVENT_FOCUS_OUT) {
+        pthread_mutex_unlock(&g_beer_windows_mtx);
+        if (hwnd && event->type == XWAYLAND_EVENT_FOCUS_IN) queue_message_for_thread(owner, hwnd, 0x0006, 1, 0);
+        return;
+    }
+    if (hwnd && (event->type == XWAYLAND_EVENT_KEY_DOWN || event->type == XWAYLAND_EVENT_KEY_UP)) {
+        /* Keys go to the focused control of this dialog (SetFocus), else to the dialog itself. */
+        BeerWindow *top = beer_window_other(hwnd);
+        const u64 focus = atomic_load(&g_other_focus);
+        BeerWindow *focused = focus ? beer_window_other(focus) : NULL;
+        u64 target = hwnd;
+        u32 target_owner = owner;
+        if (focused && beer_window_top(focused) == top) { target = focused->hwnd; target_owner = focused->owner_tid; }
+        pthread_mutex_unlock(&g_beer_windows_mtx);
+        const int down = event->type == XWAYLAND_EVENT_KEY_DOWN;
+        u32 vk = x11_keycode_to_vk(event->keycode);
+        if (!vk) vk = x11_keysym_to_vk(event->keysym);
+        const u8 dik = x11_keycode_to_dik(event->keycode);
+        const int extended = x11_keycode_is_extended(event->keycode);
+        pthread_mutex_lock(&g_input_mutex);
+        const int repeat = down && vk && vk < 256 && (g_input.keys[vk] & 0x80);
+        pthread_mutex_unlock(&g_input_mutex);
+        beer_deliver_key(vk, dik, extended, down, 0);                 /* key state (GetKeyState) only */
+        if (!vk) return;
+        u32 message_vk = vk;
+        if (vk == 0xa0 || vk == 0xa1) message_vk = 0x10;
+        else if (vk == 0xa2 || vk == 0xa3) message_vk = 0x11;
+        else if (vk == 0xa4 || vk == 0xa5) message_vk = 0x12;
+        pthread_mutex_lock(&g_input_mutex);
+        const int alt = (g_input.keys[0x12] & 0x80) != 0, ctrl = (g_input.keys[0x11] & 0x80) != 0;
+        pthread_mutex_unlock(&g_input_mutex);
+        u64 lparam = 1 | ((u64)(dik & 0x7f) << 16);
+        if (extended) lparam |= 1ULL << 24;
+        if (alt) lparam |= 1ULL << 29;
+        if (!down) lparam |= 0xc0000000ULL;
+        else if (repeat) lparam |= 0x40000000ULL;
+        const int sys = (alt && !ctrl) || message_vk == 0x12 || message_vk == 0x79;   /* Alt combinations, F10 */
+        queue_message_for_thread(target_owner, target, sys ? (down ? 0x0104u : 0x0105u) : (down ? 0x0100u : 0x0101u),
+                                 message_vk, lparam);
+        return;
+    }
+    /* The deepest visible, enabled child under the pointer takes it, in its own client coordinates (dialog controls);
+     * a window that captured the mouse (SetCapture, e.g. a pressed button) keeps it. */
+    s32 px = event->x, py = event->y;
+    {
+        /* The frame Beer draws (beer_window_draw_frame): dragging the caption moves the window, the close button
+         * posts WM_CLOSE; the client area starts below and right of the frame. */
+        BeerWindow *top = beer_window_other(hwnd);
+        if (top && (top->style & 0x08000000u) && event->type != XWAYLAND_EVENT_POINTER_MOTION) {
+            pthread_mutex_unlock(&g_beer_windows_mtx);                 /* disabled (a modal dialog is open) */
+            return;
+        }
+        if (top) {
+            s32 l, t, r, b;
+            beer_window_nc(top, &l, &t, &r, &b);
+            if (top->dragging && event->type == XWAYLAND_EVENT_POINTER_MOTION) {
+                top->x = event->root_x - top->drag_dx; top->y = event->root_y - top->drag_dy;
+                if (top->surface) xwayland_surface_update(top->surface, top->x, top->y, top->w, top->h, NULL);
+                pthread_mutex_unlock(&g_beer_windows_mtx);
+                return;
+            }
+            if (top->dragging && event->type == XWAYLAND_EVENT_BUTTON_UP) {
+                top->dragging = 0;
+                pthread_mutex_unlock(&g_beer_windows_mtx);
+                return;
+            }
+            if (t >= BEER_NC_CAPTION && py < t && event->button == 1 && event->type == XWAYLAND_EVENT_BUTTON_DOWN &&
+                !atomic_load(&g_mouse_capture_hwnd)) {
+                if ((top->style & 0x00080000u) && px >= top->w - 46) {             /* close button */
+                    const u32 tid = top->owner_tid;
+                    const u64 target = top->hwnd;
+                    pthread_mutex_unlock(&g_beer_windows_mtx);
+                    queue_message_for_thread(tid, target, 0x0010, 0, 0);          /* WM_CLOSE */
+                    return;
+                }
+                if (xwayland_surface_is_managed(top->surface)) {           /* the window manager moves it */
+                    const int surface = top->surface;
+                    pthread_mutex_unlock(&g_beer_windows_mtx);
+                    xwayland_surface_begin_move(surface, event->root_x, event->root_y, (int)event->button);
+                    return;
+                }
+                top->dragging = 1;
+                top->drag_dx = event->root_x - top->x; top->drag_dy = event->root_y - top->y;
+                pthread_mutex_unlock(&g_beer_windows_mtx);
+                return;
+            }
+            px -= l; py -= t;
+        }
+        u64 parent = hwnd;
+        for (int depth = 0; parent && depth < 32; ++depth) {
+            u64 hit = 0; s32 hx = 0, hy = 0;
+            s64 hit_z = 0;
+            for (int i = 0; i < BEER_MAX_WINDOWS; ++i) {
+                const BeerWindow *c = &g_beer_windows[i];
+                if (!c->used || c->parent != parent || !beer_window_is_child(c) || !c->visible) continue;
+                if (c->style & 0x08000000u) continue;                                  /* WS_DISABLED */
+                if (px < c->x || py < c->y || px >= c->x + c->w || py >= c->y + c->h) continue;
+                if (!hit || c->z > hit_z) { hit = c->hwnd; hit_z = c->z; hx = c->x; hy = c->y; owner = c->owner_tid; }
+            }
+            if (!hit) break;
+            hwnd = hit; px -= hx; py -= hy; parent = hit;
+        }
+        const u64 capture_hwnd = atomic_load(&g_mouse_capture_hwnd);
+        BeerWindow *captured = capture_hwnd ? beer_window_other(capture_hwnd) : NULL;
+        if (captured && captured->hwnd != hwnd) {
+            s32 ox = 0, oy = 0;
+            if (beer_window_screen_origin(captured, &ox, &oy)) {
+                hwnd = captured->hwnd; owner = captured->owner_tid;
+                px = event->root_x - ox; py = event->root_y - oy;
+            }
+        }
+    }
     pthread_mutex_unlock(&g_beer_windows_mtx);
+    if (getenv("BEER_INPUT_DIAGNOSTICS") && event->type != XWAYLAND_EVENT_POINTER_MOTION)
+        fprintf(stderr, "[INPUT] surface %d button %u %s at %d,%d -> hwnd 0x%llx (%d,%d) thread %u\n", event->surface,
+                event->button, event->type == XWAYLAND_EVENT_BUTTON_DOWN ? "down" : "up", event->x, event->y,
+                (unsigned long long)hwnd, px, py, owner);
     if (!hwnd) return;
     pthread_mutex_lock(&g_input_mutex);
     g_input.root_x = event->root_x;                  /* GetCursorPos while the pointer is over the popup */
     g_input.root_y = event->root_y;
     pthread_mutex_unlock(&g_input_mutex);
-    const u64 lparam = (u64)(u16)event->x | ((u64)(u16)event->y << 16);
+    const u64 lparam = (u64)(u16)px | ((u64)(u16)py << 16);
     u64 keys = 0;                                    /* MK_* from the X button state */
     if (event->state & (1u << 8)) keys |= 0x0001;
     if (event->state & (1u << 10)) keys |= 0x0002;
@@ -22676,6 +23778,15 @@ impl_DefWindowProcW(u64 hw, u32 msg, u64 wp, u64 lp)
             s32 x, y, cx, cy; u32 flags;
             memcpy(&x, pos + 16, 4); memcpy(&y, pos + 20, 4); memcpy(&cx, pos + 24, 4); memcpy(&cy, pos + 28, 4);
             memcpy(&flags, pos + 32, 4);
+            /* WM_MOVE carries the client area's origin and WM_SIZE its size (the window less Beer's frame). */
+            BeerWindow *w = beer_window_other(hw);
+            if (w) {
+                s32 l, t, r, b;
+                beer_window_nc(w, &l, &t, &r, &b);
+                x += l; y += t; cx -= l + r; cy -= t + b;
+                if (cx < 0) cx = 0;
+                if (cy < 0) cy = 0;
+            }
             if (!(flags & 0x0002)) call_window_proc(hw, 0x0003, 0, (u64)(u16)x | ((u64)(u16)y << 16));
             if (!(flags & 0x0001)) call_window_proc(hw, 0x0005, 0, (u64)(u16)cx | ((u64)(u16)cy << 16));
             return 0;
@@ -22762,6 +23873,11 @@ static u64 *other_window_long(BeerWindow *w, s32 index)
     case -8: return &w->parent;                                       /* GWLP_HWNDPARENT */
     case -16: scratch = w->style; return &scratch;
     case -20: scratch = w->exstyle; return &scratch;
+    case -12:                                                         /* GWL_ID: the control ID */
+        pthread_mutex_lock(&g_beer_ctl_mtx);
+        { const BeerCtl *c = beer_ctl_get(w->hwnd, 0); scratch = c ? (u64)(s64)c->id : 0; }
+        pthread_mutex_unlock(&g_beer_ctl_mtx);
+        return &scratch;
     default: return NULL;
     }
 }
@@ -22774,6 +23890,13 @@ static u64 set_window_long_value(u64 hw, s32 index, u64 value)
         const u64 old = *slot;
         if (index == -16) other->style = (u32)value;
         else if (index == -20) other->exstyle = (u32)value;
+        else if (index == -12) {
+            if (getenv("BEER_CTL_DIAGNOSTICS"))
+                fprintf(stderr, "[OD] SetWindowLong(0x%llx, GWL_ID, 0x%llx)\n", (unsigned long long)hw, (unsigned long long)value);
+            pthread_mutex_lock(&g_beer_ctl_mtx);
+            { BeerCtl *c = beer_ctl_get(hw, 1); if (c) c->id = (s32)value; }
+            pthread_mutex_unlock(&g_beer_ctl_mtx);
+        }
         else *slot = value;
         return old;
     }
@@ -23814,7 +24937,11 @@ static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
      * SteamAPI_Init()-repeats-forever loop documented previously, now caught
      * safely by the cycle detector instead of hanging -- but it's still just
      * masking, not fixing, the real early fatal-exit bug.) */
-    fprintf(stderr, "[IMPL] ExitProcess(%u) -> terminating loader\n", code);
+    {
+        const char *image = g_exe_path ? strrchr(g_exe_path, '\\') : NULL;
+        fprintf(stderr, "[IMPL] ExitProcess(%u) -> terminating loader (pid %d, %s)\n", code, (int)getpid(),
+                image ? image + 1 : g_exe_path ? g_exe_path : "?");
+    }
     {   /* Where did the guest decide to quit? Dump the code around the caller. */
         const char *dir = getenv("BEER_EXIT_DUMP");
         u64 grsp = 0;
@@ -24044,7 +25171,17 @@ impl_WriteFile(u64 h, const void *buf, u32 n, u32 *written, u64 ov)
         }
         return 1;
     }
-    ssize_t r = write(fd, buf, n);
+    /* A synchronous WriteFile writes everything (a pipe blocks until the reader took it all). write() can stop early
+     * or fail with EINTR when a signal arrives (Beer's suspend/timer signals): decoders that stream through pipes
+     * (unarc -> rz -> srep) ignore the count, so a short write silently dropped data. */
+    ssize_t r = 0;
+    while ((size_t)r < n) {
+        const ssize_t part = write(fd, (const u8 *)buf + r, n - (size_t)r);
+        if (part < 0 && errno == EINTR) continue;
+        if (part <= 0) { if (r == 0) r = part; break; }
+        r += part;
+    }
+    beer_stdio_tee(fd == STDOUT_FILENO ? 1 : -1, buf, r);
     if (beer_pipe_is_pipe(h)) beer_pipe_dump("write", h, buf, r);
     if (r < 0 && beer_pipe_is_pipe(h)) g_last_error = 232;      /* ERROR_NO_DATA: the other end is closing */
     else if (r < 0)   /* a Windows error, never 0: read-only handle -> ACCESS_DENIED, full disk -> DISK_FULL */
@@ -28005,6 +29142,7 @@ static ImplEntry g_impls[] = {
     {"FreeConsole",                           (ImplFn)impl_FreeConsole},
     {"GetConsoleWindow",                      (ImplFn)impl_GetConsoleWindow},
     {"SetConsoleMode",                        (ImplFn)impl_console_invalid_handle},
+    {"SetConsoleTextAttribute",               (ImplFn)impl_SetConsoleTextAttribute},
     {"SetConsoleTitleW",                      (ImplFn)impl_console_invalid_handle},
     {"SetConsoleTitleA",                      (ImplFn)impl_console_invalid_handle},
     {"GetConsoleScreenBufferInfo",            (ImplFn)impl_console_invalid_handle},
@@ -28318,6 +29456,8 @@ static ImplEntry g_impls[] = {
     {"GetACP",                                (ImplFn)impl_GetACP},
     {"GetOEMCP",                              (ImplFn)impl_GetOEMCP},
     {"GetCPInfo",                             (ImplFn)impl_GetCPInfo},
+    {"GetCPInfoExW",                          (ImplFn)impl_GetCPInfoExW},
+    {"GetCPInfoExA",                          (ImplFn)impl_GetCPInfoExA},
     {"IsValidCodePage",                       (ImplFn)impl_IsValidCodePage},
     /* Module paths */
     {"GetModuleFileNameW",                    (ImplFn)impl_GetModuleFileNameW},
@@ -28592,6 +29732,9 @@ static ImplEntry g_impls[] = {
     {"PathFileExistsA",                       (ImplFn)impl_PathFileExistsA},
     {"PathFileExistsW",                       (ImplFn)impl_PathFileExistsW},
     {"GetPrivateProfileStringW",              (ImplFn)impl_GetPrivateProfileStringW},
+    {"GetPrivateProfileStringA",              (ImplFn)impl_GetPrivateProfileStringA},
+    {"GetPrivateProfileIntA",                 (ImplFn)impl_GetPrivateProfileIntA},
+    {"GetPrivateProfileIntW",                 (ImplFn)impl_GetPrivateProfileIntW},
     {"WritePrivateProfileStringW",            (ImplFn)impl_WritePrivateProfileStringW},
     {"SetFileAttributesA",                    (ImplFn)impl_SetFileAttributesA},
     {"SetFileAttributesW",                    (ImplFn)impl_SetFileAttributesW},
@@ -30392,8 +31535,14 @@ static GuestDll *guest_dll_finish(GuestDll *dll)
     NtHdrs64 *mapped_nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
     if (dll->delta) {
         DataDir *relocations = &mapped_nt->opt.dirs[DIR_RELOC];
-        if (!relocations->size)
+        /* No relocation directory: only IMAGE_FILE_RELOCS_STRIPPED forbids another base. Without that flag Windows
+         * takes the image as needing no fixups (x64 code is RIP-relative) and loads it anywhere; RAZOR's
+         * rz-1.03.7-stdio.exe and its razor.dll both ask for 0x400000 and neither has relocations. */
+        if (!relocations->size && (mapped_nt->file.chars & 0x0001u))
             die("%s could not load at preferred base and has no relocations", dll->name);
+        if (!relocations->size)
+            fprintf(stderr, "[LOADER] %s has no relocations and is not marked relocs-stripped: loaded at %p instead of 0x%llx\n",
+                    dll->name, (void *)dll->image, (unsigned long long)mapped_nt->opt.imagebase);
         u8 *cursor = dll->image + relocations->rva;
         u8 *end = cursor + relocations->size;
         while (cursor + sizeof(RelocBlock) <= end) {
@@ -31253,6 +32402,13 @@ static void pe_imports(void)
              * state to RE8 and its private MSVC redistributables. */
             if (crt_api_set && guest_export)
                 real = NULL;
+            /* An exe that imports the legacy msvcrt.dll (MinGW builds such as RAZOR's rz-1.03.7-stdio.exe) gets it
+             * from the bundled UCRT, as guest DLLs already do: one coherent CRT, and no logging stubs for
+             * __getmainargs, strlen or __C_specific_handler. */
+            if (!guest && fn_only && !strcmp(import_lower, "msvcrt.dll")) {
+                const u64 legacy = msvcrt_exe_export(fn_only);
+                if (legacy) { guest_export = legacy; real = NULL; }
+            }
             if (guest_export && fn_only && guest && !strncmp(guest->name, "oo2core_", 8) &&
                 !strcmp(fn_only, "OodleLZ_Decompress")) {
                 g_oodle_decompress = (void *)guest_export;
@@ -37849,6 +39005,15 @@ static void on_host_abort(int sig)
 
 int main(int argc, char **argv)
 {
+    /* Standard output belongs to the program when it is a pipe its parent reads (unarc feeding an external decoder
+     * through CreateProcess, _BEER_GUEST_STDOUT) or when asked (BEER_LOG_TO_STDERR=1): the loader's own messages then
+     * go to standard error, and descriptor 1 carries only what the program writes. */
+    if (getenv("_BEER_GUEST_STDOUT") || getenv("BEER_LOG_TO_STDERR")) {
+        const int log_fd = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
+        FILE *log = log_fd >= 0 ? fdopen(log_fd, "w") : NULL;
+        if (log) { setvbuf(log, NULL, _IOLBF, 0); stdout = log; }
+        else if (log_fd >= 0) close(log_fd);
+    }
     beer_virtual_set_image_lookup(beer_image_range);
     if (!getenv("BEER_SEH_HOST_STACK")) beer_seh_set_handler_caller(seh_call_handler_on_guest_stack);   /* diagnostic */
     {
@@ -37978,6 +39143,7 @@ int main(int argc, char **argv)
     BeerD3D11Renderer renderer = BEER_D3D11_RENDERER_VULKAN;
     const char *exe_arg = NULL;
     const char *cmdline_arg = NULL;
+    const char *beer_cmd_arg = NULL;
     beer_proc_save_args(argc, argv);
     beer_breakpoints_start();
     beer_thread_dump_start();
@@ -38020,6 +39186,8 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--prefix requires a non-empty path\n");
                 return 2;
             }
+        } else if (strncmp(arg, "--beer-cmd=", 11) == 0) {
+            beer_cmd_arg = arg + 11;      /* cmd.exe: Beer's command interpreter (platform/beer_cmd.inc) */
         } else if (strncmp(arg, "--cmdline=", 10) == 0) {
             cmdline_arg = arg + 10;       /* full guest command line (set by CreateProcess for child loaders) */
         } else if (strncmp(arg, "--audio=", 8) == 0) {
@@ -38037,6 +39205,10 @@ int main(int argc, char **argv)
         } else {
             exe_arg = arg;
         }
+    }
+    if (beer_cmd_arg) {
+        if (!configure_guest_prefix(prefix_arg)) return 1;
+        return beer_cmd_main(beer_cmd_arg);
     }
     if (!exe_arg) {
         fprintf(stderr,
@@ -38152,6 +39324,7 @@ int main(int argc, char **argv)
     beer_inherit_install();
     beer_overlay_init();
     beer_post_init(exe_arg);
+    beer_capture_init(exe_arg);
     beer_control_start(exe_arg);
     if (getenv("BEER_PROF_SAMPLE")) prof_start();
 

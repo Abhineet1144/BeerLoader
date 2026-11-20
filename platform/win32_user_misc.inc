@@ -235,11 +235,33 @@ static u64 __attribute__((ms_abi)) impl_EndDialog(u64 dialog, s64 result)
     g_last_error = 1400;                                 /* ERROR_INVALID_WINDOW_HANDLE */
     return 0;
 }
+/* GetDlgItem: the child of a Beer-drawn window with that control ID (Delphi routes WM_MEASUREITEM, which only carries
+ * the ID, to the control this way). */
 static u64 __attribute__((ms_abi)) impl_GetDlgItem(u64 dialog, s32 id)
 {
-    (void)dialog; (void)id;
-    g_last_error = 1421;                                 /* ERROR_CONTROL_ID_NOT_FOUND */
-    return 0;
+    u64 found = 0;
+    for (int i = 0; i < BEER_MAX_WINDOWS && !found; ++i) {
+        const BeerWindow *w = &g_beer_windows[i];
+        if (!w->used || w->parent != dialog || !(w->style & 0x40000000u)) continue;
+        pthread_mutex_lock(&g_beer_ctl_mtx);
+        const BeerCtl *c = beer_ctl_get(w->hwnd, 0);
+        if (c && c->id == id) found = w->hwnd;
+        pthread_mutex_unlock(&g_beer_ctl_mtx);
+    }
+    if (!found) g_last_error = 1421;                     /* ERROR_CONTROL_ID_NOT_FOUND */
+    if (getenv("BEER_CTL_DIAGNOSTICS"))
+        fprintf(stderr, "[OD] GetDlgItem(0x%llx, 0x%x) -> 0x%llx\n", (unsigned long long)dialog, (u32)id, (unsigned long long)found);
+    return found;
+}
+static u64 __attribute__((ms_abi)) impl_GetDlgCtrlID(u64 hwnd)
+{
+    BeerWindow *w = beer_window_other(hwnd);
+    if (!w) { g_last_error = 1400; return 0; }
+    s32 id = 0;
+    pthread_mutex_lock(&g_beer_ctl_mtx);
+    { const BeerCtl *c = beer_ctl_get(hwnd, 0); if (c) id = c->id; }
+    pthread_mutex_unlock(&g_beer_ctl_mtx);
+    return (u64)(u32)id;
 }
 
 /* The process has no clipboard access (OpenClipboard fails), for which Windows returns 0. */
@@ -379,6 +401,7 @@ static u64 __attribute__((ms_abi)) impl_ToUnicode(u32 vk, u32 scan, const u8 *st
     {"DialogBoxIndirectParamW",     (ImplFn)impl_DialogBoxIndirectParamW}, \
     {"EndDialog",                   (ImplFn)impl_EndDialog}, \
     {"GetDlgItem",                  (ImplFn)impl_GetDlgItem}, \
+    {"GetDlgCtrlID",                (ImplFn)impl_GetDlgCtrlID}, \
     {"GetClipboardSequenceNumber",  (ImplFn)impl_GetClipboardSequenceNumber}, \
     {"GetRawInputBuffer",           (ImplFn)impl_GetRawInputBuffer}, \
     {"SetLayeredWindowAttributes",  (ImplFn)impl_SetLayeredWindowAttributes}, \

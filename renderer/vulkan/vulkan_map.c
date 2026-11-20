@@ -609,6 +609,9 @@ static VkSemaphore post_frame(Swap *s, VkQueue queue, uint32_t family, const VkP
 
     const int slot = (int)(s->frame % RING);
     wait_slot(s, slot);
+    /* Frames up to frame-RING used this slot or an earlier one: their recorded capture frames are complete. */
+    if (s->frame >= RING) vulkan_post_collect_frames(s->frame - RING);
+    vulkan_post_set_frame_tag(s->frame);
     if (vulkan_post_screenshot_waiting()) {          /* the buffer is only valid once every submitted pass is done */
         for (int i = 0; i < RING; ++i) wait_slot(s, i);
         vulkan_post_collect();

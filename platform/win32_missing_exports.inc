@@ -2,9 +2,14 @@
  * Generated from a real RE4 start-up log; unimplemented ones return 0 (FALSE/NULL). */
 static u64 __attribute__((ms_abi)) stub_GetConsoleMode(u64 h, u32 *mode){ (void)h; if(mode)*mode=0; return 0; }
 static u64 __attribute__((ms_abi)) stub_RemoveDirectoryW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetConsoleOutputCP(void){ return 437; }
+/* Console code pages: 0 without a console, as for a GUI program or a console program its parent started without one
+ * (Wine reports the same). Beer has a console when one of the standard streams is a terminal. RAZOR's stdio decoder
+ * prints progress with printf + fflush(stdout) only when it has a console; with stdout being unarc's data pipe the
+ * text went into the decoded stream. */
+static int beer_has_console(void) { return isatty(0) || isatty(1) || isatty(2); }
+static u64 __attribute__((ms_abi)) stub_GetConsoleOutputCP(void){ return beer_has_console() ? 437 : 0; }
 static u64 __attribute__((ms_abi)) stub_GetThreadPriority(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetConsoleCP(void){ return 437; }
+static u64 __attribute__((ms_abi)) stub_GetConsoleCP(void){ return beer_has_console() ? 437 : 0; }
 static u64 __attribute__((ms_abi)) stub_EnumResourceTypesA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumResourceNamesA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumResourceLanguagesA(void){ return 0; }
@@ -68,8 +73,84 @@ static u64 __attribute__((ms_abi)) stub_Module32Next(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DebugBreak(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayRedim(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SafeArrayPtrOfIndex(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CharUpperBuffW(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CharLowerBuffW(void){ return 0; }
+/* Case mapping for ASCII and Latin-1 (the code pages Beer reports); characters outside stay as they are. */
+static u16 beer_wide_upper(u16 c)
+{
+    if ((c >= 'a' && c <= 'z') || (c >= 0xe0 && c <= 0xfe && c != 0xf7)) return (u16)(c - 32);
+    if (c == 0xff) return 0x178;
+    return c;
+}
+static u16 beer_wide_lower(u16 c)
+{
+    if ((c >= 'A' && c <= 'Z') || (c >= 0xc0 && c <= 0xde && c != 0xd7)) return (u16)(c + 32);
+    if (c == 0x178) return 0xff;
+    return c;
+}
+/* CharUpperBuffW / CharLowerBuffW: in place, return the number of characters processed (Delphi's AnsiUpperCase
+ * family checks it; the old stub returned 0 and left the text alone). */
+static u64 __attribute__((ms_abi)) stub_CharUpperBuffW(u16 *s, u32 n)
+{
+    for (u32 i = 0; s && i < n; ++i) s[i] = beer_wide_upper(s[i]);
+    return s ? n : 0;
+}
+/* CharUpperW / CharLowerW: a single character when the high word is zero, otherwise a string converted in place. */
+static u64 __attribute__((ms_abi)) impl_CharUpperW(u16 *s)
+{
+    if ((uintptr_t)s >> 16 == 0) return beer_wide_upper((u16)(uintptr_t)s);
+    for (u16 *p = s; *p; ++p) *p = beer_wide_upper(*p);
+    return (u64)(uintptr_t)s;
+}
+static u64 __attribute__((ms_abi)) impl_CharLowerW(u16 *s)
+{
+    if ((uintptr_t)s >> 16 == 0) return beer_wide_lower((u16)(uintptr_t)s);
+    for (u16 *p = s; *p; ++p) *p = beer_wide_lower(*p);
+    return (u64)(uintptr_t)s;
+}
+/* Thread UI languages: Beer runs as an en-US system (GetUserDefaultUILanguage is 0x409). Delphi's RTL resolves these
+ * while a DLL initialises (UPX-packed razor.dll gives up on the first missing export). */
+static u64 __attribute__((ms_abi)) impl_GetThreadUILanguage(void) { return 0x0409; }
+/* GetThreadPreferredUILanguages(flags, PULONG count, PZZWSTR buffer, PULONG buffer_chars): one language, "en-US" as a
+ * name or "0409" as an id (MUI_LANGUAGE_ID 0x4), double-NUL terminated. */
+static u64 __attribute__((ms_abi)) impl_GetThreadPreferredUILanguages(u32 flags, u32 *count, u16 *buffer, u32 *chars)
+{
+    if (!count || !chars) { g_last_error = 87; return 0; }
+    const char *name = (flags & 0x4u) ? "0409" : "en-US";
+    const u32 need = (u32)strlen(name) + 2;
+    *count = 1;
+    if (!buffer) { *chars = need; g_last_error = 0; return 1; }
+    if (*chars < need) { *chars = need; g_last_error = 122; return 0; }   /* ERROR_INSUFFICIENT_BUFFER */
+    u32 i = 0;
+    for (; name[i]; ++i) buffer[i] = (u8)name[i];
+    buffer[i] = 0;
+    buffer[i + 1] = 0;
+    *chars = need;
+    g_last_error = 0;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_SetThreadPreferredUILanguages(u32 flags, const u16 *languages, u32 *count)
+{
+    (void)flags; (void)languages;
+    if (count) *count = languages ? 1 : 0;
+    g_last_error = 0;
+    return 1;                                                /* accepted; resource lookups stay en-US */
+}
+/* EnumCalendarInfoW: calendar enumeration is not provided (Delphi only uses it for era names). */
+static u64 __attribute__((ms_abi)) impl_EnumCalendarInfoW(void *callback, u32 locale, u32 calendar, u32 type)
+{
+    (void)callback; (void)locale; (void)calendar; (void)type;
+    g_last_error = 120;                                      /* ERROR_CALL_NOT_IMPLEMENTED */
+    return 0;
+}
+/* NetApiBufferFree: Beer implements no NetApi call that allocates a buffer, so there is nothing to release. */
+static u64 __attribute__((ms_abi)) impl_NetApiBufferFree(void *buffer) { (void)buffer; return 0; }   /* NERR_Success */
+/* OLE Automation VARIANT arithmetic and string conversions: not implemented; they fail as a type mismatch. */
+static u64 __attribute__((ms_abi)) impl_VarUnsupported(void) { return 0x80020005u; }   /* DISP_E_TYPEMISMATCH */
+
+static u64 __attribute__((ms_abi)) stub_CharLowerBuffW(u16 *s, u32 n)
+{
+    for (u32 i = 0; s && i < n; ++i) s[i] = beer_wide_lower(s[i]);
+    return s ? n : 0;
+}
 static u64 __attribute__((ms_abi)) stub_UnregisterClassA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClipboardFormatNameA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CharToOemA(void){ return 0; }
@@ -113,7 +194,7 @@ static u64 __attribute__((ms_abi)) stub_CountClipboardFormats(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumClipboardFormats(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EmptyClipboard(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_IsClipboardFormatAvailable(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_EnableWindow(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_EnableWindow(u64 hwnd, u32 enable){ return beer_enable_window(hwnd, enable); }
 static u64 __attribute__((ms_abi)) stub_GetMenu(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetMenu(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DrawMenuBar(void){ return 0; }
@@ -139,8 +220,15 @@ static u64 __attribute__((ms_abi)) stub_HideCaret(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ShowCaret(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetCaretPos(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetCaretPos(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetSysColor(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetSysColorBrush(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_GetSysColor(s32 index){ return beer_gdi_sys_color(index); }
+/* GetSysColorBrush: one solid brush per system colour, owned by the system (never deleted). */
+static u64 __attribute__((ms_abi)) stub_GetSysColorBrush(s32 index)
+{
+    static u64 brushes[31];
+    if (index < 0 || index >= 31) return 0;
+    if (!brushes[index]) brushes[index] = beer_CreateSolidBrush(beer_gdi_sys_color(index));
+    return brushes[index];
+}
 static u64 __attribute__((ms_abi)) stub_SetSysColors(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DrawFocusRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FrameRect(void){ return 0; }
@@ -157,7 +245,86 @@ static u64 __attribute__((ms_abi)) stub_SetScrollInfo(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetScrollInfo(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_TranslateMDISysAccel(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DrawEdge(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_DrawFrameControl(void){ return 0; }
+/* DrawFrameControl: the classic-style frame controls programs draw themselves when no visual theme is active
+ * (Inno Setup's component and task lists draw their check boxes and radio buttons with it). rect is logical. */
+static void dfc_fill(u64 dc, s32 l, s32 t, s32 r, s32 b, u32 colorref)
+{
+    if (l >= r || t >= b) return;
+    const int32_t rect[4] = { l, t, r, b };
+    const u64 brush = beer_CreateSolidBrush(colorref);
+    beer_FillRect(dc, rect, brush);
+    beer_DeleteObject(brush);
+}
+static void dfc_frame(u64 dc, s32 l, s32 t, s32 r, s32 b, u32 colorref)
+{
+    dfc_fill(dc, l, t, r, t + 1, colorref); dfc_fill(dc, l, b - 1, r, b, colorref);
+    dfc_fill(dc, l, t, l + 1, b, colorref); dfc_fill(dc, r - 1, t, r, b, colorref);
+}
+static u64 __attribute__((ms_abi)) stub_DrawFrameControl(u64 dc, const s32 *rect, u32 type, u32 state)
+{
+    if (!rect) return 0;
+    const s32 l = rect[0], t = rect[1], r = rect[2], b = rect[3];
+    if (getenv("BEER_CTL_DIAGNOSTICS")) {
+        int32_t origin[2] = { 0, 0 }, clip[4] = { 0, 0, 0, 0 };
+        beer_GetWindowOrgEx(dc, origin);
+        const int region = beer_GetClipBox(dc, clip);
+        fprintf(stderr, "[DFC] dc=0x%llx rect=%d,%d-%d,%d type=%u state=0x%x winorg=%d,%d clip(%d)=%d,%d-%d,%d\n",
+                (unsigned long long)dc, l, t, r, b, type, state, origin[0], origin[1], region, clip[0], clip[1], clip[2], clip[3]);
+    }
+    const int inactive = (state & 0x0100) != 0, pushed = (state & 0x0200) != 0, checked = (state & 0x0400) != 0;
+    const u32 ink = inactive ? 0x6D6D6D : 0x333333;
+    if (type == 4) {                                                       /* DFC_BUTTON */
+        const u32 kind = state & 0x1f;
+        if (kind == 0x10) {                                                 /* DFCS_BUTTONPUSH */
+            dfc_fill(dc, l, t, r, b, pushed ? 0xF7E4CC : 0xE1E1E1);
+            dfc_frame(dc, l, t, r, b, pushed ? 0xD77800 : 0xADADAD);
+            return 1;
+        }
+        const s32 size = (r - l < b - t ? r - l : b - t) < 13 ? (r - l < b - t ? r - l : b - t) : 13;
+        const s32 x = l + (r - l - size) / 2, y = t + (b - t - size) / 2;
+        const int radio = kind == 0x4 || kind == 0x5 || kind == 0x2;      /* BUTTONRADIO, RADIOMASK/IMAGE */
+        const u32 face = inactive ? 0xF0F0F0 : pushed ? 0xF7E4CC : 0xFFFFFF;
+        if (radio) {                                                        /* a round-ish box */
+            dfc_fill(dc, x + 1, y + 1, x + size - 1, y + size - 1, face);
+            for (s32 i = 0; i < size; ++i) {
+                const s32 inset = i < 3 ? 3 - i : i > size - 4 ? i - (size - 4) : 0;
+                dfc_fill(dc, x + inset, y + i, x + inset + 1, y + i + 1, ink);
+                dfc_fill(dc, x + size - 1 - inset, y + i, x + size - inset, y + i + 1, ink);
+                dfc_fill(dc, x + i, y + inset, x + i + 1, y + inset + 1, ink);
+                dfc_fill(dc, x + i, y + size - 1 - inset, x + i + 1, y + size - inset, ink);
+            }
+            if (checked) dfc_fill(dc, x + 4, y + 4, x + size - 4, y + size - 4, ink);
+            return 1;
+        }
+        dfc_fill(dc, x, y, x + size, y + size, face);                       /* DFCS_BUTTONCHECK / 3STATE */
+        dfc_frame(dc, x, y, x + size, y + size, ink);
+        if (checked && (kind == 0x8)) dfc_fill(dc, x + 3, y + 3, x + size - 3, y + size - 3, 0x6D6D6D);   /* mixed */
+        else if (checked)
+            for (int i = 0; i < 7; ++i) {                                   /* a tick */
+                const s32 cx = x + 3 + i, cy = i < 3 ? y + 6 + i : y + 8 - (i - 2);
+                dfc_fill(dc, cx, cy, cx + 1, cy + 2, ink);
+            }
+        return 1;
+    }
+    if (type == 3 || type == 1) {                                           /* DFC_SCROLL / DFC_CAPTION */
+        dfc_fill(dc, l, t, r, b, pushed ? 0xDADADA : 0xF0F0F0);
+        const u32 kind = state & 0xff;
+        const s32 cx = (l + r) / 2, cy = (t + b) / 2;
+        if (type == 1 && kind == 0) {                                       /* DFCS_CAPTIONCLOSE: an x */
+            for (s32 i = -3; i <= 3; ++i) { dfc_fill(dc, cx + i, cy + i, cx + i + 1, cy + i + 1, ink);
+                                            dfc_fill(dc, cx + i, cy - i, cx + i + 1, cy - i + 1, ink); }
+            return 1;
+        }
+        for (s32 i = 0; i < 4; ++i) {                                       /* arrows: up 0, down 1, left 2, right 3 */
+            if (type == 3 && kind == 0) dfc_fill(dc, cx - i, cy - 2 + i, cx + i + 1, cy - 1 + i, ink);
+            else if (type == 3 && (kind == 1 || kind == 5)) dfc_fill(dc, cx - 3 + i, cy - 1 + i, cx + 4 - i, cy + i, ink);
+            else if (type == 3 && kind == 2) dfc_fill(dc, cx - 2 + i, cy - i, cx - 1 + i, cy + i + 1, ink);
+            else if (type == 3 && kind == 3) dfc_fill(dc, cx + 1 - i, cy - i, cx + 2 - i, cy + i + 1, ink);
+        }
+        return 1;
+    }
+    return 1;
+}
 static u64 __attribute__((ms_abi)) stub_TrackPopupMenuEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ChildWindowFromPointEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DrawIconEx(void){ return 0; }
@@ -184,19 +351,32 @@ static u64 __attribute__((ms_abi)) stub_GetTextExtentExPointW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetRandomRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Arc(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Chord(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateBrushIndirect(void){ return 0; }
+/* CreateBrushIndirect(LOGBRUSH { lbStyle, lbColor, lbHatch }): solid brushes (hatched and pattern brushes are drawn
+ * solid), BS_NULL/BS_HOLLOW the stock null brush. The first 8 bytes are the same in 32- and 64-bit code. */
+static u64 __attribute__((ms_abi)) stub_CreateBrushIndirect(const u32 *log)
+{
+    if (!log) return 0;
+    if (log[0] == 1) return beer_GetStockObject(5);                       /* NULL_BRUSH */
+    return beer_CreateSolidBrush(log[1]);
+}
 static u64 __attribute__((ms_abi)) stub_CreateDIBitmap(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreatePenIndirect(void){ return 0; }
+/* CreatePenIndirect(LOGPEN { lopnStyle, POINT lopnWidth, lopnColor }) - the same 16 bytes in 32- and 64-bit code. */
+static u64 __attribute__((ms_abi)) stub_CreatePenIndirect(const u32 *log)
+{
+    return log ? beer_CreatePen((int)log[0], (int)log[1], log[3]) : 0;
+}
 static u64 __attribute__((ms_abi)) stub_CreatePatternBrush(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Ellipse(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EqualRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_ExcludeClipRect(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_ExcludeClipRect(u64 dc, s32 l, s32 t, s32 r, s32 b){ return (u64)beer_ExcludeClipRect(dc, l, t, r, b); }
 static u64 __attribute__((ms_abi)) stub_ExtCreateRegion(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExtFloodFill(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FillRgn(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetROP2(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_PtVisible(u64 dc, s32 x, s32 y){ return (u64)beer_PtVisible(dc, x, y); }
+static u64 __attribute__((ms_abi)) stub_UnrealizeObject(u64 object){ (void)object; return 1; }
+static u64 __attribute__((ms_abi)) stub_GetROP2(u64 dc){ return (u64)beer_GetROP2(dc); }
 static u64 __attribute__((ms_abi)) stub_GetBitmapBits(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetClipBox(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_GetClipBox(u64 dc, int32_t *rect){ return (u64)beer_GetClipBox(dc, rect); }
 static u64 __attribute__((ms_abi)) stub_GetClipRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetCurrentObject(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetDIBits(void){ return 0; }
@@ -204,16 +384,16 @@ static u64 __attribute__((ms_abi)) stub_GetMapMode(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetRegionData(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetTextAlign(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetViewportExtEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetViewportOrgEx(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_GetViewportOrgEx(u64 dc, int32_t *p){ return (u64)beer_GetViewportOrgEx(dc, p); }
 static u64 __attribute__((ms_abi)) stub_GetWindowExtEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetWindowOrgEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_IntersectClipRect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_LineTo(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_GetWindowOrgEx(u64 dc, int32_t *p){ return (u64)beer_GetWindowOrgEx(dc, p); }
+static u64 __attribute__((ms_abi)) stub_IntersectClipRect(u64 dc, s32 l, s32 t, s32 r, s32 b){ return (u64)beer_IntersectClipRect(dc, l, t, r, b); }
+static u64 __attribute__((ms_abi)) stub_LineTo(u64 dc, s32 x, s32 y){ return (u64)beer_LineTo(dc, x, y); }
 static u64 __attribute__((ms_abi)) stub_MaskBlt(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Pie(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_PaintRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RectInRegion(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_RectVisible(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_RectVisible(u64 dc, const int32_t *rect){ return (u64)beer_RectVisible(dc, rect); }
 static u64 __attribute__((ms_abi)) stub_RealizePalette(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RoundRect(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SelectClipRgn(void){ return 0; }
@@ -221,11 +401,11 @@ static u64 __attribute__((ms_abi)) stub_ExtSelectClipRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SelectPalette(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetMapMode(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetPolyFillMode(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetROP2(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_SetROP2(u64 dc, s32 mode){ return (u64)beer_SetROP2(dc, mode); }
 static u64 __attribute__((ms_abi)) stub_SetTextCharacterExtra(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetArcDirection(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ExtCreatePen(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_MoveToEx(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_MoveToEx(u64 dc, s32 x, s32 y, int32_t *previous){ return (u64)beer_MoveToEx(dc, x, y, previous); }
 static u64 __attribute__((ms_abi)) stub_CreatePolygonRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DPtoLP(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_LPtoDP(void){ return 0; }
@@ -233,10 +413,10 @@ static u64 __attribute__((ms_abi)) stub_Polygon(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_Polyline(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_PolyBezier(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetViewportExtEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetViewportOrgEx(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_SetViewportOrgEx(u64 dc, s32 x, s32 y, int32_t *p){ return (u64)beer_SetViewportOrgEx(dc, x, y, p); }
 static u64 __attribute__((ms_abi)) stub_SetWindowExtEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetWindowOrgEx(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_OffsetViewportOrgEx(void){ return 0; }
+static u64 __attribute__((ms_abi)) stub_SetWindowOrgEx(u64 dc, s32 x, s32 y, int32_t *p){ return (u64)beer_SetWindowOrgEx(dc, x, y, p); }
+static u64 __attribute__((ms_abi)) stub_OffsetViewportOrgEx(u64 dc, s32 x, s32 y, int32_t *p){ return (u64)beer_OffsetViewportOrgEx(dc, x, y, p); }
 static u64 __attribute__((ms_abi)) stub_SetBrushOrgEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetDCOrgEx(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DragQueryFileA(void){ return 0; }
@@ -340,7 +520,66 @@ static u64 __attribute__((ms_abi)) beer_EnumSystemFirmwareTables(u32 provider, u
     return 4;
 }
 static u64 __attribute__((ms_abi)) stub_RtlInitString(u16 *d, const char *s){ if(!d) return 0; size_t n=0; if(s) while(s[n]) ++n; d[0]=(u16)n; d[1]=(u16)(s?n+1:0); *(const char **)(void*)((u8*)d+8)=s; return 0; }
-static u64 __attribute__((ms_abi)) stub_PathMatchSpecW(void){ return 0; }
+/* PathMatchSpec: case-insensitive wildcard match ('*' any run, '?' one character) of the whole path against one mask,
+ * or (PathMatchSpec, PMSF_MULTIPLE) against a ';'-separated list with leading spaces ignored; "*.*" matches anything. */
+static u32 beer_path_match_upper(u32 c) { return c < 0x80 ? (u32)toupper((int)c) : (u32)towupper((wint_t)c); }
+static int beer_path_match_one(const u16 *path, const u16 *mask, const u16 *mask_end)
+{
+    while (mask < mask_end) {
+        if (*mask == '*') {
+            while (mask < mask_end && *mask == '*') ++mask;
+            if (mask == mask_end) return 1;
+            for (; *path; ++path) if (beer_path_match_one(path, mask, mask_end)) return 1;
+            return 0;
+        }
+        if (!*path) return 0;
+        if (*mask != '?' && beer_path_match_upper(*mask) != beer_path_match_upper(*path)) return 0;
+        ++mask; ++path;
+    }
+    return !*path;
+}
+static int beer_path_match_spec(const u16 *path, const u16 *spec, u32 flags)
+{
+    if (!path || !spec) return 0;
+    const int multiple = (flags & 1) != 0, keep_spaces = (flags & 0x10000) != 0;
+    for (const u16 *mask = spec; ;) {
+        if (!keep_spaces) while (*mask == ' ') ++mask;
+        const u16 *end = mask;
+        while (*end && (!multiple || *end != ';')) ++end;
+        const u16 *trimmed = end;
+        if (!keep_spaces) while (trimmed > mask && trimmed[-1] == ' ') --trimmed;
+        if (trimmed - mask == 3 && mask[0] == '*' && mask[1] == '.' && mask[2] == '*') return 1;
+        if (trimmed > mask && beer_path_match_one(path, mask, trimmed)) return 1;
+        if (!*end) return 0;
+        mask = end + 1;
+    }
+}
+static u16 *beer_path_match_widen(const char *text)
+{
+    if (!text) return NULL;
+    const size_t n = strlen(text);
+    u16 *wide = calloc(n + 1, sizeof(u16));
+    if (wide) for (size_t i = 0; i < n; ++i) wide[i] = (u8)text[i];
+    return wide;
+}
+static u64 __attribute__((ms_abi)) stub_PathMatchSpecW(const u16 *path, const u16 *spec)
+    { return (u64)beer_path_match_spec(path, spec, 1); }
+static u64 __attribute__((ms_abi)) beer_PathMatchSpecExW(const u16 *path, const u16 *spec, u32 flags)
+    { return beer_path_match_spec(path, spec, flags) ? 0 : 1; }                         /* S_OK / S_FALSE */
+static u64 __attribute__((ms_abi)) beer_PathMatchSpecA(const char *path, const char *spec)
+{
+    u16 *wide_path = beer_path_match_widen(path), *wide_spec = beer_path_match_widen(spec);
+    const int match = beer_path_match_spec(wide_path, wide_spec, 1);
+    free(wide_path); free(wide_spec);
+    return (u64)match;
+}
+static u64 __attribute__((ms_abi)) beer_PathMatchSpecExA(const char *path, const char *spec, u32 flags)
+{
+    u16 *wide_path = beer_path_match_widen(path), *wide_spec = beer_path_match_widen(spec);
+    const int match = beer_path_match_spec(wide_path, wide_spec, flags);
+    free(wide_path); free(wide_spec);
+    return match ? 0 : 1;
+}
 static u64 __attribute__((ms_abi)) stub_InitCommonControls(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_Create(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_Destroy(void){ return 0; }
@@ -2057,7 +2296,7 @@ static u64 __attribute__((ms_abi)) stub_awt_EndPage(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_StartPage(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_EndDoc(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_StartDocW(void) { return 0; }
-static u64 __attribute__((ms_abi)) stub_awt_GetCurrentPositionEx(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_GetCurrentPositionEx(u64 dc, int32_t *point) { return (u64)beer_GetCurrentPositionEx(dc, point); }
 static u64 __attribute__((ms_abi)) stub_awt_GetSystemPaletteEntries(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_GetFontData(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_GetCharWidthW(void) { return 0; }
@@ -2071,7 +2310,7 @@ static u64 __attribute__((ms_abi)) stub_awt_GetPaletteEntries(void) { return 0; 
 static u64 __attribute__((ms_abi)) stub_awt_CreatePalette(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_CreateMetaFileW(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_CloseMetaFile(void) { return 0; }
-static u64 __attribute__((ms_abi)) stub_awt_OffsetWindowOrgEx(void) { return 0; }
+static u64 __attribute__((ms_abi)) stub_awt_OffsetWindowOrgEx(u64 dc, s32 x, s32 y, int32_t *p) { return (u64)beer_OffsetWindowOrgEx(dc, x, y, p); }
 static u64 __attribute__((ms_abi)) stub_awt_SetWinMetaFileBits(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_SetEnhMetaFileBits(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_GetEnhMetaFileBits(void) { return 0; }

@@ -32,6 +32,7 @@ from overlay_page import OverlayPage, flat_message, load_config as load_overlay_
 from overlay_page import write_loader_file as write_overlay_loader_file  # noqa: E402
 from display_page import DisplayPage, post_message, load_config as load_display_config  # noqa: E402
 from display_page import write_loader_file as write_display_loader_file  # noqa: E402
+from capture_page import CapturePage  # noqa: E402
 from graphics_window import GraphicsWindow, apply_saved as apply_saved_tweaks  # noqa: E402
 from frame_window import FrameWindow  # noqa: E402
 from mods_page import ModRunner, ModsPage  # noqa: E402
@@ -111,6 +112,9 @@ LAUNCH_VALUES = [
     ("nvapi_driver", "NVIDIA driver version to report", "BEER_SPOOF_NVAPI_DRIVER", "NVAPI driver version number (e.g. 56603 for 566.03)"),
     ("ngx_path", "DLSS (NGX) runtime folder", "BEER_NGX_PATH", "Folder with nvngx.dll / _nvngx.dll when it is not found automatically"),
     ("steam_id", "Steam ID for the offline Steam API", "BEER_STEAM_ID", "SteamID64 or account number reported by Beer's offline Steam"),
+    ("steam_networking_library", "Steam local networking library", "BEER_STEAM_NETWORKING_LIBRARY",
+     "Optional libGameNetworkingSockets.so for local listeners (including solo listen servers). "
+     "Does not provide remote Steam signaling or relay authentication. Empty = not enabled by the manager."),
 ]
 
 # DLSS overrides (platform/win32_ngx.inc, live settings dlss_* in platform/beer_control.c).
@@ -254,7 +258,7 @@ class DlssControls:
 
 
 # Loader values that hold paths get a browse button: key -> (pick a folder, list separator or None).
-PATH_VALUES = {"dll_path": (True, ":"), "ngx_path": (True, None)}
+PATH_VALUES = {"dll_path": (True, ":"), "ngx_path": (True, None), "steam_networking_library": (False, None)}
 
 BEER_HOME = os.path.expanduser("~/.beer")
 PREFIX_DIR = os.path.join(BEER_HOME, "prefixes")
@@ -1302,6 +1306,8 @@ class Manager(Adw.Application):
         self.stack.add_titled_with_icon(self.overlay_page, "overlay", "Overlay", "view-reveal-symbolic")
         self.display_page = DisplayPage(self)
         self.stack.add_titled_with_icon(self.display_page, "display", "Display", "video-display-symbolic")
+        self.capture_page = CapturePage(self)
+        self.stack.add_titled_with_icon(self.capture_page, "capture", "Capture", "media-record-symbolic")
         self.mods_page = ModsPage(self)
         self.stack.add_titled_with_icon(self.mods_page, "mods", "Mods", "application-x-addon-symbolic")
 
@@ -1712,7 +1718,9 @@ class Manager(Adw.Application):
         values = game.get("values", {})
         for key, _label, variable, _description in LAUNCH_VALUES:
             if str(values.get(key, "")).strip():
-                env[variable] = str(values[key]).strip()
+                value = str(values[key]).strip()
+                # dlopen does not expand '~'; a saved library path must also work outside a terminal.
+                env[variable] = os.path.expanduser(value) if key == "steam_networking_library" else value
         env.update(dlss_environment(game))
         guard = game.get("memguard") or {}
         if guard:

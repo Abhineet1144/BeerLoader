@@ -25,6 +25,8 @@ Steam session provider over `$XDG_RUNTIME_DIR/beer/steam.sock`.
 | `~/.beer/steam-library/` | Default Steam downloads folder |
 | `~/.beer/cache/` | Shader caches (default; changeable) |
 | `~/Pictures/Beer` | Screenshots |
+| `~/.beer/capture.json` | Capture settings (mode 0600: holds the stream key) |
+| `~/Videos/Beer` | Recordings (default; changeable) |
 
 Files from the old XDG locations (`~/.config/beer/*.json`) are copied (never moved) on first start. The shader cache from
 `~/.cache/beer` is renamed into the new cache folder once, on first use.
@@ -36,7 +38,7 @@ Title "Beer", 900×680. A header bar with a view switcher and two buttons:
 - **Add a game** (`+`) — opens the Add game dialog.
 - **Loader settings** (gear) — opens the Loader settings dialog.
 
-Pages (view switcher): **Library, Steam, Running, Prefixes, Overlay, Display, Mods**. Toasts report events (started a
+Pages (view switcher): **Library, Steam, Running, Prefixes, Overlay, Display, Capture, Mods**. Toasts report events (started a
 game, loader or exe not found, etc.). The manager polls running loaders continuously and refreshes the Running page and
 the library's "Running" state.
 
@@ -112,7 +114,10 @@ Loader options
 - **Values** (empty = default): Beer's own DLLs (`BEER_DLL_BUILTIN`); extra runtime DLL folders (`BEER_DLL_PATH`);
   pipeline memory budget (MB); max VRAM reported (MB); max shared GPU memory reported (MB); max RAM reported (MB);
   audio latency margin (ms); NVIDIA driver version to report; DLSS (NGX) runtime folder; Steam ID for the offline Steam
-  API. Path-type values get a folder picker.
+  API; optional Steam local networking library (`BEER_STEAM_NETWORKING_LIBRARY`, a file picker).
+  The networking backend enables real local listeners, including solo listen servers; remote Steam signaling and
+  relay authentication remain unsupported. It is opt-in per game, and `~` in its saved path is expanded at launch.
+  Folder-type values get a folder picker.
 
 Advanced
 - **Extra loader arguments**, **Game arguments** (passed to the exe), **Environment** (`KEY=value KEY2=value`).
@@ -201,6 +206,27 @@ Final-image effects applied after the game's own tone mapping, live and at launc
   temperature, sharpen, vignette, film grain, letterbox bars.
 - **Colour vision**: Off; correct protanopia / deuteranopia / tritanopia; simulate protanopia / deuteranopia /
   tritanopia; strength slider.
+
+## Capture page (`capture_page.py`)
+
+Records running games to a file or streams them live over RTMP. The loader (`platform/beer_capture.c`) scales the
+finished picture on the GPU (Display effects applied, overlay left out), reads it back into a ring of host buffers and
+feeds it, with the game's own audio, to an `ffmpeg` child process. Needs `ffmpeg` on the PATH.
+
+- **Running games**: one row per game with **Record**, **Stream** and **Stop**, and a live status (time, size, file
+  size, "encoder behind" when frames arrive late). A toast reports the saved file or the reason a capture stopped.
+  Folder button opens the video folder.
+- **Video**: **Resolution** (game's own, 2160p … 480p; aspect kept, never above the game's), **Frame rate** (24–144),
+  **Encoder** (Automatic = NVENC on NVIDIA, else VA-API, else CPU; the subtitle names the ffmpeg encoder used).
+- **Recording**: **Bitrate** (kbit/s), **Codec** (H.264, HEVC, AV1), **File type** (fragmented MP4 or MKV; both
+  survive a crash), **Folder**, and **Record in normal time when the game is slowed**: frames follow the game's
+  scaled clock, so slowed play becomes normal-speed video (no sound on this timeline).
+- **Streaming**: **Bitrate**, **Service** (Twitch, YouTube, custom `rtmp://`/`rtmps://` server), **Stream key**,
+  **Also save a copy** (same encode written to the folder too). Streams are H.264, constant bitrate.
+- **Sound**: **Game sound** (only the game's audio streams, mixed to 48 kHz stereo AAC).
+
+Control commands: `capture_start {mode, encoder, fps, height, bitrate, audio, game_time, container, folder, url,
+save_copy, ffmpeg}`, `capture_stop`, `capture_status`. ffmpeg's log is `$XDG_RUNTIME_DIR/beer/capture-<pid>.log`.
 
 ## Mods page (`mods_page.py`)
 

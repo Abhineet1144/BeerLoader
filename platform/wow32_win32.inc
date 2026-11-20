@@ -283,6 +283,68 @@ static u64 w32_GetNativeSystemInfo(const u32 *args)
     return 0;
 }
 
+/* SetFilePointerEx(HANDLE, LARGE_INTEGER distance, PLARGE_INTEGER new_position, DWORD method): the distance is passed
+ * by value, as two stack DWORDs (low, high). The generic forwarder widened each DWORD into its own argument, so the
+ * high half became the output pointer and every seek past 4 GiB went wrong (FitGirl's 6 GB fg-01.bin then
+ * "decompression fails"). The LARGE_INTEGER output has the same layout in both modes. */
+static u64 w32_SetFilePointerEx(const u32 *args)
+{
+    const s64 distance = (s64)(((u64)args[2] << 32) | args[1]);
+    return (u32)impl_SetFilePointerEx(w32_widen(args[0]), distance, (s64 *)W32_PTR(3), args[4]);
+}
+
+/* Bytes of the 32-bit user range (64 KiB .. 0x7ffeffff) that no host mapping uses. */
+static u64 w32_free_address_space(void)
+{
+    const unsigned long long lo = 0x10000, hi = 0x7fff0000;
+    unsigned long long used = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return hi - lo;
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long long a, b;
+        if (sscanf(line, "%llx-%llx", &a, &b) != 2 || b <= lo || a >= hi) continue;
+        if (a < lo) a = lo;
+        if (b > hi) b = hi;
+        used += b - a;
+    }
+    fclose(maps);
+    return used < hi - lo ? hi - lo - used : 0;
+}
+
+/* A 32-bit process that is not large-address-aware sees at most 2 GB - 1 in each MEMORYSTATUS field. */
+static u32 w32_clamp_2g(u64 v) { return v > 0x7fffffffu ? 0x7fffffffu : (u32)v; }
+
+/* GlobalMemoryStatus: the 32-bit MEMORYSTATUS is eight DWORDs (32 bytes). Forwarding to the 64-bit implementation
+ * wrote 56 bytes of SIZE_T fields and overwrote the caller's frame (unarc.dll returned to 0x7fff, the high half of
+ * the 64-bit total-virtual value). */
+static u64 w32_GlobalMemoryStatus(const u32 *args)
+{
+    u8 *ms = W32_PTR(0);
+    if (!ms) return 0;
+    WIN_MEMORYSTATUSEX info;
+    memset(&info, 0, sizeof(info));
+    info.length = sizeof(info);
+    if (!impl_GlobalMemoryStatusEx(&info)) return 0;
+    const u32 out[8] = { 32, info.memory_load, w32_clamp_2g(info.total_physical), w32_clamp_2g(info.available_physical),
+                         w32_clamp_2g(info.total_page_file), w32_clamp_2g(info.available_page_file), 0x7ffe0000u,
+                         w32_clamp_2g(w32_free_address_space()) };
+    memcpy(ms, out, sizeof(out));
+    return 0;
+}
+
+/* GlobalMemoryStatusEx: same 64-byte layout as on x64, but the virtual figures are the 32-bit user range. */
+static u64 w32_GlobalMemoryStatusEx(const u32 *args)
+{
+    WIN_MEMORYSTATUSEX *ms = W32_PTR(0);
+    if (!ms) { g_last_error = 87; return 0; }
+    if (!impl_GlobalMemoryStatusEx(ms)) return 0;
+    ms->total_virtual = 0x7ffe0000u;
+    ms->available_virtual = w32_free_address_space();
+    ms->available_extended_virtual = 0;
+    return 1;
+}
+
 /* ---- synchronization ---- */
 
 /* CRITICAL_SECTION, 24 bytes: DebugInfo, LockCount, RecursionCount, OwningThread, LockSemaphore, SpinCount.
@@ -755,6 +817,26 @@ static u64 w32_FindResourceW(const u32 *args)         /* (module, name, type) */
     return w32_find_resource(args[0], w32_res_name(args[2], type, sizeof(type)),
                              w32_res_name(args[1], name, sizeof(name)), 0);
 }
+/* LoadBitmapW/A: system bitmaps (NULL module, OBM_*) from Beer; a module's own RT_BITMAP resources from the 32-bit
+ * image (the 64-bit loader cannot see 32-bit modules' resources). */
+static u64 w32_load_bitmap(u32 module, uintptr_t name)
+{
+    if (!module) return (u32)beer_LoadBitmapW(0, name);
+    const u64 entry = w32_find_resource(module, name, 2 /* RT_BITMAP */, 0);
+    if (!entry) return 0;
+    const u32 *data_entry = (const u32 *)(uintptr_t)entry;
+    return (u32)beer_gdi_bitmap_from_dib((const u8 *)(uintptr_t)module + data_entry[0], data_entry[1]);
+}
+static u64 w32_LoadBitmapW(const u32 *args)
+{
+    char name[256];
+    return w32_load_bitmap(args[0], w32_res_name(args[1], name, sizeof(name)));
+}
+static u64 w32_LoadBitmapA(const u32 *args) { return w32_load_bitmap(args[0], args[1]); }
+/* POINT passed by value: two DWORDs on the 32-bit stack, one register (x low, y high) in 64-bit code. */
+static u64 w32_pack_point(const u32 *args, int index) { return (u64)args[index] | ((u64)args[index + 1] << 32); }
+static u64 w32_PtInRect(const u32 *args) { return (u32)impl_PtInRect(W32_PTR(0), w32_pack_point(args, 1)); }
+static u64 w32_WindowFromPoint(const u32 *args) { return (u32)impl_WindowFromPoint(w32_pack_point(args, 0)); }
 static u64 w32_FindResourceA(const u32 *args)
 {
     const u32 reordered[4] = { args[0], args[2], args[1], 0 };
@@ -805,7 +887,9 @@ static u32 w32_wndproc_call(u32 proc, u64 hwnd, u32 message, u64 wparam, u64 lpa
     u32 lp32 = (u32)lparam;
     u8 *copy = NULL;
     const u8 *host = (const u8 *)(uintptr_t)lparam;
-    if (lparam > 0xffffffffull) {
+    /* A sign-extended 32-bit value (MAKELPARAM(0, 65535) for PBM_SETRANGE, negative coordinates) is not a pointer. */
+    const int widened_value = (lparam >> 31) == 0x1ffffffffull;
+    if (lparam > 0xffffffffull && !widened_value) {
         switch (message) {
         case 0x0001: case 0x0081: {                         /* WM_CREATE / WM_NCCREATE: CREATESTRUCT */
             const WIN_CREATESTRUCT *cs = (const WIN_CREATESTRUCT *)host;
@@ -1350,6 +1434,10 @@ static u64 w32_PeekMessageW(const u32 *args)
     WIN_MSG msg;
     memset(&msg, 0, sizeof(msg));
     const u64 result = impl_PeekMessageW(&msg, w32_widen(args[1]), args[2], args[3], args[4]);
+    if (result && getenv("BEER_W32_MSG_TRACE"))
+        fprintf(stderr, "[W32MSG] peek hwnd=0x%llx msg=0x%x wp=0x%llx lp=0x%llx remove=%u\n",
+                (unsigned long long)msg.hwnd, msg.message, (unsigned long long)msg.wParam,
+                (unsigned long long)msg.lParam, args[4]);
     if (result && args[0]) w32_msg_from_native(&msg, W32_PTR(0));
     return (u32)result;
 }
@@ -1786,6 +1874,36 @@ static u64 w32_EndPaint(const u32 *args)
     return (u32)impl_EndPaint(w32_widen(args[0]), (void *)native);
 }
 static u64 w32_PeekMessageA(const u32 *args) { return w32_PeekMessageW(args); }
+/* SendMessageW: EM_STREAMIN (a RichEdit's content, Inno Setup's license and information pages) calls the program's
+ * 32-bit EDITSTREAMCALLBACK (DWORD_PTR cookie, LPBYTE buffer, LONG bytes, LONG *done) with a guest buffer until it
+ * delivers nothing; the 32-bit EDITSTREAM is { cookie, dwError, callback }. Everything else is forwarded. */
+static u64 beer_ctl_stream_in(u64 hw, const u8 *data, size_t n, u32 format);
+static u64 w32_SendMessageW(const u32 *args)
+{
+    if (args[1] == 0x0449 && args[3]) {
+        u32 *stream = W32_PTR(3);
+        u8 *chunk = w32_heap_alloc(4096 + 8, 1);
+        size_t used = 0, cap = 0;
+        u8 *data = NULL;
+        u32 error = 0;
+        for (int guard = 0; chunk && stream[2] && guard < 65536; ++guard) {
+            u32 *done = (u32 *)(chunk + 4096);
+            *done = 0;
+            const u32 call[4] = { stream[0], (u32)(uintptr_t)chunk, 4096, (u32)(uintptr_t)done };
+            error = w32_call(stream[2], 4, call);
+            if (error || (s32)*done <= 0) break;
+            if (cap - used < *done) { u8 *grown = realloc(data, cap + 65536); if (!grown) break; data = grown; cap += 65536; }
+            memcpy(data + used, chunk, *done);
+            used += *done;
+        }
+        stream[1] = error;
+        if (chunk) w32_heap_free(chunk);
+        const u64 r = data ? beer_ctl_stream_in(w32_widen(args[0]), data, used, args[2]) : 0;
+        free(data);
+        return (u32)r;
+    }
+    return w32_forward("SendMessageW", args, 4);
+}
 static u64 w32_SendMessageTimeoutW(const u32 *args)        /* (hwnd, msg, wp, lp, flags, timeout, DWORD_PTR*) */
 {
     const u64 r = w32_forward("SendMessageW", args, 4);
@@ -1802,7 +1920,7 @@ static u64 w32_EqualSid(const u32 *args)
     return !memcmp(a, b, 8 + 4u * a[1]);
 }
 static u64 w32_IsWindowUnicode(const u32 *args) { (void)args; return 1; }
-static u64 w32_GetDlgCtrlID(const u32 *args) { (void)args; return 0; }
+static u64 w32_GetDlgCtrlID(const u32 *args) { return (u32)impl_GetDlgCtrlID(w32_widen(args[0])); }
 
 /* ---- file mappings: the guest can only address the low 4 GiB, so views are placed there explicitly ---- */
 static u64 w32_CreateFileMappingA(const u32 *args) { return w32_call_sa("CreateFileMappingA", args, 6, 1); }
@@ -1817,14 +1935,14 @@ static u64 w32_MapViewOfFileEx(const u32 *args)   /* (mapping, access, offset_hi
     uint32_t status = 0;
     void *address = NULL;
     size_t size = 0;
-    for (int attempt = 0; attempt < 8192; ++attempt) {
-        if (!args[5]) {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        if (!args[5]) {   /* the highest free gap (a view of the whole section is sized by the section; 16 MiB guess) */
+            const uintptr_t span = args[4] ? ((uintptr_t)args[4] + 0xffffu) & ~(uintptr_t)0xffffu : (0x1000000u << (attempt / 8));
             pthread_mutex_lock(&g_w32_lock);
-            const uintptr_t span = args[4] ? ((uintptr_t)args[4] + 0xffffu) & ~(uintptr_t)0xffffu : 0x1000000u;
-            candidate = (g_w32_top - span) & ~(uintptr_t)0xffffu;
-            g_w32_top = candidate;                          /* each probe moves down; a failed one is just skipped */
+            candidate = w32_find_gap(span, 0x20000000, 0x7e000000);
+            if (!candidate) candidate = w32_find_gap(span, 0x10000, 0x20000000);
             pthread_mutex_unlock(&g_w32_lock);
-            if (candidate < 0x20000000) break;
+            if (!candidate) break;
         }
         address = (void *)candidate;
         size = args[4];

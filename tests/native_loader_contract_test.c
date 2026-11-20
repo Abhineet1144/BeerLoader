@@ -1162,15 +1162,23 @@ static void process_security_contract_test(void)
             setenv("_BEER_PRIMARY_TOKEN", token ? "1" : "0", 1);
             assert(beer_security_init(image, sizeof(image)) && beer_process_elevated() == token);
             setenv("_BEER_PRIMARY_TOKEN", "stale", 1);
-            char **env = beer_inherit_environment(NULL);
+            /* A stale image name (this process's own) never reaches a child; the one given for the child does, once. */
+            setenv("_BEER_IMAGE_NAME", "stale.exe", 1);
+            char **env = beer_inherit_environment(NULL, token ? "_BEER_IMAGE_NAME=CLS-srep_x64.exe" : NULL);
             assert(env);
-            int seen = 0;
+            int seen = 0, images = 0;
             for (size_t i = 0; env[i]; ++i) {
+                if (!strncmp(env[i], "_BEER_IMAGE_NAME=", 17)) {
+                    assert(token && !strcmp(env[i], "_BEER_IMAGE_NAME=CLS-srep_x64.exe"));
+                    ++images;
+                }
                 if (strncmp(env[i], "_BEER_PRIMARY_TOKEN=", 20)) continue;
                 assert(!strcmp(env[i], token ? "_BEER_PRIMARY_TOKEN=1" : "_BEER_PRIMARY_TOKEN=0"));
                 ++seen;
             }
             assert(seen == 1);
+            assert(images == (token ? 1 : 0));
+            unsetenv("_BEER_IMAGE_NAME");
             free(env);
         }
         unsetenv("_BEER_PRIMARY_TOKEN");
@@ -1188,6 +1196,22 @@ static void process_security_contract_test(void)
 
 int main(void)
 {
+    typedef u64 (__attribute__((ms_abi)) *SetConsoleAttributes)(u64, u16);
+    SetConsoleAttributes set_attributes = (SetConsoleAttributes)find_impl("SetConsoleTextAttribute");
+    assert(set_attributes);
+    int console_export_owners = 0;
+    for (size_t i = 0; i < BEER_MODULE_EXPORT_COUNT; ++i)
+        if (!strcmp(beer_module_exports[i][1], "SetConsoleTextAttribute")) {
+            if (!strcmp(beer_module_exports[i][0], "kernel32.dll")) console_export_owners |= 1;
+            if (!strcmp(beer_module_exports[i][0], "kernelbase.dll")) console_export_owners |= 2;
+        }
+    assert(console_export_owners == 3);
+    const u64 console_handles[] = {0, UINT64_MAX, (u64)(s64)-11, (u64)(s64)-12};
+    for (size_t i = 0; i < sizeof(console_handles) / sizeof(*console_handles); ++i) {
+        g_last_error = 0;
+        assert(!set_attributes(console_handles[i], 14));
+        assert(g_last_error == 6);
+    }
     multimedia_timer_contract_test();
         legacy_dns_contract_test();
     subclass_contract_test();

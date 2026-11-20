@@ -65,6 +65,12 @@ int xwayland_window_create(int x, int y, int width, int height,
 int xwayland_window_show(int visible);
 /* Secondary surfaces: ARGB popup windows for layered Win32 windows. Return an id (0 = failure). */
 int xwayland_surface_create(int x, int y, int width, int height);
+/* A managed, undecorated top-level surface (a program's dialog): keyboard focus, taskbar entry, title. */
+int xwayland_surface_create_window(int x, int y, int width, int height, const char *title);
+int xwayland_surface_activate(int id);
+int xwayland_surface_begin_move(int id, int root_x, int root_y, int button);
+int xwayland_surface_is_managed(int id);
+int xwayland_surface_set_title(int id, const char *title);
 int xwayland_surface_update(int id, int x, int y, int width, int height, const uint32_t *pixels);
 int xwayland_surface_show(int id, int visible);
 void xwayland_surface_destroy(int id);

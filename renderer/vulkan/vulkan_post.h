@@ -26,6 +26,12 @@ int vulkan_post_screenshot_waiting(void);
  * presenter's fence wait). */
 void vulkan_post_collect(void);
 
+/* Presenters with several frames in flight (the Vulkan mapper): tag the frame before vulkan_post_apply, and once the
+ * fence of the frame tagged T has signalled (and every earlier one), hand that frame's capture to the encoder with
+ * vulkan_post_collect_frames(T). vulkan_post_collect collects every recorded frame. */
+void vulkan_post_set_frame_tag(uint64_t tag);
+void vulkan_post_collect_frames(uint64_t done_tag);
+
 /* The presenter destroyed (or is about to recreate) its upload image: drop cached views of it. */
 void vulkan_post_forget_upload(void);
 

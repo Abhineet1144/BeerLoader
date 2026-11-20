@@ -417,16 +417,37 @@ static int beer_mapping_shm(const char *name, s64 size, int create, int *existed
     size_t n = strlen(path);
     for (size_t i = 0; name[i] && n + 1 < sizeof(path); ++i) path[n++] = (name[i] == '/' || name[i] == '\\') ? '_' : name[i];
     path[n] = 0;
-    int fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    /* Windows deletes a named mapping with its last handle, but a shm object outlives its processes. Every holder
+     * keeps a shared flock on it (the section's dup of this descriptor shares the lock), so an object nobody holds is
+     * an exited process's leftover: it is not found, or is created afresh (zeroed). Stale contents broke FitGirl's CLS
+     * hand-over (Init_MapFile_, IO_MapFile_<method><n>). The creator holds the lock exclusively until the object has
+     * its size, so an opener never maps a short object. */
     if (existed) *existed = 0;
-    if (fd < 0 && errno == EEXIST) { fd = shm_open(path, O_RDWR, 0600); if (existed) *existed = 1; }
-    else if (fd < 0 && !create) return -1;
-    if (fd < 0 && !create) return -1;
-    if (fd >= 0 && create && size > 0) {
-        struct stat st;
-        if (fstat(fd, &st) == 0 && st.st_size < size && ftruncate(fd, size) != 0) { close(fd); return -1; }
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        int fd = shm_open(path, O_RDWR, 0600);
+        if (fd >= 0) {
+            if (flock(fd, LOCK_EX | LOCK_NB) == 0) {                         /* nobody holds it */
+                if (!create) { shm_unlink(path); close(fd); return -1; }
+                if (ftruncate(fd, 0) != 0 || (size > 0 && ftruncate(fd, size) != 0)) { close(fd); return -1; }
+                flock(fd, LOCK_SH);
+                return fd;
+            }
+            if (flock(fd, LOCK_SH) != 0) { close(fd); return -1; }
+            if (existed) *existed = 1;
+            if (create && size > 0) {
+                struct stat st;
+                if (fstat(fd, &st) == 0 && st.st_size < size && ftruncate(fd, size) != 0) { close(fd); return -1; }
+            }
+            return fd;
+        }
+        if (!create) return -1;
+        fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) { if (errno == EEXIST) continue; return -1; }
+        if (flock(fd, LOCK_EX) != 0 || (size > 0 && ftruncate(fd, size) != 0)) { shm_unlink(path); close(fd); return -1; }
+        flock(fd, LOCK_SH);
+        return fd;
     }
-    return fd;
+    return -1;
 }
 static u64 beer_create_file_mapping(u64 file, u32 protect, u32 size_high, u32 size_low, const char *name)
 {

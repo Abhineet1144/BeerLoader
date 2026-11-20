@@ -7,7 +7,7 @@ TARGET = loader
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
 MEDIA_SRCS = media/media_foundation.c
-PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_winhttp_url.c platform/win32_winhttp.c platform/win32_full_path.c platform/win32_gdi.c platform/win32_gdiplus.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_gpu_stats.c \
+PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_winhttp_url.c platform/win32_winhttp.c platform/win32_full_path.c platform/win32_gdi.c platform/win32_gdiplus.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_capture.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
 				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_sddl.c platform/win32_shell_strings.c platform/win32_variant.c platform/win32_schannel.c platform/wow32_math.c
@@ -75,6 +75,10 @@ platform/beer_env.o: platform/beer_env.c platform/beer_env.h
 	$(CC) $(RENDER_CFLAGS) -c $< -o $@
 
 graphics/d3d11/d3d11_impl.o: graphics/d3d11/d3d11_impl.c
+	$(CC) $(RENDER_CFLAGS) -c $< -o $@
+
+# Mixes and resamples the recorded game audio on every sound-server write.
+platform/beer_capture.o: platform/beer_capture.c
 	$(CC) $(RENDER_CFLAGS) -c $< -o $@
 
 # D3D12's Win64 ABI passes floating-point parameters in XMM registers (for

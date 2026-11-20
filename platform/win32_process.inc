@@ -281,6 +281,9 @@ static pthread_mutex_t g_pipe_mtx = PTHREAD_MUTEX_INITIALIZER;
  * Descriptors are placed at fixed numbers from BEER_INHERIT_FD_BASE in the child. Handle kinds without a host
  * counterpart (threads, mutexes, semaphores, mappings) are not carried over and are reported. */
 #define BEER_INHERIT_FD_BASE 500
+/* The host descriptor a 32-bit program made its standard stream `i` (MSVCRT _dup2 onto 0/1/2 also sets the process's
+ * standard handle, which a child started by CreateProcess gets), or -1 for the loader's own (wow32.inc). */
+static int w32_child_std_fd(int i);
 typedef struct { char *env; posix_spawn_file_actions_t actions; int actions_ready; } BeerInherit;
 
 static int beer_inherit_prepare(BeerInherit *inherit)
@@ -346,19 +349,24 @@ static void beer_inherit_release(BeerInherit *inherit)
     if (inherit->actions_ready) posix_spawn_file_actions_destroy(&inherit->actions);
     free(inherit->env);
 }
-/* The parent's environment, without an inherited-handle list of its own, plus `extra` (may be NULL). */
-static char **beer_inherit_environment(const char *extra)
+/* The parent's environment, without an inherited-handle list or image name of its own, plus `extra` and `image`
+ * (each may be NULL). */
+static char **beer_inherit_environment(const char *extra, const char *image)
 {
     size_t n = 0;
     while (environ[n]) ++n;
-    char **env = calloc(n + 3, sizeof(*env));
+    char **env = calloc(n + 5, sizeof(*env));
     if (!env) return NULL;
     size_t k = 0;
     for (size_t i = 0; i < n; ++i)
         if (strncmp(environ[i], "BEER_INHERITED_HANDLES=", 23) &&
-            strncmp(environ[i], "_BEER_PRIMARY_TOKEN=", 20)) env[k++] = environ[i];
+            strncmp(environ[i], "_BEER_PRIMARY_TOKEN=", 20) &&
+            strncmp(environ[i], "_BEER_IMAGE_NAME=", 17) &&
+            strncmp(environ[i], "_BEER_GUEST_STDOUT=", 19)) env[k++] = environ[i];
     if (extra) env[k++] = (char *)extra;
+    if (image) env[k++] = (char *)image;
     env[k++] = beer_process_elevated() ? "_BEER_PRIMARY_TOKEN=1" : "_BEER_PRIMARY_TOKEN=0";
+    if (w32_child_std_fd(1) >= 0) env[k++] = "_BEER_GUEST_STDOUT=1";   /* the child's stdout is a redirected stream */
     env[k] = NULL;
     return env;
 }
@@ -432,8 +440,29 @@ static void beer_inherit_install(void)
     unsetenv("BEER_INHERITED_HANDLES");
 }
 
+#include "beer_cmd.inc"
+
+/* cmd.exe (any directory, any case): Beer's interpreter in platform/beer_cmd.inc. */
+static int beer_is_cmd_exe(const char *token)
+{
+    const char *base = token;
+    for (const char *c = token; *c; ++c) if (*c == '\\' || *c == '/') base = c + 1;
+    return !strcasecmp(base, "cmd.exe") || !strcasecmp(base, "cmd");
+}
+
+static u64 beer_create_process_in(const char *application, const char *command_line, u32 flags, u8 *info,
+                                  const u8 *startup, int inherit_handles, const char *directory);
 static u64 beer_create_process(const char *application, const char *command_line, u32 flags, u8 *info, const u8 *startup,
-                               int inherit_handles)
+                               int inherit_handles, const char *directory)
+{
+    const u64 ok = beer_create_process_in(application, command_line, flags, info, startup, inherit_handles, directory);
+    if (!ok)
+        fprintf(stderr, "[PROCESS] CreateProcess failed (error %u): app=%s cmd=%s\n", g_last_error,
+                application ? application : "(null)", command_line ? command_line : "(null)");
+    return ok;
+}
+static u64 beer_create_process_in(const char *application, const char *command_line, u32 flags, u8 *info,
+                                  const u8 *startup, int inherit_handles, const char *directory)
 {
     char token[PATH_MAX];
     token[0] = 0;
@@ -459,6 +488,8 @@ static u64 beer_create_process(const char *application, const char *command_line
     char host[PATH_MAX];
     struct stat st;
     int found = 0;
+    const int is_cmd = beer_is_cmd_exe(token);
+    if (is_cmd) found = 1;
     for (int attempt = 0; attempt < 2 && !found; ++attempt) {
         char candidate[PATH_MAX];
         snprintf(candidate, sizeof(candidate), attempt ? "%s.exe" : "%s", token);
@@ -466,12 +497,26 @@ static u64 beer_create_process(const char *application, const char *command_line
             found = 1;
     }
     if (!found) { g_last_error = 2; return 0; }        /* ERROR_FILE_NOT_FOUND */
+    /* The file name as the caller spelled it: Windows reports that spelling (GetModuleFileName) even when the file on
+     * disk differs in case, and programs derive names from it (FitGirl's CLS-srep_x64.exe opens the events
+     * IOEvent_CLS-srep<n> that CLS-srep.dll created; the file on disk is cls-srep_x64.exe). */
+    char image_entry[300] = "";
+    {
+        const char *base = token;
+        for (const char *c = token; *c; ++c) if (*c == '\\' || *c == '/') base = c + 1;
+        const char *host_base = strrchr(host, '/');
+        host_base = host_base ? host_base + 1 : host;
+        char spelled[260];
+        snprintf(spelled, sizeof(spelled), "%s%s", base, strlen(base) + 4 == strlen(host_base) ? ".exe" : "");
+        if (strcmp(spelled, host_base) && !strcasecmp(spelled, host_base))
+            snprintf(image_entry, sizeof(image_entry), "_BEER_IMAGE_NAME=%s", spelled);
+    }
     /* CreateProcess inherits the primary token, even without handle inheritance.
      * Unlike an initial host launch it must never auto-elevate a child. */
-    int level = beer_security_file_level(host);
+    int level = is_cmd ? 0 : beer_security_file_level(host);
     if (level < 0) { g_last_error = 193; return 0; }
     if (level == 3 && !beer_process_elevated()) { g_last_error = 740; return 0; }
-    {
+    if (!is_cmd) {
         unsigned char magic[2] = {0, 0};
         FILE *f = fopen(host, "rb");
         if (f) { if (fread(magic, 1, 2, f) != 2) magic[0] = 0; fclose(f); }
@@ -498,9 +543,9 @@ static u64 beer_create_process(const char *application, const char *command_line
         if (strncmp(a, "--cmdline=", 10)) argv[argc++] = g_loader_argv[i];
     }
     char cmdline_option[8192 + 16];
-    snprintf(cmdline_option, sizeof(cmdline_option), "--cmdline=%s", command);
+    snprintf(cmdline_option, sizeof(cmdline_option), is_cmd ? "--beer-cmd=%s" : "--cmdline=%s", command);
     argv[argc++] = cmdline_option;
-    argv[argc++] = host;
+    if (!is_cmd) argv[argc++] = host;
     argv[argc] = NULL;
 
     if (flags & 0x4u)
@@ -508,13 +553,37 @@ static u64 beer_create_process(const char *application, const char *command_line
     pid_t pid = 0;
     BeerInherit inherit;
     int have_inherit = inherit_handles && g_inheritable_handles && beer_inherit_prepare(&inherit);
-    char **env = beer_inherit_environment(have_inherit ? inherit.env : NULL);
+    char **env = beer_inherit_environment(have_inherit ? inherit.env : NULL, image_entry[0] ? image_entry : NULL);
     if (!env) {
         if (have_inherit) beer_inherit_release(&inherit);
         g_last_error = 8;
         return 0;
     }
-    int rc = posix_spawn(&pid, self, have_inherit ? &inherit.actions : NULL, NULL, argv, env);
+    /* Standard streams a 32-bit program redirected go to the child as its stdin/stdout/stderr (unarc feeds an external
+     * decoder such as cls-srep_x64.exe "d - -" through pipes this way). */
+    posix_spawn_file_actions_t std_actions;
+    posix_spawn_file_actions_t *actions = have_inherit ? &inherit.actions : NULL;
+    int std_ready = 0;
+    for (int i = 0; i < 3; ++i) {
+        const int fd = w32_child_std_fd(i);
+        if (fd < 0) continue;
+        if (!actions) {
+            if (posix_spawn_file_actions_init(&std_actions) != 0) break;
+            std_ready = 1;
+            actions = &std_actions;
+        }
+        posix_spawn_file_actions_adddup2(actions, fd, i);
+    }
+    /* lpCurrentDirectory: the child starts there (ISDone runs cmd.exe in the game folder). */
+    char directory_host[PATH_MAX];
+    if (directory && *directory && resolve_windows_host_path(directory, directory_host, sizeof(directory_host))) {
+        if (!actions) {
+            if (posix_spawn_file_actions_init(&std_actions) == 0) { std_ready = 1; actions = &std_actions; }
+        }
+        if (actions) posix_spawn_file_actions_addchdir_np(actions, directory_host);
+    }
+    int rc = posix_spawn(&pid, self, actions, NULL, argv, env);
+    if (std_ready) posix_spawn_file_actions_destroy(&std_actions);
     free(env);
     if (have_inherit) beer_inherit_release(&inherit);
     if (rc != 0) { g_last_error = 5; return 0; }       /* ERROR_ACCESS_DENIED */
@@ -550,20 +619,22 @@ beer_CreateProcessA(const char *application, const char *command_line, void *pro
         }
     }
     if (info) memset(info, 0, 24);                          /* PROCESS_INFORMATION stays zero on failure */
-    return beer_create_process(application, command_line, flags, info, startup, inherit != 0);
+    return beer_create_process(application, command_line, flags, info, startup, inherit != 0, directory);
 }
 
 static u64 __attribute__((ms_abi))
 beer_CreateProcessW(const u16 *application, const u16 *command_line, void *process_sa, void *thread_sa,
                     u32 inherit, u32 flags, void *environment, const u16 *directory, void *startup, u8 *info)
 {
-    (void)environment; (void)directory;
+    (void)environment;
     note_inheritable_sa((u64)(uintptr_t)process_sa); note_inheritable_sa((u64)(uintptr_t)thread_sa);
-    char app[PATH_MAX], cmd[8192];
+    char app[PATH_MAX], cmd[8192], dir[PATH_MAX];
     beer_proc_utf16_to_utf8(application, app, sizeof(app));
     beer_proc_utf16_to_utf8(command_line, cmd, sizeof(cmd));
+    beer_proc_utf16_to_utf8(directory, dir, sizeof(dir));
     if (info) memset(info, 0, 24);                          /* PROCESS_INFORMATION stays zero on failure */
-    return beer_create_process(application ? app : NULL, command_line ? cmd : NULL, flags, info, startup, inherit != 0);
+    return beer_create_process(application ? app : NULL, command_line ? cmd : NULL, flags, info, startup, inherit != 0,
+                               directory ? dir : NULL);
 }
 
 static u64 __attribute__((ms_abi)) beer_GetProcessId(u64 process)

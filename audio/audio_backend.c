@@ -39,6 +39,9 @@ typedef uint64_t (*PaSimpleLatencyFn)(pa_simple *, int *);
 
 enum { PA_STREAM_PLAYBACK = 1, PA_SAMPLE_S16LE = 3 };
 
+/* Game-audio tap for recording/streaming (platform/beer_capture.c). Weak: the audio unit tests link without it. */
+void beer_capture_audio(const void *stream, const int16_t *pcm, size_t frames, unsigned rate, unsigned channels) __attribute__((weak));
+
 typedef struct AudioPacket {
     void *data;
     size_t size;
@@ -71,6 +74,7 @@ struct BeerAudioStream {
     size_t max_queued_bytes;
     size_t piece_bytes;
     uint32_t bytes_per_second;
+    unsigned rate, channels;
     atomic_uint_fast64_t bytes_played;
     atomic_uint_fast64_t write_started_ms;   /* 0 while no pa_simple_write is in flight */
     pthread_t watchdog;
@@ -190,6 +194,11 @@ static void *audio_thread_main(void *opaque)
             size_t n = packet->size - done < piece ? packet->size - done : piece;
             const uint64_t t_before = audio_now_ms();
             if (g_pulse.simple_write(s->stream, (const uint8_t *)packet->data + done, n, &error) != 0) write_ok = 0;
+            /* Tapped after the write returns: the sound server then holds only its short target buffer, so the
+             * recording lines up with what is heard. */
+            else if (beer_capture_audio)
+                beer_capture_audio(s, (const int16_t *)((const uint8_t *)packet->data + done), n / (s->channels * sizeof(int16_t)),
+                                   s->rate, s->channels);
             if (getenv("BEER_AUDIO_DIAGNOSTICS") && audio_now_ms() - t_before > 100)
                 fprintf(stderr, "[AUDIO] %s slow write: %zu bytes took %llu ms (queued %zu)\n", s->name, n, (unsigned long long)(audio_now_ms() - t_before), s->queued_bytes);
             done += n;
@@ -242,6 +251,8 @@ BeerAudioStream *beer_audio_stream_open(unsigned rate, unsigned channels, const 
     pthread_cond_init(&s->condition, NULL);
     s->running = 1;
     s->bytes_per_second = bytes_per_second;
+    s->rate = rate;
+    s->channels = channels;
     /* Bound copied PCM to roughly 400 ms. This keeps the mixer thread
      * decoupled from PipeWire without allowing unbounded latency/memory growth. */
     s->max_queued_bytes = (size_t)rate * channels * sizeof(int16_t) * 2u / 5u;

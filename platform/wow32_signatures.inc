@@ -135,11 +135,11 @@
     W32_FWD("IsIconic", 4), \
     W32_FWD("IsRectEmpty", 4), \
     W32_FWD("IsZoomed", 4), \
-    W32_FWD("LoadBitmapW", 8), \
+    {"LoadBitmapW", w32_LoadBitmapW, 8}, {"LoadBitmapA", w32_LoadBitmapA, 8}, \
     W32_FWD("LoadKeyboardLayoutW", 8), \
     W32_FWD("MapVirtualKeyW", 8), \
     W32_FWD("OffsetRect", 12), \
-    W32_FWD("PtInRect", 12), \
+    {"PtInRect", w32_PtInRect, 12}, \
     W32_FWD("ReleaseCapture", 0), \
     W32_FWD("RemoveMenu", 12), \
     W32_FWD("RemovePropW", 8), \
@@ -161,7 +161,7 @@
     W32_FWD("UnhookWindowsHookEx", 4), \
     W32_FWD("UnregisterClassW", 8), \
     W32_FWD("WaitMessage", 0), \
-    W32_FWD("WindowFromPoint", 8), \
+    {"WindowFromPoint", w32_WindowFromPoint, 8}, \
     W32_FWD("ShellExecuteW", 24), \
     W32_FWD("ImageList_Add", 12), \
     W32_FWD("ImageList_BeginDrag", 16), \
@@ -191,7 +191,7 @@
     {"GlobalFindAtomW", w32_unsupported, 4}, \
     {"OpenMutexW", w32_unsupported, 12}, \
     {"WriteProfileStringW", w32_unsupported, 12}, \
-    {"CreateBrushIndirect", w32_unsupported, 4}, \
+    W32_FWD("CreateBrushIndirect", 4), \
     {"EnumFontFamiliesExW", w32_unsupported, 20}, \
     {"StartDocW", w32_unsupported, 8}, \
     {"AddFontResourceW", w32_unsupported, 4}, \
@@ -203,7 +203,7 @@
     {"RemoveFontResourceW", w32_unsupported, 4}, \
     {"SetAbortProc", w32_unsupported, 8}, \
     {"SetDIBColorTable", w32_unsupported, 16}, \
-    {"UnrealizeObject", w32_unsupported, 4}, \
+    W32_FWD("UnrealizeObject", 4), \
     {"OpenThreadToken", w32_unsupported, 16}, \
     {"GetTokenInformation", w32_unsupported, 20}, \
     {"RegDeleteKeyW", w32_unsupported, 8}, \

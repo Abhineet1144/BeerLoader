@@ -4,6 +4,7 @@
 #include "beer_objects.h"
 #include "beer_overlay.h"
 #include "beer_post.h"
+#include "beer_capture.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -497,6 +498,8 @@ static void mg_status_json(char *out, size_t size)
              (unsigned long long)g_mg.cg_used_mb, (unsigned long long)g_mg.cg_limit_mb);
 }
 
+void beer_w32_set_trace(int level) __attribute__((weak));
+size_t beer_w32_thread_report(char *out, size_t size) __attribute__((weak));
 #define REPLY_SIZE (256 * 1024)
 typedef struct { Sample last; } Session;
 
@@ -508,6 +511,17 @@ static void handle(Session *session, const char *request, char *out, size_t size
         char exe[600];
         json_escape(exe, sizeof(exe), g_exe);
         snprintf(out, size, "{\"ok\":true,\"protocol\":1,\"pid\":%d,\"exe\":\"%s\"}\n", (int)getpid(), exe);
+    } else if (!strcmp(cmd, "w32_trace")) {
+        /* {"cmd":"w32_trace","value":0|1|2}: the 32-bit API trace (to standard error) in a running process. */
+        int32_t milli = 1000;
+        beer_json_milli(request, "value", &milli);
+        const int level = (int)(milli / 1000);
+        if (beer_w32_set_trace) { beer_w32_set_trace(level); snprintf(out, size, "{\"ok\":true,\"level\":%d}\n", level); }
+        else reply_error(out, size, "not a 32-bit process");
+    } else if (!strcmp(cmd, "w32_threads")) {
+        /* The API each 32-bit thread is in (plain text lines). */
+        if (beer_w32_thread_report) beer_w32_thread_report(out, size);
+        else reply_error(out, size, "not a 32-bit process");
     } else if (!strcmp(cmd, "trim")) {
         /* Hands free memory inside the host allocator's arenas back to the system. */
         uint64_t ticks, before, after, threads;
@@ -594,6 +608,8 @@ static void handle(Session *session, const char *request, char *out, size_t size
         snprintf(out, size, "{\"ok\":true}\n");
     } else if (!strncmp(cmd, "gfx_", 4)) {
         bd12_cbt_handle(cmd, request, out, size);
+    } else if (!strncmp(cmd, "capture_", 8)) {
+        beer_capture_handle(cmd, request, out, size);
     } else if (!strncmp(cmd, "post_", 5) || !strcmp(cmd, "screenshot")) {
         beer_post_handle(cmd, request, out, size);
     } else if (!strncmp(cmd, "overlay_", 8) || !strncmp(cmd, "hotkey_", 7)) {

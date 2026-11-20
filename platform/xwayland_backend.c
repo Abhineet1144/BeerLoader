@@ -268,6 +268,7 @@ typedef struct {
         Visual *visual;
         int x, y, width, height, mapped;
         uint32_t *pixels;          /* last content, repainted on Expose */
+        int managed;               /* a window-manager managed dialog (keyboard focus, taskbar), not a popup */
     } surfaces[BEER_X11_MAX_SURFACES];
     int pointer_confine_wanted;   /* ClipCursor active */
     int win_decorated;            /* last set_style */
@@ -1297,7 +1298,38 @@ static void surface_repaint_locked(int id)
     g_x11.DestroyImage(image);
 }
 
+/* Fixed-size hints of a managed surface (the program sizes its dialogs itself). */
+static void surface_size_hints_locked(Window window, int x, int y, int width, int height)
+{
+    XSizeHints hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = 1 | 2 | 16 | 32;               /* USPosition | USSize | PMinSize | PMaxSize */
+    hints.x = x; hints.y = y; hints.width = width; hints.height = height;
+    hints.min_width = hints.max_width = width;
+    hints.min_height = hints.max_height = height;
+    g_x11.SetWMNormalHints(g_x11.display, window, &hints);
+}
+static void surface_set_title_locked(Window window, const char *title)
+{
+    if (!title) return;
+    g_x11.StoreName(g_x11.display, window, title);
+    Atom name = g_x11.InternAtom(g_x11.display, "_NET_WM_NAME", 0);
+    Atom utf8 = g_x11.InternAtom(g_x11.display, "UTF8_STRING", 0);
+    if (name && utf8)
+        g_x11.ChangeProperty(g_x11.display, window, name, utf8, 8, 0, (const unsigned char *)title, (int)strlen(title));
+}
+static int surface_create(int x, int y, int width, int height, int managed, const char *title);
 int xwayland_surface_create(int x, int y, int width, int height)
+{
+    return surface_create(x, y, width, height, 0, NULL);
+}
+/* A dialog window of the program (a Beer-drawn top-level window with its own caption): managed by the window
+ * manager so it can take keyboard focus and appears in the taskbar, but undecorated (Beer draws the frame). */
+int xwayland_surface_create_window(int x, int y, int width, int height, const char *title)
+{
+    return surface_create(x, y, width, height, 1, title);
+}
+static int surface_create(int x, int y, int width, int height, int managed, const char *title)
 {
     if (beer_headless() || width <= 0 || height <= 0) return 0;
     pthread_mutex_lock(&g_x11.lock);
@@ -1315,8 +1347,9 @@ int xwayland_surface_create(int x, int y, int width, int height)
     XSetWindowAttributesLocal attributes;
     memset(&attributes, 0, sizeof(attributes));
     attributes.colormap = g_x11.CreateColormap(g_x11.display, root, info.visual, 0 /* AllocNone */);
-    attributes.override_redirect = 1;            /* a popup: placed by the game, no frame */
+    attributes.override_redirect = managed ? 0 : 1;   /* a popup: placed by the game, no frame */
     attributes.event_mask = (1L << 2) | (1L << 3) | (1L << 6) | (1L << 15);   /* buttons, motion, exposure */
+    if (managed) attributes.event_mask |= (1L << 0) | (1L << 1) | (1L << 17) | (1L << 21);  /* keys, structure, focus */
     const unsigned long mask = (1UL << 1) | (1UL << 3) | (1UL << 9) | (1UL << 11) | (1UL << 13);
     s->window = g_x11.CreateWindow(g_x11.display, root, x, y, (unsigned)width, (unsigned)height, 0, 32,
                                    1 /* InputOutput */, info.visual, mask, &attributes);
@@ -1330,6 +1363,36 @@ int xwayland_surface_create(int x, int y, int width, int height)
     s->gc = g_x11.CreateGC(g_x11.display, s->window, 0, NULL);
     s->x = x; s->y = y; s->width = width; s->height = height; s->mapped = 0;
     s->pixels = calloc((size_t)width * (size_t)height, 4);
+    s->managed = managed;
+    if (managed) {
+        surface_set_title_locked(s->window, title && *title ? title : "Beer Windows Application");
+        surface_size_hints_locked(s->window, x, y, width, height);
+        struct { unsigned long flags, functions, decorations; long input_mode; unsigned long status; } motif = {
+            2, 0, 0, 0, 0 };                     /* MWM_HINTS_DECORATIONS: none (Beer draws the caption) */
+        Atom motif_atom = g_x11.InternAtom(g_x11.display, "_MOTIF_WM_HINTS", 0);
+        if (motif_atom)
+            g_x11.ChangeProperty(g_x11.display, s->window, motif_atom, motif_atom, 32, 0,
+                                 (const unsigned char *)&motif, 5);
+        if (g_x11.app_id[0]) {
+            Atom wm_class = g_x11.InternAtom(g_x11.display, "WM_CLASS", 0);
+            Atom string = g_x11.InternAtom(g_x11.display, "STRING", 0);
+            const size_t length = strlen(g_x11.app_id);
+            char class_value[sizeof(g_x11.app_id) * 2u + 2u];
+            memcpy(class_value, g_x11.app_id, length + 1u);
+            memcpy(class_value + length + 1u, g_x11.app_id, length + 1u);
+            if (wm_class && string)
+                g_x11.ChangeProperty(g_x11.display, s->window, wm_class, string, 8, 0,
+                                     (const unsigned char *)class_value, (int)(length * 2u + 2u));
+        }
+        Atom net_wm_pid = g_x11.InternAtom(g_x11.display, "_NET_WM_PID", 0);
+        Atom cardinal = g_x11.InternAtom(g_x11.display, "CARDINAL", 0);
+        unsigned long process_id = (unsigned long)(uint32_t)getpid();
+        if (net_wm_pid && cardinal)
+            g_x11.ChangeProperty(g_x11.display, s->window, net_wm_pid, cardinal, 32, 0,
+                                 (const unsigned char *)&process_id, 1);
+        Atom wm_delete = g_x11.InternAtom(g_x11.display, "WM_DELETE_WINDOW", 0);
+        if (wm_delete) g_x11.SetWMProtocols(g_x11.display, s->window, &wm_delete, 1);
+    }
     g_x11.Flush(g_x11.display);
     pthread_mutex_unlock(&g_x11.lock);
     fprintf(stderr, "[XWAYLAND] secondary surface %d: %dx%d at %d,%d\n", id, width, height, x, y);
@@ -1345,6 +1408,7 @@ int xwayland_surface_update(int id, int x, int y, int width, int height, const u
     __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
     if (!s->window) { pthread_mutex_unlock(&g_x11.lock); return 0; }
     if (x != s->x || y != s->y || width != s->width || height != s->height) {
+        if (s->managed) surface_size_hints_locked(s->window, x, y, width, height);
         g_x11.MoveResizeWindow(g_x11.display, s->window, x, y, (unsigned)width, (unsigned)height);
         if (width != s->width || height != s->height) {
             uint32_t *grown = calloc((size_t)width * (size_t)height, 4);
@@ -1359,6 +1423,75 @@ int xwayland_surface_update(int id, int x, int y, int width, int height, const u
     return 1;
 }
 
+/* Asks the window manager to activate (focus and raise) a managed surface, as request_focus_locked does. */
+static void surface_activate_locked(Window window)
+{
+    Atom active = g_x11.InternAtom(g_x11.display, "_NET_ACTIVE_WINDOW", 0);
+    Window root = g_x11.DefaultRootWindow(g_x11.display);
+    if (!active || !root) return;
+    XClientMessageEvent message;
+    memset(&message, 0, sizeof(message));
+    message.type = 33;
+    message.display = g_x11.display;
+    message.window = window;
+    message.message_type = active;
+    message.format = 32;
+    message.data.l[0] = 1;
+    message.data.l[1] = (long)g_x11.user_time;
+    g_x11.SendEvent(g_x11.display, root, 0, (1L << 19) | (1L << 20), (XEvent *)&message);
+}
+int xwayland_surface_activate(int id)
+{
+    if (beer_headless() || id < 1 || id > BEER_X11_MAX_SURFACES) return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
+    if (s->window && s->managed && s->mapped) { surface_activate_locked(s->window); g_x11.Flush(g_x11.display); }
+    pthread_mutex_unlock(&g_x11.lock);
+    return 1;
+}
+/* Dragging a managed surface's (Beer-drawn) caption: the window manager moves it (_NET_WM_MOVERESIZE, MOVE). */
+int xwayland_surface_begin_move(int id, int root_x, int root_y, int button)
+{
+    if (beer_headless() || id < 1 || id > BEER_X11_MAX_SURFACES) return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
+    int ok = 0;
+    Atom moveresize = g_x11.display ? g_x11.InternAtom(g_x11.display, "_NET_WM_MOVERESIZE", 0) : 0;
+    if (s->window && s->managed && moveresize) {
+        g_x11.UngrabPointer(g_x11.display, 0);            /* the button press grab: the window manager takes over */
+        XClientMessageEvent message;
+        memset(&message, 0, sizeof(message));
+        message.type = 33;
+        message.display = g_x11.display;
+        message.window = s->window;
+        message.message_type = moveresize;
+        message.format = 32;
+        message.data.l[0] = root_x; message.data.l[1] = root_y;
+        message.data.l[2] = 8;                              /* _NET_WM_MOVERESIZE_MOVE */
+        message.data.l[3] = button;
+        message.data.l[4] = 1;
+        ok = g_x11.SendEvent(g_x11.display, g_x11.DefaultRootWindow(g_x11.display), 0,
+                             (1L << 19) | (1L << 20), (XEvent *)&message) != 0;
+        g_x11.Flush(g_x11.display);
+    }
+    pthread_mutex_unlock(&g_x11.lock);
+    return ok;
+}
+int xwayland_surface_is_managed(int id)
+{
+    if (id < 1 || id > BEER_X11_MAX_SURFACES) return 0;
+    return g_x11.surfaces[id - 1].managed;
+}
+int xwayland_surface_set_title(int id, const char *title)
+{
+    if (beer_headless() || id < 1 || id > BEER_X11_MAX_SURFACES) return 0;
+    pthread_mutex_lock(&g_x11.lock);
+    __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
+    if (s->window && s->managed) { surface_set_title_locked(s->window, title); g_x11.Flush(g_x11.display); }
+    pthread_mutex_unlock(&g_x11.lock);
+    return 1;
+}
+
 int xwayland_surface_show(int id, int visible)
 {
     if (beer_headless()) return 1;
@@ -1369,6 +1502,7 @@ int xwayland_surface_show(int id, int visible)
         if (visible) g_x11.MapRaised(g_x11.display, s->window);
         else g_x11.UnmapWindow(g_x11.display, s->window);
         s->mapped = !!visible;
+        if (visible && s->managed) surface_activate_locked(s->window);
         if (visible) surface_repaint_locked(id);
         g_x11.Flush(g_x11.display);
     }
@@ -1414,13 +1548,41 @@ int xwayland_window_poll_event(XwaylandEvent *out)
     XEvent event;
     memset(&event, 0, sizeof(event));
     g_x11.NextEvent(g_x11.display, &event);
-    /* Pointer and expose events of a secondary surface: tagged with its id; everything else of it is ignored. */
-    if (event.type >= 4 && event.type <= 12 && ((XAnyEventLocal *)&event)->window != g_x11.window) {
+    /* Events of a secondary surface: tagged with its id. Pointer and expose events for every surface; keys, focus,
+     * position and close for managed (dialog) surfaces. */
+    if (((event.type >= 2 && event.type <= 12) || event.type == 22 || event.type == 33) &&
+        ((XAnyEventLocal *)&event)->window != g_x11.window) {
         const Window target = ((XAnyEventLocal *)&event)->window;
         int id = 0;
         for (int i = 0; i < BEER_X11_MAX_SURFACES && !id; ++i)
             if (g_x11.surfaces[i].window && g_x11.surfaces[i].window == target) id = i + 1;
-        if (id && event.type == 12) surface_repaint_locked(id);
+        if (id && (event.type == 2 || event.type == 3)) {
+            XKeyEvent *key = (XKeyEvent *)&event;
+            out->type = event.type == 2 ? XWAYLAND_EVENT_KEY_DOWN : XWAYLAND_EVENT_KEY_UP;
+            out->keycode = key->keycode;
+            out->keysym = g_x11.LookupKeysym(key, 0);
+            out->state = key->state;
+            out->surface = id;
+        } else if (id && (event.type == 9 || event.type == 10)) {
+            out->type = event.type == 9 ? XWAYLAND_EVENT_FOCUS_IN : XWAYLAND_EVENT_FOCUS_OUT;
+            out->surface = id;
+        } else if (id && event.type == 22) {
+            __typeof__(g_x11.surfaces[0]) *s = &g_x11.surfaces[id - 1];
+            int root_x = 0, root_y = 0;
+            Window child = 0;
+            if (g_x11.TranslateCoordinates(g_x11.display, s->window, g_x11.DefaultRootWindow(g_x11.display), 0, 0,
+                                           &root_x, &root_y, &child)) {
+                s->x = root_x; s->y = root_y;
+                out->type = XWAYLAND_EVENT_CONFIGURE;
+                out->x = root_x; out->y = root_y;
+                out->width = s->width; out->height = s->height;
+                out->surface = id;
+            }
+        } else if (id && event.type == 33) {
+            XClientMessageEvent *client = (XClientMessageEvent *)&event;
+            Atom wm_delete = g_x11.InternAtom(g_x11.display, "WM_DELETE_WINDOW", 0);
+            if ((Atom)client->data.l[0] == wm_delete) { out->type = XWAYLAND_EVENT_CLOSE; out->surface = id; }
+        } else if (id && event.type == 12) surface_repaint_locked(id);
         else if (id && (event.type == 4 || event.type == 5)) {
             XButtonEvent *button = (XButtonEvent *)&event;
             out->type = event.type == 4 ? XWAYLAND_EVENT_BUTTON_DOWN : XWAYLAND_EVENT_BUTTON_UP;

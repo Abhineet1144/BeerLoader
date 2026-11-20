@@ -1,5 +1,46 @@
 # Beer Loader — Active Development Context
 
+## Alternate Chained Together launcher — startup crash repaired (2026-11-21)
+
+- Follow-up manager failure: new **Chained Together 1.8.6** entry had empty Loader values, and subsequent edits
+  removed `SetConsoleTextAttribute` from implementation/dispatch/tests (export names alone remained). Latest
+  manager log `Chained_Together_1_8_6-20261121-012754.log` reproduced the original null call. Restored the API,
+  dispatch entry and tests, rebuilt, and configured the new entry with the installed networking library too.
+  Native-loader and five manager-launch tests pass; no extra loader/game arguments required. Disk space recovered
+  to 17 GB free at this check. Reload the manager before launching so stale in-memory settings are not reused.
+- `unsteam_loader64.exe` in the second installation called a null dynamically resolved console-color API
+  (return address `0x140009e9b`, output handle -11, attributes 14). Added `SetConsoleTextAttribute` with an
+  explicit Win64 signature and truthful ERROR_INVALID_HANDLE for Beer's no-console processes; regenerated
+  public system-DLL exports. No fabricated console buffer, authentication ticket or guest binary changes.
+- Negative-control native-loader test failed on missing export; rebuild and final native-loader ABI tests pass,
+  checking kernel32/kernelbase ownership and invalid/no-console handles. Editor diagnostics clean.
+- Retest started the real shipping executable, created the 2560x1440 Vulkan swapchain and local P2P listener
+  (`GetIdentity -> 1`, port 27015 -> 65536), and continued rendering/resource work during the bounded 100s run.
+  Log `/tmp/beer-ct-console-fixed.log`. Launcher exit1 is separate from the child continuing to run.
+- This copy requests app 2567870; provider rejects games_played/auth tickets because the account does not own it.
+  Multiplayer is not verified. CREATE_SUSPENDED is also still unsupported (child starts immediately).
+- Full `make test-input` blocked compiling win32_gdi.c: root filesystem 100% full, ENOSPC writing dependency file.
+  No user files deleted to free space. Existing manager entry still points to the earlier working installation.
+
+## Chained Together — manager launch repaired (2026-11-21)
+
+- The 2026-11-17 solo/training fix depended on an explicit `BEER_STEAM_NETWORKING_LIBRARY`; the saved manager
+  entry did not include it. Its 2026-11-19 launch therefore still had no local transport.
+- Added an opt-in **Steam local networking library** per-game Loader value, with a file picker and `~` expansion
+  before passing the path to the loader. Configured Chained Together's existing manager entry to use the persistent
+  `~/.local/share/beer/native/steam-networking/libGameNetworkingSockets.so`. Other games remain unchanged;
+  inherited/Advanced environment overrides still work when this value is blank.
+- Restarted the manager and invoked its normal `Manager.launch` action. Both launcher and shipping child received
+  the expanded installed path, without `LD_LIBRARY_PATH`. Log confirms backend initialization, `GetIdentity -> 1`,
+  and real `CreateListenSocketP2P port=27015 -> 65536`. User handled all game input; capture shows actual solo
+  gameplay at ~59 FPS, not just a title screen. Left the game and manager running.
+- Validation: five manager-launch regression tests (including opt-in, expansion, precedence and picker metadata),
+  old-table negative control, actual GTK Edit/Save round-trip, `make test-steam`, installed-library real-resource
+  tests, Python compile and diff checks pass. No loader/native graphics changes for this fix; no long soak or
+  remote multiplayer claim.
+- Evidence: `~/.beer/logs/Chained_Together-20261121-002103.log`, gameplay capture
+  `~/Pictures/Beer/ChainedTogether-Win64-Shipping-20261121-002151.png`.
+
 ## Chained Together — solo gameplay works (2026-11-17, user confirmed)
 
 **RESOLVED:** entering gameplay returned to the title screen; it was not a crash or GPU device loss.
@@ -33,6 +74,20 @@ User confirmed "works now" after the real local networking backend was enabled.
 - Validation: loader builds, `make test-steam`, `make test-input`, identity ASan/UBSan tests, and real-library
   resource tests passed (duplicate virtual port rejected, close/rebind, poll-group lifetime and invalid handles).
   Final gameplay success confirmed interactively by the user; no claim of multiplayer or long-duration soak.
+
+## Future: replace Chained Together's third-party GameNetworkingSockets dependency
+
+- The current opt-in `BEER_STEAM_NETWORKING_LIBRARY` / `libGameNetworkingSockets.so` adapter is an external Valve
+  runtime installed under `~/.local/share/beer/native/steam-networking/`. Remove this runtime dependency in a
+  future task by implementing the required `ISteamNetworkingSockets012` local-listener and poll-group subset
+  directly in Beer and routing the existing Win64 wrappers to that native backend. Keep the Steam identity and
+  handle semantics truthful; no success-shaped fake handles or guest-code bypasses.
+- Scope the first milestone to solo/training mode (listen-socket lifecycle, virtual ports, poll groups, receive
+  ownership and close/rebind tests), then verify the game reaches gameplay with no external networking library.
+  Preserve the GameNetworkingSockets adapter temporarily as an optional test/reference backend during migration.
+- This does **not** make friend/online multiplayer a free follow-up: compatible Steam peer signaling, authentication,
+  direct connections and/or relay support need a separate design and interoperability test with a real second
+  player. Do not claim online support from local-listener tests.
 - Live-run preference: user handles all inputs as soon as the window opens. Do not automate clicks/keys;
   continue investigating for approximately a minute after launch before checking the attempt.
 
@@ -344,6 +399,39 @@ Proton, DLSS, DLSS FG + Reflex (XMM6 fix), RE9 DX12U mesh path (barycentrics). U
      /VERYSILENT /LOG=... /DIR=Z:\mnt\hdd1\Games\x; BEER_W32_TRACE=1 prints api calls with esp and return addresses.
    - Not done: the actual game unpack (17 GB fg-0*.bin) never started; GUI wizard invisible (no drawing); persistence of the
      registry; Run entries (cmd.exe, QuickSFV.EXE case-insensitive CreateProcess, ShellExecute) fail with codes 2/120.
+   FOLLOW-UP 2026-11-20 (evening; unpack now runs unarc -> external RAZOR + CLS-srep stages; uncommitted):
+   - eip=0x7fff root cause: GlobalMemoryStatus was W32_FWD'd, so the 64-bit impl wrote 56 bytes of SIZE_T fields into
+     the guest's 32-byte MEMORYSTATUS and overwrote unarc's return address (high half of total_virtual = 0x7fff).
+     WoW32 now has its own GlobalMemoryStatus/Ex (non-LAA clamps, virtual = real free gaps below 2 GiB).
+   - Low allocator: w32_map is first-fit over /proc/self/maps (top-down in 0x20000000..0x7e000000, then below), so
+     freed space is reused; unarc's address-space probe used to drive the old watermark to the floor (TEB alloc died).
+   - SetFilePointerEx (LARGE_INTEGER by value = 2 DWORDs) had been forwarded per-DWORD: every seek > 4 GiB broke.
+   - CRT fds 0/1/2 are now the guest's own (g_w32_std); _dup2 returns 0 (MSVCRT; unarc treated POSIX's 1 as failure),
+     _write writes fully, _read retries EINTR, and the guest's redirected std fds become a CreateProcess child's
+     stdin/stdout/stderr (w32_child_std_fd). BEER_W32_TRACE=ret also prints results.
+   - Named events are cross-process ($XDG_RUNTIME_DIR/beer/objects, flock liveness); named shm mappings got the same
+     liveness rule (stale /dev/shm objects were reused). Child image name keeps the caller's spelling (_BEER_IMAGE_NAME):
+     CLS-srep_x64.exe builds IOEvent_<its name><n> from GetModuleFileName.
+   - 64-bit side: DLLs without a reloc dir and without RELOCS_STRIPPED load anywhere (UPX DLLs, razor.dll);
+     ReadFile(STD_INPUT_HANDLE); GetCPInfoEx, Char{Upper,Lower}{W,BuffW}, thread UI languages, EnumCalendarInfoW (fails),
+     NetApiBufferFree, Var* (DISP_E_TYPEMISMATCH); main-exe msvcrt.dll imports go to the UCRT like guest DLLs'.
+     BEER_GETPROC_DISCOVER=1 lists every missing GetProcAddress name in one run (UPX stubs stop at the first NULL).
+   - FOLLOW-UP 2026-11-21: Beer x64 msvcrt layer (loader.c msvcrt_export): data exports are Beer variables
+     (MsvcrtData, filled by __getmainargs), msvcrt _iob/__iob_func (48-byte FILEs) translated to UCRT streams in the
+     bridge thunks ('F'/'S' args), puts/printf family bridged. rz decodes byte-exact vs Wine (2.3 GB). Also: CLS.ini
+     readers (GetPrivateProfileString/Int A+W, 32- and 64-bit), WriteFile loops on short pipe writes, GetFileType
+     reports pipes/files, console CP 0 without a tty, child stdout pipe: loader logs -> stderr (_BEER_GUEST_STDOUT,
+     BEER_LOG_TO_STDERR) and msvcrt stdout text -> stderr (rz's progress text corrupted srep's input),
+     BEER_STDIO_TEE_DIR diagnostics. Unpack reached 8.2 GB, then STALLED: next decoder `sifu.exe c0 - -` (32-bit)
+     crashes at startup (eip 0x4506f4, fault 0xfffffffe, right after unimplemented HeapSetInformation) and setup.tmp
+     waits forever for it (child exit not noticed). NEXT for the unpack.
+   - Inno wizard UI (2026-11-21): child windows of Beer-drawn windows are composited onto their top-level surface
+     (beer_other_present / beer_compose_children), Beer draws a caption + close button (drag to move), mouse hit-tests
+     the deepest child, SetCapture/SetFocus/GetFocus for these windows, standard controls paint (win32_controls.inc),
+     GDI: system colours, CreateBrush/PenIndirect, MoveTo/LineTo, window/viewport origins, clip rect,
+     SaveDC/RestoreDC, RectVisible/GetClipBox, FreeType text (platform/win32_gdi_text.inc; Wine's tahoma.ttf etc.).
+     Language dialog and welcome page render like Windows. Open: Info page RichEdit (EM_STREAMIN), keyboard input to
+     dialogs (override-redirect surfaces get no X focus), combo drop-down list, test the remaining pages.
    NEXT: PE32 resource-enumeration callbacks and remaining real _shfoldr imports, plus proper RaiseException/SEH;
    do not treat the later damaged EIP as root cause.
    Resource-string pointer-width paths (LoadStringW capacity0), indexed DIBs/sections,
@@ -417,7 +505,12 @@ Proton, DLSS, DLSS FG + Reflex (XMM6 fix), RE9 DX12U mesh path (barycentrics). U
       DLSS). Needs a user-supplied nvngx_dlss.dll for FSR-only games.
    3. Split FSR DLLs (amd_fidelityfx_loader/upscaler_dx12: RE9, PRAGMATA, Forza), XeSS -> DLSS, FSR 3.0 (GoT).
    Not planned: statically linked FSR (exe patching); FSR FG -> DLSS-G (keep game FSR FG).
-   5. **Recording/streaming (user, 2026-11-14: after the upscaler work; scope = these three only, no webcam/scenes):**
+   5. **Recording/streaming - (b) and (c) BUILT 2026-11-20** (platform/beer_capture.c, manager/capture_page.py; ffmpeg
+      child process fed through sockets; GPU scale + 6-slot readback ring in vulkan_post.c, frame-tagged collection for
+      the Vulkan mapper; game audio tapped after each pa_simple_write; "game time" timeline records slowed play at normal
+      speed without sound). Verified: harness (NVENC/x264/x265/SVT-AV1, local RTMP server, tee copy, stop in 300 ms,
+      440 Hz tone exact, no dropouts) and vkclear through the real loader. Not done: (a) replay buffer, hotkeys, HDR.
+      Original note (user, 2026-11-14: after the upscaler work; scope = these three only, no webcam/scenes):
       (a) replay buffer (last N s in memory, save on hotkey), (b) manual recording MP4/MKV (HDR = 10-bit HEVC/AV1),
       (c) RTMP streaming (Twitch/YouTube). Capture the present image before the overlay; game-only audio from the
       WASAPI render path (same tap as BEER_WASAPI_DUMP), optional mic via PipeWire; NVENC through dlopen'd ffmpeg 8

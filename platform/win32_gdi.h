@@ -25,6 +25,24 @@ uint64_t GDI_MS beer_LoadImageA(uint64_t instance, uint64_t name, uint32_t type,
 int beer_gdi_dc_surface(uint64_t dc, uint8_t **bits, int *width, int *height, int *stride, int *bpp, int *topdown);
 int beer_gdi_read_dc_argb(uint64_t dc, int src_x, int src_y, int width, int height, uint32_t *out, int *has_alpha);
 int GDI_MS beer_FillRect(uint64_t dc, const int32_t *rect, uint64_t brush);
+uint32_t beer_gdi_sys_color(int index);   /* GetSysColor */
+uint64_t beer_gdi_bitmap_from_dib(const uint8_t *dib, uint32_t size);
+int GDI_MS beer_MoveToEx(uint64_t dc, int x, int y, int32_t *previous);
+int GDI_MS beer_GetCurrentPositionEx(uint64_t dc, int32_t *point);
+int GDI_MS beer_LineTo(uint64_t dc, int x, int y);
+int GDI_MS beer_SetROP2(uint64_t dc, int mode);
+int GDI_MS beer_GetROP2(uint64_t dc);
+int GDI_MS beer_GetClipBox(uint64_t dc, int32_t *rect);
+int GDI_MS beer_RectVisible(uint64_t dc, const int32_t *rect);
+int GDI_MS beer_PtVisible(uint64_t dc, int x, int y);
+int GDI_MS beer_SetWindowOrgEx(uint64_t dc, int x, int y, int32_t *previous);
+int GDI_MS beer_OffsetWindowOrgEx(uint64_t dc, int x, int y, int32_t *previous);
+int GDI_MS beer_GetWindowOrgEx(uint64_t dc, int32_t *point);
+int GDI_MS beer_SetViewportOrgEx(uint64_t dc, int x, int y, int32_t *previous);
+int GDI_MS beer_OffsetViewportOrgEx(uint64_t dc, int x, int y, int32_t *previous);
+int GDI_MS beer_GetViewportOrgEx(uint64_t dc, int32_t *point);
+int GDI_MS beer_IntersectClipRect(uint64_t dc, int l, int t, int r, int b);
+int GDI_MS beer_ExcludeClipRect(uint64_t dc, int l, int t, int r, int b);
 int GDI_MS beer_DrawTextW(uint64_t dc, const uint16_t *text, int count, int32_t *rect, uint32_t format);
 int GDI_MS beer_DrawTextA(uint64_t dc, const char *text, int count, int32_t *rect, uint32_t format);
 uint64_t GDI_MS beer_GetWindowDC(uint64_t window);

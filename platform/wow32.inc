@@ -74,6 +74,10 @@ static u32 g_w32_peb;
  * free for DLLs that insist on their preferred base: packed DLLs such as BASS.dll are not relocatable. */
 static uintptr_t g_w32_top = 0x7e000000;
 static pthread_mutex_t g_w32_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The API trace: -1 = from BEER_W32_TRACE at the first call, 0 off, 1 calls, 2 calls and results. The control socket
+ * switches it in a running process (w32_trace), e.g. to see what a hung installer waits for. */
+static _Atomic int g_w32_trace_level = -1;
+void beer_w32_set_trace(int level) { atomic_store(&g_w32_trace_level, level); }
 static int g_w32_next_ldt = 16;
 static u32 w32_dll_by_name(const char *name);
 static u32 w32_dll_load(const char *name);
@@ -89,7 +93,39 @@ u64 beer_w32_call32(u32 entry, u32 esp);   /* runs 32-bit code at `entry` on sta
 
 /* ---- low memory ---- */
 
-/* Maps `size` bytes below 4 GiB at `want` (0 = anywhere). */
+/* Highest 64 KiB-aligned start of a free range of `size` bytes inside [floor, ceiling), from the process's real
+ * mappings (/proc/self/maps), so space that was freed is found again; 0 when nothing fits. */
+static uintptr_t w32_find_gap(size_t size, uintptr_t floor, uintptr_t ceiling)
+{
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    uintptr_t best = 0, previous_end = floor;
+    char line[512];
+    int done = 0;
+    while (!done) {
+        unsigned long long a = ceiling, b = ceiling;
+        if (!fgets(line, sizeof(line), maps)) done = 1;               /* past the last mapping: the tail gap */
+        else if (sscanf(line, "%llx-%llx", &a, &b) != 2) continue;
+        if (a > ceiling) a = ceiling;
+        if (b > ceiling) b = ceiling;
+        if (a > previous_end) {                                         /* gap [previous_end, a) */
+            const uintptr_t low = (previous_end + 0xffff) & ~(uintptr_t)0xffff;
+            if (a >= size && a - size >= low) {
+                const uintptr_t at = (uintptr_t)(a - size) & ~(uintptr_t)0xffff;
+                if (at >= low && at > best) best = at;
+            }
+        }
+        if (b > previous_end) previous_end = b;
+        if (previous_end >= ceiling) done = 1;
+    }
+    fclose(maps);
+    return best;
+}
+
+/* Maps `size` bytes below 2 GiB at `want` (0 = anywhere). Anonymous placements go top-down into the highest free gap
+ * between 0x20000000 and 0x7e000000, so the range below stays free for DLLs that insist on their preferred base
+ * (packed DLLs such as BASS.dll are not relocatable); only when that is full does it use the range below, as Windows
+ * would. A first-fit search over the real mappings: memory a guest frees is used again. */
 static void *w32_map(uintptr_t want, size_t size, int prot)
 {
     size = (size + 0xffff) & ~(size_t)0xffff;
@@ -97,15 +133,19 @@ static void *w32_map(uintptr_t want, size_t size, int prot)
         void *p = mmap((void *)want, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (p != MAP_FAILED) return p;
     }
+    static const uintptr_t ranges[2][2] = { { 0x20000000, 0x7e000000 }, { 0x10000, 0x20000000 } };
     pthread_mutex_lock(&g_w32_lock);
-    for (uintptr_t at = (g_w32_top - size) & ~(uintptr_t)0xffff; at >= 0x20000000 && at < g_w32_top; at -= 0x10000) {
-        void *p = mmap((void *)at, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (p != MAP_FAILED) {
-            g_w32_top = at;
-            pthread_mutex_unlock(&g_w32_lock);
-            return p;
+    for (int r = 0; r < 2; ++r)
+        for (int attempt = 0; attempt < 8; ++attempt) {   /* another thread can map into the gap between scan and mmap */
+            const uintptr_t at = w32_find_gap(size, ranges[r][0], ranges[r][1]);
+            if (!at) break;
+            void *p = mmap((void *)at, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p != MAP_FAILED) {
+                if (at < g_w32_top) g_w32_top = at;
+                pthread_mutex_unlock(&g_w32_lock);
+                return p;
+            }
         }
-    }
     pthread_mutex_unlock(&g_w32_lock);
     return NULL;
 }
@@ -496,6 +536,29 @@ static u64 w32_call_impl(ImplFn fn, const u32 *args, u32 argc)
     return (u32)((W32Impl12)(void *)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]);
 }
 
+/* Which API each 32-bit thread is in (the control socket's w32_threads: what a hung program waits for). */
+typedef struct {
+    _Atomic int used;
+    int tid;
+    _Atomic u32 api, in_call;
+    u32 args[4], ret;
+} W32ThreadState;
+static W32ThreadState g_w32_threads[256];
+static __thread W32ThreadState *t_w32_state;
+size_t beer_w32_thread_report(char *out, size_t size)
+{
+    size_t n = 0;
+    for (int i = 0; i < 256 && n + 200 < size; ++i) {
+        W32ThreadState *s = &g_w32_threads[i];
+        if (!atomic_load(&s->used)) continue;
+        const u32 api = atomic_load(&s->api);
+        const W32Thunk *t = api < g_w32_thunk_count ? &g_w32_thunks[api] : NULL;
+        n += (size_t)snprintf(out + n, size - n, "tid %d %s %s!%s(0x%x,0x%x,0x%x,0x%x) ret=0x%x\n", s->tid,
+                              atomic_load(&s->in_call) ? "IN" : "after", t ? t->dll : "?", t ? t->name : "?",
+                              s->args[0], s->args[1], s->args[2], s->args[3], s->ret);
+    }
+    return n;
+}
 u64 w32_dispatch(u32 index)
 {
     u64 teb64;
@@ -516,8 +579,11 @@ u64 w32_dispatch(u32 index)
             fprintf(stderr, "[WOW32] called unimplemented %s!%s (returns 0)\n", t->dll, t->name);
     }
     const u32 *args = (const u32 *)(uintptr_t)(esp + 4);
-    static int trace = -1;
-    if (trace < 0) trace = getenv("BEER_W32_TRACE") != NULL;
+    if (g_w32_trace_level < 0) {
+        const char *e = getenv("BEER_W32_TRACE");
+        g_w32_trace_level = !e ? 0 : strstr(e, "ret") ? 2 : 1;
+    }
+    const int trace = g_w32_trace_level > 0;
     if (trace) {
         fprintf(stderr, "[W32T] %s!%s(0x%x,0x%x,0x%x,0x%x) esp=%x", t->dll, t->name, args[0], args[1], args[2], args[3], esp);
         fprintf(stderr, " ret=%x", *(const u32 *)(uintptr_t)esp);
@@ -541,8 +607,25 @@ u64 w32_dispatch(u32 index)
         }
         fputc('\n', stderr);
     }
+    if (!t_w32_state)
+        for (int i = 0; i < 256 && !t_w32_state; ++i) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&g_w32_threads[i].used, &expected, 1)) {
+                t_w32_state = &g_w32_threads[i];
+                t_w32_state->tid = (int)syscall(SYS_gettid);
+            }
+        }
+    if (t_w32_state) {
+        memcpy(t_w32_state->args, args, sizeof(t_w32_state->args));
+        t_w32_state->ret = *(const u32 *)(uintptr_t)esp;
+        atomic_store(&t_w32_state->api, index);
+        atomic_store(&t_w32_state->in_call, 1);
+    }
     const u64 result = t->impl ? w32_call_impl(t->impl, args, t->arg_bytes / 4) : t->fn(args);
+    if (t_w32_state) atomic_store(&t_w32_state->in_call, 0);
     w32_teb()->LastErrorValue = g_last_error;
+    if (g_w32_trace_level > 1)       /* BEER_W32_TRACE=ret: also each call's result and last error */
+        fprintf(stderr, "[W32R] %s!%s -> 0x%llx err=%u esp=%x\n", t->dll, t->name, (unsigned long long)result, g_last_error, esp);
     return result;
 }
 
@@ -612,7 +695,10 @@ static void w32_thunks_init(void)
 /* ---- API implementations (32-bit argument layout) ----
  * Each reads its stdcall arguments from the guest stack; pointers zero-extend, handles fit in 32 bits. */
 
-#define W32_ARG(i) ((u64)args[i])
+/* A handle argument: widened like every forwarded value (w32_widen), so the pseudo handles keep their meaning:
+ * STD_INPUT/OUTPUT/ERROR_HANDLE (-10/-11/-12), GetCurrentProcess() (-1). Zero-extended, ReadFile(STD_INPUT_HANDLE)
+ * failed: FitGirl's sifu.exe could not read its input pipe, quit, and the installer waited for it forever. */
+#define W32_ARG(i) w32_widen(args[i])
 #define W32_PTR(i) ((void *)(uintptr_t)args[i])
 
 static u64 w32_GetStdHandle(const u32 *args) { return (u32)impl_GetStdHandle(args[0]); }
@@ -1315,8 +1401,51 @@ static u64 w32_open(const u32 *args)
     if (mode & 0x400u) flags |= O_EXCL;
     return (u32)open(host, flags | O_CLOEXEC, 0666);
 }
-static u64 w32_close(const u32 *args) { return (u32)close((int)args[0]); }
-static u64 w32_read(const u32 *args) { return (u32)read((int)args[0], W32_PTR(1), args[2]); }
+/* CRT descriptors are host descriptors, except 0, 1 and 2: those are the guest's own (private copies of the loader's,
+ * made on first use), so a program that swaps its standard streams (unarc runs external coders with _dup2 onto 0/1
+ * and closes 2) never redirects Beer's own stdout/stderr, whose log lines would otherwise land in its data pipes. */
+static int g_w32_std[3] = { -2, -2, -2 };       /* -2: not copied yet; -1: closed by the guest */
+static pthread_mutex_t g_w32_std_lock = PTHREAD_MUTEX_INITIALIZER;
+static int w32_fd(u32 guest)
+{
+    const int fd = (int)guest;
+    if (fd < 0 || fd > 2) return fd;
+    pthread_mutex_lock(&g_w32_std_lock);
+    if (g_w32_std[fd] == -2) g_w32_std[fd] = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+    const int host = g_w32_std[fd];
+    pthread_mutex_unlock(&g_w32_std_lock);
+    if (host < 0) errno = EBADF;
+    return host;
+}
+
+static int w32_child_std_fd(int i)
+{
+    if (i < 0 || i > 2) return -1;
+    pthread_mutex_lock(&g_w32_std_lock);
+    const int fd = g_w32_std[i];
+    pthread_mutex_unlock(&g_w32_std_lock);
+    return fd;                                               /* -2 (never touched) and -1 (closed): the loader's own */
+}
+static u64 w32_close(const u32 *args)
+{
+    const int fd = (int)args[0];
+    if (fd >= 0 && fd <= 2) {                                /* the guest's own standard descriptor (wow32_crt.inc) */
+        const int host = w32_fd(args[0]);
+        pthread_mutex_lock(&g_w32_std_lock);
+        g_w32_std[fd] = -1;
+        pthread_mutex_unlock(&g_w32_std_lock);
+        return host < 0 ? (u32)-1 : (u32)close(host);
+    }
+    return (u32)close(fd);
+}
+static u64 w32_read(const u32 *args)
+{
+    const int fd = w32_fd(args[0]);
+    for (;;) {
+        const ssize_t n = read(fd, W32_PTR(1), args[2]);
+        if (n >= 0 || errno != EINTR) return (u32)n;
+    }
+}
 static u64 w32_setmode(const u32 *args) { (void)args; return 0x8000; }   /* _O_BINARY: text mode is not translated */
 
 static u64 w32_chdir(const u32 *args) { return impl_SetCurrentDirectoryA(W32_PTR(0)) ? 0 : (u32)-1; }
@@ -1455,7 +1584,7 @@ static const W32Api g_w32_apis[] = {
     {"GetClassInfoW", w32_GetClassInfoW, 12},
     {"PeekMessageW", w32_PeekMessageW, 20}, {"GetMessageW", w32_GetMessageW, 16},
     {"DispatchMessageW", w32_DispatchMessageW, 4}, {"TranslateMessage", w32_TranslateMessage, 4},
-    W32_FWD("CreateWindowExW", 48), {"DefWindowProcW", w32_DefWindowProcW, 16}, W32_FWD("SendMessageW", 16),
+    W32_FWD("CreateWindowExW", 48), {"DefWindowProcW", w32_DefWindowProcW, 16}, {"SendMessageW", w32_SendMessageW, 16},
     W32_FWD("PostMessageW", 16), W32_FWD("PostQuitMessage", 4), W32_FWD("ShowWindow", 8),
     W32_FWD("SetWindowTextW", 8),
     W32_FWD("RegisterWindowMessageW", 4), W32_FWD("GlobalAddAtomW", 4),
@@ -1644,14 +1773,14 @@ static const W32Api g_w32_apis[] = {
     W32_FWD("CreateSemaphoreW", 16),
     W32_FWD("ReleaseSemaphore", 12),
     W32_FWD("GetFileSizeEx", 8),
-    W32_FWD("SetFilePointerEx", 20),
+    {"SetFilePointerEx", w32_SetFilePointerEx, 20},
     W32_FWD("GetFileAttributesExW", 12),
     W32_FWD("GetFileAttributesExA", 12),
     W32_FWD("SleepEx", 8),
     W32_FWD("GetThreadPriority", 4),
     W32_FWD("LocalLock", 4),
     W32_FWD("LocalUnlock", 4),
-    W32_FWD("GlobalMemoryStatus", 4),
+    {"GlobalMemoryStatus", w32_GlobalMemoryStatus, 4},
     W32_FWD("OutputDebugStringA", 4),
     W32_FWD("OutputDebugStringW", 4),
     W32_FWD("GetTempPathA", 8),
@@ -1688,7 +1817,8 @@ static const W32Api g_w32_apis[] = {
     W32_FWD("SetThreadExecutionState", 4),
     W32_FWD("GetCurrentPackageId", 8),
     {"GetThreadContext", w32_unsupported, 8},
-    {"GetStartupInfoW", w32_unsupported, 4},
+    {"GetStartupInfoW", w32_GetStartupInfoA, 4},          /* STARTUPINFOW has the A layout; its strings are NULL */
+    {"HeapSetInformation", w32_one, 16}, W32_FWD("SetConsoleMode", 8), W32_FWD("ReadConsoleW", 20),
     {"CreateToolhelp32Snapshot", w32_unsupported, 8},
     {"Process32First", w32_unsupported, 8},
     {"Process32Next", w32_unsupported, 8},
@@ -1714,9 +1844,9 @@ static const W32Api g_w32_apis[] = {
     {"GetSystemWindowsDirectoryA", w32_unsupported, 8},
     {"GetProcessWorkingSetSize", w32_unsupported, 12},
     {"SetProcessWorkingSetSize", w32_unsupported, 12},
-    {"GetPrivateProfileStringA", w32_unsupported, 24},
-    {"GetPrivateProfileIntA", w32_unsupported, 16},
-    {"GetPrivateProfileIntW", w32_unsupported, 16},
+    W32_FWD("GetPrivateProfileStringA", 24),
+    W32_FWD("GetPrivateProfileIntA", 16),
+    W32_FWD("GetPrivateProfileIntW", 16),
     {"GetPrivateProfileSectionA", w32_unsupported, 16},
     {"WritePrivateProfileSectionA", w32_unsupported, 12},
     {"GetLargestConsoleWindowSize", w32_unsupported, 4},
@@ -1947,7 +2077,7 @@ W32_FWD("ReleaseMutex", 4),
     W32_FWD("SetEnvironmentVariableA", 8),
     W32_FWD("GetExitCodeProcess", 8),
     {"GetModuleFileNameA", w32_GetModuleFileNameA, 12},
-    W32_FWD("GlobalMemoryStatusEx", 4),
+    {"GlobalMemoryStatusEx", w32_GlobalMemoryStatusEx, 4},
     W32_FWD("WaitForSingleObject", 8),
     /* advapi32 */
     {"RegOpenKeyExA", w32_RegOpenKeyExA, 20},
@@ -2161,6 +2291,7 @@ static void w32_fault(int sig, siginfo_t *info, void *uctx)
 static void __attribute__((noreturn)) beer_wow32_main(const char *path)
 {
     fprintf(stderr, "[WOW32] 32-bit executable: running it in compatibility mode\n");
+    beer_control_start(path);                    /* the control socket (status, w32_trace) for 32-bit programs too */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = w32_fault;

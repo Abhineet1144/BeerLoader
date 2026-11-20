@@ -2,10 +2,12 @@
 #include "vulkan_context.h"
 #include "../../platform/beer_overlay.h"
 #include "../../platform/beer_post.h"
+#include "../../platform/beer_capture.h"
 #include "post_effects_spv.h"
 #include "post_overlay_spv.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +26,7 @@ static struct {
     FN(CmdDispatch); FN(CmdPipelineBarrier); FN(CmdCopyImageToBuffer); FN(CreateImage); FN(DestroyImage);
     FN(GetImageMemoryRequirements); FN(AllocateMemory); FN(FreeMemory); FN(BindImageMemory); FN(CreateBuffer);
     FN(DestroyBuffer); FN(GetBufferMemoryRequirements); FN(BindBufferMemory); FN(MapMemory); FN(DeviceWaitIdle);
+    FN(CmdBlitImage);
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
 
     VkDescriptorSetLayout set_layout;
@@ -50,7 +53,27 @@ static struct {
     int shot_waiting;
     uint32_t shot_w, shot_h;
     char shot_path[512];
+
+    /* Capture (platform/beer_capture.c): the scaled picture and a ring of host readback buffers. */
+    VkImage cap_image;
+    VkDeviceMemory cap_memory;
+    uint32_t cap_w, cap_h;
+    int cap_allocated;
+    uint64_t frame_tag;
 } P;
+
+enum { CAP_FREE, CAP_RECORDED, CAP_ENCODING };
+#define CAP_SLOTS 6
+static struct {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    uint8_t *map;
+    size_t capacity;
+    atomic_int state;
+    uint64_t due;
+    uint64_t tag;                 /* frame_tag of the frame that recorded it */
+    uint32_t w, h;
+} S[CAP_SLOTS];
 
 #define LOAD(name) do { P.name = (PFN_vk##name)get(P.device, "vk" #name); if (!P.name) return 0; } while (0)
 
@@ -63,18 +86,26 @@ static int find_memory(uint32_t bits, VkMemoryPropertyFlags want, uint32_t *inde
     return 0;
 }
 
-static int make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *buffer, VkDeviceMemory *memory, uint8_t **map)
+static int make_buffer_ex(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *buffer, VkDeviceMemory *memory, uint8_t **map, int cached)
 {
     VkBufferCreateInfo info = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
     VkMemoryRequirements req;
     uint32_t type;
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     if (P.CreateBuffer(P.device, &info, NULL, buffer) != VK_SUCCESS) return 0;
     P.GetBufferMemoryRequirements(P.device, *buffer, &req);
-    if (!find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &type)) return 0;
+    /* Readback buffers prefer cached memory: the encoder reads every byte, and uncached reads are several times slower. */
+    if (!(cached && find_memory(req.memoryTypeBits, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &type)) &&
+        !find_memory(req.memoryTypeBits, host, &type)) { P.DestroyBuffer(P.device, *buffer, NULL); *buffer = VK_NULL_HANDLE; return 0; }
     VkMemoryAllocateInfo alloc = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type };
     return P.AllocateMemory(P.device, &alloc, NULL, memory) == VK_SUCCESS &&
            P.BindBufferMemory(P.device, *buffer, *memory, 0) == VK_SUCCESS &&
            P.MapMemory(P.device, *memory, 0, size, 0, (void **)map) == VK_SUCCESS;
+}
+
+static int make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *buffer, VkDeviceMemory *memory, uint8_t **map)
+{
+    return make_buffer_ex(size, usage, buffer, memory, map, 0);
 }
 
 static int make_pipeline(const uint32_t *code, size_t bytes, VkPipeline *pipeline)
@@ -139,6 +170,7 @@ static int init(void)
     LOAD(CmdDispatch); LOAD(CmdPipelineBarrier); LOAD(CmdCopyImageToBuffer); LOAD(CreateImage); LOAD(DestroyImage);
     LOAD(GetImageMemoryRequirements); LOAD(AllocateMemory); LOAD(FreeMemory); LOAD(BindImageMemory); LOAD(CreateBuffer);
     LOAD(DestroyBuffer); LOAD(GetBufferMemoryRequirements); LOAD(BindBufferMemory); LOAD(MapMemory); LOAD(DeviceWaitIdle);
+    LOAD(CmdBlitImage);
 
     VkDescriptorSetLayoutBinding bindings[3] = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
@@ -258,6 +290,127 @@ static int record_screenshot(VkCommandBuffer cmd, const char *path)
     return 1;
 }
 
+/* ---- capture readback ---- */
+
+static void capture_release(int slot)
+{
+    if (slot >= 0 && slot < CAP_SLOTS) atomic_store(&S[slot].state, CAP_FREE);
+}
+
+static void destroy_cap_image(void)
+{
+    if (P.cap_image) P.DestroyImage(P.device, P.cap_image, NULL);
+    if (P.cap_memory) P.FreeMemory(P.device, P.cap_memory, NULL);
+    P.cap_image = VK_NULL_HANDLE;
+    P.cap_memory = VK_NULL_HANDLE;
+    P.cap_w = P.cap_h = 0;
+}
+
+/* Called while no capture runs: frees the readback memory once the encoder handed every buffer back. Safe without a
+ * device wait: a buffer is only FREE after the frame that wrote it was collected (its fence signalled). */
+static void release_capture_memory(void)
+{
+    if (!P.cap_allocated) return;
+    for (int i = 0; i < CAP_SLOTS; ++i)
+        if (atomic_load(&S[i].state) != CAP_FREE) return;
+    for (int i = 0; i < CAP_SLOTS; ++i) {
+        if (S[i].buffer) P.DestroyBuffer(P.device, S[i].buffer, NULL);
+        if (S[i].memory) P.FreeMemory(P.device, S[i].memory, NULL);
+        S[i].buffer = VK_NULL_HANDLE;
+        S[i].memory = VK_NULL_HANDLE;
+        S[i].map = NULL;
+        S[i].capacity = 0;
+    }
+    destroy_cap_image();
+    P.cap_allocated = 0;
+}
+
+static int ensure_cap_image(uint32_t w, uint32_t h)
+{
+    if (P.cap_image && P.cap_w == w && P.cap_h == h) return 1;
+    destroy_cap_image();   /* the presenter waited for the previous frame, the only one that could still use it */
+    VkImageCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+    VkMemoryRequirements req;
+    uint32_t type;
+    if (P.CreateImage(P.device, &info, NULL, &P.cap_image) != VK_SUCCESS) { P.cap_image = VK_NULL_HANDLE; return 0; }
+    P.GetImageMemoryRequirements(P.device, P.cap_image, &req);
+    VkMemoryAllocateInfo alloc = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size };
+    if (!find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type)) { destroy_cap_image(); return 0; }
+    alloc.memoryTypeIndex = type;
+    if (P.AllocateMemory(P.device, &alloc, NULL, &P.cap_memory) != VK_SUCCESS) { P.cap_memory = VK_NULL_HANDLE; destroy_cap_image(); return 0; }
+    if (P.BindImageMemory(P.device, P.cap_image, P.cap_memory, 0) != VK_SUCCESS) { destroy_cap_image(); return 0; }
+    P.cap_w = w;
+    P.cap_h = h;
+    return 1;
+}
+
+/* Out image (GENERAL, effects done, overlay not yet blended) -> scaled copy -> a free readback buffer. Leaves the out
+ * image in GENERAL, ready for the overlay pass. */
+static void record_capture(VkCommandBuffer cmd)
+{
+    uint32_t cw, ch;
+    uint64_t due;
+    if (!beer_capture_poll(P.width, P.height, &cw, &ch, &due)) return;
+    int slot = -1;
+    for (int i = 0; i < CAP_SLOTS && slot < 0; ++i)
+        if (atomic_load(&S[i].state) == CAP_FREE) slot = i;
+    if (slot < 0) { beer_capture_note_busy(); return; }   /* the encoder is behind: the next frame fills this slot */
+    const size_t bytes = (size_t)cw * ch * 4;
+    if (S[slot].capacity < bytes) {
+        if (S[slot].buffer) P.DestroyBuffer(P.device, S[slot].buffer, NULL);
+        if (S[slot].memory) P.FreeMemory(P.device, S[slot].memory, NULL);
+        S[slot].buffer = VK_NULL_HANDLE;
+        S[slot].memory = VK_NULL_HANDLE;
+        S[slot].capacity = 0;
+        P.cap_allocated = 1;
+        if (!make_buffer_ex(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &S[slot].buffer, &S[slot].memory, &S[slot].map, 1)) return;
+        S[slot].capacity = bytes;
+    }
+    const int scaled = cw != P.width || ch != P.height;
+    if (scaled && !ensure_cap_image(cw, ch)) return;
+    P.cap_allocated = 1;
+
+    image_barrier(cmd, P.out_image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
+                  VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { cw, ch, 1 } };
+    if (scaled) {
+        image_barrier(cmd, P.cap_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const VkImageBlit blit = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .srcOffsets = { { 0, 0, 0 }, { (int32_t)P.width, (int32_t)P.height, 1 } },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstOffsets = { { 0, 0, 0 }, { (int32_t)cw, (int32_t)ch, 1 } }
+        };
+        P.CmdBlitImage(cmd, P.out_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, P.cap_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+        image_barrier(cmd, P.cap_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        P.CmdCopyImageToBuffer(cmd, P.cap_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, S[slot].buffer, 1, &region);
+    } else {
+        P.CmdCopyImageToBuffer(cmd, P.out_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, S[slot].buffer, 1, &region);
+    }
+    image_barrier(cmd, P.out_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT,
+                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    VkBufferMemoryBarrier host = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = S[slot].buffer, .offset = 0, .size = VK_WHOLE_SIZE
+    };
+    P.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &host, 0, NULL);
+    S[slot].due = due;
+    S[slot].tag = P.frame_tag;
+    S[slot].w = cw;
+    S[slot].h = ch;
+    atomic_store(&S[slot].state, CAP_RECORDED);
+    beer_capture_commit(due);
+}
+
 VkImage vulkan_post_apply(VkCommandBuffer cmd, VkImage upload, uint32_t width, uint32_t height,
                           uint32_t output_width, uint32_t output_height, int *overlay_done)
 {
@@ -270,7 +423,9 @@ VkImage vulkan_post_apply(VkCommandBuffer cmd, VkImage upload, uint32_t width, u
     char shot_path[512];
     int shot_clean = 0;
     const int shot = beer_post_take_screenshot(shot_path, sizeof(shot_path), &shot_clean);
-    if (!effects && boxes == 0 && !shot) return VK_NULL_HANDLE;
+    const int capture = beer_capture_active();
+    if (!capture) release_capture_memory();
+    if (!effects && boxes == 0 && !shot && !capture) return VK_NULL_HANDLE;
     if (!prepare_images(upload, width, height)) return VK_NULL_HANDLE;
 
     /* Overlay pixels go into the storage buffer (cached per box by serial). */
@@ -300,6 +455,7 @@ VkImage vulkan_post_apply(VkCommandBuffer cmd, VkImage upload, uint32_t width, u
     P.CmdPushConstants(cmd, P.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(effect_push), effect_push);
     P.CmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
 
+    if (capture) { compute_barrier(cmd); record_capture(cmd); }
     int screenshot_taken = 0;
     if (shot && (shot_clean || boxes == 0)) { compute_barrier(cmd); screenshot_taken = record_screenshot(cmd, shot_path); }
     int blended = 0;
@@ -389,8 +545,25 @@ static void *shot_thread(void *opaque)
     return NULL;
 }
 
+void vulkan_post_set_frame_tag(uint64_t tag)
+{
+    P.frame_tag = tag;
+}
+
+/* Capture frames whose GPU work is complete go to the encoder thread (it reads the mapped memory directly and frees
+ * the slot when done). */
+void vulkan_post_collect_frames(uint64_t done_tag)
+{
+    for (int i = 0; i < CAP_SLOTS; ++i)
+        if (atomic_load(&S[i].state) == CAP_RECORDED && S[i].tag <= done_tag) {
+            atomic_store(&S[i].state, CAP_ENCODING);
+            beer_capture_push(i, S[i].map, S[i].w, S[i].h, S[i].due, capture_release);
+        }
+}
+
 void vulkan_post_collect(void)
 {
+    vulkan_post_collect_frames(UINT64_MAX);
     if (!P.shot_waiting) return;
     P.shot_waiting = 0;
     ShotJob *job = calloc(1, sizeof(*job));
