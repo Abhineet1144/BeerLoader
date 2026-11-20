@@ -1,5 +1,51 @@
 # Beer Loader — Active Development Context
 
+## Chained Together unsteam launcher — injection, Steam process opt-in, game runs on app 480 (2026-11-21)
+
+- Implemented the remote operations the unsteam launcher needs (platform/win32_remote.inc, platform/win32_child.c;
+  details in docs/child-startup.md "Remote operations"): VirtualAllocEx/ProtectEx/FreeEx/QueryEx served inside the
+  child over its control socket; Read/WriteProcessMemory via process_vm_*; CreateRemoteThread[Ex] resolved by
+  export name in the child (raw starts only inside parent-allocated remote memory); second child gate before
+  TLS/entry for remote threads queued while suspended; OpenProcess(child pid) handles reach the same child.
+- Live run of the 1.8.6 entry (`unsteam_loader64.exe`, official Steam mode): VirtualAllocEx -> 0x10000 in the
+  game, WriteProcessMemory of "unsteam64.dll", CreateRemoteThread(LoadLibraryA) resolved in the child (launcher
+  0xfeee4140, game 0xfeee42a0, confirming per-process stub layouts), unsteam64.dll loaded before the game's entry.
+- **Steam process (opt-in, user decision 2026-11-21: only for games that need it):** unsteam walks a Toolhelp
+  snapshot for steam.exe. New per-game manager flag "Show the Steam client process" (`BEER_STEAM_CLIENT_PROCESS=1`)
+  adds a steam.exe entry, with the real pid of Beer's Steam service (`beer-steam serve`, via SO_PEERCRED on
+  steam.sock), only while that service accepts connections. Enabled for the "Chained Together 1.8.6" library
+  entry only (library.json backup: ~/beer-safety/library.json.0047).
+- unsteam next needed `ntdll!LdrRegisterDllNotification` / `LdrUnregisterDllNotification`: implemented (loaded
+  notifications with LDR_DLL_LOADED_NOTIFICATION_DATA before DllMain on the loading thread; no unload ones,
+  because Beer never unmaps DLLs).
+- Result (no API trace): the game runs and renders. Unsteam routes it to app 480 on the signed-in Beer session
+  ("Steam session for app 480", "matchmaking ready for app 480", ISteamUtils::GetAppID -> 480). Online play with
+  another person is NOT verified. The 1.8.6 entry has no Steam local networking library set (the older entry does).
+- With `BEER_API_TRACE=1` the game instead fast-fails (0xC0000409, stack cookie) on a worker thread right after
+  its thread-naming RaiseException(0x406D1388). This does not happen untraced; it is a tracing artifact to look at
+  separately.
+- Tests: test-child-startup, test-child-loader, test-native-loader, test-native-sync pass. Logs in the session
+  scratchpad (ct.err). Also regenerated platform/win32_module_exports.h (adds CreateRemoteThreadEx, PtVisible,
+  UnrealizeObject, LdrRegisterDllNotification, LdrUnregisterDllNotification). manager_launch_test.py: 5 pass.
+
+## Chained Together wrapper startup — real suspension implemented; remote operations pending (2026-11-21)
+
+- Filtered startup trace `/tmp/beer-ct-startup-trace.log` confirms the launcher calls CreateProcessA,
+  VirtualAllocEx(process, NULL, 14, MEM_RESERVE|MEM_COMMIT), WriteProcessMemory, CreateRemoteThread,
+  then ResumeThread. Remote allocation currently fails; the subsequent write uses address zero. Merely
+  changing the Steam app ID or implementing suspension cannot complete this sequence.
+- Generic CREATE_SUSPENDED support now uses `platform/win32_child.{c,h}`: private startup socket handshake,
+  readiness before guest initialization, real primary-thread handles (namespace 0x39), nested suspend counts,
+  release on ResumeThread one-to-zero, primary/process exit separation, wait/close/pre-start termination,
+  transactional failure cleanup and child reaping. No Steam routing, ownership or guest binary changes.
+- Independent host fixtures O0/O2/ASan+UBSan, actual Win32 wrapper fixtures, native-loader and native-sync tests
+  passed; final loader built. Main-agent rerun `make test-child-startup test-child-loader` passes. Fixtures do
+  not yet prove a real PE64/PE32 suspended-entry integration or this game's multiplayer startup.
+- Remaining milestone: secure per-child RPC for real remote virtual memory and remote guest thread creation,
+  with child-side TEB/ABI setup, target-address validation and timeout/crash/lifetime tests. Parent-issued
+  synthetic API addresses must not be guessed or blindly executed in the child. See `docs/child-startup.md`
+  for deliberate limits. Launcher Spacewar routing and online session creation are NOT fixed by this milestone.
+
 ## Alternate Chained Together launcher — startup crash repaired (2026-11-21)
 
 - Follow-up manager failure: new **Chained Together 1.8.6** entry had empty Loader values, and subsequent edits

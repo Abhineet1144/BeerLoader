@@ -12,6 +12,7 @@ PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_e
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
 				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_sddl.c platform/win32_shell_strings.c platform/win32_variant.c platform/win32_schannel.c platform/wow32_math.c
 PLATFORM_SRCS += platform/beer_steam_networking.c
+PLATFORM_SRCS += platform/win32_child.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
                renderer/vulkan/vulkan_post.c \
@@ -55,6 +56,12 @@ $(STEAM_PROVIDER): $(STEAM_SRCS) $(wildcard steam/*.h)
 test-ki-dispatcher:
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_ki_dispatcher_test.c -o /tmp/beer-ki-dispatcher-test
 	/tmp/beer-ki-dispatcher-test
+
+test-child-startup:
+	$(CC) -O2 -Wall -Wextra -Werror -Iplatform tests/child_startup_test.c platform/win32_child.c -lpthread -o /tmp/beer-child-startup-test
+	/tmp/beer-child-startup-test
+
+.PHONY: test-child-startup
 
 test-steam:
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_networking_test.c platform/beer_steam_networking.c -lpthread -ldl -o /tmp/beer-steam-networking-test
@@ -212,6 +219,12 @@ test-native-sync: $(filter-out loader.o,$(OBJS))
 	rm -f /tmp/beer-native-sync-contract-test
 
 .PHONY: test-native-sync
+
+test-child-loader: $(filter-out loader.o,$(OBJS))
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections tests/child_loader_contract_test.c $(filter-out loader.o,$(OBJS)) $(LDFLAGS) -o /tmp/beer-child-loader-contract-test
+	/tmp/beer-child-loader-contract-test
+
+.PHONY: test-child-loader
 
 test-adapter-info:
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/win32_adapter_info_test.c -o /tmp/beer-adapter-info-test

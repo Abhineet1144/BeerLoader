@@ -2324,6 +2324,9 @@ static void __attribute__((noreturn)) beer_wow32_main(const char *path)
     u64 teb64;
     __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb64));
     *(u64 *)(uintptr_t)(teb64 + W32_SLOT_ESP) = esp;
+    /* No remote threads for 32-bit children (no hooks): a queued one ends with an error, and the gate still waits
+     * for ResumeThread. */
+    if (!beer_child_startup() || !beer_child_pre_entry()) _exit(2);
     if (nt->opt.rva_count > 9 && nt->opt.dirs[9].size) {
         const W32TlsDirectory *tls = (const void *)(image + nt->opt.dirs[9].rva);
         if (tls->callbacks) {

@@ -97,6 +97,7 @@
 #include "win32_nt_section.h"
 #include "win32_virtual_memory.h"
 #include "win32_entry.h"
+#include "win32_child.h"
 #include "win32_ui_language.h"
 #include "win32_onexit.h"
 #include "win32_crt_init.h"
@@ -12799,6 +12800,20 @@ beer_wait_single_raw(u64 h, u32 ms)
     g_dbg_wait_kind = 2; g_dbg_wait_handle = h; g_dbg_wait_ms = ms;
     u64 trc = thread_wait_handle(h, ms);
     if (trc != (u64)-2) { g_dbg_wait_kind = 0; return trc; }
+    if (beer_primary_namespace(h)) {
+        struct timespec start, now;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (;;) {
+            int state = beer_primary_poll(h);
+            if (state < 0) { g_last_error = 6; g_dbg_wait_kind = 0; return 0xffffffffu; }
+            if (state) { g_dbg_wait_kind = 0; return 0; }
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            s64 elapsed = (s64)(now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+            if (ms != 0xffffffffu && elapsed >= ms) { g_dbg_wait_kind = 0; return 0x102; }
+            struct timespec delay = {0, 2000000};
+            nanosleep(&delay, NULL);
+        }
+    }
     u64 prc = beer_proc_wait(h, ms);
     if (prc != (u64)-2) { g_dbg_wait_kind = 0; return prc; }
 
@@ -13121,6 +13136,11 @@ static int wait_handle_poll(u64 handle, int consume)
 
     int process_state = beer_proc_poll(handle);
     if (process_state != -2) return process_state;
+    if (beer_primary_namespace(handle)) {
+        int state = beer_primary_poll(handle);
+        if (state < 0) g_last_error = 6;
+        return state;
+    }
 
     g_last_error = 6; /* ERROR_INVALID_HANDLE */
     return -1;
@@ -16627,9 +16647,17 @@ static u64 current_thread_real_handle(void)
     return (u64)(THREAD_HANDLE_BASE + (u32)id);
 }
 
+static int beer_remote_thread_exit_code(u64 h, u32 *code);   /* platform/win32_remote.inc */
+static void beer_remote_thread_forget(u64 h);
 static u64 __attribute__((ms_abi))
 impl_GetExitCodeThread(u64 h, u32 *exit_code)
 {
+    if (beer_remote_thread_exit_code(h, exit_code)) return 1;   /* CreateRemoteThread handle (win32_remote.inc) */
+    if (beer_primary_namespace(h)) {
+        if (beer_primary_exit_code(h, exit_code)) return 1;
+        g_last_error = exit_code ? 6 : 87;
+        return 0;
+    }
     if (h == (u64)-2 && exit_code) { *exit_code = 259u; return 1; }   /* the caller is running */
     int id = thread_id_from_handle(h);
     if (id < 0 || !exit_code) { g_last_error = 6; return 0; }
@@ -16710,6 +16738,12 @@ static u64 duplicate_handle_local(u64 source, u64 *target, u32 options)
 static u64 __attribute__((ms_abi))
 impl_SuspendThread(u64 h)
 {
+    if (beer_primary_namespace(h)) {
+        u32 previous;
+        int error = beer_primary_suspend(h, &previous);
+        if (error) { g_last_error = error; return 0xffffffffu; }
+        return previous;
+    }
     int id = thread_id_from_handle(h);
     if (id < 0) return (u64)-1;
     WinThread *t = &g_threads[id];
@@ -16722,8 +16756,14 @@ impl_SuspendThread(u64 h)
 static u64 __attribute__((ms_abi))
 impl_ResumeThread(u64 h)
 {
+    if (beer_primary_namespace(h)) {
+        u32 previous;
+        int error = beer_primary_resume(h, &previous);
+        if (error) { g_last_error = error; return 0xffffffffu; }
+        return previous;
+    }
     int id = thread_id_from_handle(h);
-    if (id < 0) return (u64)-1;
+    if (id < 0) { g_last_error = 6; return 0xffffffffu; }
     WinThread *t = &g_threads[id];
     pthread_mutex_lock(&t->mtx);
     u64 prev = t->suspended ? 1 : 0;
@@ -16745,6 +16785,7 @@ static u64 __attribute__((ms_abi)) impl_SetThreadPriority(u64 h, u32 p)   { (voi
  * impossible state and breaks runtimes that reap worker threads by polling. */
 static void thread_set_current_exit_code(u32 code)
 {
+    beer_child_primary_exit(code);
     const u32 tid = (u32)current_windows_thread_id();
     for (int id = 1; id < g_thread_cnt; ++id) {
         WinThread *thread = &g_threads[id];
@@ -16771,6 +16812,11 @@ impl_FreeLibraryAndExitThread(u64 hmod, u32 code)
 static u64 __attribute__((ms_abi))
 impl_TerminateThread(u64 h, u32 code)
 {
+    if (beer_primary_namespace(h)) {
+        int error = beer_primary_terminate(h, code);
+        if (error) { g_last_error = error; return 0; }
+        return 1;
+    }
     int id = thread_id_from_handle(h);
     if (id < 0) return 0;
     WinThread *t = &g_threads[id];
@@ -18787,6 +18833,7 @@ static void beer_addr_change_forget_handle(u64 handle);
 static u64 __attribute__((ms_abi))
 impl_CloseHandle(u64 h)
 {
+    beer_remote_thread_forget(h);
     int tid = thread_id_from_handle(h);
     if (tid < 0 && dup_ref_release(h)) return 1;       /* a duplicate handle: the object stays open */
     handle_set_inheritable(h, 0);                      /* a later object reusing this value starts uninheritable */
@@ -18856,6 +18903,11 @@ impl_CloseHandle(u64 h)
     if (beer_proc_close(h)) {
         g_last_error = 0;
         return 1;
+    }
+    if (beer_primary_namespace(h)) {
+        if (beer_primary_close(h)) { g_last_error = 0; return 1; }
+        g_last_error = 6;
+        return 0;
     }
 
     if (beer_nt_section_close(h)) {
@@ -25010,7 +25062,14 @@ static u64 __attribute__((ms_abi)) impl_ExitProcess(u32 code) {
     _exit((int)code);
 }
 static u64 __attribute__((ms_abi)) impl_TerminateProcess(u64 h, u32 code)
-    { if (beer_proc_terminate(h, code)) return 1; fprintf(stderr, "[IMPL] TerminateProcess(%u) -> terminating loader\n", code); dbg_dump_guest_callchain("TerminateProcess"); fflush(stderr); _exit((int)code); }
+{
+    if (h != (u64)-1 && h != 0x7ff0ull) {
+        if (beer_proc_terminate(h, code)) return 1;
+        return 0;
+    }
+    fflush(stderr);
+    _exit((int)code);
+}
 /* Anti-debug probes that protection stubs run: a normal, undebugged Windows machine answers these
  * with "no debugger", success and zero. */
 static u64 __attribute__((ms_abi)) impl_CheckRemoteDebuggerPresent(u64 process, u32 *present)
@@ -28625,7 +28684,10 @@ impl___acrt_iob_func(u32 index)
 }
 
 /* ---- Impl dispatch table ---- */
+static u64 __attribute__((ms_abi)) impl_LdrRegisterDllNotification(u32 flags, u64 callback, u64 context, u64 *cookie);
+static u64 __attribute__((ms_abi)) impl_LdrUnregisterDllNotification(u64 cookie);
 #include "platform/win32_process.inc"
+#include "platform/win32_remote.inc"
 #include "platform/win32_d3d9.inc"
 #include "platform/win32_display_config.inc"
 #include "platform/win32_nvapi.inc"
@@ -32068,6 +32130,67 @@ static void guest_dll_initialize_dependencies(GuestDll *dll)
     }
 }
 
+/* ---- LdrRegisterDllNotification (Microsoft Learn): callbacks told about each DLL the process loads ----
+ * LDR_DLL_LOADED_NOTIFICATION_DATA { ULONG Flags; PCUNICODE_STRING FullDllName, BaseDllName; PVOID DllBase;
+ * ULONG SizeOfImage; }, delivered with reason LDR_DLL_NOTIFICATION_REASON_LOADED (1) after the DLL is mapped and
+ * before its DllMain, on the loading thread. Beer never unmaps a DLL (FreeLibrary keeps it), so no
+ * LDR_DLL_NOTIFICATION_REASON_UNLOADED (2) is ever due. */
+typedef struct { u64 callback, context; int used; } BeerDllNotification;
+static BeerDllNotification g_dll_notifications[16];
+static pthread_mutex_t g_dll_notification_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static u64 __attribute__((ms_abi)) impl_LdrRegisterDllNotification(u32 flags, u64 callback, u64 context, u64 *cookie)
+{
+    if (flags || !callback || !cookie) return 0xC000000Du;           /* STATUS_INVALID_PARAMETER */
+    pthread_mutex_lock(&g_dll_notification_mtx);
+    for (int i = 0; i < 16; ++i)
+        if (!g_dll_notifications[i].used) {
+            g_dll_notifications[i] = (BeerDllNotification){ callback, context, 1 };
+            *cookie = (u64)(uintptr_t)&g_dll_notifications[i];
+            pthread_mutex_unlock(&g_dll_notification_mtx);
+            return 0;
+        }
+    pthread_mutex_unlock(&g_dll_notification_mtx);
+    return 0xC000009Au;                                                /* STATUS_INSUFFICIENT_RESOURCES */
+}
+static u64 __attribute__((ms_abi)) impl_LdrUnregisterDllNotification(u64 cookie)
+{
+    pthread_mutex_lock(&g_dll_notification_mtx);
+    for (int i = 0; i < 16; ++i)
+        if (g_dll_notifications[i].used && cookie == (u64)(uintptr_t)&g_dll_notifications[i]) {
+            g_dll_notifications[i].used = 0;
+            pthread_mutex_unlock(&g_dll_notification_mtx);
+            return 0;
+        }
+    pthread_mutex_unlock(&g_dll_notification_mtx);
+    return 0xC0000135u;                                                /* STATUS_DLL_NOT_FOUND */
+}
+static void guest_dll_notify_loaded(GuestDll *dll)
+{
+    BeerDllNotification list[16];
+    int count = 0;
+    pthread_mutex_lock(&g_dll_notification_mtx);
+    for (int i = 0; i < 16; ++i) if (g_dll_notifications[i].used) list[count++] = g_dll_notifications[i];
+    pthread_mutex_unlock(&g_dll_notification_mtx);
+    if (!count) return;
+    /* The full name as the guest sees it (Z:\host\path), and its last component. */
+    static _Thread_local u16 full[PATH_MAX + 3];
+    size_t n = 0;
+    full[n++] = 'Z'; full[n++] = ':';
+    for (const char *p = dll->path[0] ? dll->path : dll->name; *p && n + 1 < sizeof(full) / 2; ++p)
+        full[n++] = *p == '/' ? '\\' : (u8)*p;
+    full[n] = 0;
+    size_t base = n;
+    while (base > 0 && full[base - 1] != '\\') --base;
+    struct { u16 length, maximum; u32 pad; u64 buffer; } full_name, base_name;
+    full_name = (typeof(full_name)){ (u16)(n * 2), (u16)(n * 2 + 2), 0, (u64)(uintptr_t)full };
+    base_name = (typeof(base_name)){ (u16)((n - base) * 2), (u16)((n - base) * 2 + 2), 0, (u64)(uintptr_t)(full + base) };
+    struct { u32 flags, pad; u64 full_name, base_name, base; u32 size, pad2; } data = {
+        0, 0, (u64)(uintptr_t)&full_name, (u64)(uintptr_t)&base_name, (u64)(uintptr_t)dll->image, (u32)dll->image_size, 0 };
+    typedef void __attribute__((ms_abi)) (*Notify)(u32, void *, u64);
+    for (int i = 0; i < count; ++i) ((Notify)(uintptr_t)list[i].callback)(1 /* LOADED */, &data, list[i].context);
+}
+
 static void guest_dll_initialize_one(GuestDll *dll)
 {
     if (dll->entry_called || dll->initializing) return;
@@ -32079,6 +32202,7 @@ static void guest_dll_initialize_one(GuestDll *dll)
     NtHdrs64 *nt = (NtHdrs64 *)(dll->image + ((DosHdr *)dll->image)->lfanew);
     dll->initializing = 1;
     guest_dll_initialize_dependencies(dll);
+    guest_dll_notify_loaded(dll);
     if (!nt->opt.entry_rva) {
         dll->entry_called = 1;
         dll->initializing = 0;
@@ -39098,6 +39222,8 @@ int main(int argc, char **argv)
         if (personality(ADDR_NO_RANDOMIZE) != -1) reexec = 1;
     }
     if (reexec) execv("/proc/self/exe", argv);
+    /* Re-exec needs the private fd, but host helpers must never inherit it. */
+    if (!beer_child_capture()) return 2;
     const char *recovery_limit = getenv("BEER_CRASH_RECOVERY_LIMIT");
     if (recovery_limit && *recovery_limit) {
         char *end = NULL;
@@ -39208,6 +39334,7 @@ int main(int argc, char **argv)
     }
     if (beer_cmd_arg) {
         if (!configure_guest_prefix(prefix_arg)) return 1;
+        if (!beer_child_startup() || !beer_child_pre_entry()) return 2;
         return beer_cmd_main(beer_cmd_arg);
     }
     if (!exe_arg) {
@@ -39342,6 +39469,10 @@ int main(int argc, char **argv)
     sigaction(SIGTRAP, &sa, NULL);  /* int3 / abort() in Windows CRT */
     beer_hw_breakpoints_start();
     
+    /* Imports can initialize dependencies: gate before any guest callback. A remote thread created while the
+     * process is suspended (CreateRemoteThread) lets initialization proceed to the second gate below. */
+    beer_child_set_hooks(&g_beer_remote_child_hooks);
+    if (!beer_child_startup()) return 2;
     pe_imports();
     setup_teb_peb();
     pe_initialize_security_cookie();
@@ -39538,5 +39669,8 @@ int main(int argc, char **argv)
     /* Windows executes executable TLS callbacks on the initial thread before
      * entering the image. This is mandatory loader behavior; failures terminate
      * startup rather than handing the executable partially initialized state. */
+    /* Remote threads queued while suspended run now (LoadLibraryA of an injected DLL); the executable itself starts
+     * only after ResumeThread. */
+    if (!beer_child_pre_entry()) _exit(2);
     beer_guest_enter(g_entry_rsp, executable_tls_process_attach, entry);
 }

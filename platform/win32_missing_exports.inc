@@ -36,13 +36,35 @@ static u64 __attribute__((ms_abi)) stub_GlobalUnlock(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_HeapDestroy(void){ return 1; }
 static u64 __attribute__((ms_abi)) stub_OpenProcess(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetExitCodeProcess(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateRemoteThread(void){ return 0; }
+/* CreateRemoteThread[Ex]: the current process runs a local thread; a Beer child runs it there (win32_remote.inc). */
+static u64 __attribute__((ms_abi)) beer_CreateRemoteThreadEx(u64 process, void *sa, u64 stack, u64 start, u64 param,
+                                                             u32 flags, void *attributes, u32 *tid)
+{
+    (void)sa; (void)attributes;
+    if (process == (u64)-1 || process == (u64)(u32)getpid()) return impl_CreateThread(0, stack, start, param, flags, tid);
+    int handled = 0;
+    const u64 thread = beer_remote_create_thread(process, start, param, flags, tid, &handled);
+    if (!handled) {
+        fprintf(stderr, "[REMOTE] CreateRemoteThread(%#llx): not a Beer child process; ERROR_ACCESS_DENIED\n",
+                (unsigned long long)process);
+        g_last_error = 5;
+        return 0;
+    }
+    return thread;
+}
+static u64 __attribute__((ms_abi)) beer_CreateRemoteThread(u64 process, void *sa, u64 stack, u64 start, u64 param,
+                                                           u32 flags, u32 *tid)
+{ return beer_CreateRemoteThreadEx(process, sa, stack, start, param, flags, NULL, tid); }
 /* GetThreadContext: Beer cannot read another thread's registers, but it never sets hardware breakpoints, so the debug
  * registers are reported as clear (CONTEXT_DEBUG_REGISTERS: Dr0-Dr3, Dr6, Dr7 at +0x48..+0x77 of the x64 CONTEXT).
  * Failing the call left the caller's buffer as stack garbage, which copy protection (RDR2's Arxan TLS callback)
  * reads as a debugger's breakpoints and answers by sabotaging the game ("Social Club error"). */
 static u64 __attribute__((ms_abi)) beer_GetThreadContext(u64 thread, u8 *context)
 {
+    if (beer_primary_namespace(thread)) {
+        g_last_error = beer_primary_poll(thread) < 0 ? 6 : 50;
+        return 0;
+    }
     if (!context) { g_last_error = 998; return 0; }                 /* ERROR_NOACCESS */
     if (thread_unstarted_context(thread, context, 0) > 0) return 1;
     const u32 flags = *(u32 *)(context + 0x30);
@@ -1114,9 +1136,21 @@ static u64 __attribute__((ms_abi)) beer_GetFileAttributesExA(const char *name, u
 }
 /* The Ex forms on another process are not supported; on this process they are the plain calls. */
 static u64 __attribute__((ms_abi)) beer_VirtualQueryEx(u64 process, void *address, BeerMemoryBasicInformation *info, u64 size)
-    { if (process != (u64)-1) { g_last_error = 5; return 0; } return impl_VirtualQuery(address, info, size); }
+{
+    if (process == (u64)-1 || process == (u64)(u32)getpid()) return impl_VirtualQuery(address, info, size);
+    int handled = 0;
+    const u64 r = beer_remote_virtual_query(process, address, info, size, &handled);
+    if (!handled) { g_last_error = 5; return 0; }
+    return r;
+}
 static u64 __attribute__((ms_abi)) beer_VirtualFreeEx(u64 process, void *address, u64 size, u32 type)
-    { if (process != (u64)-1) { g_last_error = 5; return 0; } return impl_VirtualFree(address, size, type); }
+{
+    if (process == (u64)-1 || process == (u64)(u32)getpid()) return impl_VirtualFree(address, size, type);
+    int handled = 0;
+    const u64 r = beer_remote_virtual_free(process, address, size, type, &handled);
+    if (!handled) { g_last_error = 5; return 0; }
+    return r;
+}
 /* One geographic location (the United States, GEOID 244), matching Beer's en-US locale. */
 static u64 __attribute__((ms_abi)) beer_GetUserGeoID(u32 geo_class) { (void)geo_class; return 244; }
 static u64 __attribute__((ms_abi)) beer_GetGeoInfoW(u32 location, u32 type, u16 *data, s32 capacity, u16 language)
@@ -1589,7 +1623,7 @@ static u64 __attribute__((ms_abi)) beer_CM_Get_Device_Interface_PropertyW(const 
                                                                           u32 *size, u32 flags)
     { (void)interface; (void)key; (void)buffer; (void)flags; if (type) *type = 0; if (size) *size = 0; return 0x37; }
 
-/* ---- Process-memory calls on the current process (replacing the earlier return-0 placeholders) ----
+/* ---- Process-memory calls on the current process, and on Beer children (platform/win32_remote.inc) ----
  * Other processes' memory is not reachable from Beer: those calls fail with ERROR_ACCESS_DENIED. */
 static int beer_is_current_process(u64 process)
 {
@@ -1597,18 +1631,33 @@ static int beer_is_current_process(u64 process)
 }
 static u64 __attribute__((ms_abi)) beer_VirtualAllocEx(u64 process, void *address, u64 size, u32 type, u32 protect)
 {
-    if (!beer_is_current_process(process)) { g_last_error = 5; return 0; }
+    if (!beer_is_current_process(process)) {
+        int handled = 0;
+        const u64 r = beer_remote_virtual_alloc(process, address, size, type, protect, &handled);
+        if (!handled) g_last_error = 5;
+        return handled ? r : 0;
+    }
     return impl_VirtualAlloc(address, size, type, protect);
 }
 static u64 __attribute__((ms_abi)) beer_VirtualProtectEx(u64 process, void *address, u64 size, u32 protect, u32 *old)
 {
-    if (!beer_is_current_process(process)) { g_last_error = 5; return 0; }
+    if (!beer_is_current_process(process)) {
+        int handled = 0;
+        const u64 r = beer_remote_virtual_protect(process, address, size, protect, old, &handled);
+        if (!handled) g_last_error = 5;
+        return handled ? r : 0;
+    }
     return impl_VirtualProtect(address, size, protect, old);
 }
 static u64 beer_process_memory_copy(u64 process, void *remote, void *local, u64 size, u64 *done, int write)
 {
     if (done) *done = 0;
-    if (!beer_is_current_process(process)) { g_last_error = 5; return 0; }
+    if (!beer_is_current_process(process)) {
+        int handled = 0;
+        const u64 r = beer_remote_memory_copy(process, remote, local, size, done, write, &handled);
+        if (!handled) g_last_error = 5;
+        return handled ? r : 0;
+    }
     if (!size) return 1;
     struct iovec local_vector = { local, (size_t)size }, remote_vector = { remote, (size_t)size };
     ssize_t copied = write ? process_vm_writev(getpid(), &local_vector, 1, &remote_vector, 1, 0)

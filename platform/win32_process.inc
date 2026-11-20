@@ -63,7 +63,7 @@ static int beer_pid_is_loader(pid_t pid)
 #define BEER_MAX_SNAPS 32
 #define BEER_SNAP_MAX_ENTRIES 128
 
-typedef struct { int used; pid_t pid; int child; int exited; u32 exit_code; } BeerProc;
+typedef struct { int used; pid_t pid; int child; int exited; u32 exit_code; u64 control; } BeerProc;
 static BeerProc g_procs[BEER_MAX_PROCS];
 static pthread_mutex_t g_proc_mtx = PTHREAD_MUTEX_INITIALIZER;
 
@@ -113,6 +113,12 @@ static int beer_proc_exited(BeerProc *p)
 {
     pthread_mutex_lock(&g_proc_mtx);
     if (!p->exited) {
+        if (p->control) {
+            p->exited = beer_child_poll(p->control, &p->exit_code) == 1;
+            int exited = p->exited;
+            pthread_mutex_unlock(&g_proc_mtx);
+            return exited;
+        }
         int status = 0;
         pid_t r = p->child ? waitpid(p->pid, &status, WNOHANG) : 0;
         if (r == p->pid) {
@@ -166,9 +172,14 @@ static int beer_proc_poll(u64 h)
 static int beer_proc_terminate(u64 h, u32 code)
 {
     BeerProc *p = beer_proc_from_handle(h);
-    if (!p) return 0;
-    (void)code;
-    if (p->pid != getpid()) kill(p->pid, SIGKILL);
+    if (!p) { g_last_error = 6; return 0; }
+    if (p->control) {
+        int error = beer_child_terminate(p->control, code);
+        if (error) { g_last_error = error; return 0; }
+        return 1;
+    }
+    if (p->pid == getpid()) _exit((int)code);
+    if (kill(p->pid, SIGKILL)) { g_last_error = 5; return 0; }
     return 1;
 }
 
@@ -177,6 +188,7 @@ static int beer_proc_close(u64 h)
     BeerProc *p = beer_proc_from_handle(h);
     if (p) {
         pthread_mutex_lock(&g_proc_mtx);
+        if (p->control) beer_child_release(p->control);
         if (p->child && !p->exited) {
             /* The child keeps running; reap it later through a detached waiter-less zombie at worst. */
         }
@@ -355,11 +367,12 @@ static char **beer_inherit_environment(const char *extra, const char *image)
 {
     size_t n = 0;
     while (environ[n]) ++n;
-    char **env = calloc(n + 5, sizeof(*env));
+    char **env = calloc(n + 6, sizeof(*env));
     if (!env) return NULL;
     size_t k = 0;
     for (size_t i = 0; i < n; ++i)
         if (strncmp(environ[i], "BEER_INHERITED_HANDLES=", 23) &&
+            strncmp(environ[i], BEER_CHILD_ENV, strlen(BEER_CHILD_ENV)) &&
             strncmp(environ[i], "_BEER_PRIMARY_TOKEN=", 20) &&
             strncmp(environ[i], "_BEER_IMAGE_NAME=", 17) &&
             strncmp(environ[i], "_BEER_GUEST_STDOUT=", 19)) env[k++] = environ[i];
@@ -465,6 +478,8 @@ static u64 beer_create_process_in(const char *application, const char *command_l
                                   const u8 *startup, int inherit_handles, const char *directory)
 {
     char token[PATH_MAX];
+    if (!info || !startup || *(const u32 *)startup < 104) { g_last_error = 87; return 0; }
+    memset(info, 0, 24);
     token[0] = 0;
     if (application && *application) {
         snprintf(token, sizeof(token), "%s", application);
@@ -481,6 +496,13 @@ static u64 beer_create_process_in(const char *application, const char *command_l
     }
     if (!token[0]) { g_last_error = 87; return 0; }
     {
+        /* In-process console emulation cannot honour a suspended primary thread. */
+        const char *base = beer_path_basename(token);
+        if ((flags & 4u) && (!strcasecmp(base, "hostname") || !strcasecmp(base, "hostname.exe") ||
+                            !strcasecmp(base, "whoami") || !strcasecmp(base, "whoami.exe"))) {
+            g_last_error = 50;
+            return 0;
+        }
         int tool = beer_builtin_console_tool(token, startup, info);
         if (tool) return tool > 0;
     }
@@ -548,11 +570,17 @@ static u64 beer_create_process_in(const char *application, const char *command_l
     if (!is_cmd) argv[argc++] = host;
     argv[argc] = NULL;
 
-    if (flags & 0x4u)
-        fprintf(stderr, "[PROCESS] CREATE_SUSPENDED is not supported; starting %s immediately\n", host);
     pid_t pid = 0;
     BeerInherit inherit;
-    int have_inherit = inherit_handles && g_inheritable_handles && beer_inherit_prepare(&inherit);
+    int have_inherit = 0;
+    if (inherit_handles && g_inheritable_handles) {
+        if (!beer_inherit_prepare(&inherit)) {
+            beer_inherit_release(&inherit);
+            g_last_error = 8;
+            return 0;
+        }
+        have_inherit = 1;
+    }
     char **env = beer_inherit_environment(have_inherit ? inherit.env : NULL, image_entry[0] ? image_entry : NULL);
     if (!env) {
         if (have_inherit) beer_inherit_release(&inherit);
@@ -582,16 +610,58 @@ static u64 beer_create_process_in(const char *application, const char *command_l
         }
         if (actions) posix_spawn_file_actions_addchdir_np(actions, directory_host);
     }
-    int rc = posix_spawn(&pid, self, actions, NULL, argv, env);
+    BeerChildLaunch launch;
+    if (!actions) {
+        if (posix_spawn_file_actions_init(&std_actions)) {
+            free(env);
+            if (have_inherit) beer_inherit_release(&inherit);
+            g_last_error = 8;
+            return 0;
+        }
+        std_ready = 1;
+        actions = &std_actions;
+    }
+    /* Above fixed inherited destinations, but actually unused in this host. */
+    if (!beer_child_prepare(&launch, actions, BEER_INHERIT_FD_BASE + BEER_MAX_INHERITABLE + 16)) {
+        if (std_ready) posix_spawn_file_actions_destroy(&std_actions);
+        free(env);
+        if (have_inherit) beer_inherit_release(&inherit);
+        g_last_error = 8;
+        return 0;
+    }
+    size_t env_count = 0;
+    while (env[env_count]) ++env_count;
+    env[env_count++] = launch.env;
+    env[env_count] = NULL;
+    u64 process = beer_proc_alloc(0, 1);
+    int rc = process ? posix_spawn(&pid, self, actions, NULL, argv, env) : ENOMEM;
     if (std_ready) posix_spawn_file_actions_destroy(&std_actions);
     free(env);
     if (have_inherit) beer_inherit_release(&inherit);
-    if (rc != 0) { g_last_error = 5; return 0; }       /* ERROR_ACCESS_DENIED */
+    if (rc != 0) {
+        beer_child_discard(&launch);
+        if (process) beer_proc_close(process);
+        g_last_error = rc == ENOMEM ? 8 : 5;
+        return 0;
+    }
+    u64 control = 0, thread = 0;
+    int adopted = beer_child_adopt(&launch, pid, (flags & 4u) != 0, &control, &thread);
+    if (adopted <= 0) {
+        beer_child_discard(&launch);
+        if (!adopted) {
+            kill(pid, SIGKILL);
+            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        }
+        beer_proc_close(process);
+        g_last_error = 31;
+        return 0;
+    }
+    pthread_mutex_lock(&g_proc_mtx);
+    g_procs[process - BEER_PROC_HANDLE_BASE].pid = pid;
+    g_procs[process - BEER_PROC_HANDLE_BASE].control = control;
+    pthread_mutex_unlock(&g_proc_mtx);
     fprintf(stderr, "[PROCESS] CreateProcess pid=%d: %s\n", (int)pid, command);
 
-    u64 process = beer_proc_alloc(pid, 1);
-    u64 thread = event_alloc(1, 1);       /* closable stand-in for the primary thread handle */
-    if (!process) return 0;
     if (info) {
         memcpy(info + 0, &process, 8);
         memcpy(info + 8, &thread, 8);
@@ -607,16 +677,17 @@ static u64 __attribute__((ms_abi))
 beer_CreateProcessA(const char *application, const char *command_line, void *process_sa, void *thread_sa,
                     u32 inherit, u32 flags, void *environment, const char *directory, void *startup, u8 *info)
 {
+    if (environment) {
+        if (info) memset(info, 0, 24);
+        g_last_error = 50; /* custom guest environment blocks are not implemented */
+        return 0;
+    }
     note_inheritable_sa((u64)(uintptr_t)process_sa); note_inheritable_sa((u64)(uintptr_t)thread_sa);
     /* posix_spawn alone does not copy the guest handle tables or event state.
      * Claiming success here would make inherited numeric handles refer to unrelated
      * objects in the child, so fail while any handle could actually be inherited. */
     if (getenv("BEER_PROCESS_DIAGNOSTICS")) {
         fprintf(stderr, "[PROCESS] CreateProcessA inherit=%u flags=0x%x directory=%s environment=%p\n", inherit, flags, directory ? directory : "(null)", environment);
-        if (environment) {
-            const char *e = (const char *)environment;
-            for (int k = 0; k < 64 && *e; ++k) { fprintf(stderr, "[PROCESS]   env %s\n", e); e += strlen(e) + 1; }
-        }
     }
     if (info) memset(info, 0, 24);                          /* PROCESS_INFORMATION stays zero on failure */
     return beer_create_process(application, command_line, flags, info, startup, inherit != 0, directory);
@@ -626,7 +697,11 @@ static u64 __attribute__((ms_abi))
 beer_CreateProcessW(const u16 *application, const u16 *command_line, void *process_sa, void *thread_sa,
                     u32 inherit, u32 flags, void *environment, const u16 *directory, void *startup, u8 *info)
 {
-    (void)environment;
+    if (environment) {
+        if (info) memset(info, 0, 24);
+        g_last_error = 50;
+        return 0;
+    }
     note_inheritable_sa((u64)(uintptr_t)process_sa); note_inheritable_sa((u64)(uintptr_t)thread_sa);
     char app[PATH_MAX], cmd[8192], dir[PATH_MAX];
     beer_proc_utf16_to_utf8(application, app, sizeof(app));
@@ -668,6 +743,31 @@ static void beer_snapshot_add(BeerSnapshot *s, pid_t pid)
     fclose(f);
 }
 
+/* Opt-in (BEER_STEAM_CLIENT_PROCESS=1, the manager's "Steam client process" setting): games and wrappers that
+ * refuse to start unless they see Steam's client process (Unsteam: "Unable to find Steam process") are shown a
+ * steam.exe entry for Beer's Steam service, which holds the signed-in session official Steam mode uses. Only while
+ * that service answers on its socket, and with its real pid; otherwise there is no Steam process to show. */
+static pid_t beer_steam_client_process_pid(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("BEER_STEAM_CLIENT_PROCESS") && strcmp(getenv("BEER_STEAM_CLIENT_PROCESS"), "0");
+    if (!enabled) return 0;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (!beer_steam_session_socket_path(addr.sun_path, sizeof(addr.sun_path))) return 0;
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 0;
+    pid_t pid = 0;
+    if (!connect(fd, (struct sockaddr *)&addr, sizeof(addr))) {
+        struct ucred cred;
+        socklen_t length = sizeof(cred);
+        if (!getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &length) && cred.pid > 0) pid = cred.pid;
+    }
+    close(fd);
+    return pid;
+}
+
 static u64 __attribute__((ms_abi)) beer_CreateToolhelp32Snapshot(u32 flags, u32 pid)
 {
     (void)pid;
@@ -685,6 +785,14 @@ static u64 __attribute__((ms_abi)) beer_CreateToolhelp32Snapshot(u32 flags, u32 
                     beer_snapshot_add(s, (pid_t)atoi(entry->d_name));
             }
             if (dir) closedir(dir);
+            const pid_t steam = beer_steam_client_process_pid();
+            if (steam && s->count < BEER_SNAP_MAX_ENTRIES) {
+                BeerProcEntry *e = &s->entries[s->count++];
+                memset(e, 0, sizeof(*e));
+                e->pid = (u32)steam;
+                e->ppid = 1;
+                snprintf(e->name, sizeof(e->name), "steam.exe");
+            }
         }
         if (flags & 0x4u)                        /* TH32CS_SNAPTHREAD: this process's guest threads */
             s->tcount = (int)beer_guest_thread_ids(s->tids, BEER_SNAP_MAX_THREADS);
