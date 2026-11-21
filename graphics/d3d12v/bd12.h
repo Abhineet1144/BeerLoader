@@ -104,7 +104,7 @@ struct BD12Device {
     int storage_texel_single_alignment;
 
     pthread_mutex_t view_lock;    /* guards every BD12Buffer view cache */
-    pthread_mutex_t va_lock;
+    pthread_rwlock_t va_lock;   /* lookups (every root descriptor, from all recording threads) share it */
     BD12VaEntry *va_table;        /* sorted by va */
     size_t va_count, va_capacity;
 

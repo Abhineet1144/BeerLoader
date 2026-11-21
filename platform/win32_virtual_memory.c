@@ -25,6 +25,21 @@ typedef struct { uintptr_t start, end; int foreign; } BottomUpRange;
 static BottomUpRange *g_ranges;
 static size_t g_range_count, g_range_capacity;
 static pthread_mutex_t g_range_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Everything in [BOTTOM_UP_LOW, g_full_below) is known to be taken, so searches start there instead of walking
+ * every region from the bottom: the list grows over a session (each allocation and each host mapping found in the
+ * way), and a search cost that grew with it made streaming stutter worse the longer a game ran. Lowered when a
+ * region below it is released. */
+static uintptr_t g_full_below = BOTTOM_UP_LOW;
+
+static size_t range_first_ending_above_locked(uintptr_t address)
+{
+    size_t low = 0, high = g_range_count;
+    while (low < high) {
+        const size_t mid = low + (high - low) / 2;
+        if (g_ranges[mid].end <= address) low = mid + 1; else high = mid;
+    }
+    return low;
+}
 
 int beer_vm_bottom_up_enabled(void)
 {
@@ -45,8 +60,16 @@ static void range_insert_locked(uintptr_t start, uintptr_t end, int foreign)
         g_ranges = grown;
         g_range_capacity = capacity;
     }
-    size_t at = 0;
-    while (at < g_range_count && g_ranges[at].start < start) ++at;
+    size_t low = 0, high = g_range_count;                        /* first range starting at or after `start` */
+    while (low < high) {
+        const size_t mid = low + (high - low) / 2;
+        if (g_ranges[mid].start < start) low = mid + 1; else high = mid;
+    }
+    const size_t at = low;
+    /* Keep the list free of overlaps (the search relies on sorted ends): a host mapping recorded as foreign is
+     * clipped at the next known range; a later probe records whatever lies beyond it. */
+    if (at < g_range_count && end > g_ranges[at].start) end = g_ranges[at].start;
+    if (end <= start) return;
     memmove(g_ranges + at + 1, g_ranges + at, (g_range_count - at) * sizeof(*g_ranges));
     g_ranges[at] = (BottomUpRange){ start, end, foreign };
     ++g_range_count;
@@ -76,21 +99,22 @@ void *beer_vm_map_bottom_up(size_t size, size_t alignment, int protection, int e
     if (alignment < 65536) alignment = 65536;
     size = (size + 0xffff) & ~(size_t)0xffff;
     pthread_mutex_lock(&g_range_mutex);
-    uintptr_t candidate = BOTTOM_UP_LOW;
+    /* Advance the known-full mark over ranges that start exactly where coverage ends. */
+    for (size_t i = range_first_ending_above_locked(g_full_below);
+         i < g_range_count && g_ranges[i].start <= g_full_below; ++i)
+        g_full_below = g_ranges[i].end;
+    uintptr_t candidate = g_full_below;
     void *result = MAP_FAILED;
     for (int attempts = 0; attempts < 4096; ++attempts) {
         candidate = (candidate + alignment - 1) & ~(uintptr_t)(alignment - 1);
-        /* Skip known ranges that overlap the candidate (the list is sorted by start). */
-        int moved = 1;
-        while (moved) {
-            moved = 0;
-            for (size_t i = 0; i < g_range_count; ++i) {
-                if (g_ranges[i].start >= candidate + size) break;
-                if (g_ranges[i].end > candidate) {
-                    candidate = (g_ranges[i].end + alignment - 1) & ~(uintptr_t)(alignment - 1);
-                    moved = 1;
-                }
-            }
+        /* Skip known ranges that overlap the candidate. The list is sorted by start and its ranges do not overlap
+         * (each is inserted in a gap), so their ends are sorted too: one forward pass from the first range ending
+         * above the candidate finds the lowest gap. Rescanning from the bottom made each
+         * allocation's cost grow with the number of live regions, under the lock every VirtualAlloc takes. */
+        for (size_t i = range_first_ending_above_locked(candidate); i < g_range_count; ++i) {
+            if (g_ranges[i].start >= candidate + size) break;
+            if (g_ranges[i].end > candidate)
+                candidate = (g_ranges[i].end + alignment - 1) & ~(uintptr_t)(alignment - 1);
         }
         if (candidate + size > BOTTOM_UP_HIGH || candidate + size < candidate) break;
         void *mapped = mmap((void *)candidate, size, protection,
@@ -120,8 +144,14 @@ void beer_vm_unmap_bottom_up(void *base, size_t size)
 {
     const uintptr_t start = (uintptr_t)base;
     pthread_mutex_lock(&g_range_mutex);
-    for (size_t i = 0; i < g_range_count; ++i)
-        if (g_ranges[i].start == start && !g_ranges[i].foreign) {
+    size_t low = 0, high = g_range_count;
+    while (low < high) {
+        const size_t mid = low + (high - low) / 2;
+        if (g_ranges[mid].start < start) low = mid + 1; else high = mid;
+    }
+    for (size_t i = low; i < g_range_count && g_ranges[i].start == start; ++i)
+        if (!g_ranges[i].foreign) {
+            if (start < g_full_below) g_full_below = start > BOTTOM_UP_LOW ? start : BOTTOM_UP_LOW;
             memmove(g_ranges + i, g_ranges + i + 1, (g_range_count - i - 1) * sizeof(*g_ranges));
             --g_range_count;
             break;

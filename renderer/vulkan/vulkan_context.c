@@ -1290,7 +1290,25 @@ void beer_vulkan_context_destroy(void)
     pthread_mutex_unlock(&g_context_lock);
 }
 
+static int host_gpu_info_query(BeerHostGpuInfo *out);
+/* The device and its properties never change, but DXGI QueryVideoMemoryInfo (called every frame by Unreal's RHI
+ * submission thread) fills the adapter description through here: query the driver once. */
 static int host_gpu_info_real(BeerHostGpuInfo *out)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static BeerHostGpuInfo cached;
+    static int have;
+    if (!out) return 0;
+    pthread_mutex_lock(&lock);
+    if (!have) have = host_gpu_info_query(&cached);
+    *out = cached;
+    const int result = have;
+    pthread_mutex_unlock(&lock);
+    if (!result) memset(out, 0, sizeof(*out));
+    return result;
+}
+
+static int host_gpu_info_query(BeerHostGpuInfo *out)
 {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));

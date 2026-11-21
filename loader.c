@@ -7902,6 +7902,40 @@ static u64 steam_user_interface(const char *lower_version)
     return result ? result : impl_SteamUser();
 }
 
+/* In the real Steam client every interface method is its own function. Beer serves many slots from one shared
+ * implementation (steam_vfn_false, ...), so a wrapper that hooks one method by patching its code (unsteam uses
+ * funchook on ISteamRemoteStorage) also captured every other slot sharing it: ISteamUtils::RunFrame, called each
+ * frame by SteamAPI_RunCallbacks, ran unsteam's GetFileNameAndSize with garbage arguments and crashed as soon as a
+ * cloud save existed (Chained Together). Each slot therefore gets its own entry: a 5-byte nop (room for a hook's
+ * jump) and an indirect jump to the slot's implementation. */
+#define BEER_STEAM_SLOT_THUNKS 2048
+u64 beer_steam_slot_targets[BEER_STEAM_SLOT_THUNKS];
+extern const u8 beer_steam_slot_thunks[];
+__asm__(".pushsection .text.beer_steam_slots,\"ax\",@progbits\n"
+        ".balign 16\n"
+        "beer_steam_slot_thunks:\n"
+        ".set beer_steam_slot_index, 0\n"
+        ".rept 2048\n"
+        ".byte 0x0f, 0x1f, 0x44, 0x00, 0x00\n"
+        "jmp *beer_steam_slot_targets+8*beer_steam_slot_index(%rip)\n"
+        ".balign 16, 0xcc\n"
+        ".set beer_steam_slot_index, beer_steam_slot_index + 1\n"
+        ".endr\n"
+        ".popsection\n");
+static void steam_vtab_unique_slots(u64 *vtab, size_t count)
+{
+    static _Atomic size_t used;
+    const size_t first = atomic_fetch_add(&used, count);
+    if (first + count > BEER_STEAM_SLOT_THUNKS) {
+        fprintf(stderr, "[STEAM] out of per-method entry points (%zu needed)\n", first + count);
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        beer_steam_slot_targets[first + i] = vtab[i];
+        vtab[i] = (u64)(uintptr_t)(beer_steam_slot_thunks + 16 * (first + i));
+    }
+}
+
 static void init_steam_fake(void) {
     for (int i = 0; i < STEAM_VTAB_SZ; i++) {
         /* Unsupported Steam methods must not report success without populating
@@ -8001,6 +8035,12 @@ static void init_steam_fake(void) {
      * CSteamID still keys per-user saves. */
     g_steam_user_vtab[1] = (u64)steam_user_logged_on;     /* false unless official mode has a session */
     g_steam_user_vtab[2] = (u64)steam_user_get_steam_id;
+    steam_vtab_unique_slots(g_steam_vtab, STEAM_VTAB_SZ);
+    steam_vtab_unique_slots(g_steam_apps_vtab, STEAM_VTAB_SZ);
+    steam_vtab_unique_slots(g_steam_friends_vtab, STEAM_VTAB_SZ);
+    steam_vtab_unique_slots(g_steam_user_vtab, STEAM_VTAB_SZ);
+    steam_vtab_unique_slots(g_steam_utils_vtab, STEAM_VTAB_SZ);
+    steam_vtab_unique_slots(g_steam_remote_storage_vtab, STEAM_VTAB_SZ);
     g_steam_apps_obj = (u64)g_steam_apps_vtab;
     g_steam_friends_obj = (u64)g_steam_friends_vtab;
     g_steam_user_obj = (u64)g_steam_user_vtab;
@@ -8066,6 +8106,7 @@ static u64 __attribute__((ms_abi)) impl_SteamClient(void)
         g_steam_client_vtab[17] = (u64)sc_get_remote_storage;
         g_steam_client_vtab[18] = (u64)sc_get_unavailable;    /* screenshots */
         g_steam_client_vtab[22] = (u64)sc_true;               /* BShutdownIfAllPipesClosed */
+        steam_vtab_unique_slots(g_steam_client_vtab, 64);
         static u64 object[2];
         object[0] = (u64)g_steam_client_vtab;
         g_steam_client_obj_ptr = object;
@@ -35916,6 +35957,41 @@ static int beer_dispatch_signal_to_seh(int sig, siginfo_t *si, ucontext_t *uc)
 
     u8 context[0x4d0] __attribute__((aligned(16)));
     beer_context_from_ucontext(context, uc);
+    if (getenv("BEER_CRASH_CODE") && guest_dll_addr_is_exec((*record_ptr).address)) {
+        /* Before dispatch: a handler that never returns (an engine crash reporter that exits) would otherwise hide
+         * the fault. The faulting DLL's image is written as it is in memory, so packed DLLs are seen unpacked. */
+        static volatile sig_atomic_t image_dumped;
+        const greg_t *g = uc->uc_mcontext.gregs;
+        fprintf(stderr, "[CRASHCODE] fault 0x%08x at 0x%llx p0=0x%llx p1=0x%llx rax=0x%llx rbx=0x%llx rcx=0x%llx "
+                "rdx=0x%llx rsi=0x%llx rdi=0x%llx rbp=0x%llx rsp=0x%llx r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx "
+                "r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx\n", (*record_ptr).code,
+                (unsigned long long)(*record_ptr).address, (unsigned long long)(*record_ptr).information[0],
+                (unsigned long long)(*record_ptr).information[1], (unsigned long long)g[REG_RAX],
+                (unsigned long long)g[REG_RBX], (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX],
+                (unsigned long long)g[REG_RSI], (unsigned long long)g[REG_RDI], (unsigned long long)g[REG_RBP],
+                (unsigned long long)g[REG_RSP], (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R9],
+                (unsigned long long)g[REG_R10], (unsigned long long)g[REG_R11], (unsigned long long)g[REG_R12],
+                (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15]);
+        for (int index = 0; index < g_guest_dll_count && !image_dumped; ++index) {
+            const GuestDll *dll = &g_guest_dlls[index];
+            const u64 base = (u64)(uintptr_t)dll->image;
+            if (!base || (*record_ptr).address < base || (*record_ptr).address - base >= dll->image_size) continue;
+            image_dumped = 1;
+            char path[96];
+            snprintf(path, sizeof(path), "/tmp/beer-crash-image-%d-%llx.bin", (int)getpid(), (unsigned long long)base);
+            const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd >= 0) {
+                for (u64 done = 0; done < dll->image_size;) {
+                    const ssize_t n = write(fd, dll->image + done, dll->image_size - done);
+                    if (n <= 0) break;
+                    done += (u64)n;
+                }
+                close(fd);
+                fprintf(stderr, "[CRASHCODE] image base 0x%llx size 0x%llx written to %s\n",
+                        (unsigned long long)base, (unsigned long long)dll->image_size, path);
+            }
+        }
+    }
     u64 stack_low = g_current_guest_stack_low ? g_current_guest_stack_low : g_guest_stack_low;
     u64 stack_high = g_current_guest_stack_high ? g_current_guest_stack_high : g_guest_stack_high;
     u32 visited = 0;

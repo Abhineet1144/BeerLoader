@@ -118,7 +118,7 @@ BD12Device *bd12_device_create(void)
         const BeerD3D12DxilCaps caps = { scalar, modern->raw_access_chains, modern->vendor_id, modern->barycentrics };
         beer_d3d12_dxil_set_caps(&caps);
     }
-    pthread_mutex_init(&device->va_lock, NULL);
+    pthread_rwlock_init(&device->va_lock, NULL);
     pthread_mutex_init(&device->submit_barrier_lock, NULL);
     pthread_mutex_init(&device->view_lock, NULL);
     pthread_mutex_init(&device->zero_lock, NULL);
@@ -530,7 +530,7 @@ void bd12_device_destroy(BD12Device *device)
                                   NULL);
     free(device->samplers);
     free(device->va_table);
-    pthread_mutex_destroy(&device->va_lock);
+    pthread_rwlock_destroy(&device->va_lock);
     pthread_mutex_destroy(&device->view_lock);
     free(device);
 }
@@ -1178,13 +1178,13 @@ static size_t va_lower_bound(const BD12Device *device, uint64_t va)
 
 static int va_insert(BD12Device *device, BD12Buffer *buffer)
 {
-    pthread_mutex_lock(&device->va_lock);
+    pthread_rwlock_wrlock(&device->va_lock);
     if (device->va_count == device->va_capacity) {
         size_t capacity = device->va_capacity ? device->va_capacity * 2 : 256;
         BD12VaEntry *grown = realloc(device->va_table,
                                      capacity * sizeof(*grown));
         if (!grown) {
-            pthread_mutex_unlock(&device->va_lock);
+            pthread_rwlock_unlock(&device->va_lock);
             return 0;
         }
         device->va_table = grown;
@@ -1195,13 +1195,13 @@ static int va_insert(BD12Device *device, BD12Buffer *buffer)
             (device->va_count - index) * sizeof(*device->va_table));
     device->va_table[index] = (BD12VaEntry){ buffer->va, buffer->size, buffer };
     ++device->va_count;
-    pthread_mutex_unlock(&device->va_lock);
+    pthread_rwlock_unlock(&device->va_lock);
     return 1;
 }
 
 static void va_remove(BD12Device *device, const BD12Buffer *buffer)
 {
-    pthread_mutex_lock(&device->va_lock);
+    pthread_rwlock_wrlock(&device->va_lock);
     /* Placed resources that alias the same heap offset share one device address, so several entries can have this
      * VA. Checking only the first left a destroyed buffer in the table when another alias sorted ahead of it, and a
      * later root-descriptor lookup returned freed memory (RE9). */
@@ -1213,14 +1213,14 @@ static void va_remove(BD12Device *device, const BD12Buffer *buffer)
         --device->va_count;
         break;
     }
-    pthread_mutex_unlock(&device->va_lock);
+    pthread_rwlock_unlock(&device->va_lock);
 }
 
 BD12Buffer *bd12_va_resolve(BD12Device *device, uint64_t va,
                             VkDeviceSize *offset)
 {
     BD12Buffer *found = NULL;
-    pthread_mutex_lock(&device->va_lock);
+    pthread_rwlock_rdlock(&device->va_lock);
     size_t index = va_lower_bound(device, va);
     if (index < device->va_count && device->va_table[index].va == va)
         ++index;
@@ -1231,7 +1231,7 @@ BD12Buffer *bd12_va_resolve(BD12Device *device, uint64_t va,
             if (offset) *offset = va - entry->va;
         }
     }
-    pthread_mutex_unlock(&device->va_lock);
+    pthread_rwlock_unlock(&device->va_lock);
     return found;
 }
 
