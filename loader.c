@@ -13838,15 +13838,31 @@ static u32 virtual_key_to_scan_code(u32 virtual_key)
         case 0xbe: return 0x34; case 0xbf: return 0x35;
         case 0xc0: return 0x29; case 0xdb: return 0x1a;
         case 0xdc: return 0x2b; case 0xdd: return 0x1b;
-        case 0xde: return 0x28; default: return 0;
+        case 0xde: return 0x28;
+        /* Left/right modifiers (the generic VK_SHIFT/CONTROL/MENU above report the left key's scan code). */
+        case 0xa0: return 0x2a; case 0xa1: return 0x36;
+        case 0xa2: return 0x1d; case 0xa3: return 0xe01d;
+        case 0xa4: return 0x38; case 0xa5: return 0xe038;
+        default: return 0;
     }
 }
 
-static u32 scan_code_to_virtual_key(u32 scan_code)
+/* MAPVK_VSC_TO_VK (distinguish 0) reports the generic VK_SHIFT/VK_CONTROL/VK_MENU for either side;
+ * MAPVK_VSC_TO_VK_EX (distinguish 1) reports VK_LSHIFT/VK_RSHIFT, VK_L/RCONTROL and VK_L/RMENU, the right Ctrl/Alt
+ * by their E0 prefix. Unreal maps WM_KEYDOWN VK_SHIFT through the _EX form and binds only the side-specific keys,
+ * so returning the generic VK there made every Shift/Ctrl/Alt binding (sprint, crouch, ...) dead. */
+static u32 scan_code_to_virtual_key(u32 scan_code, int distinguish)
 {
     u32 extended = scan_code & 0xff00u;
     u32 scan = scan_code & 0xffu;
-    if (extended == 0xe000u) {
+    switch (scan) {
+        case 0x2a: return distinguish ? 0xa0 : 0x10;
+        case 0x36: return distinguish ? 0xa1 : 0x10;
+        case 0x1d: return distinguish ? (extended == 0xe000u ? 0xa3 : 0xa2) : 0x11;
+        case 0x38: return distinguish ? (extended == 0xe000u ? 0xa5 : 0xa4) : 0x12;
+        default: break;
+    }
+    if (extended == 0xe000u && distinguish) {
         switch (scan) {
             case 0x1c: return 0x0d; case 0x1d: return 0xa3;
             case 0x35: return 0x6f; case 0x38: return 0xa5;
@@ -13870,13 +13886,21 @@ impl_MapVirtualKeyW(u32 code, u32 map_type)
 {
     switch (map_type) {
         case 0: return virtual_key_to_scan_code(code) & 0xffu;
-        case 1: return scan_code_to_virtual_key(code & 0xffu);
+        case 1: return scan_code_to_virtual_key(code & 0xffu, 0);
         case 2:
             if ((code >= 'A' && code <= 'Z') ||
                 (code >= '0' && code <= '9')) return code;
             if (code == 0x20) return ' ';
             return 0;
-        case 3: return scan_code_to_virtual_key(code);
+        case 3: {
+            const u32 vk = scan_code_to_virtual_key(code, 1);
+            if (getenv("BEER_INPUT_DIAGNOSTICS") && code < 0x10000) {
+                static u8 seen[0x200];
+                const u32 slot = ((code >> 8) == 0xe0 ? 0x100 : 0) | (code & 0xff);
+                if (!seen[slot]) { seen[slot] = 1; fprintf(stderr, "[INPUT] MapVirtualKey(scan 0x%x, VSC_TO_VK_EX) -> 0x%02x\n", code, vk); }
+            }
+            return vk;
+        }
         case 4: return virtual_key_to_scan_code(code);
         default: return 0;
     }
@@ -23546,7 +23570,7 @@ static int take_window_message(WIN_MSG *message, u32 min, u32 max, int remove)
             if (t_unread_raw_input) { release_raw_input(t_unread_raw_input); t_unread_raw_input = 0; }
             if (id == 0x00ffu) t_unread_raw_input = g_win_messages[index].lParam;
             beer_win32_apply_input_message(g_win_message_keys, id,
-                                            g_win_messages[index].wParam);
+                                            g_win_messages[index].wParam, g_win_messages[index].lParam);
             for (u32 j = i; j + 1 < g_win_message_count; ++j) {
                 u32 to = (g_win_message_head + j) % WIN_MESSAGE_CAPACITY;
                 u32 from = (g_win_message_head + j + 1) % WIN_MESSAGE_CAPACITY;

@@ -87,16 +87,31 @@ int main(void)
     assert(partial_mouse_state[12] == 0x80);
 
     uint8_t queue_keys[256] = {0};
-    beer_win32_apply_input_message(queue_keys, 0x0201, 0);
+    beer_win32_apply_input_message(queue_keys, 0x0201, 0, 0);
     assert(beer_win32_get_key_state(queue_keys, 0x01) == 0x8000);
-    beer_win32_apply_input_message(queue_keys, 0x0202, 0);
+    beer_win32_apply_input_message(queue_keys, 0x0202, 0, 0);
     assert(beer_win32_get_key_state(queue_keys, 0x01) == 0);
-    beer_win32_apply_input_message(queue_keys, 0x0204, 0);
+    beer_win32_apply_input_message(queue_keys, 0x0204, 0, 0);
     assert(beer_win32_get_key_state(queue_keys, 0x02) == 0x8000);
-    beer_win32_apply_input_message(queue_keys, 0x0100, 'E');
+    beer_win32_apply_input_message(queue_keys, 0x0100, 'E', 0);
     assert(beer_win32_get_key_state(queue_keys, 'E') == 0x8000);
-    beer_win32_apply_input_message(queue_keys, 0x0101, 'E');
+    beer_win32_apply_input_message(queue_keys, 0x0101, 'E', 0);
     assert(beer_win32_get_key_state(queue_keys, 'E') == 0);
+    /* Shift/Ctrl/Alt messages carry the generic VK; the side comes from the scan code / extended bit. */
+    beer_win32_apply_input_message(queue_keys, 0x0100, 0x10, 0x00360001);          /* right shift down */
+    assert(beer_win32_get_key_state(queue_keys, 0xa1) == 0x8000);
+    assert(beer_win32_get_key_state(queue_keys, 0xa0) == 0);
+    assert(beer_win32_get_key_state(queue_keys, 0x10) == 0x8000);
+    beer_win32_apply_input_message(queue_keys, 0x0100, 0x10, 0x002a0001);          /* left shift down */
+    beer_win32_apply_input_message(queue_keys, 0x0101, 0x10, 0xc0360001);          /* right shift up */
+    assert(beer_win32_get_key_state(queue_keys, 0xa1) == 0);
+    assert(beer_win32_get_key_state(queue_keys, 0x10) == 0x8000);                   /* left still held */
+    beer_win32_apply_input_message(queue_keys, 0x0101, 0x10, 0xc02a0001);
+    assert(beer_win32_get_key_state(queue_keys, 0x10) == 0);
+    beer_win32_apply_input_message(queue_keys, 0x0100, 0x11, 0x011d0001);          /* right ctrl (E0) */
+    assert(beer_win32_get_key_state(queue_keys, 0xa3) == 0x8000);
+    beer_win32_apply_input_message(queue_keys, 0x0101, 0x11, 0xc11d0001);
+    assert(beer_win32_get_key_state(queue_keys, 0x11) == 0);
 
     assert(!beer_dinput_can_acquire(0, 0x00000005u)); /* foreground/exclusive */
     assert(beer_dinput_can_acquire(1, 0x00000005u));

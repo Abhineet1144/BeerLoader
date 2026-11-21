@@ -283,6 +283,20 @@ User confirmed "works now" after the real local networking backend was enabled.
 - Live-run preference: user handles all inputs as soon as the window opens. Do not automate clicks/keys;
   continue investigating for approximately a minute after launch before checking the attempt.
 
+## Chained Together — sprint (Left Shift) did nothing (2026-11-21)
+
+- Cause (generic, all Unreal games): UE turns WM_KEYDOWN VK_SHIFT/VK_CONTROL/VK_MENU into the side-specific key via
+  `MapVirtualKey(scan, MAPVK_VSC_TO_VK_EX)` and binds only LeftShift/RightShift etc. Beer's scan->VK lookup returned
+  the first VK with that scan code (generic VK_SHIFT 0x10 for 0x2A), and had no entries at all for 0xA0..0xA5, so
+  every Shift/Ctrl/Alt binding (sprint, crouch, ...) was dropped. MAPVK_VSC_TO_VK (type 1) also returned
+  side-specific keys for the right-hand ones where Windows returns the generic VK.
+- Fix: `scan_code_to_virtual_key(code, distinguish)` — type 1 generic, type 3 VK_LSHIFT/VK_RSHIFT, VK_L/RCONTROL,
+  VK_L/RMENU (right Ctrl/Alt by the E0 prefix); VK->scan entries for 0xA0..0xA5. The message-queue key state
+  (`beer_win32_apply_input_message`, now with lParam) also sets the left/right VK from the scan code/extended bit,
+  as Windows' GetKeyState does. Tests added to directinput_format_test.c; `make test-input` passes.
+- `BEER_INPUT_DIAGNOSTICS=1` now also logs `[INPUT] MapVirtualKey(scan 0x2a, VSC_TO_VK_EX) -> 0xa0` once per key.
+- Launched via the manager's own `Manager.launch` with the library entry; the user tests sprint in game.
+
 ## WORK PLAN (read first, every session) — agreed 2026-11-11
 
 **PENDING after 2026-11-13 session (all work since 14bdfde is UNCOMMITTED).** Done that day: RE8 RT ~parity with

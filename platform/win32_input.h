@@ -8,7 +8,8 @@
  * of the newer physical state returned by GetAsyncKeyState. */
 static inline void beer_win32_apply_input_message(uint8_t keys[256],
                                                    uint32_t message,
-                                                   uint64_t wparam)
+                                                   uint64_t wparam,
+                                                   uint64_t lparam)
 {
     uint32_t vk = 0;
     int down = 0;
@@ -40,6 +41,20 @@ static inline void beer_win32_apply_input_message(uint8_t keys[256],
     default: return;
     }
 
+    /* Keyboard messages carry the generic modifier VKs; Windows also tracks which side changed (GetKeyState
+     * VK_LSHIFT/VK_RSHIFT, ...) from the scan code and extended bit in lParam. */
+    if (message != 0x0201 && message != 0x0202 && vk >= 0x10 && vk <= 0x12) {
+        const uint32_t scan = (uint32_t)(lparam >> 16) & 0xffu;
+        const int extended = (int)((lparam >> 24) & 1u);
+        uint32_t side;
+        if (vk == 0x10) side = scan == 0x36 ? 0xa1u : 0xa0u;
+        else if (vk == 0x11) side = extended ? 0xa3u : 0xa2u;
+        else side = extended ? 0xa5u : 0xa4u;
+        keys[side] = down ? 0x80u : 0u;
+        const uint32_t pair = side & ~1u;
+        keys[vk] = ((keys[pair] | keys[pair + 1]) & 0x80u) ? 0x80u : 0u;
+        return;
+    }
     if (vk < 256)
         keys[vk] = down ? 0x80u : 0u;
 }
