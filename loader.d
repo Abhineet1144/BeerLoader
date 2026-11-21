@@ -35,13 +35,13 @@ loader.o: loader.c platform/beer_env.h graphics/d3d11/d3d11_compat.h \
  platform/win32_winhttp.h platform/win32_adapter_info.h \
  platform/win32_registry.inc platform/win32_steam_matchmaking.inc \
  platform/steam_networking_identity.h platform/beer_steam_networking.h \
- platform/win32_wmi.inc platform/win32_wic.inc platform/win32_tsf.h \
- platform/win32_full_path.h platform/win32_sddl.h \
- platform/win32_advapi_misc.inc platform/win32_controls.inc \
- platform/win32_treeview.inc platform/win32_ownerdraw.inc \
- platform/win32_subclass.inc platform/win32_mm_timer.inc \
- platform/win32_process.inc platform/beer_cmd.inc \
- platform/win32_remote.inc platform/win32_d3d9.inc \
+ platform/win32_steam_networking.inc platform/win32_wmi.inc \
+ platform/win32_wic.inc platform/win32_tsf.h platform/win32_full_path.h \
+ platform/win32_sddl.h platform/win32_advapi_misc.inc \
+ platform/win32_controls.inc platform/win32_treeview.inc \
+ platform/win32_ownerdraw.inc platform/win32_subclass.inc \
+ platform/win32_mm_timer.inc platform/win32_process.inc \
+ platform/beer_cmd.inc platform/win32_remote.inc platform/win32_d3d9.inc \
  platform/win32_display_config.inc platform/win32_nvapi.inc \
  platform/../graphics/d3d12v/bd12_cuda.h platform/win32_ngx.inc \
  platform/win32_d3dkmt.inc platform/win32_file_search.inc \
@@ -129,6 +129,7 @@ platform/win32_registry.inc:
 platform/win32_steam_matchmaking.inc:
 platform/steam_networking_identity.h:
 platform/beer_steam_networking.h:
+platform/win32_steam_networking.inc:
 platform/win32_wmi.inc:
 platform/win32_wic.inc:
 platform/win32_tsf.h:

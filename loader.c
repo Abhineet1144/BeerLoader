@@ -248,6 +248,7 @@ static u8    *g_img     = NULL;   /* image base in our VA space    */
 static u64    g_img_size = 0;     /* loaded PE OptionalHeader.SizeOfImage */
 static int g_process_elevated;
 static int beer_security_init(const u8 *image, size_t size);
+static void beer_stacktop_watch_arm(u64 high);   /* diagnostic, BEER_STACKTOP_WATCH */
 static int beer_security_file_level(const char *path);
 static int beer_process_elevated(void);
 static u64    g_delta   = 0;      /* relocation delta              */
@@ -4113,7 +4114,10 @@ typedef struct HeapGuardEntry {
     struct HeapGuardEntry *next;
 } HeapGuardEntry;
 
-#define HEAP_GUARD_BUCKETS 4096
+/* Games keep millions of heap blocks alive (Where Winds Meet: several million while loading). With 4096 buckets each
+ * HeapFree walked chains of hundreds of entries under a striped lock: 38% of all CPU time during WWM's loading.
+ * 2^21 buckets (16 MiB of zero-initialised .bss, touched only where used) keep the chains a few entries long. */
+#define HEAP_GUARD_BUCKETS (1u << 21)
 static HeapGuardEntry *g_heap_guard_table[HEAP_GUARD_BUCKETS];
 /* The size table is striped: one lock per group of buckets, chosen by the pointer's hash, so threads allocating
  * at the same time do not serialise on one mutex (8 shader-compiler threads did, in Where Winds Meet). */
@@ -4124,7 +4128,7 @@ static size_t heap_guard_hash(void *p)
 {
     u64 v = (u64)(uintptr_t)p;
     v ^= v >> 33; v *= 0xff51afd7ed558ccdULL; v ^= v >> 33;
-    return (size_t)(v % HEAP_GUARD_BUCKETS);
+    return (size_t)(v & (HEAP_GUARD_BUCKETS - 1));
 }
 static pthread_mutex_t *heap_guard_lock(void *p) { return &g_heap_guard_locks[heap_guard_hash(p) % HEAP_GUARD_LOCKS]; }
 
@@ -5285,15 +5289,22 @@ typedef struct {
 
 static u64 fill_windows_version(WIN_OSVERSIONINFOEXW *info)
 {
+    if (getenv("BEER_VERSION_DIAGNOSTICS"))
+        fprintf(stderr, "[VERSION] RtlGetVersion/GetVersionEx(info=%p size=%u) tid %ld caller 0x%llx\n", (void *)info,
+                info ? info->size : 0, (long)syscall(SYS_gettid), (unsigned long long)g_dispatch_incoming_return);
     if (!info || info->size < 276) return 87;
-    u32 size = info->size;
-    memset(info, 0, size < sizeof(*info) ? size : sizeof(*info));
+    /* Like RtlGetVersion: the extended fields only for exactly sizeof(RTL_OSVERSIONINFOEXW) (284); any other size
+     * gets the basic 276-byte RTL_OSVERSIONINFOW. A caller that left the size uninitialised (WWM's Discord SDK
+     * passes 32765) must not have more than that written: 284 bytes overran its stack cookie. */
+    const u32 size = info->size;
+    const size_t filled = size == sizeof(*info) ? sizeof(*info) : 276;
+    memset(info, 0, filled);
     info->size = size;
     info->major = 10;
     info->minor = 0;
     info->build = 19045;
     info->platform = 2;
-    if (size >= sizeof(*info)) info->product_type = 1;
+    if (filled == sizeof(*info)) info->product_type = 1;
     return 0;
 }
 static u64 __attribute__((ms_abi)) impl_RtlGetVersion(WIN_OSVERSIONINFOEXW *info)
@@ -6586,6 +6597,8 @@ impl_SteamInternal_CreateInterface(const char *version)
         return steam_input_offline_interface();
     if (!strcmp(lower, "steamnetworkingsockets012"))
         return steam_networking_sockets_interface();
+    if (!strcmp(lower, "steamnetworkingutils004"))
+        return steam_networking_utils_interface();
     /* Networking, matchmaking, server browser, parties and game search have no backend in Beer. The Steam
      * client always hands these interfaces out and its methods then report "nothing" (invalid handle or
      * API call, k_EResultNone, false, 0, no lobbies or servers); Valve's SteamAPI_Init fails outright when
@@ -6680,6 +6693,7 @@ static u64 __attribute__((ms_abi)) impl_Steam_BGetCallback(u32 pipe, void *messa
 {
     /* A real steam_api64.dll pumps every callback through this pipe, so Beer's posted events (GetAuthSessionTicket,
      * GetAuthTicketForWebApi responses, ...) are delivered here as well as through Beer's own RunCallbacks. */
+    if (pipe == 1) steam_networking_pump();                 /* connection status changes (platform/win32_steam_networking.inc) */
     if (pipe == 1 && t_steam_event_pending && steam_event_next_callback(message)) { t_steam_callback_source = 2; return 1; }
     if (pipe == 1 && steam_client_next_callback(message)) { t_steam_callback_source = 1; return 1; }
     if (pipe == 1 && steam_event_next_callback(message)) { t_steam_callback_source = 2; return 1; }
@@ -7235,6 +7249,7 @@ static u64 __attribute__((ms_abi))
 impl_SteamAPI_RunCallbacks(void)
 {
     steam_mms_facade_pump();
+    steam_networking_pump();
     steam_callbacks_deliver();
     BeerSteamDispatch pending[BEER_STEAM_CALL_CAPACITY];
     size_t count = 0;
@@ -16428,6 +16443,7 @@ static void *win_thread_trampoline(void *p) {
         g_current_guest_stack_low = low;
         g_current_guest_stack_high = high;
         guest_top = high;
+        beer_stacktop_watch_arm(high);
     }
     u64 exit_code = beer_call_thread_entry(t->fn, t->arg, guest_top);
     pthread_mutex_lock(&t->mtx);
@@ -17064,6 +17080,8 @@ static u8 g_fh_used[MAX_FHANDLES];
 static int g_fh_lock_fd[MAX_FHANDLES];
 static char g_fh_guest_path[MAX_FHANDLES][PATH_MAX];
 static char g_fh_host_path[MAX_FHANDLES][PATH_MAX];
+/* Opened with FILE_FLAG_OVERLAPPED and a regular file: its OVERLAPPED reads may complete asynchronously. */
+static u8 g_fh_async[MAX_FHANDLES];
 static pthread_mutex_t g_fh_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static int save_diagnostics_enabled(void)
@@ -17102,6 +17120,7 @@ static u64 fh_alloc(int fd, const char *guest_path, const char *host_path) {
         if (g_fh_used[id]) continue;
         g_fh_used[id] = 1;
         g_fh_fd[id] = fd;
+        g_fh_async[id] = 0;
         snprintf(g_fh_guest_path[id], sizeof(g_fh_guest_path[id]), "%s",
                  guest_path ? guest_path : "");
         snprintf(g_fh_host_path[id], sizeof(g_fh_host_path[id]), "%s",
@@ -17113,6 +17132,11 @@ static u64 fh_alloc(int fd, const char *guest_path, const char *host_path) {
     pthread_mutex_unlock(&g_fh_mtx);
     g_last_error = 4; /* ERROR_TOO_MANY_OPEN_FILES */
     return INVALID_HANDLE_VALUE64;
+}
+static int fh_is_async(u64 h)
+{
+    if (h < 0x70000001ULL || h >= 0x70000000ULL + MAX_FHANDLES) return 0;
+    return __atomic_load_n(&g_fh_async[(u32)(h - 0x70000000ULL)], __ATOMIC_RELAXED);
 }
 static int fh_get(u64 h) {
     if (h < 0x70000001ULL || h >= 0x70000000ULL + MAX_FHANDLES) return -1;
@@ -17143,7 +17167,9 @@ static int fh_paths(u64 h, char *guest, size_t guest_size,
 static void iocp_forget_file(u64 h);
 static int file_has_iocp(u64 file);
 static u8 file_notify_flags(u64 file);
+static int beer_async_read_cancel(u64 handle, void *overlapped);
 static int fh_close(u64 h) {
+    if (fh_is_async(h)) beer_async_read_cancel(h, NULL);       /* queued reads end with STATUS_CANCELLED, as on close */
     if (h < 0x70000001ULL || h >= 0x70000000ULL + MAX_FHANDLES) return 0;
     u32 id = (u32)(h - 0x70000000ULL);
     pthread_mutex_lock(&g_fh_mtx);
@@ -17835,6 +17861,11 @@ static u64 create_file_a(const char *name, u32 access, u32 share, u64 sa, u32 cr
     }
     u64 handle = fh_alloc(fd, name, host_path);
     if (handle == INVALID_HANDLE_VALUE64) close(fd);
+    else if (attrs & 0x40000000u) {                             /* FILE_FLAG_OVERLAPPED */
+        struct stat opened;
+        if (fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode) && !getenv("BEER_SYNC_FILE_IO"))
+            __atomic_store_n(&g_fh_async[(u32)(handle - 0x70000000ULL)], 1, __ATOMIC_RELAXED);
+    }
     else g_last_error = (creation == 4 && !(flags & O_EXCL)) ? 0 : 0;
     if (getenv("BEER_FILE_DIAGNOSTICS"))
         fprintf(stderr, "[FILE] CreateFile guest=%s host=%s access=0x%x "
@@ -19030,6 +19061,168 @@ static int beer_notify_addr_change_self_test(void)
     return impl_CloseHandle(handle) != 0;
 }
 
+/* ---- Asynchronous OVERLAPPED reads of files opened with FILE_FLAG_OVERLAPPED ----
+ * As on Windows: a read whose data is already cached completes at once (TRUE, plus a completion packet unless
+ * FILE_SKIP_COMPLETION_PORT_ON_SUCCESS); otherwise ReadFile returns FALSE with ERROR_IO_PENDING, Internal stays
+ * STATUS_PENDING, and the read runs on an I/O worker. Many requests are then in flight at once, so the block layer
+ * can order them (on a hard disk this replaces one seek-bound read at a time per game thread). Completion stores
+ * InternalHigh then Internal (an NTSTATUS), signals hEvent and queues the packet on the handle's completion port
+ * (unless hEvent's low bit is set). BEER_SYNC_FILE_IO=1 keeps every read synchronous. */
+typedef struct BeerAsyncRead {
+    struct BeerAsyncRead *next;
+    u64 handle;
+    int fd;                                       /* a duplicate: the guest may close its handle meanwhile */
+    void *buffer;
+    u32 length;
+    u64 offset;
+    WIN_OVERLAPPED *overlapped;
+    int cancelled;
+} BeerAsyncRead;
+static BeerAsyncRead *g_async_head, *g_async_tail;
+static pthread_mutex_t g_async_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_async_work = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_async_done = PTHREAD_COND_INITIALIZER;   /* any completion (GetOverlappedResult waits) */
+static int g_async_workers;
+#define BEER_ASYNC_WORKERS 16
+
+static void iocp_post(int idx, u64 key, u64 overlapped, u32 bytes, u32 status);
+/* Completion packet for an operation that completed asynchronously: always queued (skip-on-success only concerns
+ * operations that completed inline). `error` is the Win32 code GetQueuedCompletionStatus reports. */
+static void iocp_file_post(u64 file, u64 overlapped, u32 bytes, u32 error)
+{
+    int port = -1;
+    u64 key = 0;
+    pthread_mutex_lock(&g_iocp_table_mtx);
+    for (int i = 0; i < g_iocp_assoc_count; ++i)
+        if (g_iocp_assoc[i].handle == file && g_iocp_assoc[i].port >= 0) {
+            port = g_iocp_assoc[i].port; key = g_iocp_assoc[i].key;
+            break;
+        }
+    pthread_mutex_unlock(&g_iocp_table_mtx);
+    if (port >= 0) iocp_post(port, key, overlapped, bytes, error);
+}
+
+static void beer_async_read_complete(BeerAsyncRead *r, ssize_t got, int error)
+{
+    u32 status = 0, win32 = 0;
+    if (r->cancelled) { status = 0xC0000120u; win32 = 995; got = 0; }              /* STATUS_CANCELLED */
+    else if (got < 0) { status = error == EIO ? 0xC0000185u : 0xC0000001u; win32 = error == EIO ? 1117 : 31; got = 0; }
+    else if (got == 0 && r->length) { status = 0xC0000011u; win32 = 38; }         /* STATUS_END_OF_FILE */
+    WIN_OVERLAPPED *ov = r->overlapped;
+    __atomic_store_n(&ov->InternalHigh, (u64)got, __ATOMIC_RELAXED);
+    __atomic_store_n(&ov->Internal, (u64)status, __ATOMIC_RELEASE);
+    const u64 event = ov->hEvent;
+    if (event & ~1ull) impl_SetEvent(event & ~1ull);
+    if (!(event & 1)) iocp_file_post(r->handle, (u64)(uintptr_t)ov, (u32)got, win32);
+    pthread_mutex_lock(&g_async_mtx);
+    pthread_cond_broadcast(&g_async_done);
+    pthread_mutex_unlock(&g_async_mtx);
+}
+
+static void *beer_async_read_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_async_mtx);
+        while (!g_async_head) pthread_cond_wait(&g_async_work, &g_async_mtx);
+        BeerAsyncRead *r = g_async_head;
+        g_async_head = r->next;
+        if (!g_async_head) g_async_tail = NULL;
+        const int cancelled = r->cancelled;
+        pthread_mutex_unlock(&g_async_mtx);
+        ssize_t got = 0;
+        int error = 0;
+        if (!cancelled) {
+            size_t done = 0;
+            while (done < r->length) {                             /* a regular file: short only at the end */
+                const ssize_t n = pread(r->fd, (u8 *)r->buffer + done, r->length - done, (off_t)(r->offset + done));
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) { if (n < 0 && !done) { got = -1; error = errno; } break; }
+                done += (size_t)n;
+            }
+            if (got >= 0) got = (ssize_t)done;
+        }
+        close(r->fd);
+        beer_async_read_complete(r, got, error);
+        free(r);
+    }
+    return NULL;
+}
+
+/* 1 when the read was queued (the caller returns ERROR_IO_PENDING), 0 when the caller must complete it inline. */
+static int beer_async_read_submit(u64 handle, int fd, void *buffer, u32 length, u64 offset, WIN_OVERLAPPED *ov)
+{
+    BeerAsyncRead *r = calloc(1, sizeof(*r));
+    if (!r) return 0;
+    r->fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+    if (r->fd < 0) { free(r); return 0; }
+    r->handle = handle; r->buffer = buffer; r->length = length; r->offset = offset; r->overlapped = ov;
+    __atomic_store_n(&ov->InternalHigh, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ov->Internal, 0x103, __ATOMIC_RELEASE);                    /* STATUS_PENDING */
+    if (ov->hEvent & ~1ull) impl_ResetEvent(ov->hEvent & ~1ull);                 /* ReadFile resets the event */
+    pthread_mutex_lock(&g_async_mtx);
+    while (g_async_workers < BEER_ASYNC_WORKERS) {
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, beer_async_read_worker, NULL) != 0) break;
+        pthread_detach(worker);
+        ++g_async_workers;
+    }
+    if (!g_async_workers) {
+        pthread_mutex_unlock(&g_async_mtx);
+        close(r->fd);
+        free(r);
+        return 0;
+    }
+    if (g_async_tail) g_async_tail->next = r; else g_async_head = r;
+    g_async_tail = r;
+    pthread_cond_signal(&g_async_work);
+    pthread_mutex_unlock(&g_async_mtx);
+    return 1;
+}
+
+/* CancelIo(Ex) / CloseHandle: queued (not yet started) reads of the handle end with STATUS_CANCELLED. A read
+ * already running completes normally, as an in-flight request may on Windows. Returns 1 when any was found. */
+static int beer_async_read_cancel(u64 handle, void *overlapped)
+{
+    int any = 0;
+    pthread_mutex_lock(&g_async_mtx);
+    for (BeerAsyncRead *r = g_async_head; r; r = r->next)
+        if (r->handle == handle && (!overlapped || (void *)r->overlapped == overlapped)) { r->cancelled = 1; any = 1; }
+    pthread_mutex_unlock(&g_async_mtx);
+    return any;
+}
+
+/* Waits until an asynchronous read's OVERLAPPED leaves STATUS_PENDING; 1 when it did. */
+static int beer_async_read_wait(WIN_OVERLAPPED *ov, u32 timeout_ms)
+{
+    if (__atomic_load_n(&ov->Internal, __ATOMIC_ACQUIRE) != 0x103) return 1;
+    if (!timeout_ms) return 0;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    if (timeout_ms != 0xFFFFFFFFu) {
+        deadline.tv_sec += timeout_ms / 1000;
+        deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    }
+    pthread_mutex_lock(&g_async_mtx);
+    int done;
+    while (!(done = __atomic_load_n(&ov->Internal, __ATOMIC_ACQUIRE) != 0x103)) {
+        if (timeout_ms == 0xFFFFFFFFu) {
+            /* Bounded waits: an OVERLAPPED completed by another path (a pipe, a socket) does not broadcast here. */
+            struct timespec step;
+            clock_gettime(CLOCK_REALTIME, &step);
+            step.tv_nsec += 50000000L;
+            if (step.tv_nsec >= 1000000000L) { step.tv_sec++; step.tv_nsec -= 1000000000L; }
+            pthread_cond_timedwait(&g_async_done, &g_async_mtx, &step);
+        } else if (pthread_cond_timedwait(&g_async_done, &g_async_mtx, &deadline) == ETIMEDOUT) {
+            done = __atomic_load_n(&ov->Internal, __ATOMIC_ACQUIRE) != 0x103;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_async_mtx);
+    return done;
+}
+
 /* ---- Overlapped I/O on named pipes ----
  * A pipe read issued with an OVERLAPPED that finds no data is left pending (ERROR_IO_PENDING) instead of blocking the
  * thread; GetOverlappedResult(Ex) completes it once data arrives, reports ERROR_IO_INCOMPLETE until then, and
@@ -19083,11 +19276,17 @@ impl_GetOverlappedResultEx(u64 h, WIN_OVERLAPPED *ov, u32 *transferred, u32 time
         while ((state = beer_pending_poll(ov, 1000)) == 0) { }
     }
     if (state == 0) { if (transferred) *transferred = 0; g_last_error = timeout_ms ? 258u : 996u; return 0; }   /* WAIT_TIMEOUT / ERROR_IO_INCOMPLETE */
+    if (state < 0 && __atomic_load_n(&ov->Internal, __ATOMIC_ACQUIRE) == 0x103u && !beer_async_read_wait(ov, timeout_ms)) {
+        if (transferred) *transferred = 0;
+        g_last_error = timeout_ms ? 258u : 996u;
+        return 0;
+    }
     if (ov->Internal == 0x103u) { if (transferred) *transferred = 0; g_last_error = 996u; return 0; }
     if (transferred) *transferred = (u32)ov->InternalHigh;
     if (ov->Internal != 0) {
         /* NTSTATUS from a pipe read, or the Win32 error an I/O completion stored. */
-        g_last_error = ov->Internal == 0xC000014Bu ? 109u : ov->Internal < 0x10000u ? (u32)ov->Internal : 1117u;
+        g_last_error = ov->Internal == 0xC000014Bu ? 109u : ov->Internal == 0xC0000011u ? 38u :
+                       ov->Internal == 0xC0000120u ? 995u : ov->Internal < 0x10000u ? (u32)ov->Internal : 1117u;
         return 0;
     }
     g_last_error = 0;
@@ -19100,6 +19299,7 @@ static u64 __attribute__((ms_abi))
 impl_CancelIoEx(u64 h, WIN_OVERLAPPED *ov)
 {
     int any = beer_is_socket(h) ? wsa_async_cancel(h, (u64 *)ov) : 0;
+    if (fh_is_async(h) && beer_async_read_cancel(h, ov)) any = 1;
     pthread_mutex_lock(&g_pending_mtx);
     for (size_t i = 0; i < 64; ++i)
         if (g_pending_reads[i].overlapped && g_pending_reads[i].handle == h && (!ov || g_pending_reads[i].overlapped == ov)) {
@@ -19310,6 +19510,21 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
          * synchronous for now, but its result and event follow the completed
          * Windows OVERLAPPED contract. */
         u64 offset = ((u64)overlapped->OffsetHigh << 32) | overlapped->Offset;
+        if (fh_is_async(h) && offset <= (u64)INT64_MAX && n) {
+            /* Data already in the page cache completes inline, as a cached read usually does on Windows. */
+            struct iovec vector = { buf, n };
+            ssize_t cached;
+            do { cached = preadv2(fd, &vector, 1, (off_t)offset, RWF_NOWAIT); } while (cached < 0 && errno == EINTR);
+            struct stat now;
+            const int complete = cached == (ssize_t)n ||
+                                 (cached >= 0 && fstat(fd, &now) == 0 && offset + (u64)cached >= (u64)now.st_size);
+            if (!complete && beer_async_read_submit(h, fd, buf, n, offset, overlapped)) {
+                if (done) *done = 0;
+                g_last_error = 997;                                         /* ERROR_IO_PENDING */
+                return 0;
+            }
+            received = complete ? cached : pread(fd, buf, n, (off_t)offset);
+        } else
         received = offset <= (u64)INT64_MAX
             ? pread(fd, buf, n, (off_t)offset) : -1;
         overlapped->Internal = received < 0 ? (u64)(u32)errno : 0;
@@ -19801,11 +20016,15 @@ impl_GetFileAttributesA(const char *path)
         stat(host_path, &st) < 0) {
         /* Windows distinguishes a missing file (2) from a missing directory on the way to it (3). */
         g_last_error = 2;
-        char *slash = path ? strrchr(host_path, '/') : NULL;
+        const int resolved = path && resolve_windows_host_path(path, host_path, sizeof(host_path));
+        char *slash = resolved ? strrchr(host_path, '/') : NULL;
         if (slash && slash != host_path) {
             *slash = 0;
             if (stat(host_path, &st) < 0) g_last_error = 3;
         }
+        if (!resolved && path) g_last_error = 3;                 /* not a path Beer can map: no such directory */
+        if (getenv("BEER_FILE_DIAGNOSTICS"))
+            fprintf(stderr, "[FILE] GetFileAttributes(%s) -> INVALID (error %u)\n", path ? path : "(null)", g_last_error);
         return 0xFFFFFFFF;
     }
     u32 attr = S_ISDIR(st.st_mode) ? 0x10u : 0x20u;
@@ -34784,11 +35003,14 @@ static __thread sig_atomic_t g_delivering_vectored_exception;
  * language handler with EXCEPTION_UNWINDING (EXCEPTION_TARGET_UNWIND at the
  * target frame) and finally restore the unwound context at the target. This is
  * what C `longjmp` and the C++ catch machinery rely on. */
-/* beer_call_consolidate_asm(ctx=rcx, callback=rdx, record=r8): STATUS_UNWIND_CONSOLIDATE. Runs
- * `ULONG64 callback(EXCEPTION_RECORD *)` with the unwound frame's registers and stack (the catch-block runner of
- * the C++ runtime needs them) and returns its result, the address where execution resumes. Host registers and
- * the host stack pointer are restored afterwards. */
-extern u64 __attribute__((ms_abi)) beer_call_consolidate_asm(u8 *ctx, u64 callback, void *record);
+/* beer_call_consolidate_asm(ctx=rcx, callback=rdx, record=r8, stack=r9): STATUS_UNWIND_CONSOLIDATE. Runs
+ * `ULONG64 callback(EXCEPTION_RECORD *)` with the unwound frame's nonvolatile registers and returns its result, the
+ * address where execution resumes. Like Windows' RtlRestoreContext, the callback runs on the stack BELOW the frames
+ * being unwound (`stack`, the deepest live guest stack pointer): the C++ runtime's catch-block runner destroys the
+ * exception object, which lives in the thrower's frame, only after the catch block returns, so that frame must stay
+ * intact until then. With stack = 0 the unwound frame's own stack is used. Host registers and the host stack pointer
+ * are restored afterwards. */
+extern u64 __attribute__((ms_abi)) beer_call_consolidate_asm(u8 *ctx, u64 callback, void *record, u64 stack);
 __asm__(
 ".pushsection .text\n"
 ".global beer_call_consolidate_asm\n"
@@ -34802,12 +35024,15 @@ __asm__(
 "    push %r13\n"
 "    push %r14\n"
 "    push %r15\n"
-"    mov %rsp, %r9\n"                 /* host rsp */
+"    mov %rsp, %r10\n"                /* host rsp */
 "    mov %rcx, %rax\n"                /* ctx */
-"    mov 0x98(%rax), %rsp\n"          /* unwound frame's rsp */
+"    test %r9, %r9\n"
+"    jnz 1f\n"
+"    mov 0x98(%rax), %r9\n"           /* no deeper stack given: the unwound frame's rsp */
+"1:  mov %r9, %rsp\n"
 "    and $-16, %rsp\n"
 "    sub $0x50, %rsp\n"
-"    mov %r9, 0x40(%rsp)\n"           /* host rsp, kept on the guest stack */
+"    mov %r10, 0x40(%rsp)\n"          /* host rsp, kept on the guest stack */
 "    mov 0x90(%rax), %rbx\n"
 "    mov 0xa0(%rax), %rbp\n"
 "    mov 0xa8(%rax), %rsi\n"
@@ -35133,6 +35358,11 @@ beer_rtl_unwind_helper(u8 *ctx, u64 target_frame, u64 target_ip,
     u8 current[0x4d0] __attribute__((aligned(16)));
     u8 next[0x4d0] __attribute__((aligned(16)));
     memcpy(current, ctx, sizeof(current));
+    /* The deepest live guest stack pointer: the RtlUnwindEx caller's, or the exception context's when the caller
+     * runs on the host-call stack. A consolidation callback runs below it (beer_call_consolidate_asm). */
+    u64 deep_rsp = *(u64 *)(ctx + 0x98);
+    if (stack_high > stack_low && (deep_rsp < stack_low || deep_rsp + 8 > stack_high))
+        deep_rsp = t_seh_exception_ctx ? *(u64 *)(t_seh_exception_ctx + 0x98) : 0;
     if (t_seh_exception_ctx && stack_high > stack_low) {
         const u64 start_rsp = *(u64 *)(ctx + 0x98);
         /* Only when the unwind targets a guest frame: a handler that unwinds to a frame of its own on the host
@@ -35248,7 +35478,16 @@ beer_rtl_unwind_helper(u8 *ctx, u64 target_frame, u64 target_ip,
                 record->information[0]) {
                 /* The C++ runtime's _UnwindNestedFrames: the callback runs the catch block and returns the
                  * address to continue at. */
-                const u64 resume = beer_call_consolidate_asm(current, record->information[0], record);
+                /* 0x1000 below the deepest live frame leaves the dispatcher's records (CONTEXT, EXCEPTION_RECORD)
+                 * that Beer keeps under the exception context alone. */
+                u64 below = deep_rsp > 0x2000 ? deep_rsp - 0x1000 : 0;
+                if (below && (below >= *(u64 *)(current + 0x98) ||
+                              (stack_high > stack_low && (below < stack_low + 0x10000 || below >= stack_high))))
+                    below = 0;                                     /* not below the target on this stack */
+                if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
+                    fprintf(stderr, "[UNWIND] consolidation callback on stack 0x%lx (target frame rsp 0x%lx)\n",
+                            below ? below : *(u64 *)(current + 0x98), *(u64 *)(current + 0x98));
+                const u64 resume = beer_call_consolidate_asm(current, record->information[0], record, below);
                 if (getenv("BEER_EXCEPTION_DIAGNOSTICS"))
                     fprintf(stderr, "[UNWIND] consolidation callback %p returned resume address 0x%lx\n",
                             (void *)(uintptr_t)record->information[0], resume);
@@ -36134,12 +36373,56 @@ static u64 g_hw_watches[4];
 static int g_hw_watch_count;
 static _Atomic(int) g_hw_watch_hits;
 
+/* Diagnostic BEER_STACKTOP_WATCH=<hex offset>: every guest thread created with its own stack watches writes to
+ * (stack top - offset) with a hardware watchpoint on itself (other threads' writes are not seen). For stack-cookie
+ * failures at a fixed distance from the stack top. */
+static __thread u64 t_stacktop_watch;
+static _Atomic(int) g_stacktop_watch_hits;
+static void beer_stacktop_watch_arm(u64 high)
+{
+    static u64 offset = (u64)-1;
+    if (offset == (u64)-1) offset = getenv("BEER_STACKTOP_WATCH") ? strtoull(getenv("BEER_STACKTOP_WATCH"), NULL, 16) : 0;
+    if (!offset) return;
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_BREAKPOINT;
+    attr.size = sizeof(attr);
+    attr.bp_type = HW_BREAKPOINT_W;
+    attr.bp_addr = high - offset;
+    attr.bp_len = HW_BREAKPOINT_LEN_8;
+    attr.sample_period = 1;
+    attr.sigtrap = 1;
+    attr.sig_data = 99;
+    attr.remove_on_exec = 1;                       /* required with sigtrap */
+    attr.exclude_kernel = 1;
+    attr.exclude_hv = 1;
+    if (syscall(SYS_perf_event_open, &attr, 0, -1, -1, PERF_FLAG_FD_CLOEXEC) >= 0) t_stacktop_watch = high - offset;
+    else fprintf(stderr, "[STACKWATCH] perf_event_open: %s\n", strerror(errno));
+}
+
 static int beer_hw_breakpoint_hit(siginfo_t *si, ucontext_t *uc)
 {
     if (si->si_code != TRAP_PERF) return 0;
     u64 at = (u64)uc->uc_mcontext.gregs[REG_RIP];
     u64 perf_data;                    /* kernel siginfo: _sigfault._perf._data follows si_addr */
     memcpy(&perf_data, (const char *)&si->si_addr + sizeof(void *), sizeof(perf_data));
+    if (perf_data == 99) {
+        /* BEER_STACKTOP_WATCH_VALUE=<hex>: report only writes that leave this value. */
+        static int have_value = -1;
+        static u64 value;
+        if (have_value < 0) {
+            const char *v = getenv("BEER_STACKTOP_WATCH_VALUE");
+            have_value = v && *v;
+            if (have_value) value = strtoull(v, NULL, 16);
+        }
+        if (have_value && *(const u64 *)(uintptr_t)t_stacktop_watch != value) return 1;
+        if (atomic_fetch_add(&g_stacktop_watch_hits, 1) >= 4000) return 1;
+        greg_t *r = uc->uc_mcontext.gregs;
+        fprintf(stderr, "[STACKWATCH] tid %ld 0x%llx := 0x%llx at rip 0x%llx (rsp 0x%llx)\n", (long)syscall(SYS_gettid),
+                (unsigned long long)t_stacktop_watch, (unsigned long long)*(const u64 *)(uintptr_t)t_stacktop_watch,
+                (unsigned long long)at, (unsigned long long)r[REG_RSP]);
+        return 1;
+    }
     if (perf_data >= 100 && perf_data < 100 + (u64)g_hw_watch_count) {
         if (atomic_fetch_add(&g_hw_watch_hits, 1) >= 32) return 1;
         greg_t *r = uc->uc_mcontext.gregs;

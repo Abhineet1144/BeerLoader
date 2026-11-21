@@ -10,52 +10,7 @@ static _Atomic(int) g_steam_mms_started;
 #include "steam_networking_identity.h"
 #include "beer_steam_networking.h"
 
-static u64 __attribute__((ms_abi)) steam_networking_listen(u64 self, s32 port, s32 count, const void *options)
-    { (void)self; return beer_steam_networking_listen(port, count, options); }
-static u64 __attribute__((ms_abi)) steam_networking_close_listener(u64 self, u32 h)
-    { (void)self; return beer_steam_networking_close_listener(h); }
-static u64 __attribute__((ms_abi)) steam_networking_poll_group(u64 self)
-    { (void)self; return beer_steam_networking_poll_group(); }
-static u64 __attribute__((ms_abi)) steam_networking_destroy_group(u64 self, u32 h)
-    { (void)self; return beer_steam_networking_destroy_poll_group(h); }
-static u64 __attribute__((ms_abi)) steam_networking_set_group(u64 self, u32 c, u32 g)
-    { (void)self; return beer_steam_networking_set_poll_group(c, g); }
-static u64 __attribute__((ms_abi)) steam_networking_receive_group(u64 self, u32 g, void **out, s32 count)
-    { (void)self; return (u64)(s64)beer_steam_networking_receive_poll_group(g, out, count); }
-
-static u64 __attribute__((ms_abi)) steam_networking_get_identity(u64 self, void *out)
-{
-    (void)self;
-    u64 id = g_steam_api_official && steam_official_session() ? beer_steam_session_steamid() : 0;
-    int ok = beer_steam_networking_identity(out, id);
-    if (getenv("BEER_STEAM_DIAGNOSTICS"))
-        fprintf(stderr, "[STEAM-NET] GetIdentity -> %d\n", ok);
-    return (u64)ok;
-}
-
-static u64 steam_networking_sockets_interface(void)
-{
-    static u64 vtable[64];
-    static u64 object;
-    if (!object) {
-        for (size_t i = 0; i < sizeof(vtable) / sizeof(*vtable); ++i)
-            vtable[i] = (u64)(uintptr_t)impl_steam_offline_noop;
-        /* ISteamNetworkingSockets012 slot 21; session identity is independent
-         * of whether an optional local transport is installed. */
-        vtable[21] = (u64)(uintptr_t)steam_networking_get_identity;
-        if (g_steam_api_official && steam_official_session() &&
-            beer_steam_networking_start(beer_steam_session_steamid())) {
-            vtable[2] = (u64)(uintptr_t)steam_networking_listen;
-            vtable[6] = (u64)(uintptr_t)steam_networking_close_listener;
-            vtable[24] = (u64)(uintptr_t)steam_networking_poll_group;
-            vtable[25] = (u64)(uintptr_t)steam_networking_destroy_group;
-            vtable[26] = (u64)(uintptr_t)steam_networking_set_group;
-            vtable[27] = (u64)(uintptr_t)steam_networking_receive_group;
-        }
-        object = (u64)(uintptr_t)vtable;
-    }
-    return (u64)(uintptr_t)&object;
-}
+#include "win32_steam_networking.inc"
 
 /* Starts matchmaking for the signed-in session and tells Steam the app is running, as the Steam client does
  * when a game initializes Steamworks. */
@@ -132,12 +87,26 @@ MMS_FN mm_member_count(u64 self, u64 lobby) { (void)self; return (u64)(s64)beer_
 MMS_FN mm_member_by_index(u64 self, u64 *ret, u64 lobby, s32 index)
     { (void)self; if (ret) *ret = beer_mms_member_by_index(lobby, index); return (u64)(uintptr_t)ret; }
 MMS_FN mm_lobby_data(u64 self, u64 lobby, const char *key)
-    { (void)self; return (u64)(uintptr_t)beer_mms_lobby_data(lobby, key); }
+{
+    (void)self;
+    const char *value = beer_mms_lobby_data(lobby, key);
+    if (getenv("BEER_STEAM_DIAGNOSTICS") && key && strcasestr(key, "ping"))
+        fprintf(stderr, "[STEAM-PING] lobby %llu key %.128s: %s\n", (unsigned long long)lobby,
+                key, *value ? "present" : "missing");
+    return (u64)(uintptr_t)value;
+}
 MMS_FN mm_set_lobby_data(u64 self, u64 lobby, const char *key, const char *value)
     { (void)self; return (u64)beer_mms_set_lobby_data(lobby, key, value); }
 MMS_FN mm_lobby_data_count(u64 self, u64 lobby) { (void)self; return (u64)(s64)beer_mms_lobby_data_count(lobby); }
 MMS_FN mm_lobby_data_by_index(u64 self, u64 lobby, s32 index, char *key, s32 key_cap, char *value, s32 value_cap)
-    { (void)self; return (u64)beer_mms_lobby_data_by_index(lobby, index, key, key_cap, value, value_cap); }
+{
+    (void)self;
+    int ok = beer_mms_lobby_data_by_index(lobby, index, key, key_cap, value, value_cap);
+    if (ok && getenv("BEER_STEAM_DIAGNOSTICS") && key && key_cap > 0 && strcasestr(key, "ping"))
+        fprintf(stderr, "[STEAM-PING] lobby %llu enumerated key %.128s: %s\n", (unsigned long long)lobby,
+                key, value && value_cap > 0 && *value ? "present" : "missing");
+    return (u64)ok;
+}
 MMS_FN mm_delete_lobby_data(u64 self, u64 lobby, const char *key)
     { (void)self; return (u64)beer_mms_delete_lobby_data(lobby, key); }
 MMS_FN mm_member_data(u64 self, u64 lobby, u64 user, const char *key)

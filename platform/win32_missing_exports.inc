@@ -215,6 +215,8 @@ static u64 __attribute__((ms_abi)) stub_GetClipboardData(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CountClipboardFormats(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumClipboardFormats(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EmptyClipboard(void){ return 0; }
+/* The clipboard never changes in Beer (SetClipboardData fails), so its sequence number stays the same. */
+static u64 __attribute__((ms_abi)) beer_GetClipboardSequenceNumber(void) { return 1; }
 static u64 __attribute__((ms_abi)) stub_IsClipboardFormatAvailable(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnableWindow(u64 hwnd, u32 enable){ return beer_enable_window(hwnd, enable); }
 static u64 __attribute__((ms_abi)) stub_GetMenu(void){ return 0; }
@@ -1093,6 +1095,34 @@ static u64 __attribute__((ms_abi)) beer_GetFinalPathNameByHandleA(u64 file, char
     memcpy(path, formatted, length + 1);
     return length;
 }
+/* The W form: same path, UTF-16. The result counts UTF-16 units; too small a buffer returns the size needed,
+ * including the terminator. */
+/* VarBstrFromBool (OLEAUT32): "True"/"False" by default (English, as without VAR_LOCALBOOL), "On"/"Off" with
+ * VAR_BOOLONOFF (0x400), "Yes"/"No" with VAR_BOOLYESNO (0x800). Delphi's Variants unit asks for both at start-up and
+ * raises when the call fails (FitGirl's xtool.exe died with runtime error 217). */
+static u64 __attribute__((ms_abi)) beer_VarBstrFromBool(s16 value, u32 lcid, u32 flags, u16 **out)
+{
+    (void)lcid;
+    if (!out) return 0x80070057u;                                       /* E_INVALIDARG */
+    const char *text = (flags & 0x400u) ? (value ? "On" : "Off") : (flags & 0x800u) ? (value ? "Yes" : "No")
+                                                                   : (value ? "True" : "False");
+    u16 wide[8];
+    u32 n = 0;
+    for (; text[n]; ++n) wide[n] = (u8)text[n];
+    *out = bstr_alloc(wide, n, 1);
+    return *out ? 0 : 0x8007000Eu;                                      /* E_OUTOFMEMORY */
+}
+static u64 __attribute__((ms_abi)) beer_GetFinalPathNameByHandleW(u64 file, u16 *path, u32 capacity, u32 flags)
+{
+    char narrow[1200];
+    const u64 length = beer_GetFinalPathNameByHandleA(file, narrow, sizeof(narrow), flags);
+    if (!length || length >= sizeof(narrow)) return 0;
+    u16 wide[1200];
+    const size_t units = beer_utf8_to_utf16(narrow, wide, sizeof(wide) / sizeof(*wide));
+    if (!path || capacity <= units) return units + 1;
+    memcpy(path, wide, (units + 1) * sizeof(u16));
+    return units;
+}
 static u64 __attribute__((ms_abi)) beer_CreateHardLinkA(const char *link, const char *target, void *attributes)
     { (void)link; (void)target; (void)attributes; beer_unsupported_once("CreateHardLinkA"); g_last_error = 50; return 0; }
 static u64 __attribute__((ms_abi)) beer_CreateSymbolicLinkA(const char *link, const char *target, u32 flags)
@@ -1485,6 +1515,15 @@ static u64 __attribute__((ms_abi)) beer_OpenTraceW(void *logfile)
 static u64 __attribute__((ms_abi)) beer_ControlTraceW(u64 trace, const u16 *name, void *properties, u32 control)
     { (void)trace; (void)name; (void)properties; (void)control; return 5; }          /* ERROR_ACCESS_DENIED: not admin */
 static u64 __attribute__((ms_abi)) beer_CloseTrace(u64 trace) { (void)trace; return 6; }               /* ERROR_INVALID_HANDLE */
+/* The rest of the ETW controller/consumer surface, consistent with the above: no trace session can be opened, so
+ * consuming fails on the handle, and controlling or enabling providers is denied as for a non-administrator. */
+static u64 __attribute__((ms_abi)) beer_OpenTraceA(void *logfile) { (void)logfile; g_last_error = 5; return ~0ull; }
+static u64 __attribute__((ms_abi)) beer_ProcessTrace(u64 *handles, u32 count, void *start, void *end)
+    { (void)handles; (void)count; (void)start; (void)end; return 6; }               /* ERROR_INVALID_HANDLE */
+static u64 __attribute__((ms_abi)) beer_trace_denied4(u64 a, u64 b, u64 c, u64 d)
+    { (void)a; (void)b; (void)c; (void)d; return 5; }                                /* ERROR_ACCESS_DENIED */
+static u64 __attribute__((ms_abi)) beer_QueryAllTraces(void **properties, u32 count, u32 *returned)
+    { (void)properties; (void)count; if (returned) *returned = 0; return 5; }
 
 /* ADVAPI32 security. The process is an administrator only when elevated (beer_process_elevated). */
 static u64 __attribute__((ms_abi)) beer_AllocateAndInitializeSid(const u8 *authority, u8 count, u32 s0, u32 s1, u32 s2,

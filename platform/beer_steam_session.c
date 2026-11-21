@@ -30,11 +30,22 @@ static struct {
     size_t pending_len;
     char *events[256];           /* matchmaking event lines kept for the game (oldest first) */
     unsigned event_count;
-} g = { PTHREAD_MUTEX_INITIALIZER, -1, 0, 0, 0, "", NULL, 0, 1, NULL, 0, { NULL }, 0 };
+    char *p2p[256];              /* peer-to-peer signaling lines (p2p_event, p2p_fail), oldest first */
+    unsigned p2p_count;
+} g = { PTHREAD_MUTEX_INITIALIZER, -1, 0, 0, 0, "", NULL, 0, 1, NULL, 0, { NULL }, 0, { NULL }, 0 };
 
 /* Keeps a broadcast line the game must see later (matchmaking events); others are dropped. Takes the line. */
 static void keep_event_line(char *line)
 {
+    if (strstr(line, "\"event\":\"p2p_event\"") || strstr(line, "\"event\":\"p2p_fail\"")) {
+        if (g.p2p_count == sizeof(g.p2p) / sizeof(*g.p2p)) {
+            free(g.p2p[0]);
+            memmove(g.p2p, g.p2p + 1, sizeof(g.p2p) - sizeof(*g.p2p));
+            g.p2p_count--;
+        }
+        g.p2p[g.p2p_count++] = line;
+        return;
+    }
     if (!strstr(line, "\"event\":\"mms_event\"")) { free(line); return; }
     if (g.event_count == sizeof(g.events) / sizeof(*g.events)) {      /* full: drop the oldest */
         free(g.events[0]);
@@ -112,7 +123,8 @@ static char *request(const char *op, const char *fields)
 {
     if (g.fd < 0 && (g.fd = connect_provider()) < 0) return NULL;
     char id[32];
-    snprintf(id, sizeof(id), "game%u", g.next_id++);
+    /* Provider replies are broadcast: different game processes must not reuse game1/game2. */
+    snprintf(id, sizeof(id), "game%ld-%u", (long)getpid(), g.next_id++);
     char *line = NULL;
     int n = asprintf(&line, "{\"op\":\"%s\",\"id\":\"%s\"%s%s}\n", op, id, fields ? "," : "",
                      fields ? fields : "");
@@ -125,7 +137,12 @@ static char *request(const char *op, const char *fields)
         if (reply) return reply;
         char chunk[16384];
         ssize_t got = recv(g.fd, chunk, sizeof(chunk), 0);
-        if (got <= 0) goto lost;
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+            fprintf(stderr, "[STEAM] provider request %s failed: %s\n", op,
+                got == 0 ? "connection closed" : strerror(errno));
+            goto lost;
+        }
         char *grown = realloc(g.pending, g.pending_len + (size_t)got);
         if (!grown) goto lost;
         g.pending = grown;
@@ -400,12 +417,10 @@ int beer_steam_session_games_played(uint32_t appid, uint32_t pid)
     return ok;
 }
 
-long beer_steam_session_next_mms_event(uint32_t *emsg, uint8_t *out, size_t cap)
+/* Collects what the provider sent since the last request (caller holds the lock). */
+static void collect_pending_locked(void)
 {
-    /* Called from the game's callback pump: never wait behind a request that is waiting for Steam (its reply
-     * loop queues the events that arrive meanwhile). */
-    if (pthread_mutex_trylock(&g.lock)) return -1;
-    if (g.fd >= 0) {                              /* collect what arrived since the last request */
+    if (g.fd >= 0) {
         for (;;) {
             char chunk[16384];
             ssize_t got = recv(g.fd, chunk, sizeof(chunk), MSG_DONTWAIT);
@@ -418,6 +433,94 @@ long beer_steam_session_next_mms_event(uint32_t *emsg, uint8_t *out, size_t cap)
         }
         take_lines(NULL);
     }
+}
+
+long beer_steam_session_networking_config(uint32_t appid, uint8_t *out, size_t cap, char *err, size_t errlen)
+{
+    if (!out || !cap) return -1;
+    char fields[64];
+    snprintf(fields, sizeof(fields), "\"appid\":\"%u\"", appid);
+    pthread_mutex_lock(&g.lock);
+    char *reply = g.active ? request("networking_config", fields) : NULL;
+    pthread_mutex_unlock(&g.lock);
+    long length = reply_ok(reply, err, errlen) ? hex_field(reply, "body", out, cap) : -1;
+    free(reply);
+    return length;
+}
+
+long beer_steam_session_networking_certificate(uint32_t appid, const uint8_t key[32],
+                                               uint8_t *out, size_t cap, char *err, size_t errlen)
+{
+    if (!key || !out || !cap) return -1;
+    char *hex = hex_of(key, 32), *fields = NULL;
+    if (!hex) return -1;
+    if (asprintf(&fields, "\"appid\":\"%u\",\"key\":\"%s\"", appid, hex) < 0) fields = NULL;
+    free(hex);
+    pthread_mutex_lock(&g.lock);
+    char *reply = fields && g.active ? request("networking_certificate", fields) : NULL;
+    pthread_mutex_unlock(&g.lock);
+    free(fields);
+    long length = reply_ok(reply, err, errlen) ? hex_field(reply, "body", out, cap) : -1;
+    free(reply);
+    return length;
+}
+
+int beer_steam_session_p2p_send(uint32_t appid, uint64_t dest, const void *body, size_t len)
+{
+    char *hex = hex_of(body, len), *fields = NULL;
+    if (!hex) return 0;
+    if (asprintf(&fields, "\"appid\":\"%u\",\"dest\":\"%llu\",\"body\":\"%s\"", appid,
+                 (unsigned long long)dest, hex) < 0) fields = NULL;
+    free(hex);
+    pthread_mutex_lock(&g.lock);
+    char *reply = fields && g.active ? request("p2p_send", fields) : NULL;
+    pthread_mutex_unlock(&g.lock);
+    free(fields);
+    char err[256];
+    const int ok = reply_ok(reply, err, sizeof(err));
+    if (!ok) fprintf(stderr, "[STEAM-NET] signaling to %llu for app %u failed: %s\n", (unsigned long long)dest, appid, err);
+    free(reply);
+    return ok;
+}
+
+long beer_steam_session_next_p2p_event(uint64_t *src, uint64_t *dest, uint32_t *appid, int *failed,
+                                       uint8_t *out, size_t cap)
+{
+    if (pthread_mutex_trylock(&g.lock)) return -1;
+    collect_pending_locked();
+    long len = -1;
+    while (g.p2p_count && len < 0) {
+        char *line = g.p2p[0];
+        memmove(g.p2p, g.p2p + 1, (g.p2p_count - 1) * sizeof(*g.p2p));
+        g.p2p_count--;
+        char text[32] = "";
+        json_value(line, "src", text, sizeof(text));
+        *src = strtoull(text, NULL, 10);
+        json_value(line, "dest", text, sizeof(text));
+        *dest = strtoull(text, NULL, 10);
+        json_value(line, "appid", text, sizeof(text));
+        *appid = (uint32_t)strtoul(text, NULL, 10);
+        *failed = strstr(line, "\"event\":\"p2p_fail\"") != NULL;
+        if (*failed) {
+            json_value(line, "reason", text, sizeof(text));
+            uint32_t reason = (uint32_t)strtoul(text, NULL, 10);
+            if (cap >= 4) memcpy(out, &reason, 4);
+            len = 4;
+        } else {
+            len = hex_field(line, "body", out, cap);
+        }
+        free(line);
+    }
+    pthread_mutex_unlock(&g.lock);
+    return len;
+}
+
+long beer_steam_session_next_mms_event(uint32_t *emsg, uint8_t *out, size_t cap)
+{
+    /* Called from the game's callback pump: never wait behind a request that is waiting for Steam (its reply
+     * loop queues the events that arrive meanwhile). */
+    if (pthread_mutex_trylock(&g.lock)) return -1;
+    collect_pending_locked();
     long len = -1;
     while (g.event_count && len < 0) {
         char *line = g.events[0];

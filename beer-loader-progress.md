@@ -1,5 +1,151 @@
 # Beer Loader — Active Development Context
 
+## Where Winds Meet after the 2026-11-21 game update: start-up fixed (2026-11-21)
+
+- Protector import check (TLS callback) needed `USER32!GetClipboardSequenceNumber` (constant: Beer's clipboard never
+  changes) and `ADVAPI32!ProcessTrace`; the rest of the ETW controller/consumer family was added consistently
+  (OpenTraceA, Start/Stop/Control/Flush/QueryTraceA/W, EnableTrace[Ex/Ex2] = access denied, QueryAllTraces).
+- `GetFinalPathNameByHandleW` (was a stub) now uses the A implementation.
+- **C++ exceptions (all games):** the new trpak check throws `boost::filesystem::filesystem_error`; it crashed while
+  being caught. Beer ran the STATUS_UNWIND_CONSOLIDATE callback (the C++ runtime's catch-block runner) on the
+  *target* frame's stack, overwriting the exception object in the thrower's frame before the catch destroyed it
+  (garbage refcount at object+0x48). Like Windows' RtlRestoreContext, `beer_call_consolidate_asm` now runs the
+  callback 0x1000 below the deepest live guest frame (RtlUnwindEx caller, or the exception context when the caller
+  is on the host-call stack); fallback to the old behaviour when that is not below the target on the same stack.
+- `GetFileAttributesA` no longer reads an uninitialised buffer when a path cannot be resolved; failures are logged
+  with `BEER_FILE_DIAGNOSTICS`.
+- Result: 150 s runs (DX11 entry) with no crash; filesystem_error/logic_error/UnexpectedEof exceptions caught.
+  test-native-loader, test-native-sync, test-ki-dispatcher pass. RE8/RE9 gate not yet rerun after the EH change.
+- **Crash at the title ~90 s in (Discord SDK /GS failure, 0xC0000409 p0=2 in discord_partner_sdk.dll+0x3a60c0,
+  libuv uv__tcp_connect):** caught with a hardware watchpoint (new diagnostic `BEER_STACKTOP_WATCH=<hex offset from the
+  thread stack top>` + `BEER_STACKTOP_WATCH_VALUE`; needs `kernel.perf_event_paranoid` <= 2). The writer was Beer's
+  `fill_windows_version`: the SDK calls RtlGetVersion with an uninitialised dwOSVersionInfoSize (32765) and Beer zeroed
+  min(size, 284) bytes and set wProductType for any size >= 284, overrunning a smaller struct into the caller's cookie.
+  Now, like RtlGetVersion, only exactly 284 gets the extended fields; any other size gets the 276-byte struct.
+  `BEER_VERSION_DIAGNOSTICS` logs the calls. 240 s run clean afterwards.
+- **Loading speed (all games):** `heap_guard_remove` took 38% of CPU while WWM loaded: Beer's heap size table had
+  4096 buckets for millions of live blocks. Now 2^21 buckets. WWM loading much faster (user confirmed).
+- **DX12 recommended for WWM** (DX11/BD11 renders the terrain white and grass black; not investigated yet). Library
+  entry switched to `--commandline-dx12-control=1`; user enabled "Release pipelines after compiling" (RAM ~10 GB of 14).
+- **Asynchronous OVERLAPPED file reads (all games):** handles opened with FILE_FLAG_OVERLAPPED on regular files now
+  behave like Windows: a read whose data is in the page cache (preadv2 RWF_NOWAIT) completes inline; otherwise
+  ReadFile returns ERROR_IO_PENDING and one of 16 I/O workers does the pread on a duplicated descriptor, then stores
+  InternalHigh/Internal (NTSTATUS: EOF 0xC0000011, cancelled 0xC0000120), signals hEvent (ReadFile resets it first)
+  and always posts the completion-port packet. GetOverlappedResult(Ex) now waits for such reads; CancelIoEx and
+  CloseHandle cancel queued ones. Opt-out `BEER_SYNC_FILE_IO=1`. WWM streams from an HDD with ~4 KB scattered reads
+  (3.8k/s) across 492 archives; before, each game thread did one blocking read at a time. New test in
+  tests/native_loader_contract_test.c (pass). WWM DX12 240 s clean. Not yet checked: RE8/RE9 (archive reads use
+  OVERLAPPED) and other games.
+- Notes: API tracing (any BEER_API_TRACE) trips WWM's anti-debug (int3 with rcx=0xdeadc0de). UniCrashReporter
+  (boot watchdog) exits 1 immediately, harmless so far. Volume open `\\.\Z:` fails with ERROR_FILE_NOT_FOUND.
+
+## Steam Windows-compatibility follow-up — authenticated public-session join verified; browser count fixed (2026-11-21)
+
+- **Browser ping remains unfixed (confirmed separately after joining worked):** user sees9999 in the session
+  browser. Networking-only trace `~/.beer/logs/Chained_Together_1_8_6-20261121-194035.log` shows
+  CheckPingDataUpToDate, lobby metadata P2PPING present on ten results, then ParsePingLocationString called.
+  Parsing returns false; no estimate API call follows. This is a missing relay-ping location parser/measurement
+  subsystem, not missing lobby metadata, incorrect player counts, or the connected peer's RTT. The external
+  non-SDR runtime also implements these methods as unavailable stubs (csteamnetworkingsockets.h).
+  Added method-specific once-only diagnostics and ping-key metadata presence diagnostics; never log credentials
+  or replace9999 with fixed/CM-request/connected-peer timings. Correct return ABI is NOT a browser-ping fix.
+  Next actual implementation requires compatible ping-location decoding plus real local relay measurements
+  and the estimator; blindly enabling the SDR macro does not supply absent implementation sources.
+
+- **Latest interactive validation succeeded:** user confirmed "Joined successfully" on the updated build.
+  Log `~/.beer/logs/Chained_Together_1_8_6-20261121-192756.log` shows host 76561198714405628,
+  connection 199667368, genuine authentication, IPv6 ICE end-to-end connectivity confirmed and
+  state 0 -> 1 -> 2 -> 3 (Connected), callback 1221 delivered. Later application close reason1000
+  "Connection Ended", not rendezvous timeout. This verifies a real public-session join, not every
+  host/Windows version/NAT topology or a long multiplayer soak. Host OS was not independently confirmed.
+
+- Supersedes the CA/app-ID blocker below. The external GNS runtime now includes Beer's versioned first-party
+  bridge: Valve's pinned root, signed intermediate chains, revocations, actual app identity and real Steam-issued
+  certificates are verified before installation. No private key leaves GNS. Installed atomically with a backup
+  at the existing manager path. Build/design: [docs/steam-networking-auth.md](docs/steam-networking-auth.md).
+- Actual Chained Together log `~/.beer/logs/Chained_Together_1_8_6-20261121-171405.log` confirms app 480,
+  signed certificate installation and callback 1222 on the guest pump. Renewal/hourly trust refresh are separate
+  from signaling. Auth callback config 202 setter/getter/direct/fallback tested against the real loader.
+  New authenticated peer connections/listeners now refuse to start without Current authentication rather than
+  emitting self-signed requests after certificate failure. Extended-runtime offline refusal fixture PASS.
+- Fresh host 76561199644219519 **replied**: ConnectOK, private/public ICE candidates, 13 inbound signals in
+  `/tmp/beer-fresh-win-peer.log`. Game state 1 -> 2 -> 4, reason 5008: "Timed out attempting to negotiate
+  rendezvous". This passes the old no-reply/authentication boundary but is not a data connection. Local native
+  ICE gathers host/reflexive candidates. Later retry of the old peer had no replies; do not assume it stayed live.
+- Browser count fixed: lobby-list field 6 and lobby-data field 3 retain Steam's advertised count for nonjoined
+  lobbies. Identity enumeration/permissions still require actual membership; browse/refresh/join tests PASS.
+  Relay ping APIs now have correct Win64 signatures (including float-return location age) and honest unavailable
+  results (-1.0 age / -2 unknown ping), safe empty strings; no invented measurements. Game's ping9999 marker may
+  remain. Fixing a displayed count or ping does not establish a working route.
+- IPC: retry EINTR and report the actual failing request; include process ID in reply IDs because provider
+  replies are broadcast and games formerly reused game1/game2. Foreign-reply negative control PASS.
+  Later real certificate issuance timed out; targeted provider restart restored it. Final genuine auth test
+  `/tmp/beer-network-reconnected-auth.log` PASS, not the preceding failed attempt.
+- Validation: loader/provider, native-loader callback/ping ABI, full test-input, real-library test-steam,
+  offline CA/tamper/revocation tests and genuine certificate/app/key/tamper controls PASS. Final regression logs
+  `/tmp/beer-network-final-{build,native,input,steam}.log`. Networking-only interactive launch for fresh join:
+  `~/.beer/logs/Chained_Together_1_8_6-20261121-192756.log`. No automatic game input or commit.
+  **Direct public-session joining is verified; SDR remains unimplemented and relay-dependent hosts remain unsupported.**
+
+## Chained Together public-session join — timeout reproduced; STUN stall fixed, Windows interoperability NOT fixed (2026-11-21)
+
+- Actual failure in `~/.beer/logs/Chained_Together_1_8_6-20261121-152743.log`: ConnectP2P to
+  SteamID 76561199780177792, virtual port 27015, state 0 -> 1 -> 5 (5003, "Timed out attempting to connect")
+  -> 0. Callback 1221 is delivered; returning to title is Unreal's connection failure handling, not a crash.
+  User clarified the host is a random public-session player, probably on Windows; not a known Beer peer.
+- Independent opt-in `tests/steam_p2p_live_probe.c` reproduced a **10.17 s ICE initialization stall** with the
+  default STUN hostname, under GNS's global lock. Only the close signal went out after the connect deadline.
+  Numeric STUN endpoints avoid it. Added `platform/steam_stun_resolver.h`: real DNS preflight once before
+  entering GNS, preserves custom/empty lists, emits numeric IPv4/IPv6 endpoints; no hardcoded server IP.
+  Final default-hostname probe sends 21 rendezvous/close messages without that lock stall, but gets **0 replies**.
+  Provider acceptance proves submission to CM, not delivery to the remote game. Host availability is unknown.
+- **Verified authentication groundwork:** new app-authorized provider `networking_certificate` operation requests
+  EMsg 5621 with the instance's public Ed25519 key (field 2) and app ID (field 3). Steam returned a real signed
+  certificate for app 480. GNS DOES expose GetCertificateRequest/SetCertificate and ships Valve's root CA;
+  assertions that there is no certificate API or that Windows interoperability is inherently impossible are false.
+- **Remaining runtime blocker:** the installed GNS has no public flat API for importing the current Steam
+  intermediate CA chain or setting app ID (its internal default is 0). Test SetCertificate failed: signer
+  13151444190962006299 unknown, followed by GNS reading an unpopulated identity in that failure path.
+  Automatic installation was removed; certificate acquisition is diagnostic-only (`BEER_STEAM_DIAGNOSTICS`),
+  so normal startup gets no extra request wait. No fabricated certificate, trusted-key override, signature bypass,
+  or guest code change. Backend explicitly logs missing stock-Steam CA/app-ID/SDR integration.
+- Valve's public `ISteamApps/GetSDRConfig/v1/?appid=480` supplies CA chains/revocations and relay configuration.
+  Next milestone is a supported runtime integration for verified CA-chain import + app-ID setup, genuine local
+  certificate installation/renewal + auth callbacks, then compatible Windows rendezvous/ICE and SDR (relay-only
+  hosts need it). Do NOT claim public-session support from the socketpair two-process test.
+- Validation: loader/provider built; real-library `make test-steam` PASS, including two-process reliable P2P,
+  offline STUN resolver tests and certificate IPC/error/interleaved-event tests; native-loader and full test-input PASS.
+  Real final probe `/tmp/beer-ct-p2p-final.log` STILL times out. Provider restarted with the certificate-capable
+  binary; existing game PID 8357 retains the old loader until relaunched. No multiplayer success claimed.
+
+## Steam peer-to-peer networking (ISteamNetworkingSockets ConnectP2P) — built, awaiting two-player test (2026-11-21)
+
+- Why joining failed: Beer served only local listeners; ConnectP2P and the rest of ISteamNetworkingSockets012 were
+  no-ops, so a joining player could never open a connection to the host. Applies to every official-mode game.
+- Design (user: generic, as Windows does it; friend also runs Beer):
+  - Signaling goes through Steam as the Steam client sends it: CMsgClientP2PConnectionInfo (EMsg 5434,
+    steam_id_dest=1, steam_id_src=2, app_id=3, rendezvous=6; fail info 5435) carrying the library's
+    CMsgSteamNetworkingP2PRendezvous. Provider (steam/provider.c): op `p2p_send` (source = signed-in account,
+    plain client message, owned apps only); incoming 5434/5435 broadcast as `p2p_event` / `p2p_fail`. Session client
+    (platform/beer_steam_session.c): separate P2P queue, `beer_steam_session_p2p_send` / `_next_p2p_event`.
+  - Transport: GameNetworkingSockets (BEER_STEAM_NETWORKING_LIBRARY) with custom signaling + ICE; STUN default
+    stun.l.google.com:19302 (override BEER_STEAM_STUN_SERVERS). No Valve relays (SDR) or CA certificates: peers use
+    self-signed certs, so this interoperates only with other Beer players. No TURN: two strict/symmetric NATs can fail.
+  - platform/beer_steam_networking.c: full native adapter + service thread (signaling in, RunCallbacks), status events
+    converted to the Win64 SteamNetConnectionStatusChangedCallback_t (m_info @8, 712 bytes).
+  - platform/win32_steam_networking.inc: ISteamNetworkingSockets012 slots 0-27 + RunCallbacks 41, and
+    ISteamNetworkingUtils004 (AllocateMessage, GetRelayNetworkStatus = CannotTry, timestamp, Set/GetConfigValue 16/17).
+    Slots verified from the flat wrappers in the game's steam_api64.dll (Steamv153). Status callbacks go to a game's
+    configured callback function (config 201: connection, listen socket or global) or are posted as callback 1221;
+    pumped from Steam_BGetCallback / SteamAPI_RunCallbacks / RunCallbacks. Library messages are copied into Win64
+    SteamNetworkingMessage_t objects with ms_abi Release/FreeData.
+- Tests: tests/steam_p2p_signaling_test.c (library-level), platform/beer_steam_networking_p2p_test.c (adapter, two
+  processes, in `make test-steam`; PASS with and without STUN). Steam/loader suites pass.
+- NOT yet verified: Steam actually relaying 5434 between two accounts, and a real two-player join. Needs the
+  provider restarted with the new beer-steam (my restart was blocked by the permission classifier), and the friend
+  running this same uncommitted build (loader + beer-steam). ISteamNetworkingMessages and the legacy ISteamNetworking
+  API are still the offline object.
+
 ## Chained Together unsteam launcher — injection, Steam process opt-in, game runs on app 480 (2026-11-21)
 
 - Implemented the remote operations the unsteam launcher needs (platform/win32_remote.inc, platform/win32_child.c;

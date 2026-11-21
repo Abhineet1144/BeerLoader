@@ -35,7 +35,7 @@ GRAPHICS_SRCS = graphics/d3d11/d3d11_impl.c \
                 graphics/d3d12v/bd12_capture.c graphics/d3d12v/bd12_cbtweak.c graphics/d3d12v/bd12_feedback.c \
                 graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c \
                 graphics/d3d11v/bd11_swap.c
-SRCS = loader.c $(AUDIO_SRCS) $(MEDIA_SRCS) $(PLATFORM_SRCS) $(VULKAN_SRCS) $(GRAPHICS_SRCS)
+SRCS = loader.c $(AUDIO_SRCS) $(MEDIA_SRCS) $(PLATFORM_SRCS) $(VULKAN_SRCS) $(GRAPHICS_SRCS) steam/pb.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 
@@ -64,8 +64,14 @@ test-child-startup:
 .PHONY: test-child-startup
 
 test-steam:
-	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_networking_test.c platform/beer_steam_networking.c -lpthread -ldl -o /tmp/beer-steam-networking-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_networking_test.c platform/beer_steam_networking.c steam/pb.c -lpthread -ldl -o /tmp/beer-steam-networking-test
 	/tmp/beer-steam-networking-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_networking_p2p_test.c platform/beer_steam_networking.c steam/pb.c -lpthread -ldl -o /tmp/beer-steam-networking-p2p-test
+	$(CC) -O2 -Wall -Wextra platform/steam_stun_resolver_test.c -o /tmp/beer-steam-stun-test
+	/tmp/beer-steam-stun-test
+	BEER_STEAM_STUN_SERVERS= /tmp/beer-steam-networking-p2p-test
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_networking_auth_failure_test.c platform/beer_steam_networking.c steam/pb.c -lpthread -ldl -o /tmp/beer-steam-auth-failure-test
+	BEER_STEAM_STUN_SERVERS= /tmp/beer-steam-auth-failure-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/steam_networking_identity_test.c -o /tmp/beer-steam-networking-identity-test
 	/tmp/beer-steam-networking-identity-test
 	$(CC) $(STEAM_CFLAGS) steam/pb_test.c steam/pb.c -o /tmp/beer-steam-pb-test
@@ -76,6 +82,13 @@ test-steam:
 	/tmp/beer-steam-session-test
 	$(CC) -O2 -Wall -Wextra -D_GNU_SOURCE -Iplatform platform/beer_steam_mms_test.c platform/beer_steam_mms.c -lpthread -o /tmp/beer-steam-mms-test
 	/tmp/beer-steam-mms-test
+
+# Explicitly opt-in real-session check; never included in the offline Steam test target.
+test-steam-auth-live:
+	$(CC) -O2 -Wall -Wextra tests/steam_networking_auth_live_test.c platform/beer_steam_networking.c platform/beer_steam_session.c steam/pb.c -lpthread -ldl -lcrypto -o /tmp/beer-steam-auth-live-test
+	/tmp/beer-steam-auth-live-test
+
+.PHONY: test-steam-auth-live
 
 # Hot: every BEER_* switch lookup goes through it.
 platform/beer_env.o: platform/beer_env.c platform/beer_env.h

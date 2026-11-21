@@ -711,7 +711,8 @@ static int cmd_run_batch(const char *host, int argc, char args[][PATH_MAX])
 /* The process: `command_line` is cmd's full command line ("cmd.exe /c ..."). */
 static int beer_cmd_main(const char *command_line)
 {
-    fprintf(stderr, "[CMD] %s\n", command_line);
+    char cwd[PATH_MAX];
+    fprintf(stderr, "[CMD] %s (in %s)\n", command_line, getcwd(cwd, sizeof(cwd)) ? cwd : "?");
     const char *p = command_line;
     while (*p == ' ') ++p;
     if (*p == '"') { p = strchr(p + 1, '"'); p = p ? p + 1 : command_line + strlen(command_line); }

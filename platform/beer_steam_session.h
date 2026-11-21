@@ -43,6 +43,19 @@ int beer_steam_session_mms_send(uint32_t appid, uint32_t emsg, const void *body,
 int beer_steam_session_games_played(uint32_t appid, uint32_t pid);
 long beer_steam_session_next_mms_event(uint32_t *emsg, uint8_t *out, size_t cap);
 
+/* Steam networking signaling (CMsgClientP2PConnectionInfo, EMsg 5434) through the signed-in session: p2p_send
+ * delivers one rendezvous blob to `dest` for the app; next_p2p_event returns the next blob Steam delivered for this
+ * account (its length, or -1 when none), or with *failed set a delivery failure (4-byte close reason in out). */
+int beer_steam_session_p2p_send(uint32_t appid, uint64_t dest, const void *body, size_t len);
+/* Steam-issued networking certificate for this instance's public key. Private key stays in GNS.
+ * Returns the signed certificate blob length, or -1 with a provider error. */
+long beer_steam_session_networking_certificate(uint32_t appid, const uint8_t key[32],
+                                               uint8_t *out, size_t cap, char *err, size_t errlen);
+/* HTTPS-fetched Valve config, including signed CA chains and key revocations; no caller-selected URL. */
+long beer_steam_session_networking_config(uint32_t appid, uint8_t *out, size_t cap, char *err, size_t errlen);
+long beer_steam_session_next_p2p_event(uint64_t *src, uint64_t *dest, uint32_t *appid, int *failed,
+                                       uint8_t *out, size_t cap);
+
 /* Socket path used by the provider; exposed for tests. */
 int beer_steam_session_socket_path(char *out, size_t cap);
 

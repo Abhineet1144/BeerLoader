@@ -8,6 +8,57 @@
 #include "wow32_dll_contract.inc"
 
 static int native_veh_calls;
+static int steam_auth_callback_calls;
+static void __attribute__((ms_abi)) steam_auth_test_callback(void *data)
+{
+    int32_t availability;
+    memcpy(&availability, data, 4);
+    assert(availability == 100);
+    assert(!strcmp((const char *)data + 4, "OK"));
+    ++steam_auth_callback_calls;
+}
+
+static void steam_auth_callback_contract_test(void)
+{
+    struct { u8 location[512]; u64 guard; } ping = { .guard = UINT64_C(0xabcdef0123456789) };
+    memset(ping.location, 0xa5, sizeof(ping.location));
+    assert(net_utils_local_ping(0, ping.location) == -1.0f);
+    for (size_t i = 0; i < sizeof(ping.location); ++i) assert(!ping.location[i]);
+    assert(ping.guard == UINT64_C(0xabcdef0123456789));
+    assert((s64)net_utils_estimate_ping(0, ping.location, ping.location) == -2);
+    assert((s64)net_utils_estimate_local_ping(0, ping.location) == -2);
+    assert(!net_utils_ping_fresh(0, 30.0f));
+    char text[2] = {'x', 'y'};
+    net_utils_ping_string(0, ping.location, text, 1);
+    assert(!text[0] && text[1] == 'y');
+    assert(!net_utils_parse_ping(0, "invalid", ping.location));
+    u32 via = UINT32_MAX;
+    assert((s64)net_utils_ping_dc(0, 0, &via) == -2 && !via);
+    assert((s64)net_utils_ping_pop(0, 0) == -2);
+    u64 fn = (u64)(uintptr_t)steam_auth_test_callback;
+    assert(!net_utils_set_config(0, 202, 3, 0, 5, &fn));
+    assert(!net_utils_set_config(0, 202, 1, 0, 1, &fn));
+    assert(net_utils_set_config(0, 202, 1, 0, 5, &fn));
+    struct { u64 value, guard; } result = {0, UINT64_C(0xabcdef0123456789)};
+    u64 size = 4;
+    s32 type = 0;
+    assert((s64)net_utils_get_config(0, 202, 1, 0, &type, &result.value, &size) == -3);
+    assert(size == 8 && type == 5 && !result.value && result.guard == UINT64_C(0xabcdef0123456789));
+    assert(net_utils_get_config(0, 202, 1, 0, &type, &result.value, &size) == 1 && result.value == fn);
+    u8 auth[BEER_STEAM_AUTH_SIZE] = {0};
+    const s32 current = 100;
+    memcpy(auth, &current, 4);
+    memcpy(auth + 4, "OK", 3);
+    steam_networking_dispatch_auth(auth);
+    assert(steam_auth_callback_calls == 1);
+    assert(net_utils_set_config(0, 202, 1, 0, 5, NULL));
+    u32 before = g_steam_event_count;
+    steam_networking_dispatch_auth(auth);
+    assert(g_steam_event_count == before + 1);
+    assert(g_steam_events[before].id == 1222 && g_steam_events[before].size == sizeof(auth));
+    assert(!memcmp(g_steam_events[before].data, auth, sizeof(auth)));
+    g_steam_event_count = before;
+}
 typedef struct { WIN_CS *cs; pthread_barrier_t tried; } CriticalSectionContender;
 static void *critical_section_contender(void *arg)
 {
@@ -1194,8 +1245,90 @@ static void process_security_contract_test(void)
     else unsetenv("_BEER_PRIMARY_TOKEN");
 }
 
+/* Asynchronous OVERLAPPED reads (FILE_FLAG_OVERLAPPED regular files): pending or inline completion, data,
+ * GetOverlappedResult waiting, end of file, completion-port packets and CancelIoEx. The file is dropped from the
+ * page cache first so the reads take the asynchronous path. */
+static void evict_file(const char *host)
+{
+    int fd = open(host, O_RDONLY);
+    assert(fd >= 0);
+    fdatasync(fd);
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+}
+static void async_file_read_contract_test(void)
+{
+    char host[] = "/tmp/beer-async-read-XXXXXX";
+    int fd = mkstemp(host);
+    assert(fd >= 0);
+    enum { SIZE = 1 << 20, CHUNK = 65536 };
+    u8 *data = malloc(SIZE);
+    assert(data);
+    for (u32 i = 0; i < SIZE; ++i) data[i] = (u8)(i * 7 + (i >> 12));
+    assert(write(fd, data, SIZE) == SIZE);
+    close(fd);
+    char guest[PATH_MAX];
+    snprintf(guest, sizeof(guest), "Z:%s", host);
+    for (char *c = guest; *c; ++c) if (*c == '/') *c = '\\';
+    const u64 file = impl_CreateFileA(guest, 0x80000000u, 1, 0, 3, 0x40000080u, 0);   /* FILE_FLAG_OVERLAPPED */
+    assert(file != INVALID_HANDLE_VALUE64 && fh_is_async(file));
+    u8 *buffer = malloc(CHUNK);
+    assert(buffer);
+
+    /* Event-signalled read, waited for with GetOverlappedResult. */
+    evict_file(host);
+    WIN_OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    ov.Offset = 7 * 4096;
+    ov.hEvent = event_alloc(1, 1);                       /* initially set: ReadFile must reset it */
+    u32 got = 0;
+    const u64 ok = impl_ReadFile(file, buffer, CHUNK, NULL, &ov);
+    assert(ok || g_last_error == 997);
+    assert(impl_GetOverlappedResult(file, &ov, &got, 1) && got == CHUNK);
+    assert(!memcmp(buffer, data + 7 * 4096, CHUNK));
+    assert(impl_WaitForSingleObject(ov.hEvent, 0) == 0);
+    assert(g_async_workers > 0 || ok);
+
+    /* Past the end: no data, end-of-file. */
+    memset(&ov, 0, sizeof(ov));
+    ov.Offset = SIZE;
+    ov.hEvent = event_alloc(1, 0);
+    const u64 eof = impl_ReadFile(file, buffer, CHUNK, NULL, &ov);
+    got = 1;
+    const u64 eof_result = impl_GetOverlappedResult(file, &ov, &got, 1);
+    assert(got == 0);
+    assert(eof_result || g_last_error == 38);
+    (void)eof;
+
+    /* Completion port: the packet carries the key, the OVERLAPPED and the byte count. */
+    const u64 port = impl_CreateIoCompletionPort(file, 0, 77, 0);
+    assert(port);
+    evict_file(host);
+    memset(&ov, 0, sizeof(ov));
+    ov.Offset = 3 * CHUNK;
+    memset(buffer, 0, CHUNK);
+    const u64 queued = impl_ReadFile(file, buffer, CHUNK, NULL, &ov);
+    assert(queued || g_last_error == 997);
+    u32 bytes = 0;
+    u64 key = 0, overlapped = 0;
+    assert(impl_GetQueuedCompletionStatus(port, &bytes, &key, &overlapped, 5000));
+    assert(key == 77 && overlapped == (u64)(uintptr_t)&ov && bytes == CHUNK);
+    assert(ov.Internal == 0 && ov.InternalHigh == CHUNK && !memcmp(buffer, data + 3 * CHUNK, CHUNK));
+
+    /* Nothing is queued any more: CancelIoEx finds nothing. */
+    assert(!impl_CancelIoEx(file, &ov) && g_last_error == 1168);
+    assert(impl_CloseHandle(file));
+    impl_CloseHandle(port);
+    unlink(host);
+    free(buffer);
+    free(data);
+    puts("asynchronous OVERLAPPED file reads: PASS");
+}
+
 int main(void)
 {
+    async_file_read_contract_test();
+    steam_auth_callback_contract_test();
     typedef u64 (__attribute__((ms_abi)) *SetConsoleAttributes)(u64, u16);
     SetConsoleAttributes set_attributes = (SetConsoleAttributes)find_impl("SetConsoleTextAttribute");
     assert(set_attributes);

@@ -33,6 +33,7 @@
 #include "library.h"
 #include "vdf.h"
 #include "secret.h"
+#include "http.h"
 
 #define LOGON_TIMEOUT_MS 20000
 #define LOGIN_TIMEOUT_S 300
@@ -331,10 +332,12 @@ static void library_reset(void)
 }
 
 static void broadcast_mms_event(uint32_t emsg, const uint8_t *body, size_t len);
+static void broadcast_p2p_event(uint32_t emsg, const uint8_t *body, size_t len);
 static void on_message(void *context, uint32_t emsg, const uint8_t *body, size_t len)
 {
     (void)context;
     if (emsg >= 6601u && emsg <= 6627u) { broadcast_mms_event(emsg, body, len); return; }
+    if (emsg == 5434u || emsg == 5435u) { broadcast_p2p_event(emsg, body, len); return; }
     if (emsg == EMSG_CLIENT_GAME_CONNECT_TOKENS) {
         PbReader r = { body, body + len };
         PbField f;
@@ -1280,6 +1283,139 @@ static void handle_mms_request(const char *op, const char *id, const char *line)
     free(reply);
 }
 
+/* ---------------------------------------------------------------- peer-to-peer signaling */
+
+/* Steam networking's connection setup between two players travels through Steam, as the Steam client sends it:
+ * CMsgClientP2PConnectionInfo (EMsg 5434) { fixed64 steam_id_dest = 1; fixed64 steam_id_src = 2; uint32 app_id = 3;
+ * bytes rendezvous = 6 } carries one serialized CMsgSteamNetworkingP2PRendezvous; CMsgClientP2PConnectionFailInfo
+ * (5435) reports that Steam could not deliver one. The game supplies the destination and the rendezvous bytes; the
+ * source is always the signed-in account. */
+#define EMSG_CLIENT_P2P_CONNECTION_INFO 5434u
+#define EMSG_CLIENT_P2P_CONNECTION_FAIL_INFO 5435u
+
+/* Only a public Ed25519 key leaves the game's networking instance. Steam decides whether to issue
+ * a certificate for the signed-in account/app; never accept a caller-supplied identity or private key. */
+static void handle_networking_config(const char *op, const char *id, const char *line)
+{
+    char app[16] = "", path[128], idj[140], error[256] = "";
+    json_get(line, "appid", app, sizeof(app));
+    uint32_t appid = (uint32_t)strtoul(app, NULL, 10);
+    if (!session_app_allowed(op, id, appid)) return;
+    snprintf(path, sizeof(path), "/ISteamApps/GetSDRConfig/v1/?appid=%u", appid);
+    HttpConn http;
+    http_init(&http, "api.steampowered.com", 1);
+    uint8_t *body = NULL;
+    size_t length = 0;
+    int status = http_get(&http, path, &body, &length, error, sizeof(error));
+    http_close(&http);
+    if (status != 200 || !length || length > 1024 * 1024) {
+        free(body);
+        game_error(op, id, "could not obtain Steam's trusted networking configuration");
+        return;
+    }
+    char *hex = malloc(length * 2 + 1);
+    if (!hex) { free(body); game_error(op, id, "out of memory"); return; }
+    hex_text(body, length, hex);
+    free(body);
+    json_escape(idj, sizeof(idj), id);
+    emit("{\"event\":\"networking_config\",\"id\":\"%s\",\"ok\":true,\"body\":\"%s\"}", idj, hex);
+    free(hex);
+}
+
+static void handle_networking_certificate(const char *op, const char *id, const char *line)
+{
+    char app[16] = "", key_hex[66] = "", idj[140];
+    json_get(line, "appid", app, sizeof(app));
+    uint32_t appid = (uint32_t)strtoul(app, NULL, 10);
+    if (!session_app_allowed(op, id, appid)) return;
+    json_get(line, "key", key_hex, sizeof(key_hex));
+    uint8_t key[32];
+    if (strlen(key_hex) != 64 || unhex(key_hex, key, sizeof(key)) != sizeof(key)) {
+        game_error(op, id, "invalid networking public key"); return;
+    }
+    PbBuf request = {0};
+    pb_bytes(&request, 2, key, sizeof(key));
+    pb_u64(&request, 3, appid);
+    CmPart *parts = NULL;
+    int answered = cm_request_routed(g.cm, 5621u, &request, appid, 0, 10000, &parts);
+    pb_free(&request);
+    if (!answered || !parts) { cm_parts_free(parts); game_error(op, id, "Steam did not answer the networking certificate request"); return; }
+    PbField cert, signer, signature;
+    int ok = pb_find(parts->body.data, parts->body.len, 4, &cert) && cert.type == PB_BYTES && cert.len &&
+             pb_find(parts->body.data, parts->body.len, 5, &signer) && signer.type == PB_FIXED64 && signer.value &&
+             pb_find(parts->body.data, parts->body.len, 6, &signature) && signature.type == PB_BYTES && signature.len == 64;
+    char *text = NULL;
+    if (ok && parts->body.len <= 8192) {
+        text = malloc(parts->body.len * 2 + 1);
+        if (text) hex_text(parts->body.data, parts->body.len, text);
+    }
+    json_escape(idj, sizeof(idj), id);
+    if (text) emit("{\"event\":\"networking_certificate\",\"id\":\"%s\",\"ok\":true,\"body\":\"%s\"}", idj, text);
+    else game_error(op, id, "Steam did not issue a signed networking certificate");
+    free(text);
+    cm_parts_free(parts);
+}
+
+static void handle_p2p_send(const char *op, const char *id, const char *line)
+{
+    char appid_text[16] = "", dest_text[32] = "", idj[140];
+    json_get(line, "appid", appid_text, sizeof(appid_text));
+    json_get(line, "dest", dest_text, sizeof(dest_text));
+    const uint32_t appid = (uint32_t)strtoul(appid_text, NULL, 10);
+    const uint64_t dest = strtoull(dest_text, NULL, 10);
+    json_escape(idj, sizeof(idj), id);
+    if (!session_app_allowed(op, id, appid)) return;
+    if (!dest) { game_error(op, id, "no destination"); return; }
+    char *hex = malloc(strlen(line) + 1);
+    uint8_t *rendezvous = malloc(strlen(line) / 2 + 1);
+    if (!hex || !rendezvous) { free(hex); free(rendezvous); game_error(op, id, "out of memory"); return; }
+    hex[0] = 0;
+    json_get(line, "body", hex, strlen(line) + 1);
+    const size_t len = unhex(hex, rendezvous, strlen(line) / 2 + 1);
+    free(hex);
+    PbBuf msg = {0};
+    pb_fixed64(&msg, 1, dest);
+    pb_fixed64(&msg, 2, cm_steamid(g.cm));
+    pb_u64(&msg, 3, appid);
+    pb_bytes(&msg, 6, rendezvous, len);
+    free(rendezvous);
+    const int sent = cm_send(g.cm, EMSG_CLIENT_P2P_CONNECTION_INFO, &msg);
+    pb_free(&msg);
+    if (!sent) { game_error(op, id, "not connected to Steam"); return; }
+    emit("{\"event\":\"p2p_send\",\"id\":\"%s\",\"ok\":true}", idj);
+}
+
+/* Signaling that arrives for this account goes to every game client; each keeps what is for its own app. */
+static void broadcast_p2p_event(uint32_t emsg, const uint8_t *body, size_t len)
+{
+    PbReader r = { body, body + len };
+    PbField f;
+    uint64_t dest = 0, src = 0;
+    uint32_t appid = 0, error = 0, reason = 0;
+    const uint8_t *rendezvous = NULL;
+    size_t rendezvous_len = 0;
+    while (pb_next(&r, &f) == 1) {
+        if (f.field == 1) dest = f.value;
+        else if (f.field == 2) src = f.value;
+        else if (f.field == 3) appid = (uint32_t)f.value;
+        else if (emsg == EMSG_CLIENT_P2P_CONNECTION_INFO && f.field == 6 && f.type == PB_BYTES) { rendezvous = f.data; rendezvous_len = f.len; }
+        else if (emsg == EMSG_CLIENT_P2P_CONNECTION_FAIL_INFO && f.field == 4) error = (uint32_t)f.value;
+        else if (emsg == EMSG_CLIENT_P2P_CONNECTION_FAIL_INFO && f.field == 7) reason = (uint32_t)f.value;
+    }
+    if (emsg == EMSG_CLIENT_P2P_CONNECTION_FAIL_INFO) {
+        emit("{\"event\":\"p2p_fail\",\"src\":\"%llu\",\"dest\":\"%llu\",\"appid\":%u,\"error\":%u,\"reason\":%u}",
+             (unsigned long long)src, (unsigned long long)dest, appid, error, reason);
+        return;
+    }
+    if (!rendezvous_len) return;                            /* legacy ISteamNetworking candidates: not relayed */
+    char *text = malloc(rendezvous_len * 2 + 1);
+    if (!text) return;
+    hex_text(rendezvous, rendezvous_len, text);
+    emit("{\"event\":\"p2p_event\",\"src\":\"%llu\",\"dest\":\"%llu\",\"appid\":%u,\"body\":\"%s\"}",
+         (unsigned long long)src, (unsigned long long)dest, appid, text);
+    free(text);
+}
+
 /* Unsolicited matchmaking messages (lobby data, members joining or leaving, chat, game server set) go to
  * every game client; each keeps the ones for its own app and lobbies. */
 static void broadcast_mms_event(uint32_t emsg, const uint8_t *body, size_t len)
@@ -1305,6 +1441,12 @@ static void handle_request(char *line)
         handle_game_request(op, id, line);
     } else if (!strcmp(op, "mms_request") || !strcmp(op, "mms_send") || !strcmp(op, "games_played")) {
         handle_mms_request(op, id, line);
+    } else if (!strcmp(op, "p2p_send")) {
+        handle_p2p_send(op, id, line);
+    } else if (!strcmp(op, "networking_certificate")) {
+        handle_networking_certificate(op, id, line);
+    } else if (!strcmp(op, "networking_config")) {
+        handle_networking_config(op, id, line);
     } else if (!strcmp(op, "installs")) {
         char folders[8192] = "";
         json_get(line, "folders", folders, sizeof(folders));

@@ -519,6 +519,12 @@ static u64 beer_create_process_in(const char *application, const char *command_l
             found = 1;
     }
     if (!found) { g_last_error = 2; return 0; }        /* ERROR_FILE_NOT_FOUND */
+    /* A program named relative to this process's directory: the child may start in lpCurrentDirectory instead, so
+     * it gets the absolute path (rz-1.03.7-stdio.exe of FitGirl installers, started by bare name). */
+    if (!is_cmd && host[0] != '/') {
+        char absolute[PATH_MAX];
+        if (realpath(host, absolute)) snprintf(host, sizeof(host), "%s", absolute);
+    }
     /* The file name as the caller spelled it: Windows reports that spelling (GetModuleFileName) even when the file on
      * disk differs in case, and programs derive names from it (FitGirl's CLS-srep_x64.exe opens the events
      * IOEvent_CLS-srep<n> that CLS-srep.dll created; the file on disk is cls-srep_x64.exe). */
@@ -604,7 +610,13 @@ static u64 beer_create_process_in(const char *application, const char *command_l
     }
     /* lpCurrentDirectory: the child starts there (ISDone runs cmd.exe in the game folder). */
     char directory_host[PATH_MAX];
-    if (directory && *directory && resolve_windows_host_path(directory, directory_host, sizeof(directory_host))) {
+    directory_host[0] = 0;
+    if (directory && *directory) {
+        const int resolved = resolve_windows_host_path(directory, directory_host, sizeof(directory_host));
+        fprintf(stderr, "[PROCESS] working directory \"%s\" -> %s\n", directory, resolved ? directory_host : "(unresolved)");
+        if (!resolved) directory_host[0] = 0;
+    }
+    if (directory_host[0]) {
         if (!actions) {
             if (posix_spawn_file_actions_init(&std_actions) == 0) { std_ready = 1; actions = &std_actions; }
         }

@@ -244,6 +244,7 @@ typedef struct {
     KvList data;
     Member *members;
     int member_count;
+    int advertised_member_count; /* Steam's count for browse-only lobbies, not a fabricated member list */
     uint32_t server_ip;
     uint16_t server_port;
     uint64_t server_id;
@@ -500,7 +501,7 @@ static void run_job(Job *job, uint8_t *reply)
             PbIn lr = { f.data, f.data + f.len };
             PbF lf;
             uint64_t id = 0;
-            int max = 0, type = 0, flags = 0;
+            int max = 0, type = 0, flags = 0, members = 0;
             const uint8_t *meta = NULL;
             size_t meta_len = 0;
             while (pb_next(&lr, &lf) == 1) {
@@ -509,6 +510,7 @@ static void run_job(Job *job, uint8_t *reply)
                 else if (lf.field == 3) type = (int)lf.v;
                 else if (lf.field == 4) flags = (int)lf.v;
                 else if (lf.field == 5 && lf.type == 2) { meta = lf.data; meta_len = lf.len; }
+                else if (lf.field == 6 && lf.type == 0 && lf.v <= INT32_MAX) members = (int)lf.v;
             }
             Lobby *l = id ? lobby_locked(id, 1) : NULL;
             if (!l) continue;
@@ -516,6 +518,7 @@ static void run_job(Job *job, uint8_t *reply)
                 l->max_members = max;
                 l->type = type;
                 l->flags = flags;
+                l->advertised_member_count = members;
                 if (meta) kv_decode(meta, meta_len, &l->data);
             }
             g.list[g.list_count++] = id;
@@ -713,7 +716,8 @@ static void handle_event_locked(uint32_t emsg, const uint8_t *data, size_t len)
         r = (PbIn){ data, data + len };
         int has_members = 0;
         while (pb_next(&r, &f) == 1) {
-            if (f.field == 4) l->max_members = (int)f.v;
+            if (f.field == 3 && f.type == 0 && f.v <= INT32_MAX) l->advertised_member_count = (int)f.v;
+            else if (f.field == 4) l->max_members = (int)f.v;
             else if (f.field == 5) l->type = (int)f.v;
             else if (f.field == 6) l->flags = (int)f.v;
             else if (f.field == 7) l->owner = f.v;
@@ -992,7 +996,7 @@ int beer_mms_member_count(uint64_t lobby)
 {
     pthread_mutex_lock(&g.lock);
     Lobby *l = lobby_locked(lobby, 0);
-    int count = l && l->entered ? l->member_count : 0;
+    int count = l ? (l->entered ? l->member_count : l->advertised_member_count) : 0;
     pthread_mutex_unlock(&g.lock);
     return count;
 }

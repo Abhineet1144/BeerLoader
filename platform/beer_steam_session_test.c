@@ -24,6 +24,8 @@ static void reply_to(int fd, const char *line)
     char out[1024];
     /* A broadcast the client must ignore. */
     dprintf(fd, "{\"event\":\"download\",\"appid\":1,\"state\":\"downloading\",\"id\":\"\"}\n");
+    /* A different game's reply must not satisfy our first request. Old IDs collide here. */
+    dprintf(fd, "{\"event\":\"game_session\",\"id\":\"game1\",\"ok\":false,\"error\":\"foreign reply\"}\n");
     if (!strcmp(op, "game_session") && strstr(line, "\"appid\":\"480\""))
         snprintf(out, sizeof(out), "{\"event\":\"game_session\",\"id\":\"%s\",\"ok\":true,\"appid\":480,"
                  "\"steamid\":\"76561198000000001\",\"account\":\"tester\",\"persona\":\"Tes\\\"ter\",\"owned\":[480,481,1000]}", id);
@@ -34,6 +36,15 @@ static void reply_to(int fd, const char *line)
         snprintf(out, sizeof(out), "{\"event\":\"app_ticket\",\"id\":\"%s\",\"ok\":true,\"appid\":480,\"ticket\":\"0a0b0c0d\"}", id);
     else if (!strcmp(op, "encrypted_ticket") && strstr(line, "\"userdata\":\"cafe\""))
         snprintf(out, sizeof(out), "{\"event\":\"encrypted_ticket\",\"id\":\"%s\",\"ok\":true,\"appid\":480,\"ticket\":\"ff00\"}", id);
+    else if (!strcmp(op, "networking_config") && strstr(line, "\"appid\":\"480\""))
+        snprintf(out, sizeof(out), "{\"event\":\"networking_config\",\"id\":\"%s\",\"ok\":true,\"body\":\"7b7d\"}", id);
+    else if (!strcmp(op, "networking_certificate") && strstr(line, "\"appid\":\"480\"")) {
+        const char *key = strstr(line, "\"key\":\"");
+        assert(key && strspn(key + 7, "0123456789abcdef") == 64);
+        assert(!strstr(line, "private"));
+        dprintf(fd, "{\"event\":\"p2p_event\",\"src\":\"12\",\"dest\":\"76561198000000001\",\"appid\":480,\"body\":\"1234\"}\n");
+        snprintf(out, sizeof(out), "{\"event\":\"networking_certificate\",\"id\":\"%s\",\"ok\":true,\"body\":\"01020304\"}", id);
+    }
     else
         snprintf(out, sizeof(out), "{\"event\":\"%s\",\"id\":\"%s\",\"ok\":false,\"error\":\"refused\"}", op, id);
     dprintf(fd, "%s\n", out);
@@ -99,6 +110,23 @@ int main(void)
     const uint8_t userdata[] = { 0xca, 0xfe };
     assert(beer_steam_session_encrypted_ticket(480, userdata, 2, ticket, sizeof(ticket)) == 2 && ticket[0] == 0xff);
     assert(beer_steam_session_encrypted_ticket(480, NULL, 0, ticket, sizeof(ticket)) == 0);
+
+    uint8_t key[32] = {1}, certificate[8] = {0};
+    assert(beer_steam_session_networking_config(480, certificate, sizeof(certificate), err, sizeof(err)) == 2);
+    assert(certificate[0] == '{' && certificate[1] == '}');
+    assert(beer_steam_session_networking_config(480, certificate, 1, err, sizeof(err)) == -1);
+    assert(beer_steam_session_networking_config(999, certificate, sizeof(certificate), err, sizeof(err)) == -1);
+    assert(beer_steam_session_networking_certificate(480, key, certificate, sizeof(certificate), err, sizeof(err)) == 4);
+    assert(certificate[0] == 1 && certificate[3] == 4);
+    assert(beer_steam_session_networking_certificate(999, key, certificate, sizeof(certificate), err, sizeof(err)) == -1);
+    assert(!strcmp(err, "refused"));
+    assert(beer_steam_session_networking_certificate(480, key, certificate, 2, err, sizeof(err)) == -1);
+    assert(beer_steam_session_networking_certificate(480, NULL, certificate, sizeof(certificate), err, sizeof(err)) == -1);
+    uint64_t src, dest;
+    uint32_t app;
+    int failed;
+    assert(beer_steam_session_next_p2p_event(&src, &dest, &app, &failed, ticket, sizeof(ticket)) == 2);
+    assert(src == 12 && dest == UINT64_C(76561198000000001) && app == 480 && !failed && ticket[0] == 0x12);
 
     unlink(addr.sun_path);
     rmdir(path);

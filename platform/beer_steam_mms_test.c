@@ -55,6 +55,7 @@ static long fake_request(uint32_t appid, uint32_t emsg, const void *body, size_t
         size_t m = f_64(lobby, 1, LOBBY);
         m += f_u(lobby + m, 2, 4);
         m += f_b(lobby + m, 5, KV, sizeof(KV));
+        m += f_u(lobby + m, 6, 3);
         n += f_u(out, 1, 480); n += f_u(out + n, 3, 1); n += f_b(out + n, 4, lobby, m);
         break;
     }
@@ -201,6 +202,18 @@ int main(void)
     assert(beer_mms_call_result(call, &count, 4, 510, &failed) && count == 1);
     assert(beer_mms_lobby_by_index(0) == LOBBY && beer_mms_lobby_by_index(1) == 0);
     assert(!strcmp(beer_mms_lobby_data(LOBBY, "mode"), "coop"));
+    assert(beer_mms_member_count(LOBBY) == 3); /* browsing does not require joining */
+    assert(beer_mms_member_by_index(LOBBY, 0) == 0); /* do not synthesize identities */
+    assert(!beer_mms_set_lobby_data(LOBBY, "mode", "x")); /* count does not grant membership */
+
+    /* A public lobby data refresh carries an authoritative count without member identities. */
+    while (beer_mms_peek_callback(&cb)) beer_mms_pop_callback();
+    n = f_u(event_body, 1, 480);
+    n += f_64(event_body + n, 2, LOBBY);
+    n += f_u(event_body + n, 3, 2);
+    event_emsg = 6612; event_len = n;
+    beer_mms_pump();
+    assert(beer_mms_member_count(LOBBY) == 2);
 
     /* Join: members and owner from the reply; LobbyEnter_t with Success. */
     while (beer_mms_peek_callback(&cb)) beer_mms_pop_callback();
