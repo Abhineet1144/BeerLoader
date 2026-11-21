@@ -7,7 +7,9 @@ stored or logged here.
 """
 import json
 import os
+import signal
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -37,6 +39,7 @@ class ProviderClient:
     def __init__(self, on_event):
         self.on_event = on_event
         self.sock = None
+        self.provider_pid = None
         self.lock = threading.Lock()
         self.next_id = 1
 
@@ -44,10 +47,16 @@ class ProviderClient:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.connect(socket_path())
+            credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            pid, uid, _gid = struct.unpack("3i", credentials)
+            if uid != os.getuid():
+                sock.close()
+                return False
         except OSError:
             sock.close()
             return False
         self.sock = sock
+        self.provider_pid = pid
         threading.Thread(target=self._read, args=(sock,), daemon=True).start()
         return True
 
@@ -139,6 +148,8 @@ class SteamPage(Gtk.Box):
         self.state = {}
         self.login_kind = None        # "qr" or "password" while a sign-in is running
         self.started_provider = False
+        self.restarting_provider = False
+        self.restart_pending = False
 
         self.views = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vexpand=True)
         self.append(self.views)
@@ -830,6 +841,50 @@ class SteamPage(Gtk.Box):
     def provider_binary(self):
         return self.app.lib.settings.get("steam_provider") or DEFAULT_PROVIDER
 
+    def restart_provider(self):
+        if not self.client.connected() and not self.client.connect():
+            self.app.toast("Steam provider is not running")
+            return
+        pid = self.client.provider_pid
+        if not pid:
+            self.app.toast("Could not identify the Steam provider process")
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            self.app.toast("Could not stop Steam provider: %s" % error)
+            return
+        self.client.close()
+        self.client.provider_pid = None
+        self.restarting_provider = True
+        self.connecting.set_title("Restarting the Steam provider…")
+        self.views.set_visible_child_name("connecting")
+        deadline = time.monotonic() + 8
+
+        def wait_for_exit():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                self.restarting_provider = False
+                self.restart_pending = True
+                self._connect(force_start=True)
+                return False
+            except OSError as error:
+                self.restarting_provider = False
+                self.restart_pending = False
+                self.app.toast("Could not restart Steam provider: %s" % error)
+                return False
+            if time.monotonic() >= deadline:
+                self.restarting_provider = False
+                self.restart_pending = False
+                self.app.toast("Steam provider did not stop; check its log")
+                return False
+            return True
+
+        GLib.timeout_add(100, wait_for_exit)
+
     def _connect(self, force_start=False):
         if self.client.connected():
             return False
@@ -882,6 +937,9 @@ class SteamPage(Gtk.Box):
         if kind == "state":
             self.state = event
             self._show_state()
+            if self.restart_pending and event.get("state") == "signed_in":
+                self.restart_pending = False
+                self.app.toast("Steam provider restarted")
         elif kind == "qr" and self.login_kind == "qr":
             self.qr_code.set_text(event.get("url", ""))
             self.qr_stack.set_visible_child_name("code")
@@ -923,6 +981,8 @@ class SteamPage(Gtk.Box):
         elif kind == "warning":
             self.app.toast(event.get("message", ""))
         elif kind == "disconnected":
+            if self.restarting_provider:
+                return False
             self.login_kind = None
             self.connecting.set_title("Connecting to Steam…")
             self.views.set_visible_child_name("connecting")

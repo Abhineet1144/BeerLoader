@@ -1618,6 +1618,24 @@ class Manager(Adw.Application):
         steam_options = Adw.PreferencesGroup()
         steam_options.add(language)
         steam_options.add(bandwidth)
+        restart_provider = Gtk.Button(label="Restart", valign=Gtk.Align.CENTER)
+        restart_row = Adw.ActionRow(title="Restart Steam provider",
+                                    subtitle="Reconnect after changing networks; active downloads will pause.")
+        restart_row.add_suffix(restart_provider)
+        restart_row.set_activatable_widget(restart_provider)
+
+        def confirm_provider_restart(_button):
+            confirm = Adw.AlertDialog(heading="Restart Steam provider?",
+                                      body="The Steam connection will briefly disconnect. Active downloads may pause.")
+            confirm.add_response("cancel", "Cancel")
+            confirm.add_response("restart", "Restart")
+            confirm.set_response_appearance("restart", Adw.ResponseAppearance.DESTRUCTIVE)
+            confirm.connect("response", lambda _dialog, response:
+                            response == "restart" and self.steam_page.restart_provider())
+            confirm.present(self.window)
+
+        restart_provider.connect("clicked", confirm_provider_restart)
+        steam_options.add(restart_row)
         page.add(steam_options)
         folders = list(self.lib.settings.get("steam_libraries") or [STEAM_LIBRARY_DIR])
         folder_rows = []
