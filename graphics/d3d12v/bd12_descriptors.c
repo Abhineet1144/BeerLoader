@@ -8,9 +8,14 @@
 /* Buffer view cache ------------------------------------------------------- */
 
 #define VIEW_AGE_FRAMES 16
-#define VIEW_GC_MIN 4096
+/* A buffer's views are aged out once it holds this many (or twice what the previous pass kept). Engines bind typed
+ * slices of ring buffers at a new offset every frame (~70 new views a frame in Unreal), so this sets how much stale
+ * work a single pass does. At 4096 each pass destroyed thousands of views at once while every recording thread
+ * waited on the then device-wide lock, and the total grew through a session as more buffers filled up: hitches that
+ * got worse the longer a game ran (Chained Together). */
+#define VIEW_GC_MIN 512
 
-/* Device-wide totals for the profiler; guarded by view_lock. */
+/* Device-wide totals for the profiler; atomic (buffers update them under their own locks). */
 static uint64_t g_views, g_pinned;
 
 void bd12_view_stats(uint64_t *views, uint64_t *pinned)
@@ -40,23 +45,29 @@ static uint64_t view_key(VkFormat format, VkDeviceSize offset, VkDeviceSize rang
     return k ^ (k >> 29);
 }
 
-/* Frees unpinned views not looked up for `age` epochs, compacts the array and
- * rebuilds the hash. Runs with view_lock held. The game binds slices of ring
- * buffers at a new offset every frame, so without this the cache grows without
- * bound and the driver eventually fails buffer-view creation. */
-static void view_gc(BD12Buffer *buffer, uint64_t age)
+/* Removes unpinned views not looked up for `age` epochs, compacts the array and rebuilds the hash. Runs with the
+ * buffer's view_lock held. The game binds slices of ring buffers at a new offset every frame, so without this the cache
+ * grows without bound and the driver eventually fails buffer-view creation. The removed views are returned in *dead
+ * (malloc'd; the caller destroys them after unlocking, so the driver calls do not extend the lock) or destroyed here
+ * when that array cannot be allocated. */
+static void view_gc(BD12Buffer *buffer, uint64_t age, VkBufferView **dead, uint32_t *dead_count)
 {
     BD12Device *device = buffer->device;
-    uint32_t kept = 0;
+    VkBufferView *out = malloc((size_t)buffer->view_count * sizeof(*out));
+    uint32_t kept = 0, removed = 0;
     for (uint32_t i = 0; i < buffer->view_count; ++i) {
         BD12BufferView v = buffer->views[i];
         if (v.pins || v.last_use + age >= device->epoch) {
             buffer->views[kept++] = v;
         } else {
-            device->vk.DestroyBufferView(device->device, v.view, NULL);
-            --g_views;
+            if (out) out[removed] = v.view;
+            else device->vk.DestroyBufferView(device->device, v.view, NULL);
+            ++removed;
         }
     }
+    __atomic_sub_fetch(&g_views, removed, __ATOMIC_RELAXED);
+    *dead = out;
+    *dead_count = out ? removed : 0;
     buffer->view_count = kept;
     if (buffer->view_hash) {
         memset(buffer->view_hash, 0, ((size_t)buffer->view_hash_mask + 1) * sizeof(uint32_t));
@@ -71,22 +82,32 @@ static void view_gc(BD12Buffer *buffer, uint64_t age)
     buffer->view_gc_threshold = kept * 2 > VIEW_GC_MIN ? kept * 2 : VIEW_GC_MIN;
 }
 
-/* bd12_buffer_destroy, after the buffer left the live registry: under view_lock, so an unpin that saw the buffer
- * alive finishes first. */
+static void views_destroy(BD12Device *device, VkBufferView *dead, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i) device->vk.DestroyBufferView(device->device, dead[i], NULL);
+    free(dead);
+}
+
+/* bd12_buffer_destroy, after the buffer left the live registry: under the device view_lock (then the buffer's), so an
+ * unpin that saw the buffer alive finishes first. Lock order everywhere: device view_lock, then buffer view_lock. */
 void bd12_buffer_views_release(BD12Buffer *buffer)
 {
     BD12Device *device = buffer->device;
     pthread_mutex_lock(&device->view_lock);
+    pthread_mutex_lock(&buffer->view_lock);
+    uint64_t pinned = 0;
     for (uint32_t i = 0; i < buffer->view_count; ++i) {
         device->vk.DestroyBufferView(device->device, buffer->views[i].view, NULL);
-        if (buffer->views[i].pins) --g_pinned;
+        if (buffer->views[i].pins) ++pinned;
     }
-    g_views -= buffer->view_count;
+    __atomic_sub_fetch(&g_pinned, pinned, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&g_views, buffer->view_count, __ATOMIC_RELAXED);
     free(buffer->views);
     free(buffer->view_hash);
     buffer->views = NULL;
     buffer->view_hash = NULL;
     buffer->view_count = buffer->view_capacity = 0;
+    pthread_mutex_unlock(&buffer->view_lock);
     pthread_mutex_unlock(&device->view_lock);
 }
 
@@ -157,7 +178,11 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
                     (unsigned long long)range, (unsigned long long)buffer->size, storage);
     }
     VkBufferView found = VK_NULL_HANDLE;
-    pthread_mutex_lock(&device->view_lock);
+    VkBufferView *dead = NULL;
+    uint32_t dead_count = 0;
+    /* The caller holds a live reference to `buffer`, so its own lock suffices: lookups on different buffers no longer
+     * serialise, and an age-out pass blocks only users of this buffer. */
+    pthread_mutex_lock(&buffer->view_lock);
     /* A single buffer can accumulate thousands of (format, offset, range)
      * views (RE8 binds slices of a few huge buffers), so lookups go through an
      * open-addressed hash instead of scanning the array. */
@@ -174,7 +199,7 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
             if (v->format == format && v->offset == offset && v->range == range) {
                 found = v->view;
                 buffer->views[entry - 1].last_use = device->epoch;
-                if (pin && !buffer->views[entry - 1].pins++) ++g_pinned;
+                if (pin && !buffer->views[entry - 1].pins++) __atomic_add_fetch(&g_pinned, 1, __ATOMIC_RELAXED);
                 break;
             }
         }
@@ -182,7 +207,7 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
     if (!found) {
         if (buffer->view_count >= (buffer->view_gc_threshold ? buffer->view_gc_threshold : VIEW_GC_MIN) &&
             device->epoch > VIEW_AGE_FRAMES)
-            view_gc(buffer, VIEW_AGE_FRAMES);
+            view_gc(buffer, VIEW_AGE_FRAMES, &dead, &dead_count);
         VkBufferViewCreateInfo info = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
             .buffer = buffer->buffer,
@@ -193,8 +218,12 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
         VkResult view_result =
             device->vk.CreateBufferView(device->device, &info, NULL, &found);
         if (view_result != VK_SUCCESS && buffer->view_count && device->epoch > 2) {
-            /* Device memory pressure: drop everything idle for a couple of frames and retry. */
-            view_gc(buffer, 2);
+            /* Device memory pressure: drop everything idle for a couple of frames and retry (destroyed now: the
+             * retry needs the memory back). */
+            VkBufferView *pressure = NULL;
+            uint32_t pressure_count = 0;
+            view_gc(buffer, 2, &pressure, &pressure_count);
+            views_destroy(device, pressure, pressure_count);
             view_result = device->vk.CreateBufferView(device->device, &info, NULL, &found);
         }
         {   /* BEER_BD12_VIEW_LOG=1: running count of cached views and failure codes. */
@@ -244,8 +273,8 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
             if (stored) {
                 buffer->views[buffer->view_count] = (BD12BufferView){
                     format, offset, range, found, device->epoch, pin ? 1u : 0u };
-                ++g_views;
-                if (pin) ++g_pinned;
+                __atomic_add_fetch(&g_views, 1, __ATOMIC_RELAXED);
+                if (pin) __atomic_add_fetch(&g_pinned, 1, __ATOMIC_RELAXED);
                 uint32_t slot = (uint32_t)key & buffer->view_hash_mask;
                 while (buffer->view_hash[slot])
                     slot = (slot + 1) & buffer->view_hash_mask;
@@ -265,7 +294,8 @@ static VkBufferView buffer_view_impl(BD12Buffer *buffer, VkFormat format,
             found = VK_NULL_HANDLE;
         }
     }
-    pthread_mutex_unlock(&device->view_lock);
+    pthread_mutex_unlock(&buffer->view_lock);
+    views_destroy(device, dead, dead_count);     /* aged out VIEW_AGE_FRAMES frames ago: the GPU is done with them */
     return found;
 }
 
@@ -278,21 +308,24 @@ void bd12_buffer_view_unpin(BD12Device *device, BD12Buffer *buffer, uint32_t ser
     if (!buffer) return;
     /* `buffer` may already be freed: nothing is read through it until the live check below passes. */
     pthread_mutex_lock(&device->view_lock);   /* bd12_buffer_destroy frees the views under this lock */
-    if (bd12_live_has(buffer) && buffer->serial == serial && buffer->view_hash) {
-        range = view_range(buffer, format, offset, range);
+    if (bd12_live_has(buffer) && buffer->serial == serial) {
+        pthread_mutex_lock(&buffer->view_lock);
+        range = buffer->view_hash ? view_range(buffer, format, offset, range) : 0;
         const uint64_t key = view_key(format, offset, range);
-        for (uint32_t slot = (uint32_t)key & buffer->view_hash_mask;; slot = (slot + 1) & buffer->view_hash_mask) {
+        for (uint32_t slot = (uint32_t)key & buffer->view_hash_mask; buffer->view_hash;
+             slot = (slot + 1) & buffer->view_hash_mask) {
             const uint32_t entry = buffer->view_hash[slot];
             if (!entry) break;
             BD12BufferView *v = &buffer->views[entry - 1];
             if (v->format == format && v->offset == offset && v->range == range) {
                 if (v->pins && !--v->pins) {
-                    --g_pinned;
+                    __atomic_sub_fetch(&g_pinned, 1, __ATOMIC_RELAXED);
                     v->last_use = device->epoch;
                 }
                 break;
             }
         }
+        pthread_mutex_unlock(&buffer->view_lock);
     }
     pthread_mutex_unlock(&device->view_lock);
 }

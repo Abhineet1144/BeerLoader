@@ -578,6 +578,28 @@ static const void *ll_present_id_chain(VkPresentIdKHR *present_id, uint64_t *id)
     return chain;
 }
 
+/* Whether an acquire/present result calls for a new swapchain. VK_SUBOPTIMAL_KHR still presents correctly; the
+ * NVIDIA driver on XWayland reports it whenever the compositor changes how it shows the window, and rebuilding on it
+ * (a full device idle plus a new swapchain each time) put large visible hitches into gameplay while Beer's own frame
+ * timing looked fine (Chained Together: ~20 rebuilds in 2 minutes). A DXGI swapchain is never rebuilt behind the
+ * game's back, so keep presenting and rebuild only when the swapchain is out of date or the size changes.
+ * BEER_SWAPCHAIN_RECREATE_SUBOPTIMAL=1 restores the old behaviour. */
+static int swapchain_needs_recreate(VkResult result, const char *where)
+{
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        fprintf(stderr, "[VULKAN] swapchain out of date at %s: recreating\n", where);
+        return 1;
+    }
+    if (result != VK_SUBOPTIMAL_KHR) return 0;
+    static unsigned long long suboptimal;
+    static int recreate = -1;
+    if (recreate < 0) recreate = getenv("BEER_SWAPCHAIN_RECREATE_SUBOPTIMAL") != NULL;
+    if (!(suboptimal++ % 256))
+        fprintf(stderr, "[VULKAN] swapchain suboptimal at %s (%llu so far): %s\n", where, suboptimal,
+                recreate ? "recreating" : "kept");
+    return recreate;
+}
+
 static int recreate_swapchain(int requested_width, int requested_height,
                               int source_width, int source_height)
 {
@@ -868,6 +890,10 @@ static int present_rgba8_staging(void *display, unsigned long window,
         g_vk.extent.height != (uint32_t)output_height ||
         g_vk.upload_extent.width != (uint32_t)width ||
         g_vk.upload_extent.height != (uint32_t)height) {
+        if (g_vk.swapchain)
+            fprintf(stderr, "[VULKAN] swapchain resize: output %ux%u -> %dx%d, source %ux%u -> %dx%d\n",
+                    g_vk.extent.width, g_vk.extent.height, output_width, output_height,
+                    g_vk.upload_extent.width, g_vk.upload_extent.height, width, height);
         if (!recreate_swapchain(output_width, output_height, width, height)) return 0;
     }
 
@@ -940,9 +966,10 @@ static int present_rgba8_staging(void *display, unsigned long window,
                     (unsigned long long)dropped_presents);
         return 1;
     }
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+    if (swapchain_needs_recreate(result, "acquire")) {
         return recreate_swapchain(output_width, output_height, width, height);
     }
+    if (result == VK_SUBOPTIMAL_KHR) result = VK_SUCCESS;   /* the acquired image is valid */
     if (result != VK_SUCCESS) {
         beer_vulkan_record_result(result, "swapchain image acquisition");
         return 0;
@@ -1096,10 +1123,10 @@ static int present_rgba8_staging(void *display, unsigned long window,
     beer_vulkan_record_result(result, "queue presentation");
     g_vk.upload_initialized = 1;
     g_vk.image_initialized[image_index] = 1;
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+    if (swapchain_needs_recreate(result, "present")) {
         return recreate_swapchain(output_width, output_height, width, height);
     }
-    return result == VK_SUCCESS;
+    return result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
 }
 
 int vulkan_presenter_present_rgba8(void *display, unsigned long window,
@@ -1155,6 +1182,10 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
         g_vk.extent.height != (uint32_t)output_height ||
         g_vk.upload_extent.width != (uint32_t)width ||
         g_vk.upload_extent.height != (uint32_t)height) {
+        if (g_vk.swapchain)
+            fprintf(stderr, "[VULKAN] swapchain resize: output %ux%u -> %dx%d, source %ux%u -> %dx%d\n",
+                    g_vk.extent.width, g_vk.extent.height, output_width, output_height,
+                    g_vk.upload_extent.width, g_vk.upload_extent.height, width, height);
         if (!recreate_swapchain(output_width, output_height, width, height))
             return 0;
     }
@@ -1192,8 +1223,9 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
                                                 g_vk.image_available,
                                                 VK_NULL_HANDLE, &image_index);
     if (result == VK_TIMEOUT || result == VK_NOT_READY) return 1;
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+    if (swapchain_needs_recreate(result, "acquire"))
         return recreate_swapchain(output_width, output_height, width, height);
+    if (result == VK_SUBOPTIMAL_KHR) result = VK_SUCCESS;   /* the acquired image is valid */
     if (result != VK_SUCCESS) {
         record_direct_present(sequence, "acquire-failed", source_image,
                               source_layout, width, height, output_width,
@@ -1370,9 +1402,9 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
     beer_vulkan_record_result(result, "queue presentation");
     if (!direct_blit) g_vk.upload_initialized = 1;
     g_vk.image_initialized[image_index] = 1;
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+    if (swapchain_needs_recreate(result, "present"))
         return recreate_swapchain(output_width, output_height, width, height);
-    return result == VK_SUCCESS;
+    return result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
 }
 
 int vulkan_presenter_is_active(void)

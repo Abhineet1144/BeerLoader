@@ -4,6 +4,7 @@
 #define W32_SIG_FWD \
     W32_FWD("CompareFileTime", 8), \
     W32_FWD("CreateNamedPipeW", 32), \
+    W32_FWD("SetNamedPipeHandleState", 16), \
     W32_FWD("GetComputerNameW", 8), \
     W32_FWD("GetCurrentThread", 0), \
     W32_FWD("GetDriveTypeW", 4), \
@@ -184,7 +185,6 @@
 #define W32_SIG_FAIL \
     {"DeviceIoControl", w32_unsupported, 32}, \
     {"GetOverlappedResult", w32_unsupported, 16}, \
-    {"SetNamedPipeHandleState", w32_unsupported, 16}, \
     {"TransactNamedPipe", w32_unsupported, 28}, \
     {"VirtualQueryEx", w32_VirtualQueryEx, 16}, \
     {"GetProfileStringW", w32_unsupported, 20}, \

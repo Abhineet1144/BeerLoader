@@ -775,6 +775,26 @@ static VkDescriptorSet resolve_set_impl(
                 bd12_capture_srv_depth(list, r.image, r.view_mip, r.view_base_layer,
                                        r.view_layers, list->compute_pipeline->shader_hash,
                                        b->reg + e);
+            {   /* Diagnostic BEER_BD12_CB_DUMP=<hash prefix>: the constant buffers a matching compute shader is recorded with */
+                static const char *want = (const char *)1;
+                if (want == (const char *)1) want = getenv("BEER_BD12_CB_DUMP");
+                if (want && state == &list->compute && list->compute_pipeline && r.kind == BD12_DESC_CBV) {
+                    char hex[20];
+                    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)list->compute_pipeline->shader_hash);
+                    if (!strncmp(hex, want, strlen(want))) {
+                        const BD12Buffer *sb = r.source_buffer;
+                        if (sb && sb->cpu) {
+                            const uint32_t *w = (const uint32_t *)((const uint8_t *)sb->cpu + r.offset);
+                            fprintf(stderr, "[CBDUMP] cs=%s b%u space%u range=%llu:", hex, b->reg + e, b->space, (unsigned long long)r.range);
+                            for (uint32_t k = 0; k < 24 && k * 4 < r.range; ++k) fprintf(stderr, " %08x", w[k]);
+                            fprintf(stderr, "\n");
+                        } else {
+                            fprintf(stderr, "[CBDUMP] cs=%s b%u space%u range=%llu: GPU-only (va %llx)\n", hex, b->reg + e, b->space,
+                                    (unsigned long long)r.range, (unsigned long long)(sb ? sb->va + r.offset : 0));
+                        }
+                    }
+                }
+            }
             if (__atomic_load_n(&g_bd12_cbt_active, __ATOMIC_RELAXED) && r.kind == BD12_DESC_CBV && r.source_buffer) {
                 const uint64_t pso = state == &list->graphics ? (list->gfx.pipeline ? list->gfx.pipeline->shader_hash : 0)
                                                               : (list->compute_pipeline ? list->compute_pipeline->shader_hash : 0);
@@ -1086,11 +1106,77 @@ static int skip_compute(uint64_t hash)
     return 0;
 }
 
+/* Diagnostic BEER_BD12_CB_DUMP=<hash prefix>: at record time, every root CBV (when CPU-visible) and root constant of a
+ * matching compute dispatch, in either binding model. */
+static void cb_dump_dispatch(BD12CmdList *list, const BD12BindState *state, uint64_t hash)
+{
+    static const char *want = (const char *)1;
+    if (want == (const char *)1) want = getenv("BEER_BD12_CB_DUMP");
+    if (!want || !state || !state->root_signature) return;
+    char hex[20];
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)hash);
+    if (strncmp(hex, want, strlen(want))) return;
+    const BD12RootSignature *rs = state->root_signature;
+    for (uint32_t p = 0; p < rs->parameter_count; ++p) {
+        const BD12RootParameter *rp = &rs->parameters[p];
+        const BD12RootArgument *arg = &state->arguments[p];
+        static unsigned root_shown;
+        if ((rp->type == BD12_ROOT_CONSTANTS || rp->type == BD12_ROOT_CBV) && root_shown++ > 12) continue;
+        if (rp->type == BD12_ROOT_CONSTANTS) {
+            fprintf(stderr, "[CBDUMP] cs=%s param%u constants b%u space%u:", hex, p, rp->shader_register, rp->space);
+            for (uint32_t k = 0; k < rp->dword_count && k < 24; ++k) fprintf(stderr, " %08x", arg->constants[k]);
+            fprintf(stderr, "\n");
+        } else if (rp->type == BD12_ROOT_TABLE && list->heaps[0] && arg->value >= list->heaps[0]->gpu_base) {
+            /* Table CBVs: printed only when words 7 or 15 (the SDF march's cascade and step counts, read as uint)
+             * look wrong, so normal frames stay quiet. */
+            const BD12DescriptorHeap *heap = list->heaps[0];
+            const uint64_t first = (arg->value - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT;
+            uint32_t next = 0;
+            for (uint32_t r = 0; r < rp->range_count; ++r) {
+                const BD12DescriptorRange *dr = &rp->ranges[r];
+                const uint32_t off = dr->offset == BD12_RANGE_APPEND ? next : dr->offset;
+                next = dr->count == UINT32_MAX ? off : off + dr->count;
+                if (dr->type != BD12_RANGE_CBV) continue;
+                const uint32_t count = dr->count == UINT32_MAX || dr->count > 16 ? 16 : dr->count;
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint64_t k = first + off + i;
+                    if (k >= heap->count) break;
+                    const BD12Descriptor *d = &heap->descriptors[k];
+                    const BD12Buffer *sb = d->source_buffer;
+                    if (d->kind != BD12_DESC_CBV) continue;
+                    const uint32_t *w = sb && sb->cpu ? (const uint32_t *)((const uint8_t *)sb->cpu + d->offset) : NULL;
+                    static unsigned shown;
+                    if (dr->base_register + i != 9 || shown++ > 3000) continue;   /* b9 only: the SDF march constants */
+                    fprintf(stderr, "[CBDUMP] cs=%s param%u table CBV b%u space%u range=%llu:", hex, p, dr->base_register + i,
+                            dr->space, (unsigned long long)d->range);
+                    if (!w) fprintf(stderr, " %s", sb ? "GPU-only" : "no source buffer");
+                    for (uint32_t q = 0; w && q < 24 && q * 4 + 4 <= d->range; ++q) fprintf(stderr, " %08x", w[q]);
+                    fprintf(stderr, "\n");
+                }
+            }
+        } else if (rp->type == BD12_ROOT_CBV) {
+            VkDeviceSize offset = 0;
+            BD12Buffer *b = arg->value ? bd12_va_resolve(list->device, arg->value, &offset) : NULL;
+            if (b && b->cpu) {
+                const uint32_t *w = (const uint32_t *)((const uint8_t *)b->cpu + offset);
+                fprintf(stderr, "[CBDUMP] cs=%s param%u CBV b%u space%u va=%llx:", hex, p, rp->shader_register, rp->space,
+                        (unsigned long long)arg->value);
+                for (uint32_t k = 0; k < 24 && offset + k * 4 + 4 <= b->size; ++k) fprintf(stderr, " %08x", w[k]);
+                fprintf(stderr, "\n");
+            } else {
+                fprintf(stderr, "[CBDUMP] cs=%s param%u CBV b%u space%u va=%llx: %s\n", hex, p, rp->shader_register, rp->space,
+                        (unsigned long long)arg->value, b ? "GPU-only" : "no buffer");
+            }
+        }
+    }
+}
+
 int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
                             uint32_t z)
 {
     BD12ComputePipeline *pso = list->compute_pipeline;
     if (pso) bd12_cs_watch_count(pso->shader_hash);
+    if (pso) cb_dump_dispatch(list, &list->compute, pso->shader_hash);
     if (pso && skip_compute(pso->shader_hash)) return 1;
     if (pso && pso->db_layout && list->compute.root_signature) {
         if (bd12_debug_sync_all()) bd12_cmd_global_barrier(list);
@@ -1165,11 +1251,47 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
     return 1;
 }
 
+/* Diagnostic BEER_BD12_IND_ARGS=1: the arguments of every indirect dispatch are copied (before it runs) into a
+ * host-visible ring; bd12_ind_args_dump (kill -USR1, with the GPU checkpoints) prints the newest entries, so the
+ * group counts of a dispatch that hangs the GPU can be read afterwards. */
+#define IND_ARGS_RING 256u
+static BD12Buffer *g_ind_args_rb;
+static uint64_t g_ind_args_hash[IND_ARGS_RING];
+static uint32_t g_ind_args_next;
+static void ind_args_record(BD12CmdList *list, uint64_t hash, BD12Buffer *args, VkDeviceSize offset)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_BD12_IND_ARGS") != NULL;
+    if (!on || !args) return;
+    if (!g_ind_args_rb) g_ind_args_rb = bd12_buffer_create_committed(list->device, BD12_HEAP_READBACK, IND_ARGS_RING * 16);
+    if (!g_ind_args_rb || !g_ind_args_rb->cpu) return;
+    const uint32_t slot = __atomic_fetch_add(&g_ind_args_next, 1, __ATOMIC_RELAXED) % IND_ARGS_RING;
+    g_ind_args_hash[slot] = hash;
+    bd12_cmd_global_barrier(list);
+    const VkBufferCopy region = { offset, (VkDeviceSize)slot * 16, 12 };
+    list->device->vk.CmdCopyBuffer(list->command_buffer, args->buffer, g_ind_args_rb->buffer, 1, &region);
+    bd12_cmd_global_barrier(list);
+}
+void bd12_ind_args_dump(void)
+{
+    if (!g_ind_args_rb || !g_ind_args_rb->cpu) return;
+    const uint32_t next = __atomic_load_n(&g_ind_args_next, __ATOMIC_RELAXED);
+    const uint32_t first = next > 32 ? next - 32 : 0;
+    fprintf(stderr, "[INDARGS] newest indirect dispatches (%u recorded):\n", next);
+    for (uint32_t n = first; n < next; ++n) {
+        const uint32_t slot = n % IND_ARGS_RING;
+        const uint32_t *v = (const uint32_t *)((const uint8_t *)g_ind_args_rb->cpu + (size_t)slot * 16);
+        fprintf(stderr, "[INDARGS]   #%u cs=%016llx groups=%u,%u,%u\n", n, (unsigned long long)g_ind_args_hash[slot],
+                v[0], v[1], v[2]);
+    }
+}
+
 int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
                                      VkDeviceSize offset)
 {
     BD12ComputePipeline *pso = list->compute_pipeline;
     if (pso) bd12_cs_watch_count(pso->shader_hash);
+    if (pso && skip_compute(pso->shader_hash)) return 1;   /* BEER_BD12_SKIP_CS covers indirect dispatches too */
     if (bd12_trace_active())
         fprintf(stderr, "[TRACE] dispatch-indirect cs=%016llx args=%llx+%llu list=%p%s\n",
                 (unsigned long long)(pso ? pso->shader_hash : 0), (unsigned long long)(args ? args->va : 0),
@@ -1177,6 +1299,7 @@ int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
     if (pso && pso->db_layout && list->compute.root_signature) {
         bd12_cmd_end_rendering(list);
         if (!bind_compute_db(list, pso)) return 0;
+        ind_args_record(list, pso->shader_hash, args, offset);
         record_dispatch(list, 0, 0, 0, 1);
         list->device->vk.CmdDispatchIndirect(list->command_buffer, args->buffer, offset);
         bd12_capture_dispatch_step(list, &list->compute, pso->shader_hash);

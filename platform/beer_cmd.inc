@@ -261,6 +261,10 @@ static int cmd_run_program(const char *raw_command, int argc, char words[][PATH_
     const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
     if (n <= 0) return 1;
     self[n] = 0;
+    {   /* replaced on disk since this process started */
+        const size_t len = strlen(self), tag = sizeof(" (deleted)") - 1;
+        if (len > tag && !strcmp(self + len - tag, " (deleted)")) self[len - tag] = 0;
+    }
     char *argv[64];
     int k = 0;
     argv[k++] = self;
@@ -276,7 +280,9 @@ static int cmd_run_program(const char *raw_command, int argc, char words[][PATH_
     argv[k] = NULL;
     pid_t pid;
     extern char **environ;
-    if (posix_spawn(&pid, self, NULL, NULL, argv, environ) != 0) return 1;
+    setenv("_BEER_INHERIT_CWD", "1", 1);   /* the program starts in cmd's current directory, as on Windows */
+    /* /proc/self/exe, not the path: it still runs this build after the loader file was rebuilt (replaced). */
+    if (posix_spawn(&pid, "/proc/self/exe", NULL, NULL, argv, environ) != 0) return 1;
     fprintf(stderr, "[CMD] started pid %d: %s\n", (int)pid, raw_command);
     if (nowait) return 0;
     int status = 0;

@@ -762,7 +762,8 @@ static u64 __attribute__((ms_abi)) impl_PropVariantClear(u8 *value)
     if (!value) return 0;
     u16 vt = *(u16 *)value;
     void *data = *(void **)(value + 8);
-    if ((vt == 30 || vt == 31) && data) free(data);                       /* VT_LPSTR / VT_LPWSTR */
+    if ((vt == 30 || vt == 31 || vt == 72) && data) free(data);           /* VT_LPSTR / VT_LPWSTR / VT_CLSID */
+    else if (vt == 0x1011) free(*(void **)(value + 16));                  /* VT_VECTOR | VT_UI1: pElems */
     else if (vt == 65 || vt == 70) free(*(void **)(value + 16));          /* VT_BLOB / VT_BLOB_OBJECT: pBlobData */
     else if (vt == 8 && data) impl_SysFreeString(data);                   /* VT_BSTR */
     else if ((vt == 9 || vt == 13) && data)                               /* VT_DISPATCH / VT_UNKNOWN */

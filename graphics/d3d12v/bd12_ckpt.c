@@ -66,8 +66,10 @@ static void print_entry(const Entry *e)
     if (e->args) fprintf(stderr, " args=%llx count=%llx", (unsigned long long)e->args, (unsigned long long)e->count);
 }
 
+void bd12_ind_args_dump(void);   /* bd12_bind.c, BEER_BD12_IND_ARGS */
 void bd12_ckpt_dump(void)
 {
+    bd12_ind_args_dump();
     if (g_state <= 0 || !g_device) return;
     static int busy;
     if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) return;

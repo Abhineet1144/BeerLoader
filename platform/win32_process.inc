@@ -367,7 +367,7 @@ static char **beer_inherit_environment(const char *extra, const char *image)
 {
     size_t n = 0;
     while (environ[n]) ++n;
-    char **env = calloc(n + 6, sizeof(*env));
+    char **env = calloc(n + 7, sizeof(*env));
     if (!env) return NULL;
     size_t k = 0;
     for (size_t i = 0; i < n; ++i)
@@ -375,11 +375,13 @@ static char **beer_inherit_environment(const char *extra, const char *image)
             strncmp(environ[i], BEER_CHILD_ENV, strlen(BEER_CHILD_ENV)) &&
             strncmp(environ[i], "_BEER_PRIMARY_TOKEN=", 20) &&
             strncmp(environ[i], "_BEER_IMAGE_NAME=", 17) &&
-            strncmp(environ[i], "_BEER_GUEST_STDOUT=", 19)) env[k++] = environ[i];
+            strncmp(environ[i], "_BEER_GUEST_STDOUT=", 19) &&
+            strncmp(environ[i], "_BEER_INHERIT_CWD=", 18)) env[k++] = environ[i];
     if (extra) env[k++] = (char *)extra;
     if (image) env[k++] = (char *)image;
     env[k++] = beer_process_elevated() ? "_BEER_PRIMARY_TOKEN=1" : "_BEER_PRIMARY_TOKEN=0";
     if (w32_child_std_fd(1) >= 0) env[k++] = "_BEER_GUEST_STDOUT=1";   /* the child's stdout is a redirected stream */
+    env[k++] = "_BEER_INHERIT_CWD=1";   /* keep the directory it is spawned in (lpCurrentDirectory or ours) */
     env[k] = NULL;
     return env;
 }
@@ -559,6 +561,10 @@ static u64 beer_create_process_in(const char *application, const char *command_l
     ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
     if (n <= 0) { g_last_error = 5; return 0; }
     self[n] = 0;
+    {   /* replaced on disk since this process started */
+        const size_t len = strlen(self), tag = sizeof(" (deleted)") - 1;
+        if (len > tag && !strcmp(self + len - tag, " (deleted)")) self[len - tag] = 0;
+    }
 
     char *argv[64];
     int argc = 0;
@@ -646,11 +652,14 @@ static u64 beer_create_process_in(const char *application, const char *command_l
     env[env_count++] = launch.env;
     env[env_count] = NULL;
     u64 process = beer_proc_alloc(0, 1);
-    int rc = process ? posix_spawn(&pid, self, actions, NULL, argv, env) : ENOMEM;
+    /* Through /proc/self/exe rather than the path: a rebuild that replaces the loader file while a program runs
+     * ("loader (deleted)") made every later child fail with ENOENT, and the child runs the parent's own build. */
+    int rc = process ? posix_spawn(&pid, "/proc/self/exe", actions, NULL, argv, env) : ENOMEM;
     if (std_ready) posix_spawn_file_actions_destroy(&std_actions);
     free(env);
     if (have_inherit) beer_inherit_release(&inherit);
     if (rc != 0) {
+        fprintf(stderr, "[PROCESS] spawning the loader for %s failed: %s\n", host, strerror(rc));
         beer_child_discard(&launch);
         if (process) beer_proc_close(process);
         g_last_error = rc == ENOMEM ? 8 : 5;
@@ -1150,7 +1159,20 @@ static u64 __attribute__((ms_abi))
 beer_SetNamedPipeHandleState(u64 handle, u32 *mode, u32 *max_collection, u32 *timeout)
 {
     (void)max_collection; (void)timeout;
-    if (!beer_pipe_is_pipe(handle)) { g_last_error = 6; return 0; }
+    if (!beer_pipe_is_pipe(handle)) {
+        /* An anonymous pipe (CreatePipe): on Windows it is a named pipe too, so its mode can be set. It is a byte
+         * pipe, so message read mode is invalid; PIPE_NOWAIT makes reads on an empty pipe fail with ERROR_NO_DATA
+         * instead of blocking. FitGirl's rzw.exe sets the mode on its pipe ends and gave up when this failed. */
+        const int fd = fh_get(handle);
+        struct stat st;
+        if (fd < 0 || fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode)) { g_last_error = 6; return 0; }
+        if (mode) {
+            if (*mode & 2u) { g_last_error = 87; return 0; }                  /* PIPE_READMODE_MESSAGE */
+            const int flags = fcntl(fd, F_GETFL);
+            if (flags >= 0) fcntl(fd, F_SETFL, (*mode & 1u) ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
+        }
+        return 1;
+    }
     if (mode) g_pipe_info[(u32)(handle - 0x70000000ULL)].nowait = (*mode & 1u) ? 1 : 0;
     return 1;
 }

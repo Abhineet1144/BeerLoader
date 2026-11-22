@@ -6,7 +6,7 @@ TARGET = loader
 .DEFAULT_GOAL := $(TARGET)
 
 AUDIO_SRCS = audio/audio_backend.c audio/wasapi_compat.c
-MEDIA_SRCS = media/media_foundation.c
+MEDIA_SRCS = media/media_foundation.c media/media_session.c
 PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_environment.c platform/win32_shared_data.c platform/win32_apiset.c platform/win32_bcrypt.c platform/win32_version.c platform/win32_winhttp_url.c platform/win32_winhttp.c platform/win32_full_path.c platform/win32_gdi.c platform/win32_gdiplus.c platform/win32_resource.c platform/win32_address_wait.c platform/win32_registered_message.c platform/win32_tsf.c platform/beer_time.c platform/beer_control.c platform/beer_memory.c platform/beer_objects.c platform/beer_overlay.c platform/beer_post.c platform/beer_capture.c platform/beer_gpu_stats.c \
 				platform/win32_nt_section.c platform/win32_virtual_memory.c platform/win32_entry.c platform/win32_onexit.c platform/win32_crt_init.c \
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
@@ -158,6 +158,9 @@ audio/wasapi_compat.o: audio/wasapi_compat.c audio/wasapi_compat.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Iaudio -c $< -o $@
 
 media/media_foundation.o: media/media_foundation.c media/media_foundation.h
+	$(CC) $(D3D12_ABI_CFLAGS) -Imedia -c $< -o $@
+
+media/media_session.o: media/media_session.c media/media_session.h
 	$(CC) $(D3D12_ABI_CFLAGS) -Imedia -c $< -o $@
 
 platform/win32_tsf.o: platform/win32_tsf.c platform/win32_tsf.h

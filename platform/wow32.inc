@@ -605,6 +605,20 @@ u64 w32_dispatch(u32 index)
                 }
             }
         }
+        if (strstr(t->name, "cmp")) {   /* cdecl (msvcrt) functions record no argument bytes */
+            /* String comparisons: both operands, quoted in full even when empty or not printable at the start. */
+            for (int a = 0; a < 2; ++a) {
+                char s[66];
+                struct iovec local = { s, 64 }, remote = { (void *)(uintptr_t)args[a], 64 };
+                const ssize_t got = args[a] > 0x10000 ? process_vm_readv(getpid(), &local, 1, &remote, 1, 0) : -1;
+                if (got <= 0) continue;
+                s[got] = 0;
+                fprintf(stderr, " %c[", a ? 'b' : 'a');
+                for (ssize_t k = 0; k < got && s[k]; ++k)
+                    fprintf(stderr, s[k] >= 32 && s[k] < 127 ? "%c" : "\\x%02x", (unsigned char)s[k]);
+                fputc(']', stderr);
+            }
+        }
         fputc('\n', stderr);
     }
     if (!t_w32_state)
@@ -1184,6 +1198,23 @@ static u64 w32_fwrite(const u32 *args)
 
 /* printf-style formatting where the arguments are 32-bit stack slots (int, pointer: one slot; 64-bit integer: two).
  * Floating-point conversions are not supported (the loader is built without SSE): their two slots are skipped. */
+/* Set while formatting for the wide printf family (swprintf): there %s and %c take wide arguments and %S / %hs
+ * narrow ones, the reverse of printf. */
+static _Thread_local int t_w32_format_wide;
+/* A guest UTF-16 string, narrowed (non-ASCII as '?'); NULL when unreadable. */
+static const char *w32_narrow_guest_wide(u32 address, char *out, size_t capacity)
+{
+    if (!address) return NULL;
+    u16 chunk[512];
+    struct iovec local = { chunk, sizeof(chunk) }, remote = { (void *)(uintptr_t)address, sizeof(chunk) };
+    ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (got < 2) { local.iov_len = remote.iov_len = 2; got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0); }
+    if (got < 2) return NULL;
+    size_t i = 0;
+    for (; i + 1 < capacity && i < (size_t)got / 2 && chunk[i]; ++i) out[i] = chunk[i] < 0x80 ? (char)chunk[i] : '?';
+    out[i] = 0;
+    return out;
+}
 static size_t w32_format(char *out, size_t capacity, const char *format, const u32 *va)
 {
     size_t length = 0;
@@ -1206,13 +1237,15 @@ static size_t w32_format(char *out, size_t capacity, const char *format, const u
             if (*format == '*') { n += (size_t)snprintf(spec + n, sizeof(spec) - n, "%d", (int)*va++); ++format; }
             else while (isdigit((unsigned char)*format) && n < 40) spec[n++] = *format++;
         }
-        int wide = 0, shorts = 0;
+        int wide = 0, shorts = 0, longs = 0;
         if (format[0] == 'I' && format[1] == '6' && format[2] == '4') { wide = 1; format += 3; }
         else if (format[0] == 'I' && format[1] == '3' && format[2] == '2') format += 3;
         else if (format[0] == 'l' && format[1] == 'l') { wide = 1; format += 2; }
         else for (; *format == 'h' || *format == 'l' || *format == 'z' || *format == 'j' || *format == 't' ||
-                    *format == 'L'; ++format)
+                    *format == 'L'; ++format) {
                  if (*format == 'h') ++shorts;
+                 if (*format == 'l') ++longs;
+             }
         const char conversion = *format;
         if (!conversion) break;
         switch (conversion) {
@@ -1232,11 +1265,27 @@ static size_t w32_format(char *out, size_t capacity, const char *format, const u
             W32_EMIT(spec, v);
             break;
         }
-        case 'c':
+        case 'c': case 'C':
             spec[n++] = 'c'; spec[n] = 0;
-            W32_EMIT(spec, (int)*va++);
+            {   /* a wide character prints narrowed */
+                const int wide_char = conversion == 'C' ? !(t_w32_format_wide && longs == 0 && shorts == 0) || longs
+                                                        : (t_w32_format_wide ? !shorts : longs > 0);
+                const u32 c = *va++;
+                W32_EMIT(spec, wide_char ? (int)((c & 0xffff) < 0x80 ? (c & 0xffff) : '?') : (int)(u8)c);
+            }
             break;
+        case 'S':
         case 's': {
+            /* Wide argument: %ls / %S in printf; %s / %ls in wprintf (%hs / %S there are narrow). */
+            const int wide_text = conversion == 'S' ? (t_w32_format_wide ? longs > 0 : !shorts)
+                                                    : (t_w32_format_wide ? !shorts : longs > 0);
+            if (wide_text) {
+                char narrow[1024];
+                const char *text = w32_narrow_guest_wide(*va++, narrow, sizeof(narrow));
+                spec[n++] = 's'; spec[n] = 0;
+                W32_EMIT(spec, text ? text : "(null)");
+                break;
+            }
             const char *text = (const char *)(uintptr_t)*va++;
             if (text) {                                  /* an unreadable pointer prints as (null) instead of faulting */
                 char probe;
@@ -1332,6 +1381,57 @@ static u64 w32_getmainargs(const u32 *args)
 static u64 w32_p_environ(const u32 *args) { (void)args; return (u32)(uintptr_t)w32_cell(&g_w32_environ_cell); }
 static u64 w32_p_fmode(const u32 *args) { (void)args; return (u32)(uintptr_t)w32_cell(&g_w32_fmode_cell); }
 static u64 w32_set_app_type(const u32 *args) { (void)args; return 0; }
+/* Rest of the MSVCRT start-up surface of programs built with older Visual C++ (FitGirl's rzw.exe): the C runtime's
+ * mainCRTStartup writes _commode through __p__commode and reads __initenv, so a null return crashed it at once. */
+static u32 *g_w32_commode_cell, *g_w32_initenv_cell;
+static u64 w32_p_commode(const u32 *args) { (void)args; return (u32)(uintptr_t)w32_cell(&g_w32_commode_cell); }
+static u64 w32_p_initenv(const u32 *args)
+{
+    (void)args;
+    u32 *cell = w32_cell(&g_w32_initenv_cell);
+    if (!*cell && g_w32_environ_cell) *cell = *g_w32_environ_cell;   /* __initenv is the environment main() got */
+    return (u32)(uintptr_t)cell;
+}
+static u64 w32_setusermatherr(const u32 *args) { (void)args; return 0; }
+/* _controlfp(new, mask): Beer leaves the x87/SSE control state as the process starts it; report Windows' default
+ * (_CW_DEFAULT: all exceptions masked, 53-bit precision, round to nearest) so callers saving and restoring it work. */
+static u64 w32_controlfp(const u32 *args) { (void)args; return 0x0009001Fu; }
+/* Language-specific SEH handlers and filters of the VC runtime, used only while an exception is dispatched: decline
+ * (ExceptionContinueSearch / EXCEPTION_CONTINUE_SEARCH), so the search goes on to the next handler. */
+static u64 w32_except_handler3(const u32 *args) { (void)args; return 1; }
+static u64 w32_xcptfilter(const u32 *args) { (void)args; return 0; }
+static u64 w32_crt_underscore_exit(const u32 *args) { impl_ExitProcess(args[0]); _exit((int)args[0]); }
+/* swprintf(buffer, format, ...): the old MSVCRT form without a count. Formatted narrow (non-ASCII as '?'). */
+static u64 w32_crt_swprintf(const u32 *args)
+{
+    u16 *out = W32_PTR(0);
+    const u16 *wformat = W32_PTR(1);
+    if (!out || !wformat) return (u32)-1;
+    char format[2048];
+    size_t i = 0;
+    for (; i + 1 < sizeof(format) && wformat[i]; ++i) format[i] = wformat[i] < 0x80 ? (char)wformat[i] : '?';
+    format[i] = 0;
+    char text[8192];
+    t_w32_format_wide = 1;
+    const size_t length = w32_format(text, sizeof(text), format, args + 2);
+    t_w32_format_wide = 0;
+    for (size_t k = 0; k <= length; ++k) out[k] = (u8)text[k];
+    return (u32)length;
+}
+/* CreatePipe(&read, &write, attributes, size): 32-bit handles and the 12-byte SECURITY_ATTRIBUTES. */
+static u64 w32_CreatePipe(const u32 *args)
+{
+    u32 *read_out = W32_PTR(0), *write_out = W32_PTR(1);
+    const u32 *sa32 = W32_PTR(2);
+    struct { u32 length; u32 pad; u64 descriptor; u32 inherit; u32 pad2; } sa64 = { 24, 0, 0, 0, 0 };
+    if (sa32) { sa64.descriptor = sa32[1]; sa64.inherit = sa32[2]; }
+    u64 r = 0, w = 0;
+    if (!read_out || !write_out) { g_last_error = 87; return 0; }
+    if (!impl_CreatePipe(&r, &w, sa32 ? &sa64 : NULL, args[3])) return 0;
+    *read_out = (u32)r;
+    *write_out = (u32)w;
+    return 1;
+}
 
 #define W32_ATEXIT_MAX 64
 static u32 g_w32_atexit[W32_ATEXIT_MAX];
@@ -2108,6 +2208,16 @@ W32_FWD("ReleaseMutex", 4),
     {"__p__environ", w32_p_environ, 0},
     {"__p__fmode", w32_p_fmode, 0},
     {"__set_app_type", w32_set_app_type, 0},
+    {"__p__commode", w32_p_commode, 0},
+    {"__p___initenv", w32_p_initenv, 0},
+    {"__setusermatherr", w32_setusermatherr, 0},
+    {"_controlfp", w32_controlfp, 0},
+    {"_except_handler3", w32_except_handler3, 0},
+    {"_XcptFilter", w32_xcptfilter, 0},
+    {"_exit", w32_crt_underscore_exit, 0},
+    {"swprintf", w32_crt_swprintf, 0},
+    {"CreatePipe", w32_CreatePipe, 16},
+    W32_FWD("SetHandleInformation", 12),
     {"_cexit", w32_cexit, 0},
     {"atexit", w32_atexit, 0},
     {"_onexit", w32_onexit, 0},

@@ -175,6 +175,9 @@ int beer_mf_composite_pending_frame(void)
 #define BEER_MF_ATTRIBUTE_UINT64 2u
 #define BEER_MF_ATTRIBUTE_GUID   3u
 #define BEER_MF_ATTRIBUTE_UNKNOWN 4u
+#define BEER_MF_ATTRIBUTE_DOUBLE 5u
+#define BEER_MF_ATTRIBUTE_STRING 6u   /* value.blob: UTF-16 with its terminator, size in bytes */
+#define BEER_MF_ATTRIBUTE_BLOB   7u
 
 typedef struct BeerMfGuid {
     uint8_t bytes[16];
@@ -188,6 +191,8 @@ typedef struct BeerMfAttributeEntry {
         uint64_t u64;
         BeerMfGuid guid;
         void *unknown;
+        double d;
+        struct { void *data; uint32_t size; } blob;
     } value;
 } BeerMfAttributeEntry;
 
@@ -231,6 +236,8 @@ void beer_mf_set_async_callback_invoker(BeerMfAsyncCallbackInvokeFn on_read_samp
 
 static BeerMfWorkerStartFn g_mf_worker_start;
 void beer_mf_set_worker_starter(BeerMfWorkerStartFn start) { g_mf_worker_start = start; }
+/* For media_session.c: a guest-capable worker thread running fn(arg) (0 when the loader set no starter). */
+int beer_mf_start_worker(void *(*fn)(void *), void *arg) { return g_mf_worker_start ? g_mf_worker_start(fn, arg) : 0; }
 
 static int mf_guid_equal(const BeerMfGuid *a, const BeerMfGuid *b);
 
@@ -458,6 +465,8 @@ static void mf_attribute_entry_clear(BeerMfAttributeEntry *entry)
 {
     if (entry->type == BEER_MF_ATTRIBUTE_UNKNOWN && entry->value.unknown)
         mf_unknown_release(entry->value.unknown);
+    if ((entry->type == BEER_MF_ATTRIBUTE_STRING || entry->type == BEER_MF_ATTRIBUTE_BLOB) && entry->value.blob.data)
+        free(entry->value.blob.data);
     memset(entry, 0, sizeof(*entry));
 }
 
@@ -595,10 +604,14 @@ mf_attributes_get_unknown(BeerMfAttributes *self, const BeerMfGuid *key,
     }
     void *unknown = self->entries[index].value.unknown;
     if (unknown) mf_unknown_add_ref(unknown);
-    *value = unknown;
     mf_unlock(&self->lock);
-    (void)iid;
-    return unknown ? BEER_S_OK : BEER_MF_E_NOT_FOUND;
+    if (!unknown) return BEER_MF_E_NOT_FOUND;
+    if (!iid) { *value = unknown; return BEER_S_OK; }
+    /* The stored object answers for the requested interface, as IMFAttributes::GetUnknown does. */
+    typedef uint64_t __attribute__((ms_abi)) (*QueryFn)(void *, const void *, void **);
+    const uint64_t hr = ((QueryFn)(*(void ***)unknown)[0])(unknown, iid, value);
+    mf_unknown_release(unknown);
+    return hr;
 }
 
 static uint64_t __attribute__((ms_abi))
@@ -717,6 +730,468 @@ static uint64_t __attribute__((ms_abi)) mf_attributes_notimpl(void *self, ...)
     return BEER_E_NOTIMPL;
 }
 
+/* ---- The rest of IMFAttributes and IMFMediaType ----
+ * PROPVARIANT (24 bytes): vt at 0, value at 8. The store keeps UINT32 (VT_UI4), UINT64 (VT_UI8), DOUBLE (VT_R8),
+ * GUID (VT_CLSID: a pointer), STRING (VT_LPWSTR), BLOB (VT_VECTOR|VT_UI1: count at 8, pointer at 16) and IUnknown
+ * (VT_UNKNOWN), the MF_ATTRIBUTE_TYPE set. Values handed out are allocated like CoTaskMemAlloc (the host heap). */
+enum { MF_VT_EMPTY = 0, MF_VT_R8 = 5, MF_VT_UNKNOWN = 13, MF_VT_UI4 = 19, MF_VT_UI8 = 21, MF_VT_LPWSTR = 31,
+       MF_VT_CLSID = 72, MF_VT_BLOB_UI1 = 0x1011 };
+#define BEER_S_FALSE UINT64_C(1)
+#define BEER_E_OUTOFMEMORY UINT64_C(0x8007000E)
+#define BEER_E_INSUFFICIENT_BUFFER UINT64_C(0x8007007A)
+#define BEER_MF_E_INVALIDTYPE UINT64_C(0xC00D36BD)
+
+static uint32_t mf_vt_of(uint32_t type)
+{
+    switch (type) {
+    case BEER_MF_ATTRIBUTE_UINT32: return MF_VT_UI4;
+    case BEER_MF_ATTRIBUTE_UINT64: return MF_VT_UI8;
+    case BEER_MF_ATTRIBUTE_DOUBLE: return MF_VT_R8;
+    case BEER_MF_ATTRIBUTE_GUID: return MF_VT_CLSID;
+    case BEER_MF_ATTRIBUTE_STRING: return MF_VT_LPWSTR;
+    case BEER_MF_ATTRIBUTE_BLOB: return MF_VT_BLOB_UI1;
+    case BEER_MF_ATTRIBUTE_UNKNOWN: return MF_VT_UNKNOWN;
+    default: return MF_VT_EMPTY;
+    }
+}
+static size_t mf_wcslen(const uint16_t *text) { size_t n = 0; while (text && text[n]) ++n; return n; }
+
+/* Writes an entry as a PROPVARIANT the caller owns (PropVariantClear frees it). */
+static uint64_t mf_entry_to_variant(const BeerMfAttributeEntry *entry, uint8_t *variant)
+{
+    memset(variant, 0, 24);
+    *(uint16_t *)variant = (uint16_t)mf_vt_of(entry->type);
+    switch (entry->type) {
+    case BEER_MF_ATTRIBUTE_UINT32: *(uint32_t *)(variant + 8) = entry->value.u32; break;
+    case BEER_MF_ATTRIBUTE_UINT64: *(uint64_t *)(variant + 8) = entry->value.u64; break;
+    case BEER_MF_ATTRIBUTE_DOUBLE: *(double *)(variant + 8) = entry->value.d; break;
+    case BEER_MF_ATTRIBUTE_GUID: {
+        BeerMfGuid *copy = malloc(sizeof(*copy));
+        if (!copy) return BEER_E_OUTOFMEMORY;
+        *copy = entry->value.guid;
+        *(void **)(variant + 8) = copy;
+        break;
+    }
+    case BEER_MF_ATTRIBUTE_STRING:
+    case BEER_MF_ATTRIBUTE_BLOB: {
+        void *copy = malloc(entry->value.blob.size ? entry->value.blob.size : 1);
+        if (!copy) return BEER_E_OUTOFMEMORY;
+        memcpy(copy, entry->value.blob.data, entry->value.blob.size);
+        if (entry->type == BEER_MF_ATTRIBUTE_STRING) *(void **)(variant + 8) = copy;
+        else { *(uint32_t *)(variant + 8) = entry->value.blob.size; *(void **)(variant + 16) = copy; }
+        break;
+    }
+    case BEER_MF_ATTRIBUTE_UNKNOWN:
+        if (entry->value.unknown) mf_unknown_add_ref(entry->value.unknown);
+        *(void **)(variant + 8) = entry->value.unknown;
+        break;
+    }
+    return BEER_S_OK;
+}
+
+/* Fills `entry` (key already set) from a PROPVARIANT; MF_E_INVALIDTYPE for types an attribute store cannot hold. */
+static uint64_t mf_entry_from_variant(BeerMfAttributeEntry *entry, const uint8_t *variant)
+{
+    const uint16_t vt = *(const uint16_t *)variant;
+    switch (vt) {
+    case MF_VT_UI4: entry->type = BEER_MF_ATTRIBUTE_UINT32; entry->value.u32 = *(const uint32_t *)(variant + 8); break;
+    case MF_VT_UI8: entry->type = BEER_MF_ATTRIBUTE_UINT64; entry->value.u64 = *(const uint64_t *)(variant + 8); break;
+    case MF_VT_R8: entry->type = BEER_MF_ATTRIBUTE_DOUBLE; entry->value.d = *(const double *)(variant + 8); break;
+    case MF_VT_CLSID: {
+        const BeerMfGuid *guid = *(const BeerMfGuid *const *)(variant + 8);
+        if (!guid) return BEER_E_INVALIDARG;
+        entry->type = BEER_MF_ATTRIBUTE_GUID;
+        entry->value.guid = *guid;
+        break;
+    }
+    case MF_VT_LPWSTR: {
+        const uint16_t *text = *(const uint16_t *const *)(variant + 8);
+        const size_t bytes = (mf_wcslen(text) + 1) * 2;
+        void *copy = malloc(bytes);
+        if (!copy) return BEER_E_OUTOFMEMORY;
+        if (text) memcpy(copy, text, bytes); else *(uint16_t *)copy = 0;
+        entry->type = BEER_MF_ATTRIBUTE_STRING;
+        entry->value.blob.data = copy;
+        entry->value.blob.size = (uint32_t)bytes;
+        break;
+    }
+    case MF_VT_BLOB_UI1: {
+        const uint32_t size = *(const uint32_t *)(variant + 8);
+        const void *data = *(const void *const *)(variant + 16);
+        void *copy = malloc(size ? size : 1);
+        if (!copy) return BEER_E_OUTOFMEMORY;
+        if (size && data) memcpy(copy, data, size);
+        entry->type = BEER_MF_ATTRIBUTE_BLOB;
+        entry->value.blob.data = copy;
+        entry->value.blob.size = size;
+        break;
+    }
+    case MF_VT_UNKNOWN: {
+        void *unknown = *(void *const *)(variant + 8);
+        if (unknown) mf_unknown_add_ref(unknown);
+        entry->type = BEER_MF_ATTRIBUTE_UNKNOWN;
+        entry->value.unknown = unknown;
+        break;
+    }
+    default:
+        return BEER_MF_E_INVALIDTYPE;
+    }
+    return BEER_S_OK;
+}
+
+/* Equality of a stored entry and a PROPVARIANT value. */
+static int mf_entry_equals_variant(const BeerMfAttributeEntry *entry, const uint8_t *variant)
+{
+    if (mf_vt_of(entry->type) != *(const uint16_t *)variant) return 0;
+    switch (entry->type) {
+    case BEER_MF_ATTRIBUTE_UINT32: return entry->value.u32 == *(const uint32_t *)(variant + 8);
+    case BEER_MF_ATTRIBUTE_UINT64: return entry->value.u64 == *(const uint64_t *)(variant + 8);
+    case BEER_MF_ATTRIBUTE_DOUBLE: return entry->value.d == *(const double *)(variant + 8);
+    case BEER_MF_ATTRIBUTE_GUID: return mf_guid_equal(&entry->value.guid, *(const BeerMfGuid *const *)(variant + 8));
+    case BEER_MF_ATTRIBUTE_STRING: {
+        const uint16_t *text = *(const uint16_t *const *)(variant + 8);
+        return text && (mf_wcslen(text) + 1) * 2 == entry->value.blob.size &&
+               !memcmp(text, entry->value.blob.data, entry->value.blob.size);
+    }
+    case BEER_MF_ATTRIBUTE_BLOB:
+        return *(const uint32_t *)(variant + 8) == entry->value.blob.size &&
+               (!entry->value.blob.size || !memcmp(*(const void *const *)(variant + 16), entry->value.blob.data,
+                                                    entry->value.blob.size));
+    case BEER_MF_ATTRIBUTE_UNKNOWN: return entry->value.unknown == *(void *const *)(variant + 8);
+    default: return 0;
+    }
+}
+static void mf_variant_clear(uint8_t *variant)
+{
+    const uint16_t vt = *(const uint16_t *)variant;
+    if (vt == MF_VT_CLSID || vt == MF_VT_LPWSTR) free(*(void **)(variant + 8));
+    else if (vt == MF_VT_BLOB_UI1) free(*(void **)(variant + 16));
+    else if (vt == MF_VT_UNKNOWN && *(void **)(variant + 8)) mf_unknown_release(*(void **)(variant + 8));
+    memset(variant, 0, 24);
+}
+
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_item(BeerMfAttributes *self, const BeerMfGuid *key, uint8_t *value)
+{
+    if (!key) return BEER_E_INVALIDARG;
+    mf_lock(&self->lock);
+    const int index = mf_attributes_find(self, key);
+    uint64_t hr = index < 0 ? BEER_MF_E_NOT_FOUND : value ? mf_entry_to_variant(&self->entries[index], value) : BEER_S_OK;
+    mf_unlock(&self->lock);
+    if (index < 0) mf_note_missing("Item", key);
+    return hr;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_item_type(BeerMfAttributes *self, const BeerMfGuid *key, uint32_t *type)
+{
+    if (!key || !type) return BEER_E_POINTER;
+    mf_lock(&self->lock);
+    const int index = mf_attributes_find(self, key);
+    if (index >= 0) *type = mf_vt_of(self->entries[index].type);
+    mf_unlock(&self->lock);
+    return index < 0 ? BEER_MF_E_NOT_FOUND : BEER_S_OK;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_compare_item(BeerMfAttributes *self, const BeerMfGuid *key, const uint8_t *value, int32_t *result)
+{
+    if (!key || !value || !result) return BEER_E_POINTER;
+    mf_lock(&self->lock);
+    const int index = mf_attributes_find(self, key);
+    *result = index >= 0 && mf_entry_equals_variant(&self->entries[index], value);
+    mf_unlock(&self->lock);
+    return BEER_S_OK;
+}
+typedef uint64_t __attribute__((ms_abi)) (*MfGetItemFn)(void *, const BeerMfGuid *, uint8_t *);
+typedef uint64_t __attribute__((ms_abi)) (*MfGetCountFn)(void *, uint32_t *);
+typedef uint64_t __attribute__((ms_abi)) (*MfGetItemByIndexFn)(void *, uint32_t, BeerMfGuid *, uint8_t *);
+typedef uint64_t __attribute__((ms_abi)) (*MfSetItemFn)(void *, const BeerMfGuid *, const uint8_t *);
+/* Every item of `ours` is in `theirs` with the same value. */
+static int mf_items_contained(BeerMfAttributes *ours, void *theirs)
+{
+    void **vt = *(void ***)theirs;
+    int all = 1;
+    mf_lock(&ours->lock);
+    for (uint32_t i = 0; i < ours->count && all; ++i) {
+        uint8_t value[24];
+        memset(value, 0, sizeof(value));
+        if (((MfGetItemFn)vt[3])(theirs, &ours->entries[i].key, value) != BEER_S_OK) { all = 0; break; }
+        all = mf_entry_equals_variant(&ours->entries[i], value);
+        mf_variant_clear(value);
+    }
+    mf_unlock(&ours->lock);
+    return all;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_compare(BeerMfAttributes *self, void *theirs, uint32_t match, int32_t *result)
+{
+    if (!theirs || !result) return BEER_E_POINTER;
+    uint32_t their_count = 0, our_count;
+    ((MfGetCountFn)(*(void ***)theirs)[30])(theirs, &their_count);
+    mf_lock(&self->lock); our_count = self->count; mf_unlock(&self->lock);
+    /* Items of theirs present in ours with equal values: checked by looking each of theirs up in ours. */
+    int theirs_in_ours = 1, intersection = 1;
+    for (uint32_t i = 0; i < their_count && (theirs_in_ours || intersection); ++i) {
+        BeerMfGuid key;
+        uint8_t value[24];
+        memset(value, 0, sizeof(value));
+        if (((MfGetItemByIndexFn)(*(void ***)theirs)[31])(theirs, i, &key, value) != BEER_S_OK) { theirs_in_ours = 0; continue; }
+        mf_lock(&self->lock);
+        const int index = mf_attributes_find(self, &key);
+        const int equal = index >= 0 && mf_entry_equals_variant(&self->entries[index], value);
+        mf_unlock(&self->lock);
+        if (index < 0) theirs_in_ours = 0;
+        else if (!equal) theirs_in_ours = intersection = 0;
+        mf_variant_clear(value);
+    }
+    switch (match) {
+    case 0: *result = mf_items_contained(self, theirs); break;                      /* MF_ATTRIBUTES_MATCH_OUR_ITEMS */
+    case 1: *result = theirs_in_ours; break;                                         /* THEIR_ITEMS */
+    case 2: *result = our_count == their_count && theirs_in_ours; break;             /* ALL_ITEMS */
+    case 3: *result = intersection; break;                                           /* INTERSECTION */
+    case 4: *result = our_count <= their_count ? mf_items_contained(self, theirs) : theirs_in_ours; break; /* SMALLER */
+    default: return BEER_E_INVALIDARG;
+    }
+    return BEER_S_OK;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_double(BeerMfAttributes *self, const BeerMfGuid *key, double *value)
+{
+    if (!key || !value) return BEER_E_INVALIDARG;
+    mf_lock(&self->lock);
+    const int index = mf_attributes_find(self, key);
+    const int ok = index >= 0 && self->entries[index].type == BEER_MF_ATTRIBUTE_DOUBLE;
+    if (ok) *value = self->entries[index].value.d;
+    mf_unlock(&self->lock);
+    if (!ok) mf_note_missing("Double", key);
+    return ok ? BEER_S_OK : index < 0 ? BEER_MF_E_NOT_FOUND : BEER_MF_E_INVALIDTYPE;
+}
+/* The string or blob stored under `key` (locked; NULL when absent or of another type). */
+static BeerMfAttributeEntry *mf_attributes_bytes_locked(BeerMfAttributes *self, const BeerMfGuid *key, uint32_t type,
+                                                         uint64_t *hr)
+{
+    const int index = mf_attributes_find(self, key);
+    if (index < 0) { *hr = BEER_MF_E_NOT_FOUND; return NULL; }
+    if (self->entries[index].type != type) { *hr = BEER_MF_E_INVALIDTYPE; return NULL; }
+    *hr = BEER_S_OK;
+    return &self->entries[index];
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_string_length(BeerMfAttributes *self, const BeerMfGuid *key, uint32_t *length)
+{
+    if (!key || !length) return BEER_E_POINTER;
+    uint64_t hr;
+    mf_lock(&self->lock);
+    BeerMfAttributeEntry *entry = mf_attributes_bytes_locked(self, key, BEER_MF_ATTRIBUTE_STRING, &hr);
+    if (entry) *length = entry->value.blob.size / 2 - 1;
+    mf_unlock(&self->lock);
+    return hr;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_string(BeerMfAttributes *self, const BeerMfGuid *key, uint16_t *out, uint32_t capacity,
+                         uint32_t *length)
+{
+    if (!key || !out) return BEER_E_POINTER;
+    uint64_t hr;
+    mf_lock(&self->lock);
+    BeerMfAttributeEntry *entry = mf_attributes_bytes_locked(self, key, BEER_MF_ATTRIBUTE_STRING, &hr);
+    if (entry) {
+        const uint32_t characters = entry->value.blob.size / 2;          /* with the terminator */
+        if (capacity < characters) hr = BEER_E_INSUFFICIENT_BUFFER;
+        else { memcpy(out, entry->value.blob.data, entry->value.blob.size); if (length) *length = characters - 1; }
+    }
+    mf_unlock(&self->lock);
+    return hr;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_allocated_string(BeerMfAttributes *self, const BeerMfGuid *key, uint16_t **out, uint32_t *length)
+{
+    if (!key || !out) return BEER_E_POINTER;
+    *out = NULL;
+    uint64_t hr;
+    mf_lock(&self->lock);
+    BeerMfAttributeEntry *entry = mf_attributes_bytes_locked(self, key, BEER_MF_ATTRIBUTE_STRING, &hr);
+    if (entry) {
+        if (!(*out = malloc(entry->value.blob.size))) hr = BEER_E_OUTOFMEMORY;
+        else { memcpy(*out, entry->value.blob.data, entry->value.blob.size); if (length) *length = entry->value.blob.size / 2 - 1; }
+    }
+    mf_unlock(&self->lock);
+    return hr;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_blob_size(BeerMfAttributes *self, const BeerMfGuid *key, uint32_t *size)
+{
+    if (!key || !size) return BEER_E_POINTER;
+    uint64_t hr;
+    mf_lock(&self->lock);
+    BeerMfAttributeEntry *entry = mf_attributes_bytes_locked(self, key, BEER_MF_ATTRIBUTE_BLOB, &hr);
+    if (entry) *size = entry->value.blob.size;
+    mf_unlock(&self->lock);
+    return hr;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_blob(BeerMfAttributes *self, const BeerMfGuid *key, uint8_t *out, uint32_t capacity, uint32_t *size)
+{
+    if (!key || !out) return BEER_E_POINTER;
+    uint64_t hr;
+    mf_lock(&self->lock);
+    BeerMfAttributeEntry *entry = mf_attributes_bytes_locked(self, key, BEER_MF_ATTRIBUTE_BLOB, &hr);
+    if (entry) {
+        if (capacity < entry->value.blob.size) hr = BEER_E_INSUFFICIENT_BUFFER;
+        else { memcpy(out, entry->value.blob.data, entry->value.blob.size); if (size) *size = entry->value.blob.size; }
+    }
+    mf_unlock(&self->lock);
+    return hr;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_allocated_blob(BeerMfAttributes *self, const BeerMfGuid *key, uint8_t **out, uint32_t *size)
+{
+    if (!key || !out || !size) return BEER_E_POINTER;
+    *out = NULL;
+    uint64_t hr;
+    mf_lock(&self->lock);
+    BeerMfAttributeEntry *entry = mf_attributes_bytes_locked(self, key, BEER_MF_ATTRIBUTE_BLOB, &hr);
+    if (entry) {
+        if (!(*out = malloc(entry->value.blob.size ? entry->value.blob.size : 1))) hr = BEER_E_OUTOFMEMORY;
+        else { memcpy(*out, entry->value.blob.data, entry->value.blob.size); *size = entry->value.blob.size; }
+    }
+    mf_unlock(&self->lock);
+    return hr;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_set_item(BeerMfAttributes *self, const BeerMfGuid *key, const uint8_t *value)
+{
+    if (!key || !value) return BEER_E_POINTER;
+    BeerMfAttributeEntry staged;
+    memset(&staged, 0, sizeof(staged));
+    staged.key = *key;
+    const uint64_t hr = mf_entry_from_variant(&staged, value);
+    if (hr != BEER_S_OK) return hr;
+    mf_lock(&self->lock);
+    BeerMfAttributeEntry *entry = mf_attributes_set_entry(self, key);
+    if (entry) *entry = staged;
+    mf_unlock(&self->lock);
+    if (!entry) { mf_attribute_entry_clear(&staged); return BEER_E_OUTOFMEMORY; }
+    return BEER_S_OK;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_set_double(BeerMfAttributes *self, const BeerMfGuid *key, double value)
+{
+    if (!key) return BEER_E_INVALIDARG;
+    mf_lock(&self->lock);
+    BeerMfAttributeEntry *entry = mf_attributes_set_entry(self, key);
+    if (entry) { entry->type = BEER_MF_ATTRIBUTE_DOUBLE; entry->value.d = value; }
+    mf_unlock(&self->lock);
+    return entry ? BEER_S_OK : BEER_E_OUTOFMEMORY;
+}
+static uint64_t mf_attributes_set_bytes(BeerMfAttributes *self, const BeerMfGuid *key, uint32_t type,
+                                        const void *data, uint32_t size)
+{
+    void *copy = malloc(size ? size : 1);
+    if (!copy) return BEER_E_OUTOFMEMORY;
+    if (size) memcpy(copy, data, size);
+    mf_lock(&self->lock);
+    BeerMfAttributeEntry *entry = mf_attributes_set_entry(self, key);
+    if (entry) { entry->type = type; entry->value.blob.data = copy; entry->value.blob.size = size; }
+    mf_unlock(&self->lock);
+    if (!entry) { free(copy); return BEER_E_OUTOFMEMORY; }
+    return BEER_S_OK;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_set_string(BeerMfAttributes *self, const BeerMfGuid *key, const uint16_t *text)
+{
+    if (!key || !text) return BEER_E_POINTER;
+    return mf_attributes_set_bytes(self, key, BEER_MF_ATTRIBUTE_STRING, text, (uint32_t)((mf_wcslen(text) + 1) * 2));
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_set_blob(BeerMfAttributes *self, const BeerMfGuid *key, const uint8_t *data, uint32_t size)
+{
+    if (!key || (!data && size)) return BEER_E_POINTER;
+    return mf_attributes_set_bytes(self, key, BEER_MF_ATTRIBUTE_BLOB, data, size);
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_get_item_by_index(BeerMfAttributes *self, uint32_t index, BeerMfGuid *key, uint8_t *value)
+{
+    if (!key) return BEER_E_POINTER;
+    mf_lock(&self->lock);
+    uint64_t hr = BEER_E_INVALIDARG;
+    if (index < self->count) {
+        *key = self->entries[index].key;
+        hr = value ? mf_entry_to_variant(&self->entries[index], value) : BEER_S_OK;
+    }
+    mf_unlock(&self->lock);
+    return hr;
+}
+static uint64_t __attribute__((ms_abi))
+mf_attributes_copy_all_items(BeerMfAttributes *self, void *destination)
+{
+    if (!destination) return BEER_E_POINTER;
+    void **vt = *(void ***)destination;
+    ((uint64_t __attribute__((ms_abi)) (*)(void *))vt[20])(destination);          /* DeleteAllItems */
+    /* Snapshot first: the destination's SetItem must not run under our lock (it may be ourselves). */
+    mf_lock(&self->lock);
+    const uint32_t count = self->count;
+    BeerMfGuid *keys = malloc((count ? count : 1) * sizeof(*keys));
+    uint8_t *values = calloc(count ? count : 1, 24);
+    for (uint32_t i = 0; keys && values && i < count; ++i) {
+        keys[i] = self->entries[i].key;
+        mf_entry_to_variant(&self->entries[i], values + 24 * i);
+    }
+    mf_unlock(&self->lock);
+    if (!keys || !values) { free(keys); free(values); return BEER_E_OUTOFMEMORY; }
+    for (uint32_t i = 0; i < count; ++i) {
+        ((MfSetItemFn)vt[18])(destination, &keys[i], values + 24 * i);
+        mf_variant_clear(values + 24 * i);
+    }
+    free(keys);
+    free(values);
+    return BEER_S_OK;
+}
+
+/* IMFMediaType */
+static const BeerMfGuid g_mf_mt_compressed = {{                  /* 3AFD0CEE-18F2-4BA5-A110-8BEA502E1F92 */
+    0xee, 0x0c, 0xfd, 0x3a, 0xf2, 0x18, 0xa5, 0x4b, 0xa1, 0x10, 0x8b, 0xea, 0x50, 0x2e, 0x1f, 0x92 }};
+static uint64_t __attribute__((ms_abi)) mf_media_type_get_major_type(BeerMfAttributes *self, BeerMfGuid *major)
+{
+    if (!major) return BEER_E_POINTER;
+    return mf_attributes_get_guid(self, &g_mf_mt_major_type, major);
+}
+static uint64_t __attribute__((ms_abi)) mf_media_type_is_compressed(BeerMfAttributes *self, int32_t *compressed)
+{
+    if (!compressed) return BEER_E_POINTER;
+    uint32_t flag = 0;
+    if (mf_attributes_get_uint32(self, &g_mf_mt_compressed, &flag) == BEER_S_OK) { *compressed = flag != 0; return BEER_S_OK; }
+    /* Uncompressed formats are the FOURCC/D3DFORMAT subtypes of raw video and PCM / IEEE float audio. */
+    BeerMfGuid subtype;
+    *compressed = 1;
+    if (mf_attributes_get_guid(self, &g_mf_mt_subtype, &subtype) == BEER_S_OK) {
+        uint32_t code;
+        memcpy(&code, subtype.bytes, 4);
+        static const uint32_t raw[] = { 0x3231564e /* NV12 */, 0x32595559 /* YUY2 */, 0x30323449 /* I420 */,
+                                        0x56555949 /* IYUV */, 0x32315659 /* YV12 */, 0x59565955 /* UYVY */,
+                                        0x16 /* RGB32 */, 0x15 /* ARGB32 */, 0x14 /* RGB24 */, 1 /* PCM */,
+                                        3 /* IEEE float */, 0x30313050 /* P010 */ };
+        for (size_t i = 0; i < sizeof(raw) / sizeof(*raw); ++i) if (code == raw[i]) *compressed = 0;
+    }
+    return BEER_S_OK;
+}
+static uint64_t __attribute__((ms_abi)) mf_media_type_is_equal(BeerMfAttributes *self, void *other, uint32_t *flags)
+{
+    if (!other || !flags) return BEER_E_POINTER;
+    *flags = 0;
+    void **vt = *(void ***)other;
+    typedef uint64_t __attribute__((ms_abi)) (*GetGuidFn)(void *, const BeerMfGuid *, BeerMfGuid *);
+    BeerMfGuid ours, theirs;
+    if (mf_attributes_get_guid(self, &g_mf_mt_major_type, &ours) == BEER_S_OK &&
+        ((GetGuidFn)vt[10])(other, &g_mf_mt_major_type, &theirs) == BEER_S_OK && mf_guid_equal(&ours, &theirs))
+        *flags |= 1;                                                             /* MF_MEDIATYPE_EQUAL_MAJOR_TYPES */
+    if (mf_attributes_get_guid(self, &g_mf_mt_subtype, &ours) == BEER_S_OK &&
+        ((GetGuidFn)vt[10])(other, &g_mf_mt_subtype, &theirs) == BEER_S_OK && mf_guid_equal(&ours, &theirs))
+        *flags |= 2;                                                             /* FORMAT_TYPES */
+    int32_t same = 0;
+    if (mf_attributes_compare(self, other, 2, &same) == BEER_S_OK && same) *flags |= 4 | 8;   /* FORMAT_DATA, USER_DATA */
+    return *flags == 15 ? BEER_S_OK : BEER_S_FALSE;
+}
+
 static void *__attribute__((ms_abi))
 mf_audio_media_type_get_audio_format(BeerMfAttributes *self)
 {
@@ -725,17 +1200,18 @@ mf_audio_media_type_get_audio_format(BeerMfAttributes *self)
 
 static void *g_attributes_vtable[39] = {
     mf_attributes_query_interface, mf_attributes_add_ref, mf_attributes_release,
-    mf_attributes_notimpl, mf_attributes_notimpl, mf_attributes_notimpl,
-    mf_attributes_notimpl, mf_attributes_get_uint32, mf_attributes_get_uint64,
-    mf_attributes_notimpl, mf_attributes_get_guid, mf_attributes_notimpl,
-    mf_attributes_notimpl, mf_attributes_notimpl, mf_attributes_notimpl,
-    mf_attributes_notimpl, mf_attributes_notimpl, mf_attributes_get_unknown,
-    mf_attributes_notimpl, mf_attributes_delete_item, mf_attributes_delete_all,
-    mf_attributes_set_uint32, mf_attributes_set_uint64, mf_attributes_notimpl,
-    mf_attributes_set_guid, mf_attributes_notimpl, mf_attributes_notimpl,
+    mf_attributes_get_item, mf_attributes_get_item_type, mf_attributes_compare_item,
+    mf_attributes_compare, mf_attributes_get_uint32, mf_attributes_get_uint64,
+    mf_attributes_get_double, mf_attributes_get_guid, mf_attributes_get_string_length,
+    mf_attributes_get_string, mf_attributes_get_allocated_string, mf_attributes_get_blob_size,
+    mf_attributes_get_blob, mf_attributes_get_allocated_blob, mf_attributes_get_unknown,
+    mf_attributes_set_item, mf_attributes_delete_item, mf_attributes_delete_all,
+    mf_attributes_set_uint32, mf_attributes_set_uint64, mf_attributes_set_double,
+    mf_attributes_set_guid, mf_attributes_set_string, mf_attributes_set_blob,
     mf_attributes_set_unknown, mf_attributes_ok, mf_attributes_ok,
-    mf_attributes_get_count, mf_attributes_notimpl, mf_attributes_notimpl,
-    mf_attributes_notimpl, mf_attributes_notimpl, mf_attributes_notimpl,
+    mf_attributes_get_count, mf_attributes_get_item_by_index, mf_attributes_copy_all_items,
+    /* IMFMediaType; GetRepresentation / FreeRepresentation are not provided */
+    mf_media_type_get_major_type, mf_media_type_is_compressed, mf_media_type_is_equal,
     mf_attributes_notimpl, mf_attributes_notimpl,
     mf_audio_media_type_get_audio_format
 };

@@ -640,8 +640,13 @@ static u64 __attribute__((ms_abi)) beer_CloseTouchInputHandle(u64 input)
 /* No taskbar to flash: the window was not active-highlighted before (FALSE). */
 static u64 __attribute__((ms_abi)) beer_FlashWindow(u64 window, u32 invert) { (void)window; (void)invert; return 0; }
 /* Window-class fields are not stored separately from the window; there is no previous value to return. */
+/* GCLP_HCURSOR (-12) on the main window's class changes the cursor DefWindowProc applies for WM_SETCURSOR; the other
+ * class fields are not tracked. Returns the previous value, as Windows does. */
 static u64 __attribute__((ms_abi)) beer_SetClassLongPtrW(u64 window, s32 index, u64 value)
-    { (void)window; (void)index; (void)value; return 0; }
+{
+    if (index == -12 && !beer_window_other(window)) return atomic_exchange(&g_main_class_cursor, value);
+    return 0;
+}
 /* Beer shows the host pointer for every cursor handle, as LoadCursorW does. */
 static u64 __attribute__((ms_abi)) beer_LoadCursorFromFileW(const u16 *path)
     { if (!path) { g_last_error = 2; return 0; } return impl_LoadCursorW(0, 32512 /* IDC_ARROW */); }
@@ -1922,20 +1927,10 @@ static u64 __attribute__((ms_abi)) beer_GdipGetGenericFontFamilySansSerif(u64 *f
 /* Deleting objects that were never created: GDI+ answers InvalidParameter for NULL. */
 static u64 __attribute__((ms_abi)) beer_GdipDeleteObject(void *object) { return object ? 0 : 2; }
 
-/* ---- Media Foundation pipelines (sessions, topologies, renderers): not provided by Beer ---- */
+/* ---- Media Foundation: the playback pipeline (sessions, topologies, sinks) is media/media_session.c ---- */
 #define BEER_MF_NOTIMPL(name, ...) \
     static u64 __attribute__((ms_abi)) beer_##name(__VA_ARGS__) { return 0x80004001u; }
-static u64 __attribute__((ms_abi)) beer_MFCreateTopology(u64 *topology) { if (topology) *topology = 0; return 0x80004001u; }
-static u64 __attribute__((ms_abi)) beer_MFCreateTopologyNode(u32 type, u64 *node) { (void)type; if (node) *node = 0; return 0x80004001u; }
-static u64 __attribute__((ms_abi)) beer_MFCreateMediaSession(void *config, u64 *session) { (void)config; if (session) *session = 0; return 0x80004001u; }
-static u64 __attribute__((ms_abi)) beer_MFCreateSourceResolver(u64 *resolver) { if (resolver) *resolver = 0; return 0x80004001u; }
-static u64 __attribute__((ms_abi)) beer_MFCreateAudioRendererActivate(u64 *activate) { if (activate) *activate = 0; return 0x80004001u; }
-static u64 __attribute__((ms_abi)) beer_MFCreateVideoRendererActivate(u64 window, u64 *activate) { (void)window; if (activate) *activate = 0; return 0x80004001u; }
-static u64 __attribute__((ms_abi)) beer_MFCreateAsyncResult(void *object, void *callback, void *state, u64 *result)
-    { (void)object; (void)callback; (void)state; if (result) *result = 0; return 0x80004001u; }
 static u64 __attribute__((ms_abi)) beer_MFCreateVideoSampleFromSurface(void *surface, u64 *sample) { (void)surface; if (sample) *sample = 0; return 0x80004001u; }
-static u64 __attribute__((ms_abi)) beer_MFGetService(void *object, const void *service, const void *iid, u64 *out)
-    { (void)object; (void)service; (void)iid; if (out) *out = 0; return 0xC00D36BAu; }       /* MF_E_UNSUPPORTED_SERVICE */
 /* 100-ns frame duration for a rational frame rate (numerator/denominator). */
 static u64 __attribute__((ms_abi)) beer_MFFrameRateToAverageTimePerFrame(u32 numerator, u32 denominator, u64 *duration)
 {

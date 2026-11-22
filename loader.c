@@ -135,6 +135,7 @@
 #include "audio/audio_backend.h"
 #include "audio/wasapi_compat.h"
 #include "media/media_foundation.h"
+#include "media/media_session.h"
 #include "renderer/vulkan/vulkan_indexed_renderer.h"
 
 static void beer_signal_guest_event(uint64_t event_handle);
@@ -2850,6 +2851,13 @@ static const char *configure_guest_process_path(const char *exe)
     char *slash = strrchr(directory, '/');
     if (!slash) { errno = EINVAL; return NULL; }
     *slash = 0;
+    /* A process Beer started for a guest (CreateProcess, cmd.exe) already runs where Windows would start it: in its
+     * lpCurrentDirectory, or else in the parent's current directory. Moving it to its executable's folder broke tools
+     * that open relative paths: FitGirl's ins.exe, run by cmd.exe in the game's Paks folder, created its .pak in the
+     * installer's temp folder and the unpack failed. A top-level launch still starts in the executable's folder. */
+    char inherited[PATH_MAX];
+    const int keep_inherited = getenv("_BEER_INHERIT_CWD") && getcwd(inherited, sizeof(inherited));
+    unsetenv("_BEER_INHERIT_CWD");
     if (chdir(directory) != 0) return NULL;
     /* A launcher's chosen current directory (CreateProcess lpCurrentDirectory), such as the
      * working directory in a Steam launch option. */
@@ -2857,6 +2865,9 @@ static const char *configure_guest_process_path(const char *exe)
     if (working && *working && chdir(working) != 0)
         fprintf(stderr, "[LOADER] BEER_WORKING_DIR %s: %s (staying in the executable's folder)\n",
                 working, strerror(errno));
+    if (keep_inherited && chdir(inherited) != 0)
+        fprintf(stderr, "[LOADER] inherited current directory %s: %s (staying in the executable's folder)\n",
+                inherited, strerror(errno));
 
     g_exe_host_path = g_exe_host_path_storage;
     g_exe_path = g_exe_path_storage;
@@ -4912,10 +4923,20 @@ static u64 __attribute__((ms_abi)) impl_TlsGetValue(u32 idx) {
     if (idx >= WIN_TLS_MAX || !g_tls_used[idx]) return 0;
     return (u64)pthread_getspecific(g_tls_pkeys[idx]);
 }
+/* Windows clears a freed slot in every thread, so the index TlsAlloc hands out next reads 0 everywhere. Keeping the
+ * pthread key kept every thread's old value: a reused slot came back holding another component's data. PhysX keeps
+ * each thread's scene read/write lock depth in a slot it allocates after others were freed; a stale depth made a SIFU
+ * task thread take the scene write lock while it still held a read lock, and it spun on itself forever. Deleting the
+ * key discards every thread's value; the next TlsAlloc of the index creates a fresh one. */
 static u64 __attribute__((ms_abi)) impl_TlsFree(u32 idx) {
     if (idx >= WIN_TLS_MAX) return 0;
     pthread_mutex_lock(&g_tls_mtx);
+    if (!g_tls_used[idx]) { pthread_mutex_unlock(&g_tls_mtx); g_last_error = 87; return 0; }
     g_tls_used[idx] = 0;
+    if (g_tls_pkey_ok[idx]) {
+        pthread_key_delete(g_tls_pkeys[idx]);
+        g_tls_pkey_ok[idx] = 0;
+    }
     pthread_mutex_unlock(&g_tls_mtx);
     return 1;
 }
@@ -12382,6 +12403,18 @@ static int beer_mf_start_guest_worker(void *(*fn)(void *), void *arg)
     return 1;
 }
 
+/* Host services of the Media Foundation session (media/media_session.c): a Windows path or file: URL path as a host
+ * path, and a wait on a guest event handle (MFPutWaitingWorkItem). */
+static int beer_mf_resolve_path(const char *windows_path, char *host_path, size_t size)
+{
+    return resolve_windows_host_path(windows_path, host_path, size) && access(host_path, R_OK) == 0;
+}
+static u64 __attribute__((ms_abi)) impl_WaitForSingleObject(u64 h, u32 ms);
+static uint64_t beer_mf_wait_handle(uint64_t handle, uint32_t milliseconds)
+{
+    return impl_WaitForSingleObject(handle, milliseconds);
+}
+
 /* IMFSourceReaderCallback::OnReadSample trampoline.
  * Calls vtable slot 3 on the guest-allocated callback object via ms_abi. */
 static uint64_t beer_mf_invoke_on_read_sample(void *callback_object,
@@ -14472,6 +14505,20 @@ static u64 register_window_class(const WIN_WNDCLASSEX *window_class, const char 
         fprintf(stderr, "[PROGRESS] %s retained WndProc=0x%lx\n", api, g_last_class_proc);
     }
     return 1; /* stable class atom */
+}
+
+/* The main window's class cursor (WNDCLASSEX.hCursor, or SetClassLongPtr(GCLP_HCURSOR)): what DefWindowProc applies
+ * for WM_SETCURSOR over the client area. Unreal registers its class with no cursor, as Windows games commonly do to
+ * manage the cursor themselves; DefWindowProc then leaves the cursor alone. 1 (the arrow) until a window exists. */
+static _Atomic(u64) g_main_class_cursor = 1;
+static void note_main_window_class(u64 class_name, int wide)
+{
+    char key[128];
+    window_class_key(class_name, wide, key, sizeof(key));
+    pthread_mutex_lock(&g_window_class_lock);
+    for (int i = 0; i < g_window_class_count; i++)
+        if (!strcmp(g_window_classes[i].name, key)) { atomic_store(&g_main_class_cursor, g_window_classes[i].info.hCursor); break; }
+    pthread_mutex_unlock(&g_window_class_lock);
 }
 
 /* GetClassInfoEx(instance, class, WNDCLASSEX *): a class registered in this process. Beer provides no
@@ -19644,7 +19691,8 @@ impl_ReadFile(u64 h, void *buf, u32 n, u32 *done, WIN_OVERLAPPED *overlapped)
         }
     }
     if (received < 0) {
-        g_last_error = (u32)errno;
+        /* A PIPE_NOWAIT pipe with nothing to read (SetNamedPipeHandleState made it non-blocking). */
+        g_last_error = (errno == EAGAIN || errno == EWOULDBLOCK) ? 232u : (u32)errno;   /* ERROR_NO_DATA */
         return 0;
     }
     if (save_diagnostics_enabled()) {
@@ -21091,6 +21139,7 @@ impl_CreateWindowExW(u32 exstyle, u64 classname, u64 title, u32 style,
                 (unsigned long)param, (void *)g_dispatch_incoming_return);
     const u64 hwnd = create_guest_window(exstyle, classname, title, style, x, y, w, h,
                                          parent, menu, inst, param, utf8_title);
+    if (hwnd && !beer_window_other(hwnd)) note_main_window_class(classname, 1);
     fprintf(stderr, "[WIN]   -> hwnd=0x%llx parent=0x%llx style=0x%x thread=%u native=0x%llx\n",
             (unsigned long long)hwnd, (unsigned long long)parent, style, (unsigned)current_windows_thread_id(),
             (unsigned long long)g_native_hwnd);
@@ -21103,8 +21152,10 @@ impl_CreateWindowExA(u32 exstyle, u64 classname, u64 title, u32 style,
     const char *ascii_title = (const char *)(uintptr_t)title;
     fprintf(stderr, "[WIN] CreateWindowExA(%dx%d, title=%s)\n", w, h,
             (ascii_title && *ascii_title) ? ascii_title : "(untitled)");
-    return create_guest_window(exstyle, classname, title, style, x, y, w, h,
-                               parent, menu, inst, param, ascii_title);
+    const u64 hwnd = create_guest_window(exstyle, classname, title, style, x, y, w, h,
+                                         parent, menu, inst, param, ascii_title);
+    if (hwnd && !beer_window_other(hwnd)) note_main_window_class(classname, 0);
+    return hwnd;
 }
 /* UpdateLayeredWindow: a layered window's whole content is the given bitmap, so a window that is not the native one
  * (WWM's NetEase user-agreement dialog) gets its own ARGB surface: position from pptDst, size from psize, pixels from
@@ -23862,11 +23913,20 @@ impl_DispatchMessageW(const WIN_MSG *msg)
     if (beer_window_other(msg->hwnd)) return call_window_proc(msg->hwnd, msg->message, msg->wParam, msg->lParam);
     u64 result = call_guest_wndproc(msg->message, msg->wParam, msg->lParam);
     if (msg->message == 0x0020 && !result) {
-        /* Unhandled: DefWindowProc applies the class cursor (the arrow). That is a SetCursor: it does not
-         * override a negative ShowCursor counter (RE8 hides the arrow that way and draws its own cursor). */
-        atomic_store(&g_current_cursor, atomic_load(&g_current_cursor) ?
-                     atomic_load(&g_current_cursor) : 1);
-        beer_apply_cursor_visibility();
+        /* Unhandled: DefWindowProc sets the cursor. Over the client area (hit test HTCLIENT) that is the class
+         * cursor, and nothing at all when the class has none: a game that hides the cursor with SetCursor(NULL)
+         * keeps it hidden. Showing the arrow here made it flicker on every mouse move in SIFU (Unreal) while the
+         * game hid it again each frame. Elsewhere (borders, caption) it is the arrow. Either is a SetCursor, which
+         * does not override a negative ShowCursor counter (RE8 hides the arrow that way and draws its own). */
+        const u32 hit = (u32)(msg->lParam & 0xffff);
+        const u64 class_cursor = atomic_load(&g_main_class_cursor);
+        if (hit != 1 /* HTCLIENT */) {
+            atomic_store(&g_current_cursor, atomic_load(&g_current_cursor) ? atomic_load(&g_current_cursor) : 1);
+            beer_apply_cursor_visibility();
+        } else if (class_cursor) {
+            atomic_store(&g_current_cursor, class_cursor);
+            beer_apply_cursor_visibility();
+        }
     }
     return result;
 }
@@ -39640,6 +39700,7 @@ int main(int argc, char **argv)
     beer_mf_set_async_callback_invoker(beer_mf_invoke_on_read_sample,
                                        beer_mf_invoke_on_flush);
     beer_mf_set_worker_starter(beer_mf_start_guest_worker);
+    beer_mf_session_set_host(beer_mf_resolve_path, beer_mf_wait_handle);
     /* Asynchronous WinHTTP delivers its callbacks on the same kind of guest-capable worker. */
     beer_winhttp_configure(winhttp_set_error, beer_mf_start_guest_worker);
     beer_winhttp_set_caller(winhttp_caller);

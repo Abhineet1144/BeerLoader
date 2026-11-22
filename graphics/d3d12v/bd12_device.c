@@ -1245,6 +1245,7 @@ BD12Buffer *bd12_buffer_create_placed(BD12Heap *heap, VkDeviceSize offset,
     BD12Buffer *buffer = calloc(1, sizeof(*buffer));
     if (!buffer) return NULL;
     buffer->device = device;
+    pthread_mutex_init(&buffer->view_lock, NULL);
     buffer->heap = heap;
     buffer->heap_offset = offset;
     buffer->size = size;

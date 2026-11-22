@@ -103,7 +103,7 @@ struct BD12Device {
     int uniform_texel_single_alignment;
     int storage_texel_single_alignment;
 
-    pthread_mutex_t view_lock;    /* guards every BD12Buffer view cache */
+    pthread_mutex_t view_lock;    /* image views, samplers, acceleration structures; buffer views have per-buffer locks */
     pthread_rwlock_t va_lock;   /* lookups (every root descriptor, from all recording threads) share it */
     BD12VaEntry *va_table;        /* sorted by va */
     size_t va_count, va_capacity;
@@ -169,6 +169,7 @@ typedef struct {
 
 typedef struct BD12Buffer {
     BD12Device *device;
+    pthread_mutex_t view_lock;    /* this buffer's view cache (zero-initialised = default mutex); see bd12_descriptors.c */
     BD12BufferView *views;
     uint32_t view_count, view_capacity;
     uint32_t *view_hash;          /* open-addressed index into views (0 = empty, else index+1) */

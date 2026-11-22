@@ -29,7 +29,7 @@ loader.o: loader.c platform/beer_env.h graphics/d3d11/d3d11_compat.h \
  platform/win32_keyboard_text.h platform/win32_filesystem_policy.h \
  platform/window_style_policy.h platform/window_icon_policy.h \
  audio/audio_backend.h audio/wasapi_compat.h media/media_foundation.h \
- renderer/vulkan/vulkan_indexed_renderer.h \
+ media/media_session.h renderer/vulkan/vulkan_indexed_renderer.h \
  platform/win32_kernel32_export_names.inc \
  platform/win32_system_dll_names.h platform/win32_winhttp_url.h \
  platform/win32_winhttp.h platform/win32_adapter_info.h \
@@ -119,6 +119,7 @@ platform/window_icon_policy.h:
 audio/audio_backend.h:
 audio/wasapi_compat.h:
 media/media_foundation.h:
+media/media_session.h:
 renderer/vulkan/vulkan_indexed_renderer.h:
 platform/win32_kernel32_export_names.inc:
 platform/win32_system_dll_names.h:

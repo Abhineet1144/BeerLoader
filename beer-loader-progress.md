@@ -6400,3 +6400,33 @@ CmdBlitImage driver crash.
     translation that dumps.
   - vkd3d dumps only on a translation, never on a cache hit (libs/vkd3d-shader/dxil.c).
   - Match shaders by the DXBC container hash at offset 4: identical blobs give identical hashes.
+
+## 2026-11-22 RE9 GPU hang at launch (Xid 109 CTX SWITCH TIMEOUT), open
+
+Symptoms and keywords: RE9 hangs ~35-60 s after every launch (title screen, no input needed), Xid 109, log stops
+mid pipeline creation, "every launch hangs".
+
+- **Trigger:** config.ini `RayTracingSetting=High`. The user's config changed on 11-20 from path tracing to RT High.
+  - RT Off: no hang in 150 s. PT (11-19 runs): no hang.
+  - Not a code regression: a0251a4 (11-18), 4220b3b (11-19), HEAD a6b478d and the working tree all hang. The
+    uncommitted bd12_descriptors.c view-cache rework is innocent.
+- **Hanging work (BEER_VK_CHECKPOINTS=1 + kill -USR1 after the Xid):**
+  - Compute 406577c5b213a399, a 54x30 dispatch with 16x16 threads, never completes. It is an SDF ray march over a
+    3D texture (t12) with loop counts from CBV b9 (table CBV): [1].w cascades, [3].w steps.
+  - Skipping it (BEER_BD12_SKIP_CS, which now also covers indirect dispatches) moves the hang to indirect
+    a8b1145dacee3dc9. 5bf717ae91f17ef4 is a sibling.
+- **Ruled out (still hangs):**
+  - BEER_BD12_AS_BARRIERS=full, BEER_BD12_ROOT_PUSH=0, BEER_BD12_SSBO=0, BEER_DXIL_LEGACY_STRUCTURIZER=1,
+    BEER_BD12_UAV_BARRIER=full, BEER_DSTORAGE_CPU=1.
+  - Indirect args are sane (BEER_BD12_IND_ARGS=1 ring, dumped on USR1): 6288, 50296 groups.
+  - Robustness2 is enabled. Zero-fill covers default heaps, sub-allocations and images.
+- **Not informative:** BEER_BD12_MESH=0 / BEER_BD12_VRS=0 "fix" it only because RE9 then drops its whole DX12U path
+  (no mesh pipelines, so no RT).
+- **CPU-side CBV dumps (BEER_BD12_CB_DUMP=<hash prefix>)** do not reflect what the GPU reads: b9 shows
+  zeros/ffffffff on dispatches that complete. The data is probably GPU-written or written later, so CPU reads of
+  constants cannot find the bad input.
+- **Next:**
+  - A Proton/vkd3d dump of 406577c5 (RT High) to diff the SPIR-V. Proton currently does not start for the user.
+  - Or capture the GPU-side b9/t12 contents with a GPU copy right before the dispatch, using BEER_BD12_SNAP_UAV-style
+    tooling.
+  - Check how RE9's RT High SDF volume (t12) is produced: streamed, compute-built or copied.
