@@ -70,6 +70,7 @@ struct BD12DescriptorBuffers {
     /* Storage-buffer mode (BEER_BD12_SSBO): raw/structured views are SSBOs in the heap, with each heap's metadata
      * ({offset, size} inside the aligned SSBO and the UAV counter address, META_BYTES per slot) bound as set 3. */
     int ssbo;
+    int split;                                  /* set 4: the per-slot storage-buffer array (heap->raw) */
     VkDescriptorSetLayout meta_layout;          /* set 3: binding 0, the bound heap's metadata buffer */
     VkDeviceSize meta_desc_size;
     VkDeviceSize ssbo_alignment;                /* minStorageBufferOffsetAlignment */
@@ -161,6 +162,11 @@ static int heap_buffer_create(BD12Device *device, BD12DescriptorHeap *heap, VkDe
      * and then the metadata it points at. */
     const int meta = db->ssbo && !samplers;
     VkDeviceSize meta_data = 0;
+    if (meta && db->split) {   /* the raw array: a second copy of the set-0 layout (binding offset included) */
+        const VkDeviceSize a = db->offset_alignment ? db->offset_alignment : 64;
+        heap->raw_set_offset = (bytes + a - 1) / a * a;
+        bytes = heap->raw_set_offset + db->resource_offset + (VkDeviceSize)heap->count * db->resource_stride;
+    }
     if (meta) {
         const VkDeviceSize a = db->offset_alignment ? db->offset_alignment : 64;
         heap->meta_desc_offset = (bytes + a - 1) / a * a;
@@ -215,6 +221,7 @@ static int heap_buffer_create(BD12Device *device, BD12DescriptorHeap *heap, VkDe
     };
     heap->db_address = device->vk.GetBufferDeviceAddress(device->device, &address);
     heap->payload = (uint8_t *)mapped + (samplers ? db->sampler_offset : db->resource_offset);
+    if (meta && db->split) heap->raw = (uint8_t *)mapped + heap->raw_set_offset + db->resource_offset;
     if (meta) {
         heap->meta = (uint8_t *)mapped + meta_data;
         VkDescriptorAddressInfoEXT target = {
@@ -259,6 +266,7 @@ static void heap_attach_payload(BD12DescriptorHeap *heap)
     heap->payload = calloc(heap->count, stride);
     if (!heap->payload) heap->payload_stride = 0;
     if (db->ssbo && !samplers) heap->meta = calloc(heap->count, META_BYTES);   /* copied with the descriptors */
+    if (db->ssbo && db->split && !samplers) heap->raw = calloc(heap->count, stride);
 }
 
 /* BEER_BD12_PROF: descriptor heaps created/destroyed (shader-visible ones get a driver allocation) and time spent. */
@@ -310,6 +318,7 @@ int bd12_heapdb_heap_destroy(BD12DescriptorHeap *heap)
         device->vk.FreeMemory(device->device, heap->db_memory, NULL);
     } else {
         free(heap->payload);
+        free(heap->raw);
         free(heap->meta);   /* CPU heaps only: a shader-visible heap's metadata lives in its descriptor buffer */
     }
     munmap(heap->region, heap->region_bytes);
@@ -408,15 +417,53 @@ static int ssbo_address(const struct BD12DescriptorBuffers *db, const BD12Descri
     return 1;
 }
 
+/* Split mode: the storage-buffer descriptor of slot `d` for set 4 (`raw`, `stride` bytes): every buffer view, typed
+ * or not, as an SSBO over its range; anything else a null SSBO. Also fills the {offset, size} metadata. */
+static void encode_raw(BD12Device *device, const BD12Descriptor *d, uint8_t *raw, uint32_t stride, uint8_t *meta)
+{
+    struct BD12DescriptorBuffers *db = device->db;
+    VkDescriptorAddressInfoEXT address;
+    uint32_t meta_offset = 0, meta_size = 0;
+    VkDescriptorGetInfoEXT info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+                                    .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
+    const int buffer_view = d->kind == BD12_DESC_SRV_BUFFER || d->kind == BD12_DESC_UAV_BUFFER;
+    if (buffer_view && ssbo_address(db, d, &address, &meta_offset, &meta_size)) {
+        info.data.pStorageBuffer = &address;
+        if (meta) { memcpy(meta, &meta_offset, 4); memcpy(meta + 4, &meta_size, 4); }
+    }
+    const uint32_t size = db->type_size[T_SSBO];
+    if (!size || size > stride || (!info.data.pStorageBuffer && !db->null_descriptor)) {
+        memset(raw, 0, stride);
+        return;
+    }
+    db->GetDescriptor(device->device, &info, size, raw);
+    if (size < stride) memset(raw + size, 0, stride - size);
+}
+
+static void encode_slot(BD12Device *device, const BD12Descriptor *d, VkDescriptorType null_type, uint8_t *out,
+                        uint32_t stride, uint8_t *meta);
+
+/* Slot `d`: its set-0 descriptor in `out`, metadata, and (split mode) its set-4 storage-buffer descriptor in `raw`.
+ * The raw encode runs last: it adds the {offset, size} of typed views, which the set-0 path leaves zero. */
 static void encode(BD12Device *device, const BD12Descriptor *d, VkDescriptorType null_type, uint8_t *out,
-                   uint32_t stride, uint8_t *meta)
+                   uint32_t stride, uint8_t *meta, uint8_t *raw)
+{
+    encode_slot(device, d, null_type, out, stride, meta);
+    if (raw) encode_raw(device, d, raw, stride, meta);
+}
+
+static void encode_slot(BD12Device *device, const BD12Descriptor *d, VkDescriptorType null_type, uint8_t *out,
+                        uint32_t stride, uint8_t *meta)
 {
     struct BD12DescriptorBuffers *db = device->db;
     VkDescriptorImageInfo image;
     VkDescriptorAddressInfoEXT address;
     VkDescriptorGetInfoEXT info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT };
     uint32_t meta_offset = 0, meta_size = 0;
-    const int untyped = db->ssbo && (d->flags & BD12_DESC_FLAG_UNTYPED);   /* every raw/structured view (shaders use SSBOs) */
+    /* Every raw/structured view is an SSBO in set 0, except in split mode: shaders then read SSBOs from set 4 and set 0
+     * keeps an R32_UINT texel view, since D3D12 also lets a shader read a raw/structured view as a typed Buffer<uint>
+     * (GoT's 7633df4f89d9e63e: texelFetch on an SSBO descriptor hung the GPU; vkd3d-proton writes both too). */
+    const int untyped = db->ssbo && !db->split && (d->flags & BD12_DESC_FLAG_UNTYPED);
     if (meta) {   /* {offset, size} for SSBO views; the counter address for UAVs that have one */
         memset(meta, 0, META_BYTES);
         memcpy(meta + 8, &d->counter_va, 8);
@@ -483,6 +530,16 @@ static void encode(BD12Device *device, const BD12Descriptor *d, VkDescriptorType
     if (size < stride) memset(out + size, 0, stride - size);
 }
 
+/* Diagnostic (BEER_BD12_SNAP_CS): encodes heap slot `index` again from its record into `out` (and `meta`), to compare
+ * with the bytes the GPU reads. 0 when the heap has no descriptor bytes. */
+int bd12_heap_encode_probe(BD12DescriptorHeap *heap, uint32_t index, uint8_t *out, uint32_t out_size, uint8_t *meta)
+{
+    if (!heap || !heap->payload || index >= heap->count || heap->payload_stride > out_size) return 0;
+    encode(heap->device, &heap->descriptors[index], VK_DESCRIPTOR_TYPE_MAX_ENUM, out, heap->payload_stride,
+           heap->meta ? meta : NULL, NULL);
+    return 1;
+}
+
 void bd12_heap_written(const void *first, uint32_t count, VkDescriptorType null_type)
 {
     BD12DescriptorHeap *heap = bd12_heap_from_cpu(first);
@@ -494,7 +551,8 @@ void bd12_heap_written(const void *first, uint32_t count, VkDescriptorType null_
         for (uint32_t i = 0; i < count; ++i)
             encode(heap->device, &heap->descriptors[index + i], null_type,
                    heap->payload + (size_t)(index + i) * heap->payload_stride, heap->payload_stride,
-                   heap->meta ? heap->meta + (size_t)(index + i) * META_BYTES : NULL);
+                   heap->meta ? heap->meta + (size_t)(index + i) * META_BYTES : NULL,
+                   heap->raw ? heap->raw + (size_t)(index + i) * heap->payload_stride : NULL);
     }
     if (heap->mirror) bd12_mirror_write(heap, index, count);
 }
@@ -510,10 +568,13 @@ void bd12_heap_copied(const void *dst, const void *src, uint32_t count)
         BD12DescriptorHeap *from = bd12_heap_from_cpu(src);
         const uint32_t from_index = from ? (uint32_t)((const BD12Descriptor *)src - from->descriptors) : 0;
         if (from && from->payload_stride == to->payload_stride && from_index + count <= from->count &&
-            !from->meta == !to->meta) {
+            !from->meta == !to->meta && !from->raw == !to->raw) {
             memmove(to->payload + (size_t)index * to->payload_stride,
                     from->payload + (size_t)from_index * from->payload_stride,
                     (size_t)count * to->payload_stride);
+            if (to->raw)
+                memmove(to->raw + (size_t)index * to->payload_stride, from->raw + (size_t)from_index * from->payload_stride,
+                        (size_t)count * to->payload_stride);
             if (to->meta)
                 memmove(to->meta + (size_t)index * META_BYTES, from->meta + (size_t)from_index * META_BYTES,
                         (size_t)count * META_BYTES);
@@ -521,7 +582,8 @@ void bd12_heap_copied(const void *dst, const void *src, uint32_t count)
             for (uint32_t i = 0; i < count; ++i)
                 encode(to->device, &to->descriptors[index + i], VK_DESCRIPTOR_TYPE_MAX_ENUM,
                        to->payload + (size_t)(index + i) * to->payload_stride, to->payload_stride,
-                       to->meta ? to->meta + (size_t)(index + i) * META_BYTES : NULL);
+                       to->meta ? to->meta + (size_t)(index + i) * META_BYTES : NULL,
+                       to->raw ? to->raw + (size_t)(index + i) * to->payload_stride : NULL);
         }
     }
     if (to->mirror) bd12_mirror_write(to, index, count);
@@ -611,11 +673,13 @@ static BD12DbLayout *layout_create(BD12Device *device, const VkSampler *samplers
         free(entry);
         return NULL;
     }
-    const VkDescriptorSetLayout sets[4] = { db->resource_layout, db->sampler_layout, entry->statics, db->meta_layout };
+    const VkDescriptorSetLayout sets[5] = { db->resource_layout, db->sampler_layout, entry->statics, db->meta_layout,
+                                            db->resource_layout };
     const VkPushConstantRange range = { db->push_stages, 0, db->push_size };
     const VkPipelineLayoutCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = db->ssbo ? 4u : 3u,   /* set 3: the heap's storage-buffer metadata */
+        /* set 3: the heap's storage-buffer metadata; set 4: its storage-buffer array (split mode) */
+        .setLayoutCount = db->ssbo ? (db->split ? 5u : 4u) : 3u,
         .pSetLayouts = sets,
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &range
@@ -680,6 +744,11 @@ VkShaderStageFlags bd12_db_push_stages(const BD12Device *device)
 }
 
 /* Storage-buffer mode: raw/structured heap views are SSBOs with set-3 metadata (alignment in *alignment). */
+int bd12_db_split_raw(const BD12Device *device)
+{
+    return device && device->db && device->db->ssbo && device->db->split;
+}
+
 int bd12_db_ssbo(const BD12Device *device, uint32_t *alignment)
 {
     const struct BD12DescriptorBuffers *db = device ? device->db : NULL;
@@ -763,6 +832,11 @@ void bd12_db_bind(BD12CmdList *list, VkPipelineBindPoint point, const BD12DbLayo
             static const uint32_t meta_index = 0;
             const VkDeviceSize meta_offset = heaps[0]->meta_desc_offset;
             db->CmdSetOffsets(list->command_buffer, point, layout->layout, 3, 1, &meta_index, &meta_offset);
+            if (db->split) {   /* set 4: the storage-buffer array, a second copy of the set-0 layout */
+                static const uint32_t raw_index = 0;
+                const VkDeviceSize raw_offset = heaps[0]->raw_set_offset;
+                db->CmdSetOffsets(list->command_buffer, point, layout->layout, 4, 1, &raw_index, &raw_offset);
+            }
         }
         list->db_offsets_valid[which] = 1;
         list->db_static[which] = NULL;
@@ -861,6 +935,10 @@ void bd12_db_init(BD12Device *device)
                 db->GetLayoutSize(device->device, db->meta_layout, &db->meta_desc_size);
                 db->ssbo_alignment = device->min_storage_buffer_alignment ? device->min_storage_buffer_alignment : 16;
                 db->ssbo = 1;
+                /* Split raw/typed (default; BEER_BD12_SPLIT_RAW=0 = one mutable descriptor per slot, typed buffer
+                 * views then have no SSBO and shaders reading them raw get garbage: GoT's cloth solver hung). */
+                const char *split = getenv("BEER_BD12_SPLIT_RAW");
+                db->split = !(split && (!*split || !strcmp(split, "0")));
             }
         }
     }

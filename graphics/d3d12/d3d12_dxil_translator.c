@@ -517,8 +517,10 @@ static void rs_heap(const Collect *c, dxil_spv_vulkan_binding *out, uint32_t hea
 {
     memset(out, 0, sizeof(*out));
     if (c->rl->heap_model == BEER_HEAP_MODEL_MUTABLE) {
-        /* Every resource class aliases the one mutable array; samplers are their own heap. */
-        out->set = heap_class == HEAP_CLASS_SAMPLER ? 1 : 0;
+        /* Every resource class aliases the one mutable array; samplers are their own heap. Split raw/typed
+         * (ssbo_heap 4): storage-buffer accesses read the heap's SSBO array, set 4 (bd12_heapdb.c). */
+        out->set = heap_class == HEAP_CLASS_SAMPLER ? 1 :
+                   c->rl->ssbo_heap >= 4 && type == DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_SSBO ? 4 : 0;
         out->binding = 0;
     } else {
         out->set = 1;

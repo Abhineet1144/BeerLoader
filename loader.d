@@ -31,9 +31,10 @@ loader.o: loader.c platform/beer_env.h graphics/d3d11/d3d11_compat.h \
  audio/audio_backend.h audio/wasapi_compat.h media/media_foundation.h \
  media/media_session.h renderer/vulkan/vulkan_indexed_renderer.h \
  platform/win32_kernel32_export_names.inc \
- platform/win32_system_dll_names.h platform/win32_winhttp_url.h \
- platform/win32_winhttp.h platform/win32_adapter_info.h \
- platform/win32_registry.inc platform/win32_steam_matchmaking.inc \
+ platform/win32_system_dll_names.h platform/win32_delay_load.inc \
+ platform/win32_winhttp_url.h platform/win32_winhttp.h \
+ platform/win32_adapter_info.h platform/win32_registry.inc \
+ platform/win32_steam_matchmaking.inc \
  platform/steam_networking_identity.h platform/beer_steam_networking.h \
  platform/win32_steam_networking.inc platform/win32_wmi.inc \
  platform/win32_wic.inc platform/win32_tsf.h platform/win32_full_path.h \
@@ -45,7 +46,8 @@ loader.o: loader.c platform/beer_env.h graphics/d3d11/d3d11_compat.h \
  platform/win32_display_config.inc platform/win32_nvapi.inc \
  platform/../graphics/d3d12v/bd12_cuda.h platform/win32_ngx.inc \
  platform/win32_d3dkmt.inc platform/win32_file_search.inc \
- platform/win32_missing_exports.inc platform/win32_native_info.inc \
+ platform/win32_missing_exports.inc platform/win32_service_manager.inc \
+ platform/win32_alpc_attributes.inc platform/win32_native_info.inc \
  platform/win32_native_sync.inc platform/win32_uxtheme.inc \
  platform/win32_user_misc.inc platform/win32_crypt32.inc \
  platform/win32_missing_exports_table.inc platform/beer_extra_exports.inc \
@@ -123,6 +125,7 @@ media/media_session.h:
 renderer/vulkan/vulkan_indexed_renderer.h:
 platform/win32_kernel32_export_names.inc:
 platform/win32_system_dll_names.h:
+platform/win32_delay_load.inc:
 platform/win32_winhttp_url.h:
 platform/win32_winhttp.h:
 platform/win32_adapter_info.h:
@@ -153,6 +156,8 @@ platform/win32_ngx.inc:
 platform/win32_d3dkmt.inc:
 platform/win32_file_search.inc:
 platform/win32_missing_exports.inc:
+platform/win32_service_manager.inc:
+platform/win32_alpc_attributes.inc:
 platform/win32_native_info.inc:
 platform/win32_native_sync.inc:
 platform/win32_uxtheme.inc:

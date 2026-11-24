@@ -5,6 +5,41 @@
  * ordinary file handles; timer-queue timers are host threads that call the guest callback with a proper TEB. */
 
 /* ---- tokens / security descriptors ---- */
+/* Fixed well-known identities, independent of any process token. Logon SIDs
+ * need a logon session; account-domain identities are not implemented here. */
+static u64 __attribute__((ms_abi)) impl_CreateWellKnownSid(u32 type, const void *domain,
+                                                          void *sid, u32 *size)
+{
+    static const struct { u8 authority, count; u32 rid[2]; } fixed[] = {
+        [0] = {0,1,{0}}, [1] = {1,1,{0}}, [2] = {2,1,{0}},
+        [3] = {3,1,{0}}, [4] = {3,1,{1}}, [5] = {3,1,{2}}, [6] = {3,1,{3}}, [7] = {5,0,{0}},
+        [8] = {5,1,{1}}, [9] = {5,1,{2}}, [10] = {5,1,{3}}, [11] = {5,1,{4}},
+        [12] = {5,1,{6}}, [13] = {5,1,{7}}, [14] = {5,1,{8}}, [15] = {5,1,{9}},
+        [16] = {5,1,{10}}, [17] = {5,1,{11}}, [18] = {5,1,{12}}, [19] = {5,1,{13}},
+        [20] = {5,1,{14}}, [22] = {5,1,{18}}, [23] = {5,1,{19}}, [24] = {5,1,{20}},
+        [25] = {5,1,{32}}, [26] = {5,2,{32,544}}, [27] = {5,2,{32,545}},
+        [28] = {5,2,{32,546}}, [29] = {5,2,{32,547}}, [30] = {5,2,{32,548}},
+        [31] = {5,2,{32,549}}, [32] = {5,2,{32,550}}, [33] = {5,2,{32,551}},
+        [34] = {5,2,{32,552}}, [35] = {5,2,{32,554}}, [36] = {5,2,{32,555}},
+        [37] = {5,2,{32,556}},
+    };
+    const u8 *domain_sid = domain;
+    if (!size || (domain_sid && (domain_sid[0] != 1 || domain_sid[1] > 15)) ||
+        type >= sizeof(fixed) / sizeof(fixed[0]) || (!fixed[type].count && type != 7)) {
+        g_last_error = 87;
+        return 0;
+    }
+    const u32 needed = 8u + 4u * fixed[type].count;
+    const u32 capacity = *size;
+    if (capacity < needed) { *size = needed; g_last_error = 122; return 0; }
+    if (!sid) { g_last_error = 87; return 0; }
+    u8 bytes[16] = {1, fixed[type].count, 0, 0, 0, 0, 0, fixed[type].authority};
+    memcpy(bytes + 8, fixed[type].rid, needed - 8);
+    memcpy(sid, bytes, needed);
+    *size = needed;
+    return 1;
+}
+
 static u64 __attribute__((ms_abi)) impl_OpenThreadToken(u64 thread, u32 access, u32 open_as_self, u64 *token)
 {
     (void)thread; (void)access; (void)open_as_self;

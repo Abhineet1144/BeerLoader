@@ -645,6 +645,15 @@ void bd12_capture_srv_depth(BD12CmdList *list, BD12Image *im, uint32_t mip, uint
 
 void bd12_capture_srv_depth_reset(void) {}
 
+/* One whole image for a diagnostic dump (the inputs and output of a DLSS evaluation): colour formats as the frame
+ * breakdown saves them, depth as the sampled-depth capture. Written with the next capture flush. */
+void bd12_capture_image(BD12CmdList *list, BD12Image *im, const char *name)
+{
+    if (!list || !im || !getenv("BEER_BD12_CAPTURE_DIR")) return;
+    if (im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) { bd12_capture_srv_depth(list, im, 0, 0, 1, 0, 0); return; }
+    capture_color(list, im, 0, 0, 1, name, 0);
+}
+
 static float rt_half(uint16_t h)
 {
     const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 31, man = h & 1023;
@@ -772,6 +781,12 @@ void bd12_capture_flush(void)
     for (uint32_t i = 0; i < g_cap_count; ++i) {
         Capture *c = &g_caps[i];
         if (c->is_rt) {
+            if (getenv("BEER_BD12_CAPTURE_RAW") && c->readback->cpu) {   /* the texels as copied, for offline analysis */
+                char raw[600];
+                snprintf(raw, sizeof(raw), "%s/%s.raw", dir, c->name);
+                FILE *f = fopen(raw, "wb");
+                if (f) { fwrite(c->readback->cpu, 1, c->size, f); fclose(f); }
+            }
             if (!rt_write_ppm(c, dir))
                 fprintf(stderr, "[CAPTURE] unhandled render-target format %u (%s)\n", (unsigned)c->rt_fmt, c->name);
             bd12_buffer_destroy(c->readback);

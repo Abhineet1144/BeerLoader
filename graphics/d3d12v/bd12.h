@@ -154,6 +154,8 @@ typedef struct {
     VkDeviceSize base;            /* offset of the heap in `memory` */
     VkDeviceSize align;           /* sub-allocation alignment; 0 = derived from the size (any placed resource) */
     int rebar;                    /* dedicated UPLOAD memory in resizable-BAR VRAM (counted in the ReBAR cap) */
+    int accounted;                /* heap_live/heap_bytes already released (queued for the background free) */
+    struct BD12HeapTag *reap_next;/* background free queue link (bd12_device.c) */
 } BD12Heap;
 
 /* Cached typed views over a buffer range (texel-buffer SRV/UAV descriptors). Unpinned views are freed once no
@@ -183,6 +185,7 @@ typedef struct BD12Buffer {
     uint64_t va;                  /* D3D12 GPU virtual address */
     void *cpu;                    /* heap->mapped + offset, or NULL */
     uint32_t serial;              /* unique per buffer: descriptors remember it to detect pointer reuse */
+    int sparse;                   /* D3D12 reserved buffer: sparse residency, no heap; tiles bound by UpdateTileMappings */
     struct BD12AccelStruct *accel;/* acceleration structures placed in it */
     uint32_t accel_count, accel_capacity;
 } BD12Buffer;
@@ -219,6 +222,7 @@ typedef struct {
     uint32_t mip_levels;
     uint32_t samples;
     int allow_render_target, allow_depth_stencil, allow_uav, cube_compatible;
+    int typeless;                 /* DXGI *_TYPELESS resource format: views may use any format of its family */
 } BD12ImageDesc;
 
 /* ID3D12Resource (texture). Layouts are derived from D3D12 resource states
@@ -240,6 +244,11 @@ typedef struct BD12Image {
     BD12ImageViewEntry *views;
     uint32_t view_count, view_capacity;
     uint32_t serial;              /* unique per image (see BD12Descriptor.image_serial) */
+    /* D3D12 reserved resource on sparse residency (bd12_image_create_sparse): tiles are bound by UpdateTileMappings;
+     * `heap` (owned) backs only the packed mip tail. */
+    int sparse;
+    uint32_t sparse_block[3];     /* texels per tile: the D3D12 standard tile shape */
+    uint32_t sparse_tail_lod;     /* first mip of the packed tail */
 } BD12Image;
 
 typedef struct {
@@ -336,6 +345,12 @@ typedef struct {
      * descriptor buffer (`meta_desc_offset`: the set-3 storage-buffer descriptor pointing at it). */
     uint8_t *meta;
     VkDeviceSize meta_desc_offset;
+    /* Split raw/typed mode (with `meta`): a second array of `payload_stride` records, one per slot, holding the
+     * storage-buffer descriptor of every buffer view, typed ones included, as vkd3d-proton's split raw set does: D3D12
+     * lets a shader read a typed buffer SRV/UAV as a raw/structured buffer. Shaders see it as set 4
+     * (`raw_set_offset` into the descriptor buffer). */
+    uint8_t *raw;
+    VkDeviceSize raw_set_offset;
     /* Per-draw descriptor resolving (bd12_resolve_descriptor_set) has read this heap: from then on every write
      * advances write_epoch, which its set cache checks. Heaps it never reads (CPU-only heaps, heaps only read
      * through descriptor buffers) cost writers nothing. */
@@ -746,6 +761,8 @@ void bd12_heap_destroy(BD12Heap *heap);
 BD12Buffer *bd12_buffer_create_placed(BD12Heap *heap, VkDeviceSize offset,
                                       VkDeviceSize size);
 /* Committed buffer: dedicated heap of the requested type. */
+/* A D3D12 reserved buffer on sparse residency (64 KiB tiles bound later); NULL when unavailable. */
+BD12Buffer *bd12_buffer_create_sparse(BD12Device *device, VkDeviceSize size);
 BD12Buffer *bd12_buffer_create_committed(BD12Device *device, BD12HeapType type,
                                          VkDeviceSize size);
 void bd12_buffer_destroy(BD12Buffer *buffer);
@@ -1036,6 +1053,11 @@ void bd12_state_sync(uint32_t state, int is_source,
 BD12Image *bd12_image_create_placed(BD12Heap *heap, VkDeviceSize offset,
                                     const BD12ImageDesc *desc,
                                     uint32_t initial_state);
+/* A D3D12 reserved resource as a sparse-residency image whose tiles are the D3D12 standard shape `block` and whose
+ * packed tail starts at `standard_mips` (GetResourceTiling's layout). NULL when sparse residency is unavailable or
+ * the driver's layout differs; the caller then makes the resource fully resident. */
+BD12Image *bd12_image_create_sparse(BD12Device *device, const BD12ImageDesc *desc, uint32_t initial_state,
+                                    const uint32_t block[3], uint32_t standard_mips);
 BD12Image *bd12_image_create_committed(BD12Device *device,
                                        const BD12ImageDesc *desc,
                                        uint32_t initial_state);
@@ -1136,6 +1158,7 @@ int bd12_debug_sync_all(void);
 void bd12_trace_frame_advance(void);
 int bd12_trace_active(void);
 void bd12_trace_request(void);
+int bd12_debug_dump(void *list_iface, void *resource_iface, const char *name);
 int bd12_debug_stretch(void *list_iface, void *source_iface, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                        void *target_iface);
 int bd12_cs_watch_index(uint64_t hash);
@@ -1165,7 +1188,7 @@ enum { BD12_PROF_EXECUTE, BD12_PROF_SUBMIT, BD12_PROF_PSO, BD12_PROF_RESOLVE,
        BD12_PROF_HEAP_DESTROY,
        BD12_PROF_ALLOC_SET, BD12_PROF_UPDATE_SETS,
        BD12_PROF_SUBMIT_LOCK, BD12_PROF_VK_SUBMIT, BD12_PROF_REAP, BD12_PROF_LIST_FINISH,
-       BD12_PROF_RESOURCE, BD12_PROF_VIEW, BD12_PROF_DESC_COPY, BD12_PROF_COUNT };
+       BD12_PROF_RESOURCE, BD12_PROF_VIEW, BD12_PROF_DESC_COPY, BD12_PROF_PSO_VK, BD12_PROF_COUNT };
 extern uint64_t g_bd12_prof_ns[BD12_PROF_COUNT];
 extern uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
 static inline uint64_t bd12_prof_now(void)
@@ -1248,6 +1271,7 @@ BD12DescriptorHeap *bd12_heap_from_cpu(const void *handle);
 /* After writing `count` descriptor records at CPU handle `first`: encodes their Vulkan descriptors (null ones as
  * `null_type`, VK_DESCRIPTOR_TYPE_MAX_ENUM if unknown) and updates the mirror. */
 void bd12_heap_written(const void *first, uint32_t count, VkDescriptorType null_type);
+int bd12_heap_encode_probe(BD12DescriptorHeap *heap, uint32_t index, uint8_t *out, uint32_t out_size, uint8_t *meta);
 /* After copying `count` records from `src` to `dst`: copies their Vulkan descriptors too. */
 void bd12_heap_copied(const void *dst, const void *src, uint32_t count);
 void bd12_db_forget_image(struct BD12Image *image);
@@ -1265,9 +1289,12 @@ void bd12_db_bind(BD12CmdList *list, VkPipelineBindPoint point, const BD12DbLayo
 void bd12_cmd_invalidate_point(BD12CmdList *list, int which);
 int bd12_db_accel_in_heap(const BD12Device *device);
 int bd12_db_ssbo(const BD12Device *device, uint32_t *alignment);
+int bd12_db_split_raw(const BD12Device *device);
 void bd12_rp_trace_record(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash);
 void bd12_rp_snap_uav_after(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash, uint32_t x, uint32_t y,
                             uint32_t z);
+void bd12_rp_rec_dump(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash, uint32_t x, uint32_t y,
+                      uint32_t z);
 void bd12_rp_snap_dispatch(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash, uint32_t x, uint32_t y,
                            uint32_t z);
 void bd12_rp_snap_dump(void);
@@ -1329,6 +1356,7 @@ int bd12_scratch_alloc(BD12CmdAllocator *a, VkDeviceSize size,
                        BD12Buffer **buffer, VkDeviceSize *offset, void **ptr);
 
 /* Compute buffer capture of a traced frame (bd12_capture.c, diagnostic). */
+void bd12_capture_image(BD12CmdList *list, struct BD12Image *image, const char *name);
 void bd12_capture_srv_depth(BD12CmdList *list, struct BD12Image *image, uint32_t mip,
                             uint32_t base_layer, uint32_t layers, uint64_t shader, uint32_t reg);
 int bd12_capture_rt_enabled(void);

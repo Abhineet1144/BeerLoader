@@ -96,7 +96,8 @@ typedef struct {
     uint32_t heap_model;
     uint32_t accel_in_heap;      /* MUTABLE model: the mutable array also holds acceleration structures (TLAS SRVs) */
     uint32_t ssbo_heap;          /* MUTABLE model: raw/structured views are SSBOs; set 3 binding 0 holds per-slot
-                                  * {offset, size} (16-byte records) and the UAV counter address (bytes 8-15) */
+                                  * {offset, size} (16-byte records) and the UAV counter address (bytes 8-15);
+                                  * 4 = split raw/typed: heap SSBOs are read from set 4 binding 0 instead of set 0 */
     uint32_t ssbo_alignment;     /* the SSBO base alignment the offsets correct for */
     uint64_t hash;               /* of everything above that affects translation */
 } BeerD3D12RootLayout;

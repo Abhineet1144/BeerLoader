@@ -1,5 +1,6 @@
 #define _GNU_SOURCE   /* pipe2 */
 #include "media_foundation.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -14,6 +15,21 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* Decoder threads per ffmpeg process (BEER_MF_DECODE_THREADS, default 4). ffmpeg's default (one frame thread per
+ * core, each holding whole frames) took 910 MB and 72 threads to decode a 17 MB in-game video in Onimusha,
+ * competing with the game for RAM and CPU; four threads decode game videos in real time. ffmpeg 8 also gave the
+ * pixel-format conversion one thread per core (51 for a 4K clip): -filter_threads 2. */
+static const char *mf_decode_threads(void)
+{
+    static char value[16];
+    if (!value[0]) {
+        const char *v = getenv("BEER_MF_DECODE_THREADS");
+        const long n = v && *v ? strtol(v, NULL, 10) : 4;
+        snprintf(value, sizeof(value), "%ld", n > 0 && n < 64 ? n : 4);
+    }
+    return value;
+}
 
 /* -----------------------------------------------------------------------
  * Active NV12 frame state — converted to RGBA at lock time and retained
@@ -1474,6 +1490,7 @@ typedef struct BeerMfSourceReader {
      * rewind swaps it in instead of starting ffmpeg and waiting for its first frame (40-70 ms per loop). */
     MfDecoderPair spare;
     int has_spare;
+    int decoder_lazy;      /* decoder pair not started yet: it starts on the first read (see mf_source_reader_read_sample) */
     uint8_t *frame_data;
     uint32_t frame_size;
     uint32_t frame_index;
@@ -1865,7 +1882,9 @@ static void *g_sample_vtable[47] = {
     [45] = mf_sample_get_total_length, [46] = mf_shell_notimpl
 };
 
-static BeerMfSample *mf_sample_create_ex(const uint8_t *data, uint32_t size,
+/* Builds a sample around DATA. With ADOPT the sample takes ownership of the malloc'd DATA (no copy); on failure
+ * the caller keeps ownership. */
+static BeerMfSample *mf_sample_create_impl(uint8_t *data, int adopt, uint32_t size,
                                          int64_t timestamp, int64_t duration,
                                          uint32_t width, uint32_t height,
                                          int32_t stride)
@@ -1873,9 +1892,13 @@ static BeerMfSample *mf_sample_create_ex(const uint8_t *data, uint32_t size,
     BeerMfMediaBuffer *buffer = calloc(1, sizeof(*buffer));
     BeerMfSample *sample = calloc(1, sizeof(*sample));
     if (!buffer || !sample) { free(buffer); free(sample); return NULL; }
-    buffer->data = malloc(size);
-    if (!buffer->data) { free(buffer); free(sample); return NULL; }
-    memcpy(buffer->data, data, size);
+    if (adopt) {
+        buffer->data = data;
+    } else {
+        buffer->data = malloc(size);
+        if (!buffer->data) { free(buffer); free(sample); return NULL; }
+        memcpy(buffer->data, data, size);
+    }
     buffer->vtable = g_media_buffer_vtable;
     buffer->buffer_2d.vtable = g_2d_buffer_vtable;
     buffer->buffer_2d.owner = buffer;
@@ -1891,6 +1914,14 @@ static BeerMfSample *mf_sample_create_ex(const uint8_t *data, uint32_t size,
     sample->timestamp = timestamp;
     sample->duration = duration;
     return sample;
+}
+
+static BeerMfSample *mf_sample_create_ex(const uint8_t *data, uint32_t size,
+                                         int64_t timestamp, int64_t duration,
+                                         uint32_t width, uint32_t height,
+                                         int32_t stride)
+{
+    return mf_sample_create_impl((uint8_t *)data, 0, size, timestamp, duration, width, height, stride);
 }
 
 static BeerMfSample *mf_sample_create(const uint8_t *data, uint32_t size,
@@ -1929,6 +1960,28 @@ static void mf_source_reader_stop_decoder(BeerMfSourceReader *self)
     }
 }
 
+/* Extracted clips live in /tmp (tmpfs, so RAM) and are removed when their reader is released, but a killed or crashed
+ * loader leaves them behind (19 files, 300 MB found). They carry the owner's pid; once per process, remove those whose
+ * owner no longer exists. Files from before the pid was added (no pid field) are left alone. */
+static void mf_sweep_stale_decode_files(void)
+{
+    static int done;
+    if (__atomic_exchange_n(&done, 1, __ATOMIC_RELAXED)) return;
+    DIR *dir = opendir("/tmp");
+    if (!dir) return;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        long pid = 0;
+        char tail[16];
+        if (sscanf(entry->d_name, "beer-mf-decode-%ld-%15s", &pid, tail) != 2 || pid <= 0) continue;
+        if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;     /* owner still running (or not ours to judge) */
+        char path[320];
+        snprintf(path, sizeof(path), "/tmp/%s", entry->d_name);
+        unlink(path);
+    }
+    closedir(dir);
+}
+
 static int mf_dump_stream(BeerMfShell *byte_stream, char **path_out)
 {
     if (!byte_stream || !byte_stream->owner || !path_out) return 0;
@@ -1939,7 +1992,9 @@ static int mf_dump_stream(BeerMfShell *byte_stream, char **path_out)
     if (((BeerStreamSeekFn)vtable[5])(stream, 0, 1, &original) != BEER_S_OK ||
         ((BeerStreamSeekFn)vtable[5])(stream, 0, 0, &ignored) != BEER_S_OK)
         return 0;
-    char path[] = "/tmp/beer-mf-decode-XXXXXX";
+    mf_sweep_stale_decode_files();
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/beer-mf-decode-%ld-XXXXXX", (long)getpid());
     int fd = mkstemp(path);
     if (fd < 0) return 0;
     uint8_t block[64 * 1024];
@@ -2103,11 +2158,22 @@ static int mf_spawn_pair(BeerMfSourceReader *self, MfDecoderPair *pair)
         return 0;
     }
     fcntl(video_pipe[0], F_SETPIPE_SZ, 1 << 20);      /* a spare decodes ahead into the pipe while it waits */
-    char *video_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-i", self->decoder_input_path, "-map", "0:v:0", "-an",
-                           "-sn", "-vsync", "0", "-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1", NULL };
-    char *audio_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-i", self->decoder_input_path, "-map", "0:a:0", "-vn",
+    char *video_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-threads", (char *)mf_decode_threads(), "-filter_threads", "2",
+                           "-i", self->decoder_input_path, "-map", "0:v:0", "-an",
+                           "-sn", "-vsync", "0", "-vf", "scale=threads=2", "-pix_fmt", "nv12", "-f", "rawvideo",
+                           "pipe:1", NULL };
+    char *audio_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-threads", (char *)mf_decode_threads(), "-filter_threads", "2",
+                           "-i", self->decoder_input_path, "-map", "0:a:0", "-vn",
                            "-sn", "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1", NULL };
-    pair->video_pid = mf_spawn_ffmpeg(video_argv, video_pipe[1]);
+    /* BEER_MF_HWDEC=1: decode video on the GPU (NVDEC through CUDA). Frames are downloaded as NV12, bit-identical to the
+     * software decoder's output (checked frame by frame on a 4K H.264 clip) for ~4x less CPU; ffmpeg falls back to
+     * software itself for codecs NVDEC cannot decode. The CUDA context costs ~0.6 s on the first frame, so opt-in. */
+    char *hw_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-hwaccel", "cuda", "-filter_threads", "2",
+                        "-i", self->decoder_input_path, "-map", "0:v:0", "-an",
+                        "-sn", "-vsync", "0", "-vf", "scale=threads=2", "-pix_fmt", "nv12", "-f", "rawvideo",
+                        "pipe:1", NULL };
+    const char *hwdec = getenv("BEER_MF_HWDEC");
+    pair->video_pid = mf_spawn_ffmpeg(hwdec && *hwdec && *hwdec != '0' ? hw_argv : video_argv, video_pipe[1]);
     pair->audio_pid = pair->video_pid > 0 ? mf_spawn_ffmpeg(audio_argv, audio_pipe[1]) : -1;
     close(video_pipe[1]);
     close(audio_pipe[1]);
@@ -2129,11 +2195,21 @@ static int mf_spawn_pair(BeerMfSourceReader *self, MfDecoderPair *pair)
 static int mf_source_reader_start_decoder(BeerMfSourceReader *self)
 {
     if (!self->decoder_input_path) return 0;
+    /* A game commonly rewinds a reader right after opening it, before reading anything. Nothing has been consumed from
+     * the running pair then, so a restart would produce the identical stream: keep it (each restart of a 4K clip
+     * cost a burst of several cores and ~650 MB, thrown away after 0-13 frames). */
+    const int consumed = self->frame_index != 0 || self->audio_frame_index != 0;
+    if (!consumed && self->decoder_output && self->audio_decoder_output) {
+        self->next_video_timestamp = self->presentation_start_100ns;
+        self->next_audio_timestamp = self->presentation_start_100ns;
+        return 1;
+    }
     mf_source_reader_stop_decoder(self);
     MfDecoderPair pair;
     if (self->has_spare) { pair = self->spare; self->has_spare = 0; memset(&self->spare, 0, sizeof(self->spare)); }
     else if (!mf_spawn_pair(self, &pair)) return 0;
-    if (self->reset_count && !self->has_spare) self->has_spare = mf_spawn_pair(self, &self->spare);
+    /* A spare only pays off for a clip that is actually looping (one that was played before this rewind). */
+    if (consumed && self->reset_count && !self->has_spare) self->has_spare = mf_spawn_pair(self, &self->spare);
     self->decoder_output = pair.video;
     self->audio_decoder_output = pair.audio;
     const pid_t video_pid = pair.video_pid, audio_pid = pair.audio_pid;
@@ -2327,7 +2403,7 @@ mf_source_reader_set_current_position(BeerMfSourceReader *self,
     self->read_count = 0;
     self->reset_count++;
     atomic_store_explicit(&self->terminal_eos, 0, memory_order_release);
-    if (self->decoder_input_path && !mf_source_reader_start_decoder(self))
+    if (self->decoder_input_path && !self->decoder_lazy && !mf_source_reader_start_decoder(self))
         return BEER_E_NOTIMPL;
     return BEER_S_OK;
 }
@@ -2416,6 +2492,14 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
     if (self->async_callback && g_async_on_read_sample && g_mf_worker_start &&
         !actual_stream && !stream_flags && !timestamp && !sample)
         return mf_source_reader_async_enqueue(self, 0, stream, flags);
+    if (self->decoder_lazy) {
+        self->decoder_lazy = 0;
+        if (self->decoder_input_path && !mf_source_reader_start_decoder(self)) {
+            unlink(self->decoder_input_path);
+            free(self->decoder_input_path);
+            self->decoder_input_path = NULL;
+        }
+    }
     /* Stream selection and A/V ordering come from the requested source-reader
      * stream and decoded timestamps. Outstanding sample count is owned by the
      * caller and must not alter selection semantics. */
@@ -2456,8 +2540,13 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
                 (void *)sample);
     if (resolved_stream == 0 && self->video_selected && self->decoder_output &&
         self->frame_data && self->frame_size) {
-        size_t received = fread(self->frame_data, 1, self->frame_size,
+        /* Read the decoded frame straight into the buffer the sample will own (was: into frame_data, then
+         * malloc + memcpy of the whole frame, ~12 MB of extra copying per 4K frame). */
+        uint8_t *frame_copy = malloc(self->frame_size);
+        if (!frame_copy) return BEER_E_NOTIMPL;
+        size_t received = fread(frame_copy, 1, self->frame_size,
                                 self->decoder_output);
+        if (received != self->frame_size) free(frame_copy);
         if (received == self->frame_size) {
             uint32_t numerator = self->video_rate_numerator ?
                 self->video_rate_numerator : 60u;
@@ -2465,12 +2554,12 @@ mf_source_reader_read_sample(BeerMfSourceReader *self, uint32_t stream,
                 self->video_rate_denominator : 1u;
             int64_t frame_duration =
                 (INT64_C(10000000) * denominator + numerator / 2u) / numerator;
-            BeerMfSample *decoded = mf_sample_create_ex(
-                self->frame_data, self->frame_size,
+            BeerMfSample *decoded = mf_sample_create_impl(
+                frame_copy, 1, self->frame_size,
                 self->next_video_timestamp, frame_duration,
                 self->video_width, self->video_height,
                 (int32_t)self->video_width);
-            if (!decoded) return BEER_E_NOTIMPL;
+            if (!decoded) { free(frame_copy); return BEER_E_NOTIMPL; }
             const int64_t decoded_timestamp = decoded->timestamp;
             if (stream_flags) *stream_flags = 0;
             if (timestamp) *timestamp = decoded_timestamp;
@@ -2811,7 +2900,15 @@ beer_mf_create_source_reader_from_byte_stream(void *byte_stream,
     shell->frame_size = shell->video_width * shell->video_height * 3u / 2u;
     shell->frame_data = malloc(shell->frame_size);
     shell->audio_data = malloc(shell->audio_frame_size);
-    if (shell->frame_data && shell->audio_data && shell->decoder_input_path &&
+    /* A game opens every clip it may need (five 5-17 MB clips at load) but plays one at a time. A started ffmpeg pair
+     * burst-decodes and then idles holding ~650 MB, so start it on the first read instead (BEER_MF_LAZY_DECODER=0
+     * restores starting at open). */
+    {
+        const char *lazy = getenv("BEER_MF_LAZY_DECODER");
+        if (shell->frame_data && shell->audio_data && shell->decoder_input_path && !(lazy && !strcmp(lazy, "0")))
+            shell->decoder_lazy = 1;
+    }
+    if (!shell->decoder_lazy && shell->frame_data && shell->audio_data && shell->decoder_input_path &&
         !mf_source_reader_start_decoder(shell)) {
         unlink(shell->decoder_input_path);
         free(shell->decoder_input_path);

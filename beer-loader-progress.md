@@ -1,5 +1,69 @@
 # Beer Loader — Active Development Context
 
+## Ghost of Tsushima reaches gameplay: split raw/typed descriptors (2026-11-25)
+
+User confirmed: GoT plays (New Game -> cutscene -> gameplay). Two GPU hangs (Xid 109) were both descriptor-type
+mismatches in Beer's single-descriptor-per-slot heap, which vkd3d-proton avoids on NVIDIA with its split raw/typed sets
+(VKD3D_BINDLESS_MUTABLE_TYPE_SPLIT_RAW_TYPED: every buffer SRV/UAV writes BOTH a typed and an SSBO descriptor).
+- Cloth solver 524c7c2e7e8bd58d (and variants a7c5911970ce3c99, 594642fe825d656a): reads a TYPED float4 buffer SRV
+  (header+4, 280 x 16 B) as a raw/structured buffer. Beer's slot held a texel descriptor; read as SSBO -> garbage
+  address -> hang. All loop counts/data were valid (new BEER_BD12_SNAP_CS header-slot capture proved it).
+- Hit-mask pass 7633df4f89d9e63e (indirect, first gameplay frame): reads a RAW view (record +404, slot 874) as a typed
+  Buffer<uint>; Beer's slot held an SSBO descriptor; texelFetch on it -> hang.
+- Fix (bd12_heapdb.c, default on; BEER_BD12_SPLIT_RAW=0 = old model): each CBV/SRV/UAV descriptor buffer has a second
+  per-slot array (`heap->raw`, same mutable layout/stride, bound as set 4 at `raw_set_offset`) holding an SSBO
+  descriptor for every buffer view, typed or not (encode_raw; also writes {offset,size} metadata for typed views). Set 0
+  holds the typed view: R32_UINT texel for raw/structured views in split mode. Translator: heap SSBO accesses -> set 4
+  (ssbo_heap policy 4, new shader-cache key: first launch of every D3D12 game re-translates).
+- Root arguments: descriptor tables and root constants now carry across a same-type root-signature change (as
+  vkd3d-proton). Root CBV/SRV/UAV addresses still cleared (RE9 Xid 31) unless BEER_BD12_KEEP_ROOT_ARGS=1. Added while
+  chasing a misread dump; not proven needed for GoT, matches vkd3d.
+- Diagnostics added: BEER_BD12_IND_ARGS entries now GPU-stamped ("GPU reached" vs stale); kill -USR1 also prints
+  BEER_VK_CHECKPOINTS (hangs rarely fail a submit); BEER_BD12_REC_CS=<hash> prints the SM6.6 record's heap slots and
+  their descriptor kinds (at first dispatch and at hang time) - the tool that found the 7633 mismatch.
+- NOT YET DONE: RE8/RE9/RE4/PRAGMATA re-check on the split model + carry; commit. Open GoT issues: invisible mouse
+  cursor; fullscreen window takes the size of the window below it / clipped by dock and top bar (also Sekiro, WWM).
+- Logs: /mnt/hdd2/beer-trace/got-*-20261125.log. Launch: GhostOfTsushima.exe with BEER_DLL_BUILTIN=winmm.
+
+## Pratfall (Godot 4.6.1 Mono) .NET startup crash, partly fixed (2026-11-25)
+
+Symptoms and keywords: Pratfall.exe dies with SIGSEGV ~6 s after launch, after `RoInitialize` delay-load failed and
+`icu.dll` not found; unhandled .NET exception in `System.Buffers.SharedArrayPool<char>`; "[SEH] frame 0 pc=...: no
+runtime function entry"; fault in a virtual-call stub (`mov rax,[rcx]; mov rax,[rax+0x40]; jmp [rax+0x38]`) with rcx = a
+precode address. Prefix `pratfall` must contain `drive_c/Program Files (x86)/Steam/GameOverlayRenderer64.dll` (symlink to
+the installed one) or the game shows "Failed to load steam overlay dll" and exits.
+
+- **Generic loader bug fixed (loader.c, `beer_end_fault_dispatch_for_target_unwind`):** a catch that CoreCLR resumes
+  itself (own register restore, never RtlRestoreContext) left the fault dispatch in progress and SIGSEGV/SIGBUS masked, so
+  the NEXT fault on that thread (the next managed NullReferenceException) was not dispatched and killed the process.
+  Cleared in RtlUnwindEx just before the target-frame handler runs. Also `RtlRestoreContext`/`NtContinue` now run
+  `beer_prepare_direct_guest_resume` (`beer_restore_context_prepare`). RE8 75 s gate after: ~260 fps, no crash, no Xid.
+- **Still open:** the first NullReferenceException is `ArrayPoolEventSource.Log` == null inside
+  `SharedArrayPool<char>.Rent` (R2R CoreLib), i.e. the EventSource static init did not complete (ETW registration:
+  `EventSetInformation` export missing; ETW providers missing). Then managed code calls a virtual method on a precode
+  address. Not W^X (`DOTNET_EnableWriteXorExecute=0` same crash) and not EventSourceSupport. Next: log which ETW/Event*
+  functions CoreCLR calls (advapi32/ntdll EventRegister/EventSetInformation/EventWrite) and implement them; RoInitialize.
+- Diagnostics used: gdb with `handle SIGSYS/SIGUSR1/SIGUSR2 nostop noprint pass` (loader uses them), `BEER_EXCEPTION_DIAGNOSTICS=1`.
+
+## Pratfall startup investigation — paused (2026-11-25)
+
+- Executable: `/mnt/56A4064AA4062CD5/Games/Pratfall/Pratfall/Pratfall.exe`, Godot 4.6.1 Mono.
+- Original missing overlay repaired in the isolated `pratfall` prefix: linked the genuine installed
+  `~/.local/share/Steam/GameOverlayRenderer64.dll` into `drive_c/Program Files (x86)/Steam/`.
+  Actual overlay, bundled SteamOverlay64 and winmm process attaches now succeed. Game files unchanged.
+- Generic loader bug fixed: GetProcAddress reused diagnostic-only import slots with no emitted thunk
+  (observed timeGetDevCaps -> zero-filled code). Only reuse implementation-backed slots now.
+  Native-loader regression failed before the fix and passes afterwards; final build and full test-input PASS.
+- Game still does NOT start. Subsequent logs show unsupported DWriteCreateFactory and
+  SHGetPropertyStoreForWindow returning zero/success, followed by null dereferences; WSOCK32 ordinal115
+  is also unresolved. Default Vulkan and explicit `--rendering-driver d3d12` both fail display initialization.
+  D3D12 attempt also requests missing D3D12GetInterface. Engine suggests OpenGL3, but no OpenGL attempt
+  was made; do not conclude that missing OpenGL is the root cause or the GPU driver is unsupported.
+- Logs: `/tmp/beer-pratfall-overlay.log`, `/tmp/beer-pratfall-fixed.log`, `/tmp/beer-pratfall-d3d12.log`;
+  regression logs `/tmp/beer-pratfall-negative-test.log`, `/tmp/beer-pratfall-native-test.log`,
+  `/tmp/beer-pratfall-input-tests.log`. Test processes exited. No gameplay or stability claim.
+- User: if lack of OpenGL support blocks this game, stop and inform for now. Investigation paused.
+
 ## Where Winds Meet after the 2026-11-21 game update: start-up fixed (2026-11-21)
 
 - Protector import check (TLS callback) needed `USER32!GetClipboardSequenceNumber` (constant: Beer's clipboard never
@@ -932,6 +996,132 @@ Proton, DLSS, DLSS FG + Reflex (XMM6 fix), RE9 DX12U mesh path (barycentrics). U
    Tools: Java test harness `/tmp/jt/T.java` (`javac --release 8`; run the JRE `java.exe` under the loader with
    `--cmdline="\"Z:\\...\\java.exe\" -cp Z:\\tmp\\jt T"`, exe path must be quoted); `kill -USR1 <javaw pid>` dumps
    `[STACKS] wtid=... api=...` wait states into the log; TLauncher classes extracted to /tmp/tlj.
+
+   RESUMED 2026-11-23 (TLauncher active; installer remains paused):
+   - Runtime validation only checks the jre1.8.0_281 directory, not javaw.exe. Both runtime/temp trees
+     were empty. Preserved them as timestamped .incomplete backups; genuine runtime redownload succeeded
+     in /tmp/beer-tlauncher-recover.log (160 s whole-cgroup cap). Bundled 8u281 child starts; failure cleanup
+     removes its files again. Check actual files before retrying; do not repeatedly trust directory presence.
+   - Confirmed JavaFX dwrite.dll factory lookup returns NULL for DWriteCreateFactory. DWFactory initialization
+     fails, followed by WebPage.twkInit native NULL write at elapsed 3.395 s (hs_err_pid319559.log in the original
+     .minecraft directory). No DirectWrite implementation or dummy COM object added.
+   - Upstream OpenJDK ShellFolder2.cpp confirms standard-view icons use a toolbar TB_LOADIMAGES /
+     TB_GETIMAGELIST -> ImageList_GetIcon -> GetIconInfo -> GetDIBits. Earlier GetIconInfo-only diagnosis was
+     incomplete; toolbar/image-list/icon ownership are still missing. No fake bitmap handles/draw success added.
+   - Added real GetDIBits prerequisite over existing GDI objects: 24/32-bit RGB readback, header format query,
+     top-down/bottom-up output, partial/clamped rows, deterministic padding and rejected unsupported formats.
+     Removed earlier zero stub shadowing the export. Tests exercise actual ABI dispatch, source/output depths
+     and orientations, row bounds, output canaries and invalid/stale handles. Build + full make test-input
+     (including native-loader) PASS; editor diagnostics and diff-check clean. No post-change launcher run:
+     this prerequisite alone cannot unblock missing toolbar/icons/DirectWrite. No game regression run while
+     another workflow owns RE9. JavaFX pulses and Minecraft gameplay remain unproven.
+
+   CONTINUED 2026-11-24:
+   - Replaced CreateIconIndirect/GetIconInfo/DestroyIcon zero stubs with real GDI-backed icon ownership.
+     Win64 ICONINFO inputs are copied; color and one-bit AND/XOR mask planes have independent storage.
+     GetIconInfo allocates caller-owned bitmap copies, including rollback on allocation failure; DestroyIcon
+     releases only icon objects. DeleteObject/GetObjectType do not misidentify icons as ordinary GDI objects.
+     CreateBitmap now supports actual 1/24/32-bit storage and WORD-aligned input rows. Monochrome mask
+     readback expands to RGB black/white without fabricated alpha; indexed format queries remain unsupported.
+   - Tests cover real export dispatch, output structure canaries, source/output lifetime independence,
+     mask pixels and color alpha, monochrome cursor hotspots, stale/wrong handles and invalid input.
+     Independent external Windows 8u411 AWT probe sets an ARGB frame icon, shows/disposes its own window
+     and exits 0 (/tmp/beer-tl-icon-probe.log, service runtime 1.151 s). This is only an AWT lifecycle smoke
+     test, not proof Swing toolbar extraction or JavaFX works. No automated guest clicks/keys.
+   - Full build/native-loader/input tests pass. No launcher retry or game gate this increment; concurrent
+     Onimusha workflow left untouched. Remaining: real toolbar built-in image-list loading/extraction,
+     system LoadIcon resources and DirectWrite font factory. DWrite.dll DOES exist on the Windows volume
+     (capital D/W); the previous lowercase-only ls missed it. Loading it is not yet a proven compatible path.
+
+   - Toolbar follow-up: ToolbarWindow32 handles TB_LOADIMAGES(IDB_VIEW_SMALL_COLOR, HINST_COMMCTRL)
+     and TB_GETIMAGELIST(0). Built-in list has 13 original 16x16 glyphs with transparent masks; extracted
+     icons are independently owned. Repeated loads, explicit destroy and window cleanup are covered by
+     native contracts. No general toolbar rendering or custom image-list support is implied.
+   - Windows 8u411 probe exercised the exact Swing getStandardViewButton route: all 12 Java-cache
+     entries were nonblank, distinct and partly transparent (/tmp/beer-toolbar-probe.log). Build and
+     full test-input passed (/tmp/beer-toolbar-input.log). Actual 160 s bounded TLauncher retry
+     (/tmp/beer-toolbar-live.log) redownloaded 8u281, no longer threw the standard-view bitmap NPE,
+     and reached LOADING_WINDOW. It still logged a separate standard FileExplorer warning, then failed
+     in JavaFX/WebKit after missing DWriteCreateFactory. The bootstrapper's fallback OptionPane still
+     threw an Icon ClassCastException. No usable launcher, JavaFX pulse proof or Minecraft gameplay yet.
+
+   - DirectWrite follow-up: a standalone JavaFX font-enumeration probe explicitly loaded the genuine
+     Windows DLL through Beer's ordinary PE loader, and process attach succeeded. The initial probe
+     reached the missing GetSystemWindowsDirectoryW API. Added shared ANSI/Unicode exports through
+     Kernel32/KernelBase using the prefix's single Windows directory; tested buffer-size and output
+     behavior. Build and full input tests passed. The repeat probe advanced to CreateWellKnownSid
+     (type 23, null output buffer to query its size); the DLL expected ERROR_INSUFFICIENT_BUFFER
+     and entered fail-fast when the unimplemented call did not supply it. Font enumeration and
+     launcher startup are not fixed. No loader rule, guest DLL patch, or failure bypass was added.
+
+   - SID follow-up: implemented fixed well-known Win32 identities with real SID bytes, size query,
+     insufficient-buffer and invalid-input behavior. No token membership or permissions changed;
+     domain-relative and logon-session SID construction remains unsupported. Build and full input
+     regression suite pass. Genuine DirectWrite now gets past the prior SID failure, attempts ALPC,
+     and then calls the missing ResolveDelayLoadedAPI for a service-management API set. The call
+     returns null and the guest faults at RIP 0; the service's exit status 0 reflects the loader's
+     existing emergency fault path, not successful font enumeration (/tmp/beer-dwrite-sid.log).
+     Next: general PE delay-import resolution, then verify the actual service API behavior.
+
+   - Delay-load follow-up: shared Win64 ResolveDelayLoadedAPI supports RVA-based descriptors with writable
+     IAT/module slots and named or ordinal imports via the existing loader. It checks image bounds,
+     page permissions and name-table termination before updating the slot; failed lookups do not
+     overwrite the IAT. Failure hooks and read-only IAT updates are not implemented. Build and full
+     input suite passed, including real delayed name lookup and rejection contracts. Genuine DirectWrite
+     now invokes the resolver and reaches the downstream OpenSCManagerW export lookup, which fails
+     (/tmp/beer-dwrite-delay.log). No font enumeration, service emulation, or launcher workaround added.
+
+   - Service-manager follow-up: route the service-management API set to Beer's Advapi32 implementation.
+     The prefix has an empty local service database: connection handles support connect/enumerate,
+     absent services fail with ERROR_SERVICE_DOES_NOT_EXIST, and remote or mutating access fails.
+     No host service access, manufactured font-cache service, or program-specific branch. Build and
+     full input suite pass, including API-set lookup, access and stale-handle checks. The real
+     DirectWrite probe gets past the delayed service lookups, then faults after the unimplemented
+     AlpcInitializeMessageAttribute/AlpcGetMessageAttribute calls (/tmp/beer-dwrite-scm.log).
+     NtAlpcConnectPort also remains unimplemented. Font enumeration and launcher startup are not fixed.
+
+   - ALPC attribute follow-up: real Win64 header size, initialization and allocated-record lookup
+     based on the installed Windows ABI. Covers short-buffer queries, sparse/dense combinations and
+     untouched payloads; build and full test-input passed. No ALPC transport emulation; NtAlpcConnectPort
+     remains unimplemented. Genuine Windows DirectWrite enumerated seven families both with an explicit
+     DLL path and via ordinary Beer DLL discovery (/tmp/beer-dwrite-alpc.log, /tmp/beer-dwrite-discovery.log).
+   - Bounded real TLauncher retry used existing BEER_DLL_PATH pointed at an isolated temporary directory
+     containing only a symlink to the genuine user-owned DirectWrite DLL, plus the ordinary runtime path.
+     No guest binary mods, loader special case, or global/persistent DLL install. Bundled Java loaded
+     DirectWrite naturally and advanced to PREPARING_MAINPANE with no previous font factory error or
+     WebKit access violation logged. Still there when the service reached its 160 s cap
+     (/tmp/beer-tl-dwrite-live.log). Diagnose MainPane startup waits and verify JavaFX pulse delivery
+     independently before changing timer or message code. No usable launcher or Minecraft yet.
+   - The standalone JavaFX stage probe reproduced the stall. Glass posted its callback and GetMessage
+     retrieved it on the correct thread, but GetPropW rejected the helper HWND after a second window
+     took the native surface. Properties now belong to live HWNDs and are reclaimed on destruction.
+     Native regression covers independent keys, dispatch after surface reassignment, and table reuse.
+     Build and full test-input passed. With the bundled Windows JRE, Platform.runLater, ten consecutive
+     pulses, and the two-second PauseTransition all completed (/tmp/beer-fx-pulse-properties.log).
+   - A separate local WebView probe reached SUCCEEDED, then crashed in the WebKit timer's native stack
+     scan at jfxwebkit RVA 0x11d5820. The same fault occurred with genuine Direct2D supplied alongside
+     DirectWrite, and in the original launcher after PREPARING_MAINPANE (/tmp/beer-fx-web-d2d.log,
+     /tmp/beer-tl-properties.log). The launcher JVM reported a read above its JavaFX thread's stack.
+    Exact-runtime retry reproduced the fault (/tmp/beer-tl-stacktrace.log). The opt-in stack-query
+    trace showed the JVM's own queries on the JavaFX thread ending at the correct stack base; it did
+    not capture a WebKit query on that thread's guest stack. External Java 8u411 did query its guest
+    stack from WebKit, but aborted earlier and is not an equivalent repro. Trace how 8u281 obtains
+     and caches its scan bounds before changing stack or guard-page behavior.
+   - Exact 8u281 stack tracing identified two generic faults: InitOnceExecuteOnce ran its callback
+     on Beer's private host stack (WebKit cached that range), and raw worker-stack mappings lacked
+     a unified Win32 allocation base. Synchronous InitOnce now uses the reentrant guest-stack
+     bridge. Guest worker stacks have tracked reservations and retain fixed hard overflow protection;
+     stack growth is not implemented. Native regressions cover both contracts. A local WebView ran
+     through page load, ten pulses and the two-second transition without the access violation.
+   - A 100 s real retry with genuine DirectWrite and Direct2D in the ordinary DLL search path
+     loaded the launcher page, then BrowserPanel.loadSucceeded logged a JSException; no previous
+     stack-scan access violation, no usable launcher (/tmp/beer-tl-initonce.log). A local DOM and
+     arithmetic expression reproduced the JSException, ruling out a dependency on the launcher
+    page itself (/tmp/beer-fx-localscript.log). JavaScriptCore reported useJIT=false in an isolated
+    diagnostic rerun and still threw the same exception (/tmp/beer-fx-jsc-interpreter.log).
+    Separately, JavaFX text rendering still fails at
+     CreateWicBitmapRenderTarget; Beer's WIC factory lacks writable bitmap creation. Do not use a
+     launcher-specific bypass for either issue. Minecraft has not launched.
 
 Others not to forget:
 - RE9: run ended with ExitProcess(-1) at re9.exe+0x9ea20ce (ask whether user-initiated); exit crash after
@@ -6430,3 +6620,151 @@ mid pipeline creation, "every launch hangs".
   - Or capture the GPU-side b9/t12 contents with a GPU copy right before the dispatch, using BEER_BD12_SNAP_UAV-style
     tooling.
   - Check how RE9's RT High SDF volume (t12) is produced: streamed, compute-built or copied.
+
+## 2026-11-23 RE9 under Beer vs Proton: path-tracing noise, turning stutter (open), notes
+
+Symptoms and keywords: "PT is grainy / ghosting", "stutters when turning", "Proton doesn't stutter", "uses more
+RAM/VRAM than Proton".
+
+- **Path tracing noise/ghosting is the game's, not Beer's.** Proton 11 (same machine, RE9 run directly with
+  `/WineDetectionEnabled:False`, prefix in `~/.local/share/Steam/steamapps/compatdata/3764200`) looks the same with PT.
+  RT High through RT off look fine there. Checked in Beer before that, all correct:
+  - Ray Reconstruction inputs: motion vectors (sign, 1.0x scale, current frame, also while turning 90-180 px/frame),
+    colour, depth (same frame as albedo), roughness packed in normals.w, disocclusion mask (rain + puddle ripples).
+  - CUDA view handles (format, depth-only aspect, GENERAL layout).
+  - The final frame is clean when the camera is still.
+  - New diagnostics:
+    - `BEER_NGX_DUMP=<trigger file>` + `BEER_BD12_CAPTURE_DIR`: RR inputs/output of the next two evaluations
+      (`BEER_BD12_CAPTURE_RAW=1` also writes the raw texels).
+    - `BEER_NGX_NO_DISOCCLUSION=1` and `BEER_NGX_ROUGHNESS_PACKED=1` (test switches).
+    - `BEER_CUDA_DIAGNOSTICS=1` (every view a DLSS kernel gets a handle for).
+- **Proton now starts for the user,** so the RT High Xid 109 "Next" item above (a Proton/vkd3d dump to diff) is
+  possible. Proton ran RT High without the hang.
+- **Turning stutter (Beer only, open).** At about 80 fps, gameplay hitches of 25-35 ms (sometimes 50-90 ms) appear
+  while turning into new areas.
+  - Ruled out:
+    - Pipeline compiles. Compile-at-create is already the default (pipeline libraries on): about 66k PSOs are
+      built at create, and gameplay hitches carry no pso time.
+    - GPU work. With `BEER_BD12_GPU_PROF_FRAME=20` no frame exceeds 20 ms; the GPU takes about 10.5 ms after
+      submission for normal and hitch frames alike.
+    - Fence event latency (`BEER_FENCE_LATENCY=<ms>`, new): the waiter sets events promptly.
+    - Beer CPU cost. perf: Beer is about 6% of process CPU, RE9's own code about 70%.
+  - Found and fixed on the way, not the cause: VirtualQuery parsed `/proc/self/maps` on every call (RE9's streaming
+    thread). It now answers from the allocation table when the address is a VirtualAlloc region
+    (`win32_virtual_memory.c`).
+  - What a hitch looks like:
+    - The main thread waits on fence event 0x60000252 (SetEventOnCompletion, value = completed+1).
+    - The frame's Signal reaches the GPU 2-6 ms after that wait began. The frame is built late on the CPU.
+    - perf with `-k CLOCK_MONOTONIC` against the timestamped `[HITCH]` lines (`BEER_BD12_HITCH=25` now prints the
+      monotonic end time and the render tid): in hitch windows every job worker drops from about 50% to about 22%
+      busy, and the render thread from 64% to 47%, with kernel time up. The threads are blocked, not working.
+  - Next: log Win32 waits over 2 ms (object, thread, duration) and compare hitch frames with normal ones. Suspects
+    are Beer's events, SRW/critical sections, WaitOnAddress, Sleep/yield wake latency, and the RE Engine job
+    system's use of them.
+- **Memory (to measure later):**
+  - Process RSS is about 7.3 GB: about 3.1 GB of guest memory and about 3.5 GB of host anonymous memory (Beer +
+    driver; malloc arena about 2.1 GB), with about 25k live VkPipelines.
+  - VRAM is about 11.5 GB: heaps 9.9 GB, upload-in-VRAM 784 MB, pool gaps about 360 MB. The reported budget is about
+    14 GB, and RE Engine sizes its streaming pool from the budget.
+
+## 2026-11-23 Onimusha VRAM: upload cap always on, reserved resources on sparse residency
+
+Symptoms and keywords: "runs out of VRAM", "Wine uses 9 GB", "16 GB not enough".
+
+- **Budget is not the lever.** With `BEER_DXGI_VRAM_MB=11264` (a ~10 GB reported budget) the game's heaps still
+  reached 10-10.5 GB.
+- **Upload heaps in resizable-BAR VRAM:** 1.77 GB. The 1/16-of-VRAM cap only applied above 60% usage, but upload heaps
+  are created while loading. The cap now always applies (`upload_memory_type`, bd12_device.c);
+  `BEER_BD12_REBAR_UPLOAD_PRESSURE_ONLY=1` restores the old behaviour. RE8 (~128 MB) is under the cap.
+- **Reserved resources were fully resident:** 1084 of them, 1.38 GB, while the game's tile heaps held 272 MB. They are
+  BUFFERS (131 KB to 84 MB, a few 64 KiB tiles mapped each), mapped about 45 times a second while streaming.
+  - Now sparse residency: `bd12_buffer_create_sparse` and, for textures, `bd12_image_create_sparse`. The image path
+    requires the D3D12 standard tile shape and the same first packed mip; the mip tail and metadata are backed by
+    private memory.
+  - UpdateTileMappings becomes vkQueueBindSparse (`sparse_update_tile_mappings` / `sparse_update_buffer_tiles`).
+    The bind waits for the lane's previous submission and signals the lane's retire timeline. The lane's next
+    submission waits for it (`ComLane.sparse_wait`).
+  - Mapped heaps are referenced by the resource. Vulkan features: sparseBinding, sparseResidencyBuffer/Image2D/3D,
+    sparseResidencyAliased (only when the queue family has SPARSE_BINDING).
+  - `BEER_BD12_SPARSE=0` restores fully resident.
+  - Not handled: CopyTileMappings (still a no-op), packed-tile mappings (private memory instead).
+- **Result (AMD spoof, same save):**
+  - User overlay: 13.5-14.5 -> 13.1 (upload cap) -> 12.3 GB (sparse).
+  - Process usage about 10.7 GB: heaps 9.85 GB, upload in VRAM 637 MB + 654 MB dedicated, about 1.5k pipelines.
+  - The 5 s log now has `[DXGI] reserved resources: N live, X MiB fully resident; tile-mapped heaps: N, X MiB`.
+- **Open:**
+  - Stutter (as RE9; see the RE9 2026-11-23 notes).
+  - Each tile mapping drains the lane once (bind waits for the previous submission). Batching binds per submission,
+    or skipping the wait for pure new mappings, would cut that.
+
+## 2026-11-24 Stutter, CPU placement, RE9/Onimusha GPU comparisons with Proton
+
+Symptoms and keywords: "stutters when turning", "Proton is faster", "below 60 uncapped", "shimmering vegetation".
+
+- **Wait recorder:** `BEER_WAIT_LOG=<trigger file>` (+ `BEER_WAIT_LOG_US`, `BEER_WAIT_LOG_SECONDS`) records every guest wait at
+  or above the threshold once the file exists: handle, multi, sleep, cv, cs, srw-ex/sh, address, iocp, delay; start
+  and duration in CLOCK_MONOTONIC microseconds. `loader.c` is built -mno-sse, so it uses integer printf only.
+- **RE9 turning stutter:**
+  - Not lock contention. Hitch frames are the main thread (which is also the render thread) doing 11-18 ms of CPU
+    instead of ~6. The frame is submitted late and then waits for the GPU's full ~9 ms.
+  - On an i7-12700K the main thread spent 12% of its time on E-cores (up to 72% in some hitches).
+  - Fix: on hybrid CPUs, `SetThreadPriority` (a no-op before) keeps raised-priority threads on P-cores and releases
+    them when lowered. The main thread and every thread that calls ExecuteCommandLists are kept on P-cores. Game
+    threads reset to all cores at start (`win_thread_trampoline`). Switches: `BEER_PCORE_MAIN`, `BEER_PCORE_RENDER`,
+    `BEER_PCORE_PRIORITY` =0. Result: 13 -> 9 hitches per 20 s.
+- **RE9 Beer vs Proton:**
+  - With identical work (FSR1) Beer matches Proton: in game 104.8 vs 104 fps (Beer at 83% GPU, Proton at 95-98%).
+  - With DLSS selected, RE9 creates Ray Reconstruction (NGX feature 13) every frame under Beer, even with
+    RayTracingSetting=Off. That costs ~2.6 ms (dldn swin transformer). Proton never runs RR (DLSS indicator), which
+    explains its higher DLSS fps and its noisy PT.
+  - The GPU profiler now marks cubin launches (kind "cuda", tag = FNV of the kernel name). Before that, DLSS time was
+    charged to the dispatch recorded before it (the auto-exposure 1x1 pass looked like a 2.9 ms shader).
+  - `BEER_NGX_NO_RR=1` (refuse RR creation) leaves RE9 rendering only text: not a usable fallback.
+- **Ruled out for GPU cost:** `BEER_VK_ROBUST=0/2` (robustness off; changing it invalidates the driver shader cache),
+  `BEER_BD12_QUERY_NOWAIT`, `BEER_BD12_TS_NORESET`, `BEER_CUDA_BARRIERS=0`, `BEER_BD12_MULTI_QUEUE=1` (works on
+  Onimusha, no gain), `BEER_REFLEX=0` (+3 fps at most), `BEER_BD12_NO_MUTABLE=1` (+2 fps).
+- **Onimusha swap stalls:**
+  - Swap was full. A 118 ms hitch had 1112 major faults on the main thread.
+  - Beer's MF decode ffmpeg used 910 MB and 72 threads for a 17 MB 4K H.264 clip, and two ran at once.
+  - Now `-threads 4 -filter_threads 2 -vf scale=threads=2` (`BEER_MF_DECODE_THREADS`): about 560 MB and about 10
+    threads. ffmpeg 8's CLI still buffers several 12 MB frames per stage (single-threaded about 430 MB); going lower
+    needs libav* directly.
+- **Onimusha shimmering vegetation:**
+  - The DLSS ratio override (82.6%) was applied to the DLAA optimal-settings query. DLSS was created for 2116x1190
+    while the game rendered 2560x1440 ("RenderSubrect must match Creation time res").
+  - The override now skips PerfQualityValue 5 (DLAA).
+  - The game's settings had been reset to DLAA / FG off by the AMD-spoof test runs.
+- **Onimusha Beer vs Proton (same save and spot, Proton with PROTON_ENABLE_NVAPI=1, prefix compatdata/2638890 with
+  the GSE save copied):**
+  - DLAA preset M, RT High: Beer 58-61 fps (GPU 73-88%), Proton 80 (99%).
+  - DLAA, RT off: Beer 62.5 (97%).
+  - FSR NativeAA, RT off: Beer 71 (93%), Proton 95 (95%).
+  - So Beer's GPU frame is about 30% heavier in Onimusha. That is not DLSS, RT, Reflex, async queues, the mutable
+    format flag or the upload cap.
+  - Title-screen GPU time: root push 2.62 ms, legacy descriptors (`BEER_BD12_ROOT_PUSH=0`) 2.37 ms (+10% fps). In
+    game the legacy path is CPU-bound (59.9 fps, GPU 67-71%).
+  - Next: a per-pass GPU comparison against vkd3d-proton (a timestamp layer usable under both), and the GPU-side cost
+    of root push.
+
+## 2026-11-24 Performance pass: -O2 loader core, bench script, MF frame copy (Onimusha)
+
+Continued in [docs/performance-progress.md](docs/performance-progress.md), which is now the place for performance work.
+
+- **Loader core now builds `-O2`** (`OPT ?= -O2 -fno-omit-frame-pointer -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks`;
+  rollback `make clean && make OPT=-O0`). It was `-O0` for loader.c and most of platform/*. Statics only referenced from
+  inline asm needed `__attribute__((used))` (g_impl_targets, g_impl_real, beer_trace_log/ret, unwind/raise helpers).
+  Validated: smoke-cli, vkclear.exe, test-native-loader/sync, test-ki-dispatcher, Onimusha 5 x ~60-100 s runs, no crash.
+  NOT yet validated on RE8/RE9/WWM/others.
+- **`tools/bench.sh`**: launch, measure N s (Enter, or `BENCH_DELAY=<s>` when stdin is not a tty), summary in
+  `~/.beer/bench/summary.txt` (+ `<name>.log/.window`). Onimusha spot, same area: ~71-81 fps run to run (noise ~5 fps).
+- **`BEER_BD12_SAMPLE=1` crashes Onimusha at startup** (guest SIGSEGV, deterministic; also with an -O0 loader.o): not caused
+  by the -O2 change. Use `BEER_PROF_SAMPLE=wait` + SIGUSR2 twice instead (start after load, dump /tmp/beer-prof.txt).
+- **Onimusha steady state (not GPU-bound, GPU ~68% busy):** ~80 fps, per frame ~640 barriers (58 full ALL_COMMANDS), 92 render
+  passes, ~3300 view creates, ~7000 descriptor copies, 10 ExecuteCommandLists. Samples: ~70% guest code, ~20% libc, ~5% loader,
+  ~4% driver. pso= stays 3-6 s per 2 s window in steady state (background compile threads; not yet explained). RAM ~12.7 of 15 GB,
+  swap 3.7 GB in use during the run.
+- **MF video frames were copied twice** (fread -> frame_data, then malloc+memcpy in mf_sample_create_ex; ~12 MB/frame at 4K).
+  Now read straight into the sample's own buffer (`mf_sample_create_impl(adopt)`). `make test-media` does not link (pre-existing).
+
+- Later 2026-11-24/25: MF decoders now start on first read, rewinds of unread readers keep the decoder, stale `/tmp/beer-mf-decode-*`
+  files are swept by owner pid, `BEER_MF_HWDEC=1` opt-in GPU decode. Details and measurements: docs/performance-progress.md.

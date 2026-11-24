@@ -59,6 +59,12 @@ typedef int32_t (*BeerSehHandlerCaller)(uint64_t handler, BeerExceptionRecord64 
                                         uint64_t guest_rsp);
 void beer_seh_set_handler_caller(BeerSehHandlerCaller caller);
 
+/* Optional: a frame without unwind metadata that is a known dispatcher boundary (a vectored handler called on the
+ * guest stack) may replace the walk context with the context of the exception being dispatched. Returns nonzero
+ * when `walk_context` was replaced. */
+typedef int (*BeerSehBoundaryResolver)(uint64_t control_pc, void *walk_context);
+void beer_seh_set_boundary_resolver(BeerSehBoundaryResolver resolver);
+
 /* Performs first-pass AMD64 frame-based exception dispatch. Vectored handlers
  * must run before this function. Returns one only when a language handler asks
  * to continue execution. Malformed metadata, invalid stack frames, unsupported

@@ -472,7 +472,7 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
 {
     if (lane >= dev->lane_count) lane = 0;
     ComLane *const l = &dev->lanes[lane];
-    BD12FenceOp all_waits[9], all_signals[8];
+    BD12FenceOp all_waits[10], all_signals[8];
     uint32_t total_waits = wait_count;
     uint32_t total_signals = signal_count;
     if (wait_count > 8 || signal_count > 7)
@@ -500,6 +500,11 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
     (void)previous;
     if (l->submitted && chain)
         all_waits[total_waits++] = (BD12FenceOp){ l->retire, l->submitted };
+    /* Sparse binds are not ordered with command buffers by submission order: wait for the lane's last one. */
+    if (l->sparse_wait) {
+        all_waits[total_waits++] = (BD12FenceOp){ l->retire, l->sparse_wait };
+        l->sparse_wait = 0;
+    }
     all_signals[total_signals++] = (BD12FenceOp){ l->retire, serial };
     for (uint32_t i = 0; i < total_waits; ++i) __atomic_store_n(&all_waits[i].fence->last_use, serial, __ATOMIC_RELEASE);
     for (uint32_t i = 0; i < total_signals; ++i) __atomic_store_n(&all_signals[i].fence->last_use, serial, __ATOMIC_RELEASE);
@@ -527,6 +532,47 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
         ++g_bd12_prof_calls[BD12_PROF_REAP];
     }
     BD12_PROF_END(BD12_PROF_SUBMIT);
+    return result;
+}
+
+/* UpdateTileMappings on a sparse image, in queue order: the bind waits for the lane's previous submission and
+ * signals the lane's retire timeline at a new serial, which the lane's next submission waits for (sparse binding
+ * is not ordered by submission order). */
+static VkResult com_bind_sparse(ComDevice *dev, uint32_t lane, VkImage image, const VkSparseImageMemoryBind *binds,
+                                VkBuffer buffer, const VkSparseMemoryBind *buffer_binds, uint32_t count)
+{
+    if (lane >= dev->lane_count) lane = 0;
+    ComLane *const l = &dev->lanes[lane];
+    BD12Device *bd = dev->bd;
+    pthread_mutex_lock(&dev->submit_lock);
+    const uint64_t serial = dev->serial + 1;
+    const uint64_t wait_value = l->submitted;
+    const VkTimelineSemaphoreSubmitInfo timeline = {
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .waitSemaphoreValueCount = wait_value ? 1u : 0u, .pWaitSemaphoreValues = &wait_value,
+        .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &serial
+    };
+    const VkSparseImageMemoryBindInfo image_binds = { .image = image, .bindCount = count, .pBinds = binds };
+    const VkSparseBufferMemoryBindInfo buffer_bind_info = { .buffer = buffer, .bindCount = count, .pBinds = buffer_binds };
+    const VkBindSparseInfo info = {
+        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, .pNext = &timeline,
+        .waitSemaphoreCount = wait_value ? 1u : 0u, .pWaitSemaphores = &l->retire->semaphore,
+        .bufferBindCount = buffer ? 1u : 0u, .pBufferBinds = &buffer_bind_info,
+        .imageBindCount = image ? 1u : 0u, .pImageBinds = &image_binds,
+        .signalSemaphoreCount = 1, .pSignalSemaphores = &l->retire->semaphore
+    };
+    __atomic_store_n(&l->retire->last_use, serial, __ATOMIC_RELEASE);
+    beer_vulkan_queue_lock_at(l->queue->index);
+    const VkResult result = bd->vk.QueueBindSparse(l->queue->queue, 1, &info, VK_NULL_HANDLE);
+    beer_vulkan_queue_unlock_at(l->queue->index);
+    if (result == VK_SUCCESS) {
+        l->sparse_wait = serial;
+        __atomic_store_n(&l->submitted, serial, __ATOMIC_RELEASE);
+        __atomic_store_n(&dev->serial, serial, __ATOMIC_RELEASE);
+    } else {
+        beer_vulkan_record_result(result, "BD12 sparse tile bind");
+    }
+    pthread_mutex_unlock(&dev->submit_lock);
     return result;
 }
 
@@ -568,6 +614,38 @@ static void waiter_free(ComWaiter *w)
     free(w);
 }
 
+
+/* BEER_FENCE_LATENCY=<ms>: SetEventOnCompletion waits longer than this are printed, split into how long after the
+ * wait began the fence's Signal reached the GPU (late submission) and how long the GPU then took (GPU time). */
+static uint64_t fence_latency_ns(void)
+{
+    static int64_t t = -1;
+    if (t < 0) { const char *v = getenv("BEER_FENCE_LATENCY"); t = v && *v ? strtol(v, NULL, 10) * 1000000ll : 0; }
+    return (uint64_t)t;
+}
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static void fence_latency_report(const ComWaiter *w)
+{
+    if (!fence_latency_ns() || w->count || !w->start_ns) return;
+    const uint64_t now = mono_ns(), waited = now - w->start_ns;
+    if (waited < fence_latency_ns()) return;
+    const ComFence *f = (const ComFence *)w->fence;
+    const uint32_t i = (uint32_t)(w->value & 15);
+    if (f->sig_value[i] == w->value) {
+        const int64_t late = (int64_t)(f->sig_ns[i] - w->start_ns);
+        fprintf(stderr, "[FENCE LATENCY] %.6f s: waited %.1f ms for value %llu: Signal submitted %+.1f ms after the wait "
+                "began, GPU finished %.1f ms after that\n", now / 1e9, waited / 1e6, (unsigned long long)w->value,
+                late / 1e6, (now - f->sig_ns[i]) / 1e6);
+    } else {
+        fprintf(stderr, "[FENCE LATENCY] %.6f s: waited %.1f ms for value %llu (not a queue Signal / not recorded)\n",
+                now / 1e9, waited / 1e6, (unsigned long long)w->value);
+    }
+}
 static void *waiter_main(void *arg)
 {
     ComDevice *dev = arg;
@@ -592,6 +670,7 @@ static void *waiter_main(void *arg)
                 ComWaiter *w = ready;
                 ready = w->next;
                 if (signal && w->event) signal(w->event);
+                fence_latency_report(w);
                 waiter_free(w);
             }
             pthread_mutex_lock(&dev->wait_lock);
@@ -656,6 +735,7 @@ static void add_waiter(ComDevice *dev, ComFence *fence, uint64_t value,
     w->fence = &fence->obj;
     w->value = value;
     w->event = event;
+    if (fence_latency_ns()) w->start_ns = mono_ns();
     com_add_ref(&fence->obj);
     queue_waiter(dev, w);
 }
@@ -906,6 +986,11 @@ static HR queue_run_op(ComQueue *q, QueueOp *op)
         }
         return HR_OK;
     case QUEUE_OP_SIGNAL: {
+        if (fence_latency_ns()) {
+            const uint32_t i = (uint32_t)(op->value & 15);
+            op->fence->sig_ns[i] = mono_ns();
+            op->fence->sig_value[i] = op->value;
+        }
         BD12FenceOp signal = { op->fence->fence, op->value };
         return com_submit(dev, q->lane, NULL, 0, NULL, 0, &signal, 1) == VK_SUCCESS ? HR_OK : HR_E_FAIL;
     }
@@ -992,7 +1077,13 @@ static HR queue_push(ComQueue *q, QueueOp *op)
 static void MS queue_execute(ComQueue *q, uint32_t count, ComObj *const *lists)
 {
     BD12_PROF_BEGIN();
-    { extern uint64_t g_bd12_render_tid; g_bd12_render_tid = (uint64_t)syscall(SYS_gettid); }
+    {
+        extern uint64_t g_bd12_render_tid;
+        extern void beer_pin_render_thread(void);
+        static __thread int pinned;
+        g_bd12_render_tid = (uint64_t)syscall(SYS_gettid);
+        if (!pinned) { pinned = 1; beer_pin_render_thread(); }
+    }
     bd12_prof_report();
     QueueOp op = { .kind = QUEUE_OP_EXECUTE };
     op.lists = count ? malloc(count * sizeof(*op.lists)) : NULL;
@@ -1074,12 +1165,225 @@ static void MS queue_end_event(ComQueue *q) { (void)q; }
  * tile already has its own memory and a mapping changes nothing. What this cannot reproduce is two resources
  * sharing heap tiles, or a NULL-mapped tile reading zero after it was written; say so once, so a title that
  * depends on that shows up in the log. */
+uint64_t g_bd12_reserved_stats[4];   /* live reserved resources, their bytes; tile-mapped heaps, their bytes */
 static void MS queue_tile_noop(void)
 {
     static _Atomic int reported;
     if (!atomic_exchange(&reported, 1))
         fprintf(stderr, "[BD12] tile mappings requested: reserved resources are fully resident, "
                         "mappings are not applied\n");
+}
+
+/* UpdateTileMappings on a sparse image (bd12_image_create_sparse). D3D12 semantics:
+ * - regions: start coordinate {x, y, z, subresource} (in tiles; for packed mips x is the packed tile index) and
+ *   size {NumTiles, UseBox, Width, u16 Height, u16 Depth}; with UseBox the box is walked x fastest, otherwise
+ *   NumTiles consecutive tiles in the resource's tile order (GetResourceTiling: per array slice, the standard mips
+ *   row by row, then the slice's packed tiles), which may run on into later subresources;
+ * - ranges: flags NULL (1) unmap, SKIP (2) leave, REUSE_SINGLE_TILE (4) every tile on the range's first heap tile,
+ *   NONE maps consecutive heap tiles from the start offset; NULL counts mean one tile per range, or every tile for a
+ *   single range.
+ * Packed tiles are skipped: the image's mip tail has private memory. */
+static void MS dev_get_resource_tiling(ComDevice *self, ComResource *r, uint32_t *total_tiles, uint8_t *packed,
+                                       uint32_t *tile_shape, uint32_t *subresource_count, uint32_t first,
+                                       uint8_t *tilings);
+static uint32_t rd32(const uint8_t *p);
+/* A heap whose tiles a sparse resource maps must outlive the resource's use of it: the resource holds it. */
+static void sparse_hold_heap(ComDevice *dev, ComResource *r, ComHeap *heap)
+{
+    pthread_mutex_lock(&dev->defer_lock);
+    int known = 0;
+    for (uint32_t i = 0; i < r->tile_heap_count; ++i) known |= r->tile_heaps[i] == heap;
+    if (!known && r->tile_heap_count == r->tile_heap_capacity) {
+        const uint32_t capacity = r->tile_heap_capacity ? r->tile_heap_capacity * 2 : 4;
+        ComHeap **grown = realloc(r->tile_heaps, capacity * sizeof(*grown));
+        if (grown) { r->tile_heaps = grown; r->tile_heap_capacity = capacity; }
+    }
+    if (!known && r->tile_heap_count < r->tile_heap_capacity) {
+        r->tile_heaps[r->tile_heap_count++] = heap;
+        com_add_ref(&heap->obj);
+    }
+    pthread_mutex_unlock(&dev->defer_lock);
+}
+
+/* UpdateTileMappings on a sparse buffer: tile n is bytes [n * 64 KiB, (n + 1) * 64 KiB); a region's start
+ * coordinate X is its first tile (a box is Width tiles), ranges as for images. */
+static void sparse_update_buffer_tiles(ComQueue *q, ComResource *r, uint32_t regions, const uint32_t *coords,
+                                       const uint8_t *sizes, ComHeap *heap, uint32_t ranges,
+                                       const uint32_t *range_flags, const uint32_t *heap_starts,
+                                       const uint32_t *range_counts)
+{
+    BD12Buffer *b = r->buffer;
+    const uint64_t buffer_tiles = (b->size + 65535) / 65536;
+    uint64_t want = 0;
+    for (uint32_t i = 0; i < regions; ++i) {
+        const uint8_t *sz = sizes ? sizes + 16 * i : NULL;
+        want += sz ? (rd32(sz + 4) ? rd32(sz + 8) : rd32(sz)) : 1;
+    }
+    if (!want || want > (64u << 20)) return;
+    uint64_t *list = malloc(want * sizeof(*list));
+    VkSparseMemoryBind *binds = malloc(want * sizeof(*binds));
+    if (!list || !binds) { free(list); free(binds); return; }
+    uint32_t listed = 0;
+    for (uint32_t i = 0; i < regions; ++i) {
+        const uint32_t first = coords ? coords[4 * i] : 0;
+        const uint8_t *sz = sizes ? sizes + 16 * i : NULL;
+        const uint32_t n = sz ? (rd32(sz + 4) ? rd32(sz + 8) : rd32(sz)) : 1;
+        for (uint32_t t = 0; t < n; ++t) list[listed++] = (uint64_t)first + t;
+    }
+    uint32_t bound = 0, k = 0, mapped_any = 0;
+    for (uint32_t ri = 0; ri < (ranges ? ranges : 1) && k < listed; ++ri) {
+        const uint32_t flag = range_flags ? range_flags[ri] : 0;
+        const uint32_t count = range_counts ? range_counts[ri] : (ranges <= 1 ? listed : 1);
+        const uint32_t heap_start = heap_starts ? heap_starts[ri] : 0;
+        for (uint32_t j = 0; j < count && k < listed; ++j) {
+            const uint64_t tile = list[k++];
+            if ((flag & 2) || tile >= buffer_tiles) continue;          /* SKIP, or past the end */
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            if (!(flag & 1)) {
+                if (!heap || !heap->heap) continue;
+                const uint64_t heap_tile = (uint64_t)heap_start + ((flag & 4) ? 0 : j);
+                if ((heap_tile + 1) * 65536 > heap->heap->size || ((heap->heap->base + heap_tile * 65536) % 65536)) {
+                    static _Atomic int warned;
+                    if (!atomic_exchange(&warned, 1))
+                        fprintf(stderr, "[BD12] buffer tile mapping outside heap or unaligned (tile %llu, heap %llu "
+                                "bytes, base 0x%llx): skipped\n", (unsigned long long)heap_tile,
+                                (unsigned long long)heap->heap->size, (unsigned long long)heap->heap->base);
+                    continue;
+                }
+                memory = heap->heap->memory;
+                offset = heap->heap->base + heap_tile * 65536;
+                mapped_any = 1;
+            }
+            binds[bound++] = (VkSparseMemoryBind){ .resourceOffset = tile * 65536, .size = 65536,
+                                                   .memory = memory, .memoryOffset = offset };
+        }
+    }
+    if (mapped_any && heap) sparse_hold_heap(q->obj.dev, r, heap);
+    if (bound) com_bind_sparse(q->obj.dev, q->lane, VK_NULL_HANDLE, NULL, b->buffer, binds, bound);
+    {   static _Atomic uint64_t calls, tiles;
+        const uint64_t n = atomic_fetch_add(&calls, 1) + 1, t = atomic_fetch_add(&tiles, bound) + bound;
+        if (n == 1 || !(n & (n - 1)))
+            fprintf(stderr, "[BD12] sparse buffer tile mappings: %llu calls, %llu tile binds\n", (unsigned long long)n,
+                    (unsigned long long)t);
+    }
+    free(list);
+    free(binds);
+}
+
+static void sparse_update_tile_mappings(ComQueue *q, ComResource *r, uint32_t regions, const uint32_t *coords,
+                                        const uint8_t *sizes, ComHeap *heap, uint32_t ranges,
+                                        const uint32_t *range_flags, const uint32_t *heap_starts,
+                                        const uint32_t *range_counts)
+{
+    BD12Image *im = r->image;
+    const uint32_t *g = im->sparse_block;
+    const int is_3d = im->desc.type == VK_IMAGE_TYPE_3D;
+    const uint32_t mips = im->desc.mip_levels ? im->desc.mip_levels : 1;
+    const uint32_t layers = is_3d ? 1 : (im->desc.depth_or_layers ? im->desc.depth_or_layers : 1);
+    const uint32_t standard = im->sparse_tail_lod < mips ? im->sparse_tail_lod : mips;
+    uint32_t wt[16] = { 0 }, ht[16] = { 0 }, dt[16] = { 0 }, start[16] = { 0 }, standard_tiles = 0;
+    for (uint32_t m = 0; m < standard && m < 16; ++m) {
+        const uint32_t w = im->desc.width >> m ? im->desc.width >> m : 1;
+        const uint32_t h = im->desc.height >> m ? im->desc.height >> m : 1;
+        const uint32_t d = is_3d ? (im->desc.depth_or_layers >> m ? im->desc.depth_or_layers >> m : 1) : 1;
+        wt[m] = (w + g[0] - 1) / g[0]; ht[m] = (h + g[1] - 1) / g[1]; dt[m] = (d + g[2] - 1) / g[2];
+        start[m] = standard_tiles;
+        standard_tiles += wt[m] * ht[m] * dt[m];
+    }
+    uint8_t packed[12] = { 0 };
+    uint32_t total_tiles = 0, packed_tiles = 0;
+    dev_get_resource_tiling(q->obj.dev, r, &total_tiles, packed, NULL, NULL, 0, NULL);
+    memcpy(&packed_tiles, packed + 4, 4);
+    const uint32_t per_slice = standard_tiles + packed_tiles;
+
+    /* The tiles the regions name, as linear indices (decoded below). */
+    uint64_t want = 0;
+    for (uint32_t i = 0; i < regions; ++i) {
+        const uint8_t *sz = sizes ? sizes + 16 * i : NULL;
+        const uint32_t num = sz ? rd32(sz) : 1, box = sz ? rd32(sz + 4) : 0;
+        want += box ? (uint64_t)rd32(sz + 8) * (*(const uint16_t *)(sz + 12)) * (*(const uint16_t *)(sz + 14)) : num;
+    }
+    if (!want || want > (64u << 20)) return;
+    uint32_t *list = malloc(want * sizeof(*list));
+    VkSparseImageMemoryBind *binds = malloc(want * sizeof(*binds));
+    if (!list || !binds) { free(list); free(binds); return; }
+    uint32_t listed = 0;
+    for (uint32_t i = 0; i < regions; ++i) {
+        const uint32_t *c = coords ? coords + 4 * i : NULL;
+        const uint32_t cx = c ? c[0] : 0, cy = c ? c[1] : 0, cz = c ? c[2] : 0, sub = c ? c[3] : 0;
+        const uint32_t mip = sub % mips, layer = sub / mips;
+        const uint8_t *sz = sizes ? sizes + 16 * i : NULL;
+        const uint32_t num = sz ? rd32(sz) : 1, box = sz ? rd32(sz + 4) : 0;
+        if (box && mip < standard && mip < 16) {
+            const uint32_t bw = rd32(sz + 8), bh = *(const uint16_t *)(sz + 12), bdp = *(const uint16_t *)(sz + 14);
+            for (uint32_t z = 0; z < bdp; ++z)
+                for (uint32_t y = 0; y < bh; ++y)
+                    for (uint32_t x = 0; x < bw; ++x)
+                        list[listed++] = layer * per_slice + start[mip] + ((cz + z) * ht[mip] + cy + y) * wt[mip] + cx + x;
+        } else {
+            const uint32_t first = layer * per_slice +
+                                   (mip < standard && mip < 16 ? start[mip] + (cz * ht[mip] + cy) * wt[mip] + cx
+                                                               : standard_tiles + cx);
+            const uint32_t n = box ? rd32(sz + 8) * (*(const uint16_t *)(sz + 12)) * (*(const uint16_t *)(sz + 14))
+                                   : num;
+            for (uint32_t t = 0; t < n; ++t) list[listed++] = first + t;
+        }
+    }
+    /* Walk the ranges over the listed tiles. */
+    uint32_t bound = 0, k = 0, mapped_any = 0;
+    for (uint32_t ri = 0; ri < (ranges ? ranges : 1) && k < listed; ++ri) {
+        const uint32_t flag = range_flags ? range_flags[ri] : 0;
+        const uint32_t count = range_counts ? range_counts[ri] : (ranges <= 1 ? listed : 1);
+        const uint32_t heap_start = heap_starts ? heap_starts[ri] : 0;
+        for (uint32_t j = 0; j < count && k < listed; ++j) {
+            const uint32_t linear = list[k++];
+            if (flag & 2) continue;                                   /* SKIP */
+            const uint32_t layer = linear / per_slice, in_slice = linear % per_slice;
+            if (layer >= layers || in_slice >= standard_tiles) continue;    /* packed: private memory */
+            uint32_t mip = 0;
+            while (mip + 1 < standard && in_slice >= start[mip + 1]) ++mip;
+            const uint32_t local = in_slice - start[mip];
+            const uint32_t x = local % wt[mip], y = (local / wt[mip]) % ht[mip], z = local / (wt[mip] * ht[mip]);
+            const uint32_t w = im->desc.width >> mip ? im->desc.width >> mip : 1;
+            const uint32_t h = im->desc.height >> mip ? im->desc.height >> mip : 1;
+            const uint32_t d = is_3d ? (im->desc.depth_or_layers >> mip ? im->desc.depth_or_layers >> mip : 1) : 1;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            if (!(flag & 1)) {                                        /* NONE / REUSE_SINGLE_TILE: map */
+                if (!heap || !heap->heap) continue;
+                const uint64_t tile = (uint64_t)heap_start + ((flag & 4) ? 0 : j);
+                if ((tile + 1) * 65536 > heap->heap->size || ((heap->heap->base + tile * 65536) % 65536)) {
+                    static _Atomic int warned;
+                    if (!atomic_exchange(&warned, 1))
+                        fprintf(stderr, "[BD12] tile mapping outside heap or unaligned (tile %llu, heap %llu bytes, "
+                                "base 0x%llx): skipped\n", (unsigned long long)tile,
+                                (unsigned long long)heap->heap->size, (unsigned long long)heap->heap->base);
+                    continue;
+                }
+                memory = heap->heap->memory;
+                offset = heap->heap->base + tile * 65536;
+                mapped_any = 1;
+            }
+            binds[bound++] = (VkSparseImageMemoryBind){
+                .subresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, is_3d ? 0 : layer },
+                .offset = { (int32_t)(x * g[0]), (int32_t)(y * g[1]), (int32_t)(z * g[2]) },
+                .extent = { w - x * g[0] < g[0] ? w - x * g[0] : g[0], h - y * g[1] < g[1] ? h - y * g[1] : g[1],
+                            d - z * g[2] < g[2] ? d - z * g[2] : g[2] },
+                .memory = memory, .memoryOffset = offset
+            };
+        }
+    }
+    if (mapped_any && heap) sparse_hold_heap(q->obj.dev, r, heap);
+    if (bound) com_bind_sparse(q->obj.dev, q->lane, im->image, binds, VK_NULL_HANDLE, NULL, bound);
+    {   static _Atomic uint64_t calls, tiles;
+        const uint64_t n = atomic_fetch_add(&calls, 1) + 1, t = atomic_fetch_add(&tiles, bound) + bound;
+        if (n == 1 || !(n & (n - 1)))
+            fprintf(stderr, "[BD12] sparse tile mappings: %llu calls, %llu tile binds\n", (unsigned long long)n,
+                    (unsigned long long)t);
+    }
+    free(list);
+    free(binds);
 }
 
 /* UpdateTileMappings: still a no-op (fully resident). BEER_TILE_LOG=1 logs what is asked for (first calls in detail,
@@ -1089,13 +1393,21 @@ static void MS queue_update_tile_mappings(ComQueue *q, ComResource *r, uint32_t 
                                           const uint32_t *range_flags, const uint32_t *heap_starts,
                                           const uint32_t *range_counts, uint32_t flags)
 {
-    (void)q;
-    queue_tile_noop();
+    if (r && r->obj.kind == COM_RESOURCE && r->image && r->image->sparse)
+        sparse_update_tile_mappings(q, r, regions, coords, sizes, heap, ranges, range_flags, heap_starts, range_counts);
+    else if (r && r->obj.kind == COM_RESOURCE && r->buffer && r->buffer->sparse)
+        sparse_update_buffer_tiles(q, r, regions, coords, sizes, heap, ranges, range_flags, heap_starts, range_counts);
+    else
+        queue_tile_noop();
     static int log = -1;
     if (log < 0) log = getenv("BEER_TILE_LOG") != NULL;
-    if (heap && !atomic_exchange(&heap->tile_mapped, 1) && log)
-        fprintf(stderr, "[BD12 TILE] heap %p first tile-mapped; %u placed resources already on it, heap size %llu\n",
-                (void *)heap, atomic_load(&heap->placed_count), (unsigned long long)*(const uint64_t *)heap->desc);
+    if (heap && !atomic_load(&heap->tile_mapped) && !atomic_exchange(&heap->tile_mapped, 1)) {
+        __atomic_add_fetch(&g_bd12_reserved_stats[2], 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_bd12_reserved_stats[3], *(const uint64_t *)heap->desc, __ATOMIC_RELAXED);
+        if (log)
+            fprintf(stderr, "[BD12 TILE] heap %p first tile-mapped; %u placed resources already on it, heap size %llu\n",
+                    (void *)heap, atomic_load(&heap->placed_count), (unsigned long long)*(const uint64_t *)heap->desc);
+    }
     static _Atomic uint32_t calls;
     const uint32_t n = atomic_fetch_add(&calls, 1);
     if (log && (n < 40 || (n & (n - 1)) == 0)) {
@@ -1234,6 +1546,10 @@ static void heap_free(ComDevice *dev, void *ptr)
 {
     (void)dev;
     ComHeap *h = ptr;
+    if (atomic_load(&h->tile_mapped)) {
+        __atomic_sub_fetch(&g_bd12_reserved_stats[2], 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&g_bd12_reserved_stats[3], *(const uint64_t *)h->desc, __ATOMIC_RELAXED);
+    }
     bd12_heap_destroy(h->heap);
     free(h);
 }
@@ -1280,9 +1596,15 @@ static void resource_free(ComDevice *dev, void *ptr)
 {
     (void)dev;
     ComResource *r = ptr;
+    if (r->reserved) {
+        __atomic_sub_fetch(&g_bd12_reserved_stats[0], 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&g_bd12_reserved_stats[1], r->reserved_bytes, __ATOMIC_RELAXED);
+    }
     if (r->buffer) bd12_buffer_destroy(r->buffer);
     if (r->image) bd12_image_destroy(r->image);
     if (r->heap) com_release(&r->heap->obj);
+    for (uint32_t i = 0; i < r->tile_heap_count; ++i) com_release(&r->tile_heaps[i]->obj);
+    free(r->tile_heaps);
     free(r);
 }
 static void resource_destroy(ComObj *o)
@@ -1460,6 +1782,11 @@ static int image_desc_from(const ComResource *r, BD12ImageDesc *d)
                     (unsigned long long)r->width, r->height);
         return 0;
     }
+    switch (r->dxgi_format) {                 /* DXGI_FORMAT_*_TYPELESS */
+    case 1: case 5: case 9: case 15: case 19: case 23: case 27: case 33: case 39: case 44: case 48: case 53: case 60:
+    case 70: case 73: case 76: case 79: case 82: case 90: case 92: case 94: case 97: d->typeless = 1; break;
+    default: break;
+    }
     d->width = (uint32_t)r->width;
     d->height = r->height;
     d->depth_or_layers = r->depth_or_layers;
@@ -1484,6 +1811,11 @@ static void res_finish_planes(ComResource *r)
 static HR create_resource_impl(ComDevice *dev, ComHeap *heap, uint64_t heap_offset, const uint8_t *props,
                                uint32_t heap_flags, const uint8_t *desc, uint32_t state, const uint8_t *riid,
                                void **out);
+/* Set while CreateReservedResource creates its resource: textures become sparse-residency images. */
+static __thread int t_create_reserved;
+static void MS dev_get_resource_tiling(ComDevice *self, ComResource *r, uint32_t *total_tiles, uint8_t *packed,
+                                       uint32_t *tile_shape, uint32_t *subresource_count, uint32_t first,
+                                       uint8_t *tilings);
 static HR create_resource(ComDevice *dev, ComHeap *heap, uint64_t heap_offset,
                           const uint8_t *props, uint32_t heap_flags,
                           const uint8_t *desc, uint32_t state,
@@ -1516,7 +1848,8 @@ static HR create_resource_impl(ComDevice *dev, ComHeap *heap, uint64_t heap_offs
             r->buffer = bd12_buffer_create_placed(heap->heap, heap_offset,
                                                   r->width);
         } else {
-            r->buffer = bd12_buffer_create_committed(dev->bd, type, r->width);
+            if (t_create_reserved) r->buffer = bd12_buffer_create_sparse(dev->bd, r->width);
+            if (!r->buffer) r->buffer = bd12_buffer_create_committed(dev->bd, type, r->width);
         }
         if (!r->buffer) goto fail;
     } else {
@@ -1534,7 +1867,15 @@ static HR create_resource_impl(ComDevice *dev, ComHeap *heap, uint64_t heap_offs
             r->image = bd12_image_create_placed(heap->heap, heap_offset,
                                                 &image_desc, state);
         } else {
-            r->image = bd12_image_create_committed(dev->bd, &image_desc, state);
+            if (t_create_reserved && (r->dimension == 3 || r->dimension == 4)) {
+                /* The tile layout GetResourceTiling reports: standard shape, packed tail from packed[0]. */
+                uint32_t shape[3], tiles = 0;
+                uint8_t packed[12] = { 0 };
+                bd12_standard_tile_shape(r, shape);
+                dev_get_resource_tiling(dev, r, &tiles, packed, NULL, NULL, 0, NULL);
+                r->image = bd12_image_create_sparse(dev->bd, &image_desc, state, shape, packed[0]);
+            }
+            if (!r->image) r->image = bd12_image_create_committed(dev->bd, &image_desc, state);
         }
         if (!r->image) goto fail;
         res_finish_planes(r);
@@ -2819,9 +3160,19 @@ static HR MS dev_create_reserved(ComDevice *self, const uint8_t *desc,
                                  const uint8_t *riid, void **out)
 {
     (void)clear;
+    static int sparse = -1;
+    if (sparse < 0) { const char *v = getenv("BEER_BD12_SPARSE"); sparse = !(v && !strcmp(v, "0")); }
+    t_create_reserved = sparse;
     HR hr = create_resource(self, NULL, 0, NULL, 0, desc, state, riid, out);
-    if (hr == HR_OK && out && *out)
-        ((ComResource *)*out)->reserved = 1;
+    t_create_reserved = 0;
+    if (hr == HR_OK && out && *out) {
+        ComResource *r = *out;
+        r->reserved = 1;
+        const BD12Heap *h = r->buffer ? r->buffer->heap : r->image ? r->image->heap : NULL;
+        r->reserved_bytes = h ? h->size : r->buffer && !r->buffer->sparse ? r->buffer->size : 0;
+        __atomic_add_fetch(&g_bd12_reserved_stats[0], 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_bd12_reserved_stats[1], r->reserved_bytes, __ATOMIC_RELAXED);
+    }
     return hr;
 }
 
@@ -4167,6 +4518,7 @@ void bd12_com_debug_dump(void)
     ComDevice *dev = g_com_device;
     if (!dev) return;
     bd12_rp_snap_dump();
+    bd12_ckpt_dump();   /* BEER_VK_CHECKPOINTS: a hang often never fails a submit, so the lost-submit dump never runs */
     for (uint32_t l = 0; l < dev->lane_count; ++l)
         fprintf(stderr, "[STACKS] bd12 lane %u submitted=%llu retired=%llu\n", l,
                 (unsigned long long)__atomic_load_n(&dev->lanes[l].submitted, __ATOMIC_ACQUIRE),

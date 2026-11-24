@@ -70,6 +70,11 @@ static int snapshot_before(const BeerVehSnapshot *left,
 
 int beer_veh_dispatch(void *exception_pointers)
 {
+    return beer_veh_dispatch_with(exception_pointers, NULL);
+}
+
+int beer_veh_dispatch_with(void *exception_pointers, BeerVehCaller caller)
+{
     BeerVehSnapshot snapshot[BEER_VEH_CAPACITY];
     size_t count = 0;
     for (size_t i = 0; i < BEER_VEH_CAPACITY; ++i) {
@@ -98,7 +103,8 @@ int beer_veh_dispatch(void *exception_pointers)
     }
 
     for (size_t i = 0; i < count; ++i) {
-        int32_t result = snapshot[i].handler(exception_pointers);
+        int32_t result = caller ? caller(snapshot[i].handler, exception_pointers)
+                                : snapshot[i].handler(exception_pointers);
         if (result == BEER_EXCEPTION_CONTINUE_EXECUTION) return 1;
     }
     return 0;

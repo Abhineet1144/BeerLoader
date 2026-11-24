@@ -18,6 +18,11 @@ int beer_veh_remove(void *handle);
  * only when a handler requests EXCEPTION_CONTINUE_EXECUTION. */
 int beer_veh_dispatch(void *exception_pointers);
 
+/* Same, but each handler is invoked through `caller` (NULL = direct call). The loader's caller marks a stack
+ * boundary so a nested exception raised by a handler can unwind through it to the original fault context. */
+typedef int32_t (*BeerVehCaller)(BeerVectoredExceptionHandler handler, void *exception_pointers);
+int beer_veh_dispatch_with(void *exception_pointers, BeerVehCaller caller);
+
 /* Test/process-reset helper. Do not call concurrently with dispatch. */
 void beer_veh_reset(void);
 

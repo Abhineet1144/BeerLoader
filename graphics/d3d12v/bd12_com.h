@@ -74,6 +74,7 @@ typedef struct ComWaiter {
     int any;
     ComObj **fences;
     uint64_t *values;
+    uint64_t start_ns;           /* diagnostic (BEER_FENCE_LATENCY): when the event was registered */
 } ComWaiter;
 
 /* One Vulkan queue with its own retire timeline. Every submission takes the next device-wide serial and signals
@@ -83,6 +84,7 @@ typedef struct ComLane {
     BD12Queue *queue;
     BD12Fence *retire;
     uint64_t submitted;           /* serial of the lane's newest submission (atomic) */
+    uint64_t sparse_wait;         /* a sparse bind's serial the lane's next submission must wait for (submit_lock) */
 } ComLane;
 
 struct ComDevice {
@@ -175,6 +177,9 @@ typedef struct ComResource {
     uint32_t height, depth_or_layers, mips, dxgi_format, flags;
     uint32_t planes;              /* 2 for combined depth/stencil */
     uint32_t reserved;            /* CreateReservedResource: fully-resident emulation */
+    uint64_t reserved_bytes;      /* diagnostics: memory the fully-resident emulation gave it */
+    struct ComHeap **tile_heaps;  /* heaps its tiles were mapped to (sparse): referenced until it is freed */
+    uint32_t tile_heap_count, tile_heap_capacity;
     uint32_t feedback_region[2];  /* sampler-feedback map (format 189/190): mip region width, height */
 } ComResource;
 /* Sampler-feedback map extents (bd12_com.c): the region grid of the paired texture's `mip`, and the R64 image extent
@@ -200,6 +205,7 @@ typedef struct ComFence {
     BD12Fence *fence;
     uint32_t polls;              /* diagnostic (BEER_FENCE_DIAGNOSTICS): GetCompletedValue calls */
     uint64_t last_signal;        /* diagnostic: the last value a queue or the CPU signalled */
+    uint64_t sig_value[16], sig_ns[16];   /* diagnostic (BEER_FENCE_LATENCY): when queue Signals went to the GPU */
 } ComFence;
 
 /* ID3D12StateObject (+ ID3D12StateObjectProperties as an embedded second interface). */

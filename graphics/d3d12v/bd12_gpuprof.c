@@ -221,7 +221,7 @@ void bd12_gpuprof_report(void)
             for (uint32_t t = 0; t < f->tag_count && t < 5; ++t) {
                 const uint32_t kind = (uint32_t)(f->tags[t].tag >> 56);
                 fprintf(stderr, " %s %014llx %.2fms/%llu", kind < 10 ? names[kind] : kind == 100 ? "dispatch" :
-                        kind == 101 ? "dispatch-ind" : "other", (unsigned long long)(f->tags[t].tag & 0x00ffffffffffffffull),
+                        kind == 101 ? "dispatch-ind" : kind == 102 ? "cuda" : "other", (unsigned long long)(f->tags[t].tag & 0x00ffffffffffffffull),
                         f->tags[t].ns / 1e6, (unsigned long long)f->tags[t].calls);
             }
             fputc('\n', stderr);
@@ -232,7 +232,7 @@ void bd12_gpuprof_report(void)
     fprintf(stderr, "[GPU PROF] measured %.1f ms of GPU time in this window\n", total / 1e6);
     for (int i = 0; i < 20 && snapshot[i].calls; ++i) {
         const uint32_t kind = (uint32_t)(snapshot[i].tag >> 56);
-        const char *name = kind < 10 ? names[kind] : kind == 100 ? "dispatch" : kind == 101 ? "dispatch-ind" :
+        const char *name = kind < 10 ? names[kind] : kind == 100 ? "dispatch" : kind == 101 ? "dispatch-ind" : kind == 102 ? "cuda" :
                            kind == 200 ? "as-build" : kind == 201 ? "as-copy" : "other";
         fprintf(stderr, "[GPU PROF]   %5.1f%% %8.2f ms %7llu x %-12s %014llx\n", total ? 100.0 * snapshot[i].ns / total : 0,
                 snapshot[i].ns / 1e6, (unsigned long long)snapshot[i].calls, name,

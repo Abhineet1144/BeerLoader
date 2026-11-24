@@ -298,14 +298,18 @@ void bd12_cmd_set_descriptor_heaps(BD12CmdList *list,
 void bd12_root_arguments_carry(const BD12RootSignature *from, const BD12RootSignature *to, BD12RootArgument *arguments)
 {
     for (uint32_t i = 0; i < BD12_MAX_ROOT_PARAMETERS; ++i) {
-        /* Carrying values (vkd3d-proton style) made every RE9 start fault in the command fetch (Xid 31 MMU fault,
-         * GR0_PBDMA; 3 of 3 runs, 2026-11-12) even with the type check, and GoT never needed it (its unset tables were
-         * unused). Until the cause is understood, arguments are cleared as before. BEER_BD12_KEEP_ROOT_ARGS=1 carries
-         * them (same-type parameters only) for experiments. */
+        /* Descriptor tables (heap indices) and root constants (plain values) carry over when the parameter keeps its
+         * type: GoT sets table 1 once and alternates two compute root signatures; clearing it left the table at heap
+         * index 0, and its hit-mask pass (7633df4f89d9e63e) read its heap indices past the end of slot 0's buffer
+         * (all 0), used a raw buffer as textures and storage images, and hung the GPU (Xid 109).
+         * Root CBV/SRV/UAV descriptors are GPU addresses: carrying them made every RE9 start fault in the command fetch
+         * (Xid 31 MMU fault, GR0_PBDMA; 3 of 3 runs, 2026-11-12), so they are cleared unless
+         * BEER_BD12_KEEP_ROOT_ARGS=1. */
         static int keep = -1;
         if (keep < 0) keep = getenv("BEER_BD12_KEEP_ROOT_ARGS") != NULL;
-        const int same = keep && from && to && i < from->parameter_count && i < to->parameter_count &&
-                         from->parameters[i].type == to->parameters[i].type;
+        const int same = from && to && i < from->parameter_count && i < to->parameter_count &&
+                         from->parameters[i].type == to->parameters[i].type &&
+                         (keep || to->parameters[i].type == BD12_ROOT_TABLE || to->parameters[i].type == BD12_ROOT_CONSTANTS);
         if (same) arguments[i].cbv_valid = 0;
         else memset(&arguments[i], 0, sizeof(arguments[i]));
     }
@@ -1190,6 +1194,7 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
                     (unsigned long long)pso->shader_hash, x, y, z, (void *)list);
         bd12_rp_trace_record(list, &list->compute, pso->shader_hash);
         bd12_rp_snap_dispatch(list, &list->compute, pso->shader_hash, x, y, z);
+        bd12_rp_rec_dump(list, &list->compute, pso->shader_hash, x, y, z);
         record_dispatch(list, x, y, z, 0);
         list->device->vk.CmdDispatch(list->command_buffer, x, y, z);
         bd12_rp_snap_uav_after(list, &list->compute, pso->shader_hash, x, y, z);
@@ -1256,7 +1261,7 @@ int bd12_cmd_dispatch_bound(BD12CmdList *list, uint32_t x, uint32_t y,
  * group counts of a dispatch that hangs the GPU can be read afterwards. */
 #define IND_ARGS_RING 256u
 static BD12Buffer *g_ind_args_rb;
-static uint64_t g_ind_args_hash[IND_ARGS_RING];
+static uint64_t g_ind_args_hash[IND_ARGS_RING], g_ind_args_va[IND_ARGS_RING];
 static uint32_t g_ind_args_next;
 static void ind_args_record(BD12CmdList *list, uint64_t hash, BD12Buffer *args, VkDeviceSize offset)
 {
@@ -1265,11 +1270,14 @@ static void ind_args_record(BD12CmdList *list, uint64_t hash, BD12Buffer *args, 
     if (!on || !args) return;
     if (!g_ind_args_rb) g_ind_args_rb = bd12_buffer_create_committed(list->device, BD12_HEAP_READBACK, IND_ARGS_RING * 16);
     if (!g_ind_args_rb || !g_ind_args_rb->cpu) return;
-    const uint32_t slot = __atomic_fetch_add(&g_ind_args_next, 1, __ATOMIC_RELAXED) % IND_ARGS_RING;
+    const uint32_t n = __atomic_fetch_add(&g_ind_args_next, 1, __ATOMIC_RELAXED), slot = n % IND_ARGS_RING;
     g_ind_args_hash[slot] = hash;
+    g_ind_args_va[slot] = args->va + offset;
     bd12_cmd_global_barrier(list);
     const VkBufferCopy region = { offset, (VkDeviceSize)slot * 16, 12 };
     list->device->vk.CmdCopyBuffer(list->command_buffer, args->buffer, g_ind_args_rb->buffer, 1, &region);
+    /* Word 3: stamped by the GPU once it got here, so the dump can tell copied arguments from stale ring slots. */
+    list->device->vk.CmdFillBuffer(list->command_buffer, g_ind_args_rb->buffer, (VkDeviceSize)slot * 16 + 12, 4, n + 1);
     bd12_cmd_global_barrier(list);
 }
 void bd12_ind_args_dump(void)
@@ -1281,8 +1289,9 @@ void bd12_ind_args_dump(void)
     for (uint32_t n = first; n < next; ++n) {
         const uint32_t slot = n % IND_ARGS_RING;
         const uint32_t *v = (const uint32_t *)((const uint8_t *)g_ind_args_rb->cpu + (size_t)slot * 16);
-        fprintf(stderr, "[INDARGS]   #%u cs=%016llx groups=%u,%u,%u\n", n, (unsigned long long)g_ind_args_hash[slot],
-                v[0], v[1], v[2]);
+        fprintf(stderr, "[INDARGS]   #%u cs=%016llx groups=%u,%u,%u args=0x%llx %s\n", n,
+                (unsigned long long)g_ind_args_hash[slot], v[0], v[1], v[2], (unsigned long long)g_ind_args_va[slot],
+                v[3] == n + 1 ? "(GPU reached)" : "(not reached: stale)");
     }
 }
 
@@ -1300,6 +1309,7 @@ int bd12_cmd_dispatch_indirect_bound(BD12CmdList *list, BD12Buffer *args,
         bd12_cmd_end_rendering(list);
         if (!bind_compute_db(list, pso)) return 0;
         ind_args_record(list, pso->shader_hash, args, offset);
+        bd12_rp_rec_dump(list, &list->compute, pso->shader_hash, 0, 0, 0);
         record_dispatch(list, 0, 0, 0, 1);
         list->device->vk.CmdDispatchIndirect(list->command_buffer, args->buffer, offset);
         bd12_capture_dispatch_step(list, &list->compute, pso->shader_hash);

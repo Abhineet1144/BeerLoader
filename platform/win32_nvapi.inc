@@ -557,6 +557,10 @@ static int nvapi_reflex_ready(const void *device)
     if (!g_nvapi_initialized) return NVAPI_API_NOT_INITIALIZED;
     if (!device) return NVAPI_INVALID_ARGUMENT;
     /* The device capability decides: games and Streamline query Reflex before the first swapchain exists. */
+    /* BEER_REFLEX=0: report Reflex as unavailable (the game then never sleeps its CPU thread on it). */
+    static int off = -1;
+    if (off < 0) { const char *v = getenv("BEER_REFLEX"); off = v && !strcmp(v, "0"); }
+    if (off) return NVAPI_NO_IMPLEMENTATION;
     const BeerVulkanModern *m = beer_vulkan_modern();
     return m && m->low_latency ? NVAPI_OK : NVAPI_NO_IMPLEMENTATION;
 }

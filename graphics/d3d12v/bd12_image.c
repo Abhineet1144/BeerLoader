@@ -2,6 +2,7 @@
 #include "bd12.h"
 
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -135,9 +136,14 @@ static VkImageCreateInfo image_create_info(const BD12ImageDesc *desc,
                                            VkImageUsageFlags usage)
 {
     const int is_3d = desc->type == VK_IMAGE_TYPE_3D;
+    /* BEER_BD12_NO_MUTABLE=1 (experiment): typed colour textures without MUTABLE_FORMAT, which on NVIDIA can keep
+     * framebuffer compression; casts of typed formats then have no valid view. */
+    static int no_mutable = -1;
+    if (no_mutable < 0) no_mutable = getenv("BEER_BD12_NO_MUTABLE") != NULL;
+    const int mutable_format = !(no_mutable && !desc->typeless && format_aspect(desc->format) == VK_IMAGE_ASPECT_COLOR_BIT);
     VkImageCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+        .flags = (mutable_format ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0) |
                  (desc->cube_compatible ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
                  (is_3d && (desc->allow_render_target || desc->allow_uav) ?
                       VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0),
@@ -282,6 +288,161 @@ BD12Image *bd12_image_create_committed(BD12Device *device,
                                        uint32_t initial_state)
 {
     return image_create(device, NULL, 0, desc, initial_state);
+}
+
+/* D3D12 reserved resources (CreateReservedResource) as sparse-residency images. Only the tiles the game maps with
+ * UpdateTileMappings take memory, from the game's own heaps; fully resident emulation gave every reserved texture
+ * its whole size on top of those heaps (Onimusha: 1.38 GB of reserved textures, 272 MB of tiles actually mapped).
+ * The packed mip tail (and any metadata) is backed here by private memory, so tile mappings of packed tiles are
+ * not needed. The tile layout must be exactly GetResourceTiling's (standard shape, same first packed mip), or
+ * the game's tile coordinates would land elsewhere: anything else returns NULL and the caller falls back. */
+BD12Image *bd12_image_create_sparse(BD12Device *device, const BD12ImageDesc *desc, uint32_t initial_state,
+                                    const uint32_t block[3], uint32_t standard_mips)
+{
+    const VkPhysicalDeviceFeatures *f = beer_vulkan_enabled_features();
+    const int is_3d = desc && desc->type == VK_IMAGE_TYPE_3D;
+    if (!device || !desc || !f || !f->sparseBinding || !f->sparseResidencyAliased ||
+        !(is_3d ? f->sparseResidencyImage3D : (desc->type == VK_IMAGE_TYPE_2D && f->sparseResidencyImage2D)) ||
+        (desc->samples && desc->samples > 1) || format_aspect(desc->format) != VK_IMAGE_ASPECT_COLOR_BIT) {
+        static _Atomic int logged;
+        if (atomic_fetch_add(&logged, 1) < 4)
+            fprintf(stderr, "[BD12] reserved texture fully resident: sparse unavailable (binding %d aliased %d 2D %d "
+                    "3D %d, type %d samples %u fmt %d)\n", f ? (int)f->sparseBinding : -1,
+                    f ? (int)f->sparseResidencyAliased : -1, f ? (int)f->sparseResidencyImage2D : -1,
+                    f ? (int)f->sparseResidencyImage3D : -1, desc ? (int)desc->type : -1, desc ? desc->samples : 0,
+                    desc ? (int)desc->format : -1);
+        return NULL;
+    }
+    BD12Image *image = calloc(1, sizeof(*image));
+    if (!image) return NULL;
+    image->device = device;
+    image->desc = *desc;
+    image->initial_state = initial_state;
+    image->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    image->usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (desc->allow_render_target) image->usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (desc->allow_uav) image->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    VkImageCreateInfo info = image_create_info(desc, image->usage);
+    info.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                  VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+    image->desc.mip_levels = info.mipLevels;
+    image->desc.depth_or_layers = is_3d ? info.extent.depth : info.arrayLayers;
+    if (device->vk.CreateImage(device->device, &info, NULL, &image->image) != VK_SUCCESS) {
+        free(image);
+        return NULL;
+    }
+    const char *why = NULL;
+    VkMemoryRequirements requirements;
+    device->vk.GetImageMemoryRequirements(device->device, image->image, &requirements);
+    VkSparseImageMemoryRequirements sparse[8];
+    uint32_t sparse_count = 0;
+    device->vk.GetImageSparseMemoryRequirements(device->device, image->image, &sparse_count, NULL);
+    if (sparse_count > 8) sparse_count = 8;
+    if (sparse_count) device->vk.GetImageSparseMemoryRequirements(device->device, image->image, &sparse_count, sparse);
+    const VkSparseImageMemoryRequirements *color = NULL;
+    for (uint32_t i = 0; i < sparse_count; ++i)
+        if (sparse[i].formatProperties.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) color = &sparse[i];
+    if (!(requirements.memoryTypeBits & (1u << device->memory_type[BD12_HEAP_DEFAULT])) ||
+        requirements.alignment > 65536 || 65536 % requirements.alignment)
+        why = "memory type or alignment";
+    else if (!color)
+        why = "no colour sparse requirements";
+    else if (color->formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_NONSTANDARD_BLOCK_SIZE_BIT ||
+             color->formatProperties.imageGranularity.width != block[0] ||
+             color->formatProperties.imageGranularity.height != block[1] ||
+             color->formatProperties.imageGranularity.depth != block[2])
+        why = "tile shape differs from the D3D12 standard shape";
+    else if ((color->imageMipTailFirstLod < info.mipLevels ? color->imageMipTailFirstLod : info.mipLevels) !=
+             standard_mips)
+        why = "first packed mip differs";
+    if (why) {
+        static _Atomic uint32_t logged;
+        if (atomic_fetch_add(&logged, 1) < 8)
+            fprintf(stderr, "[BD12] reserved %ux%ux%u fmt %d mips %u: fully resident (%s; tile %ux%ux%u, tail at mip "
+                    "%u, expected %ux%ux%u / %u)\n", desc->width, desc->height, desc->depth_or_layers,
+                    (int)desc->format, info.mipLevels, why,
+                    color ? color->formatProperties.imageGranularity.width : 0,
+                    color ? color->formatProperties.imageGranularity.height : 0,
+                    color ? color->formatProperties.imageGranularity.depth : 0,
+                    color ? color->imageMipTailFirstLod : 0, block[0], block[1], block[2], standard_mips);
+        goto fail;
+    }
+    /* Private memory for every mip tail: per array layer unless the driver keeps a single tail. */
+    {
+        const VkDeviceSize align = requirements.alignment;
+        VkDeviceSize total = 0;
+        uint32_t bind_count = 0;
+        for (uint32_t i = 0; i < sparse_count; ++i) {
+            const VkSparseImageMemoryRequirements *s = &sparse[i];
+            const int metadata = (s->formatProperties.aspectMask & VK_IMAGE_ASPECT_METADATA_BIT) != 0;
+            if (!s->imageMipTailSize || (!metadata && s->imageMipTailFirstLod >= info.mipLevels)) continue;
+            const int single = is_3d || (s->formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT);
+            const uint32_t tails = single ? 1u : info.arrayLayers;
+            total += (VkDeviceSize)tails * ((s->imageMipTailSize + align - 1) & ~(align - 1));
+            bind_count += tails;
+        }
+        if (bind_count) {
+            image->heap = bd12_heap_create_for_image(device, total, align, 1);
+            VkSparseMemoryBind *binds = calloc(bind_count, sizeof(*binds));
+            if (!image->heap || !binds || (image->heap->base % align)) {
+                free(binds);
+                why = "mip tail memory";
+                goto fail;
+            }
+            image->owns_heap = 1;
+            VkDeviceSize at = 0;
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < sparse_count; ++i) {
+                const VkSparseImageMemoryRequirements *s = &sparse[i];
+                const int metadata = (s->formatProperties.aspectMask & VK_IMAGE_ASPECT_METADATA_BIT) != 0;
+                if (!s->imageMipTailSize || (!metadata && s->imageMipTailFirstLod >= info.mipLevels)) continue;
+                const int single = is_3d || (s->formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT);
+                const uint32_t tails = single ? 1u : info.arrayLayers;
+                for (uint32_t t = 0; t < tails; ++t) {
+                    binds[n++] = (VkSparseMemoryBind){
+                        .resourceOffset = s->imageMipTailOffset + (VkDeviceSize)t * s->imageMipTailStride,
+                        .size = s->imageMipTailSize,
+                        .memory = image->heap->memory,
+                        .memoryOffset = image->heap->base + at,
+                        .flags = metadata ? VK_SPARSE_MEMORY_BIND_METADATA_BIT : 0
+                    };
+                    at += (s->imageMipTailSize + align - 1) & ~(align - 1);
+                }
+            }
+            /* Bound before the image is returned: later submissions using it come after this wait. */
+            const VkSparseImageOpaqueMemoryBindInfo opaque = { .image = image->image, .bindCount = n, .pBinds = binds };
+            const VkBindSparseInfo bind = { .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, .imageOpaqueBindCount = 1,
+                                            .pImageOpaqueBinds = &opaque };
+            VkFence fence = VK_NULL_HANDLE;
+            const VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            VkResult result = device->vk.CreateFence(device->device, &fence_info, NULL, &fence);
+            if (result == VK_SUCCESS) {
+                beer_vulkan_queue_lock();
+                result = device->vk.QueueBindSparse(device->queue, 1, &bind, fence);
+                beer_vulkan_queue_unlock();
+                if (result == VK_SUCCESS)
+                    result = device->vk.WaitForFences(device->device, 1, &fence, VK_TRUE, UINT64_MAX);
+                device->vk.DestroyFence(device->device, fence, NULL);
+            }
+            free(binds);
+            if (result != VK_SUCCESS) {
+                beer_vulkan_record_result(result, "BD12 sparse mip tail bind");
+                why = "mip tail bind";
+                goto fail;
+            }
+        }
+    }
+    image->sparse = 1;
+    memcpy(image->sparse_block, block, sizeof(image->sparse_block));
+    image->sparse_tail_lod = standard_mips;
+    image->serial = bd12_live_serial();
+    bd12_live_add(image);
+    return image;
+fail:
+    if (image->owns_heap) bd12_heap_destroy(image->heap);
+    device->vk.DestroyImage(device->device, image->image, NULL);
+    free(image);
+    return NULL;
 }
 
 void bd12_image_destroy(BD12Image *image)

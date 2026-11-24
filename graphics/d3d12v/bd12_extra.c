@@ -226,7 +226,10 @@ void bd12_cmd_write_timestamp(BD12CmdList *list, VkQueryPool pool, uint32_t inde
 {
     if (!pool) return;
     bd12_cmd_end_rendering(list);
-    list->device->vk.CmdResetQueryPool(list->command_buffer, pool, index, 1);
+    static int no_reset = -1, writes;   /* BEER_BD12_TS_NORESET=1 (experiment): no per-timestamp pool reset */
+    if (no_reset < 0) no_reset = getenv("BEER_BD12_TS_NORESET") != NULL;
+    if (getenv("BEER_BD12_TS_COUNT") && !(++writes % 10000)) fprintf(stderr, "[BD12] timestamps written: %d\n", writes);
+    if (!no_reset) list->device->vk.CmdResetQueryPool(list->command_buffer, pool, index, 1);
     list->device->vk.CmdWriteTimestamp2(list->command_buffer,
                                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                         pool, index);
@@ -240,7 +243,9 @@ void bd12_cmd_copy_query_results(BD12CmdList *list, VkQueryPool pool,
     if (!pool || !count || !dst) return;
     g_ts_dst = dst; g_ts_offset = offset; g_ts_count = count;
     bd12_cmd_end_rendering(list);
+    static int no_wait = -1;   /* BEER_BD12_QUERY_NOWAIT=1 (experiment): copy without waiting for availability */
+    if (no_wait < 0) no_wait = getenv("BEER_BD12_QUERY_NOWAIT") != NULL;
     list->device->vk.CmdCopyQueryPoolResults(
         list->command_buffer, pool, first, count, dst->buffer, offset, 8,
-        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        VK_QUERY_RESULT_64_BIT | (no_wait ? 0 : VK_QUERY_RESULT_WAIT_BIT));
 }

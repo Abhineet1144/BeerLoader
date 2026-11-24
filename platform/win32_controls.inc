@@ -31,6 +31,7 @@ typedef struct {
     s32 item_height;                             /* LISTBOX / COMBOBOX: the fixed item height, 0 = default */
     s32 dropped_h;                               /* COMBOBOX: the height asked for (the drop-down list's) */
     int is_combo;
+    u64 toolbar_images;                         /* owned built-in image list */
 } BeerCtl;
 #define BEER_CTL_MAX 1024
 static BeerCtl g_beer_ctl[BEER_CTL_MAX];
@@ -81,7 +82,10 @@ static void beer_ctl_destroy(u64 hwnd)
 {
     pthread_mutex_lock(&g_beer_ctl_mtx);
     BeerCtl *c = beer_ctl_get(hwnd, 0);
-    if (c) { beer_ctl_clear_items(c); free(c->text); c->used = 0; }
+    if (c) {
+        if (c->toolbar_images) beer_ImageList_Destroy(c->toolbar_images);
+        beer_ctl_clear_items(c); free(c->text); c->used = 0;
+    }
     pthread_mutex_unlock(&g_beer_ctl_mtx);
 }
 
@@ -1313,6 +1317,23 @@ static u64 __attribute__((ms_abi)) beer_ctl_edit_proc(u64 hw, u32 msg, u64 wp, u
     { return beer_ctl_generic_proc_kind(hw, msg, wp, lp, 1); }
 
 static u64 __attribute__((ms_abi)) beer_ctl_treeview_proc(u64 hw, u32 msg, u64 wp, u64 lp);
+
+static u64 __attribute__((ms_abi)) beer_ctl_toolbar_proc(u64 hw, u32 msg, u64 wp, u64 lp)
+{
+    if (msg == 0x0432 || msg == 0x0431) {       /* TB_LOADIMAGES / TB_GETIMAGELIST */
+        const int load = msg == 0x0432;
+        if (load ? (wp != 4 || lp != (u64)-1) : wp != 0) return load ? (u64)-1 : 0;
+        pthread_mutex_lock(&g_beer_ctl_mtx);
+        BeerCtl *c = beer_ctl_get(hw, load);
+        if (load && c && !beer_ImageList_GetImageCount(c->toolbar_images))
+            c->toolbar_images = beer_gdi_create_view_imagelist();
+        u64 list = c && beer_ImageList_GetImageCount(c->toolbar_images) ? c->toolbar_images : 0;
+        pthread_mutex_unlock(&g_beer_ctl_mtx);
+        return load ? (list ? 0 : (u64)-1) : list; /* First image index, not BOOL. */
+    }
+    return beer_ctl_generic_proc(hw, msg, wp, lp);
+}
+
 /* The window procedure of a predefined class name (lower-case key); NULL when it is not one. */
 static u64 beer_system_control_proc(const char *key)
 {
@@ -1322,6 +1343,7 @@ static u64 beer_system_control_proc(const char *key)
     if (!strcmp(key, "msctls_progress32")) return (u64)(uintptr_t)beer_ctl_progress_proc;
     if (!strcmp(key, "edit") || !strncmp(key, "richedit", 8)) return (u64)(uintptr_t)beer_ctl_edit_proc;
     if (!strcmp(key, "systreeview32")) return (u64)(uintptr_t)beer_ctl_treeview_proc;
+    if (!strcmp(key, "toolbarwindow32")) return (u64)(uintptr_t)beer_ctl_toolbar_proc;
     return (u64)(uintptr_t)beer_ctl_generic_proc;
 }
 

@@ -736,6 +736,38 @@ int xwayland_window_set_style(int decorated, int resizable)
 
 static void screen_size_locked(int *out_w, int *out_h);
 
+/* Fullscreen on or off, by the EWMH rule for the window's state: a window manager ignores _NET_WM_STATE client
+ * messages for a window that is not mapped yet, so before the first map the state goes into the property itself
+ * (read when the window is managed). GoT, Sekiro and WWM resize to the desktop before ShowWindow: the message was
+ * dropped, Mutter placed a fixed 2560x1440 window below the top bar (clipped by the panels), and only a fullscreen
+ * window underneath happened to make it look right. Returns 0 when the atoms are missing. */
+static int request_fullscreen_locked(int on)
+{
+    Atom wm_state = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE", 0);
+    Atom wm_fs = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE_FULLSCREEN", 0);
+    if (!wm_state || !wm_fs) return 0;
+    if (!g_x11.visible) {
+        const unsigned long state = (unsigned long)wm_fs;
+        g_x11.ChangeProperty(g_x11.display, g_x11.window, wm_state, 4 /* XA_ATOM */, 32, 0 /* PropModeReplace */,
+                             (const unsigned char *)&state, on ? 1 : 0);
+        return 1;
+    }
+    XEvent event;
+    memset(&event, 0, sizeof(event));
+    XClientMessageEvent *client = (XClientMessageEvent *)&event;
+    client->type = 33; /* ClientMessage */
+    client->display = g_x11.display;
+    client->window = g_x11.window;
+    client->message_type = wm_state;
+    client->format = 32;
+    client->data.l[0] = on ? 1 : 0; /* _NET_WM_STATE_ADD/REMOVE */
+    client->data.l[1] = (long)wm_fs;
+    client->data.l[3] = 1; /* normal application source */
+    Window root = g_x11.DefaultRootWindow(g_x11.display);
+    return g_x11.SendEvent(g_x11.display, root, 0, (1L << 20) | (1L << 19) /* SubstructureRedirect/Notify */,
+                           &event) != 0;
+}
+
 int xwayland_window_set_fullscreen(int fullscreen)
 {
     if (beer_headless()) { (void)fullscreen; return 1; }
@@ -759,29 +791,7 @@ int xwayland_window_set_fullscreen(int fullscreen)
         }
         last_requested = !!fullscreen;
     }
-    Atom wm_state = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE", 0);
-    Atom wm_fullscreen = g_x11.InternAtom(
-        g_x11.display, "_NET_WM_STATE_FULLSCREEN", 0);
-    if (!wm_state || !wm_fullscreen) {
-        pthread_mutex_unlock(&g_x11.lock);
-        return 0;
-    }
-
-    XEvent event;
-    memset(&event, 0, sizeof(event));
-    XClientMessageEvent *client = (XClientMessageEvent *)&event;
-    client->type = 33; /* ClientMessage */
-    client->display = g_x11.display;
-    client->window = g_x11.window;
-    client->message_type = wm_state;
-    client->format = 32;
-    client->data.l[0] = fullscreen ? 1 : 0; /* _NET_WM_STATE_ADD/REMOVE */
-    client->data.l[1] = (long)wm_fullscreen;
-    client->data.l[3] = 1; /* normal application source */
-
-    Window root = g_x11.DefaultRootWindow(g_x11.display);
-    long mask = (1L << 20) | (1L << 19); /* SubstructureRedirect/Notify */
-    int ok = g_x11.SendEvent(g_x11.display, root, 0, mask, &event) != 0;
+    int ok = request_fullscreen_locked(fullscreen);
     if (ok) g_x11.Flush(g_x11.display);
     pthread_mutex_unlock(&g_x11.lock);
     return ok;
@@ -829,23 +839,7 @@ int xwayland_window_move_resize(int x, int y, int width, int height,
         const int covers = !g_x11.win_decorated && sw > 0 && sh > 0 &&
                            width >= sw && height >= sh;
         if (covers != g_x11.fullscreen_applied) {
-            Atom wm_state = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE", 0);
-            Atom wm_fs = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE_FULLSCREEN", 0);
-            if (wm_state && wm_fs) {
-                XEvent event;
-                memset(&event, 0, sizeof(event));
-                XClientMessageEvent *client = (XClientMessageEvent *)&event;
-                client->type = 33;
-                client->display = g_x11.display;
-                client->window = g_x11.window;
-                client->message_type = wm_state;
-                client->format = 32;
-                client->data.l[0] = covers ? 1 : 0;
-                client->data.l[1] = (long)wm_fs;
-                client->data.l[3] = 1;
-                Window root = g_x11.DefaultRootWindow(g_x11.display);
-                g_x11.SendEvent(g_x11.display, root, 0,
-                                (1L << 20) | (1L << 19), &event);
+            if (request_fullscreen_locked(covers)) {
                 g_x11.fullscreen_applied = covers;
                 apply_cursor_locked();
                 fprintf(stderr, "[XWAYLAND] borderless %dx%d covers desktop %dx%d -> fullscreen=%d\n",

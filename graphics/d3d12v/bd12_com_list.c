@@ -1781,6 +1781,18 @@ void *com_list_vtable_[80] = {
 /* DLSS "no upscaling" (platform/win32_ngx.inc): stretches the source region (x, y, w, h) of `source` over the whole of
  * `target` with linear filtering, recorded into the open command list `list_iface`. Both are D3D12 colour textures in
  * BD12's GENERAL layout; returns 0 (nothing recorded) for anything else. */
+/* Diagnostic: queue a copy of `resource_iface`'s image (mip 0, layer 0) into the capture folder, recorded on the open
+ * command list at this point (bd12_capture_image). */
+int bd12_debug_dump(void *list_iface, void *resource_iface, const char *name)
+{
+    ComList *list = list_iface;
+    ComResource *r = resource_iface;
+    if (!list || !r || list->obj.kind != COM_LIST || r->obj.kind != COM_RESOURCE || !list->open || !list->cur || !r->image)
+        return 0;
+    bd12_capture_image(list->cur, r->image, name);
+    return 1;
+}
+
 int bd12_debug_stretch(void *list_iface, void *source_iface, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                        void *target_iface)
 {

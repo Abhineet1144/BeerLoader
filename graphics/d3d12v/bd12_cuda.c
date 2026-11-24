@@ -179,8 +179,10 @@ int bd12_cuda_launch(void *command_list, uint64_t shader, uint32_t grid_x, uint3
     if (!ensure_loaded(list->device)) return BD12_NVAPI_NOT_SUPPORTED;
     bd12_cmd_end_rendering(list);
     /* The D3D12 barriers the caller recorded target compute/graphics stages; a kernel launch is ordered against
-     * everything around it. */
-    full_barrier(list);
+     * everything around it. BEER_CUDA_BARRIERS=0 (experiment): no barriers around launches. */
+    static int barriers = -1;
+    if (barriers < 0) { const char *v = getenv("BEER_CUDA_BARRIERS"); barriers = !(v && !strcmp(v, "0")); }
+    if (barriers) full_barrier(list);
     size_t size = params_size;
     const void *extras[] = {
         (const void *)(uintptr_t)1, params,          /* CU_LAUNCH_PARAM_BUFFER_POINTER */
@@ -195,13 +197,42 @@ int bd12_cuda_launch(void *command_list, uint64_t shader, uint32_t grid_x, uint3
         .extraCount = params && params_size ? sizeof(extras) / sizeof(*extras) : 0,
         .pExtras = params && params_size ? extras : NULL,
     };
+    {   /* GPU profiler: kernels are timed like dispatches (tag = hash of the kernel name), not charged to the
+         * operation recorded before them. */
+        uint64_t h = 1469598103934665603ull;
+        for (const char *c = s->name; *c; ++c) { h ^= (uint8_t)*c; h *= 1099511628211ull; }
+        bd12_gpuprof_mark(list, 102, h);
+    }
     g_cuda.launch(list->command_buffer, &launch);
-    full_barrier(list);
+    if (barriers) full_barrier(list);
+    static _Atomic unsigned long launches;
+    if (getenv("BEER_CUDA_COUNT") && !(++launches % 20000)) fprintf(stderr, "[NVAPI] cubin launches: %lu\n", launches);
     static int logged;
     if (logged++ < 8)
         fprintf(stderr, "[NVAPI] LaunchCubinShader(\"%s\", grid %ux%ux%u, %u param bytes)\n", s->name, grid_x, grid_y,
                 grid_z, params_size);
     return BD12_NVAPI_OK;
+}
+
+/* BEER_CUDA_DIAGNOSTICS=1: every distinct image view a CUDA kernel (DLSS, Ray Reconstruction) gets a handle for, with the
+ * image's Vulkan format, size and aspect: a handle of 0, or a view of the wrong aspect, makes the kernel read garbage. */
+static void cuda_note_view(const char *what, const BD12Descriptor *d, uint64_t handle)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_CUDA_DIAGNOSTICS") != NULL;
+    if (!on || !d) return;
+    static VkImageView seen[512];
+    static int count;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    for (int i = 0; i < count; ++i) if (seen[i] == d->image_view) { pthread_mutex_unlock(&lock); return; }
+    if (count < 512) seen[count++] = d->image_view;
+    pthread_mutex_unlock(&lock);
+    const BD12Image *image = d->image;
+    fprintf(stderr, "[CUDA VIEW] %-9s kind %u view %#llx image %ux%u vk format %d aspect 0x%x layout %d -> handle %#llx%s\n",
+            what, d->kind, (unsigned long long)(uintptr_t)d->image_view, image ? image->desc.width : 0, image ? image->desc.height : 0,
+            image ? (int)image->desc.format : -1, image ? image->aspect : 0, (int)d->image_layout, (unsigned long long)handle,
+            handle ? "" : "  <-- NO HANDLE");
 }
 
 int bd12_cuda_texture_object(void *device, uint64_t srv_descriptor, uint64_t sampler_descriptor, uint32_t *handle)
@@ -219,6 +250,7 @@ int bd12_cuda_texture_object(void *device, uint64_t srv_descriptor, uint64_t sam
         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .sampler = sampler->sampler,
     };
     *handle = g_cuda.view_handle(bd->device, &info);
+    cuda_note_view("texture", srv, *handle);
     return BD12_NVAPI_OK;
 }
 
@@ -235,6 +267,7 @@ int bd12_cuda_surface_object(void *device, uint64_t uav_descriptor, uint32_t *ha
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
     };
     *handle = g_cuda.view_handle(bd->device, &info);
+    cuda_note_view("surface", uav, *handle);
     return BD12_NVAPI_OK;
 }
 
@@ -259,6 +292,7 @@ int bd12_cuda_view_handle64(void *device, uint64_t view_descriptor, uint64_t sam
         .sampler = sampler ? sampler->sampler : VK_NULL_HANDLE,
     };
     *handle = g_cuda.view_handle64(bd->device, &info);
+    cuda_note_view(surface ? "surface64" : sampler ? "texsamp64" : "texture64", view, *handle);
     return *handle ? BD12_NVAPI_OK : BD12_NVAPI_ERROR;
 }
 

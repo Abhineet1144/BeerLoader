@@ -535,6 +535,40 @@ size_t beer_virtual_query(const void *address, BeerMemoryBasicInformation *info,
     uintptr_t start = 0, end = 0, next = UINTPTR_MAX;
     int read = 0, write = 0, execute = 0, shared = 0;
     memset(info, 0, sizeof(*info));
+    /* Inside a VirtualAlloc region every field comes from the allocation table, so /proc/self/maps is not read:
+     * parsing it costs thousands of read syscalls per query and holds the kernel's mmap lock while it is generated,
+     * stalling every thread that maps memory or faults meanwhile (RE9's streaming thread queries constantly and
+     * froze its job workers for 10-15 ms whenever new assets streamed in). */
+    pthread_mutex_lock(&g_allocation_mutex);
+    BeerAllocation *tracked = find_allocation_locked(address);
+    if (tracked) {
+        const size_t page = page_size();
+        const size_t index = (value - (uintptr_t)tracked->base) / page, count = tracked->size / page;
+        const uint32_t protection = tracked->page_protect[index];
+        size_t last = index + 1;
+        while (last < count && tracked->page_protect[last] == protection) ++last;
+        info->base_address = (uintptr_t)tracked->base + index * page;
+        info->region_size = (last - index) * page;
+        info->allocation_base = (uint64_t)(uintptr_t)tracked->base;
+        info->allocation_protect = tracked->allocation_protect;
+        info->state = protection ? BEER_MEM_COMMIT : BEER_MEM_RESERVE;
+        info->protect = protection ? protection : BEER_PAGE_NOACCESS;
+        info->type = BEER_MEM_PRIVATE;
+        pthread_mutex_unlock(&g_allocation_mutex);
+        uintptr_t image_base = 0;
+        size_t image_size = 0;
+        if (g_image_lookup && g_image_lookup(value, &image_base, &image_size) && image_size &&
+            value - image_base < image_size) {
+            info->type = BEER_MEM_IMAGE;
+            info->allocation_base = image_base;
+            info->allocation_protect = BEER_PAGE_EXECUTE_WRITECOPY;
+            const uintptr_t image_end = image_base + image_size;
+            if (info->base_address + info->region_size > image_end)
+                info->region_size = image_end - info->base_address;
+        }
+        return sizeof(*info);
+    }
+    pthread_mutex_unlock(&g_allocation_mutex);
     if (!query_proc_map(value, &start, &end, &read, &write, &execute, &shared, &next)) {
         size_t page = page_size();
         start = align_down(value, page);

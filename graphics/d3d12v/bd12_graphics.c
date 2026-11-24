@@ -462,8 +462,10 @@ layout_done:;
         .pDynamicState = &dynamic,
         .layout = gp->layout
     };
+    BD12_PROF_BEGIN();
     VkResult result = device->vk.CreateGraphicsPipelines(
         device->device, device->pipeline_cache, 1, &info, NULL, &gp->pipeline);
+    BD12_PROF_END(BD12_PROF_PSO_VK);
     if (result == VK_SUCCESS) bd12_pipeline_cache_note_new(device);
     beer_vulkan_record_result(result, "BD12 graphics pipeline");
     if (result != VK_SUCCESS) goto fail;

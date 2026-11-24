@@ -16,7 +16,7 @@
 
 /* ---------------------------------------------------------------- objects */
 
-enum { OBJ_NONE, OBJ_BITMAP, OBJ_FONT, OBJ_BRUSH, OBJ_PEN, OBJ_REGION };
+enum { OBJ_NONE, OBJ_BITMAP, OBJ_FONT, OBJ_BRUSH, OBJ_PEN, OBJ_REGION, OBJ_ICON };
 
 /* A region is a small shape tree: rectangles, rounded rectangles / ellipses, and CombineRgn results.
  * Point queries evaluate the tree. Coordinates follow GDI: right and bottom edges are exclusive. */
@@ -44,6 +44,8 @@ static void surface_release(Surface *s)
 typedef struct {
     int type, stock;
     Surface surface;             /* OBJ_BITMAP */
+    Surface icon_mask;           /* OBJ_ICON: surface is the optional color plane */
+    uint32_t icon_flag, hotspot_x, hotspot_y;
     uint8_t logfont[92];         /* OBJ_FONT (LOGFONTW) */
     uint32_t color;              /* OBJ_BRUSH / OBJ_PEN, COLORREF */
     int style, width;
@@ -103,6 +105,7 @@ static void obj_free(uint64_t handle)
     Obj *o = obj_get(handle);
     if (!o) return;
     if (o->type == OBJ_BITMAP) surface_release(&o->surface);
+    if (o->type == OBJ_ICON) { surface_release(&o->surface); surface_release(&o->icon_mask); }
     if (o->type == OBJ_REGION) rgn_free(o->region);
     free(o);
     g_objects[handle - OBJ_BASE - 1] = NULL;
@@ -257,6 +260,8 @@ static int clip_contains(const Surface *d, int x, int y, int w, int h)
 static uint32_t s_get(const Surface *s, int x, int y)
 {
     int row = s->topdown ? y : s->h - 1 - y;
+    if (s->bpp == 1) return s->bits[(size_t)row * s->stride + x / 8] & (0x80u >> (x & 7)) ?
+                            0x00ffffffu : 0;
     const uint8_t *p = s->bits + (size_t)row * s->stride + (size_t)x * (s->bpp / 8);
     if (s->bpp == 32) return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | 0xFF000000u;
@@ -267,6 +272,12 @@ static void s_put(Surface *s, int x, int y, uint32_t px)
     if (s == g_clip_surface && (x < g_clip_l || y < g_clip_t || x >= g_clip_r || y >= g_clip_b)) return;
     if (x < 0 || y < 0 || x >= s->w || y >= s->h) return;
     int row = s->topdown ? y : s->h - 1 - y;
+    if (s->bpp == 1) {
+        uint8_t *p = s->bits + (size_t)row * s->stride + x / 8;
+        uint8_t bit = (uint8_t)(0x80u >> (x & 7));
+        if (px & 0x00ffffffu) *p |= bit; else *p &= (uint8_t)~bit;
+        return;
+    }
     uint8_t *p = s->bits + (size_t)row * s->stride + (size_t)x * (s->bpp / 8);
     p[0] = (uint8_t)px; p[1] = (uint8_t)(px >> 8); p[2] = (uint8_t)(px >> 16);
     if (s->bpp == 32) p[3] = (uint8_t)(px >> 24);
@@ -705,6 +716,60 @@ uint64_t GDI_MS beer_LoadImageA(uint64_t instance, uint64_t name, uint32_t type,
     return beer_LoadBitmapA(instance, name);
 }
 
+/* True-color readback. Indexed/bitfield conversion is deliberately unsupported,
+ * rather than reporting success with uninitialised caller pixels. */
+int GDI_MS beer_GetDIBits(uint64_t dc, uint64_t bitmap, uint32_t start, uint32_t lines,
+                         void *bits, void *info, uint32_t usage)
+{
+    if (!info || usage != 0) return 0;
+    Bih h;
+    memcpy(&h, info, sizeof(h));
+    if (h.size < sizeof(h)) return 0;
+    LOCK();
+    Obj *o = obj_get(bitmap);
+    if (!dc_get(dc) || !o || o->type != OBJ_BITMAP) { UNLOCK(); return 0; }
+    Surface *s = &o->surface;
+    if (!h.bit_count) {
+        if (s->bpp == 1) { UNLOCK(); return 0; } /* Indexed format queries need a palette. */
+        /* Header-only format query: no palette for these true-color surfaces. */
+        h.width = s->w; h.height = s->h;
+        h.planes = 1; h.bit_count = (uint16_t)s->bpp;
+        h.compression = 0; h.size_image = (uint32_t)(s->stride * s->h);
+        h.clr_used = h.clr_important = 0;
+        memcpy(info, &h, sizeof(h));
+        UNLOCK();
+        return h.height;
+    }
+    if (h.planes != 1 || (h.bit_count != 24 && h.bit_count != 32) || h.compression ||
+        h.width != s->w || (h.height != s->h && h.height != -s->h)) {
+        UNLOCK(); return 0;
+    }
+    const size_t stride = ((size_t)s->w * h.bit_count + 31) / 32 * 4;
+    h.size_image = (uint32_t)(stride * s->h);
+    h.clr_used = h.clr_important = 0;
+    if (!bits) {
+        memcpy(info, &h, sizeof(h));
+        const int height = s->h;
+        UNLOCK(); return height;
+    }
+    if (start >= (uint32_t)s->h || !lines) { UNLOCK(); return 0; }
+    if (lines > (uint32_t)s->h - start) lines = (uint32_t)s->h - start;
+    for (uint32_t row = 0; row < lines; ++row) {
+        int y = h.height < 0 ? (int)(start + row) : s->h - 1 - (int)(start + row);
+        uint8_t *dst = (uint8_t *)bits + row * stride;
+        memset(dst, 0, stride);
+        for (int x = 0; x < s->w; ++x) {
+            uint32_t px = s_get(s, x, y);
+            uint8_t *p = dst + (size_t)x * (h.bit_count / 8);
+            p[0] = (uint8_t)px; p[1] = (uint8_t)(px >> 8); p[2] = (uint8_t)(px >> 16);
+            if (h.bit_count == 32) p[3] = (uint8_t)(px >> 24);
+        }
+    }
+    memcpy(info, &h, sizeof(h));
+    UNLOCK();
+    return (int)lines;
+}
+
 int GDI_MS beer_FillRect(uint64_t dc, const int32_t *rect, uint64_t brush)
 {
     if (!rect) return 0;
@@ -923,15 +988,176 @@ uint64_t GDI_MS beer_CreateCompatibleBitmap(uint64_t dc, int width, int height)
 
 uint64_t GDI_MS beer_CreateBitmap(int width, int height, uint32_t planes, uint32_t bits, const void *data)
 {
-    (void)planes;
+    if (planes != 1 || (bits != 1 && bits != 24 && bits != 32)) return 0;
     Surface s = {0};
-    if (!surface_alloc(&s, width, height, 32, 1)) return 0;
-    if (data && bits == 32) memcpy(s.bits, data, (size_t)s.stride * height);
+    if (!surface_alloc(&s, width, height, (int)bits, 1)) return 0;
+    /* CreateBitmap input scanlines are WORD aligned, unlike DIB scanlines. */
+    if (data) {
+        size_t source_stride = ((size_t)width * bits + 15) / 16 * 2;
+        for (int y = 0; y < height; ++y)
+            memcpy(s.bits + (size_t)y * s.stride, (const uint8_t *)data + (size_t)y * source_stride,
+                   ((size_t)width * bits + 7) / 8);
+    }
     LOCK();
     gdi_init();
     uint64_t h = bitmap_from_surface(&s);
     UNLOCK();
     return h;
+}
+
+static int surface_clone(const Surface *source, Surface *out)
+{
+    if (!surface_alloc(out, source->w, source->h, source->bpp, source->topdown)) return 0;
+    memcpy(out->bits, source->bits, (size_t)source->stride * source->h);
+    return 1;
+}
+
+/* Native Win64 ICONINFO (the PE32 pointer-bearing layout is not forwarded). */
+typedef struct {
+    uint32_t icon, x, y, padding;
+    uint64_t mask, color;
+} BeerIconInfo;
+_Static_assert(sizeof(BeerIconInfo) == 32, "Win64 ICONINFO layout");
+
+uint64_t GDI_MS beer_CreateIconIndirect(const void *info)
+{
+    if (!info) return 0;
+    BeerIconInfo i;
+    memcpy(&i, info, sizeof(i));
+    LOCK();
+    Obj *mask = obj_get(i.mask), *color = obj_get(i.color);
+    if (!mask || mask->type != OBJ_BITMAP || mask->surface.bpp != 1 ||
+        (i.color && (!color || color->type != OBJ_BITMAP ||
+         (color->surface.bpp != 24 && color->surface.bpp != 32) ||
+         color->surface.w != mask->surface.w || color->surface.h != mask->surface.h)) ||
+        (!i.color && (mask->surface.h & 1))) { UNLOCK(); return 0; }
+    uint64_t handle = obj_new(OBJ_ICON);
+    Obj *icon = obj_get(handle);
+    if (!icon) { UNLOCK(); return 0; }
+    if (!surface_clone(&mask->surface, &icon->icon_mask) ||
+        (color && !surface_clone(&color->surface, &icon->surface))) {
+        obj_free(handle); UNLOCK(); return 0;
+    }
+    icon->icon_flag = !!i.icon;
+    icon->hotspot_x = i.icon ? (uint32_t)mask->surface.w / 2 : i.x;
+    icon->hotspot_y = i.icon ? (uint32_t)mask->surface.h / (i.color ? 2 : 4) : i.y;
+    UNLOCK();
+    return handle;
+}
+
+int GDI_MS beer_GetIconInfo(uint64_t handle, void *info)
+{
+    if (!info) return 0;
+    LOCK();
+    Obj *icon = obj_get(handle);
+    if (!icon || icon->type != OBJ_ICON) { UNLOCK(); return 0; }
+    Surface mask = {0}, color = {0};
+    if (!surface_clone(&icon->icon_mask, &mask) ||
+        (icon->surface.bits && !surface_clone(&icon->surface, &color))) {
+        surface_release(&mask); surface_release(&color); UNLOCK(); return 0;
+    }
+    BeerIconInfo i = { icon->icon_flag, icon->hotspot_x, icon->hotspot_y, 0, 0, 0 };
+    i.mask = bitmap_from_surface(&mask);
+    if (color.bits) i.color = bitmap_from_surface(&color);
+    if (!i.mask || (icon->surface.bits && !i.color)) {
+        if (i.mask) obj_free(i.mask);
+        if (i.color) obj_free(i.color);
+        UNLOCK(); return 0;
+    }
+    memcpy(info, &i, sizeof(i));
+    UNLOCK();
+    return 1;
+}
+
+int GDI_MS beer_DestroyIcon(uint64_t handle)
+{
+    LOCK();
+    Obj *o = obj_get(handle);
+    int ok = o && o->type == OBJ_ICON;
+    if (ok) obj_free(handle);
+    UNLOCK();
+    return ok;
+}
+
+/* Built-in IDB_VIEW_SMALL_COLOR strip. Only this system list is implemented;
+ * its handle is unique even if the caller destroys it before its toolbar. */
+#define VIEW_ICON_COUNT 13
+static uint64_t view_lists[1024];
+static uint64_t next_view_list = 0xe1600000;
+
+static uint64_t *view_list_slot(uint64_t handle)
+{
+    for (size_t i = 0; i < sizeof(view_lists) / sizeof(*view_lists); ++i)
+        if (view_lists[i] == handle) return &view_lists[i];
+    return NULL;
+}
+
+uint64_t beer_gdi_create_view_imagelist(void)
+{
+    LOCK();
+    uint64_t *slot = view_list_slot(0);
+    uint64_t list = slot ? (*slot = ++next_view_list) : 0;
+    UNLOCK();
+    return list;
+}
+
+int GDI_MS beer_ImageList_Destroy(uint64_t list)
+{
+    LOCK();
+    uint64_t *slot = list ? view_list_slot(list) : NULL;
+    if (slot) *slot = 0;
+    UNLOCK();
+    return slot != NULL;
+}
+
+int GDI_MS beer_ImageList_GetImageCount(uint64_t list)
+{
+    LOCK();
+    int count = list && view_list_slot(list) ? VIEW_ICON_COUNT : 0;
+    UNLOCK();
+    return count;
+}
+
+/* Original pixel glyphs: list layouts, sort keys, folder/up, network and menu. */
+static const uint16_t view_glyphs[VIEW_ICON_COUNT][12] = {
+    {0,0,0x73b,0x73b,0x73b,0,0,0x73b,0x73b,0x73b},
+    {0,0xaaa,0xaaa,0,0xaaa,0xaaa,0,0xaaa,0xaaa},
+    {0,0x9fe,0,0,0x9fe,0,0,0x9fe,0,0,0x9fe},
+    {0,0xfff,0x888,0x888,0xfff,0x888,0x888,0xfff,0x888,0x888,0xfff},
+    {0,0x600,0x900,0xf00,0x900,0x900,0,0x020,0x070,0x0f8,0x020},
+    {0,0x200,0x600,0x200,0x200,0x700,0,0x020,0x070,0x0f8,0x020},
+    {0,0xf80,0xa80,0xf80,0x880,0xf80,0,0x020,0x070,0x0f8,0x020},
+    {0,0xf80,0x200,0x200,0x200,0x200,0,0x020,0x070,0x0f8,0x020},
+    {0,0x780,0x7fe,0x7fe,0x7de,0x78e,0x706,0x7de,0x7de,0x7fe,0x7fe},
+    {0,0xf0f,0x909,0x909,0xf0f,0x606,0x3fc,0x060,0x0f0},
+    {0,0xf0f,0x909,0x909,0xf0f,0x606,0x090,0x060,0x090},
+    {0,0x780,0x7fe,0x7fe,0x7de,0x7de,0x70e,0x7de,0x7de,0x7fe,0x7fe},
+    {0,0xfff,0x801,0xbf1,0x801,0xbf1,0x801,0x875,0x821,0x801,0xfff},
+};
+
+uint64_t GDI_MS beer_ImageList_GetIcon(uint64_t list, int index, uint32_t flags)
+{
+    if (index < 0 || index >= VIEW_ICON_COUNT || (flags & ~1u) ||
+        !beer_ImageList_GetImageCount(list)) return 0;
+    uint32_t pixels[16 * 16] = {0};
+    uint8_t mask[16 * 2];
+    memset(mask, 0xff, sizeof(mask));
+    const uint32_t ink = index == 8 || index == 11 ? 0xffbd821e : 0xff325e83;
+    for (int y = 0; y < 12; ++y) {
+        for (int x = 0; x < 12; ++x) {
+            if (!(view_glyphs[index][y] & (0x800u >> x))) continue;
+            const int px = x + 2, py = y + 2;
+            pixels[py * 16 + px] = ink;
+            mask[py * 2 + px / 8] &= (uint8_t)~(0x80u >> (px & 7));
+        }
+    }
+    BeerIconInfo info = { .icon = 1 };
+    info.mask = beer_CreateBitmap(16, 16, 1, 1, mask);
+    info.color = beer_CreateBitmap(16, 16, 1, 32, pixels);
+    uint64_t icon = info.mask && info.color ? beer_CreateIconIndirect(&info) : 0;
+    if (info.mask) beer_DeleteObject(info.mask);
+    if (info.color) beer_DeleteObject(info.color);
+    return icon;
 }
 
 static uint64_t create_dib_section(const void *info, void **bits, int low32)
@@ -1025,7 +1251,7 @@ int GDI_MS beer_DeleteObject(uint64_t object)
     LOCK();
     Obj *o = obj_get(object);
     int ok = 0;
-    if (o) {
+    if (o && o->type != OBJ_ICON) {
         ok = 1;
         if (!o->stock) obj_free(object);
     }
@@ -1106,7 +1332,7 @@ uint32_t GDI_MS beer_GetObjectType(uint64_t object)
     Obj *o = obj_get(object);
     uint32_t t = 0;
     if (o) t = o->type == OBJ_PEN ? 1 : o->type == OBJ_BRUSH ? 2 : o->type == OBJ_BITMAP ? 7 :
-               o->type == OBJ_REGION ? 8 : 6;
+               o->type == OBJ_REGION ? 8 : o->type == OBJ_FONT ? 6 : 0;
     else if (object == BEER_GDI_WINDOW_DC || (object >= DC_BASE && object < DC_BASE + DC_MAX)) t = 3;
     UNLOCK();
     return t;

@@ -8,6 +8,105 @@
 #include "wow32_dll_contract.inc"
 
 static int native_veh_calls;
+static void conversion_invalid_parameter_contract_test(void)
+{
+    assert(!beer_module_may_be_faked("icu.dll"));
+    assert(!beer_module_may_be_faked("icuuc.dll"));
+    assert(!beer_module_may_be_faked("icuin.dll"));
+    char narrow[4] = "abc";
+    u16 wide[4] = {'a', 'b', 'c', 0};
+    assert(!impl_WideCharToMultiByte(65001, 0, NULL, -1, narrow, 4, NULL, NULL) && g_last_error == 87);
+    assert(!impl_MultiByteToWideChar(65001, 0, NULL, -1, wide, 4) && g_last_error == 87);
+    const int lengths[] = {0, -2};
+    for (unsigned i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+        assert(!impl_WideCharToMultiByte(65001, 0, wide, lengths[i], narrow, 4, NULL, NULL) && g_last_error == 87);
+        assert(!impl_MultiByteToWideChar(65001, 0, narrow, lengths[i], wide, 4) && g_last_error == 87);
+    }
+    assert(!impl_WideCharToMultiByte(65001, 0, wide, -1, NULL, 4, NULL, NULL) && g_last_error == 87);
+    assert(!impl_MultiByteToWideChar(65001, 0, narrow, -1, NULL, 4) && g_last_error == 87);
+    assert(!impl_WideCharToMultiByte(65001, 0, wide, -1, narrow, -1, NULL, NULL) && g_last_error == 87);
+    assert(!impl_MultiByteToWideChar(65001, 0, narrow, -1, wide, -1) && g_last_error == 87);
+    assert(!memcmp(narrow, "abc", 4) && wide[0] == 'a' && wide[3] == 0);
+    assert(impl_WideCharToMultiByte(65001, 0, wide, -1, NULL, 0, NULL, NULL) == 4);
+    assert(impl_MultiByteToWideChar(65001, 0, narrow, -1, NULL, 0) == 4);
+}
+static void section_commit_contract_test(void)
+{
+    u64 section = impl_CreateFileMappingA(UINT64_MAX, NULL, 0x40, 0, 0x10000, NULL);
+    assert(section);
+    u8 *code = (void *)(uintptr_t)impl_MapViewOfFile(section, 0x26, 0, 0, 0x10000);
+    u8 *alias = (void *)(uintptr_t)impl_MapViewOfFile(section, 0x06, 0, 0, 0x10000);
+    assert(code && alias && code != alias);
+    assert(impl_CloseHandle(section)); /* views own their backing after close */
+    alias[0x1000] = 0x5a;
+    assert(impl_VirtualAlloc(code + 0x1000, 0x1000, 0x1000, 0x20) == (u64)(uintptr_t)(code + 0x1000));
+    assert(code[0x1000] == 0x5a);
+    alias[0x1000] = 0xa5;
+    assert(code[0x1000] == 0xa5); /* committing must not replace the MAP_SHARED view */
+    assert(impl_VirtualAlloc(code + 0x1000, 0x1000, 0x1000, 0x04) == (u64)(uintptr_t)(code + 0x1000));
+    code[0x1000] = 0x3c;
+    assert(alias[0x1000] == 0x3c);
+    assert(!impl_VirtualAlloc(alias, 0x1000, 0x1000, 0x40)); /* no executable rights on the RW view */
+    assert(!impl_VirtualAlloc(code + 0xf000, 0x2000, 0x1000, 0x04)); /* crosses view end */
+    assert(!impl_VirtualAlloc(code, 0x1000, 0x3000, 0x04)); /* cannot reserve over a view */
+    assert(impl_UnmapViewOfFile(code) && impl_UnmapViewOfFile(alias));
+    assert(!impl_VirtualAlloc(code, 0x1000, 0x1000, 0x04)); /* stale mapping is not owned */
+}
+static void processor_package_contract_test(void)
+{
+    u32 length = 0;
+    assert(!impl_GetLogicalProcessorInformationEx(3, NULL, &length));
+    assert(g_last_error == 122 && length && !(length % sizeof(WIN_SLPI_EX_CORE)));
+    struct { WIN_SLPI_EX_CORE entries[64]; u64 guard; } output;
+    memset(&output, 0xa5, sizeof(output));
+    output.guard = UINT64_C(0x123456789abcdef0);
+    assert(length <= sizeof(output.entries));
+    u32 short_length = length - 1;
+    assert(!impl_GetLogicalProcessorInformationEx(3, output.entries, &short_length));
+    assert(g_last_error == 122 && short_length == length);
+    assert(((const u8 *)output.entries)[0] == 0xa5);
+    assert(impl_GetLogicalProcessorInformationEx(3, output.entries, &length));
+    u64 processors = 0;
+    u32 count = 0;
+    for (u32 offset = 0; offset < length; offset += sizeof(WIN_SLPI_EX_CORE)) {
+        const WIN_SLPI_EX_CORE *entry = (const void *)((const u8 *)output.entries + offset);
+        assert(entry->relationship == 3 && entry->size == sizeof(*entry));
+        assert(!entry->flags && !entry->efficiency_class);
+        assert(entry->group_count == 1 && !entry->group_mask[0].group);
+        assert(entry->group_mask[0].mask && !(processors & entry->group_mask[0].mask));
+        processors |= entry->group_mask[0].mask;
+        count += __builtin_popcountll(entry->group_mask[0].mask);
+    }
+    assert(count == win_processor_count() && processors == win_processor_mask());
+    assert(output.guard == UINT64_C(0x123456789abcdef0));
+    assert(!impl_GetLogicalProcessorInformationEx(3, output.entries, NULL) && g_last_error == 87);
+    length = sizeof(output.entries);
+    assert(!impl_GetLogicalProcessorInformationEx(0x1234, output.entries, &length) && g_last_error == 87);
+}
+static void optional_com_failure_contract_test(void)
+{
+    const u8 iid[16] = {0};
+    struct { u64 object, guard; } output = {UINT64_MAX, UINT64_C(0x123456789abcdef0)};
+    typedef u64 (__attribute__((ms_abi)) *FactoryFn)(u32, const void *, u64 *);
+    typedef u64 (__attribute__((ms_abi)) *StoreFn)(u64, const void *, u64 *);
+    FactoryFn factory = (FactoryFn)find_impl("DWriteCreateFactory");
+    StoreFn store = (StoreFn)find_impl("SHGetPropertyStoreForWindow");
+    assert(factory && store);
+    assert(factory(0, iid, &output.object) == 0x80004002u && !output.object);
+    output.object = UINT64_MAX;
+    assert(factory(1, iid, &output.object) == 0x80004002u && !output.object);
+    assert(factory(0, iid, NULL) == 0x80004003u);
+    output.object = UINT64_MAX;
+    assert(factory(2, iid, &output.object) == 0x80070057u && !output.object);
+    output.object = UINT64_MAX;
+    assert(factory(0, NULL, &output.object) == 0x80070057u && !output.object);
+    output.object = UINT64_MAX;
+    assert(store(0, iid, &output.object) == 0x80004002u && !output.object);
+    assert(store(0, iid, NULL) == 0x80004003u);
+    output.object = UINT64_MAX;
+    assert(store(0, NULL, &output.object) == 0x80070057u && !output.object);
+    assert(output.guard == UINT64_C(0x123456789abcdef0));
+}
 static int steam_auth_callback_calls;
 static void __attribute__((ms_abi)) steam_auth_test_callback(void *data)
 {
@@ -396,6 +495,28 @@ static u64 __attribute__((ms_abi)) callback_host_entry(void)
                                  0xfedcba9876543210ull, 0x1234567887654321ull,
                                  0xabcdef0123456789ull, UINT64_MAX);
 }
+static u64 __attribute__((ms_abi)) init_once_stack_probe(volatile u64 *once, void *arg, u64 *context)
+{
+    WinTEB *teb;
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb));
+    u64 local;
+    assert((u64)(uintptr_t)&local >= callback_test_low && (u64)(uintptr_t)&local < callback_test_high);
+    assert(teb->StackLimit == callback_test_low && teb->StackBase == callback_test_high);
+    assert(*once == 1 && (u64)(uintptr_t)arg == 0x1234567887654321ull);
+    *context = 0x8765432112345678ull;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi)) init_once_host_entry(void)
+{
+    volatile u64 once = 0;
+    u64 context = 0;
+    assert(impl_InitOnceExecuteOnce(&once, init_once_stack_probe,
+                                   (void *)(uintptr_t)0x1234567887654321ull, &context));
+    assert(impl_InitOnceExecuteOnce(&once, init_once_stack_probe, NULL, &context));
+    return context;
+}
+
 static void window_callback_stack_test(void)
 {
     u64 old_gs;
@@ -420,15 +541,37 @@ static void window_callback_stack_test(void)
     emit_impl_thunk(slot, (u64)(uintptr_t)callback_host_entry);
     callback_test_import = (u64)(uintptr_t)(g_tramp + slot * THUNK_SZ);
     u64 top = g_host_call_stack_top, saved = g_saved_guest_rsp;
-    assert(call_window_callback_on_stack((u64)(uintptr_t)callback_host_entry,
+    assert(call_guest_callback_on_stack((u64)(uintptr_t)callback_host_entry,
                                         0, 0, 0, 0, 0, 0, top - 256) == 0x8765432112345678ull);
     assert(callback_test_visits == 2 && g_host_call_stack_top == top && g_saved_guest_rsp == saved);
+    assert(call_guest_callback_on_stack((u64)(uintptr_t)init_once_host_entry,
+                                       0, 0, 0, 0, 0, 0, top - 256) == 0x8765432112345678ull);
+    assert(g_host_call_stack_top == top && g_saved_guest_rsp == saved);
     assert(teb.StackLimit == g_host_call_stack_base && teb.StackBase == top + 256);
     assert(!syscall(SYS_arch_prctl, ARCH_SET_GS, old_gs));
     g_host_call_stack_base = g_host_call_stack_top = g_host_call_stack_real_top = 0;
     g_saved_guest_rsp = g_teb_guest_stack_limit = g_teb_guest_stack_base = 0;
     munmap(guest, HOST_CALL_STACK_SIZE);
     munmap(host, HOST_CALL_STACK_SIZE);
+}
+
+static void worker_stack_reservation_test(void)
+{
+    WinThread t = {0};
+    assert(!thread_reserve_stack(&t) && t.stack && t.guest_stack_own);
+    u8 *base = t.stack, *top = base + t.stack_size;
+    BeerMemoryBasicInformation info;
+    assert(beer_virtual_query(base, &info, sizeof(info)) && info.state == BEER_MEM_COMMIT &&
+        info.protect == BEER_PAGE_NOACCESS && info.region_size == 0x1000);
+    assert(beer_virtual_query(base + 0x1000, &info, sizeof(info)) && info.state == BEER_MEM_RESERVE &&
+        info.allocation_base == (u64)(uintptr_t)base && info.region_size == 0x10000);
+    assert(beer_virtual_query(base + 0x11000, &info, sizeof(info)) && info.state == BEER_MEM_COMMIT &&
+        info.allocation_base == (u64)(uintptr_t)base && info.protect == BEER_PAGE_READWRITE &&
+        info.base_address + info.region_size == (u64)(uintptr_t)top);
+    assert(beer_virtual_query(top, &info, sizeof(info)) && info.allocation_base != (u64)(uintptr_t)base);
+    thread_release_stack(&t);
+    assert(!t.stack && !t.stack_size && !t.guest_stack_own);
+    assert(beer_virtual_query(base, &info, sizeof(info)) && info.state == BEER_MEM_FREE);
 }
 
 static unsigned subclass_test_calls;
@@ -465,6 +608,46 @@ static void subclass_contract_test(void)
     assert(call_window_proc(hw, 0x82, 3, 4) == 0xfedcba9876543210ull);
     assert(subclass_test_calls == 4 && !g_subclass_windows);
     beer_window_free(hw);
+}
+
+static const u16 property_key[] = {'s', 't', 'a', 't', 'e', 0};
+
+static u64 __attribute__((ms_abi)) property_message_probe(u64 hw, u32 msg, u64 wp, u64 lp)
+{
+    assert(msg == 0x8043 && !wp && !lp);
+    return impl_GetPropW(hw, property_key);
+}
+
+static void window_property_contract_test(void)
+{
+    BeerWindow *first = beer_window_new(), *second = beer_window_new();
+    assert(first && second && !g_native_hwnd);
+    u64 a = first->hwnd, b = second->hwnd;
+    g_native_hwnd = a;
+    first->proc = (u64)(uintptr_t)property_message_probe;
+    first->owner_tid = (u32)current_windows_thread_id();
+    const u64 value = 0x123456789abcdef0ull;
+    assert(impl_SetPropW(a, property_key, value));
+    g_native_hwnd = b;  /* Another window takes the native surface. */
+    assert(!impl_GetPropA(b, "state"));
+    assert(impl_SetPropA(b, "state", 17));
+    assert(impl_PostMessageW(a, 0x8043, 0, 0));
+    WIN_MSG message;
+    assert(take_window_message(&message, 0x8043, 0x8043, 1));
+    assert(message.hwnd == a && impl_DispatchMessageW(&message) == value);
+    assert(impl_SetPropA(a, "state", value + 1));
+    assert(impl_RemovePropW(a, property_key) == value + 1);
+    assert(!impl_GetPropW(a, property_key) && impl_GetPropW(b, property_key) == 17);
+
+    /* Destroy a window with a full table without individually removing its properties. */
+    for (u16 i = 1; i < WINDOW_PROPERTY_CAPACITY; ++i)
+        assert(impl_SetPropW(a, (const u16 *)(uintptr_t)i, i));
+    assert(!impl_SetPropA(b, "overflow", 1) && g_last_error == 8);
+    beer_window_free(a);
+    assert(!impl_GetPropW(a, (const u16 *)(uintptr_t)1) && g_last_error == 1400);
+    assert(impl_SetPropA(b, "overflow", 1) && impl_GetPropW(b, property_key) == 17);
+    beer_window_free(b);
+    g_native_hwnd = 0;
 }
 
 static unsigned notify_calls;
@@ -615,6 +798,129 @@ static void legacy_dns_contract_test(void)
         assert(!impl_WSACleanup());
         free(g_win_hostent_storage);
         g_win_hostent_storage = NULL;
+}
+
+static void toolbar_imagelist_contract_test(void)
+{
+    const u64 hwnd = 0x123456;
+    assert(window_system_class_proc((u64)(uintptr_t)u"ToolbarWindow32") ==
+           (u64)(uintptr_t)beer_ctl_toolbar_proc);
+    assert(find_impl("ImageList_GetIcon") == (ImplFn)beer_ImageList_GetIcon);
+    assert(!beer_ctl_toolbar_proc(hwnd, 0x431, 0, 0));
+    assert(beer_ctl_toolbar_proc(hwnd, 0x432, 5, (u64)-1) == (u64)-1);
+    assert(!beer_ctl_toolbar_proc(hwnd, 0x432, 4, (u64)-1));
+    u64 list = beer_ctl_toolbar_proc(hwnd, 0x431, 0, 0);
+    assert(list && beer_ImageList_GetImageCount(list) == 13);
+    assert(!beer_ctl_toolbar_proc(hwnd, 0x432, 4, (u64)-1));
+    assert(beer_ctl_toolbar_proc(hwnd, 0x431, 0, 0) == list);
+    assert(!beer_ImageList_GetIcon(list, -1, 1) && !beer_ImageList_GetIcon(list, 13, 1));
+    u64 icon = beer_ImageList_GetIcon(list, 12, 1);
+    assert(icon && beer_ImageList_Destroy(list));
+    assert(!beer_ctl_toolbar_proc(hwnd, 0x431, 0, 0));
+    assert(!beer_ImageList_GetIcon(list, 12, 1));
+    assert(!beer_ctl_toolbar_proc(hwnd, 0x432, 4, (u64)-1));
+    u64 replacement = beer_ctl_toolbar_proc(hwnd, 0x431, 0, 0);
+    assert(replacement && replacement != list);
+    beer_ctl_destroy(hwnd);
+    assert(!beer_ImageList_GetImageCount(replacement));
+    assert(beer_DestroyIcon(icon));
+}
+
+static void gdi_icon_contract_test(void)
+{
+    struct IconInfo { u32 icon, x, y, padding; u64 mask, color; } input = {1}, out;
+    _Static_assert(sizeof(input) == 32, "ICONINFO64");
+    assert(find_impl("GetIconInfo") == (ImplFn)beer_GetIconInfo);
+    assert(find_impl("CreateIconIndirect") == (ImplFn)beer_CreateIconIndirect);
+    assert(find_impl("DestroyIcon") == (ImplFn)beer_DestroyIcon);
+    const u8 mask_pixels[4] = {0x80, 0, 0x40, 0}; /* WORD-aligned 2x2 monochrome rows. */
+    const u32 color_pixels[4] = {0x80112233, 0xff445566, 0xff778899, 0xffaabbcc};
+    input.mask = beer_CreateBitmap(2, 2, 1, 1, mask_pixels);
+    input.color = beer_CreateBitmap(2, 2, 1, 32, color_pixels);
+    assert(input.mask && input.color);
+    assert(!beer_CreateBitmap(2, 2, 2, 1, mask_pixels));
+    u64 icon = beer_CreateIconIndirect(&input);
+    assert(icon && !beer_DeleteObject(icon) && !beer_GetObjectType(icon));
+    assert(beer_DeleteObject(input.mask) && beer_DeleteObject(input.color));
+    struct { struct IconInfo info; u64 guard; } result = {.guard = UINT64_C(0x123456789abcdef0)};
+    assert(beer_GetIconInfo(icon, &result.info));
+    assert(result.guard == UINT64_C(0x123456789abcdef0));
+    out = result.info;
+    assert(out.icon == 1 && out.x == 1 && out.y == 1 && out.mask && out.color);
+    assert(beer_GetIconInfo(icon, &result.info));
+    assert(out.mask != result.info.mask && out.color != result.info.color);
+    assert(beer_DeleteObject(result.info.mask) && beer_DeleteObject(result.info.color));
+    assert(beer_DestroyIcon(icon)); /* Returned bitmaps survive the icon. */
+    assert(!beer_DestroyIcon(icon) && !beer_GetIconInfo(icon, &result.info));
+    u64 dc = beer_CreateCompatibleDC(0);
+    u32 info[10] = {40, 2, (u32)-2, 1u | (32u << 16)}, pixels[4];
+    assert(beer_GetDIBits(dc, out.color, 0, 2, pixels, info, 0) == 2);
+    assert(!memcmp(pixels, color_pixels, sizeof(pixels)));
+    assert(beer_GetDIBits(dc, out.mask, 0, 2, pixels, info, 0) == 2);
+        assert(pixels[0] == 0x00ffffff && pixels[1] == 0 &&
+            pixels[2] == 0 && pixels[3] == 0x00ffffff); /* Mask RGB, not fabricated alpha. */
+    assert(beer_DeleteObject(out.mask) && beer_DeleteObject(out.color));
+    input = (struct IconInfo){0, 7, 9, 0, beer_CreateBitmap(2, 2, 1, 1, mask_pixels), 0};
+    icon = beer_CreateIconIndirect(&input); /* Monochrome cursor: stacked AND/XOR rows. */
+    assert(icon && beer_GetIconInfo(icon, &out));
+    assert(!out.icon && out.x == 7 && out.y == 9 && !out.color);
+    assert(beer_DeleteObject(out.mask) && beer_DestroyIcon(icon));
+    assert(beer_DeleteObject(input.mask));
+    memset(&out, 0xa5, sizeof(out));
+    assert(!beer_GetIconInfo(dc, &out) && out.icon == 0xa5a5a5a5);
+    assert(!beer_CreateIconIndirect(NULL) && !beer_GetIconInfo(dc, NULL));
+    assert(!beer_DestroyIcon(dc) && beer_DeleteDC(dc));
+}
+
+static void gdi_readback_contract_test(void)
+{
+    assert(find_impl("GetDIBits") == (ImplFn)beer_GetDIBits);
+    u64 dc = beer_CreateCompatibleDC(0);
+    assert(dc);
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        int source_bpp = mode & 1 ? 24 : 32;
+        int source_topdown = mode & 2;
+        u32 source[10] = {40, 3, source_topdown ? (u32)-2 : 2,
+                          1u | ((u32)source_bpp << 16)};
+        void *storage = NULL;
+        u64 bitmap = beer_CreateDIBSection(0, source, 0, &storage, 0, 0);
+        assert(bitmap && storage);
+        u64 previous = beer_SelectObject(dc, bitmap);
+        beer_SetPixel(dc, 0, 0, 0x112233);
+        beer_SetPixel(dc, 0, 1, 0x445566);
+        beer_SelectObject(dc, previous); /* GetDIBits requires a deselected bitmap. */
+        u32 query[10] = {40};
+        assert(beer_GetDIBits(dc, bitmap, 0, 0, NULL, query, 0) == 2);
+        assert(query[1] == 3 && query[2] == 2 && query[3] == (1u | ((u32)source_bpp << 16)));
+        assert(query[5] == 24);
+        for (unsigned output = 0; output < 4; ++output) {
+            int bpp = output & 1 ? 24 : 32, topdown = output & 2;
+            u32 info[10] = {40, 3, topdown ? (u32)-2 : 2, 1u | ((u32)bpp << 16)};
+            u8 pixels[32];
+            memset(pixels, 0xa5, sizeof(pixels));
+            assert(beer_GetDIBits(dc, bitmap, 0, 99, pixels, info, 0) == 2);
+            assert(pixels[0] == (topdown ? 0x11 : 0x44));
+            assert(pixels[1] == (topdown ? 0x22 : 0x55));
+            assert(pixels[2] == (topdown ? 0x33 : 0x66));
+            assert(pixels[12] == (topdown ? 0x44 : 0x11));
+            if (bpp == 24) assert(!pixels[9] && !pixels[10] && !pixels[11]);
+            if (bpp == 32) assert(pixels[3] == 255); /* SetPixel writes opaque pixels. */
+            for (unsigned i = 24; i < sizeof(pixels); ++i) assert(pixels[i] == 0xa5);
+            memset(pixels, 0xa5, sizeof(pixels));
+            assert(beer_GetDIBits(dc, bitmap, 1, 2, pixels, info, 0) == 1);
+            assert(pixels[0] == (topdown ? 0x44 : 0x11));
+            assert(pixels[12] == 0xa5);
+            assert(!beer_GetDIBits(dc, bitmap, 2, 1, pixels, info, 0));
+            assert(!beer_GetDIBits(dc, bitmap, 0, 1, pixels, info, 1));
+            info[1] = 4;
+            assert(!beer_GetDIBits(dc, bitmap, 0, 1, pixels, info, 0));
+            info[1] = 3; info[4] = 3;
+            assert(!beer_GetDIBits(dc, bitmap, 0, 1, pixels, info, 0));
+        }
+        assert(beer_DeleteObject(bitmap));
+        assert(!beer_GetDIBits(dc, bitmap, 0, 1, NULL, query, 0));
+    }
+    assert(beer_DeleteDC(dc));
 }
 
 static void wow32_dib_contract_test(void)
@@ -1325,8 +1631,185 @@ static void async_file_read_contract_test(void)
     puts("asynchronous OVERLAPPED file reads: PASS");
 }
 
+static void alpc_attribute_contract_test(void)
+{
+    assert(impl_GetProcAddress(HMOD_NTDLL, "AlpcGetHeaderSize"));
+    assert(impl_GetProcAddress(HMOD_NTDLL, "AlpcInitializeMessageAttribute"));
+    assert(impl_GetProcAddress(HMOD_NTDLL, "AlpcGetMessageAttribute"));
+    const u32 flags = 0xfe000000u;
+    const u32 offsets[] = {8, 32, 64, 96, 120, 144, 152};
+    struct { BeerAlpcAttributes header; u8 body[152]; u64 guard; } b;
+    memset(&b, 0xa5, sizeof(b));
+    struct { u64 needed, guard; } size = {0, 0x12345678};
+    assert(impl_AlpcGetHeaderSize(0) == 8);
+    assert(impl_AlpcInitializeMessageAttribute(flags, NULL, 0, &size.needed) == 0xc0000023u);
+    assert(size.needed == 160 && size.guard == 0x12345678);
+    assert(impl_AlpcInitializeMessageAttribute(flags, &b.header, 159, &size.needed) == 0xc0000023u);
+    assert(b.header.allocated == 0xa5a5a5a5);
+    assert(!impl_AlpcInitializeMessageAttribute(flags, &b.header, 160, &size.needed));
+    assert(b.header.allocated == flags && !b.header.valid && b.guard == 0xa5a5a5a5a5a5a5a5ULL);
+    for (unsigned i = 0; i < 7; ++i)
+        assert(impl_AlpcGetMessageAttribute(&b.header, 0x80000000u >> i) ==
+               (u64)(uintptr_t)&b + offsets[i]);
+    for (size_t i = 0; i < sizeof(b.body); ++i) assert(b.body[i] == 0xa5);
+    assert(!impl_AlpcGetMessageAttribute(&b.header, 0xc0000000u));
+    assert(!impl_AlpcGetMessageAttribute(&b.header, 0));
+    assert(!impl_AlpcInitializeMessageAttribute(0x92000000u, &b.header, 160, &size.needed));
+    assert(size.needed == 64);
+    assert(impl_AlpcGetMessageAttribute(&b.header, 0x02000000u) == (u64)(uintptr_t)&b + 56);
+    assert(!impl_AlpcGetMessageAttribute(&b.header, 0x40000000u));
+}
+
+static void service_manager_contract_test(void)
+{
+    assert(find_impl("OpenSCManagerW") == (ImplFn)impl_OpenSCManagerW);
+    assert(dll_name_to_handle_in("api-ms-win-service-management-l1-1-0.dll", 1, 0) == HMOD_ADVAPI);
+    assert(impl_GetProcAddress(HMOD_ADVAPI, "OpenSCManagerW"));
+    assert(!impl_OpenSCManagerW(u"remote", NULL, 1) && g_last_error == 1722);
+    assert(!impl_OpenSCManagerA(NULL, "bogus", 1) && g_last_error == 1065);
+    assert(!impl_OpenSCManagerW(NULL, NULL, 2) && g_last_error == 5);
+    u64 connection = impl_OpenSCManagerW(NULL, NULL, 4);
+    assert(connection && !impl_OpenServiceW(connection, u"Uninstalled", 1) && g_last_error == 1060);
+    u32 needed = 123, returned = 123, resume = 123;
+    assert(impl_EnumServicesStatusW(connection, 0x30, 3, NULL, 0, &needed, &returned, &resume));
+    assert(!needed && !returned && !resume);
+    assert(impl_CloseServiceHandle(connection));
+    assert(!impl_CloseServiceHandle(connection) && g_last_error == 6);
+    u64 next = impl_OpenSCManagerA(".", "ServicesActive", 0);
+    assert(next && next != connection);
+    assert(!impl_OpenServiceA(connection, "Uninstalled", 1) && g_last_error == 6);
+    assert(!impl_EnumServicesStatusW(next, 0x30, 3, NULL, 0, &needed, &returned, NULL) && g_last_error == 5);
+    assert(impl_CloseServiceHandle(next));
+}
+
+static void delay_load_contract_test(void)
+{
+    assert(find_impl("ResolveDelayLoadedAPI") == (ImplFn)impl_ResolveDelayLoadedAPI);
+    u8 *image = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(image != MAP_FAILED);
+    u8 *saved = g_img;
+    u64 saved_size = g_img_size, base = (u64)(uintptr_t)image;
+    g_img = image;
+    g_img_size = 8192;
+    BeerDelayDescriptor *d = (void *)(image + 0x100);
+    *d = (BeerDelayDescriptor){.attributes = 1, .name = 0x200, .module = 0x240,
+                                .iat = 0x1040, .names = 0x280};
+    strcpy((char *)image + 0x200, "kernel32.dll");
+    strcpy((char *)image + 0x302, "GetWindowsDirectoryW");
+    u64 *names = (void *)(image + d->names), *iat = (void *)(image + d->iat);
+    names[0] = 0x300;
+    iat[0] = 0x1234;
+    assert(!mprotect(image + 4096, 4096, PROT_READ));
+    assert(!impl_ResolveDelayLoadedAPI(base, base + 0x100, 0, 0, base + d->iat, 0));
+    assert(g_last_error == 87 && iat[0] == 0x1234);
+    assert(!mprotect(image + 4096, 4096, PROT_READ | PROT_WRITE));
+    assert(!impl_ResolveDelayLoadedAPI(base, base + 0x100, 0, 0, base + d->iat + 8, 0));
+    assert(!impl_ResolveDelayLoadedAPI(base, base + 8190, 0, 0, base + d->iat, 0));
+    u64 proc = impl_ResolveDelayLoadedAPI(base, base + 0x100, 0, 0, base + d->iat, 0);
+    assert(proc && iat[0] == proc && *(u64 *)(image + d->module) == HMOD_K32);
+    strcpy((char *)image + 0x302, "BeerAbsentDelayExport");
+    assert(!impl_ResolveDelayLoadedAPI(base, base + 0x100, 0, 0, base + d->iat, 0));
+    assert(g_last_error == 127 && iat[0] == proc);
+    g_img = saved;
+    g_img_size = saved_size;
+    assert(!munmap(image, 8192));
+}
+
+static void well_known_sid_contract_test(void)
+{
+    assert(find_impl("CreateWellKnownSid") == (ImplFn)impl_CreateWellKnownSid);
+    const u8 service[] = {1,1,0,0,0,0,0,5,19,0,0,0};
+    const u8 admins[] = {1,2,0,0,0,0,0,5,32,0,0,0,0x20,2,0,0};
+    u32 n = 0;
+    u8 out[20];
+    memset(out, 0xa5, sizeof(out));
+    assert(!impl_CreateWellKnownSid(23, NULL, NULL, &n) && n == 12 && g_last_error == 122);
+    assert(!impl_CreateWellKnownSid(26, NULL, out, &n) && n == 16 && g_last_error == 122);
+    for (size_t i = 0; i < sizeof(out); ++i) assert(out[i] == 0xa5);
+    assert(!impl_CreateWellKnownSid(26, NULL, NULL, &n) && n == 16 && g_last_error == 87);
+    assert(impl_CreateWellKnownSid(26, NULL, out, &n) && n == 16);
+    assert(!memcmp(out, admins, sizeof(admins)) && out[16] == 0xa5);
+    assert(impl_CreateWellKnownSid(23, NULL, out, &n) && n == 12);
+    assert(!memcmp(out, service, sizeof(service)));
+    assert(impl_CreateWellKnownSid(7, NULL, out, &n) && n == 8 && out[1] == 0 && out[7] == 5);
+    assert(!impl_CreateWellKnownSid(21, NULL, out, &n) && n == 8 && g_last_error == 87);
+    assert(!impl_CreateWellKnownSid(23, out + 1, out, &n) && g_last_error == 87);
+}
+
+static void system_windows_directory_contract_test(void)
+{
+    u64 (__attribute__((ms_abi)) *wide)(u16 *, u32) =
+        (void *)find_impl("GetSystemWindowsDirectoryW");
+    u64 (__attribute__((ms_abi)) *ansi)(char *, u32) =
+        (void *)find_impl("GetSystemWindowsDirectoryA");
+    assert(wide && ansi);
+    u16 w[32] = {0x1234};
+    char a[32] = {'!'};
+    const u32 n = strlen(g_windows_dir);
+    assert(wide(w, n) == n + 1 && w[0] == 0x1234);
+    assert(ansi(a, n) == n + 1 && a[0] == '!');
+    assert(wide(NULL, 0) == n + 1 && ansi(NULL, 0) == n + 1);
+    assert(wide(w, n + 1) == n && ansi(a, n + 1) == n);
+    assert(!strcmp(a, g_windows_dir));
+    for (u32 i = 0; i <= n; ++i) assert(w[i] == (u8)a[i]);
+}
+
+static u64 veh_guest_region_low, veh_guest_region_high, veh_guest_fault_rsp;
+static int veh_guest_calls, veh_guest_boundary_ok;
+
+static int32_t __attribute__((ms_abi)) veh_guest_stack_probe(void *exception_pointers)
+{
+    const BeerExceptionPointers64 *pointers = exception_pointers;
+    volatile u8 here;
+    ++veh_guest_calls;
+    /* The handler runs on the guest stack below the fault, not on the (host) signal stack. */
+    assert((u64)(uintptr_t)&here >= veh_guest_region_low && (u64)(uintptr_t)&here < veh_guest_fault_rsp - 0x1000);
+    /* A nested exception raised from here must be able to unwind through this call to the fault context. */
+    assert(t_veh_fault_ctx == pointers->context);
+    u8 walk[0x4d0] __attribute__((aligned(16)));
+    memset(walk, 0, sizeof(walk));
+    veh_guest_boundary_ok = beer_veh_boundary_resolver((u64)(uintptr_t)beer_veh_handler_return, walk) &&
+                            *(u64 *)(walk + 0xf8) == pointers->record->address &&
+                            *(u64 *)(walk + 0x98) == veh_guest_fault_rsp &&
+                            !beer_veh_boundary_resolver((u64)(uintptr_t)beer_veh_handler_return + 1, walk);
+    *(u64 *)((u8 *)pointers->context + 0xf8) += 3;
+    return BEER_EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void veh_guest_stack_contract_test(void)
+{
+    const size_t size = 1u << 20;
+    u8 *region = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(region != MAP_FAILED);
+    veh_guest_region_low = (u64)(uintptr_t)region;
+    veh_guest_region_high = veh_guest_region_low + size;
+    veh_guest_fault_rsp = veh_guest_region_high - 0x100;
+    const u64 saved_low = g_guest_stack_low, saved_high = g_guest_stack_high;
+    g_guest_stack_low = veh_guest_region_low;
+    g_guest_stack_high = veh_guest_region_high;
+
+    beer_veh_reset();
+    assert(beer_veh_add(1, veh_guest_stack_probe));
+    ucontext_t uc;
+    memset(&uc, 0, sizeof(uc));
+    siginfo_t si;
+    memset(&si, 0, sizeof(si));
+    uc.uc_mcontext.gregs[REG_RIP] = 0x1000;
+    uc.uc_mcontext.gregs[REG_RSP] = (greg_t)veh_guest_fault_rsp;
+    assert(beer_dispatch_signal_to_veh(SIGFPE, &si, &uc));
+    assert(veh_guest_calls == 1 && veh_guest_boundary_ok);
+    assert(uc.uc_mcontext.gregs[REG_RIP] == 0x1003);
+    assert(!t_veh_fault_ctx && !g_delivering_vectored_exception);
+
+    beer_veh_reset();
+    g_guest_stack_low = saved_low;
+    g_guest_stack_high = saved_high;
+    munmap(region, size);
+}
+
 int main(void)
 {
+    veh_guest_stack_contract_test();
     async_file_read_contract_test();
     steam_auth_callback_contract_test();
     typedef u64 (__attribute__((ms_abi)) *SetConsoleAttributes)(u64, u16);
@@ -1564,7 +2047,12 @@ int main(void)
     g_tramp = mmap(NULL, (size_t)MAX_STUBS * THUNK_SZ, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(g_tramp != MAP_FAILED);
+    conversion_invalid_parameter_contract_test();
+    section_commit_contract_test();
+    processor_package_contract_test();
+    optional_com_failure_contract_test();
     window_callback_stack_test();
+    worker_stack_reservation_test();
     /* The real loader constructor already maps these headers before main. */
     for (size_t i = 0; i < sizeof(g_fake_pe_modules) / sizeof(*g_fake_pe_modules); ++i)
         assert(*(const u16 *)(uintptr_t)g_fake_pe_modules[i].base == MZ_MAGIC);
@@ -1573,6 +2061,32 @@ int main(void)
     g_snames[g_nstubs++] = strdup("shell32.dll!CommandLineToArgvW");
     fake_pe_exports_build();
     assert(g_fake_pe_ready);
+    /* A guest DLL export reserves an import label without emitting a thunk.
+     * Resolving the builtin with the same name must not return that empty slot. */
+    int guest_export_slot = g_nstubs++;
+    g_snames[guest_export_slot] = strdup("WINMM.dll!timeGetDevCaps");
+    assert(!g_impl_real[guest_export_slot]);
+    assert(!g_tramp[guest_export_slot * THUNK_SZ]);
+    u64 winmm = dll_name_to_handle_in("winmm.dll", 1, 1);
+    assert(winmm);
+    u64 timer_caps = impl_GetProcAddress(winmm, "timeGetDevCaps");
+    assert(timer_caps && timer_caps != (u64)(g_tramp + guest_export_slot * THUNK_SZ));
+    assert(timer_caps >= (u64)g_tramp && timer_caps < (u64)(g_tramp + g_nstubs * THUNK_SZ));
+    assert(g_impl_real[(timer_caps - (u64)g_tramp) / THUNK_SZ] == (u64)beer_timeGetDevCaps);
+    assert(impl_GetProcAddress(winmm, "timeGetDevCaps") == timer_caps);
+    /* Legacy Winsock uses the same standard ordinal ABI as WS2_32. */
+    assert(beer_is_winsock_module("WSOCK32.dll"));
+    assert(beer_is_winsock_module("ws2_32.dll"));
+    assert(!beer_is_winsock_module("other.dll"));
+    u64 legacy_winsock = dll_name_to_handle("wsock32.dll", 1);
+    assert(legacy_winsock);
+    const u16 socket_ordinals[] = {4, 23, 115, 116};
+    for (size_t i = 0; i < sizeof(socket_ordinals) / sizeof(*socket_ordinals); ++i) {
+        u64 address = impl_GetProcAddress(legacy_winsock, (const char *)(uintptr_t)socket_ordinals[i]);
+        assert(address >= (u64)g_tramp && address < (u64)(g_tramp + g_nstubs * THUNK_SZ));
+        assert(g_impl_real[(address - (u64)g_tramp) / THUNK_SZ] == (u64)winsock_ordinal_impl(socket_ordinals[i]));
+    }
+    assert(!impl_GetProcAddress(legacy_winsock, (const char *)(uintptr_t)65535));
     u64 comctl = dll_name_to_handle("comctl32.dll", 1);
     assert(comctl);
     const char *subclass_exports[] = { "SetWindowSubclass", "GetWindowSubclass",
@@ -1621,6 +2135,15 @@ int main(void)
     wow32_static_tls_contract_test();
     wow32_controls_contract_test();
     wow32_sid_contract_test();
+    alpc_attribute_contract_test();
+    service_manager_contract_test();
+    delay_load_contract_test();
+    well_known_sid_contract_test();
+    system_windows_directory_contract_test();
+    toolbar_imagelist_contract_test();
+    window_property_contract_test();
+    gdi_icon_contract_test();
+    gdi_readback_contract_test();
     wow32_dib_contract_test();
     process_security_contract_test();
     wow32_named_resource_contract_test();

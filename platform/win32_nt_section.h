@@ -22,6 +22,11 @@ uint32_t beer_nt_section_map(uint64_t handle, void **base_address,
                              size_t *view_size, uint32_t inherit_disposition,
                              uint32_t allocation_type, uint32_t protection);
 uint32_t beer_nt_section_unmap(void *base_address);
+/* Recommit pages of an existing, eagerly mapped non-image section without
+ * replacing its shared backing. Returns 1 on success, -1 on a recognized view
+ * with invalid bounds/protection, or 0 if the address is not a section view.
+ * This does not implement SEC_RESERVE per-page commitment accounting. */
+int beer_nt_section_commit(void *address, size_t size, uint32_t protection);
 int beer_nt_section_is_image(uint64_t handle);
 int beer_nt_section_close(uint64_t handle);
 void beer_nt_section_reset(void);

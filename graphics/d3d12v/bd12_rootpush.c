@@ -71,7 +71,8 @@ static void build_layout(BD12RootSignature *rs)
     /* Storage-buffer mode: raw/structured heap views are SSBOs with set-3 offsets and counter addresses. */
     /* 3 = the SSBO policy (every raw/structured heap view an SSBO with set-3 offsets), part of the hash. */
     layout->ssbo_heap = layout->heap_model == BEER_HEAP_MODEL_MUTABLE &&
-                        bd12_db_ssbo(rs->device, &layout->ssbo_alignment) ? 3u : 0u;
+                        bd12_db_ssbo(rs->device, &layout->ssbo_alignment) ?
+                        (bd12_db_split_raw(rs->device) ? 4u : 3u) : 0u;   /* 4: SSBOs in their own array, set 4 */
     {
         /* accel_in_heap joins the hash only when set, so layouts without it keep their hash (and the on-disk
          * translations made before it existed). */
@@ -276,19 +277,111 @@ static void rp_print_meta(const BD12DescriptorHeap *heap, uint32_t index)
 /* + the SM 6.6 heap record: ResourceDescriptorHeap[root constant word 2] at byte offset root constant word 0 (the
  * pattern of GoT's hanging cloth solver 524c7c2e7e8bd58d, whose loop count is read from that record). */
 #define SNAP_CHAIN_BYTES 512   /* the constraint buffer: heap[record[header + 116]] (GPU-only in GoT) */
-#define SNAP_ENTRY (16 + SNAP_ROOTS * SNAP_BYTES + SNAP_HEAP_BYTES + SNAP_CHAIN_BYTES)
+/* + every heap view the solver's header names (header + 4 + 16*k, k < SNAP_HDR): its first bytes at dispatch time,
+ * with the Vulkan descriptor bytes and SSBO metadata the GPU reads for that slot (recorded on the CPU: they are host
+ * memory, read by the GPU when it runs). */
+#define SNAP_HDR 12
+#define SNAP_HDR_BYTES 256
+#define SNAP_HDR_BASE (16 + SNAP_ROOTS * SNAP_BYTES + SNAP_HEAP_BYTES + SNAP_CHAIN_BYTES)
+#define SNAP_ENTRY (SNAP_HDR_BASE + SNAP_HDR * SNAP_HDR_BYTES)
 static BD12Buffer *g_snap;
 static uint32_t g_snap_next;
 static struct { uint32_t seq, x, y, z; uint64_t va[SNAP_ROOTS]; uint32_t param[SNAP_ROOTS];
                 uint32_t rc[4], heap_slot; uint64_t heap_va; int heap_ok;
                 const BD12DescriptorHeap *heap; const BD12Buffer *buffer; VkDeviceSize at;
-                uint32_t chain_slot; uint64_t chain_size; int chain_ok; } g_snap_meta[SNAP_RING];
+                uint32_t chain_slot; uint64_t chain_size; int chain_ok;
+                uint32_t hdr_offset, hdr_slot[SNAP_HDR]; int hdr_ok[SNAP_HDR], hdr_kind[SNAP_HDR];
+                uint32_t hdr_flags[SNAP_HDR]; uint64_t hdr_view[SNAP_HDR][3];   /* offset, range, buffer size */
+                uint8_t hdr_payload[SNAP_HDR][32], hdr_metab[SNAP_HDR][16]; } g_snap_meta[SNAP_RING];
 
 static int snap_on(void)
 {
     static int on = -1;
     if (on < 0) on = getenv("BEER_BD12_SNAP_CS") != NULL;
     return on;
+}
+
+static const BD12DescriptorHeap *g_rec_last_heap;
+static uint32_t g_rec_last_rc[4];
+static uint64_t g_rec_last_hash;
+static void rec_print(const BD12DescriptorHeap *heap, const uint32_t rc[4], uint64_t shader_hash, uint32_t x, uint32_t y,
+                      uint32_t z);
+/* BEER_BD12_REC_CS=<hash> (diagnostic): for the first dispatches of that compute shader, reads its SM 6.6 heap record
+ * (ResourceDescriptorHeap[root constant word 2] at byte offset root constant word 0; GoT's pattern) on the CPU and
+ * prints, for every record word that is a heap index, the descriptor kind behind it. Shows descriptor-type
+ * mismatches between what the shader declares at an offset and what the slot holds. */
+void bd12_rp_rec_dump(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash, uint32_t x, uint32_t y,
+                      uint32_t z)
+{
+    static uint64_t want = 1;
+    static int printed;
+    if (want == 1) { const char *v = getenv("BEER_BD12_REC_CS"); want = v ? strtoull(v, NULL, 16) : 0; }
+    if (!want || shader_hash != want || !state->root_signature || !state->root_signature->root_layout) return;
+    const BeerD3D12RootLayout *layout = state->root_signature->root_layout;
+    const BD12DescriptorHeap *heap = list->heaps[0];
+    if (!heap) return;
+    /* The shader's push block exactly as recorded (root descriptor addresses first, then table indices and
+     * constants at their push_index): `registers._m0.._m3` in its translation are its first four words. */
+    uint32_t rc[4] = {0};
+    {
+        uint8_t push[256] = {0};
+        const uint32_t bytes = state->root_signature->root_push_bytes;
+        if (bytes && bytes <= sizeof(push)) {
+            build_push(list, state, push, bytes);
+            memcpy(rc, push, bytes < 16 ? bytes : 16);
+        }
+    }
+    {
+        static const BeerD3D12RootLayout *shown;
+        if (shown != layout) {
+            shown = layout;
+            fprintf(stderr, "[REC] layout: %u params, %u root descriptors, push %u bytes\n", layout->param_count,
+                    layout->descriptor_count, state->root_signature->root_push_bytes);
+            for (uint32_t i = 0; i < layout->param_count; ++i)
+                fprintf(stderr, "[REC]   param %u type %u reg %u space %u push %u ranges %u\n", i, layout->params[i].type,
+                        layout->params[i].shader_register, layout->params[i].space, layout->params[i].push_index,
+                        layout->params[i].range_count);
+        }
+    }
+    pthread_mutex_lock(&g_rp_trace_lock);
+    g_rec_last_heap = heap;   /* bd12_rp_snap_dump reads the record again at hang time (the game fills it per frame) */
+    memcpy(g_rec_last_rc, rc, sizeof(rc));
+    g_rec_last_hash = shader_hash;
+    if (printed >= 6 || (!x && !y && !z && printed >= 1)) { pthread_mutex_unlock(&g_rp_trace_lock); return; }
+    ++printed;
+    rec_print(heap, rc, shader_hash, x, y, z);
+    pthread_mutex_unlock(&g_rp_trace_lock);
+}
+
+static void rec_print(const BD12DescriptorHeap *heap, const uint32_t rc[4], uint64_t shader_hash, uint32_t x, uint32_t y,
+                      uint32_t z)
+{
+    fprintf(stderr, "[REC] cs=%016llx groups=%u,%u,%u rc=%08x %08x %08x %08x\n", (unsigned long long)shader_hash, x, y, z,
+            rc[0], rc[1], rc[2], rc[3]);
+    if (rc[2] >= heap->count) { fprintf(stderr, "[REC]   record slot %u out of heap\n", rc[2]); return; }
+    const BD12Descriptor *rd = &heap->descriptors[rc[2]];
+    const BD12Buffer *rb = rd->source_buffer;
+    fprintf(stderr, "[REC]   record slot %u: kind %u flags %u off %llu range %llu %s\n", rc[2], rd->kind, rd->flags,
+            (unsigned long long)rd->offset, (unsigned long long)rd->range, rb && rb->cpu ? "CPU-visible" : "GPU-only");
+    if (!rb || !rb->cpu) return;
+    for (uint32_t off = 0; off < 512; off += 4) {
+        const VkDeviceSize at = rd->offset + rc[0] + off;
+        if (at + 4 > rb->size) break;
+        uint32_t v;
+        memcpy(&v, (const uint8_t *)rb->cpu + at, 4);
+        if (!v || v >= heap->count) continue;
+        const BD12Descriptor *d = &heap->descriptors[v];
+        fprintf(stderr, "[REC]   +%-3u slot %-7u kind %u flags %u fmt %d range %llu view %s%s\n", off, v, d->kind, d->flags,
+                (int)d->format, (unsigned long long)d->range, d->image_view ? "image" : d->source_buffer ? "buffer" : "-",
+                "");
+    }
+}
+
+void bd12_rp_rec_hang_dump(void)
+{
+    if (!g_rec_last_heap) return;
+    fprintf(stderr, "[REC] at dump time, the last recorded dispatch's record:\n");
+    rec_print(g_rec_last_heap, g_rec_last_rc, g_rec_last_hash, 0, 0, 0);
 }
 
 void bd12_rp_snap_dispatch(BD12CmdList *list, const BD12BindState *state, uint64_t shader_hash, uint32_t x, uint32_t y,
@@ -360,6 +453,32 @@ void bd12_rp_snap_dispatch(BD12CmdList *list, const BD12BindState *state, uint64
                     const VkDeviceSize where = d->offset + header + 116;
                     if (where + 4 <= b->size) memcpy(&chain, (const uint8_t *)b->cpu + where, 4);
                     g_snap_meta[slot].chain_slot = chain;
+                    g_snap_meta[slot].hdr_offset = header;
+                    for (uint32_t k = 0; k < SNAP_HDR; ++k) {
+                        uint32_t hi = UINT32_MAX;
+                        const VkDeviceSize hw = d->offset + header + 4 + 16 * k;
+                        if (hw + 4 <= b->size) memcpy(&hi, (const uint8_t *)b->cpu + hw, 4);
+                        g_snap_meta[slot].hdr_slot[k] = hi;
+                        if (hi >= heap->count) continue;
+                        const BD12Descriptor *hd = &heap->descriptors[hi];
+                        g_snap_meta[slot].hdr_kind[k] = (int)hd->kind;
+                        g_snap_meta[slot].hdr_flags[k] = hd->flags;
+                        g_snap_meta[slot].hdr_view[k][0] = hd->offset;
+                        g_snap_meta[slot].hdr_view[k][1] = hd->range;
+                        g_snap_meta[slot].hdr_view[k][2] = hd->source_buffer ? hd->source_buffer->size : 0;
+                        if (heap->payload)
+                            memcpy(g_snap_meta[slot].hdr_payload[k], heap->payload + (size_t)hi * heap->payload_stride,
+                                   heap->payload_stride < 32 ? heap->payload_stride : 32);
+                        if (heap->meta) memcpy(g_snap_meta[slot].hdr_metab[k], heap->meta + (size_t)hi * 16, 16);
+                        BD12Buffer *hb = hd->source_buffer;
+                        if (hb && hb->buffer && hd->offset < hb->size) {
+                            const VkBufferCopy hc = { hd->offset, base + SNAP_HDR_BASE + (VkDeviceSize)k * SNAP_HDR_BYTES,
+                                                      hb->size - hd->offset < SNAP_HDR_BYTES ? hb->size - hd->offset
+                                                                                              : SNAP_HDR_BYTES };
+                            device->vk.CmdCopyBuffer(list->command_buffer, hb->buffer, g_snap->buffer, 1, &hc);
+                            g_snap_meta[slot].hdr_ok[k] = 1;
+                        }
+                    }
                     if (chain < heap->count) {
                         const BD12Descriptor *cd = &heap->descriptors[chain];
                         BD12Buffer *cb = cd->source_buffer;
@@ -484,8 +603,10 @@ static void uavsnap_dump(void)
         fputc('\n', stderr);
     }
 }
+void bd12_rp_rec_hang_dump(void);
 void bd12_rp_snap_dump(void)
 {
+    bd12_rp_rec_hang_dump();
     uavsnap_dump();
     if (!g_snap || !g_snap->cpu) return;
     uint32_t newest = 0;
@@ -535,6 +656,36 @@ void bd12_rp_snap_dump(void)
             const BD12DescriptorHeap *heap = g_snap_meta[slot].heap;
             fprintf(stderr, "[SNAP]   record buffer %s (size %llu)\n", b && b->cpu ? "CPU-visible" : "GPU-only",
                     b ? (unsigned long long)b->size : 0ull);
+            fprintf(stderr, "[SNAP]   record words: +0f0(240)=%u +0f4(244)=%u +0f8(248)=%u +010(16)=%u +0e8(232)=%u; "
+                    "header at %u\n", w[60], w[61], w[62], w[4], w[58], g_snap_meta[slot].hdr_offset);
+            for (uint32_t k = 0; k < SNAP_HDR; ++k) {
+                const uint32_t hi = g_snap_meta[slot].hdr_slot[k];
+                if (hi == UINT32_MAX || !heap || hi >= heap->count) {
+                    fprintf(stderr, "[SNAP]   hdr+%u = 0x%x (not a heap index)\n", 4 + 16 * k, hi);
+                    continue;
+                }
+                const uint8_t *pb = g_snap_meta[slot].hdr_payload[k];
+                const uint32_t *mb = (const uint32_t *)g_snap_meta[slot].hdr_metab[k];
+                uint8_t fresh[128] = {0}, fresh_meta[16] = {0};
+                const int enc = bd12_heap_encode_probe((BD12DescriptorHeap *)heap, hi, fresh, sizeof(fresh), fresh_meta);
+                const uint32_t cmp = heap->payload_stride < 32 ? heap->payload_stride : 32;
+                fprintf(stderr, "[SNAP]   hdr+%u = slot %u: kind %d flags %u off %llu range %llu bufsize %llu | meta "
+                        "off %u size %u | payload", 4 + 16 * k, hi, g_snap_meta[slot].hdr_kind[k],
+                        g_snap_meta[slot].hdr_flags[k], (unsigned long long)g_snap_meta[slot].hdr_view[k][0],
+                        (unsigned long long)g_snap_meta[slot].hdr_view[k][1],
+                        (unsigned long long)g_snap_meta[slot].hdr_view[k][2], mb[0], mb[1]);
+                for (uint32_t i = 0; i < cmp; i += 4) fprintf(stderr, "%s%08x", i ? " " : " ", *(const uint32_t *)(pb + i));
+                fprintf(stderr, " | re-encode %s\n", !enc ? "n/a" :
+                        memcmp(fresh, pb, cmp) || memcmp(fresh_meta, mb, 16) ? "DIFFERS" : "same");
+                if (g_snap_meta[slot].hdr_ok[k]) {
+                    const uint32_t *v = (const uint32_t *)(e + SNAP_HDR_BASE + (size_t)k * SNAP_HDR_BYTES);
+                    for (int row = 0; row < SNAP_HDR_BYTES / 4; row += 16) {
+                        fprintf(stderr, "[SNAP]       +%03x:", row * 4);
+                        for (int i = 0; i < 16; ++i) fprintf(stderr, " %08x", v[row + i]);
+                        fputc('\n', stderr);
+                    }
+                }
+            }
             if (b && b->cpu && heap) {
                 const uint32_t header = w[2];                    /* record word +8 */
                 for (uint32_t k = 0; k < 32; ++k) {

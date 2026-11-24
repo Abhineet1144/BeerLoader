@@ -61,6 +61,7 @@ typedef struct {
     int used;
     void *base;
     size_t size;
+    int commit_protection; /* initial view rights; zero for SEC_IMAGE views */
 } BeerNtView;
 
 static BeerNtSection g_sections[BEER_NT_SECTION_CAPACITY];
@@ -318,11 +319,48 @@ uint32_t beer_nt_section_map(uint64_t handle, void **base_address,
 #endif
 
     pthread_mutex_lock(&g_section_mutex);
-    g_views[view_index] = (BeerNtView){.used = 1, .base = mapped, .size = length};
+    g_views[view_index] = (BeerNtView){.used = 1, .base = mapped, .size = length,
+                                    .commit_protection = prot};
     pthread_mutex_unlock(&g_section_mutex);
     *base_address = mapped;
     *view_size = length;
     return BEER_STATUS_SUCCESS;
+}
+
+int beer_nt_section_commit(void *address, size_t size, uint32_t protection)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) page = 4096;
+    uintptr_t start = (uintptr_t)address & ~((uintptr_t)page - 1);
+    size_t prefix = (uintptr_t)address - start;
+    int prot = protection_to_posix(protection);
+    if (!size || size > SIZE_MAX - prefix || size + prefix > SIZE_MAX - ((size_t)page - 1)) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t length = (size + prefix + (size_t)page - 1) & ~((size_t)page - 1);
+    pthread_mutex_lock(&g_section_mutex);
+    for (int i = 0; i < BEER_NT_VIEW_CAPACITY; ++i) {
+        BeerNtView *view = &g_views[i];
+        if (!view->used || start < (uintptr_t)view->base ||
+            start - (uintptr_t)view->base >= view->size) continue;
+        size_t remaining = view->size - (start - (uintptr_t)view->base);
+        /* The host mapping rounds the last file page up as well. */
+        remaining = (remaining + (size_t)page - 1) & ~((size_t)page - 1);
+        if (length > remaining || !view->commit_protection || prot < 0 ||
+            (prot & ~view->commit_protection)) {
+            pthread_mutex_unlock(&g_section_mutex);
+            errno = EINVAL;
+            return -1;
+        }
+        int result = mprotect((void *)start, length, prot);
+        int saved = errno;
+        pthread_mutex_unlock(&g_section_mutex);
+        errno = saved;
+        return result == 0 ? 1 : -1;
+    }
+    pthread_mutex_unlock(&g_section_mutex);
+    return 0;
 }
 
 uint32_t beer_nt_section_unmap(void *base_address)
@@ -339,10 +377,9 @@ uint32_t beer_nt_section_unmap(void *base_address)
             break;
         }
     }
+    int result = index < 0 ? -1 : munmap(base_address, size);
     pthread_mutex_unlock(&g_section_mutex);
-    if (index < 0) return BEER_STATUS_INVALID_PARAMETER;
-    return munmap(base_address, size) == 0 ? BEER_STATUS_SUCCESS
-                                           : BEER_STATUS_INVALID_PARAMETER;
+    return result == 0 ? BEER_STATUS_SUCCESS : BEER_STATUS_INVALID_PARAMETER;
 }
 
 int beer_nt_section_is_image(uint64_t handle)

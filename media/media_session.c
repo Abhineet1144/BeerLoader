@@ -24,6 +24,21 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Decoder threads per ffmpeg process (BEER_MF_DECODE_THREADS, default 4). ffmpeg's default (one frame thread per
+ * core, each holding whole frames) took 910 MB and 72 threads to decode a 17 MB in-game video in Onimusha,
+ * competing with the game for RAM and CPU; four threads decode game videos in real time. ffmpeg 8 also gave the
+ * pixel-format conversion one thread per core (51 for a 4K clip): -filter_threads 2. */
+static const char *mf_decode_threads(void)
+{
+    static char value[16];
+    if (!value[0]) {
+        const char *v = getenv("BEER_MF_DECODE_THREADS");
+        const long n = v && *v ? strtol(v, NULL, 10) : 4;
+        snprintf(value, sizeof(value), "%ld", n > 0 && n < 64 ? n : 4);
+    }
+    return value;
+}
+
 extern char **environ;
 int beer_mf_start_worker(void *(*fn)(void *), void *arg);                          /* media_foundation.c */
 uint64_t BEER_MF_MSABI beer_mf_create_attributes(void **attributes, uint32_t initial_size);
@@ -2039,15 +2054,17 @@ static void *decode_thread(void *opaque)
     Session *s = job.session;
     pthread_mutex_lock(&s->lock);
     SessionStream *st = &s->streams[job.stream];
-    char start[32], index[16], size[32], channels[16], rate[16];
+    char start[32], index[16], size[64], channels[16], rate[16];
     snprintf(start, sizeof(start), "%.4f", job.start / 1e7);
     snprintf(index, sizeof(index), "0:%d", st->info.ff_index);
-    snprintf(size, sizeof(size), "%ux%u", st->width, st->height);
+    snprintf(size, sizeof(size), "scale=%u:%u:threads=2", st->width, st->height);   /* conversion threads: 2 */
     snprintf(channels, sizeof(channels), "%u", st->channels);
     snprintf(rate, sizeof(rate), "%u", st->rate);
-    char *video_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-ss", start, "-i", st->path, "-map", index, "-an", "-sn",
-                           "-vsync", "passthrough", "-pix_fmt", (char *)st->format, "-s", size, "-f", "rawvideo", "pipe:1", NULL };
-    char *audio_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-ss", start, "-i", st->path, "-map", index, "-vn", "-sn",
+    char *video_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-threads", (char *)mf_decode_threads(), "-filter_threads", "2", "-ss", start,
+                           "-i", st->path, "-map", index, "-an", "-sn",
+                           "-vsync", "passthrough", "-pix_fmt", (char *)st->format, "-vf", size, "-f", "rawvideo", "pipe:1", NULL };
+    char *audio_argv[] = { "ffmpeg", "-nostdin", "-v", "error", "-threads", (char *)mf_decode_threads(), "-filter_threads", "2", "-ss", start,
+                           "-i", st->path, "-map", index, "-vn", "-sn",
                            "-ac", channels, "-ar", rate, "-f", (char *)st->format, "pipe:1", NULL };
     const int video = st->kind == 1;
     const u32 bytes = video ? st->frame_bytes : 1024 * st->channels * (st->bits / 8);

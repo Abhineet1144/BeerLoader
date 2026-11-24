@@ -29,6 +29,12 @@ static int stack_contains(uint64_t low, uint64_t high, uint64_t address,
 }
 
 static BeerSehHandlerCaller g_handler_caller;
+static BeerSehBoundaryResolver g_boundary_resolver;
+
+void beer_seh_set_boundary_resolver(BeerSehBoundaryResolver resolver)
+{
+    g_boundary_resolver = resolver;
+}
 
 void beer_seh_set_handler_caller(BeerSehHandlerCaller caller)
 {
@@ -62,6 +68,10 @@ int beer_seh_dispatch(BeerExceptionRecord64 *record, void *context_record,
         if (!entry && getenv("BEER_EXCEPTION_DIAGNOSTICS"))
             fprintf(stderr, "[SEH] frame %u pc=0x%llx: no runtime function entry\n", frame_index,
                     (unsigned long long)control_pc);
+        if (!entry && g_boundary_resolver && g_boundary_resolver(control_pc, walk_context)) {
+            if (visited_frames) *visited_frames = frame_index + 1;
+            continue;
+        }
         if (!entry) {
             uint64_t caller;
             memcpy(&caller, (const void *)(uintptr_t)old_rsp, sizeof(caller));

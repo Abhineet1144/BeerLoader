@@ -1,5 +1,9 @@
 CC     = gcc
-CFLAGS = -O0 -Wall -Wextra -m64 -gdwarf-4 -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan -Ithird_party/dxil-spirv -include platform/beer_env.h
+# Loader core optimisation. The old -O0 build was the largest single CPU cost of every guest->host API call.
+# Frame pointers stay (the unwinder/crash dumper walk host frames); the other flags keep GCC from exploiting UB
+# the 40k-line core was never written against. Rollback: make OPT=-O0
+OPT ?= -O2 -fno-omit-frame-pointer -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks
+CFLAGS = $(OPT) -Wall -Wextra -m64 -gdwarf-4 -MMD -MP -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -mno-sse -mno-sse2 -mno-avx -mno-mmx -Igraphics/d3d11 -Igraphics/d3d12 -Iaudio -Imedia -Iplatform -Irenderer/vulkan -Ithird_party/dxil-spirv -include platform/beer_env.h
 RENDER_CFLAGS = $(filter-out -O0,$(CFLAGS)) -O3 -march=native
 LDFLAGS = -lpthread -ldl -lcrypto -lz -lm
 TARGET = loader

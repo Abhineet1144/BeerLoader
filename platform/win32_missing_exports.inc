@@ -261,10 +261,7 @@ static u64 __attribute__((ms_abi)) stub_EnumWindows(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumThreadWindows(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetLastActivePopup(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_DestroyCursor(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_DestroyIcon(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_CopyImage(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CreateIconIndirect(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetIconInfo(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetScrollInfo(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetScrollInfo(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_TranslateMDISysAccel(void){ return 0; }
@@ -357,12 +354,9 @@ static u64 __attribute__((ms_abi)) stub_RegCreateKeyExA(void){ return 5; }
 static u64 __attribute__((ms_abi)) stub_RegDeleteValueA(void){ return 2; }
 static u64 __attribute__((ms_abi)) stub_RegOpenKeyA(void){ return 2; }
 static u64 __attribute__((ms_abi)) stub_RegSetValueExA(void){ return 5; }
-static u64 __attribute__((ms_abi)) stub_OpenSCManagerA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RegSetValueExW(void){ return 5; }
 static u64 __attribute__((ms_abi)) stub_RegCreateKeyExW(void){ return 5; }
-static u64 __attribute__((ms_abi)) stub_EnumServicesStatusW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_RegFlushKey(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_CloseServiceHandle(void){ return 1; }
 static u64 __attribute__((ms_abi)) stub_CreateFontIndirectA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumFontFamiliesA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetCharABCWidthsA(void){ return 0; }
@@ -403,7 +397,6 @@ static u64 __attribute__((ms_abi)) stub_GetBitmapBits(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClipBox(u64 dc, int32_t *rect){ return (u64)beer_GetClipBox(dc, rect); }
 static u64 __attribute__((ms_abi)) stub_GetClipRgn(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetCurrentObject(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_GetDIBits(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMapMode(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetRegionData(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetTextAlign(void){ return 0; }
@@ -454,6 +447,24 @@ static u64 __attribute__((ms_abi)) stub_FindExecutableW(const u16 *file, const u
 { (void)file; (void)dir; if (result) result[0] = 0; return 31; }
 /* No shell namespace: the COM-style shell entry points fail with E_FAIL and null outputs. */
 static u64 __attribute__((ms_abi)) stub_SHGetDesktopFolder(u64 *folder){ if (folder) *folder = 0; return 0x80004005u; }
+/* No DirectWrite factory or window property-store backend is available.
+ * These HRESULT APIs must fail, not report S_OK with an uninitialized COM
+ * output. Engines can then use their own fonts and omit shell integration. */
+static u64 __attribute__((ms_abi)) beer_DWriteCreateFactory(u32 type, const void *iid, u64 *factory)
+{
+    if (!factory) return 0x80004003u; /* E_POINTER */
+    *factory = 0;
+    if (!iid || type > 1) return 0x80070057u; /* E_INVALIDARG */
+    return 0x80004002u; /* E_NOINTERFACE */
+}
+static u64 __attribute__((ms_abi)) beer_SHGetPropertyStoreForWindow(u64 window, const void *iid, u64 *store)
+{
+    (void)window;
+    if (!store) return 0x80004003u; /* E_POINTER */
+    *store = 0;
+    if (!iid) return 0x80070057u; /* E_INVALIDARG */
+    return 0x80004002u; /* E_NOINTERFACE */
+}
 static u64 __attribute__((ms_abi)) stub_SHGetFileInfoW(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SHGetSettings(void){ return 0; }
 /* No desktop composition is reported: S_OK with *enabled = FALSE. */
@@ -606,8 +617,6 @@ static u64 __attribute__((ms_abi)) beer_PathMatchSpecExA(const char *path, const
 }
 static u64 __attribute__((ms_abi)) stub_InitCommonControls(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_Create(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_ImageList_Destroy(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_ImageList_GetImageCount(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_SetImageCount(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_Add(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_ImageList_Replace(void){ return 0; }
@@ -2431,7 +2440,6 @@ static u64 __attribute__((ms_abi)) stub_awt_CommDlgExtendedError(void) { return 
 static u64 __attribute__((ms_abi)) stub_awt_GetSaveFileNameW(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_PageSetupDlgW(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_PlaySoundW(void) { return 0; }
-static u64 __attribute__((ms_abi)) stub_awt_ImageList_GetIcon(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_SHCreateStreamOnFileW(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_OleInitialize(void *reserved) { return 0; }
 static u64 __attribute__((ms_abi)) stub_awt_CoGetCurrentProcess(void) { return 1; }

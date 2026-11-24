@@ -193,7 +193,9 @@ impl_NtDelayExecution(u32 alertable, const s64 *interval)
     if (value < 0) {            /* relative, in 100 ns units */
         u64 ns = (u64)(-value) * 100u;
         struct timespec ts = { (time_t)(ns / 1000000000u), (long)(ns % 1000000000u) };
+        const u64 wlog_t0 = wlog_enabled() ? wlog_now() : 0;
         while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        if (wlog_t0) wlog_add(WLOG_DELAY, wlog_t0, ns / 1000u, g_dispatch_incoming_return);
     } else if (value > 0) {     /* absolute system time (FILETIME) */
         u64 unix_100ns = (u64)value > EPOCH_DIFF ? (u64)value - EPOCH_DIFF : 0;
         struct timespec ts = { (time_t)(unix_100ns / 10000000u), (long)(unix_100ns % 10000000u) * 100 };

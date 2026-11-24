@@ -20,6 +20,7 @@
  *   16 Reset.
  * This file is built without SSE, so only the integer and pointer slots are used. */
 
+int bd12_debug_dump(void *list_iface, void *resource_iface, const char *name);
 int bd12_debug_stretch(void *list_iface, void *source_iface, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                        void *target_iface);   /* graphics/d3d12v/bd12_com_list.c */
 
@@ -33,7 +34,7 @@ typedef u32 __attribute__((ms_abi)) (*NgxGetU32)(u64 self, const char *name, u32
 typedef u32 __attribute__((ms_abi)) (*NgxFn1)(u64);
 typedef u32 __attribute__((ms_abi)) (*NgxFn4)(u64, u64, u64, u64);
 
-enum { NGX_SET_PTR = 0, NGX_SET_U32 = 4, NGX_GET_PTR = 8, NGX_GET_D3D12_RESOURCE = 9, NGX_GET_U32 = 12 };
+enum { NGX_SET_PTR = 0, NGX_SET_D3D12_RESOURCE = 1, NGX_SET_U32 = 4, NGX_GET_PTR = 8, NGX_GET_D3D12_RESOURCE = 9, NGX_GET_U32 = 12 };
 
 static u64 ngx_slot(u64 params, int slot)
 {
@@ -166,6 +167,16 @@ static u32 __attribute__((ms_abi)) ngx_optimal_settings(u64 params)
         if (real_w && real_h) {                      /* a mode this DLSS offers: its minimum, else its own size */
             ngx_note_min(out_w, out_h, real_min_w ? real_min_w : real_w, real_min_h ? real_min_h : real_h);
         }
+    }
+    /* DLAA (PerfQualityValue 5) always renders at the output size, whatever this query answers: a smaller size here
+     * only made DLSS expect a resolution the game never renders ("RenderSubrect must match Creation time res"),
+     * so it ran without usable history (Onimusha: heavy shimmering on vegetation with the 82.6% override). */
+    if (quality == 5) {
+        static int noted;
+        if (!noted++ && ngx_size_override())
+            fprintf(stderr, "[NGX] game uses DLAA: the render size override does not apply (choose a DLSS quality mode "
+                            "in the game to use it)\n");
+        return result;
     }
     if (!ngx_render_size(out_w, out_h, &w, &h)) return result;
     {   /* Diagnostic only: DLSS runs below its reported minimum (tools commonly use 20-25%), so no floor. */
@@ -305,6 +316,96 @@ static const char *ngx_feature_name(u64 feature)
     default: return "other";
     }
 }
+/* BEER_NGX_DIAGNOSTICS=1: what a feature is given. Ray reconstruction denoises only with every guide it expects (albedo,
+ * normals, roughness, depth, motion vectors) and the right jitter / motion-vector scale; a missing or mis-scaled one
+ * passes the path tracer's noise straight through. Floats are printed with integer arithmetic (no SSE here). */
+static int ngx_diagnostics(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_NGX_DIAGNOSTICS") != NULL;
+    return on;
+}
+static void ngx_format_float(u32 bits, char *out, size_t size)
+{
+    const int negative = bits >> 31, exponent = (int)((bits >> 23) & 0xff) - 127;
+    const u64 mantissa = (bits & 0x7fffffu) | 0x800000u;
+    if ((bits & 0x7fffffffu) == 0) { snprintf(out, size, "0"); return; }
+    if (exponent > 30 || exponent < -30) { snprintf(out, size, "0x%08x", bits); return; }
+    /* value * 10000 = mantissa * 2^(exponent - 23) * 10000 */
+    const int shift = exponent - 23;
+    const u64 scaled = shift >= 0 ? (mantissa * 10000u) << shift : (mantissa * 10000u) >> -shift;
+    snprintf(out, size, "%s%llu.%04llu", negative ? "-" : "", (unsigned long long)(scaled / 10000u),
+             (unsigned long long)(scaled % 10000u));
+}
+static void ngx_log_numbers(u64 params, const char *const *names, size_t count, int as_float)
+{
+    for (size_t i = 0; i < count; ++i) {
+        u32 value = 0;
+        const int ok = as_float ? ((NgxGetU32)(uintptr_t)ngx_slot(params, 14))(params, names[i], &value) == NGX_RESULT_SUCCESS
+                                : ngx_get_u32(params, names[i], &value);
+        if (!ok) continue;
+        char text[48];
+        if (as_float) ngx_format_float(value, text, sizeof(text)); else snprintf(text, sizeof(text), "%u (0x%x)", value, value);
+        fprintf(stderr, "[NGX DIAG]   %s = %s\n", names[i], text);
+    }
+}
+static void ngx_log_resources(u64 params)
+{
+    static const char *const names[] = {
+        "Color", "Output", "Depth", "MotionVectors", "TransparencyMask", "ExposureTexture", "DLSS.Input.Bias.Current.Color.Mask",
+        "GBuffer.Albedo", "GBuffer.Roughness", "GBuffer.Metallic", "GBuffer.Specular", "GBuffer.Subsurface",
+        "GBuffer.Normals", "GBuffer.ShadingModelId", "GBuffer.MaterialId", "GBuffer.Emissive",
+        "GBuffer.Attrib.8", "GBuffer.Attrib.9", "GBuffer.Attrib.10", "GBuffer.Attrib.11", "GBuffer.Attrib.12",
+        "GBuffer.Attrib.13", "GBuffer.Attrib.14", "GBuffer.Attrib.15",
+        "DLSS.Input.DiffuseAlbedo", "DLSS.Input.SpecularAlbedo", "DLSS.DisocclusionMask",
+        "DiffuseAlbedo", "SpecularAlbedo", "DiffuseHitDistance", "SpecularHitDistance", "SpecularMvec",
+        "DLSSD.DiffuseAlbedo", "DLSSD.SpecularAlbedo", "DLSSD.Normals", "DLSSD.Roughness", "DLSSD.SpecularMvec",
+        "DLSSD.DiffuseHitDistance", "DLSSD.SpecularHitDistance", "DLSSD.ReflectedAlbedo", "DLSSD.ParticleMask",
+        "DLSSD.TransparencyLayer", "DLSSD.TransparencyLayerOpacity", "DLSSD.TransparencyLayerMvecs", "DLSSD.DisocclusionMask",
+        "DLSSD.ScreenSpaceSubsurfaceScatteringGuide", "DLSSD.ColorBeforeParticles", "DLSSD.ColorAfterParticles",
+        "DLSSD.ColorBeforeTransparency", "DLSSD.ColorAfterTransparency", "DLSSD.ColorBeforeFog", "DLSSD.ColorAfterFog",
+        "DLSSD.DepthHighRes", "DLSSD.Position.ViewSpace", "DLSSD.FrameTimeDeltaInMsec", "DLSSD.RayTracingHitDistance",
+        "DLSSD.MotionVectorsReflection", "IndirectAlbedo", "Roughness", "Normals",
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) {
+        const u64 resource = ngx_get_resource(params, names[i]);
+        if (!resource) continue;
+        u8 desc[56] = {0};                                      /* D3D12_RESOURCE_DESC, returned through a hidden pointer */
+        ((u64 (__attribute__((ms_abi)) *)(u64, u8 *))(*(u64 **)(uintptr_t)resource)[10])(resource, desc);
+        fprintf(stderr, "[NGX DIAG]   %-40s %#llx %llux%u format %u flags 0x%x\n", names[i], (unsigned long long)resource,
+                (unsigned long long)*(u64 *)(desc + 16), *(u32 *)(desc + 24), *(u32 *)(desc + 32), *(u32 *)(desc + 48));
+    }
+}
+static void ngx_log_inputs(u64 params, const char *when)
+{
+    static const char *const ints[] = {
+        "Reset", "DLSS.Feature.Create.Flags", "DLSS.Denoise.Mode", "DLSS.Roughness.Mode", "DLSS.Use.HW.Depth",
+        "DLSS.Input.Roughness.Subrect.Base.X",
+        "DLSSD.Enable.Output.Subrects", "DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y",
+        "DLSS.Render.Subrect.Dimensions.Width", "DLSS.Render.Subrect.Dimensions.Height", "Width", "Height", "OutWidth",
+        "OutHeight", "PerfQualityValue", "RTXValue", "DLSS.Hint.Render.Preset.Quality", "DLSS.Hint.Render.Preset.Balanced",
+        "DLSS.Hint.Render.Preset.Performance", "DLSS.Hint.Render.Preset.DLAA", "DLSSD.Hint.Render.Preset.Quality",
+        "DLSS.Indicator.Invert.X.Axis", "DLSS.Indicator.Invert.Y.Axis",
+    };
+    static const char *const floats[] = {
+        "Jitter.Offset.X", "Jitter.Offset.Y", "MV.Scale.X", "MV.Scale.Y", "Sharpness", "DLSS.Pre.Exposure",
+        "DLSS.Exposure.Scale", "FrameTimeDeltaInMsec", "DLSSD.FrameTimeDeltaInMsec",
+    };
+    fprintf(stderr, "[NGX DIAG] %s\n", when);
+    ngx_log_numbers(params, ints, sizeof(ints) / sizeof(*ints), 0);
+    ngx_log_numbers(params, floats, sizeof(floats) / sizeof(*floats), 1);
+    ngx_log_resources(params);
+}
+
+/* BEER_NGX_ROUGHNESS_PACKED=1: tell Ray Reconstruction that roughness is in the normals' alpha (DLSS.Roughness.Mode
+ * = packed) when no roughness texture is given (test switch). */
+static void ngx_force_packed_roughness(u64 params)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_NGX_ROUGHNESS_PACKED") != NULL;
+    if (!on || !params || ngx_get_resource(params, "GBuffer.Roughness")) return;
+    ngx_set_u32(params, "DLSS.Roughness.Mode", 1);
+}
 static void ngx_log_create(u64 feature, u64 params, u64 handle_out, u32 result)
 {
     u32 in_w = 0, in_h = 0, out_w = 0, out_h = 0;
@@ -316,6 +417,7 @@ static void ngx_log_create(u64 feature, u64 params, u64 handle_out, u32 result)
     }
     fprintf(stderr, "[NGX] CreateFeature %llu (%s): render %ux%u -> output %ux%u -> 0x%x\n", (unsigned long long)feature,
             ngx_feature_name(feature), in_w, in_h, out_w, out_h, result);
+    if (ngx_diagnostics() && params && feature != 11) ngx_log_inputs(params, "create parameters");
     const u64 handle = result == NGX_RESULT_SUCCESS && handle_out ? *(u64 *)(uintptr_t)handle_out : 0;
     if (!handle) return;
     for (int i = 0; i < 32; ++i)
@@ -338,10 +440,22 @@ static void ngx_count_evaluation(u64 handle)
         }
 }
 
+/* BEER_NGX_NO_RR=1 (experiment): refuse Ray Reconstruction feature creation, as if it were unavailable. */
+static int ngx_no_rr(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_NGX_NO_RR") != NULL;
+    return on;
+}
 #define NGX_CREATE_WRAPPER(i) \
     static u32 __attribute__((ms_abi)) ngx_create_##i(u64 cmd, u64 feature, u64 params, u64 handle) \
     { \
         ngx_before_create(feature, params); \
+        if (feature == 13 && ngx_no_rr()) { \
+            fprintf(stderr, "[NGX] CreateFeature 13 (ray reconstruction) refused (BEER_NGX_NO_RR)\n"); \
+            return 0xBAD00001u; /* NVSDK_NGX_Result_FAIL_FeatureNotSupported */ \
+        } \
+        if (feature != NGX_FEATURE_SUPER_SAMPLING && feature != 11) ngx_force_packed_roughness(params); \
         if (feature == NGX_FEATURE_SUPER_SAMPLING) fprintf(stderr, "[NGX] CreateFeature calling (tid %d)\n", (int)syscall(SYS_gettid)); \
         const u32 result = ((NgxFn4)(uintptr_t)g_ngx_real_create[i])(cmd, feature, params, handle); \
         if (feature == NGX_FEATURE_SUPER_SAMPLING) fprintf(stderr, "[NGX] CreateFeature returned 0x%x\n", result); \
@@ -360,9 +474,25 @@ static u32 (__attribute__((ms_abi)) *const g_ngx_create_wrappers[NGX_CREATE_EXPO
  * (dlss_bypass), DLSS super sampling is replaced by a linear stretch of the colour input (its render subrect) over
  * the output: the game's internal-resolution image as it reaches DLSS, for comparison. */
 static u64 g_ngx_real_evaluate;
+static u64 ngx_feature_of(u64 handle, u64 *evaluations)
+{
+    for (int i = 0; i < 32 && g_ngx_features[i].handle; ++i)
+        if (g_ngx_features[i].handle == handle) { if (evaluations) *evaluations = g_ngx_features[i].evaluations; return g_ngx_features[i].feature; }
+    return 0;
+}
 static u32 __attribute__((ms_abi)) ngx_evaluate(u64 cmd, u64 handle, u64 params, u64 progress)
 {
     ngx_count_evaluation(handle);
+    if (ngx_diagnostics() && params) {
+        u64 n = 0;
+        const u64 feature = ngx_feature_of(handle, &n);
+        if (feature != 11 && (n <= 3 || n % 1000 == 0)) {
+            char when[96];
+            snprintf(when, sizeof(when), "evaluate feature %llu (%s) #%llu", (unsigned long long)feature,
+                     ngx_feature_name(feature), (unsigned long long)n);
+            ngx_log_inputs(params, when);
+        }
+    }
     if (beer_control_dlss_bypass() && params && ngx_is_sr_handle(handle)) {
         const u64 color = ngx_get_resource(params, "Color"), output = ngx_get_resource(params, "Output");
         u32 x = 0, y = 0, w = 0, h = 0;
@@ -379,7 +509,51 @@ static u32 __attribute__((ms_abi)) ngx_evaluate(u64 cmd, u64 handle, u64 params,
         if (logged != -1) { logged = -1; fprintf(stderr, "[NGX] DLSS bypass not possible here (color=%llx output=%llx)\n",
                                                    (unsigned long long)color, (unsigned long long)output); }
     }
-    return ((NgxFn4)(uintptr_t)g_ngx_real_evaluate)(cmd, handle, params, progress);
+    /* BEER_NGX_DUMP=<trigger file> (with BEER_BD12_CAPTURE_DIR): once that file exists, the next two evaluations of a
+     * non-SR feature (Ray Reconstruction) save their input images before, and their output after, the call; written a
+     * few presents later. The file is removed. */
+    static u64 dump_at;
+    static int dump_left;
+    const char *trigger = getenv("BEER_NGX_DUMP");
+    u64 n = 0;
+    const int feature_ok = params && ngx_feature_of(handle, &n) != 11;
+    if (trigger && feature_ok && !dump_left && (n & 31) == 0 && access(trigger, F_OK) == 0) {
+        unlink(trigger);
+        dump_left = 2;
+        dump_at = n;
+    }
+    const int dump = feature_ok && dump_left > 0 && n >= dump_at;
+    if (dump) --dump_left;
+    static const char *const inputs[] = {
+        "Color", "Depth", "MotionVectors", "GBuffer.Normals", "DLSS.Input.DiffuseAlbedo", "DLSS.Input.SpecularAlbedo",
+        "DLSS.DisocclusionMask", "DLSSD.SpecularHitDistance", "GBuffer.Roughness", "Output",
+    };
+    if (dump)
+        for (size_t i = 0; i < sizeof(inputs) / sizeof(*inputs); ++i) {
+            const u64 r = ngx_get_resource(params, inputs[i]);
+            char name[96];
+            snprintf(name, sizeof(name), "ngx%llu_%s_in", (unsigned long long)n, inputs[i]);
+            if (r) bd12_debug_dump((void *)(uintptr_t)cmd, (void *)(uintptr_t)r, name);
+        }
+    if (feature_ok) ngx_force_packed_roughness(params);
+    /* BEER_NGX_NO_DISOCCLUSION=1: Ray Reconstruction evaluates without the game's disocclusion mask (test switch). */
+    static int no_mask = -1;
+    if (no_mask < 0) no_mask = getenv("BEER_NGX_NO_DISOCCLUSION") != NULL;
+    u64 saved_mask = 0;
+    if (no_mask && feature_ok && (saved_mask = ngx_get_resource(params, "DLSS.DisocclusionMask")) != 0)
+        ((NgxSetPtr)(uintptr_t)ngx_slot(params, NGX_SET_D3D12_RESOURCE))(params, "DLSS.DisocclusionMask", 0);
+    const u32 result = ((NgxFn4)(uintptr_t)g_ngx_real_evaluate)(cmd, handle, params, progress);
+    if (saved_mask)
+        ((NgxSetPtr)(uintptr_t)ngx_slot(params, NGX_SET_D3D12_RESOURCE))(params, "DLSS.DisocclusionMask", saved_mask);
+    if (dump) {
+        const u64 r = ngx_get_resource(params, "Output");
+        char name[96];
+        snprintf(name, sizeof(name), "ngx%llu_Output_out", (unsigned long long)n);
+        if (r) bd12_debug_dump((void *)(uintptr_t)cmd, (void *)(uintptr_t)r, name);
+        fprintf(stderr, "[NGX DIAG] evaluation %llu: images queued for %s\n", (unsigned long long)n,
+                getenv("BEER_BD12_CAPTURE_DIR") ? getenv("BEER_BD12_CAPTURE_DIR") : "(no BEER_BD12_CAPTURE_DIR)");
+    }
+    return result;
 }
 
 /* GetProcAddress on a guest DLL: NGX core entry points get Beer's wrapper when an override is set. */

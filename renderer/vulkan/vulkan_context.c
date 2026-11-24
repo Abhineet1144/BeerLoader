@@ -17,6 +17,7 @@ typedef struct {
     VkQueue queue;
     uint32_t queue_family;
     uint32_t queue_family_size;   /* queues the family offers */
+    VkQueueFlags queue_flags;     /* the family's capabilities (sparse binding for D3D12 reserved resources) */
     VkQueue queues[BEER_VULKAN_MAX_QUEUES]; /* [0] == queue; more with BEER_BD12_MULTI_QUEUE=1 */
     uint32_t queue_count;
     PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
@@ -401,6 +402,7 @@ int beer_vulkan_context_initialize(void)
                 g_context.physical_device = physical_devices[p];
                 g_context.queue_family = q;
                 g_context.queue_family_size = queues[q].queueCount;
+                g_context.queue_flags = queues[q].queueFlags;
                 break;
             }
         }
@@ -889,14 +891,22 @@ int beer_vulkan_context_initialize(void)
     /* D3D requires defined out-of-bounds buffer and image behavior. Core
      * robustness covers buffers, while robustness2 extends this to images and
      * tighter buffer bounds used by translated structured/typed views. */
+    /* BEER_VK_ROBUST: unset = all three bounds-checking features (core robustBufferAccess, robustBufferAccess2,
+     * robustImageAccess2); "2" = robustness2 only (no core robustBufferAccess); "0" = none (null descriptors stay).
+     * Each adds bounds checks to shader memory accesses; this is for measuring their GPU cost. */
+    const char *robust_mode = getenv("BEER_VK_ROBUST");
+    const int robust_core = !robust_mode || !*robust_mode || !strcmp(robust_mode, "1");
+    const int robust_2 = robust_core || (robust_mode && !strcmp(robust_mode, "2"));
     g_context.enabled_features.robustBufferAccess =
-        supported.robustBufferAccess;
+        robust_core ? supported.robustBufferAccess : VK_FALSE;
     g_context.enabled_features.samplerAnisotropy = supported.samplerAnisotropy;
     const VkPhysicalDeviceProperties properties = physical_properties;
     g_context.max_sampler_anisotropy = supported.samplerAnisotropy ?
         (uint32_t)properties.limits.maxSamplerAnisotropy : 1u;
-    robustness2.robustBufferAccess2 = robustness2.robustBufferAccess2;
-    robustness2.robustImageAccess2 = robustness2.robustImageAccess2;
+    robustness2.robustBufferAccess2 = robust_2 ? robustness2.robustBufferAccess2 : VK_FALSE;
+    robustness2.robustImageAccess2 = robust_2 ? robustness2.robustImageAccess2 : VK_FALSE;
+    if (!robust_core) fprintf(stderr, "[VULKAN] BEER_VK_ROBUST=%s: robustBufferAccess off%s\n", robust_mode,
+                              robust_2 ? "" : ", robustBufferAccess2/robustImageAccess2 off");
     robustness2.nullDescriptor = robustness2.nullDescriptor;
     g_context.enabled_features.shaderStorageImageExtendedFormats =
         supported.shaderStorageImageExtendedFormats;
@@ -945,6 +955,21 @@ int beer_vulkan_context_initialize(void)
     BEER_ENABLE_FEATURE(vertexPipelineStoresAndAtomics);
     BEER_ENABLE_FEATURE(shaderStorageImageMultisample);
     BEER_ENABLE_FEATURE(occlusionQueryPrecise);
+    /* D3D12 reserved (tiled) resources map onto sparse residency: only the tiles a game maps take memory.
+     * BEER_BD12_SPARSE=0 keeps them fully resident (no sparse features enabled). */
+    {
+        const char *sparse = getenv("BEER_BD12_SPARSE");
+        if (!(sparse && !strcmp(sparse, "0")) && (g_context.queue_flags & VK_QUEUE_SPARSE_BINDING_BIT) &&
+            supported.sparseBinding) {
+            BEER_ENABLE_FEATURE(sparseBinding);
+            BEER_ENABLE_FEATURE(sparseResidencyBuffer);
+            BEER_ENABLE_FEATURE(sparseResidencyImage2D);
+            BEER_ENABLE_FEATURE(sparseResidencyImage3D);
+            BEER_ENABLE_FEATURE(sparseResidencyAliased);
+            BEER_ENABLE_FEATURE(shaderResourceResidency);
+            BEER_ENABLE_FEATURE(shaderResourceMinLod);
+        }
+    }
 #undef BEER_ENABLE_FEATURE
     const void *device_features = feature_chain;
     VkDeviceCreateInfo device_info = {

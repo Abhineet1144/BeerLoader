@@ -1,5 +1,9 @@
 #define _GNU_SOURCE
 #include "bd12.h"
+
+/* Background free of dedicated heaps (see bd12_heap_destroy). */
+unsigned bd12_heap_reaper_pending(void);
+void bd12_heap_reaper_drain(void);
 #include "d3d12_dxil_translator.h"
 
 #include <pthread.h>
@@ -521,6 +525,7 @@ void bd12_pipeline_cache_note_new(BD12Device *device)
 void bd12_device_destroy(BD12Device *device)
 {
     if (!device) return;
+    bd12_heap_reaper_drain();      /* queued heap frees use this device */
     if (device->pipeline_cache) {
         if (device->pipeline_cache_new) bd12_pipeline_cache_save(device);
         device->vk.DestroyPipelineCache(device->device, device->pipeline_cache, NULL);
@@ -684,10 +689,15 @@ static int32_t upload_memory_type(BD12Device *device, VkDeviceSize size)
     const int32_t rebar = device->memory_type[BD12_HEAP_UPLOAD];
     if (rebar == device->upload_sysmem_type || device->upload_sysmem_type < 0) return rebar;
     uint64_t pressure_budget = 0, pressure_usage = 0;
-    /* The cap only applies under VRAM pressure (usage above 60% of the budget): games with VRAM to spare (RE8 at
-     * ~5 of 14 GB) keep every upload heap in VRAM exactly as before. */
+    /* The cap always applies. It used to wait for VRAM pressure (usage above 60% of the budget), but engines create
+     * most upload heaps while loading, when VRAM is still empty: Onimusha had 1.77 GB of them in VRAM before the
+     * cap engaged, and they stay for the session. RE8 uses ~128 MB, well under the cap, so it is unchanged.
+     * BEER_BD12_REBAR_UPLOAD_PRESSURE_ONLY=1 restores the pressure condition (A/B). */
+    static int pressure_only = -1;
+    if (pressure_only < 0) pressure_only = getenv("BEER_BD12_REBAR_UPLOAD_PRESSURE_ONLY") != NULL;
     if (__atomic_load_n(&g_bd12_rebar_bytes, __ATOMIC_RELAXED) + size > rebar_upload_cap(device) &&
-        beer_vulkan_memory_budget(&pressure_budget, &pressure_usage) && pressure_usage > pressure_budget / 10 * 6) {
+        (!pressure_only ||
+         (beer_vulkan_memory_budget(&pressure_budget, &pressure_usage) && pressure_usage > pressure_budget / 10 * 6))) {
         static int noted;
         if (!noted++) fprintf(stderr, "[BD12] resizable-BAR upload cap reached: new upload heaps go to system memory\n");
         return device->upload_sysmem_type;
@@ -1085,6 +1095,10 @@ static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
     };
     VkResult result = device->vk.AllocateMemory(device->device, &allocate, NULL,
                                                 &heap->memory);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && bd12_heap_reaper_pending()) {
+        bd12_heap_reaper_drain();      /* memory the game already released may still be queued to be freed */
+        result = device->vk.AllocateMemory(device->device, &allocate, NULL, &heap->memory);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && type == BD12_HEAP_DEFAULT) {
         const int32_t fallback = sysmem_fallback_type(device);
         if (fallback >= 0) {
@@ -1126,9 +1140,92 @@ static BD12Heap *heap_create_impl(BD12Device *device, BD12HeapType type,
 }
 
 static void heap_destroy_impl(BD12Heap *heap);
+
+/* Dedicated heaps are released by a background thread. vkFreeMemory costs about a millisecond, a turn in Onimusha
+ * frees dozens of streaming heaps in one frame, and the free used to run inline on the thread submitting the frame
+ * (com_reap): 61 frees = a 54 ms hitch. The game-visible accounting (heap_live/heap_bytes, which the DXGI budget
+ * reports) is released immediately, so the game sees the memory as free exactly when it released the heap. An
+ * allocation that hits out-of-memory while frees are still queued waits for them and retries
+ * (bd12_heap_reaper_drain) before it demotes to system memory. BEER_BD12_SYNC_HEAP_FREE=1 frees inline again. */
+static pthread_mutex_t g_reap_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_reap_work = PTHREAD_COND_INITIALIZER, g_reap_idle = PTHREAD_COND_INITIALIZER;
+static BD12Heap *g_reap_head, *g_reap_tail;
+static unsigned g_reap_pending;       /* queued or being freed */
+static int g_reap_thread_started, g_reap_failed;
+
+static void *heap_reaper_main(void *unused)
+{
+    (void)unused;
+    pthread_setname_np(pthread_self(), "beer-heapfree");
+    for (;;) {
+        pthread_mutex_lock(&g_reap_mtx);
+        while (!g_reap_head) pthread_cond_wait(&g_reap_work, &g_reap_mtx);
+        BD12Heap *heap = g_reap_head;
+        g_reap_head = (BD12Heap *)heap->reap_next;
+        if (!g_reap_head) g_reap_tail = NULL;
+        pthread_mutex_unlock(&g_reap_mtx);
+        heap_destroy_impl(heap);
+        pthread_mutex_lock(&g_reap_mtx);
+        if (--g_reap_pending == 0) pthread_cond_broadcast(&g_reap_idle);
+        pthread_mutex_unlock(&g_reap_mtx);
+    }
+    return NULL;
+}
+
+unsigned bd12_heap_reaper_pending(void)
+{
+    return __atomic_load_n(&g_reap_pending, __ATOMIC_ACQUIRE);
+}
+
+void bd12_heap_reaper_drain(void)
+{
+    pthread_mutex_lock(&g_reap_mtx);
+    while (g_reap_pending) pthread_cond_wait(&g_reap_idle, &g_reap_mtx);
+    pthread_mutex_unlock(&g_reap_mtx);
+}
+
+static int heap_reaper_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("BEER_BD12_SYNC_HEAP_FREE"); enabled = !(e && *e && *e != '0'); }
+    return enabled;
+}
+
+static int heap_reaper_enqueue(BD12Heap *heap)
+{
+    pthread_mutex_lock(&g_reap_mtx);
+    if (g_reap_failed) { pthread_mutex_unlock(&g_reap_mtx); return 0; }
+    if (!g_reap_thread_started) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, heap_reaper_main, NULL) != 0) {
+            g_reap_failed = 1;
+            pthread_mutex_unlock(&g_reap_mtx);
+            return 0;
+        }
+        pthread_detach(thread);
+        g_reap_thread_started = 1;
+    }
+    heap->reap_next = NULL;
+    if (g_reap_tail) g_reap_tail->reap_next = (struct BD12HeapTag *)heap; else g_reap_head = heap;
+    g_reap_tail = heap;
+    __atomic_add_fetch(&g_reap_pending, 1, __ATOMIC_RELEASE);
+    pthread_cond_signal(&g_reap_work);
+    pthread_mutex_unlock(&g_reap_mtx);
+    return 1;
+}
+
 void bd12_heap_destroy(BD12Heap *heap)
 {
     BD12_PROF_BEGIN();
+    if (heap && !heap->block && heap_reaper_enabled()) {
+        __atomic_sub_fetch(&g_bd12_heap_live[heap->type], 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&g_bd12_heap_bytes[heap->type], heap->size, __ATOMIC_RELAXED);
+        heap->accounted = 1;
+        if (heap_reaper_enqueue(heap)) { BD12_PROF_END(BD12_PROF_HEAP_DESTROY); return; }
+        heap->accounted = 0;                       /* no thread: free inline, counting as usual */
+        __atomic_add_fetch(&g_bd12_heap_live[heap->type], 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_bd12_heap_bytes[heap->type], heap->size, __ATOMIC_RELAXED);
+    }
     heap_destroy_impl(heap);
     BD12_PROF_END(BD12_PROF_HEAP_DESTROY);
 }
@@ -1159,8 +1256,10 @@ static void heap_destroy_impl(BD12Heap *heap)
     heap->device->vk.FreeMemory(heap->device->device, heap->memory, NULL);
     __atomic_sub_fetch(&g_bd12_dedicated_bytes[heap->type], heap->size, __ATOMIC_RELAXED);
     if (heap->rebar) __atomic_sub_fetch(&g_bd12_rebar_bytes, heap->size, __ATOMIC_RELAXED);
-    __atomic_sub_fetch(&g_bd12_heap_live[heap->type], 1, __ATOMIC_RELAXED);
-    __atomic_sub_fetch(&g_bd12_heap_bytes[heap->type], heap->size, __ATOMIC_RELAXED);
+    if (!heap->accounted) {
+        __atomic_sub_fetch(&g_bd12_heap_live[heap->type], 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&g_bd12_heap_bytes[heap->type], heap->size, __ATOMIC_RELAXED);
+    }
     free(heap);
 }
 
@@ -1282,6 +1381,52 @@ BD12Buffer *bd12_buffer_create_placed(BD12Heap *heap, VkDeviceSize offset,
     bd12_live_add(buffer);
     return buffer;
 
+fail_buffer:
+    device->vk.DestroyBuffer(device->device, buffer->buffer, NULL);
+fail:
+    free(buffer);
+    return NULL;
+}
+
+/* Reserved buffers: only the 64 KiB tiles a game maps take memory (UpdateTileMappings binds them into its heaps);
+ * unmapped ranges read zero. Onimusha reserves buffers of up to 84 MB and maps a few tiles of each. */
+BD12Buffer *bd12_buffer_create_sparse(BD12Device *device, VkDeviceSize size)
+{
+    const VkPhysicalDeviceFeatures *f = beer_vulkan_enabled_features();
+    if (!device || !size || !f || !f->sparseBinding || !f->sparseResidencyBuffer || !f->sparseResidencyAliased)
+        return NULL;
+    BD12Buffer *buffer = calloc(1, sizeof(*buffer));
+    if (!buffer) return NULL;
+    buffer->device = device;
+    pthread_mutex_init(&buffer->view_lock, NULL);
+    buffer->size = size;
+    buffer->sparse = 1;
+    const VkBufferCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+                 VK_BUFFER_CREATE_SPARSE_ALIASED_BIT,
+        .size = (size + 65535) & ~(VkDeviceSize)65535,
+        .usage = buffer_usage(),
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (device->vk.CreateBuffer(device->device, &info, NULL, &buffer->buffer) != VK_SUCCESS) goto fail;
+    VkMemoryRequirements requirements;
+    device->vk.GetBufferMemoryRequirements(device->device, buffer->buffer, &requirements);
+    if (!(requirements.memoryTypeBits & (1u << device->memory_type[BD12_HEAP_DEFAULT])) ||
+        requirements.alignment > 65536 || 65536 % requirements.alignment) {
+        static int logged;
+        if (!logged++)
+            fprintf(stderr, "[BD12] reserved buffers fully resident: sparse alignment %llu, memory types 0x%x\n",
+                    (unsigned long long)requirements.alignment, requirements.memoryTypeBits);
+        goto fail_buffer;
+    }
+    const VkBufferDeviceAddressInfo address = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+                                                .buffer = buffer->buffer };
+    buffer->va = device->vk.GetBufferDeviceAddress(device->device, &address);
+    if (!buffer->va || !va_insert(device, buffer)) goto fail_buffer;
+    buffer->serial = bd12_live_serial();
+    bd12_live_add(buffer);
+    return buffer;
 fail_buffer:
     device->vk.DestroyBuffer(device->device, buffer->buffer, NULL);
 fail:
@@ -1783,8 +1928,11 @@ void bd12_hitch_present(void)
     if (last && (int64_t)(now - last) > threshold_ns) {
         static const char *names[] = { "execute", "submit", "pso", "resolve", "fence-wait", "finish", "present",
                                        "heap-create", "heap-destroy", "alloc-set", "update-sets", "submit-lock",
-                                       "vk-submit", "reap", "list-finish", "resource-create", "view-create", "descriptor-copy" };
-        fprintf(stderr, "[HITCH] frame %llu took %.1f ms:", (unsigned long long)frame, (now - last) / 1e6);
+                                       "vk-submit", "reap", "list-finish", "resource-create", "view-create", "descriptor-copy", "pso-vk" };
+        {   extern uint64_t g_bd12_render_tid;
+            fprintf(stderr, "[HITCH] frame %llu took %.1f ms (ends at %.6f s monotonic, render tid %llu):",
+                    (unsigned long long)frame, (now - last) / 1e6, now / 1e9, (unsigned long long)g_bd12_render_tid);
+        }
         for (int i = 0; i < BD12_PROF_COUNT; ++i) {
             /* BEER_BD12_PROF resets the counters every 2 s: a smaller value means a reset, count from zero. */
             const uint64_t dn = g_bd12_prof_ns[i] >= ns[i] ? g_bd12_prof_ns[i] - ns[i] : g_bd12_prof_ns[i];
@@ -1828,7 +1976,7 @@ void bd12_prof_report(void)
     if (now - last < 2000000000ull) return;
     static const char *names[] = { "execute", "submit", "pso", "resolve",
                                    "fence-wait", "finish", "present", "heap-create", "heap-destroy",
-                                   "alloc-set", "update-sets", "submit-lock", "vk-submit", "reap", "list-finish", "resource-create", "view-create", "descriptor-copy" };
+                                   "alloc-set", "update-sets", "submit-lock", "vk-submit", "reap", "list-finish", "resource-create", "view-create", "descriptor-copy", "pso-vk" };
     fprintf(stderr, "[BD12 PROF] %llu ms window:", (unsigned long long)((now - last) / 1000000));
     for (int i = 0; i < BD12_PROF_COUNT; ++i) {
         fprintf(stderr, " %s=%llums/%llu", names[i],
