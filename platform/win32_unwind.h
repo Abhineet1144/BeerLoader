@@ -44,4 +44,17 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
                             void *context_record, uint64_t *handler_data,
                             uint64_t *establisher_frame, int *ok);
 
+/* AMD64 KNONVOLATILE_CONTEXT_POINTERS: 16 XMM slots, then 16 integer slots,
+ * both indexed by the register numbers in the unwind codes. */
+typedef struct {
+    uint64_t floating[16];
+    uint64_t integer[16];
+} BeerNonvolatileContextPointers;
+
+uint64_t beer_virtual_unwind_with_locations(uint32_t handler_type, uint64_t image_base,
+                            uint64_t control_pc, const BeerRuntimeFunction *function_entry,
+                            void *context_record, uint64_t *handler_data,
+                            uint64_t *establisher_frame,
+                            BeerNonvolatileContextPointers *locations, int *ok);
+
 #endif

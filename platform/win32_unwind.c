@@ -225,17 +225,20 @@ static unsigned unwind_operation_slots(unsigned op, unsigned op_info)
     }
 }
 
-uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
+uint64_t beer_virtual_unwind_with_locations(uint32_t handler_type, uint64_t image_base,
                             uint64_t control_pc,
                             const BeerRuntimeFunction *function_entry,
                             void *context_record, uint64_t *handler_data,
-                            uint64_t *establisher_frame, int *ok)
+                            uint64_t *establisher_frame,
+                            BeerNonvolatileContextPointers *locations, int *ok)
 {
     if (ok) *ok = 0;
     if (handler_data) *handler_data = 0;
     if (!image_base || !function_entry || !context_record) return 0;
 
     uint8_t saved[0x4d0];
+    BeerNonvolatileContextPointers updated;
+    if (locations) memcpy(&updated, locations, sizeof(updated));
     uint8_t *context = context_record;
     memcpy(saved, context, sizeof(saved));
     const BeerRuntimeFunction *entry = function_entry;
@@ -306,6 +309,7 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
             case UWOP_PUSH_NONVOL:
                 if (op_info >= 16) goto fail;
                 set_gp(context, op_info, read_u64((const void *)(uintptr_t)rsp));
+                if (locations) updated.integer[op_info] = rsp;
                 rsp += 8;
                 index++;
                 break;
@@ -334,6 +338,7 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
                 offset = (uint64_t)read_u16(codes + (index + 1) * 2) * 8;
                 set_gp(context, op_info,
                       read_u64((const void *)(uintptr_t)(save_base + offset)));
+                    if (locations) updated.integer[op_info] = save_base + offset;
                 index += 2;
                 break;
             case UWOP_SAVE_NONVOL_FAR:
@@ -341,6 +346,7 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
                 offset = read_u32(codes + (index + 1) * 2);
                 set_gp(context, op_info,
                       read_u64((const void *)(uintptr_t)(save_base + offset)));
+                    if (locations) updated.integer[op_info] = save_base + offset;
                 index += 3;
                 break;
             case UWOP_SAVE_XMM128:
@@ -348,6 +354,7 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
                 offset = (uint64_t)read_u16(codes + (index + 1) * 2) * 16;
                 memcpy(context + 0x1a0 + op_info * 16,
                       (const void *)(uintptr_t)(save_base + offset), 16);
+                    if (locations) updated.floating[op_info] = save_base + offset;
                 index += 2;
                 break;
             case UWOP_SAVE_XMM128_FAR:
@@ -355,6 +362,7 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
                 offset = read_u32(codes + (index + 1) * 2);
                 memcpy(context + 0x1a0 + op_info * 16,
                       (const void *)(uintptr_t)(save_base + offset), 16);
+                    if (locations) updated.floating[op_info] = save_base + offset;
                 index += 3;
                 break;
             case UWOP_PUSH_MACHFRAME: {
@@ -366,8 +374,7 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
                 memcpy(context + 0xf8, &rip, sizeof(rip));
                 set_gp(context, 4, final_rsp);
                 if (establisher_frame) *establisher_frame = final_rsp;
-                if (ok) *ok = 1;
-                return 0;
+                goto success;
             }
             default:
                 goto fail;
@@ -402,10 +409,21 @@ uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
         memcpy(context + 0xf8, &rip, sizeof(rip));
         set_gp(context, 4, rsp);
     }
+success:
+    if (locations) memcpy(locations, &updated, sizeof(updated));
     if (ok) *ok = 1;
     return handler;
 
 fail:
     memcpy(context, saved, sizeof(saved));
     return 0;
+}
+
+uint64_t beer_virtual_unwind(uint32_t handler_type, uint64_t image_base,
+                            uint64_t control_pc, const BeerRuntimeFunction *function_entry,
+                            void *context_record, uint64_t *handler_data,
+                            uint64_t *establisher_frame, int *ok)
+{
+    return beer_virtual_unwind_with_locations(handler_type, image_base, control_pc,
+        function_entry, context_record, handler_data, establisher_frame, NULL, ok);
 }

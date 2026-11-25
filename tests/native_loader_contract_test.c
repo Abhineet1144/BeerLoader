@@ -8,6 +8,52 @@
 #include "wow32_dll_contract.inc"
 
 static int native_veh_calls;
+static void crypt_binary_to_string_contract_test(void)
+{
+    const u8 sample[] = {0, 1, 2, 0xfd};
+    const char expected[] = "-----BEGIN CERTIFICATE-----\nAAEC/Q==\n-----END CERTIFICATE-----\n";
+    char out[128];
+    u32 count = 0;
+    assert(impl_CryptBinaryToStringA(sample, sizeof(sample), 0x80000000, NULL, &count));
+    assert(count == sizeof(expected));
+    --count;
+    assert(!impl_CryptBinaryToStringA(sample, sizeof(sample), 0x80000000, out, &count));
+    assert(g_last_error == 234 && count == sizeof(expected));
+    assert(impl_CryptBinaryToStringA(sample, sizeof(sample), 0x80000000, out, &count));
+    assert(count == sizeof(expected) - 1 && !strcmp(out, expected));
+    u8 long_sample[49] = {0};
+    count = sizeof(out);
+    assert(impl_CryptBinaryToStringA(long_sample, sizeof(long_sample), 1, out, &count));
+    assert(count == 72 && strspn(out, "A") == 64 && !strcmp(out + 64, "\r\nAA==\r\n"));
+    count = sizeof(out);
+    assert(impl_CryptBinaryToStringA(sample, sizeof(sample), 0x40000001, out, &count));
+    assert(count == 8 && !strcmp(out, "AAEC/Q=="));
+}
+
+static void unwind_register_locations_contract_test(void)
+{
+    u8 image[128] = {0};
+    const BeerRuntimeFunction function = {0x10, 0x40, 0x60};
+    /* Save XMM6 at RSP+16, save R12 at RSP+8, then undo the allocation
+     * and recover RBX from its push slot. */
+    const u8 unwind[] = {1, 16, 6, 0, 16, 0x68, 1, 0, 10, 0xc4, 1, 0,
+                         5, 0x32, 1, 0x30};
+    memcpy(image + function.unwind_data, unwind, sizeof(unwind));
+    _Alignas(16) u64 stack[] = {0, 12, 6, 7, 3, 0x1234};
+    u64 base = (u64)(uintptr_t)image;
+    u64 context[0x4d0 / 8] = {0};
+    u64 locations[32] = {0}; /* Windows layout: XMM first, then integer. */
+    locations[16 + 5] = (u64)(uintptr_t)&context[0xa0 / 8];
+    context[0x98 / 8] = (u64)(uintptr_t)stack;
+    impl_RtlVirtualUnwind(0, base, base + 0x21, (u64)(uintptr_t)&function,
+                          (u64)(uintptr_t)context, NULL, NULL, (u64)(uintptr_t)locations);
+    assert(context[0xf8 / 8] == stack[5]);
+    assert(locations[6] == (u64)(uintptr_t)&stack[2]);
+    assert(locations[16 + 3] == (u64)(uintptr_t)&stack[4]);
+    assert(locations[16 + 12] == (u64)(uintptr_t)&stack[1]);
+    assert(locations[16 + 5] == (u64)(uintptr_t)&context[0xa0 / 8]);
+}
+
 static void conversion_invalid_parameter_contract_test(void)
 {
     assert(!beer_module_may_be_faked("icu.dll"));
@@ -1807,8 +1853,131 @@ static void veh_guest_stack_contract_test(void)
     munmap(region, size);
 }
 
+static void winrt_apartment_contract_test(void)
+{
+    assert(find_impl("RoInitialize") == (ImplFn)impl_RoInitialize);
+    assert(find_impl("RoUninitialize") == (ImplFn)impl_RoUninitialize);
+    assert(impl_RoInitialize(2) == 0x80070057u);
+    assert(impl_RoInitialize(1) == 0);
+    assert(impl_CoInitializeEx(0, 0) == 1);
+    assert(impl_CoInitialize(0) == 0x80010106u);
+    impl_RoUninitialize();
+    assert(impl_RoInitialize(0) == 0x80010106u);
+    impl_CoUninitialize();
+    assert(impl_RoInitialize(0) == 0);
+    impl_RoUninitialize();
+}
+
+static void trace_exception_caller_contract_test(void)
+{
+    u8 thunk[THUNK_SZ];
+    u8 *saved_tramp = g_tramp;
+    const int saved_trace = g_api_trace;
+    const u64 saved_real = g_impl_real[0], saved_target = g_impl_targets[0];
+    g_tramp = thunk;
+    g_api_trace = 1;
+    emit_impl_thunk(0, (u64)impl_RaiseException_entry);
+    assert(g_impl_targets[0] == (u64)impl_RaiseException_entry);
+    emit_impl_thunk(0, (u64)impl_RoInitialize);
+    assert(g_impl_targets[0] == (u64)beer_trace_wrap);
+    g_tramp = saved_tramp;
+    g_api_trace = saved_trace;
+    g_impl_real[0] = saved_real;
+    g_impl_targets[0] = saved_target;
+}
+
+static void etw_provider_contract_test(void)
+{
+    const u8 provider[16] = {1};
+    u64 first = 0, second = 0;
+    assert(find_impl("EventSetInformation") == (ImplFn)impl_EventSetInformation);
+    assert(impl_EventRegister(NULL, NULL, NULL, &first) == 87 && !first);
+    assert(!impl_EventRegister(provider, NULL, NULL, &first) && first);
+    assert(!impl_EventRegister(provider, NULL, NULL, &second) && second && second != first);
+    assert(impl_EventSetInformation(first, 2, NULL, 1) == 87);
+    assert(impl_EventSetInformation(first, 2, provider, sizeof(provider)) == 50);
+    assert(!impl_EventUnregister(first));
+    assert(impl_EventSetInformation(first, 2, provider, sizeof(provider)) == 6);
+    assert(impl_EventUnregister(first) == 6);
+    assert(!impl_EventUnregister(second));
+}
+
+static void *error_mode_worker(void *arg)
+{
+    (void)arg;
+    assert(impl_GetThreadErrorMode() == 1);
+    assert(impl_SetThreadErrorMode(0, NULL));
+    assert(impl_GetThreadErrorMode() == 0);
+    return NULL;
+}
+
+static void thread_error_mode_contract_test(void)
+{
+    assert(find_impl("SetThreadErrorMode") == (ImplFn)impl_SetThreadErrorMode);
+    const u32 saved_process = (u32)impl_SetErrorMode(1);
+    const u32 saved_thread = t_error_mode;
+    const int saved_override = t_error_mode_set;
+    u32 old_mode = ~0u;
+    assert(impl_GetErrorMode() == 1 && impl_GetThreadErrorMode() == 1);
+    assert(impl_SetThreadErrorMode(0x8002, &old_mode) && old_mode == 1);
+    assert(!impl_SetThreadErrorMode(4, &old_mode) && g_last_error == 87 && old_mode == 1);
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, error_mode_worker, NULL));
+    assert(!pthread_join(thread, NULL));
+    assert(impl_GetErrorMode() == 1 && impl_GetThreadErrorMode() == 0x8002);
+    t_error_mode = saved_thread;
+    t_error_mode_set = saved_override;
+    impl_SetErrorMode(saved_process);
+}
+
+static void ilonly_pe32_contract_test(void)
+{
+    u8 file[0x400] = {0};
+    DosHdr *dos = (DosHdr *)file;
+    dos->magic = MZ_MAGIC;
+    dos->lfanew = 0x80;
+    *(u32 *)(file + 0x80) = PE_SIG;
+    FileHdr *coff = (FileHdr *)(file + 0x84);
+    coff->machine = 0x14c;
+    coff->chars = 0x2000;
+    coff->nsections = 1;
+    coff->opthdr_sz = 224;
+    u8 *opt = file + 0x98;
+    *(u16 *)opt = 0x10b;
+    *(u32 *)(opt + 56) = 0x2000;
+    *(u32 *)(opt + 60) = 0x200;
+    *(u32 *)(opt + 92) = 16;
+    *(DataDir *)(opt + 96 + 14 * sizeof(DataDir)) = (DataDir){0x1020, 72};
+    SecHdr *section = (SecHdr *)(opt + coff->opthdr_sz);
+    section->vrva = 0x1000;
+    section->vsz = section->raw_sz = 0x200;
+    section->raw_off = 0x200;
+    u8 *clr = file + 0x220;
+    *(u32 *)clr = 72;
+    *(DataDir *)(clr + 8) = (DataDir){0x1080, 32};
+    *(u32 *)(clr + 16) = 1;
+    memcpy(file + 0x280, "BSJB", 4);
+    size_t length = 0;
+    u8 *view = beer_map_ilonly_pe32(file, sizeof(file), &length);
+    assert(view && length == 0x2000 && !memcmp(view + 0x1080, "BSJB", 4));
+    assert(!munmap(view, length));
+    *(u32 *)(clr + 16) = 3; /* IL-only, but 32BITREQUIRED */
+    assert(!beer_map_ilonly_pe32(file, sizeof(file), &length));
+    *(u32 *)(clr + 16) = 0x11; /* native entry point */
+    assert(!beer_map_ilonly_pe32(file, sizeof(file), &length));
+    *(u32 *)(clr + 16) = 1;
+    assert(!beer_map_ilonly_pe32(file, sizeof(file) - 1, &length));
+}
+
 int main(void)
 {
+    crypt_binary_to_string_contract_test();
+    unwind_register_locations_contract_test();
+    ilonly_pe32_contract_test();
+    thread_error_mode_contract_test();
+    etw_provider_contract_test();
+    trace_exception_caller_contract_test();
+    winrt_apartment_contract_test();
     veh_guest_stack_contract_test();
     async_file_read_contract_test();
     steam_auth_callback_contract_test();

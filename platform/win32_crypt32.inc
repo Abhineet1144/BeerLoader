@@ -11,6 +11,7 @@
  * synthesized. Unsupported parameters fail with the native error codes. */
 
 #include <openssl/bio.h>
+#include <openssl/evp.h>
 #include <openssl/pkcs7.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -21,6 +22,49 @@
 #define BEER_CRYPT_E_NO_MATCH      0x80092009u
 #define BEER_TRUST_E_NOSIGNATURE   0x800B0100u
 #define BEER_NESTED_SIGNATURE_OID  "1.3.6.1.4.1.311.2.4.1"
+
+/* Certificate PEM and plain Base64. Windows wraps at 64 characters and
+ * counts the terminator in the size query, but not after a successful write. */
+static u64 __attribute__((ms_abi))
+impl_CryptBinaryToStringA(const u8 *bytes, u32 length, u32 flags, char *out, u32 *count)
+{
+    static const char header[] = "-----BEGIN CERTIFICATE-----";
+    static const char footer[] = "-----END CERTIFICATE-----";
+    const u32 no_cr = 0x80000000u, no_crlf = 0x40000000u;
+    const u32 format = flags & ~(no_cr | no_crlf);
+    if (!bytes || !count || format > 1) { g_last_error = 87; return 0; }
+    const char *separator = flags & no_cr ? "\n" : flags & no_crlf ? "" : "\r\n";
+    const size_t sep_len = strlen(separator);
+    const u64 lines = ((u64)length + 47) / 48;
+    const u64 encoded_len = (((u64)length + 2) / 3) * 4;
+    const u64 required = encoded_len + lines * sep_len + 1 +
+        (format == 0 ? sizeof(header) + sizeof(footer) - 2 + 2 * sep_len : 0);
+    if (required > UINT32_MAX) { g_last_error = 534; return 0; }
+    if (!out) { *count = (u32)required; return 1; }
+    if (*count < required) { *count = (u32)required; g_last_error = 234; return 0; }
+
+    char *p = out;
+    if (format == 0) {
+        memcpy(p, header, sizeof(header) - 1); p += sizeof(header) - 1;
+        memcpy(p, separator, sep_len); p += sep_len;
+    }
+    while (length) {
+        u8 line[65];
+        const u32 chunk = length > 48 ? 48 : length;
+        const int chars = EVP_EncodeBlock(line, bytes, (int)chunk);
+        memcpy(p, line, (size_t)chars); p += chars;
+        memcpy(p, separator, sep_len); p += sep_len;
+        bytes += chunk;
+        length -= chunk;
+    }
+    if (format == 0) {
+        memcpy(p, footer, sizeof(footer) - 1); p += sizeof(footer) - 1;
+        memcpy(p, separator, sep_len); p += sep_len;
+    }
+    *p = '\0';
+    *count = (u32)(required - 1);
+    return 1;
+}
 
 typedef struct { u32 magic; PKCS7 *p7; u8 *pending; size_t pending_length; } BeerCryptMsg;
 typedef struct { u32 magic; STACK_OF(X509) *certs; } BeerCertStore;

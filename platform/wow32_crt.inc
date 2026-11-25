@@ -132,30 +132,35 @@ static u64 w32_IsBadCodePtr(const u32 *args)
     return w32_IsBadReadPtr(probe);
 }
 /* GetModuleHandleEx: flags 1 = pin, 2 = unchanged refcount, 4 = the argument is an address inside the module. */
-static u64 w32_GetModuleHandleExA(const u32 *args)         /* (flags, name_or_address, module*) */
+/* GetModuleHandleEx(flags, name_or_address, module*). The name is passed as a host pointer: the W variant narrows it
+ * into a host buffer, whose 64-bit address cannot travel through a 32-bit argument slot (it was truncated and the
+ * lookup read garbage: the MSVC CRT's exit path in Pratfall's Launcher.exe faulted in w32_module_key). */
+static u64 w32_module_handle_ex(u32 flags, u32 address, const char *name, u32 out)
 {
-    if (!args[2]) { g_last_error = 87; return 0; }
+    if (!out) { g_last_error = 87; return 0; }
     u32 module = 0;
-    if (args[0] & 4) {
+    if (flags & 4) {                                         /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */
         u32 base, size;
         const u8 *exe = (const u8 *)(uintptr_t)g_w32_image;
         const W32NtHdrs *nt = (const W32NtHdrs *)(exe + ((const DosHdr *)exe)->lfanew);
-        if (args[1] >= g_w32_image && args[1] - g_w32_image < nt->opt.size_of_image) module = g_w32_image;
-        else if (w32_dll_image_range(args[1], &base, &size)) module = base;
-    } else if (!args[1]) module = g_w32_image;
-    else module = w32_module_by_name((const char *)W32_PTR(1));
+        if (address >= g_w32_image && address - g_w32_image < nt->opt.size_of_image) module = g_w32_image;
+        else if (w32_dll_image_range(address, &base, &size)) module = base;
+    } else if (!name) module = g_w32_image;
+    else module = w32_module_by_name(name);
     if (!module) { g_last_error = 126; return 0; }
-    *(u32 *)W32_PTR(2) = module;
+    *(u32 *)(uintptr_t)out = module;
     return 1;
+}
+static u64 w32_GetModuleHandleExA(const u32 *args)
+{
+    return w32_module_handle_ex(args[0], args[1], (args[0] & 4) || !args[1] ? NULL : (const char *)W32_PTR(1), args[2]);
 }
 static u64 w32_GetModuleHandleExW(const u32 *args)
 {
-    if (!args[2]) { g_last_error = 87; return 0; }
-    if ((args[0] & 4) || !args[1]) return w32_GetModuleHandleExA(args);
+    if ((args[0] & 4) || !args[1]) return w32_module_handle_ex(args[0], args[1], NULL, args[2]);
     char name[PATH_MAX];
     w32_narrow(W32_PTR(1), name, sizeof(name));
-    const u32 call[3] = { args[0], (u32)(uintptr_t)name, args[2] };
-    return w32_GetModuleHandleExA(call);
+    return w32_module_handle_ex(args[0], args[1], name, args[2]);
 }
 static u64 w32_SetWindowTextA(const u32 *args) { return w32_via_wide("SetWindowTextW", args, 2, 2); }
 static u64 w32_OpenEventA(const u32 *args) { (void)args; g_last_error = 2; return 0; }

@@ -368,6 +368,16 @@ static u64 w32_InitializeCriticalSectionAndSpinCount(const u32 *args)
     if (cs) cs->spin = args[1];
     return 1;
 }
+/* (cs, spin, flags): the flags (CRITICAL_SECTION_NO_DEBUG_INFO, ...) only affect debug bookkeeping. */
+static u64 w32_InitializeCriticalSectionEx(const u32 *args) { return w32_InitializeCriticalSectionAndSpinCount(args); }
+/* A 32-bit SLIST_HEADER is 8 bytes (next pointer, depth, sequence), all zero when empty. The MSVC CRT's startup
+ * initializes one and later pushes onto it; leaving it unwritten crashed Pratfall's Launcher.exe on a null next. */
+static u64 w32_InitializeSListHead(const u32 *args)
+{
+    u8 *head = W32_PTR(0);
+    if (head) memset(head, 0, 8);
+    return 0;
+}
 static u64 w32_DeleteCriticalSection(const u32 *args) { (void)args; return 0; }
 
 static void w32_cs_enter(W32CritSec *cs)
@@ -1827,6 +1837,18 @@ static u64 w32_EnumSystemLocalesA(const u32 *args)         /* (proc, flags): rep
     char *id = w32_heap_alloc(16, 0);
     if (!id) { g_last_error = 8; return 0; }
     snprintf(id, 16, "00000409");
+    const u32 argv[1] = { (u32)(uintptr_t)id };
+    w32_call(args[0], 1, argv);
+    w32_heap_free(id);
+    return 1;
+}
+static u64 w32_EnumSystemLocalesW(const u32 *args)         /* (proc, flags): as the A variant, UTF-16 */
+{
+    if (!args[0]) { g_last_error = 87; return 0; }
+    u16 *id = w32_heap_alloc(18 * sizeof(u16), 0);
+    if (!id) { g_last_error = 8; return 0; }
+    static const char text[] = "00000409";
+    for (size_t i = 0; i < sizeof(text); ++i) id[i] = (u8)text[i];
     const u32 argv[1] = { (u32)(uintptr_t)id };
     w32_call(args[0], 1, argv);
     w32_heap_free(id);

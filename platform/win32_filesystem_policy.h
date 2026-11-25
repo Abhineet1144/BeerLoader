@@ -46,6 +46,16 @@ static inline int beer_module_has_compat_file_identity(const char *lower_name)
     return lower_name && !strcmp(lower_name, "steamclient64.dll");
 }
 
+/* Steam's overlay renderer, which third-party Steam loaders (OnlineFix's SteamOverlay64.dll) open from the Steam
+ * folder only to check that it loads, never calling into it, and quit when it does not ("Failed to load steam
+ * overlay dll"). Beer has no Steam installation to provide it. When the requested file cannot be loaded, an empty
+ * stand-in module satisfies the request; a real file at the path is always loaded first, so this never hides one. */
+static inline int beer_module_stand_in_when_missing(const char *lower_name)
+{
+    return lower_name && (!strcmp(lower_name, "gameoverlayrenderer64.dll") ||
+                          !strcmp(lower_name, "gameoverlayrenderer.dll"));
+}
+
 /* An explicit DOS/UNC path is an instruction to load that image, not a module
  * basename search. Compatibility fallbacks may satisfy unresolved basename
  * requests, but must never replace a caller-selected application file. */

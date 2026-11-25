@@ -942,9 +942,16 @@ static u64 w32_RaiseException(const u32 *args)
         frame = next;
     }
     if (g_w32_unhandled_filter) {
-        const u32 ep[2] = { (u32)(uintptr_t)rec, (u32)(uintptr_t)ctx };
+        /* EXCEPTION_POINTERS in 32-bit memory, like the record and context: a host-stack array's address does not
+         * fit the 32-bit argument (it was truncated). */
+        u32 *ep = w32_heap_alloc(8, 1);
+        if (!ep) die("WoW32: out of memory raising an exception");
+        ep[0] = (u32)(uintptr_t)rec;
+        ep[1] = (u32)(uintptr_t)ctx;
         const u32 info = (u32)(uintptr_t)ep;
-        if ((s32)w32_call(g_w32_unhandled_filter, 1, &info) == -1) return 0;   /* EXCEPTION_CONTINUE_EXECUTION */
+        const s32 verdict = (s32)w32_call(g_w32_unhandled_filter, 1, &info);
+        w32_heap_free(ep);
+        if (verdict == -1) return 0;   /* EXCEPTION_CONTINUE_EXECUTION */
     }
     fprintf(stderr, "[WOW32] unhandled exception 0x%08x at 0x%08x\n", rec[0], rec[3]);
     impl_ExitProcess(rec[0]);
@@ -1711,6 +1718,7 @@ static const W32Api g_w32_apis[] = {
     {"GetSystemInfo", w32_GetSystemInfo, 4}, {"GetNativeSystemInfo", w32_GetNativeSystemInfo, 4},
     {"InitializeCriticalSection", w32_InitializeCriticalSection, 4},
     {"InitializeCriticalSectionAndSpinCount", w32_InitializeCriticalSectionAndSpinCount, 8},
+    {"InitializeCriticalSectionEx", w32_InitializeCriticalSectionEx, 12}, {"InitializeSListHead", w32_InitializeSListHead, 4},
     {"DeleteCriticalSection", w32_DeleteCriticalSection, 4},
     {"EnterCriticalSection", w32_EnterCriticalSection, 4},
     {"TryEnterCriticalSection", w32_TryEnterCriticalSection, 4},
@@ -2068,7 +2076,7 @@ static const W32Api g_w32_apis[] = {
     {"FreeEnvironmentStringsA", w32_FreeEnvironmentStrings, 4}, {"FreeEnvironmentStringsW", w32_FreeEnvironmentStrings, 4},
     W32_FWD("GetConsoleCP", 0), W32_FWD("GetConsoleMode", 8), W32_FWD("GetConsoleOutputCP", 0),
     W32_FWD("WriteConsoleA", 20), W32_FWD("WriteConsoleW", 20), W32_FWD("SetStdHandle", 8), W32_FWD("SetHandleCount", 4),
-    {"EnumSystemLocalesA", w32_EnumSystemLocalesA, 8}, W32_FWD("IsValidLocale", 8), W32_FWD("IsValidCodePage", 4),
+    {"EnumSystemLocalesA", w32_EnumSystemLocalesA, 8}, {"EnumSystemLocalesW", w32_EnumSystemLocalesW, 8}, W32_FWD("LCMapStringEx", 36), W32_FWD("IsValidLocale", 8), W32_FWD("IsValidCodePage", 4),
     W32_FWD("LCMapStringA", 24), W32_FWD("GetStringTypeA", 20),
     {"UnhandledExceptionFilter", w32_UnhandledExceptionFilter, 4},
     {"DialogBoxParamW", w32_DialogBoxParamW, 20}, W32_FWD("EndDialog", 8), W32_FWD("GetDlgItem", 8),
@@ -2425,6 +2433,31 @@ static void __attribute__((noreturn)) beer_wow32_main(const char *path)
     *(u32 *)(peb + 0xa8) = 0;
     *(u16 *)(peb + 0xac) = 19045;                          /* OSBuildNumber */
     *(u32 *)(peb + 0xb0) = 2;                              /* OSPlatformId */
+    {   /* RTL_USER_PROCESS_PARAMETERS32 at PEB+0x10, in the same page: the MSVC CRT's exit path reads
+         * ProcessParameters->Flags (Pratfall's Launcher.exe faulted at address 8 on a NULL pointer after starting
+         * the game). Length/MaximumLength, Flags = RTL_USER_PROC_PARAMS_NORMALIZED, and the image path and command
+         * line as UNICODE_STRING32 whose text is copied into the page. */
+        u8 *params = peb + 0x1000;
+        u16 *text = (u16 *)(peb + 0x2000);
+        const u16 *const limit = (const u16 *)(peb + 0x10000);
+        *(u32 *)(params + 0x00) = 0x2a0;                   /* MaximumLength */
+        *(u32 *)(params + 0x04) = 0x2a0;                   /* Length */
+        *(u32 *)(params + 0x08) = 1;                       /* Flags: normalized */
+        const u16 *sources[2] = { (const u16 *)(uintptr_t)impl_GetCommandLineW(), g_exe_path_w };
+        const u32 offsets[2] = { 0x40, 0x38 };             /* CommandLine, ImagePathName */
+        for (int k = 0; k < 2; ++k) {
+            const u16 *src = sources[k];
+            size_t n = 0;
+            while (src && src[n] && text + n + 1 < limit && n < 0x7ffe) ++n;
+            for (size_t i = 0; i < n; ++i) text[i] = src[i];
+            text[n] = 0;
+            *(u16 *)(params + offsets[k]) = (u16)(n * 2);              /* Length (bytes) */
+            *(u16 *)(params + offsets[k] + 2) = (u16)(n * 2 + 2);      /* MaximumLength */
+            *(u32 *)(params + offsets[k] + 4) = (u32)(uintptr_t)text;  /* Buffer */
+            text += n + 1;
+        }
+        *(u32 *)(peb + 0x10) = (u32)(uintptr_t)params;     /* ProcessParameters */
+    }
     const W32NtHdrs *nt = (const W32NtHdrs *)(image + ((const DosHdr *)image)->lfanew);
     if (!beer_security_init(image, nt->opt.size_of_image))
         die("WoW32: process security initialization failed (Windows error %u)", g_last_error);

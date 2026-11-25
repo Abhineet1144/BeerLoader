@@ -746,6 +746,20 @@ static int request_fullscreen_locked(int on)
     Atom wm_state = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE", 0);
     Atom wm_fs = g_x11.InternAtom(g_x11.display, "_NET_WM_STATE_FULLSCREEN", 0);
     if (!wm_state || !wm_fs) return 0;
+    if (!g_x11.win_resizable) {
+        /* A fixed-size window carries min == max size hints. Fullscreen: none, since the compositor sizes it to the
+         * monitor, and a window that cannot take the monitor's size is refused fullscreen (Godot 4 makes its
+         * fullscreen window 2 px taller than the screen, 2560x1442: Mutter left it a window below the top bar).
+         * Leaving fullscreen: the pin again, at the current size. */
+        XSizeHints size_hints;
+        memset(&size_hints, 0, sizeof(size_hints));
+        if (!on) {
+            size_hints.flags = (1L << 4) | (1L << 5); /* PMinSize | PMaxSize */
+            size_hints.min_width = size_hints.max_width = g_x11.width;
+            size_hints.min_height = size_hints.max_height = g_x11.height;
+        }
+        g_x11.SetWMNormalHints(g_x11.display, g_x11.window, &size_hints);
+    }
     if (!g_x11.visible) {
         const unsigned long state = (unsigned long)wm_fs;
         g_x11.ChangeProperty(g_x11.display, g_x11.window, wm_state, 4 /* XA_ATOM */, 32, 0 /* PropModeReplace */,
@@ -816,7 +830,13 @@ int xwayland_window_move_resize(int x, int y, int width, int height,
         pthread_mutex_unlock(&g_x11.lock);
         return 0;
     }
-    if (resize && !g_x11.win_resizable) {
+    int covers_desktop = 0;
+    if (resize) {   /* the borderless-fullscreen test below; such a window gets no size pin (request_fullscreen_locked) */
+        int sw = 0, sh = 0;
+        screen_size_locked(&sw, &sh);
+        covers_desktop = !g_x11.win_decorated && sw > 0 && sh > 0 && width >= sw && height >= sh;
+    }
+    if (resize && !g_x11.win_resizable && !covers_desktop) {
         /* A fixed-size window pins min == max to the old size; the window
          * manager would ignore the new size, leaving a borderless "fullscreen"
          * window stuck at its initial 1080p extent. Re-pin to the new size. */

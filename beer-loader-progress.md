@@ -1,5 +1,21 @@
 # Beer Loader — Active Development Context
 
+## SIFU: dark/flickering translucent cards (2026-11-26) — OPEN, likely NVIDIA 595+ driver regression
+
+Symptom (user): translucent smoke/light-shaft cards render as dark boxes (blue smoke visible inside), coloured flicker
+spreads from them; random places/times; same on D3D11 and D3D12 (SIFU now launches with `-dx12`, manager entry
+updated; UE4.26 has D3D12RHI). Frame capture: steps 544-548, pipelines 3e04d586f9f1a4b4 / a770d9a43f38aeac (forward
+-lit translucency, GPUScene stride 36, volumetric lightmap, fog volume) stamp near-black into the HDR scene colour.
+Ruled out (each tested): blend state (additive ONE/ONE, correct); volumetric fog (r.VolumetricFog=0 still flickers;
+fog/scattering volumes dumped: no NaN/Inf); constant buffers (no NaN in used ranges); View.OutOfBoundsMask debug path
+(cb0[140].x = 0); GPUScene ScatterCopyCS/Memcpy translation (correct); cross-submission memory visibility
+(BEER_BD12_LIST_BARRIER=list: still flickers). Lead: NVIDIA forum reports foliage flicker on Linux in The Crew
+Motorfest/Enshrouded/RDR2 with drivers 595.x, 610.57.04 (ours) and 615.x via vkd3d-proton, clean on 580.178.04;
+Windows fix 596.36 (bug 5950261) reportedly not in Linux. Next: same spot under Proton (if it flickers too -> driver),
+or a 580 driver. New diagnostics (env-gated): BEER_BD12_PSO_DUMP=<dir>[,hash] (stage SPIR-V + blend state per
+pipeline), BEER_BD12_NAN_SCAN=<hash,...> (root/table CBVs + CPU SRV buffers at draw), BEER_BD12_SRV_DUMP=<dir>,<hash>
+(sampled images copied at list end, written on kill -USR1). Logs /mnt/hdd2/beer-trace/sifu-*-20261126.log.
+
 ## Ghost of Tsushima reaches gameplay: split raw/typed descriptors (2026-11-25)
 
 User confirmed: GoT plays (New Game -> cutscene -> gameplay). Two GPU hangs (Xid 109) were both descriptor-type
@@ -25,7 +41,73 @@ mismatches in Beer's single-descriptor-per-slot heap, which vkd3d-proton avoids 
   cursor; fullscreen window takes the size of the window below it / clipped by dock and top bar (also Sekiro, WWM).
 - Logs: /mnt/hdd2/beer-trace/got-*-20261125.log. Launch: GhostOfTsushima.exe with BEER_DLL_BUILTIN=winmm.
 
-## Pratfall (Godot 4.6.1 Mono) .NET startup crash, partly fixed (2026-11-25)
+## Pratfall (Godot 4.6.1 Mono) startup (updated 2026-11-26)
+
+**Session creation still blocked:** A user-triggered retry (`/tmp/beer-pratfall-session-retry.log`)
+confirmed that `SteamMatchMaking009` uses Beer's offline object and that Steam callback polling runs.
+No call reached the instrumented offline `CreateLobby` slot after the click; the bundled Steam API
+wrapper was verified to dispatch to that slot. The offline backend cannot create lobbies, but a
+failed `CreateLobby` call is not the observed cause of this wait. A second user-triggered run
+(`/tmp/beer-pratfall-session-flow.log`) reached the Steam matchmaking accessor at startup, but neither
+the public `CreateLobby` nor `CreateListenSocketP2P` entry point fired. Read-only inspection of the
+managed code shows that the game selects its own offline lobby and connection managers when launched
+without `--steam`, as both diagnostic runs were. Steam API initialization alone does not select online
+hosting. The “Creating search party” text is set by the post-scene-load host callback, before the call
+to the selected lobby manager. The next local investigation is that manager's prefab-loading and UI
+completion flow, not the Steam callback queue. The build also has a separate local-mode menu handler;
+its availability in the visible UI and its gameplay result have not been verified.
+
+**2026-11-26 (later): Pratfall now starts and runs** (pratfall prefix; 60 s run: window/swapchain 2544x1301, Steam Input,
+save files written; killed by the test timeout, not a crash). Gameplay not yet checked by the user. Chain fixed (all
+generic, loader.c):
+- `steamclient64!Steam_IsKnownInterface` added (was missing: OnlineFix64 forwards its export to the client's and called
+  the null pointer = the old "null callback" blocker). True for the families Beer's interface factory serves.
+- Offline-object interfaces extended: inventory, HTTP, music (+remote), parental settings, Remote Play, screenshots,
+  timeline, video, game server (+stats). steam_api64 checks all of them; one missing one failed SteamAPI_Init.
+- .NET NLS globalization (no ICU): `LOCALE_INEUTRAL` (0x71) / `LOCALE_IREADINGLAYOUT` (0x70) in the locale table
+  (INEUTRAL failure = CultureNotSupported for en-US -> FailFast via infinite resource recursion);
+  new `GetCalendarInfoEx`, `EnumCalendarInfoExEx`, `EnumTimeFormatsEx` (Gregorian, en-US/ja-JP data consistent with
+  GetLocaleInfo), `FindNLSStringEx` (same folding rules as CompareStringW).
+- `ws2_32!WSAConnect` (= connect; connect data/QoS -> WSAEOPNOTSUPP like the TCP/IP provider).
+- **Fullscreen (2026-11-26):** `SetWindowLongPtrA` / `SetWindowLongA` were stubs returning 0 (Godot 4 sets
+  WS_POPUP through the A variant), so the window stayed decorated. Now share set_window_long_value. And Godot's
+  fullscreen window is 2 px taller than the screen (2560x1442): Mutter refused fullscreen for a window whose
+  min == max size hints exceed the monitor. Fullscreen requests now drop a fixed-size window's size hints
+  (re-pinned when leaving), and a desktop-covering borderless resize no longer re-pins. Verified with xprop:
+  _NET_WM_STATE_FULLSCREEN at 0,0 2560x1440.
+- **Overlay stand-in (2026-11-26):** OnlineFix's SteamOverlay64.dll only checks that
+  `C:\Program Files (x86)\Steam\GameOverlayRenderer64.dll` loads (no GetProcAddress on it). New policy
+  `beer_module_stand_in_when_missing` (win32_filesystem_policy.h, + test): gameoverlayrenderer(64).dll get an empty
+  stand-in module when the requested file cannot be loaded (real file always tried first). Pratfall now runs in the
+  `default` prefix (verified 3 launches: setup, fullscreen). The `pratfall` prefix link is no longer required.
+- **OPEN, intermittent (1 of 7 runs):** CoreCLR "Stack overflow." on two threads at once (0xc0000409 FailFast),
+  each with RSP outside its TEB stack range ("RSP outside!", RSP=0x82cbd0c0). Log
+  /mnt/hdd2/beer-trace/pratfall-standin-20261126.log. Not investigated yet.
+- **Online sessions (2026-11-26, night):** hosting needs `Pratfall.exe --steam` (launch_data.of: OnlineFix's
+  Launcher.exe passes `--steam --rendering-driver d3d12`; without --steam the game picks its offline lobby manager and
+  "Creating search party" spins forever), Steam mode `official`, and BEER_STEAM_NETWORKING_LIBRARY
+  (~/.local/share/beer/native/steam-networking/libGameNetworkingSockets.so; without it CreateListenSocketP2P -> 0 =
+  "Invalid Socket" -> internal CLR error). Godot's D3D12 renderer does not work on Beer (shader creation fails), so use
+  Vulkan (no --rendering-driver). With all three: lobby created on Steam, session level loads, player spawns.
+- Fixed on the way (generic): Launcher.exe (WOW32) - InitializeSListHead, InitializeCriticalSectionEx,
+  EnumSystemLocalesW, LCMapStringEx; PEB32 ProcessParameters (CRT exit read Flags through NULL); truncated host pointers
+  in w32 GetModuleHandleExW and the unhandled-exception filter's EXCEPTION_POINTERS. kernel32:
+  QueryUnbiasedInterruptTime/QueryInterruptTime(+Precise), GetSystemTimes (thread-pool gate thread; the intermittent
+  "Stack overflow." crash), InitializeContext(2)/CopyContext, GetThreadIOPendingFlag, RtlNtStatusToDosError,
+  FindStringOrdinal, EventWriteTransfer, IdnToAscii/Unicode, GetNLSVersionEx, IsNLSDefinedString, ResolveLocaleName
+  (found by diffing CoreLib's P/Invoke names against Beer; remaining gaps: threadpool I/O family, COM monikers, Var*).
+  Steam: ISteamUser voice slots 7-12 now real (platform/beer_steam_voice.c: Pulse mic capture, Opus in Steam's voice
+  packet format, per-sender decoders; roundtrip test in make test-steam; interop with real Steam clients untested);
+  ISteamInput struct returns (17 digital, 21 analog, 29 motion) fill the hidden return buffer (garbage = NaN movement);
+  offline-object interfaces now log "<interface> slot <n>" under BEER_STEAM_DIAGNOSTICS.
+- **OPEN (next): GC hang in a hosted session.** Beer cannot suspend/inspect/redirect running threads (SuspendThread is a
+  no-op after start, GetThreadContext returns no registers, SetThreadContext -> ERROR_NOT_SUPPORTED). CoreCLR's GC
+  suspension retries forever (repeated LocateXStateFeature) when a thread is busy in managed code; the game freezes.
+  Plan: signal-based suspension like Wine (handler saves ucontext, parks until ResumeThread; Get/SetThreadContext read/
+  edit it; a thread inside Beer reports its guest-entry context). Affects all games (Mono/Boehm GC, DRM) - gate on
+  Pratfall, RE8/RE9 and a Unity title.
+- (superseded) Manager entry must use prefix `pratfall` (the `default` prefix lacks the GameOverlayRenderer64.dll link ->
+  "Failed to load steam overlay dll"). Tests: test-input, test-native-loader, test-steam pass.
 
 Symptoms and keywords: Pratfall.exe dies with SIGSEGV ~6 s after launch, after `RoInitialize` delay-load failed and
 `icu.dll` not found; unhandled .NET exception in `System.Buffers.SharedArrayPool<char>`; "[SEH] frame 0 pc=...: no
@@ -38,14 +120,35 @@ the installed one) or the game shows "Failed to load steam overlay dll" and exit
   the NEXT fault on that thread (the next managed NullReferenceException) was not dispatched and killed the process.
   Cleared in RtlUnwindEx just before the target-frame handler runs. Also `RtlRestoreContext`/`NtContinue` now run
   `beer_prepare_direct_guest_resume` (`beer_restore_context_prepare`). RE8 75 s gate after: ~260 fps, no crash, no Xid.
-- **Still open:** the first NullReferenceException is `ArrayPoolEventSource.Log` == null inside
-  `SharedArrayPool<char>.Rent` (R2R CoreLib), i.e. the EventSource static init did not complete (ETW registration:
-  `EventSetInformation` export missing; ETW providers missing). Then managed code calls a virtual method on a precode
-  address. Not W^X (`DOTNET_EnableWriteXorExecute=0` same crash) and not EventSourceSupport. Next: log which ETW/Event*
-  functions CoreCLR calls (advapi32/ntdll EventRegister/EventSetInformation/EventWrite) and implement them; RoInitialize.
+- **WinRT startup fixed:** `RoInitialize` now resolves for the WinRT delay-load and shares per-thread apartment state
+  with COM; `RoUninitialize` balances it. A live run passed the former null call. No activation factories were added.
+- **Trace compatibility:** exception/context entry points bypass the API return-logging wrapper so their captured
+  caller is not the wrapper's host frame. The old traced run failed on the first C++ throw; the new traced run reaches
+  managed target unwind but later gets SIGBUS. Use the untraced run as the reference for the final crash.
+- **Two missing .NET imports fixed:** the first native throw decoded to `COR_E_ENTRYPOINTNOTFOUND` immediately
+  after the `advapi32!EventSetInformation` lookup. Implementing local ETW registration/teardown and returning
+  `ERROR_NOT_SUPPORTED` for metadata submission moved startup into assembly resolution. That exposed another
+  `EntryPointNotFoundException`, for `SetThreadErrorMode`, now implemented with per-thread state.
+- **AnyCPU assemblies now load:** CoreCLR uses the Windows loader for file-backed assemblies, including IL-only
+  PE32 files. Beer maps their sections at image RVAs, keeps the mapping read-only, and never invokes an x86 entry
+  point. The live run mapped `System.Runtime.dll` and `GodotSharp.dll` and entered Godot's script discovery.
+- **CoreCLR reflection crash fixed:** the GC wrote ordinary relocation metadata over an address later read
+  through a stale managed reference. CoreCLR requested the saved-register locations from `RtlVirtualUnwind`,
+  but Beer returned only the register values, not the writable locations needed to update roots. The new
+  ABI regression failed before the fix. Untraced launches now pass script discovery without `0x80131506`.
+- **Certificate enumeration loop fixed:** Godot retried the same root certificate on a failed
+  `CryptBinaryToStringA` call. Beer now serializes the existing certificate bytes to PEM. It does not
+  change trust decisions or add certificates. The next untraced launch reached Godot's project initialization
+  and Steam startup with Vulkan. Build and `make test-input` (including native-loader tests) passed.
+- **Current blocker:** shortly after `ISteamClient::ConnectToGlobalUser`, the bundled `steam_api64.dll`
+  calls a callback in `OnlineFix64.dll`. The callback jumps through a null pointer in that module's
+  private data, outside its declared PE import and delay-import tables. The resulting execute access
+  violation at address zero precedes Sentry's `TerminateProcess` call (`0xffff7001`, reported by Linux
+  as exit status 1). Logs: `/tmp/beer-pratfall-steam-exception.log`,
+  `/tmp/beer-pratfall-null-callback.log`, and `/tmp/beer-pratfall-exit-caller.log`.
 - Diagnostics used: gdb with `handle SIGSYS/SIGUSR1/SIGUSR2 nostop noprint pass` (loader uses them), `BEER_EXCEPTION_DIAGNOSTICS=1`.
 
-## Pratfall startup investigation — paused (2026-11-25)
+## Earlier Pratfall startup fixes (2026-11-25)
 
 - Executable: `/mnt/56A4064AA4062CD5/Games/Pratfall/Pratfall/Pratfall.exe`, Godot 4.6.1 Mono.
 - Original missing overlay repaired in the isolated `pratfall` prefix: linked the genuine installed
@@ -54,15 +157,14 @@ the installed one) or the game shows "Failed to load steam overlay dll" and exit
 - Generic loader bug fixed: GetProcAddress reused diagnostic-only import slots with no emitted thunk
   (observed timeGetDevCaps -> zero-filled code). Only reuse implementation-backed slots now.
   Native-loader regression failed before the fix and passes afterwards; final build and full test-input PASS.
-- Game still does NOT start. Subsequent logs show unsupported DWriteCreateFactory and
-  SHGetPropertyStoreForWindow returning zero/success, followed by null dereferences; WSOCK32 ordinal115
-  is also unresolved. Default Vulkan and explicit `--rendering-driver d3d12` both fail display initialization.
-  D3D12 attempt also requests missing D3D12GetInterface. Engine suggests OpenGL3, but no OpenGL attempt
-  was made; do not conclude that missing OpenGL is the root cause or the GPU driver is unsupported.
+- Fixed false success from optional DWrite and shell COM calls, added WSOCK32 ordinal forwarding, fixed CPU package
+  topology for worker discovery and section-backed virtual memory commits, and removed ICU from the fake DLL list.
+- Vulkan 1.4 Forward+ initializes on the RTX 4070 Ti SUPER. OpenGL is not a proven blocker. The game still does not
+  reach gameplay. Latest build, `make test-native-loader`, and `make test-input` passed.
 - Logs: `/tmp/beer-pratfall-overlay.log`, `/tmp/beer-pratfall-fixed.log`, `/tmp/beer-pratfall-d3d12.log`;
   regression logs `/tmp/beer-pratfall-negative-test.log`, `/tmp/beer-pratfall-native-test.log`,
   `/tmp/beer-pratfall-input-tests.log`. Test processes exited. No gameplay or stability claim.
-- User: if lack of OpenGL support blocks this game, stop and inform for now. Investigation paused.
+- User: if lack of OpenGL support blocks this game, stop and inform for now.
 
 ## Where Winds Meet after the 2026-11-21 game update: start-up fixed (2026-11-21)
 

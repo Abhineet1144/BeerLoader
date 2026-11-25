@@ -177,6 +177,34 @@ BD12GraphicsPipeline *bd12_graphics_pipeline_create(
         }
     }
     gp->shader_hash = hash;
+    {   /* BEER_BD12_PSO_DUMP=<dir>[,<hash>...] (diagnostic): writes each stage's SPIR-V of these pipelines (every
+         * pipeline without hashes) as <dir>/<pipeline hash>_<stage>.spv: maps a frame-capture step's pipeline hash
+         * to its shaders. */
+        const char *v = getenv("BEER_BD12_PSO_DUMP");
+        if (v && *v) {
+            char dir[512];
+            const char *comma = strchr(v, ',');
+            const size_t n = comma ? (size_t)(comma - v) : strlen(v);
+            snprintf(dir, sizeof(dir), "%.*s", (int)(n < sizeof(dir) - 1 ? n : sizeof(dir) - 1), v);
+            int want = !comma;
+            for (const char *h = comma; h && !want; h = strchr(h + 1, ','))
+                want = strtoull(h + 1, NULL, 16) == hash;
+            if (want)
+                fprintf(stderr, "[PSODUMP] %016llx rt=%u blend0 en=%d src=%d dst=%d op=%d srcA=%d dstA=%d opA=%d wm=%x "
+                        "depth=%d/%d func=%d\n", (unsigned long long)hash, desc->rt_count, desc->blend[0].blend_enable,
+                        (int)desc->blend[0].src_color, (int)desc->blend[0].dst_color, (int)desc->blend[0].color_op,
+                        (int)desc->blend[0].src_alpha, (int)desc->blend[0].dst_alpha, (int)desc->blend[0].alpha_op,
+                        desc->blend[0].write_mask, desc->depth_test, desc->depth_write, (int)desc->depth_func);
+            static const char *const names[STAGES] = { "vs", "hs", "ds", "gs", "ps", "as", "ms" };
+            for (int s = 0; want && s < STAGES; ++s) {
+                if (!stages[s]->spirv) continue;
+                char path[640];
+                snprintf(path, sizeof(path), "%s/%016llx_%s.spv", dir, (unsigned long long)hash, names[s]);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite(stages[s]->spirv, 1, stages[s]->spirv_bytes, f); fclose(f); }
+            }
+        }
+    }
     if (getenv("BEER_BD12_PSO_LOG"))
         fprintf(stderr, "[PSO] %016llx topo=%d fill=%d cull=%d ccw=%d clip=%d bias=%d depth=%d/%d func=%d "
                 "stencil=%d rt=%u blend0=%d wm0=%x ds=%d samples=%u\n",
@@ -1022,6 +1050,127 @@ static void bind_index(BD12CmdList *list)
     g->dirty &= ~BD12_DIRTY_INDEX;
 }
 
+/* BEER_BD12_NAN_SCAN=<hash>[,<hash>...] (diagnostic): at every draw of these graphics pipelines, the CPU-visible
+ * constant buffers it reads (root CBVs, table CBVs) and its root constants are scanned for NaN/Inf floats; hits are
+ * logged with the register, word index and value (rate-limited). Finds a NaN that comes from the game's own data
+ * versus one a shader computes. Constant buffers live in upload memory written before the draw is recorded. */
+static void nan_scan_draw(BD12CmdList *list)
+{
+    static uint64_t want[8];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char *v = getenv("BEER_BD12_NAN_SCAN");
+        while (v && *v && n < 8) {
+            char *end;
+            want[n] = strtoull(v, &end, 16);
+            if (end == v) break;
+            ++n;
+            v = *end == ',' ? end + 1 : end;
+        }
+    }
+    if (!n || !list->gfx.pipeline) return;
+    const uint64_t hash = list->gfx.pipeline->shader_hash;
+    int match = 0;
+    for (int i = 0; i < n; ++i) match |= want[i] == hash;
+    if (!match) return;
+    static uint64_t draws, hits;
+    ++draws;
+    const BD12BindState *state = &list->graphics;
+    const BD12RootSignature *rs = state->root_signature;
+    if (!rs) return;
+    for (uint32_t p = 0; p < rs->parameter_count; ++p) {
+        const BD12RootParameter *rp = &rs->parameters[p];
+        const BD12RootArgument *arg = &state->arguments[p];
+        const uint32_t *w = NULL;
+        uint64_t words = 0;
+        uint32_t reg = rp->shader_register, space = rp->space;
+        if (rp->type == BD12_ROOT_CONSTANTS) {
+            w = arg->constants;
+            words = rp->dword_count;
+        } else if (rp->type == BD12_ROOT_CBV && arg->value) {
+            VkDeviceSize offset = 0;
+            BD12Buffer *b = bd12_va_resolve(list->device, arg->value, &offset);
+            if (b && b->cpu && offset < b->size) {
+                w = (const uint32_t *)((const uint8_t *)b->cpu + offset);
+                words = (b->size - offset) / 4;
+                if (words > 1024) words = 1024;   /* 4 KB: UE4's largest uniform buffer (View) fits */
+            }
+        }
+        if (w && rp->type == BD12_ROOT_CBV && reg == 0 && words > 560 && (rp->visibility == 0 || rp->visibility == 5)) {   /* UE4 View.OutOfBoundsMask (cb0[140].x) */
+            static unsigned shown, zero;
+            if (w[560]) { if (shown++ < 200) fprintf(stderr, "[NANSCAN] draw %llu pso=%016llx param %u vis %u View cb0[140] = %08x %08x %08x "
+                                                     "%08x\n", (unsigned long long)draws, (unsigned long long)hash, p, rp->visibility, w[560],
+                                                     w[561], w[562], w[563]); }
+            else if (zero++ == 0) fprintf(stderr, "[NANSCAN] View cb0[140].x = 0 (first draw)\n");
+        }
+        if (w) {
+            for (uint64_t k = 0; k < words; ++k)
+                if ((w[k] & 0x7f800000u) == 0x7f800000u && w[k] != 0xffffffffu && hits < 2000) {
+                    ++hits;
+                    fprintf(stderr, "[NANSCAN] draw %llu pso=%016llx param %u vis %u b%u space%u word %llu = %08x (%s)\n",
+                            (unsigned long long)draws, (unsigned long long)hash, p, rp->visibility, reg, space, (unsigned long long)k,
+                            w[k], (w[k] & 0x7fffffu) ? "NaN" : "Inf");
+                }
+            continue;
+        }
+        if (rp->type != BD12_ROOT_TABLE || !list->heaps[0] || arg->value < list->heaps[0]->gpu_base) continue;
+        const BD12DescriptorHeap *heap = list->heaps[0];
+        const uint64_t first = (arg->value - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT;
+        uint32_t next = 0;
+        for (uint32_t r = 0; r < rp->range_count; ++r) {
+            const BD12DescriptorRange *dr = &rp->ranges[r];
+            const uint32_t off = dr->offset == BD12_RANGE_APPEND ? next : dr->offset;
+            next = dr->count == UINT32_MAX ? off : off + dr->count;
+            if (dr->type != BD12_RANGE_CBV && dr->type != BD12_RANGE_SRV) continue;
+            const uint32_t count = dr->count == UINT32_MAX || dr->count > 16 ? 16 : dr->count;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint64_t idx = first + off + i;
+                if (idx >= heap->count) break;
+                const BD12Descriptor *d = &heap->descriptors[idx];
+                /* source_buffer is only a diagnostic pointer: the buffer may be gone (or the pointer reused), so it is
+                 * checked against the live set and its serial before use (a stale one crashed SIFU, address 0x101). */
+                const BD12Buffer *sb = __atomic_load_n(&d->source_buffer, __ATOMIC_ACQUIRE);
+                const uint32_t serial = __atomic_load_n(&d->buffer_serial, __ATOMIC_RELAXED);
+                if ((d->kind != BD12_DESC_CBV && d->kind != BD12_DESC_SRV_BUFFER) || !sb || !bd12_live_has(sb) ||
+                    sb->serial != serial || d->offset >= sb->size)
+                    continue;
+                if (!sb->cpu) {
+                    static int gpu_only_logged;
+                    if (gpu_only_logged++ < 16)
+                        fprintf(stderr, "[NANSCAN] pso=%016llx table %s %c%u: GPU-only buffer (not scanned), range %llu\n",
+                                (unsigned long long)hash, d->kind == BD12_DESC_CBV ? "CBV" : "SRV",
+                                d->kind == BD12_DESC_CBV ? 'b' : 't', dr->base_register + i, (unsigned long long)d->range);
+                    continue;
+                }
+                const uint32_t *cw = (const uint32_t *)((const uint8_t *)sb->cpu + d->offset);
+                if (d->kind == BD12_DESC_CBV && dr->base_register + i == 0 && d->range >= 564 * 4 &&
+                    d->offset + 564 * 4 <= sb->size) {   /* UE4 View.OutOfBoundsMask (cb0[140].x) */
+                    static unsigned tshown, tzero;
+                    if (cw[560]) { if (tshown++ < 200) fprintf(stderr, "[NANSCAN] draw %llu pso=%016llx table View cb0[140] = "
+                                                               "%08x %08x %08x %08x\n", (unsigned long long)draws,
+                                                               (unsigned long long)hash, cw[560], cw[561], cw[562], cw[563]); }
+                    else if (tzero++ == 0) fprintf(stderr, "[NANSCAN] table View cb0[140].x = 0 (first draw)\n");
+                }
+                uint64_t cn = d->range / 4;
+                if (cn > (sb->size - d->offset) / 4) cn = (sb->size - d->offset) / 4;
+                if (cn > 4096) cn = 4096;   /* large SRV buffers: their start only */
+                for (uint64_t k = 0; k < cn; ++k)
+                    if ((cw[k] & 0x7f800000u) == 0x7f800000u && cw[k] != 0xffffffffu && hits < 2000) {
+                        ++hits;
+                        fprintf(stderr, "[NANSCAN] draw %llu pso=%016llx table %s %u space%u word %llu = %08x (%s)\n",
+                                (unsigned long long)draws, (unsigned long long)hash, d->kind == BD12_DESC_CBV ? "CBV b" : "SRV t",
+                                dr->base_register + i, dr->space,
+                                (unsigned long long)k, cw[k], (cw[k] & 0x7fffffu) ? "NaN" : "Inf");
+                    }
+            }
+        }
+    }
+    if ((draws & 4095) == 1)
+        fprintf(stderr, "[NANSCAN] %llu draws scanned, %llu hits\n", (unsigned long long)draws,
+                (unsigned long long)hits);
+}
+
 int bd12_cmd_draw(BD12CmdList *list, uint32_t vertex_count,
                   uint32_t instance_count, uint32_t first_vertex,
                   uint32_t first_instance)
@@ -1030,6 +1179,8 @@ int bd12_cmd_draw(BD12CmdList *list, uint32_t vertex_count,
     bd12_cmd_record_flight_op(list, BD12_FLIGHT_DRAW,
         list->gfx.pipeline->shader_hash, (uint64_t)vertex_count * instance_count,
         vertex_count, instance_count, 0);
+    nan_scan_draw(list);
+    bd12_srv_dump_draw(list, list->gfx.pipeline->shader_hash, &list->graphics);
     list->device->vk.CmdDraw(list->command_buffer, vertex_count, instance_count,
                              first_vertex, first_instance);
     bd12_capture_draw_step(list);
@@ -1047,6 +1198,8 @@ int bd12_cmd_draw_indexed(BD12CmdList *list, uint32_t index_count,
     bd12_cmd_record_flight_op(list, BD12_FLIGHT_DRAW_INDEXED,
         list->gfx.pipeline->shader_hash, (uint64_t)index_count * instance_count,
         index_count, instance_count, 0);
+    nan_scan_draw(list);
+    bd12_srv_dump_draw(list, list->gfx.pipeline->shader_hash, &list->graphics);
     list->device->vk.CmdDrawIndexed(list->command_buffer, index_count,
                                     instance_count, first_index, base_vertex,
                                     first_instance);

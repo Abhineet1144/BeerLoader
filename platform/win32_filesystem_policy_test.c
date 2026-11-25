@@ -33,6 +33,11 @@ int main(void)
     assert(!beer_module_has_compat_file_identity("steam_api64.dll"));
     assert(!beer_module_has_compat_file_identity("game.dll"));
     assert(!beer_module_has_compat_file_identity(NULL));
+    assert(beer_module_stand_in_when_missing("gameoverlayrenderer64.dll"));
+    assert(beer_module_stand_in_when_missing("gameoverlayrenderer.dll"));
+    assert(!beer_module_stand_in_when_missing("steamclient64.dll"));
+    assert(!beer_module_stand_in_when_missing("game.dll"));
+    assert(!beer_module_stand_in_when_missing(NULL));
     assert(beer_module_path_is_explicit("C:\\Games\\steam_api64.dll"));
     assert(beer_module_path_is_explicit("Z:/Games/steam_api64.dll"));
     assert(beer_module_path_is_explicit(".\\steam_api64.dll"));

@@ -4518,6 +4518,7 @@ void bd12_com_debug_dump(void)
     ComDevice *dev = g_com_device;
     if (!dev) return;
     bd12_rp_snap_dump();
+    bd12_srv_dump_write();   /* BEER_BD12_SRV_DUMP */
     bd12_ckpt_dump();   /* BEER_VK_CHECKPOINTS: a hang often never fails a submit, so the lost-submit dump never runs */
     for (uint32_t l = 0; l < dev->lane_count; ++l)
         fprintf(stderr, "[STACKS] bd12 lane %u submitted=%llu retired=%llu\n", l,

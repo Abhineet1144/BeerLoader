@@ -16,6 +16,7 @@ PLATFORM_SRCS = platform/beer_env.c platform/xwayland_backend.c platform/win32_e
                 platform/x64_fault_emulation.c platform/win32_vectored_exception.c platform/win32_unwind.c \
 				platform/win32_seh.c platform/win32_syscall.c platform/beer_message_dialog.c platform/beer_steam_session.c platform/beer_steam_mms.c platform/beer_icon_png.c platform/win32_native_heap.c platform/win32_sddl.c platform/win32_shell_strings.c platform/win32_variant.c platform/win32_schannel.c platform/wow32_math.c
 PLATFORM_SRCS += platform/beer_steam_networking.c
+PLATFORM_SRCS += platform/beer_steam_voice.c
 PLATFORM_SRCS += platform/win32_child.c
 VULKAN_SRCS = renderer/vulkan/vulkan_context.c \
                renderer/vulkan/vulkan_presenter.c \
@@ -68,6 +69,8 @@ test-child-startup:
 .PHONY: test-child-startup
 
 test-steam:
+	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_voice_test.c platform/beer_steam_voice.c -lpthread -ldl -lm -o /tmp/beer-steam-voice-test
+	/tmp/beer-steam-voice-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_networking_test.c platform/beer_steam_networking.c steam/pb.c -lpthread -ldl -o /tmp/beer-steam-networking-test
 	/tmp/beer-steam-networking-test
 	$(CC) -O2 -Wall -Wextra -Iplatform platform/beer_steam_networking_p2p_test.c platform/beer_steam_networking.c steam/pb.c -lpthread -ldl -o /tmp/beer-steam-networking-p2p-test

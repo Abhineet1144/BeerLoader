@@ -360,6 +360,7 @@ int bd12_cmd_list_begin(BD12CmdList *list)
 int bd12_cmd_list_end(BD12CmdList *list)
 {
     bd12_cmd_end_rendering(list);
+    bd12_srv_dump_list_end(list);   /* BEER_BD12_SRV_DUMP */
     bd12_gpuprof_list_end(list);
     list->recording = 0;
     return list->device->vk.EndCommandBuffer(list->command_buffer) == VK_SUCCESS;

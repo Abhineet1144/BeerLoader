@@ -814,3 +814,151 @@ void bd12_capture_flush(void)
 }
 
 int bd12_capture_pending(void) { return g_cap_count != 0; }
+
+/* BEER_BD12_SRV_DUMP=<dir>,<pso hash>[,<pso hash>...] (diagnostic): the images that draws of these graphics pipelines
+ * sample through their root tables (any stage) are copied whole (mip 0, every slice or layer) into host memory at the
+ * end of the command list that drew them, once per image; kill -USR1 writes them as <dir>/srv_<pso>_t<reg>_<w>x<h>x<d>
+ * _vk<format>_l<layout>.raw. Shows the inputs of a draw (volumetric lightmap bricks, lookup volumes) for offline checks
+ * such as Inf/NaN scans. */
+typedef struct { BD12Image *image; uint32_t serial, reg; uint64_t pso; VkImageLayout layout; BD12Buffer *rb;
+                 VkDeviceSize size; int written; } SrvDump;
+#define SRV_DUMP_MAX 64
+static SrvDump g_srv_dump[SRV_DUMP_MAX];
+static uint32_t g_srv_dump_count;
+static pthread_mutex_t g_srv_dump_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local struct { BD12CmdList *list; uint32_t n; uint32_t idx[SRV_DUMP_MAX]; } t_srv_pending;
+
+static const char *srv_dump_dir(uint64_t *want, int *nwant)
+{
+    static char dir[512];
+    static uint64_t hashes[8];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char *v = getenv("BEER_BD12_SRV_DUMP");
+        const char *comma = v ? strchr(v, ',') : NULL;
+        if (v && comma) {
+            snprintf(dir, sizeof(dir), "%.*s", (int)(comma - v), v);
+            for (const char *h = comma; h && n < 8; h = strchr(h + 1, ',')) hashes[n++] = strtoull(h + 1, NULL, 16);
+        }
+    }
+    if (want) memcpy(want, hashes, sizeof(hashes));
+    if (nwant) *nwant = n;
+    return n ? dir : NULL;
+}
+
+void bd12_srv_dump_draw(BD12CmdList *list, uint64_t pso, const BD12BindState *state)
+{
+    uint64_t want[8];
+    int n = 0;
+    if (!srv_dump_dir(want, &n)) return;
+    int match = 0;
+    for (int i = 0; i < n; ++i) match |= want[i] == pso;
+    if (!match || !state->root_signature || !list->heaps[0]) return;
+    const BD12RootSignature *rs = state->root_signature;
+    const BD12DescriptorHeap *heap = list->heaps[0];
+    for (uint32_t p = 0; p < rs->parameter_count; ++p) {
+        const BD12RootParameter *rp = &rs->parameters[p];
+        const uint64_t v = state->arguments[p].value;
+        if (rp->type != BD12_ROOT_TABLE || v < heap->gpu_base) continue;
+        const uint64_t first = (v - heap->gpu_base) / BD12_DESCRIPTOR_INCREMENT;
+        uint32_t next = 0;
+        for (uint32_t r = 0; r < rp->range_count; ++r) {
+            const BD12DescriptorRange *dr = &rp->ranges[r];
+            const uint32_t off = dr->offset == BD12_RANGE_APPEND ? next : dr->offset;
+            next = dr->count == UINT32_MAX ? off : off + dr->count;
+            if (dr->type != BD12_RANGE_SRV) continue;
+            const uint32_t count = dr->count == UINT32_MAX || dr->count > 32 ? 32 : dr->count;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint64_t idx = first + off + i;
+                if (idx >= heap->count) break;
+                const BD12Descriptor *d = &heap->descriptors[idx];
+                if (d->kind != BD12_DESC_SRV_IMAGE) continue;
+                BD12Image *im = __atomic_load_n(&d->image, __ATOMIC_ACQUIRE);
+                const uint32_t serial = __atomic_load_n(&d->image_serial, __ATOMIC_RELAXED);
+                if (!im || !bd12_live_has(im) || im->serial != serial || im->desc.samples > 1 ||
+                    !(im->aspect & VK_IMAGE_ASPECT_COLOR_BIT))
+                    continue;
+                pthread_mutex_lock(&g_srv_dump_lock);
+                int seen = 0;
+                for (uint32_t k = 0; k < g_srv_dump_count && !seen; ++k)
+                    seen = g_srv_dump[k].image == im && g_srv_dump[k].serial == serial;
+                if (!seen && g_srv_dump_count < SRV_DUMP_MAX && t_srv_pending.n < SRV_DUMP_MAX &&
+                    (!t_srv_pending.list || t_srv_pending.list == list)) {
+                    const uint32_t k = g_srv_dump_count++;
+                    g_srv_dump[k] = (SrvDump){ im, serial, dr->base_register + i, pso,
+                                               d->image_layout ? d->image_layout : VK_IMAGE_LAYOUT_GENERAL, NULL, 0, 0 };
+                    t_srv_pending.list = list;
+                    t_srv_pending.idx[t_srv_pending.n++] = k;
+                }
+                pthread_mutex_unlock(&g_srv_dump_lock);
+            }
+        }
+    }
+}
+
+/* At the end of a command list that drew a dumped pipeline (outside any render pass): the copies. */
+void bd12_srv_dump_list_end(BD12CmdList *list)
+{
+    if (!t_srv_pending.n || t_srv_pending.list != list) return;
+    BD12Device *device = list->device;
+    for (uint32_t q = 0; q < t_srv_pending.n; ++q) {
+        SrvDump *e = &g_srv_dump[t_srv_pending.idx[q]];
+        const BD12Image *im = e->image;
+        uint32_t block = 0, bw = 1, bh = 1;
+        bd12_format_block(im->desc.format, VK_IMAGE_ASPECT_COLOR_BIT, &bw, &bh, &block);
+        if (!block) continue;
+        const uint32_t w = im->desc.width, h = im->desc.height;
+        const uint32_t depth = im->desc.type == VK_IMAGE_TYPE_3D ? im->desc.depth_or_layers : 1;
+        const uint32_t layers = im->desc.type == VK_IMAGE_TYPE_3D ? 1 : im->desc.depth_or_layers;
+        const VkDeviceSize size = (VkDeviceSize)((w + bw - 1) / bw) * ((h + bh - 1) / bh) * block * depth * layers;
+        if (!size || size > (256u << 20)) continue;
+        e->rb = bd12_buffer_create_committed(device, BD12_HEAP_READBACK, size);
+        if (!e->rb || !e->rb->cpu) { e->rb = NULL; continue; }
+        e->size = size;
+        const VkImageMemoryBarrier2 to = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
+            .oldLayout = e->layout, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = im->image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers }
+        };
+        VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                                 .pImageMemoryBarriers = &to };
+        device->vk.CmdPipelineBarrier2(list->command_buffer, &dep);
+        const VkBufferImageCopy region = { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers }, { 0, 0, 0 },
+                                           { w, h, depth } };
+        device->vk.CmdCopyImageToBuffer(list->command_buffer, im->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        e->rb->buffer, 1, &region);
+        VkImageMemoryBarrier2 back = to;
+        back.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT; back.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        back.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        back.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; back.newLayout = e->layout;
+        dep.pImageMemoryBarriers = &back;
+        device->vk.CmdPipelineBarrier2(list->command_buffer, &dep);
+    }
+    t_srv_pending.n = 0;
+    t_srv_pending.list = NULL;
+}
+
+void bd12_srv_dump_write(void)
+{
+    const char *dir = srv_dump_dir(NULL, NULL);
+    if (!dir) return;
+    pthread_mutex_lock(&g_srv_dump_lock);
+    for (uint32_t k = 0; k < g_srv_dump_count; ++k) {
+        SrvDump *e = &g_srv_dump[k];
+        if (!e->rb || e->written) continue;
+        const BD12ImageDesc *d = &e->image->desc;
+        char path[700];
+        snprintf(path, sizeof(path), "%s/srv_%016llx_t%u_%ux%ux%u_vk%d_l%d_%s.raw", dir, (unsigned long long)e->pso,
+                 e->reg, d->width, d->height, d->depth_or_layers, (int)d->format, (int)e->layout,
+                 d->type == VK_IMAGE_TYPE_3D ? "3d" : "2d");
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(e->rb->cpu, 1, e->size, f); fclose(f); e->written = 1; }
+        fprintf(stderr, "[SRVDUMP] %s (%llu bytes)\n", path, (unsigned long long)e->size);
+    }
+    pthread_mutex_unlock(&g_srv_dump_lock);
+}

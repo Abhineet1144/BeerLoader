@@ -183,7 +183,6 @@ static u64 __attribute__((ms_abi)) stub_CharLowerBuffA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetMenuItemInfoA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_EnumPropsA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetWindowTextA(void){ return 0; }
-static u64 __attribute__((ms_abi)) stub_SetWindowLongA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetClassLongA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_SetClassLongPtrA(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_FindWindowA(void){ return 0; }
@@ -2467,7 +2466,6 @@ static u64 __attribute__((ms_abi)) stub_jre_LookupAccountSidW(void) { return 0; 
 static u64 __attribute__((ms_abi)) stub_jre_LookupAccountNameA(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_jre_LookupAccountSidA(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_jre_TransmitFile(void) { return 0; }
-static u64 __attribute__((ms_abi)) stub_jre_SetWindowLongPtrA(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_jre_mixerGetNumDevs(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_jre_midiOutGetNumDevs(void) { return 0; }
 static u64 __attribute__((ms_abi)) stub_jre_midiInGetNumDevs(void) { return 0; }

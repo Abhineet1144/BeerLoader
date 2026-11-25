@@ -114,6 +114,7 @@
 #include "beer_message_dialog.h"
 #include "beer_steam_session.h"
 #include "beer_steam_mms.h"
+#include "beer_steam_voice.h"
 #include "beer_icon_png.h"
 #include "win32_ki_dispatcher.h"
 #include "win32_native_heap.h"
@@ -1576,13 +1577,15 @@ static void emit_thunk(int idx)
  *   90 * 6                          nop pad                  (6)
  */
 static u64 beer_fast_sync_body(u64 fn);
+static int beer_trace_preserves_caller(u64 fn);
 static void emit_impl_thunk(int idx, u64 fn_ptr)
 {
     u8 *p = g_tramp + idx * THUNK_SZ;
     if (getenv("BEER_THUNK_NAMES")) fprintf(stderr, "[THUNK] %d 0x%llx %s\n", idx, (unsigned long long)(0x40000000ull + (u64)idx * THUNK_SZ), g_snames[idx] ? g_snames[idx] : "?");
     if (g_api_trace < 0) g_api_trace = getenv("BEER_API_TRACE") != NULL;
     g_impl_real[idx] = fn_ptr;
-    g_impl_targets[idx] = g_api_trace ? (u64)beer_trace_wrap : fn_ptr;
+    g_impl_targets[idx] = g_api_trace && beer_trace_preserves_caller(fn_ptr)
+        ? (u64)beer_trace_wrap : fn_ptr;
 
     u32 idx32 = (u32)idx;
     u64 tramp = (u64)beer_dispatch_trampoline;
@@ -2430,11 +2433,11 @@ static u64 __attribute__((ms_abi))
 impl_RtlVirtualUnwind(u32 type, u64 base, u64 pc, u64 func,
                        u64 ctx, u64 *data, u64 *frame, u64 ctxptrs)
 {
-    (void)ctxptrs;
     int ok = 0;
-    u64 handler = beer_virtual_unwind(type, base, pc,
-                                      (const BeerRuntimeFunction *)(uintptr_t)func,
-                                      (void *)(uintptr_t)ctx, data, frame, &ok);
+    u64 handler = beer_virtual_unwind_with_locations(type, base, pc,
+                         (const BeerRuntimeFunction *)(uintptr_t)func,
+                         (void *)(uintptr_t)ctx, data, frame,
+                         (BeerNonvolatileContextPointers *)(uintptr_t)ctxptrs, &ok);
     if (!ok && getenv("BEER_EXCEPTION_DIAGNOSTICS"))
         fprintf(stderr, "[UNWIND] rejected metadata pc=0x%lx function=%p base=0x%lx\n",
                 pc, (void *)(uintptr_t)func, base);
@@ -4092,7 +4095,7 @@ impl_GetProcAddress(u64 hmod, const char *procname)
             "Steam_BLoggedOn", "Steam_BReleaseSteamPipe",
             "Steam_ConnectToGlobalUser", "Steam_CreateLocalUser",
             "Steam_CreateSteamPipe", "Steam_FreeLastCallback",
-            "Steam_GetAPICallResult", "Steam_NotifyMissingInterface",
+            "Steam_GetAPICallResult", "Steam_IsKnownInterface", "Steam_NotifyMissingInterface",
             "Steam_ReleaseThreadLocalMemory", "Steam_ReleaseUser",
             "Steam_SetLocalIPBinding"
         };
@@ -5006,6 +5009,14 @@ extern void impl_RtlUnwindEx(void);
 extern void impl_RtlRestoreContext(void);
 extern void impl_NtContinue(void);
 extern void impl_RaiseException_entry(void);
+/* The trace wrapper inserts a return frame that is neither a guest caller
+ * nor one of the dispatch trampoline boundaries recognized by exception code. */
+static int beer_trace_preserves_caller(u64 fn)
+{
+    return fn != (u64)impl_RaiseException_entry && fn != (u64)impl_RtlCaptureContext &&
+           fn != (u64)impl_RtlUnwind && fn != (u64)impl_RtlUnwindEx &&
+           fn != (u64)impl_RtlRestoreContext && fn != (u64)impl_NtContinue;
+}
 volatile unsigned char beer_check_nonvolatile;
 void beer_report_clobber(unsigned mask, unsigned import_index);
 static __thread u64 t_diag_thread_arg;
@@ -5167,6 +5178,104 @@ static int beer_module_may_be_faked(const char *lname)
     if (getenv("BEER_FAKE_ANY_DLL")) return 1;    /* diagnostic: the old behaviour */
     return 0;
 }
+/* An x64 CLR can ask LoadLibraryEx for an AnyCPU PE32 assembly. Lay out
+ * its IL and metadata at their RVAs; never execute the PE32 bootstrap. */
+static u8 *beer_map_ilonly_pe32(const u8 *file, size_t size, size_t *length)
+{
+    if (size < sizeof(DosHdr) || ((const DosHdr *)file)->magic != MZ_MAGIC) return NULL;
+    const size_t pe = (u32)((const DosHdr *)file)->lfanew;
+    if (pe > size || size - pe < 24) return NULL;
+    u32 sig;
+    memcpy(&sig, file + pe, sizeof(sig));
+    const FileHdr *coff = (const FileHdr *)(file + pe + 4);
+    if (sig != PE_SIG || coff->machine != 0x14c || !(coff->chars & 0x2000) ||
+        coff->opthdr_sz < 96 + 15 * sizeof(DataDir) || coff->opthdr_sz > size - pe - 24)
+        return NULL;
+    const u8 *opt = file + pe + 24;
+    u16 magic;
+    u32 image_size, headers_size, dir_count;
+    DataDir clr;
+    memcpy(&magic, opt, 2);
+    memcpy(&image_size, opt + 56, 4);
+    memcpy(&headers_size, opt + 60, 4);
+    memcpy(&dir_count, opt + 92, 4);
+    memcpy(&clr, opt + 96 + 14 * sizeof(DataDir), sizeof(clr));
+    const size_t section_offset = pe + 24 + coff->opthdr_sz;
+    if (magic != 0x10b || dir_count < 15 || !coff->nsections ||
+        !image_size || image_size > (1u << 30) || headers_size > size || headers_size > image_size ||
+        headers_size < section_offset || (headers_size - section_offset) / sizeof(SecHdr) < coff->nsections ||
+        clr.size < 72 || clr.rva > image_size || image_size - clr.rva < clr.size)
+        return NULL;
+
+    const SecHdr *sections = (const SecHdr *)(file + section_offset);
+    for (u16 i = 0; i < coff->nsections; ++i) {
+        const SecHdr *s = &sections[i];
+        if (s->vrva < headers_size || s->vrva > image_size || s->vsz > image_size - s->vrva ||
+            s->raw_off > size || s->raw_sz > size - s->raw_off ||
+            (!s->vsz && s->raw_sz > image_size - s->vrva)) return NULL;
+    }
+    u8 *view = beer_mmap_granular(image_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (view == MAP_FAILED) return NULL;
+    memcpy(view, file, headers_size);
+    for (u16 i = 0; i < coff->nsections; ++i) {
+        const SecHdr *s = &sections[i];
+        size_t copy = s->raw_sz;
+        if (s->vsz && copy > s->vsz) copy = s->vsz;
+        memcpy(view + s->vrva, file + s->raw_off, copy);
+    }
+    u32 cb, flags;
+    DataDir metadata, native;
+    memcpy(&cb, view + clr.rva, 4);
+    memcpy(&metadata, view + clr.rva + 8, sizeof(metadata));
+    memcpy(&flags, view + clr.rva + 16, 4);
+    memcpy(&native, view + clr.rva + 64, sizeof(native));
+    if (cb < 72 || cb > clr.size || (flags & 0x13) != 1 || native.rva || native.size ||
+        metadata.size < 4 || metadata.rva > image_size || metadata.size > image_size - metadata.rva ||
+        memcmp(view + metadata.rva, "BSJB", 4) || mprotect(view, image_size, PROT_READ)) {
+        munmap(view, image_size);
+        return NULL;
+    }
+    *length = image_size;
+    return view;
+}
+
+/* Keep these views out of the native module table. Like Beer's native DLLs,
+ * their mappings remain valid for the process lifetime. */
+static u64 beer_load_ilonly_pe32(const char *host)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static struct { char *path; u8 *view; } images[256];
+    struct stat st;
+    u64 result = 0;
+    pthread_mutex_lock(&lock);
+    for (size_t i = 0; i < sizeof(images) / sizeof(*images); ++i) {
+        if (images[i].path) {
+            if (strcmp(images[i].path, host)) continue;
+            result = (u64)(uintptr_t)images[i].view;
+            break;
+        }
+        int fd = open(host, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) break;
+        const u8 *file = MAP_FAILED;
+        if (!fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= (1u << 30))
+            file = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (file == MAP_FAILED) break;
+        size_t length;
+        u8 *view = beer_map_ilonly_pe32(file, (size_t)st.st_size, &length);
+        munmap((void *)file, (size_t)st.st_size);
+        if (!view) break;
+        images[i].path = strdup(host);
+        if (!images[i].path) { munmap(view, length); break; }
+        images[i].view = view;
+        result = (u64)(uintptr_t)view;
+        fprintf(stderr, "[PE DLL] mapped IL-only PE32 %s at %p\n", host, (void *)view);
+        break;
+    }
+    pthread_mutex_unlock(&lock);
+    return result;
+}
+
 static u64 __attribute__((ms_abi))
 impl_LoadLibraryA(const char *name)
 {
@@ -5230,11 +5339,20 @@ impl_LoadLibraryA(const char *name)
     if (explicit_path) {
         char host[PATH_MAX];
         const int resolved = build_guest_dll_path(name, host, sizeof(host));
+        const u64 managed = resolved ? beer_load_ilonly_pe32(host) : 0;
+        if (managed) return managed;
+        if (beer_module_stand_in_when_missing(lname)) {   /* the file is absent: an empty stand-in (policy header) */
+            const u64 stand_in = dll_name_to_handle(lname, 1);
+            fprintf(stderr, "[IMPL] LoadLibraryA(\"%s\") -> not present; stand-in module %s\n", name,
+                    stand_in ? "loaded" : "unavailable");
+            g_last_error = stand_in ? 0 : 126;
+            return stand_in;
+        }
         fprintf(stderr, "[IMPL] LoadLibraryA(\"%s\") -> explicit path not loaded (%s)\n", name,
                 resolved ? host : "path does not resolve");
         g_last_error = 126; return 0;
     }
-    if (!beer_module_may_be_faked(lname) && !dll_name_to_handle(lname, 0)) {
+    if (!beer_module_may_be_faked(lname) && !beer_module_stand_in_when_missing(lname) && !dll_name_to_handle(lname, 0)) {
         fprintf(stderr, "[IMPL] LoadLibraryA(\"%s\") -> not found (not a Windows DLL)\n", name);
         g_last_error = 126; return 0;
     }
@@ -5315,11 +5433,20 @@ impl_LoadLibraryW(const u16 *name)
     if (explicit_path) {
         char host[PATH_MAX];
         const int resolved = build_guest_dll_path(narrow, host, sizeof(host));
+        const u64 managed = resolved ? beer_load_ilonly_pe32(host) : 0;
+        if (managed) return managed;
+        if (beer_module_stand_in_when_missing(lname)) {   /* the file is absent: an empty stand-in (policy header) */
+            const u64 stand_in = dll_name_to_handle(lname, 1);
+            fprintf(stderr, "[IMPL] LoadLibraryW(\"%s\") -> not present; stand-in module %s\n", narrow,
+                    stand_in ? "loaded" : "unavailable");
+            g_last_error = stand_in ? 0 : 126;
+            return stand_in;
+        }
         fprintf(stderr, "[IMPL] LoadLibraryW(\"%s\") -> explicit path not loaded (%s)\n", narrow,
                 resolved ? host : "path does not resolve");
         g_last_error = 126; return 0;
     }
-    if (!beer_module_may_be_faked(lname) && !dll_name_to_handle(lname, 0)) {
+    if (!beer_module_may_be_faked(lname) && !beer_module_stand_in_when_missing(lname) && !dll_name_to_handle(lname, 0)) {
         fprintf(stderr, "[IMPL] LoadLibraryW(\"%s\") -> not found (not a Windows DLL)\n", lname);
         g_last_error = 126; return 0;
     }
@@ -6694,6 +6821,373 @@ static u64 __attribute__((ms_abi)) impl_steam_offline_noop(void)
     }
     return 0;
 }
+/* Offline-object interfaces: one object per interface version (its name after the vtable pointer) and one entry
+ * function per vtable slot, so BEER_STEAM_DIAGNOSTICS can name the method a game calls ("[STEAM-OFFLINE] <interface>
+ * slot <n>"). Every method still returns 0 (no handle, no result, false). */
+#define STEAM_OFFLINE_SLOTS 160
+typedef struct { u64 vtable; const char *name; } SteamOfflineObject;
+static void steam_offline_report(u64 self, int slot)
+{
+    if (!getenv("BEER_STEAM_DIAGNOSTICS")) return;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static u64 seen[256];
+    static size_t count;
+    const SteamOfflineObject *object = (const SteamOfflineObject *)(uintptr_t)self;
+    const u64 key = ((u64)(uintptr_t)(object ? object->name : NULL) << 8) ^ (u64)slot;
+    pthread_mutex_lock(&lock);
+    size_t i;
+    for (i = 0; i < count; ++i) if (seen[i] == key) break;
+    if (i == count && count < sizeof(seen) / sizeof(*seen)) {
+        seen[count++] = key;
+        fprintf(stderr, "[STEAM-OFFLINE] %s slot %d (caller %p)\n", object && object->name ? object->name : "?", slot,
+                __builtin_return_address(1));
+    }
+    pthread_mutex_unlock(&lock);
+}
+static u64 __attribute__((ms_abi)) steam_offline_slot_0(u64 self) { steam_offline_report(self, 0); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_1(u64 self) { steam_offline_report(self, 1); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_2(u64 self) { steam_offline_report(self, 2); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_3(u64 self) { steam_offline_report(self, 3); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_4(u64 self) { steam_offline_report(self, 4); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_5(u64 self) { steam_offline_report(self, 5); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_6(u64 self) { steam_offline_report(self, 6); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_7(u64 self) { steam_offline_report(self, 7); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_8(u64 self) { steam_offline_report(self, 8); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_9(u64 self) { steam_offline_report(self, 9); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_10(u64 self) { steam_offline_report(self, 10); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_11(u64 self) { steam_offline_report(self, 11); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_12(u64 self) { steam_offline_report(self, 12); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_13(u64 self) { steam_offline_report(self, 13); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_14(u64 self) { steam_offline_report(self, 14); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_15(u64 self) { steam_offline_report(self, 15); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_16(u64 self) { steam_offline_report(self, 16); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_17(u64 self) { steam_offline_report(self, 17); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_18(u64 self) { steam_offline_report(self, 18); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_19(u64 self) { steam_offline_report(self, 19); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_20(u64 self) { steam_offline_report(self, 20); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_21(u64 self) { steam_offline_report(self, 21); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_22(u64 self) { steam_offline_report(self, 22); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_23(u64 self) { steam_offline_report(self, 23); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_24(u64 self) { steam_offline_report(self, 24); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_25(u64 self) { steam_offline_report(self, 25); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_26(u64 self) { steam_offline_report(self, 26); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_27(u64 self) { steam_offline_report(self, 27); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_28(u64 self) { steam_offline_report(self, 28); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_29(u64 self) { steam_offline_report(self, 29); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_30(u64 self) { steam_offline_report(self, 30); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_31(u64 self) { steam_offline_report(self, 31); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_32(u64 self) { steam_offline_report(self, 32); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_33(u64 self) { steam_offline_report(self, 33); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_34(u64 self) { steam_offline_report(self, 34); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_35(u64 self) { steam_offline_report(self, 35); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_36(u64 self) { steam_offline_report(self, 36); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_37(u64 self) { steam_offline_report(self, 37); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_38(u64 self) { steam_offline_report(self, 38); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_39(u64 self) { steam_offline_report(self, 39); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_40(u64 self) { steam_offline_report(self, 40); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_41(u64 self) { steam_offline_report(self, 41); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_42(u64 self) { steam_offline_report(self, 42); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_43(u64 self) { steam_offline_report(self, 43); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_44(u64 self) { steam_offline_report(self, 44); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_45(u64 self) { steam_offline_report(self, 45); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_46(u64 self) { steam_offline_report(self, 46); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_47(u64 self) { steam_offline_report(self, 47); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_48(u64 self) { steam_offline_report(self, 48); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_49(u64 self) { steam_offline_report(self, 49); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_50(u64 self) { steam_offline_report(self, 50); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_51(u64 self) { steam_offline_report(self, 51); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_52(u64 self) { steam_offline_report(self, 52); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_53(u64 self) { steam_offline_report(self, 53); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_54(u64 self) { steam_offline_report(self, 54); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_55(u64 self) { steam_offline_report(self, 55); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_56(u64 self) { steam_offline_report(self, 56); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_57(u64 self) { steam_offline_report(self, 57); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_58(u64 self) { steam_offline_report(self, 58); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_59(u64 self) { steam_offline_report(self, 59); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_60(u64 self) { steam_offline_report(self, 60); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_61(u64 self) { steam_offline_report(self, 61); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_62(u64 self) { steam_offline_report(self, 62); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_63(u64 self) { steam_offline_report(self, 63); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_64(u64 self) { steam_offline_report(self, 64); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_65(u64 self) { steam_offline_report(self, 65); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_66(u64 self) { steam_offline_report(self, 66); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_67(u64 self) { steam_offline_report(self, 67); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_68(u64 self) { steam_offline_report(self, 68); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_69(u64 self) { steam_offline_report(self, 69); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_70(u64 self) { steam_offline_report(self, 70); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_71(u64 self) { steam_offline_report(self, 71); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_72(u64 self) { steam_offline_report(self, 72); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_73(u64 self) { steam_offline_report(self, 73); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_74(u64 self) { steam_offline_report(self, 74); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_75(u64 self) { steam_offline_report(self, 75); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_76(u64 self) { steam_offline_report(self, 76); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_77(u64 self) { steam_offline_report(self, 77); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_78(u64 self) { steam_offline_report(self, 78); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_79(u64 self) { steam_offline_report(self, 79); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_80(u64 self) { steam_offline_report(self, 80); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_81(u64 self) { steam_offline_report(self, 81); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_82(u64 self) { steam_offline_report(self, 82); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_83(u64 self) { steam_offline_report(self, 83); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_84(u64 self) { steam_offline_report(self, 84); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_85(u64 self) { steam_offline_report(self, 85); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_86(u64 self) { steam_offline_report(self, 86); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_87(u64 self) { steam_offline_report(self, 87); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_88(u64 self) { steam_offline_report(self, 88); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_89(u64 self) { steam_offline_report(self, 89); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_90(u64 self) { steam_offline_report(self, 90); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_91(u64 self) { steam_offline_report(self, 91); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_92(u64 self) { steam_offline_report(self, 92); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_93(u64 self) { steam_offline_report(self, 93); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_94(u64 self) { steam_offline_report(self, 94); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_95(u64 self) { steam_offline_report(self, 95); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_96(u64 self) { steam_offline_report(self, 96); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_97(u64 self) { steam_offline_report(self, 97); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_98(u64 self) { steam_offline_report(self, 98); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_99(u64 self) { steam_offline_report(self, 99); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_100(u64 self) { steam_offline_report(self, 100); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_101(u64 self) { steam_offline_report(self, 101); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_102(u64 self) { steam_offline_report(self, 102); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_103(u64 self) { steam_offline_report(self, 103); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_104(u64 self) { steam_offline_report(self, 104); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_105(u64 self) { steam_offline_report(self, 105); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_106(u64 self) { steam_offline_report(self, 106); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_107(u64 self) { steam_offline_report(self, 107); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_108(u64 self) { steam_offline_report(self, 108); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_109(u64 self) { steam_offline_report(self, 109); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_110(u64 self) { steam_offline_report(self, 110); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_111(u64 self) { steam_offline_report(self, 111); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_112(u64 self) { steam_offline_report(self, 112); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_113(u64 self) { steam_offline_report(self, 113); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_114(u64 self) { steam_offline_report(self, 114); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_115(u64 self) { steam_offline_report(self, 115); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_116(u64 self) { steam_offline_report(self, 116); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_117(u64 self) { steam_offline_report(self, 117); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_118(u64 self) { steam_offline_report(self, 118); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_119(u64 self) { steam_offline_report(self, 119); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_120(u64 self) { steam_offline_report(self, 120); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_121(u64 self) { steam_offline_report(self, 121); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_122(u64 self) { steam_offline_report(self, 122); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_123(u64 self) { steam_offline_report(self, 123); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_124(u64 self) { steam_offline_report(self, 124); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_125(u64 self) { steam_offline_report(self, 125); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_126(u64 self) { steam_offline_report(self, 126); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_127(u64 self) { steam_offline_report(self, 127); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_128(u64 self) { steam_offline_report(self, 128); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_129(u64 self) { steam_offline_report(self, 129); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_130(u64 self) { steam_offline_report(self, 130); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_131(u64 self) { steam_offline_report(self, 131); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_132(u64 self) { steam_offline_report(self, 132); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_133(u64 self) { steam_offline_report(self, 133); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_134(u64 self) { steam_offline_report(self, 134); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_135(u64 self) { steam_offline_report(self, 135); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_136(u64 self) { steam_offline_report(self, 136); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_137(u64 self) { steam_offline_report(self, 137); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_138(u64 self) { steam_offline_report(self, 138); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_139(u64 self) { steam_offline_report(self, 139); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_140(u64 self) { steam_offline_report(self, 140); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_141(u64 self) { steam_offline_report(self, 141); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_142(u64 self) { steam_offline_report(self, 142); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_143(u64 self) { steam_offline_report(self, 143); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_144(u64 self) { steam_offline_report(self, 144); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_145(u64 self) { steam_offline_report(self, 145); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_146(u64 self) { steam_offline_report(self, 146); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_147(u64 self) { steam_offline_report(self, 147); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_148(u64 self) { steam_offline_report(self, 148); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_149(u64 self) { steam_offline_report(self, 149); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_150(u64 self) { steam_offline_report(self, 150); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_151(u64 self) { steam_offline_report(self, 151); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_152(u64 self) { steam_offline_report(self, 152); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_153(u64 self) { steam_offline_report(self, 153); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_154(u64 self) { steam_offline_report(self, 154); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_155(u64 self) { steam_offline_report(self, 155); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_156(u64 self) { steam_offline_report(self, 156); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_157(u64 self) { steam_offline_report(self, 157); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_158(u64 self) { steam_offline_report(self, 158); return 0; }
+static u64 __attribute__((ms_abi)) steam_offline_slot_159(u64 self) { steam_offline_report(self, 159); return 0; }
+typedef u64 __attribute__((ms_abi)) (*SteamOfflineSlot)(u64);
+static const SteamOfflineSlot g_steam_offline_slots[STEAM_OFFLINE_SLOTS] = {
+    steam_offline_slot_0,
+    steam_offline_slot_1,
+    steam_offline_slot_2,
+    steam_offline_slot_3,
+    steam_offline_slot_4,
+    steam_offline_slot_5,
+    steam_offline_slot_6,
+    steam_offline_slot_7,
+    steam_offline_slot_8,
+    steam_offline_slot_9,
+    steam_offline_slot_10,
+    steam_offline_slot_11,
+    steam_offline_slot_12,
+    steam_offline_slot_13,
+    steam_offline_slot_14,
+    steam_offline_slot_15,
+    steam_offline_slot_16,
+    steam_offline_slot_17,
+    steam_offline_slot_18,
+    steam_offline_slot_19,
+    steam_offline_slot_20,
+    steam_offline_slot_21,
+    steam_offline_slot_22,
+    steam_offline_slot_23,
+    steam_offline_slot_24,
+    steam_offline_slot_25,
+    steam_offline_slot_26,
+    steam_offline_slot_27,
+    steam_offline_slot_28,
+    steam_offline_slot_29,
+    steam_offline_slot_30,
+    steam_offline_slot_31,
+    steam_offline_slot_32,
+    steam_offline_slot_33,
+    steam_offline_slot_34,
+    steam_offline_slot_35,
+    steam_offline_slot_36,
+    steam_offline_slot_37,
+    steam_offline_slot_38,
+    steam_offline_slot_39,
+    steam_offline_slot_40,
+    steam_offline_slot_41,
+    steam_offline_slot_42,
+    steam_offline_slot_43,
+    steam_offline_slot_44,
+    steam_offline_slot_45,
+    steam_offline_slot_46,
+    steam_offline_slot_47,
+    steam_offline_slot_48,
+    steam_offline_slot_49,
+    steam_offline_slot_50,
+    steam_offline_slot_51,
+    steam_offline_slot_52,
+    steam_offline_slot_53,
+    steam_offline_slot_54,
+    steam_offline_slot_55,
+    steam_offline_slot_56,
+    steam_offline_slot_57,
+    steam_offline_slot_58,
+    steam_offline_slot_59,
+    steam_offline_slot_60,
+    steam_offline_slot_61,
+    steam_offline_slot_62,
+    steam_offline_slot_63,
+    steam_offline_slot_64,
+    steam_offline_slot_65,
+    steam_offline_slot_66,
+    steam_offline_slot_67,
+    steam_offline_slot_68,
+    steam_offline_slot_69,
+    steam_offline_slot_70,
+    steam_offline_slot_71,
+    steam_offline_slot_72,
+    steam_offline_slot_73,
+    steam_offline_slot_74,
+    steam_offline_slot_75,
+    steam_offline_slot_76,
+    steam_offline_slot_77,
+    steam_offline_slot_78,
+    steam_offline_slot_79,
+    steam_offline_slot_80,
+    steam_offline_slot_81,
+    steam_offline_slot_82,
+    steam_offline_slot_83,
+    steam_offline_slot_84,
+    steam_offline_slot_85,
+    steam_offline_slot_86,
+    steam_offline_slot_87,
+    steam_offline_slot_88,
+    steam_offline_slot_89,
+    steam_offline_slot_90,
+    steam_offline_slot_91,
+    steam_offline_slot_92,
+    steam_offline_slot_93,
+    steam_offline_slot_94,
+    steam_offline_slot_95,
+    steam_offline_slot_96,
+    steam_offline_slot_97,
+    steam_offline_slot_98,
+    steam_offline_slot_99,
+    steam_offline_slot_100,
+    steam_offline_slot_101,
+    steam_offline_slot_102,
+    steam_offline_slot_103,
+    steam_offline_slot_104,
+    steam_offline_slot_105,
+    steam_offline_slot_106,
+    steam_offline_slot_107,
+    steam_offline_slot_108,
+    steam_offline_slot_109,
+    steam_offline_slot_110,
+    steam_offline_slot_111,
+    steam_offline_slot_112,
+    steam_offline_slot_113,
+    steam_offline_slot_114,
+    steam_offline_slot_115,
+    steam_offline_slot_116,
+    steam_offline_slot_117,
+    steam_offline_slot_118,
+    steam_offline_slot_119,
+    steam_offline_slot_120,
+    steam_offline_slot_121,
+    steam_offline_slot_122,
+    steam_offline_slot_123,
+    steam_offline_slot_124,
+    steam_offline_slot_125,
+    steam_offline_slot_126,
+    steam_offline_slot_127,
+    steam_offline_slot_128,
+    steam_offline_slot_129,
+    steam_offline_slot_130,
+    steam_offline_slot_131,
+    steam_offline_slot_132,
+    steam_offline_slot_133,
+    steam_offline_slot_134,
+    steam_offline_slot_135,
+    steam_offline_slot_136,
+    steam_offline_slot_137,
+    steam_offline_slot_138,
+    steam_offline_slot_139,
+    steam_offline_slot_140,
+    steam_offline_slot_141,
+    steam_offline_slot_142,
+    steam_offline_slot_143,
+    steam_offline_slot_144,
+    steam_offline_slot_145,
+    steam_offline_slot_146,
+    steam_offline_slot_147,
+    steam_offline_slot_148,
+    steam_offline_slot_149,
+    steam_offline_slot_150,
+    steam_offline_slot_151,
+    steam_offline_slot_152,
+    steam_offline_slot_153,
+    steam_offline_slot_154,
+    steam_offline_slot_155,
+    steam_offline_slot_156,
+    steam_offline_slot_157,
+    steam_offline_slot_158,
+    steam_offline_slot_159,
+};
+static u64 steam_offline_object(const char *version)
+{
+    static u64 vtable[STEAM_OFFLINE_SLOTS];
+    static SteamOfflineObject objects[32];
+    static size_t count;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (!vtable[0])
+        for (size_t i = 0; i < STEAM_OFFLINE_SLOTS; ++i) vtable[i] = (u64)(uintptr_t)g_steam_offline_slots[i];
+    SteamOfflineObject *found = NULL;
+    for (size_t i = 0; i < count && !found; ++i)
+        if (!strcasecmp(objects[i].name, version)) found = &objects[i];
+    if (!found && count < sizeof(objects) / sizeof(*objects)) {
+        found = &objects[count++];
+        found->vtable = (u64)(uintptr_t)vtable;
+        found->name = strdup(version);
+    }
+    if (!found) found = &objects[0];   /* table full: share the first (still all-zero methods) */
+    pthread_mutex_unlock(&lock);
+    return (u64)(uintptr_t)found;
+}
 static u64 __attribute__((ms_abi)) steam_input_offline_init(u64 self, u32 explicitly_call_run_frame)
 {
     (void)self;
@@ -6704,6 +7198,33 @@ static u64 __attribute__((ms_abi)) steam_input_offline_shutdown(u64 self)
 {
     (void)self;
     return 1;
+}
+/* ISteamInput methods returning a struct: MSVC returns any struct from a C++ method through a hidden pointer (RDX
+ * here), which the callee fills and returns. The no-op slot left it unwritten, so callers read garbage as stick and
+ * trigger values: Pratfall's movement force became NaN in --steam mode and the player could not move. With no
+ * controllers: digital actions released and inactive, analog actions centred and inactive, motion at rest. Slots
+ * from steam_api64's flat wrappers (SteamInput006): 17, 21, 29. */
+static u64 __attribute__((ms_abi)) steam_input_offline_digital(u64 self, u8 *out, u64 controller, u64 action)
+{
+    (void)self; (void)controller; (void)action;
+    if (out) memset(out, 0, 2);                /* InputDigitalActionData_t { bState, bActive } */
+    return (u64)(uintptr_t)out;
+}
+static u64 __attribute__((ms_abi)) steam_input_offline_analog(u64 self, u8 *out, u64 controller, u64 action)
+{
+    (void)self; (void)controller; (void)action;
+    if (out) memset(out, 0, 16);               /* InputAnalogActionData_t { eMode, x, y, bActive } */
+    return (u64)(uintptr_t)out;
+}
+static u64 __attribute__((ms_abi)) steam_input_offline_motion(u64 self, u8 *out, u64 controller)
+{
+    (void)self; (void)controller;
+    if (out) {                                 /* InputMotionData_t: rotation quaternion xyzw, accel xyz, rot vel xyz */
+        memset(out, 0, 40);
+        const uint32_t one = 0x3f800000u;      /* identity rotation: w = 1.0f */
+        memcpy(out + 12, &one, 4);
+    }
+    return (u64)(uintptr_t)out;
 }
 static u64 steam_input_offline_interface(void)
 {
@@ -6719,12 +7240,36 @@ static u64 steam_input_offline_interface(void)
             vtable[i] = (u64)(uintptr_t)impl_steam_offline_noop;
         vtable[0] = (u64)(uintptr_t)steam_input_offline_init;
         vtable[1] = (u64)(uintptr_t)steam_input_offline_shutdown;
+        vtable[17] = (u64)(uintptr_t)steam_input_offline_digital;   /* GetDigitalActionData */
+        vtable[21] = (u64)(uintptr_t)steam_input_offline_analog;    /* GetAnalogActionData */
+        vtable[29] = (u64)(uintptr_t)steam_input_offline_motion;    /* GetMotionData */
         object = (u64)(uintptr_t)vtable;
     }
     return (u64)(uintptr_t)&object;
 }
 
 #include "platform/win32_steam_matchmaking.inc"
+
+static u64 __attribute__((ms_abi))
+steam_offline_create_lobby(u64 self, s32 type, s32 max_members)
+{
+    (void)self;
+    fprintf(stderr, "[STEAM-MMS] CreateLobby(type=%d, max=%d) -> call=0 (no matchmaking backend)\n",
+            type, max_members);
+    return 0;
+}
+
+static u64 steam_offline_matchmaking_vtable[160];
+static u64 steam_offline_matchmaking_object;
+static pthread_once_t steam_offline_matchmaking_once = PTHREAD_ONCE_INIT;
+
+static void steam_offline_matchmaking_init(void)
+{
+    for (size_t i = 0; i < sizeof(steam_offline_matchmaking_vtable) / sizeof(u64); ++i)
+        steam_offline_matchmaking_vtable[i] = (u64)(uintptr_t)impl_steam_offline_noop;
+    steam_offline_matchmaking_vtable[13] = (u64)(uintptr_t)steam_offline_create_lobby;
+    steam_offline_matchmaking_object = (u64)(uintptr_t)steam_offline_matchmaking_vtable;
+}
 
 static u64 __attribute__((ms_abi))
 impl_SteamInternal_CreateInterface(const char *version)
@@ -6764,17 +7309,22 @@ impl_SteamInternal_CreateInterface(const char *version)
      * them, so a game initializes Steam and simply never finds a lobby, server or connection. */
     if (strstr(lower, "steammatchmaking") && !strstr(lower, "steammatchmakingservers") && steam_mms_start())
         return steam_matchmaking_interface();
+    if (!strcmp(lower, "steammatchmaking009") && getenv("BEER_STEAM_DIAGNOSTICS")) {
+        pthread_once(&steam_offline_matchmaking_once, steam_offline_matchmaking_init);
+        fprintf(stderr, "[STEAM] %s served by the offline object (no matchmaking backend)\n", version);
+        return (u64)(uintptr_t)&steam_offline_matchmaking_object;
+    }
+    /* So do the services a single-player session never uses but steam_api checks for at init (Steam_IsKnownInterface;
+     * one missing one fails SteamAPI_Init: Pratfall's Facepunch.Steamworks): inventory (no items), HTTP (invalid request
+     * handle), music and music remote (not enabled), parental settings (lock off), Remote Play (no sessions),
+     * screenshots, timeline, video, and the game-server pair. */
     if (strstr(lower, "steamnetworking") || strstr(lower, "steammatchmaking") ||
-        strstr(lower, "steamparties") || strstr(lower, "steammatchgamesearch")) {
-        static u64 offline_vtab[160];
-        static u64 offline_object;
-        if (!offline_object) {
-            for (size_t i = 0; i < sizeof(offline_vtab) / sizeof(*offline_vtab); ++i)
-                offline_vtab[i] = (u64)(uintptr_t)impl_steam_offline_noop;
-            offline_object = (u64)(uintptr_t)offline_vtab;
-        }
+        strstr(lower, "steamparties") || strstr(lower, "steammatchgamesearch") || strstr(lower, "steaminventory") ||
+        strstr(lower, "steamhttp") || strstr(lower, "steammusic") || strstr(lower, "steamparentalsettings") ||
+        strstr(lower, "steamremoteplay") || strstr(lower, "steamscreenshots") || strstr(lower, "steamtimeline") ||
+        strstr(lower, "steamvideo") || strstr(lower, "steamgameserver")) {
         fprintf(stderr, "[STEAM] %s served by the offline object (no lobbies, servers or connections)\n", version);
-        return (u64)(uintptr_t)&offline_object;
+        return steam_offline_object(version);
     }
     fprintf(stderr, "[STEAM] unsupported interface %s\n", version);
     return 0;
@@ -6882,6 +7432,28 @@ static u64 __attribute__((ms_abi)) impl_Steam_GetAPICallResult(u32 pipe, u64 cal
     return 0;
 }
 static u64 __attribute__((ms_abi)) impl_Steam_ReleaseThreadLocalMemory(u32 thread_exit) { (void)thread_exit; return 0; }
+/* steamclient64!Steam_IsKnownInterface(version): whether the client can serve an interface version. Newer steam_api64
+ * builds ask it for every interface they wrap; Steam-client replacements (OnlineFix64) forward their own export to
+ * the real client's, so a missing export left them a null pointer to call (Pratfall: execute fault at address 0
+ * right after ConnectToGlobalUser). True exactly for the families Beer's interface factory hands out; matchmaking
+ * is answered without creating it (creating it starts the matchmaking service). */
+static u64 __attribute__((ms_abi)) impl_SteamInternal_CreateInterface(const char *version);
+static u64 __attribute__((ms_abi)) impl_Steam_IsKnownInterface(const char *version)
+{
+    if (!version || !*version) return 0;
+    char lower[128];
+    size_t n = strlen(version);
+    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+    for (size_t i = 0; i < n; ++i) {
+        const char c = version[i];
+        lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+    }
+    lower[n] = 0;
+    const int known = strstr(lower, "steammatchmaking") ? 1 : impl_SteamInternal_CreateInterface(version) != 0;
+    if (getenv("BEER_STEAM_DIAGNOSTICS"))
+        fprintf(stderr, "[STEAMCLIENT] Steam_IsKnownInterface(\"%s\") -> %d\n", version, known);
+    return (u64)known;
+}
 static u64 __attribute__((ms_abi)) impl_Steam_NotifyMissingInterface(u32 pipe, const char *version)
 {
     (void)pipe;
@@ -8021,6 +8593,37 @@ static u64 __attribute__((ms_abi)) steam_user_get_auth_ticket_for_web_api(u64 se
     return handle;                                       /* 0 is k_HAuthTicketInvalid */
 }
 
+/* ISteamUser voice chat (slots 7-12 in SteamUser017..023), on platform/beer_steam_voice.c: microphone capture
+ * through PulseAudio/PipeWire and Opus in Steam's voice packet format, so voice reaches and comes from players on the
+ * real Steam client. GetVoiceOptimalSampleRate is the codec rate, 24000 Hz: Facepunch.Steamworks rejects the 0 an
+ * unimplemented slot returned ("Sample Rate must be between 11025 and 48000", Pratfall's voice manager crashed the
+ * game when a session started). */
+static u64 __attribute__((ms_abi)) steam_user_voice_start(u64 self) { (void)self; beer_steam_voice_start(); return 0; }
+static u64 __attribute__((ms_abi)) steam_user_voice_stop(u64 self) { (void)self; beer_steam_voice_stop(); return 0; }
+static u64 __attribute__((ms_abi)) steam_user_voice_available(u64 self, u32 *compressed, u32 *uncompressed, u32 rate)
+{
+    (void)self; (void)rate;
+    if (uncompressed) *uncompressed = 0;   /* uncompressed voice is deprecated in the SDK */
+    return (u64)beer_steam_voice_available(beer_steam_user_id(), compressed);
+}
+static u64 __attribute__((ms_abi))
+steam_user_voice_get(u64 self, u32 want_compressed, void *dest, u32 dest_size, u32 *written, u32 want_uncompressed,
+                     void *uncompressed_dest, u32 uncompressed_size, u32 *uncompressed_written, u32 rate)
+{
+    (void)self; (void)want_uncompressed; (void)uncompressed_dest; (void)uncompressed_size; (void)rate;
+    if (uncompressed_written) *uncompressed_written = 0;
+    if (!(want_compressed & 0xff)) { if (written) *written = 0; return 3; }   /* k_EVoiceResultNoData */
+    return (u64)beer_steam_voice_get(beer_steam_user_id(), dest, dest_size, written);
+}
+static u64 __attribute__((ms_abi))
+steam_user_voice_decompress(u64 self, const void *compressed, u32 compressed_size, void *dest, u32 dest_size,
+                            u32 *written, u32 rate)
+{
+    (void)self;
+    return (u64)beer_steam_voice_decompress(compressed, compressed_size, dest, dest_size, written, rate);
+}
+static u64 __attribute__((ms_abi)) steam_user_voice_optimal_rate(u64 self) { (void)self; return BEER_VOICE_SAMPLE_RATE; }
+
 static u64 steam_user_interface(const char *lower_version)
 {
     if (!g_steam_api_official) return impl_SteamUser();
@@ -8193,6 +8796,12 @@ static void init_steam_fake(void) {
      * CSteamID still keys per-user saves. */
     g_steam_user_vtab[1] = (u64)steam_user_logged_on;     /* false unless official mode has a session */
     g_steam_user_vtab[2] = (u64)steam_user_get_steam_id;
+    g_steam_user_vtab[7] = (u64)steam_user_voice_start;           /* StartVoiceRecording */
+    g_steam_user_vtab[8] = (u64)steam_user_voice_stop;            /* StopVoiceRecording */
+    g_steam_user_vtab[9] = (u64)steam_user_voice_available;       /* GetAvailableVoice */
+    g_steam_user_vtab[10] = (u64)steam_user_voice_get;            /* GetVoice */
+    g_steam_user_vtab[11] = (u64)steam_user_voice_decompress;     /* DecompressVoice */
+    g_steam_user_vtab[12] = (u64)steam_user_voice_optimal_rate;   /* GetVoiceOptimalSampleRate */
     steam_vtab_unique_slots(g_steam_vtab, STEAM_VTAB_SZ);
     steam_vtab_unique_slots(g_steam_apps_vtab, STEAM_VTAB_SZ);
     steam_vtab_unique_slots(g_steam_friends_vtab, STEAM_VTAB_SZ);
@@ -8744,6 +9353,19 @@ impl_connect(u64 socket_handle, const void *address, s32 address_length)
     }
     beer_wsa_set_error(0);
     return 0;
+}
+
+/* WSAConnect: connect plus optional connection data and QoS. Winsock's TCP/IP provider supports neither connect data
+ * nor QoS (Windows fails them with WSAEOPNOTSUPP), and .NET passes nulls, so it is connect itself. */
+static u64 __attribute__((ms_abi))
+impl_WSAConnect(u64 socket_handle, const void *address, s32 address_length, const void *caller_data, void *callee_data,
+                const void *sqos, const void *gqos)
+{
+    if (caller_data || callee_data || sqos || gqos) {
+        beer_wsa_set_error(10045);     /* WSAEOPNOTSUPP */
+        return (u32)-1;                /* SOCKET_ERROR, as connect returns it */
+    }
+    return impl_connect(socket_handle, address, address_length);
 }
 
 static u64 __attribute__((ms_abi))
@@ -10474,13 +11096,36 @@ static int beer_app_user_model_id_self_test(void)
     return ok;
 }
 
-/* ---- COM CoInitialize ---- */
+/* COM and WinRT share the calling thread's apartment. This does not register
+ * any additional activation factories. */
+static __thread u32 t_apartment_refs;
+static __thread u32 t_apartment_model;
+
+static u64 beer_apartment_init(u32 model)
+{
+    if (t_apartment_refs && t_apartment_model != model)
+        return 0x80010106u; /* RPC_E_CHANGED_MODE */
+    t_apartment_model = model;
+    return t_apartment_refs++ ? 1 : 0; /* S_FALSE or S_OK; both need uninitialization */
+}
+
 static u64 __attribute__((ms_abi))
-impl_CoInitialize(u64 reserved) { (void)reserved; return 0; /* S_OK */ }
+impl_CoInitializeEx(u64 reserved, u32 model)
+{
+    if (reserved || (model & ~0x0eu)) return 0x80070057u; /* E_INVALIDARG */
+    return beer_apartment_init(model & 2u);
+}
 static u64 __attribute__((ms_abi))
-impl_CoInitializeEx(u64 reserved, u32 model) { (void)reserved;(void)model; return 0; }
+impl_CoInitialize(u64 reserved) { return impl_CoInitializeEx(reserved, 2); }
 static u64 __attribute__((ms_abi))
-impl_CoUninitialize(void) { return 0; }
+impl_CoUninitialize(void) { if (t_apartment_refs) --t_apartment_refs; return 0; }
+
+static u64 __attribute__((ms_abi)) impl_RoInitialize(u32 model)
+{
+    if (model > 1) return 0x80070057u; /* E_INVALIDARG */
+    return beer_apartment_init(model == 0 ? 2 : 0);
+}
+static void __attribute__((ms_abi)) impl_RoUninitialize(void) { impl_CoUninitialize(); }
 
 static u64 __attribute__((ms_abi))
 impl_CoCreateGuid(u8 *guid)
@@ -13716,6 +14361,44 @@ static u64 __attribute__((ms_abi)) impl_GetTickCount(void) {
     return beer_time_monotonic_ns_for(BEER_CLOCK_TICK) / 1000000u;
 }
 static u64 __attribute__((ms_abi)) impl_GetTickCount64(void) { return impl_GetTickCount(); }
+/* Interrupt time: 100 ns units since boot, from the same clock as GetTickCount so a program's timers agree. The
+ * unbiased forms exclude time spent suspended, which the Linux monotonic clock already does. .NET's TimerQueue reads
+ * QueryUnbiasedInterruptTime (Task.Delay: Pratfall's lobby creation stopped on EntryPointNotFoundException). */
+/* GetSystemTimes(idle, kernel, user): FILETIME totals over all processors in 100 ns units, from /proc/stat. As on
+ * Windows, kernel time includes idle time. .NET's thread pool samples it for its CPU-utilization heuristics; the
+ * missing export raised EntryPointNotFoundException on the thread pool's gate thread, whose exception report then
+ * overflowed that small stack ("Stack overflow.", Pratfall, intermittent). */
+static u64 __attribute__((ms_abi)) impl_GetSystemTimes(u64 *idle, u64 *kernel, u64 *user)
+{
+    unsigned long long v[8] = {0};
+    FILE *f = fopen("/proc/stat", "r");
+    int n = f ? fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5],
+                       &v[6], &v[7]) : 0;
+    if (f) fclose(f);
+    if (n < 4) { g_last_error = 31; return 0; }                 /* ERROR_GEN_FAILURE */
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) hz = 100;
+    const u64 scale = 10000000ull / (u64)hz;                    /* clock ticks -> 100 ns */
+    const u64 idle_ticks = v[3] + v[4];                         /* idle + iowait */
+    const u64 kernel_ticks = v[2] + v[5] + v[6] + v[7] + idle_ticks;   /* system + irq + softirq + steal + idle */
+    const u64 user_ticks = v[0] + v[1];                         /* user + nice */
+    if (idle) *idle = idle_ticks * scale;
+    if (kernel) *kernel = kernel_ticks * scale;
+    if (user) *user = user_ticks * scale;
+    return 1;
+}
+static u64 beer_interrupt_time_100ns(void) { return beer_time_monotonic_ns_for(BEER_CLOCK_TICK) / 100u; }
+static u64 __attribute__((ms_abi)) impl_QueryUnbiasedInterruptTime(u64 *time)
+{
+    if (!time) { g_last_error = 87; return 0; }
+    *time = beer_interrupt_time_100ns();
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_QueryInterruptTime(u64 *time)
+{
+    if (time) *time = beer_interrupt_time_100ns();
+    return 0;   /* VOID on Windows */
+}
 
 /* ---- File type / handles ---- */
 static int fh_get(u64 h);
@@ -13916,6 +14599,11 @@ static const char *beer_locale_info_ascii(u32 locale, u32 type)
     case 0x00000014: return japanese ? "yen" : "$";     /* SCURRENCY */
     case 0x00000015: return japanese ? "JPY" : "USD";   /* SINTLSYMBOL */
     case 0x0000005c: return japanese ? "ja-JP" : "en-US"; /* SNAME */
+    /* .NET's NLS culture setup (no ICU) fails a culture whose INEUTRAL query fails: CultureNotSupported for en-US
+     * itself, then infinite recursion formatting that message (Pratfall's FailFast at DateTime.Now). Beer's locales
+     * are both specific cultures, laid out left to right. */
+    case 0x00000070: return "0";                         /* IREADINGLAYOUT: left to right */
+    case 0x00000071: return "0";                         /* INEUTRAL: a specific culture */
     case 0x00001001: return japanese ? "Japanese" : "English"; /* SENGLANGUAGE */
     case 0x00001002: return japanese ? "Japan" : "United States"; /* SENGCOUNTRY */
     case 0x00001004: return japanese ? "932" : "1252";  /* IDEFAULTANSICODEPAGE */
@@ -13996,7 +14684,7 @@ static int beer_locale_info_number(u32 type, const char *value, u32 *result)
     case 0x01: case 0x05: case 0x09: case 0x0a: case 0x0b: case 0x0d:
     case 0x11: case 0x12: case 0x19: case 0x1a: case 0x1b: case 0x1c:
     case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
-    case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: case 0x5b:
+    case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: case 0x5b: case 0x70: case 0x71:
     case 0x1004: case 0x1005: case 0x1008: case 0x1009: case 0x100b:
     case 0x100c: case 0x100d: case 0x1010: case 0x1012:
         break;
@@ -20880,9 +21568,23 @@ static u64 __attribute__((ms_abi)) impl_GlobalFree(void *p)
     { return impl_HeapFree(impl_GetProcessHeap(), 0, p) ? 0 : (u64)p; }
 
 /* SetErrorMode */
-static u32 g_error_mode = 0;
+static _Atomic(u32) g_error_mode;
+static __thread u32 t_error_mode;
+static __thread int t_error_mode_set;
 static u64 __attribute__((ms_abi)) impl_SetErrorMode(u32 mode)
-    { u32 old=g_error_mode; g_error_mode=mode; return old; }
+    { return atomic_exchange_explicit(&g_error_mode, mode, memory_order_relaxed); }
+static u32 __attribute__((ms_abi)) impl_GetThreadErrorMode(void)
+{
+    return t_error_mode_set ? t_error_mode : atomic_load_explicit(&g_error_mode, memory_order_relaxed);
+}
+static int __attribute__((ms_abi)) impl_SetThreadErrorMode(u32 mode, u32 *old_mode)
+{
+    if (mode & ~0x8003u) { g_last_error = 87; return 0; }
+    if (old_mode) *old_mode = impl_GetThreadErrorMode();
+    t_error_mode = mode;
+    t_error_mode_set = 1;
+    return 1;
+}
 
 /* ── USER32 window system ─────────────────────────────────────────── */
 
@@ -21085,8 +21787,56 @@ static u64 __attribute__((ms_abi)) impl_LookupPrivilegeValue(const void *system,
 { (void)system; (void)name; if (!luid) { g_last_error = 87; return 0; } luid[0] = 20; luid[1] = 0; return 1; }
 static u64 __attribute__((ms_abi)) impl_AdjustTokenPrivileges(u64 token, u32 disable_all, void *new_state, u32 len, void *old, u32 *ret)
 { (void)token; (void)disable_all; (void)new_state; (void)len; (void)old; if (ret) *ret = 0; g_last_error = 0; return 1; }
-static u64 __attribute__((ms_abi)) impl_EventRegister(const void *provider, void *callback, void *context, u64 *handle)
-{ (void)provider; (void)callback; (void)context; if (handle) *handle = 0x7E0E0001ull; return 0; }
+/* No ETW controller is available. Track provider lifetimes locally so a
+ * registration can be identified and unregistered without advertising a session. */
+static pthread_mutex_t g_etw_lock = PTHREAD_MUTEX_INITIALIZER;
+static u64 g_etw_next_handle = 1;
+static u64 g_etw_registrations[256];
+
+static u32 __attribute__((ms_abi)) impl_EventRegister(const void *provider, void *callback, void *context, u64 *handle)
+{
+    (void)callback;
+    (void)context;
+    if (!handle) return 87; /* ERROR_INVALID_PARAMETER */
+    *handle = 0;
+    if (!provider) return 87;
+    pthread_mutex_lock(&g_etw_lock);
+    for (size_t i = 0; i < sizeof(g_etw_registrations) / sizeof(*g_etw_registrations); ++i) {
+        if (g_etw_registrations[i]) continue;
+        *handle = g_etw_registrations[i] = g_etw_next_handle++;
+        break;
+    }
+    pthread_mutex_unlock(&g_etw_lock);
+    return *handle ? 0 : 8; /* ERROR_NOT_ENOUGH_MEMORY */
+}
+
+static u32 beer_etw_registration_status(u64 handle, int remove)
+{
+    if (!handle) return 6; /* ERROR_INVALID_HANDLE */
+    u32 status = 6;
+    pthread_mutex_lock(&g_etw_lock);
+    for (size_t i = 0; i < sizeof(g_etw_registrations) / sizeof(*g_etw_registrations); ++i) {
+        if (g_etw_registrations[i] != handle) continue;
+        if (remove) g_etw_registrations[i] = 0;
+        status = 0;
+        break;
+    }
+    pthread_mutex_unlock(&g_etw_lock);
+    return status;
+}
+
+static u32 __attribute__((ms_abi)) impl_EventSetInformation(u64 handle, u32 info_class, const void *info, u32 size)
+{
+    (void)info_class;
+    if (size && !info) return 87;
+    const u32 status = beer_etw_registration_status(handle, 0);
+    return status ? status : 50; /* ERROR_NOT_SUPPORTED: no controller to receive metadata */
+}
+
+static u32 __attribute__((ms_abi)) impl_EventUnregister(u64 handle)
+{
+    return beer_etw_registration_status(handle, 1);
+}
 #include "platform/win32_sddl.h"
 #include "platform/win32_advapi_misc.inc"
 
@@ -24805,6 +25555,16 @@ impl_GetWindowLongPtrW(u64 hw, s32 idx)
 static u64 __attribute__((ms_abi))
 impl_GetWindowLongPtrA(u64 hw, s32 idx)
     { return impl_GetWindowLongPtrW(hw, idx); }
+/* The ANSI setters store the same values: styles, extended styles, user data and the window procedure (Beer calls a
+ * procedure with the same messages either way). They were stubs returning 0, so Godot 4's fullscreen switch
+ * (SetWindowLongPtrA GWL_STYLE = WS_POPUP, then MoveWindow over the monitor) never reached the native window, which
+ * stayed decorated and was placed below the top bar instead of fullscreen (Pratfall). */
+static u64 __attribute__((ms_abi))
+impl_SetWindowLongPtrA(u64 hw, s32 idx, u64 new_value)
+    { return set_window_long_value(hw, idx, new_value); }
+static u64 __attribute__((ms_abi))
+impl_SetWindowLongA(u64 hw, s32 idx, s32 new_value)
+    { return (u32)set_window_long_value(hw, idx, (u32)new_value); }
 static u64 __attribute__((ms_abi))
 impl_SetWindowLongW(u64 hw, s32 idx, s32 new_value)
     { return (u32)set_window_long_value(hw, idx, (u32)new_value); }
@@ -25461,6 +26221,190 @@ impl_EnumSystemLocalesEx(u64 callback, u32 flags, u64 lparam, void *reserved)
     return 1;
 }
 
+/* ---- NLS calendar data (GetCalendarInfoEx, EnumCalendarInfoExEx, EnumTimeFormatsEx) ----------------------------
+ * .NET on Windows without ICU builds DateTimeFormatInfo from these (CalendarData.NlsLoadCalendarDataFromSystem,
+ * CultureData.EnumTimeFormats); a missing export is an EntryPointNotFoundException at the first formatted date
+ * (Pratfall: DateTime string interpolation during start-up). Beer's locales use the Gregorian calendar
+ * (CAL_GREGORIAN = 1) with English names; the date patterns are the ones GetLocaleInfo reports. */
+static const char *const g_cal_days[7] = { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
+static const char *const g_cal_months[12] = { "January", "February", "March", "April", "May", "June", "July", "August",
+                                              "September", "October", "November", "December" };
+
+static int beer_cal_locale_japanese(u64 locale)
+{
+    const u16 *name = (const u16 *)locale;
+    return name && (u16_ascii_equal_ci(name, "ja-JP") || u16_ascii_equal_ci(name, "Japanese"));
+}
+
+/* The text of CALTYPE `type` (flags stripped), or NULL when Beer has none; *number set for CAL_ITWODIGITYEARMAX. */
+static const char *beer_calendar_text(int japanese, u32 type, char *scratch, size_t scratch_size, u32 *number)
+{
+    const u32 lcid = japanese ? 0x0411u : 0x0409u;
+    *number = 0;
+    if (type >= 0x07 && type <= 0x0d) return g_cal_days[type - 0x07];                     /* SDAYNAME1..7 */
+    if (type >= 0x0e && type <= 0x14) {                                                    /* SABBREVDAYNAME1..7 */
+        snprintf(scratch, scratch_size, "%.3s", g_cal_days[type - 0x0e]);
+        return scratch;
+    }
+    if (type >= 0x31 && type <= 0x37) {                                                    /* SSHORTESTDAYNAME1..7 */
+        snprintf(scratch, scratch_size, "%.2s", g_cal_days[type - 0x31]);
+        return scratch;
+    }
+    if (type >= 0x15 && type <= 0x20) return g_cal_months[type - 0x15];                   /* SMONTHNAME1..12 */
+    if (type >= 0x22 && type <= 0x2d) {                                                    /* SABBREVMONTHNAME1..12 */
+        snprintf(scratch, scratch_size, "%.3s", g_cal_months[type - 0x22]);
+        return scratch;
+    }
+    switch (type) {
+    case 0x01: *number = 1; return "1";                                       /* ICALINTVALUE: Gregorian */
+    case 0x02: return "Gregorian Calendar";                                   /* SCALNAME */
+    case 0x04: return "A.D.";                                                 /* SERASTRING */
+    case 0x05: return beer_locale_info_ascii(lcid, 0x1f);                     /* SSHORTDATE */
+    case 0x06: return beer_locale_info_ascii(lcid, 0x20);                     /* SLONGDATE */
+    case 0x21: case 0x2e: return "";                                          /* S(ABBREV)MONTHNAME13 */
+    case 0x2f: return beer_locale_info_ascii(lcid, 0x1006);                   /* SYEARMONTH */
+    case 0x30: *number = 2049; return "2049";                                 /* ITWODIGITYEARMAX */
+    case 0x38: return japanese ? "M/d" : "MMMM d";                            /* SMONTHDAY */
+    case 0x39: return "AD";                                                   /* SABBREVERASTRING */
+    case 0x3b: return "A.D.";                                                 /* SENGLISHERANAME */
+    case 0x3c: return "AD";                                                   /* SENGLISHABBREVERANAME */
+    default: return NULL;
+    }
+}
+
+static u64 __attribute__((ms_abi))
+impl_GetCalendarInfoEx(u64 locale, u32 calendar, u64 reserved, u32 caltype, u16 *data, int cch, u32 *value)
+{
+    (void)reserved;
+    if (cch < 0 || (!data && cch)) { g_last_error = 87; return 0; }
+    if (calendar != 1) { g_last_error = 87; return 0; }   /* only the Gregorian calendar exists here */
+    char scratch[16];
+    u32 number = 0;
+    const char *text = beer_calendar_text(beer_cal_locale_japanese(locale), caltype & 0x0fffffffu, scratch,
+                                          sizeof(scratch), &number);
+    if (!text) { g_last_error = 1004; return 0; }        /* ERROR_INVALID_FLAGS */
+    if (caltype & 0x20000000u) {                          /* CAL_RETURN_NUMBER */
+        const u32 base = caltype & 0x0fffffffu;
+        if (base != 0x01 && base != 0x30) { g_last_error = 1004; return 0; }
+        if (!value) { g_last_error = 87; return 0; }
+        *value = number;
+        g_last_error = 0;
+        return 2;                                         /* a DWORD, counted in WCHARs */
+    }
+    const int needed = (int)strlen(text) + 1;
+    if (!cch) return (u64)needed;
+    if (cch < needed) { g_last_error = 122; return 0; }
+    for (int i = 0; i < needed; ++i) data[i] = (u8)text[i];
+    g_last_error = 0;
+    return (u64)needed;
+}
+
+static u64 __attribute__((ms_abi))
+impl_EnumCalendarInfoExEx(u64 callback, u64 locale, u32 calendar, u64 reserved, u32 caltype, u64 lparam)
+{
+    (void)reserved;
+    if (!callback) { g_last_error = 87; return 0; }
+    if (calendar != 1 && calendar != 0xffffffffu) { g_last_error = 87; return 0; }   /* ENUM_ALL_CALENDARS */
+    char scratch[16];
+    u32 number = 0;
+    const char *text = beer_calendar_text(beer_cal_locale_japanese(locale), caltype & 0x0fffffffu, scratch,
+                                          sizeof(scratch), &number);
+    if (!text) { g_last_error = 1004; return 0; }
+    u16 wide[64];
+    size_t n = strlen(text);
+    if (n >= sizeof(wide) / sizeof(*wide)) n = sizeof(wide) / sizeof(*wide) - 1;
+    for (size_t i = 0; i < n; ++i) wide[i] = (u8)text[i];
+    wide[n] = 0;
+    typedef u64 __attribute__((ms_abi)) (*CalInfoEnumProcExEx)(u16 *, u32, u16 *, u64);
+    ((CalInfoEnumProcExEx)callback)(wide, 1, NULL, lparam);   /* one value per type here */
+    g_last_error = 0;
+    return 1;
+}
+
+static u64 __attribute__((ms_abi))
+impl_EnumTimeFormatsEx(u64 callback, u64 locale, u32 flags, u64 lparam)
+{
+    if (!callback) { g_last_error = 87; return 0; }
+    const int japanese = beer_cal_locale_japanese(locale);
+    /* The user's format first, as Windows does; TIME_NOSECONDS (2) lists the short forms. */
+    static const char *const en_long[] = { "h:mm:ss tt", "hh:mm:ss tt", "H:mm:ss", "HH:mm:ss" };
+    static const char *const en_short[] = { "h:mm tt", "hh:mm tt", "H:mm", "HH:mm" };
+    static const char *const ja_long[] = { "H:mm:ss", "HH:mm:ss", "tt h:mm:ss", "tt hh:mm:ss" };
+    static const char *const ja_short[] = { "H:mm", "HH:mm", "tt h:mm", "tt hh:mm" };
+    const char *const *list = (flags & 2u) ? (japanese ? ja_short : en_short) : (japanese ? ja_long : en_long);
+    typedef u64 __attribute__((ms_abi)) (*TimeFmtEnumProcEx)(u16 *, u64);
+    for (int k = 0; k < 4; ++k) {
+        u16 wide[32];
+        size_t n = strlen(list[k]);
+        for (size_t i = 0; i < n; ++i) wide[i] = (u8)list[k][i];
+        wide[n] = 0;
+        if (!((TimeFmtEnumProcEx)callback)(wide, lparam)) break;
+    }
+    g_last_error = 0;
+    return 1;
+}
+
+/* FindNLSStringEx: culture-aware search (.NET CompareInfo StartsWith/EndsWith/IndexOf/LastIndexOf without ICU).
+ * Same comparison rules as CompareStringW here: NORM_IGNORECASE / LINGUISTIC_IGNORECASE fold case, NORM_IGNORESYMBOLS
+ * skips symbols and spaces in both strings. Returns the 0-based start in the source or -1; *found gets the matched
+ * length in source characters. FIND_STARTSWITH 0x00100000, FIND_ENDSWITH 0x00200000, FIND_FROMSTART 0x00400000,
+ * FIND_FROMEND 0x00800000. */
+static int beer_nls_fold(const u16 *src, int n, int ignore_case, int ignore_symbols, u16 *out, int *pos)
+{
+    int m = 0;
+    for (int i = 0; i < n; ++i) {
+        if (ignore_symbols && (beer_ctype1(src[i]) & 0x18)) continue;
+        out[m] = ignore_case ? beer_wupper(src[i]) : src[i];
+        pos[m++] = i;
+    }
+    return m;
+}
+
+static u64 __attribute__((ms_abi))
+impl_FindNLSStringEx(u64 locale, u32 flags, const u16 *src, int nsrc, const u16 *value, int nvalue, s32 *found,
+                     u64 version, u64 reserved, u64 sort_handle)
+{
+    (void)locale; (void)version; (void)reserved; (void)sort_handle;
+    if (!src || !value || nsrc < -1 || nvalue < -1 || !nsrc) { g_last_error = 87; return (u64)(s64)-1; }
+    if (nsrc < 0) { nsrc = 0; while (src[nsrc]) ++nsrc; }
+    if (nvalue < 0) { nvalue = 0; while (value[nvalue]) ++nvalue; }
+    const int ignore_case = (flags & 0x11u) != 0, ignore_symbols = (flags & 0x4u) != 0;
+    const u32 mode = flags & 0x00f00000u;
+    u16 *a = malloc(((size_t)nsrc + 1) * sizeof(u16)), *b = malloc(((size_t)nvalue + 1) * sizeof(u16));
+    int *ap = malloc(((size_t)nsrc + 1) * sizeof(int)), *bp = malloc(((size_t)nvalue + 1) * sizeof(int));
+    s64 result = -1;
+    int length = 0;
+    if (!a || !b || !ap || !bp) { g_last_error = 8; goto out; }
+    const int na = beer_nls_fold(src, nsrc, ignore_case, ignore_symbols, a, ap);
+    const int nb = beer_nls_fold(value, nvalue, ignore_case, ignore_symbols, b, bp);
+    ap[na] = nsrc;
+    if (!nb) {   /* an empty (or all-ignorable) value matches at the start, or at the end for the backward forms */
+        result = (mode == 0x00200000u || mode == 0x00800000u) ? nsrc : 0;
+        length = 0;
+        goto done;
+    }
+    if (nb > na) goto done;
+    {
+        int first = 0, last = na - nb, step = 1;
+        if (mode == 0x00100000u) last = 0;                                 /* STARTSWITH */
+        else if (mode == 0x00200000u) first = last;                        /* ENDSWITH */
+        else if (mode == 0x00800000u) { first = na - nb; last = 0; step = -1; }   /* FROMEND */
+        for (int i = first; step > 0 ? i <= last : i >= last; i += step)
+            if (!memcmp(a + i, b, (size_t)nb * sizeof(u16))) {
+                result = ap[i];
+                length = (i + nb < na ? ap[i + nb] : nsrc) - ap[i];
+                if (mode == 0x00200000u || i + nb == na) length = nsrc - ap[i];   /* trailing ignorables count */
+                break;
+            }
+    }
+done:
+    if (found && result >= 0) *found = length;
+    g_last_error = 0;
+out:
+    free(a); free(b); free(ap); free(bp);
+    return (u64)result;
+}
+
 static u64 __attribute__((ms_abi))
 impl_IsValidLocaleName(const u16 *name)
 {
@@ -25563,6 +26507,178 @@ impl_CompareStringOrdinal(const u16 *left, int left_count,
                                               ignore_case != 0);
     if (!result) g_last_error = 87; /* ERROR_INVALID_PARAMETER */
     return (u64)result;
+}
+
+/* ---- Imports declared by .NET's System.Private.CoreLib that were missing (found by comparing its P/Invoke names
+ * with Beer's implementations; each one would be an EntryPointNotFoundException when its path runs). ---- */
+
+/* Thread pool hill climbing: whether a thread has I/O pending. Beer completes I/O synchronously, so none is. */
+/* InitializeContext(2) / CopyContext: CoreCLR builds the CONTEXT it uses to suspend and redirect threads (GC,
+ * thread aborts) with these; the stubs failed without reporting a size and the runtime ended the process silently
+ * (Pratfall in a hosted session). A CONTEXT is 0x4d0 bytes, 16-byte aligned, ContextFlags at 0x30. Beer reports no
+ * extended-state features (GetEnabledXStateFeatures), so CONTEXT_XSTATE requests are not supported. */
+#define BEER_CONTEXT_SIZE 0x4d0u
+static u64 __attribute__((ms_abi))
+impl_InitializeContext2(u8 *buffer, u32 flags, u8 **context, u32 *length, u64 compaction_mask)
+{
+    (void)compaction_mask;
+    if (!length) { g_last_error = 87; return 0; }
+    if ((flags & 0x00100040u) == 0x00100040u) { g_last_error = 50; return 0; }   /* CONTEXT_XSTATE: ERROR_NOT_SUPPORTED */
+    const u32 needed = BEER_CONTEXT_SIZE + 15;
+    if (!buffer || *length < needed) {
+        *length = needed;
+        g_last_error = 122;                                      /* ERROR_INSUFFICIENT_BUFFER */
+        return 0;
+    }
+    u8 *aligned = (u8 *)(((uintptr_t)buffer + 15) & ~(uintptr_t)15);
+    memset(aligned, 0, BEER_CONTEXT_SIZE);
+    memcpy(aligned + 0x30, &flags, 4);
+    if (context) *context = aligned;
+    *length = needed;
+    return 1;
+}
+static u64 __attribute__((ms_abi)) impl_InitializeContext(u8 *buffer, u32 flags, u8 **context, u32 *length)
+{
+    return impl_InitializeContext2(buffer, flags, context, length, 0);
+}
+static u64 __attribute__((ms_abi)) impl_CopyContext(u8 *destination, u32 flags, const u8 *source)
+{
+    if (!destination || !source) { g_last_error = 87; return 0; }
+    if ((flags & 0x00100040u) == 0x00100040u) { g_last_error = 50; return 0; }
+    memcpy(destination, source, BEER_CONTEXT_SIZE);
+    memcpy(destination + 0x30, &flags, 4);
+    return 1;
+}
+
+static u64 __attribute__((ms_abi)) impl_GetThreadIOPendingFlag(u64 thread, s32 *pending)
+{
+    (void)thread;
+    if (!pending) { g_last_error = 998; return 0; }   /* ERROR_NOACCESS */
+    *pending = 0;
+    return 1;
+}
+
+/* NTSTATUS -> Win32 error for the statuses Beer's NT layer returns; anything else maps as Windows does for an
+ * unknown status (ERROR_MR_MID_NOT_FOUND). */
+static u64 __attribute__((ms_abi)) impl_RtlNtStatusToDosError(u32 status)
+{
+    switch (status) {
+    case 0x00000000u: return 0;
+    case 0x00000103u: return 997;    /* STATUS_PENDING -> ERROR_IO_PENDING */
+    case 0x80000005u: return 234;    /* BUFFER_OVERFLOW -> ERROR_MORE_DATA */
+    case 0x80000006u: return 18;     /* NO_MORE_FILES */
+    case 0xC0000001u: return 31;     /* UNSUCCESSFUL -> ERROR_GEN_FAILURE */
+    case 0xC0000002u: return 1;      /* NOT_IMPLEMENTED -> ERROR_INVALID_FUNCTION */
+    case 0xC0000008u: return 6;      /* INVALID_HANDLE */
+    case 0xC000000Du: return 87;     /* INVALID_PARAMETER */
+    case 0xC000000Fu: return 2;      /* NO_SUCH_FILE */
+    case 0xC0000011u: return 38;     /* END_OF_FILE -> ERROR_HANDLE_EOF */
+    case 0xC0000017u: return 8;      /* NO_MEMORY -> ERROR_NOT_ENOUGH_MEMORY */
+    case 0xC0000022u: return 5;      /* ACCESS_DENIED */
+    case 0xC0000023u: return 122;    /* BUFFER_TOO_SMALL -> ERROR_INSUFFICIENT_BUFFER */
+    case 0xC0000033u: return 123;    /* OBJECT_NAME_INVALID -> ERROR_INVALID_NAME */
+    case 0xC0000034u: return 2;      /* OBJECT_NAME_NOT_FOUND -> ERROR_FILE_NOT_FOUND */
+    case 0xC0000035u: return 183;    /* OBJECT_NAME_COLLISION -> ERROR_ALREADY_EXISTS */
+    case 0xC000003Au: return 3;      /* OBJECT_PATH_NOT_FOUND */
+    case 0xC0000043u: return 32;     /* SHARING_VIOLATION */
+    case 0xC00000BBu: return 50;     /* NOT_SUPPORTED */
+    case 0xC0000106u: return 206;    /* NAME_TOO_LONG -> ERROR_FILENAME_EXCED_RANGE */
+    case 0xC0000120u: return 995;    /* CANCELLED -> ERROR_OPERATION_ABORTED */
+    default: return 317;             /* ERROR_MR_MID_NOT_FOUND */
+    }
+}
+
+/* FindStringOrdinal(flags, source, n, value, n, ignore case): code-unit comparison (ordinal), case folded by the
+ * same upper-casing as CompareStringOrdinal. FIND_STARTSWITH 0x00100000, FIND_ENDSWITH 0x00200000, FIND_FROMSTART
+ * 0x00400000, FIND_FROMEND 0x00800000. Returns the index or -1. */
+static u64 __attribute__((ms_abi))
+impl_FindStringOrdinal(u32 flags, const u16 *src, int nsrc, const u16 *value, int nvalue, s32 ignore_case)
+{
+    if (!src || !value || nsrc < -1 || nvalue < -1) { g_last_error = 87; return (u64)(s64)-1; }
+    if (nsrc < 0) { nsrc = 0; while (src[nsrc]) ++nsrc; }
+    if (nvalue < 0) { nvalue = 0; while (value[nvalue]) ++nvalue; }
+    g_last_error = 0;
+    if (nvalue > nsrc) return (u64)(s64)-1;
+    int first = 0, last = nsrc - nvalue, step = 1;
+    if (flags & 0x00100000u) last = 0;
+    else if (flags & 0x00200000u) first = last;
+    else if (flags & 0x00800000u) { first = nsrc - nvalue; last = 0; step = -1; }
+    for (int i = first; step > 0 ? i <= last : i >= last; i += step) {
+        int k = 0;
+        for (; k < nvalue; ++k) {
+            const u16 a = src[i + k], b = value[k];
+            if (a != b && (!ignore_case || beer_wupper(a) != beer_wupper(b))) break;
+        }
+        if (k == nvalue) return (u64)(s64)i;
+    }
+    return (u64)(s64)-1;
+}
+
+/* ETW: no trace session listens in Beer, so a written event goes nowhere and succeeds (EventRegister already hands
+ * out local registrations). */
+static u64 __attribute__((ms_abi))
+impl_EventWriteTransfer(u64 handle, const void *descriptor, const void *activity, const void *related, u32 count,
+                        const void *data)
+{
+    (void)handle; (void)descriptor; (void)activity; (void)related; (void)count; (void)data;
+    return 0;   /* ERROR_SUCCESS */
+}
+
+/* IDN conversion. An ASCII name is its own ASCII and Unicode form; non-ASCII (punycode) conversion is not
+ * implemented and fails like an invalid name, which .NET reports as an ArgumentException for that host only. */
+static u64 __attribute__((ms_abi))
+impl_IdnToAscii(u32 flags, const u16 *src, int nsrc, u16 *dst, int ndst)
+{
+    (void)flags;
+    if (!src || nsrc == 0 || nsrc < -1 || ndst < 0) { g_last_error = 87; return 0; }
+    const int with_nul = nsrc < 0;
+    if (nsrc < 0) { nsrc = 0; while (src[nsrc]) ++nsrc; }
+    for (int i = 0; i < nsrc; ++i) if (src[i] >= 0x80) { g_last_error = 123; return 0; }   /* ERROR_INVALID_NAME */
+    const int needed = nsrc + with_nul;
+    if (!ndst) return (u64)needed;
+    if (!dst || ndst < needed) { g_last_error = 122; return 0; }
+    for (int i = 0; i < nsrc; ++i) dst[i] = src[i];
+    if (with_nul) dst[nsrc] = 0;
+    return (u64)needed;
+}
+
+/* NLS version of the sorting data: one stable version for Beer's tables (callers compare it for index rebuilds).
+ * NLSVERSIONINFOEX: size, NLSVersion, DefinedVersion, EffectiveId, GUID. */
+static u64 __attribute__((ms_abi)) impl_GetNLSVersionEx(u32 function, const u16 *locale, u32 *info)
+{
+    (void)locale;
+    if (function != 1 || !info || info[0] < 32) { g_last_error = 87; return 0; }   /* COMPARE_STRING */
+    info[1] = 0x00060000u;   /* dwNLSVersion */
+    info[2] = 0x00060000u;   /* dwDefinedVersion */
+    info[3] = 0x0409u;       /* dwEffectiveId */
+    memset(info + 4, 0, 16); /* guidCustomVersion */
+    return 1;
+}
+/* Every code point Beer's tables handle counts as defined. */
+static u64 __attribute__((ms_abi))
+impl_IsNLSDefinedString(u32 function, u32 flags, const void *version, const u16 *str, int n)
+{
+    (void)flags; (void)version;
+    if (function != 1 || !str) { g_last_error = 87; return 0; }
+    (void)n;
+    return 1;
+}
+/* The specific locale a name resolves to: Beer's two locales, their languages and aliases. */
+static u64 __attribute__((ms_abi)) impl_ResolveLocaleName(const u16 *name, u16 *out, int n)
+{
+    const char *resolved = "en-US";
+    if (name && name[0]) {
+        if (u16_ascii_equal_ci(name, "ja") || u16_ascii_equal_ci(name, "ja-JP") || u16_ascii_equal_ci(name, "Japanese"))
+            resolved = "ja-JP";
+        else if (!(u16_ascii_equal_ci(name, "en") || u16_ascii_equal_ci(name, "en-US") ||
+                   u16_ascii_equal_ci(name, "English")))
+            { g_last_error = 87; return 0; }
+    }
+    const int needed = (int)strlen(resolved) + 1;
+    if (!out || !n) return (u64)needed;
+    if (n < needed) { g_last_error = 122; return 0; }
+    for (int i = 0; i < needed; ++i) out[i] = (u8)resolved[i];
+    return (u64)needed;
 }
 
 static s32 compare_ascii_strings(const char *left, const char *right, int ignore_case)
@@ -25912,7 +27028,8 @@ static u64 __attribute__((ms_abi)) impl_TerminateProcess(u64 h, u32 code)
  * with "no debugger", success and zero. */
 static u64 __attribute__((ms_abi)) impl_CheckRemoteDebuggerPresent(u64 process, u32 *present)
 { (void)process; if (present) *present = 0; return 1; }
-static u64 __attribute__((ms_abi)) impl_GetErrorMode(void) { return 0; }
+static u64 __attribute__((ms_abi)) impl_GetErrorMode(void)
+    { return atomic_load_explicit(&g_error_mode, memory_order_relaxed); }
 static u64 __attribute__((ms_abi)) impl_Wow64GetSetThreadContext(u64 thread, void *context)
 { (void)thread; (void)context; g_last_error = 87; return 0; }      /* FALSE: not a WOW64 thread */
 /* Named probes preserve the previous generic STATUS_NOT_IMPLEMENTED behavior while making
@@ -29780,6 +30897,7 @@ static ImplEntry g_impls[] = {
     /* Misc */
     {"CheckRemoteDebuggerPresent",            (ImplFn)impl_CheckRemoteDebuggerPresent},
     {"GetErrorMode",                          (ImplFn)impl_GetErrorMode},
+    {"GetThreadErrorMode",                    (ImplFn)impl_GetThreadErrorMode},
     {"Wow64GetThreadContext",                 (ImplFn)impl_Wow64GetSetThreadContext},
     {"Wow64SetThreadContext",                 (ImplFn)impl_Wow64GetSetThreadContext},
     {"NtGetContextThread",                    (ImplFn)impl_NtGetContextThreadProbe},
@@ -29892,6 +31010,7 @@ static ImplEntry g_impls[] = {
     {"Steam_ReleaseThreadLocalMemory",         (ImplFn)impl_Steam_ReleaseThreadLocalMemory},
     {"Steam_ReleaseUser",                      (ImplFn)impl_Steam_ReleaseUser},
     {"Steam_SetLocalIPBinding",                (ImplFn)impl_Steam_SetLocalIPBinding},
+    {"Steam_IsKnownInterface",                 (ImplFn)impl_Steam_IsKnownInterface},
     {"Steam_NotifyMissingInterface",           (ImplFn)impl_Steam_NotifyMissingInterface},
     {"SteamInternal_CreateInterface",         (ImplFn)impl_SteamInternal_CreateInterface},
     {"SteamInternal_FindOrCreateUserInterface", (ImplFn)impl_SteamInternal_FindOrCreateUserInterface},
@@ -29947,6 +31066,7 @@ static ImplEntry g_impls[] = {
     {"send",                                    (ImplFn)impl_send},
     {"bind",                                    (ImplFn)impl_bind},
     {"connect",                                 (ImplFn)impl_connect},
+    {"WSAConnect",                              (ImplFn)impl_WSAConnect},
     {"ioctlsocket",                             (ImplFn)impl_ioctlsocket},
     {"listen",                                  (ImplFn)impl_listen},
     {"sendto",                                  (ImplFn)impl_sendto},
@@ -30103,6 +31223,7 @@ static ImplEntry g_impls[] = {
     {"CertOpenStore",                         (ImplFn)impl_CertOpenStore},
     {"CertOpenSystemStoreA",                  (ImplFn)impl_CertOpenSystemStoreA},
     {"CertOpenSystemStoreW",                  (ImplFn)impl_CertOpenSystemStoreW},
+    {"CryptBinaryToStringA",                  (ImplFn)impl_CryptBinaryToStringA},
     {"CertEnumCertificatesInStore",           (ImplFn)impl_CertEnumCertificatesInStore},
     {"CertDuplicateCertificateContext",       (ImplFn)impl_CertDuplicateCertificateContext},
     {"CertGetIntendedKeyUsage",               (ImplFn)impl_CertGetIntendedKeyUsage},
@@ -30234,6 +31355,8 @@ static ImplEntry g_impls[] = {
     {"CoInitializeEx",                        (ImplFn)impl_CoInitializeEx},
     {"CoInitializeSecurity",                  (ImplFn)impl_CoInitializeSecurity},
     {"CoUninitialize",                        (ImplFn)impl_CoUninitialize},
+    {"RoInitialize",                          (ImplFn)impl_RoInitialize},
+    {"RoUninitialize",                        (ImplFn)impl_RoUninitialize},
     {"CoCreateGuid",                          (ImplFn)impl_CoCreateGuid},
     {"CoCreateInstance",                      (ImplFn)impl_CoCreateInstance},
     {"CoSetProxyBlanket",                         (ImplFn)impl_CoSetProxyBlanket},
@@ -30412,6 +31535,11 @@ static ImplEntry g_impls[] = {
     {"SleepEx",                               (ImplFn)impl_SleepEx},
     {"GetTickCount",                          (ImplFn)impl_GetTickCount},
     {"GetTickCount64",                        (ImplFn)impl_GetTickCount64},
+    {"QueryUnbiasedInterruptTime",            (ImplFn)impl_QueryUnbiasedInterruptTime},
+    {"GetSystemTimes",                        (ImplFn)impl_GetSystemTimes},
+    {"QueryUnbiasedInterruptTimePrecise",     (ImplFn)impl_QueryInterruptTime},
+    {"QueryInterruptTime",                    (ImplFn)impl_QueryInterruptTime},
+    {"QueryInterruptTimePrecise",             (ImplFn)impl_QueryInterruptTime},
     {"GetFileType",                           (ImplFn)impl_GetFileType},
     {"SetStdHandle",                          (ImplFn)impl_SetStdHandle},
     /* Locale / string */
@@ -30662,6 +31790,7 @@ static ImplEntry g_impls[] = {
     {"GlobalFree",                            (ImplFn)impl_GlobalFree},
     /* Error mode */
     {"SetErrorMode",                          (ImplFn)impl_SetErrorMode},
+    {"SetThreadErrorMode",                    (ImplFn)impl_SetThreadErrorMode},
     /* USER32 window system */
     {"GetWindowRect",                         (ImplFn)impl_GetWindowRect},
     {"GetClientRect",                         (ImplFn)impl_GetClientRect},
@@ -30686,6 +31815,8 @@ static ImplEntry g_impls[] = {
     {"AdjustTokenPrivileges",                 (ImplFn)impl_AdjustTokenPrivileges},
     {"GetCursorInfo",                         (ImplFn)impl_GetCursorInfo},
     {"EventRegister",                         (ImplFn)impl_EventRegister},
+    {"EventSetInformation",                   (ImplFn)impl_EventSetInformation},
+    {"EventUnregister",                       (ImplFn)impl_EventUnregister},
     {"HeapSetInformation",                    (ImplFn)impl_ReturnTrue},
     {"SetHandleCount",                        (ImplFn)impl_ReturnTrue},
     {"SetRect",                               (ImplFn)impl_SetRect},
@@ -30868,6 +31999,8 @@ static ImplEntry g_impls[] = {
     {"RemoveWindowSubclass",                  (ImplFn)impl_RemoveWindowSubclass},
     {"DefSubclassProc",                       (ImplFn)impl_DefSubclassProc},
     {"SetWindowLongPtrW",                     (ImplFn)impl_SetWindowLongPtrW},
+    {"SetWindowLongPtrA",                     (ImplFn)impl_SetWindowLongPtrA},
+    {"SetWindowLongA",                        (ImplFn)impl_SetWindowLongA},
     {"GetWindowLongPtrW",                     (ImplFn)impl_GetWindowLongPtrW},
     {"GetWindowLongPtrA",                     (ImplFn)impl_GetWindowLongPtrA},
     {"SetWindowLongW",                        (ImplFn)impl_SetWindowLongW},
@@ -30937,6 +32070,10 @@ static ImplEntry g_impls[] = {
     /* Locale */
     {"EnumSystemLocalesW",                    (ImplFn)impl_EnumSystemLocalesW},
     {"EnumSystemLocalesEx",                   (ImplFn)impl_EnumSystemLocalesEx},
+    {"GetCalendarInfoEx",                     (ImplFn)impl_GetCalendarInfoEx},
+    {"EnumCalendarInfoExEx",                  (ImplFn)impl_EnumCalendarInfoExEx},
+    {"EnumTimeFormatsEx",                     (ImplFn)impl_EnumTimeFormatsEx},
+    {"FindNLSStringEx",                       (ImplFn)impl_FindNLSStringEx},
     {"IsValidLocale",                         (ImplFn)impl_IsValidLocale},
     {"IsValidLocaleName",                     (ImplFn)impl_IsValidLocaleName},
     {"GetLocaleInfoA",                        (ImplFn)impl_GetLocaleInfoA},
@@ -30945,6 +32082,18 @@ static ImplEntry g_impls[] = {
     {"CompareStringW",                        (ImplFn)impl_CompareStringW},
     {"CompareStringA",                        (ImplFn)impl_CompareStringA},
     {"CompareStringOrdinal",                  (ImplFn)impl_CompareStringOrdinal},
+    {"GetThreadIOPendingFlag",                (ImplFn)impl_GetThreadIOPendingFlag},
+    {"InitializeContext",                     (ImplFn)impl_InitializeContext},
+    {"InitializeContext2",                    (ImplFn)impl_InitializeContext2},
+    {"CopyContext",                           (ImplFn)impl_CopyContext},
+    {"RtlNtStatusToDosError",                 (ImplFn)impl_RtlNtStatusToDosError},
+    {"FindStringOrdinal",                     (ImplFn)impl_FindStringOrdinal},
+    {"EventWriteTransfer",                    (ImplFn)impl_EventWriteTransfer},
+    {"IdnToAscii",                            (ImplFn)impl_IdnToAscii},
+    {"IdnToUnicode",                          (ImplFn)impl_IdnToAscii},
+    {"GetNLSVersionEx",                       (ImplFn)impl_GetNLSVersionEx},
+    {"IsNLSDefinedString",                    (ImplFn)impl_IsNLSDefinedString},
+    {"ResolveLocaleName",                     (ImplFn)impl_ResolveLocaleName},
     {"lstrcatA",                              (ImplFn)impl_lstrcatA},
     {"lstrcmpA",                              (ImplFn)impl_lstrcmpA},
     {"lstrcmpW",                              (ImplFn)impl_lstrcmpW},
@@ -31150,6 +32299,7 @@ static const char *const g_compat_module_exports[][2] = {
     { "steamclient64.dll", "Steam_CreateSteamPipe" },
     { "steamclient64.dll", "Steam_FreeLastCallback" },
     { "steamclient64.dll", "Steam_GetAPICallResult" },
+    { "steamclient64.dll", "Steam_IsKnownInterface" },
     { "steamclient64.dll", "Steam_NotifyMissingInterface" },
     { "steamclient64.dll", "Steam_ReleaseThreadLocalMemory" },
     { "steamclient64.dll", "Steam_ReleaseUser" },
@@ -36581,7 +37731,7 @@ static int beer_dispatch_signal_to_veh(int sig, siginfo_t *si, ucontext_t *uc)
     u64 stack_low, stack_high;
     const u64 fault_rsp = *(const u64 *)(context + 0x98);
     beer_dispatch_stack_bounds(fault_rsp, &stack_low, &stack_high);
-    if (getenv("BEER_NEGATIVE_CONTROL") == NULL && stack_high > stack_low && fault_rsp > stack_low + 0x20000 && fault_rsp <= stack_high) {
+    if (stack_high > stack_low && fault_rsp > stack_low + 0x20000 && fault_rsp <= stack_high) {
         /* A fault in guest code: its handlers run on the guest stack below the fault (red zone skipped), as on
          * Windows, so a handler that raises again can unwind through them to the fault. */
         u8 *outer_fault_ctx = t_veh_fault_ctx;

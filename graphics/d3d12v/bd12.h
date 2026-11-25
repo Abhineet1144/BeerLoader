@@ -1432,6 +1432,9 @@ const uint8_t *bd12_rt_pipeline_identifier(BD12RtPipeline *pipeline, const char 
 /* GPU checkpoints (BEER_VK_CHECKPOINTS=1): mark the next command, dump the last reached ones after a fault. */
 void bd12_ckpt_mark(BD12CmdList *list, uint32_t kind, uint64_t a, uint64_t b, uint32_t w, uint32_t h, uint32_t d);
 void bd12_ckpt_dump(void);
+void bd12_srv_dump_draw(BD12CmdList *list, uint64_t pso, const BD12BindState *state);
+void bd12_srv_dump_list_end(BD12CmdList *list);
+void bd12_srv_dump_write(void);
 void bd12_buffer_view_unpin(BD12Device *device, BD12Buffer *buffer, uint32_t serial, VkFormat format, VkDeviceSize offset,
                             VkDeviceSize range);
 void bd12_view_stats(uint64_t *views, uint64_t *pinned);
