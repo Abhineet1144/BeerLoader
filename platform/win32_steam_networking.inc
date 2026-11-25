@@ -208,8 +208,45 @@ NET_FN net_set_user_data(u64 self, u32 c, s64 v) { (void)self; return (u64)beer_
 NET_FN net_get_user_data(u64 self, u32 c) { (void)self; return (u64)beer_steam_networking_get_user_data(c); }
 NET_FN net_set_name(u64 self, u32 c, const char *name) { (void)self; beer_steam_networking_set_name(c, name); return 0; }
 NET_FN net_get_name(u64 self, u32 c, char *out, s32 cap) { (void)self; return (u64)beer_steam_networking_get_name(c, out, cap); }
+/* BEER_STEAM_DIAGNOSTICS: per-connection traffic, printed every 5 s (sends by reliability, receives, failures). */
+static struct { u32 conn; u64 sent_reliable, sent_unreliable, send_failed, received, bytes_out, bytes_in; } g_net_stats[16];
+static pthread_mutex_t g_net_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static void net_stats_note(u32 c, int sent, s32 flags, u32 size, int ok)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_STEAM_DIAGNOSTICS") != NULL;
+    if (!on || !c) return;
+    pthread_mutex_lock(&g_net_stats_lock);
+    int slot = -1;
+    for (int i = 0; i < 16; ++i) if (g_net_stats[i].conn == c || (!g_net_stats[i].conn && slot < 0)) { slot = i; if (g_net_stats[i].conn == c) break; }
+    if (slot >= 0) {
+        g_net_stats[slot].conn = c;
+        if (!sent) { g_net_stats[slot].received++; g_net_stats[slot].bytes_in += size; }
+        else if (!ok) g_net_stats[slot].send_failed++;
+        else { if (flags & 8) g_net_stats[slot].sent_reliable++; else g_net_stats[slot].sent_unreliable++; g_net_stats[slot].bytes_out += size; }
+    }
+    static u64 last;
+    const u64 now = (u64)beer_steam_networking_timestamp();
+    if (now - last > 5000000) {
+        last = now;
+        for (int i = 0; i < 16 && g_net_stats[i].conn; ++i) {
+            char detail[96] = "";
+            typeof(g_net_stats[0]) *st = &g_net_stats[i];
+            fprintf(stderr, "[STEAM-NET] conn %u: sent rel %llu unrel %llu failed %llu (%llu B), received %llu (%llu B)%s\n",
+                    st->conn, (unsigned long long)st->sent_reliable, (unsigned long long)st->sent_unreliable,
+                    (unsigned long long)st->send_failed, (unsigned long long)st->bytes_out,
+                    (unsigned long long)st->received, (unsigned long long)st->bytes_in, detail);
+        }
+    }
+    pthread_mutex_unlock(&g_net_stats_lock);
+}
 NET_FN net_send(u64 self, u32 c, const void *data, u32 size, s32 flags, s64 *number)
-    { (void)self; return (u64)(u32)beer_steam_networking_send(c, data, size, flags, (int64_t *)number); }
+{
+    (void)self;
+    const int r = beer_steam_networking_send(c, data, size, flags, (int64_t *)number);
+    net_stats_note(c, 1, flags, size, r == 1);
+    return (u64)(u32)r;
+}
 /* SendMessages: Steam takes ownership of every message, sent or not. Each result is the message number, or the
  * negated EResult. */
 NET_FN net_send_messages(u64 self, s32 count, u8 **messages, s64 *results)
@@ -227,6 +264,7 @@ NET_FN net_send_messages(u64 self, s32 count, u8 **messages, s64 *results)
         memcpy(&flags, msg + 196, 4);
         int64_t number = 0;
         const int result = beer_steam_networking_send(connection, (const void *)(uintptr_t)data, (u32)size, flags, &number);
+        net_stats_note(connection, 1, flags, (u32)size, result == 1);
         if (results) results[i] = result == 1 ? number : -(s64)result;
         memcpy(&release, msg + 184, 8);
         if (release) ((void __attribute__((ms_abi)) (*)(u8 *))(uintptr_t)release)(msg);
@@ -238,6 +276,7 @@ NET_FN net_receive(u64 self, u32 c, void **out, s32 count)
 {
     (void)self;
     const int n = beer_steam_networking_receive(c, out, count);
+    for (int i = 0; i < n; ++i) { s32 size; memcpy(&size, (u8 *)out[i] + 8, 4); net_stats_note(c, 0, 0, (u32)size, 1); }
     return (u64)(s64)(n > 0 ? net_msgs_to_guest(out, n) : n);
 }
 NET_FN net_info(u64 self, u32 c, void *info) { (void)self; return (u64)beer_steam_networking_info(c, info); }
@@ -246,7 +285,13 @@ NET_FN net_realtime(u64 self, u32 c, void *status, s32 lanes, void *lane_status)
 NET_FN net_detailed(u64 self, u32 c, char *out, s32 cap) { (void)self; return (u64)(s64)beer_steam_networking_detailed(c, out, cap); }
 NET_FN net_listen_address(u64 self, u32 h, void *address) { (void)self; return (u64)beer_steam_networking_listen_address(h, address); }
 NET_FN net_socket_pair(u64 self, u32 *a, u32 *b, u8 loopback, const void *id1, const void *id2)
-    { (void)self; return (u64)beer_steam_networking_socket_pair(a, b, loopback, id1, id2); }
+{
+    (void)self;
+    const int ok = beer_steam_networking_socket_pair(a, b, loopback, id1, id2);
+    if (getenv("BEER_STEAM_DIAGNOSTICS"))
+        fprintf(stderr, "[STEAM-NET] CreateSocketPair(loopback=%d) -> %d (%u, %u)\n", loopback, ok, a ? *a : 0, b ? *b : 0);
+    return (u64)ok;
+}
 NET_FN net_configure_lanes(u64 self, u32 c, s32 lanes, const int *priorities, const u16 *weights)
     { (void)self; return (u64)(u32)beer_steam_networking_configure_lanes(c, lanes, priorities, weights); }
 NET_FN net_init_auth(u64 self) { (void)self; return (u64)(s64)beer_steam_networking_init_auth(); }
@@ -258,6 +303,7 @@ NET_FN net_receive_group(u64 self, u32 g, void **out, s32 count)
 {
     (void)self;
     const int n = beer_steam_networking_receive_poll_group(g, out, count);
+    for (int i = 0; i < n; ++i) { s32 size; u32 conn; memcpy(&size, (u8 *)out[i] + 8, 4); memcpy(&conn, (u8 *)out[i] + 12, 4); net_stats_note(conn, 0, 0, (u32)size, 1); }
     return (u64)(s64)(n > 0 ? net_msgs_to_guest(out, n) : n);
 }
 NET_FN net_run_callbacks(u64 self) { (void)self; steam_networking_pump(); return 0; }

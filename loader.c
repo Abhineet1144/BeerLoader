@@ -1454,6 +1454,19 @@ __asm__(
     "4:\n"
     "    mov 0x160(%rsp), %rax\n"
     "3:\n"
+    /* A SuspendThread caught this thread inside the implementation: park before returning to the guest
+     * (platform/win32_thread_suspend.inc). The return value rides in the frame's spare slot. */
+    "    cmpb $0, %fs:g_suspend_pending@tpoff\n"
+    "    je 6f\n"
+    "    mov %rax, 0x160(%rsp)\n"
+    "    lea 0x160(%rsp), %rdi\n"
+    "    xor %esi, %esi\n"
+    "    call beer_suspend_checkpoint\n"
+    /* A System V call clobbers RSI/RDI, which are nonvolatile for the guest: reload the values it entered with. */
+    "    mov 0x130(%rsp), %rsi\n"
+    "    mov 0x138(%rsp), %rdi\n"
+    "    mov 0x160(%rsp), %rax\n"
+    "6:\n"
     ".irp reg,6,7,8,9,10,11,12,13,14,15\n"
     "    movdqu (0x20+\\reg*0x10)(%rsp), %xmm\\reg\n"
     ".endr\n"
@@ -1500,12 +1513,26 @@ __asm__(
     "    call *%r10\n"
     ".global beer_tramp_nested_ret\n"
     "beer_tramp_nested_ret:\n"
+    "    cmpb $0, %fs:g_suspend_pending@tpoff\n"
+    "    je 7f\n"
+    "    mov %rax, 0x128(%rsp)\n"
+    "    push %rsi\n"                     /* nonvolatile for the guest, clobbered by a System V call */
+    "    push %rdi\n"
+    "    lea 0x138(%rsp), %rdi\n"
+    "    mov $1, %esi\n"
+    "    call beer_suspend_checkpoint\n"
+    "    pop %rdi\n"
+    "    pop %rsi\n"
+    "    mov 0x128(%rsp), %rax\n"
+    "7:\n"
     ".irp reg,6,7,8,9,10,11,12,13,14,15\n"
     "    movdqu (0x20+\\reg*0x10)(%rsp), %xmm\\reg\n"
     ".endr\n"
     "    mov 0x120(%rsp), %rsp\n"
     "    movb $1, %fs:beer_win32_syscall_selector@tpoff\n"
     "    ret\n"
+    ".global beer_dispatch_trampoline_end\n"
+    "beer_dispatch_trampoline_end:\n"
 );
 extern void beer_dispatch_trampoline(void);
 
@@ -4998,7 +5025,35 @@ asm(
 "mov qword ptr [rax + 0x0f0], r15\n"  /* R15 */
 "mov rcx, [rsp]\n"
 "mov qword ptr [rax + 0x0f8], rcx\n"  /* Rip = return address (caller's RIP) */
-"mov dword ptr [rax + 0x030], 0x10007f\n" /* ContextFlags = CONTEXT_ALL (offset 0x30 in AMD64 CONTEXT) */
+"mov dword ptr [rax + 0x030], 0x10000f\n" /* ContextFlags = CONTEXT_FULL | CONTEXT_SEGMENTS, as Windows */
+"mov word ptr [rax + 0x038], 0x33\n"   /* SegCs */
+"mov word ptr [rax + 0x03a], 0x2b\n"   /* SegDs */
+"mov word ptr [rax + 0x03c], 0x2b\n"   /* SegEs */
+"mov word ptr [rax + 0x03e], 0x53\n"   /* SegFs */
+"mov word ptr [rax + 0x040], 0x2b\n"   /* SegGs */
+"mov word ptr [rax + 0x042], 0x2b\n"   /* SegSs */
+"pushfq\n"
+"pop rcx\n"
+"mov dword ptr [rax + 0x044], ecx\n"   /* EFlags */
+"stmxcsr dword ptr [rax + 0x034]\n"   /* MxCsr */
+"stmxcsr dword ptr [rax + 0x118]\n"   /* FltSave.MxCsr */
+"movups xmmword ptr [rax + 0x200], xmm6\n"
+"movups xmmword ptr [rax + 0x210], xmm7\n"
+"movups xmmword ptr [rax + 0x220], xmm8\n"
+"movups xmmword ptr [rax + 0x230], xmm9\n"
+"movups xmmword ptr [rax + 0x240], xmm10\n"
+"movups xmmword ptr [rax + 0x250], xmm11\n"
+"movups xmmword ptr [rax + 0x260], xmm12\n"
+"movups xmmword ptr [rax + 0x270], xmm13\n"
+"movups xmmword ptr [rax + 0x280], xmm14\n"
+"movups xmmword ptr [rax + 0x290], xmm15\n"
+/* Reached through the dispatch trampoline, the captured Rip/Rsp describe the trampoline on the host stack: point
+ * them at the guest caller (beer_context_fix_caller). CoreCLR's managed exception dispatch unwinds from this context
+ * and resumes a catch at the unwound Rsp; leaving the host stack in it resumed managed code on that stack. */
+"push rax\n"                          /* 16-byte aligned for the System V call */
+"mov rdi, rax\n"
+"call beer_context_fix_caller_sysv\n"
+"pop rax\n"
 "xor eax, eax\n"
 "ret\n"
 ".att_syntax prefix\n"
@@ -17122,6 +17177,8 @@ typedef struct {
     pthread_mutex_t mtx;
     pthread_cond_t  cv;
 } WinThread;
+static void beer_suspend_register_thread(u32 win_tid);   /* platform/win32_thread_suspend.inc */
+static void beer_suspend_unregister_thread(void);
 
 enum {
     BEER_WORKER_STACK_HARD_PAGE = 0x1000,
@@ -17300,6 +17357,7 @@ static void thread_done_cleanup(void *p)
     WinThread *t = &g_threads[id];
     if (getenv("BEER_THREAD_DIAGNOSTICS"))
         fprintf(stderr, "[THREAD] done id=%u exit_code=%u\n", t->tid, t->exit_code);
+    beer_suspend_unregister_thread();   /* runs on the exiting thread: its slot can no longer be signalled */
     pthread_mutex_lock(&t->mtx);
     t->done = 1;
     pthread_cond_broadcast(&t->cv);
@@ -17418,6 +17476,7 @@ static void *win_thread_trampoline(void *p) {
      * the guest or stored in its TEB. */
     ((WinTEB *)teb)->UniqueThread = t->tid;
     g_cached_windows_thread_id = t->tid;
+    beer_suspend_register_thread(t->tid);
     pthread_cond_broadcast(&t->cv);
     pthread_mutex_unlock(&t->mtx);
 
@@ -17782,6 +17841,10 @@ static u64 duplicate_handle_local(u64 source, u64 *target, u32 options)
     g_last_error = 6;
     return 0;
 }
+static void beer_context_from_ucontext(u8 *context, const ucontext_t *uc);
+static void beer_context_to_ucontext(ucontext_t *uc, const u8 *context);
+#include "platform/win32_thread_suspend.inc"
+
 static u64 __attribute__((ms_abi))
 impl_SuspendThread(u64 h)
 {
@@ -17792,7 +17855,13 @@ impl_SuspendThread(u64 h)
         return previous;
     }
     int id = thread_id_from_handle(h);
-    if (id < 0) return (u64)-1;
+    if (id < 0 && h != (u64)-2) return (u64)-1;
+    if (h == (u64)-2 || g_threads[id].started) {      /* a running thread (or the caller itself) */
+        int handled = 0;
+        const u64 previous = beer_suspend_running(h, &handled);
+        if (handled) return previous;
+        if (id < 0) return 0;
+    }
     WinThread *t = &g_threads[id];
     pthread_mutex_lock(&t->mtx);
     u64 prev = t->suspended ? 1 : 0;
@@ -17810,7 +17879,16 @@ impl_ResumeThread(u64 h)
         return previous;
     }
     int id = thread_id_from_handle(h);
-    if (id < 0) { g_last_error = 6; return 0xffffffffu; }
+    if (id < 0 && h != (u64)-2) {
+        if (suspend_diagnostics()) fprintf(stderr, "[SUSPEND] ResumeThread unknown handle 0x%llx\n", (unsigned long long)h);
+        g_last_error = 6; return 0xffffffffu;
+    }
+    if (h == (u64)-2 || g_threads[id].started) {
+        int handled = 0;
+        const u64 previous = beer_resume_running(h, &handled);
+        if (handled) return previous;
+        if (id < 0) return 0;
+    }
     WinThread *t = &g_threads[id];
     pthread_mutex_lock(&t->mtx);
     u64 prev = t->suspended ? 1 : 0;
@@ -34974,6 +35052,7 @@ static void *alloc_teb_for_thread(void)
     teb->UniqueProcess = (u64)(u32)getpid();
     teb->UniqueThread = (u64)(u32)syscall(SYS_gettid);
     g_cached_windows_thread_id = teb->UniqueThread;
+    beer_suspend_register_thread((u32)teb->UniqueThread);
     /* Fields the Windows thread creation path fills before any user code runs. */
     teb->CurrentLocale = 0x409;
     teb->ActivationContextStack[1] = teb->ActivationContextStack[2] =
@@ -37142,6 +37221,9 @@ static void beer_context_fix_caller(u8 *ctx)
     }
 }
 
+void __attribute__((used)) beer_context_fix_caller_sysv(u8 *ctx);
+void __attribute__((used)) beer_context_fix_caller_sysv(u8 *ctx) { beer_context_fix_caller(ctx); }
+
 static const BeerRuntimeFunction *beer_unwind_lookup(u64 control_pc, u64 *image_base)
 {
     return (const BeerRuntimeFunction *)(uintptr_t)
@@ -37613,9 +37695,31 @@ static int beer_dispatch_signal_to_ki_hook(int sig, siginfo_t *si, ucontext_t *u
         static int reported;
         if (!reported++)
             fprintf(stderr, "[SEH] first fault: KiUserExceptionDispatcher %s, Wow64PrepareForException=0x%llx; "
-                    "rip guest code=%d, rsp guest stack=%d\n", hooked ? "hooked" : "unmodified",
-                    (unsigned long long)prepare,
-                    is_in_image_exec_range(rip) || guest_dll_addr_is_exec(rip), is_guest_stack_rsp(rsp));
+                    "rip guest code=%d, rsp guest stack=%d (rip 0x%llx rsp 0x%llx address 0x%llx signal %d)\n",
+                    hooked ? "hooked" : "unmodified", (unsigned long long)prepare,
+                    is_in_image_exec_range(rip) || guest_dll_addr_is_exec(rip), is_guest_stack_rsp(rsp),
+                    (unsigned long long)rip, (unsigned long long)rsp, (unsigned long long)(uintptr_t)si->si_addr, sig);
+        if (reported == 1 && getenv("BEER_FAULT_STACK_DUMP")) {
+            const greg_t *g = uc->uc_mcontext.gregs;
+            fprintf(stderr, "[SEH] regs rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rbp=%llx r8=%llx r9=%llx "
+                    "r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx host-stack %llx..%llx saved-guest-rsp %llx\n",
+                    (unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX], (unsigned long long)g[REG_RCX],
+                    (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI], (unsigned long long)g[REG_RDI],
+                    (unsigned long long)g[REG_RBP], (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R9],
+                    (unsigned long long)g[REG_R10], (unsigned long long)g[REG_R11], (unsigned long long)g[REG_R12],
+                    (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15],
+                    (unsigned long long)g_host_call_stack_base, (unsigned long long)g_host_call_stack_top,
+                    (unsigned long long)g_saved_guest_rsp);
+            const u64 *w = (const u64 *)(uintptr_t)(rsp & ~7ull);
+            for (int i = 0; i < 64 && (u64)(uintptr_t)(w + i) < g_host_call_stack_top + 256; i += 4)
+                fprintf(stderr, "[SEH] stack %llx: %llx %llx %llx %llx\n", (unsigned long long)(uintptr_t)(w + i),
+                        (unsigned long long)w[i], (unsigned long long)w[i + 1], (unsigned long long)w[i + 2],
+                        (unsigned long long)w[i + 3]);
+            const u8 *code = (const u8 *)(uintptr_t)(rip - 0x40);
+            fprintf(stderr, "[SEH] code %llx: ", (unsigned long long)(rip - 0x40));
+            for (int i = 0; i < 0x60; ++i) fprintf(stderr, "%02x", code[i]);
+            fputs("\n", stderr);
+        }
     }
     if (!hooked && !prepare) return 0;
     if (!(is_in_image_exec_range(rip) || guest_dll_addr_is_exec(rip)) || !is_guest_stack_rsp(rsp)) return 0;
@@ -41683,6 +41787,7 @@ int main(int argc, char **argv)
     sigaction(SIGILL,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);  /* int3 / abort() in Windows CRT */
+    beer_suspend_install();         /* SuspendThread on running threads (platform/win32_thread_suspend.inc) */
     beer_hw_breakpoints_start();
     
     /* Imports can initialize dependencies: gate before any guest callback. A remote thread created while the
@@ -41813,6 +41918,7 @@ int main(int argc, char **argv)
     } else {
         fprintf(stderr, "[SETUP] WARNING: Could not get GS base!\n");
     }
+    beer_suspend_register_thread((u32)current_windows_thread_id());   /* the main thread can be suspended too */
 
     beer_pin_main_thread();
     printf("\n[RUN] Handing off to entry point 0x%lx\n", entry);

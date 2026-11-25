@@ -106,6 +106,34 @@ generic, loader.c):
   Plan: signal-based suspension like Wine (handler saves ucontext, parks until ResumeThread; Get/SetThreadContext read/
   edit it; a thread inside Beer reports its guest-entry context). Affects all games (Mono/Boehm GC, DRM) - gate on
   Pratfall, RE8/RE9 and a Unity title.
+- **GC hang / session crash work (2026-11-26, late):** signal-based SuspendThread for running threads
+  (platform/win32_thread_suspend.inc, SIGRTMIN+5; a thread inside Beer parks at the trampoline return and reports its
+  guest-entry context; Get/SetThreadContext read/edit the parked context; `BEER_THREAD_SUSPEND=0` restores the old
+  no-op; `BEER_SUSPEND_DIAGNOSTICS=1` logs). The "crash when creating a session" was NOT suspension: **RtlCaptureContext
+  reached through the dispatch trampoline captured the host stack** (Rip=beer_tramp_outer_ret, Rsp on the host call
+  stack). CoreCLR's managed throw unwinds from RtlCaptureContext, so the first caught managed exception resumed the catch
+  on the host stack -> null fault in JIT code with rsp inside the trampoline frame -> unhandled 0xc0000005 (HEAD build
+  crashed identically). Fixed: impl_RtlCaptureContext now runs beer_context_fix_caller (as RtlUnwind/RaiseException
+  already did) and also captures XMM6-15/MxCsr/segments/EFlags (CONTEXT_FULL|SEGMENTS). Pratfall now gets past lobby
+  creation, spawns, ~80 suspend/resume pairs, thousands of managed throws caught. The intermittent "Stack overflow /
+  RSP outside!" above is probably the same bug (unverified). `BEER_FAULT_STACK_DUMP=1` (with BEER_EXCEPTION_DIAGNOSTICS)
+  dumps regs/stack/code at the first fault. Still to regression-test: RE8/RE9, a Unity title.
+- **Hosted-session status (2026-11-26, ~03:40):** manager entry now Pratfall.exe + `--steam` + steam_networking_library
+  (Launcher.exe failed: no networking library in the entry -> "Failed to start socket server" -> Internal CLR error; it
+  also forces `--rendering-driver d3d12`). Mouse look works online now (an earlier report of no vertical look did not
+  reproduce). OPEN:
+  - **Jump stutter in a hosted session** (offline jumps are smooth; frame time flat). Not Beer networking: with
+    BEER_STEAM_DIAGNOSTICS the host only opens CreateListenSocketP2P, no sends/receives and no CreateSocketPair (the host's
+    own player is in-process). Suspects: timing the game's server tick / jitter buffers read (Godot clocks,
+    SteamNetworkingUtils GetLocalTimestamp), Steam Input in --steam mode, or the game/crack itself (app 480; compare
+    with Proton). Next: frame/physics-step timing diagnostic during jumps.
+  - **Invite friends does nothing.** The button calls ISteamFriends ActivateGameOverlayInviteDialog (Steam overlay);
+    Beer's ISteamFriends is all steam_vfn_false except GetPersonaName/GetFriendPersonaName, and the Steam session
+    (beer_steam_session_*) never requests the friends list. DECIDED (user): implement real invites - fetch the friends
+    list from the CM session, Beer-side friend picker on ActivateGameOverlayInviteDialog, send a real lobby invite
+    (ISteamMatchmaking InviteUserToLobby / ISteamFriends InviteUserToGame), also groundwork for "Join Game" from the
+    friends list. (Rejected for now: copying a steam://joinlobby/480/<lobby>/<host> link.)
+  - `BEER_STEAM_DIAGNOSTICS` now also prints per-connection traffic every 5 s and CreateSocketPair calls.
 - (superseded) Manager entry must use prefix `pratfall` (the `default` prefix lacks the GameOverlayRenderer64.dll link ->
   "Failed to load steam overlay dll"). Tests: test-input, test-native-loader, test-steam pass.
 

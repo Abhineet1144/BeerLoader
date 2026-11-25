@@ -67,6 +67,7 @@ static u64 __attribute__((ms_abi)) beer_GetThreadContext(u64 thread, u8 *context
     }
     if (!context) { g_last_error = 998; return 0; }                 /* ERROR_NOACCESS */
     if (thread_unstarted_context(thread, context, 0) > 0) return 1;
+    if (beer_suspended_context(thread, context, 0)) return 1;       /* a suspended running thread: its registers */
     const u32 flags = *(u32 *)(context + 0x30);
     if ((flags & 0x100010u) == 0x100010u) memset(context + 0x48, 0, 0x30);
     return 1;
@@ -80,11 +81,12 @@ static u64 __attribute__((ms_abi)) stub_IsBadReadPtr(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_IsBadWritePtr(void){ return 0; }
 static u64 __attribute__((ms_abi)) stub_GetThreadLocale(void){ return 0x409; }
 static u64 __attribute__((ms_abi)) stub_SetThreadLocale(void){ return 0; }
-/* SetThreadContext: only a thread suspended at creation can be changed (it starts with the new registers);
- * Beer cannot rewrite a running thread's registers. */
+/* SetThreadContext: a thread suspended at creation starts with the new registers; a running thread suspended by
+ * SuspendThread takes them when it resumes (platform/win32_thread_suspend.inc). */
 static u64 __attribute__((ms_abi)) stub_SetThreadContext(u64 thread, u8 *context)
 {
     if (context && thread_unstarted_context(thread, context, 1) > 0) return 1;
+    if (context && beer_suspended_context(thread, context, 1)) return 1;   /* applied when it resumes */
     g_last_error = 50;   /* ERROR_NOT_SUPPORTED */
     return 0;
 }

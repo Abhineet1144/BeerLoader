@@ -38,7 +38,8 @@ loader.o: loader.c platform/beer_env.h graphics/d3d11/d3d11_compat.h \
  platform/win32_steam_matchmaking.inc \
  platform/steam_networking_identity.h platform/beer_steam_networking.h \
  platform/win32_steam_networking.inc platform/win32_wmi.inc \
- platform/win32_wic.inc platform/win32_tsf.h platform/win32_full_path.h \
+ platform/win32_wic.inc platform/win32_tsf.h \
+ platform/win32_thread_suspend.inc platform/win32_full_path.h \
  platform/win32_sddl.h platform/win32_advapi_misc.inc \
  platform/win32_controls.inc platform/win32_treeview.inc \
  platform/win32_ownerdraw.inc platform/win32_subclass.inc \
@@ -139,6 +140,7 @@ platform/win32_steam_networking.inc:
 platform/win32_wmi.inc:
 platform/win32_wic.inc:
 platform/win32_tsf.h:
+platform/win32_thread_suspend.inc:
 platform/win32_full_path.h:
 platform/win32_sddl.h:
 platform/win32_advapi_misc.inc:
