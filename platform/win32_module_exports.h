@@ -1705,6 +1705,8 @@ static const char *const beer_module_exports[][2] = {
     { "mswsock.dll", "GetAcceptExSockaddrs" },
     { "mswsock.dll", "TransmitFile" },
     { "netapi32.dll", "NetApiBufferFree" },
+    { "normaliz.dll", "IdnToAscii" },
+    { "normaliz.dll", "IdnToUnicode" },
     { "normaliz.dll", "IsNormalizedString" },
     { "normaliz.dll", "NormalizeString" },
     { "ntdll.dll", "AlpcGetHeaderSize" },

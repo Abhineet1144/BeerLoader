@@ -347,6 +347,7 @@ static u64 steam_networking_sockets_interface(void)
             };
             for (size_t i = 0; i < sizeof(slots) / sizeof(*slots); ++i) vtable[slots[i].slot] = (u64)(uintptr_t)slots[i].fn;
         }
+        steam_vtab_unique_slots(vtable, sizeof(vtable) / sizeof(*vtable));   /* XMM6-15 kept */
         object = (u64)(uintptr_t)vtable;
     }
     return (u64)(uintptr_t)&object;
@@ -463,6 +464,7 @@ static u64 steam_networking_utils_interface(void)
             vtable[16] = (u64)(uintptr_t)net_utils_set_config;
             vtable[17] = (u64)(uintptr_t)net_utils_get_config;
         }
+        steam_vtab_unique_slots(vtable, sizeof(vtable) / sizeof(*vtable));   /* XMM6-15 kept */
         object = (u64)(uintptr_t)vtable;
     }
     return (u64)(uintptr_t)&object;

@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #define _GNU_SOURCE   /* strcasestr */
 #include "beer_overlay.h"
 #include "beer_control.h"
@@ -437,8 +438,56 @@ int beer_overlay_translucent(void)
     return __atomic_load_n(&ov.visible, __ATOMIC_RELAXED) && __atomic_load_n(&ov.opacity, __ATOMIC_RELAXED) < 1000;
 }
 
+int beer_hitch_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("BEER_HITCH_LOG") != NULL;
+    return on;
+}
+
+long long beer_hitch_now_us(void)
+{
+    static long long start;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const long long now = (long long)ts.tv_sec * 1000000ll + ts.tv_nsec / 1000;
+    if (!start) start = now;
+    return now - start;
+}
+
+void beer_hitch_note(const char *fmt, ...)
+{
+    if (!beer_hitch_enabled()) return;
+    char text[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    const long long now = beer_hitch_now_us();
+    fprintf(stderr, "[HITCH] t=%lld.%03lld %s\n", now / 1000, now % 1000, text);
+}
+
+/* Frame interval spikes: more than 1.5x the recent average and 4 ms over it (times in microseconds). */
+static void hitch_frame(void)
+{
+    if (!beer_hitch_enabled()) return;
+    static long long last, average;
+    static unsigned frames;
+    const long long now = beer_hitch_now_us();
+    if (last > 0) {
+        const long long dt = now - last;
+        if (frames > 30 && dt * 2 > average * 3 && dt > average + 4000)
+            beer_hitch_note("frame dt=%lld.%01lld ms (average %lld.%01lld)", dt / 1000, dt % 1000 / 100,
+                            average / 1000, average % 1000 / 100);
+        average = frames ? (average * 19 + dt) / 20 : dt;
+        frames++;
+    }
+    last = now;
+}
+
 int beer_overlay_frame(int out_w, int out_h, BeerOverlayRect rects[BEER_OVERLAY_SLOTS])
 {
+    hitch_frame();
     pthread_mutex_lock(&ov.lock);
     int count = 0;
     if (ov.visible && out_w > 0 && out_h > 0) {

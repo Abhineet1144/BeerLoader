@@ -146,6 +146,9 @@ static void *capture_thread(void *arg)
 
 void beer_steam_voice_start(void)
 {
+    /* BEER_STEAM_VOICE=0: no microphone capture (recording reports no data), e.g. to rule voice chat out. */
+    const char *enabled = getenv("BEER_STEAM_VOICE");
+    if (enabled && !strcmp(enabled, "0")) return;
     pthread_once(&g_libs_once, load_libraries);
     pthread_mutex_lock(&g_lock);
     g_recording = 1;
@@ -168,6 +171,10 @@ void beer_steam_voice_stop(void)
 /* Energy gate: speech above about -50 dBFS opens it; it stays open 400 ms after the last loud frame. */
 static int frame_is_voiced(const int16_t *pcm)
 {
+    /* BEER_STEAM_VOICE_GATE=open: every frame counts as speech (diagnostics: voice traffic without talking). */
+    static int always = -1;
+    if (always < 0) { const char *v = getenv("BEER_STEAM_VOICE_GATE"); always = v && !strcmp(v, "open"); }
+    if (always) return 1;
     /* Integer only (platform code is built without SSE): mean square against 100^2. */
     uint64_t sum = 0;
     for (uint32_t i = 0; i < FRAME_SAMPLES; ++i) sum += (uint64_t)((int32_t)pcm[i] * pcm[i]);

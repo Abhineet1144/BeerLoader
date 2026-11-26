@@ -134,6 +134,47 @@ generic, loader.c):
     (ISteamMatchmaking InviteUserToLobby / ISteamFriends InviteUserToGame), also groundwork for "Join Game" from the
     friends list. (Rejected for now: copying a steam://joinlobby/480/<lobby>/<host> link.)
   - `BEER_STEAM_DIAGNOSTICS` now also prints per-connection traffic every 5 s and CreateSocketPair calls.
+- **FIXED (2026-11-26, late): hosted-session jump hang = Steam vtable calls clobbering XMM6-XMM15.** Found with a
+  decompile of Pratfall.dll (tools in /mnt/hdd2/tools: dotnet, ilspycmd, ilverify, pratfall-probe = Mono.Cecil
+  patcher + BeerProbe.dll per-physics-step logger; original game files backed up in pratfall-probe/original). The
+  player body's y/vy stayed identical for 3-11 physics ticks after a jump; only with the microphone picking up sound
+  (BEER_STEAM_VOICE=0 cured it; BEER_STEAM_VOICE_GATE=open reproduces it without talking - the key click opened
+  Beer's energy gate for ~0.5 s). Steam interface methods are called by the guest directly through per-slot thunks,
+  not the dispatch trampoline, so nothing saved the Windows-nonvolatile XMM6-15; Opus encoding inside
+  GetAvailableVoice (and libc vector memcpy, PulseAudio, GNS in other slots) wiped them under the game's physics
+  code. Now every slot thunk is `nop5; mov $slot,%r10d; jmp beer_steam_slot_call`, which saves/restores XMM6-15 and
+  copies 10 stack-argument qwords; 8192 slots. Also wrapped: SteamUser per-version vtables, offline SteamInput,
+  ISteamMatchmaking, ISteamNetworkingSockets/Utils (they were raw function pointers before). Scripted check:
+  jumptest.sh (control-socket "key" injection) with GATE=open - smooth after, stalled before.
+- **FIXED: "Fatal error. SuspendThread failed with error 5"** (Pratfall, random, in game): a thread parked in the
+  suspend-signal handler, resumed and suspended again before it ran, kept waiting without answering (the new signal is
+  blocked until the handler returns) -> 2 s ack timeout -> -1. SuspendThread now bumps `requests` (+ wakes the resume
+  futex) and the parked loop (suspend_park) acknowledges new requests; ack timeout 10 s. 2-min hosted run: 419
+  suspensions, no failure.
+- **FIXED (2026-11-27): RE4 Remake crash after window creation** - regression from 210e9a4 (a6eeb13 fine): GetProcAddress
+  stopped returning zero-return placeholder stubs, so RE4's protection got NULL for Kernel32/KernelBase routines it
+  imports statically (Beep, HeapValidate, SignalObjectAndWait, GetDiskFreeSpaceW, ...). Placeholders are returned
+  again for names in g_kernel32_export_names when the module is K32/KBASE (Sekiro's case - invented non-Windows
+  exports - stays NULL). 120 s clean.
+- **FIXED: Stellar Blade launcher "Couldn't start ... CreateProcess() returned c1"** (error 193): the child-launch
+  manifest check rejected SB-Win64-Shipping.exe because its resource directory is larger than the section's raw data
+  (legal; zero-filled). The size is clamped to the file data. CreateProcess failures now log the reason.
+- **OPEN (2026-11-27): Onimusha crashes ~40 s in (after the intro video), RIP 0x14f541fe0 FA=0x70** (null object in RE
+  engine code, reached through anti-tamper-obfuscated code that computed a bad target). Regression from 38049a1
+  (210e9a4 and a6eeb13 fine; 38049a1, 4cbf9d7 and HEAD crash 100%). NOT suspension (BEER_THREAD_SUSPEND=0 crashes),
+  not RtlVirtualUnwind ctxptrs, not saves, not Beer's shader cache, not thunk alignment/size, not stub slot size.
+  It is sensitive to the set of functions Beer implements: BEER_NO_IMPL (new diagnostic) of ANY ONE of
+  EventSetInformation, EventWriteTransfer, EventUnregister, ResolveLocaleName, MessageBeep avoids it (repeatable,
+  even names never called); NO_IMPL of Beep or WinHttpOpen, BEER_PAD_THUNKS, extra dummy exports
+  (BEER_FAKE_EXTRA_EXPORT, sorted first or last) do not. Likely the anti-tamper fingerprints kernel32/user32/advapi32
+  via thunk ordering or GetProcAddress results; mechanism not found. Fixed on the way: normaliz.dll now exports
+  IdnToAscii/IdnToUnicode (_nvngx imports IdnToAscii), EventSetInformation returns success for registered
+  handles (was ERROR_NOT_SUPPORTED). Test runner: scratchpad onitest.sh (log-based, 150 s).
+- Friend invites (2026-11-26): provider keeps the friends list (EMsg 767/766, requests 815), ops `friends` and
+  `invite_lobby` (MMS 6621 + FriendMessages.SendMessage "[lobbyinvite appid=.. lobbyid=..][/lobbyinvite]");
+  ISteamFriends slot 33 ActivateGameOverlayInviteDialog opens manager/invite_picker.py (GTK) and posts
+  GameOverlayActivated (331) open/close; InviteUserToLobby goes through the provider too. Fixed beer_mms_invite
+  field order (2 = invited user, 3 = lobby). Picker opens (user-confirmed); delivery to a friend not yet verified.
 - (superseded) Manager entry must use prefix `pratfall` (the `default` prefix lacks the GameOverlayRenderer64.dll link ->
   "Failed to load steam overlay dll"). Tests: test-input, test-native-loader, test-steam pass.
 

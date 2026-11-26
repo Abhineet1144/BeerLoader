@@ -56,6 +56,10 @@ long beer_steam_session_networking_config(uint32_t appid, uint8_t *out, size_t c
 long beer_steam_session_next_p2p_event(uint64_t *src, uint64_t *dest, uint32_t *appid, int *failed,
                                        uint8_t *out, size_t cap);
 
+/* ISteamMatchmaking::InviteUserToLobby as the Steam client does it: the matchmaking server is told and the friend
+ * gets a Steam chat invite with a Join button. Returns 1 when Steam accepted the invite message. */
+int beer_steam_session_invite_lobby(uint32_t appid, uint64_t lobby, uint64_t friend_id);
+
 /* Socket path used by the provider; exposed for tests. */
 int beer_steam_session_socket_path(char *out, size_t cap);
 

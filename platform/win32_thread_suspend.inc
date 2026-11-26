@@ -28,8 +28,10 @@ typedef struct {
     int count;                   /* Windows suspend count (atomic) */
     u32 state;                   /* SUSPEND_* (atomic, written by the target) */
     u32 acked;                   /* futex: bumped by the target once `context` holds its state */
-    u32 resume;                  /* futex: bumped by ResumeThread when the count reaches 0 */
+    u32 resume;                  /* futex: bumped by ResumeThread when the count reaches 0, and by each new request */
+    u32 requests;                /* bumped by SuspendThread for each 0 -> 1 suspension (see suspend_park) */
     int dirty;                   /* SetThreadContext changed `context` */
+    long long hitch_start_us;                        /* BEER_HITCH_LOG: when the current suspension began */
     u8 context[0x4d0] __attribute__((aligned(16)));
 } BeerSuspendSlot;
 static BeerSuspendSlot g_suspend_slots[BEER_SUSPEND_SLOTS];
@@ -207,6 +209,26 @@ static void suspend_ack(BeerSuspendSlot *slot, u32 state)
     beer_futex(&slot->acked, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL);
 }
 
+/* Parked in the signal handler until the count drops to 0. A thread resumed and suspended again before it got to run
+ * is still in here, and the new suspension's signal stays blocked until the handler returns: it is acknowledged from
+ * this loop (`seen`: the request count when the handler was entered). Without that the second SuspendThread waited
+ * for an answer that could not come and failed, which CoreCLR treats as fatal ("SuspendThread failed with error 5",
+ * Pratfall during garbage collections). */
+static void suspend_park(BeerSuspendSlot *slot, u32 seen)
+{
+    for (;;) {
+        const u32 ticket = __atomic_load_n(&slot->resume, __ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&slot->count, __ATOMIC_ACQUIRE) <= 0) return;
+        const u32 requests = __atomic_load_n(&slot->requests, __ATOMIC_ACQUIRE);
+        if (requests != seen) {
+            seen = requests;
+            suspend_ack(slot, SUSPEND_PARKED);
+            continue;
+        }
+        beer_futex(&slot->resume, FUTEX_WAIT_PRIVATE, ticket, NULL);
+    }
+}
+
 static void beer_suspend_signal(int sig, siginfo_t *info, void *context)
 {
     (void)sig; (void)info;
@@ -216,6 +238,7 @@ static void beer_suspend_signal(int sig, siginfo_t *info, void *context)
     ucontext_t *uc = context;
     greg_t *regs = uc->uc_mcontext.gregs;
     BeerSuspendSlot *slot = t_suspend_slot;
+    const u32 requests_seen = slot ? __atomic_load_n(&slot->requests, __ATOMIC_ACQUIRE) : 0;
     /* Any state but parked takes a new snapshot: a thread resumed while still inside Beer stays HOST_PENDING until it
      * reaches the trampoline checkpoint, and a later suspension must still be answered (an unanswered SuspendThread
      * fails, which CoreCLR treats as fatal). */
@@ -235,7 +258,7 @@ static void beer_suspend_signal(int sig, siginfo_t *info, void *context)
             suspend_context_from_signal(slot->context, uc);
             slot->dirty = 0;
             suspend_ack(slot, SUSPEND_PARKED);
-            suspend_wait_resumed(slot);
+            suspend_park(slot, requests_seen);
             if (slot->dirty) {                         /* SetThreadContext while parked */
                 const u32 flags = *(const u32 *)(slot->context + 0x30);
                 const u64 eflags = (u64)regs[REG_EFL];
@@ -314,7 +337,7 @@ static u32 suspend_handle_tid(u64 handle)
 /* Waits until the target captured its state (acked moved past `before`); 0 if it exited or did not answer. */
 static int suspend_wait_ack(BeerSuspendSlot *slot, u32 before)
 {
-    for (int i = 0; i < 400; ++i) {                   /* up to ~2 s */
+    for (int i = 0; i < 2000; ++i) {                  /* up to ~10 s */
         if (__atomic_load_n(&slot->acked, __ATOMIC_ACQUIRE) != before) return 1;
         const struct timespec slice = { 0, 5 * 1000 * 1000 };
         beer_futex(&slot->acked, FUTEX_WAIT_PRIVATE, before, &slice);
@@ -341,6 +364,7 @@ static u64 beer_suspend_running(u64 handle, int *handled)
     if (!slot) return 0;
     *handled = 1;
     const int previous = __atomic_fetch_add(&slot->count, 1, __ATOMIC_ACQ_REL);
+    if (previous == 0 && beer_hitch_enabled()) slot->hitch_start_us = beer_hitch_now_us();
     if (suspend_diagnostics())
         fprintf(stderr, "[SUSPEND] SuspendThread handle 0x%llx tid %u count %d -> %d\n", (unsigned long long)handle,
                 slot->win_tid, previous, previous + 1);
@@ -354,6 +378,9 @@ static u64 beer_suspend_running(u64 handle, int *handled)
     }
     beer_host_ranges_refresh(0);
     const u32 before = __atomic_load_n(&slot->acked, __ATOMIC_ACQUIRE);
+    __atomic_add_fetch(&slot->requests, 1, __ATOMIC_ACQ_REL);          /* answered by a thread still parked */
+    __atomic_add_fetch(&slot->resume, 1, __ATOMIC_ACQ_REL);
+    beer_futex(&slot->resume, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL);
     if (syscall(SYS_tgkill, getpid(), slot->host_tid, BEER_SUSPEND_SIGNAL) != 0 || !suspend_wait_ack(slot, before)) {
         __atomic_sub_fetch(&slot->count, 1, __ATOMIC_ACQ_REL);
         g_last_error = 5;                              /* ERROR_ACCESS_DENIED: exited or not answering */
@@ -382,6 +409,10 @@ static u64 beer_resume_running(u64 handle, int *handled)
     if (suspend_diagnostics())
         fprintf(stderr, "[SUSPEND] ResumeThread handle 0x%llx tid %u count %d -> %d\n", (unsigned long long)handle,
                 slot->win_tid, previous, previous > 0 ? previous - 1 : 0);
+    if (previous == 1 && beer_hitch_enabled() && slot->hitch_start_us > 0) {
+        const long long held = beer_hitch_now_us() - slot->hitch_start_us;
+        if (held >= 1000) beer_hitch_note("tid %u suspended %lld.%01lld ms", slot->win_tid, held / 1000, held % 1000 / 100);
+    }
     if (previous == 1) {
         __atomic_add_fetch(&slot->resume, 1, __ATOMIC_ACQ_REL);
         beer_futex(&slot->resume, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL);

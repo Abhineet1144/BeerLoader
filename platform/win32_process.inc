@@ -544,13 +544,19 @@ static u64 beer_create_process_in(const char *application, const char *command_l
     /* CreateProcess inherits the primary token, even without handle inheritance.
      * Unlike an initial host launch it must never auto-elevate a child. */
     int level = is_cmd ? 0 : beer_security_file_level(host);
-    if (level < 0) { g_last_error = 193; return 0; }
+    if (level < 0) {
+        fprintf(stderr, "[PROCESS] %s: the image's manifest could not be read (security level %d)\n", host, level);
+        g_last_error = 193; return 0;
+    }
     if (level == 3 && !beer_process_elevated()) { g_last_error = 740; return 0; }
     if (!is_cmd) {
         unsigned char magic[2] = {0, 0};
         FILE *f = fopen(host, "rb");
         if (f) { if (fread(magic, 1, 2, f) != 2) magic[0] = 0; fclose(f); }
-        if (magic[0] != 'M' || magic[1] != 'Z') { g_last_error = 193; return 0; }   /* ERROR_BAD_EXE_FORMAT */
+        if (magic[0] != 'M' || magic[1] != 'Z') {
+            fprintf(stderr, "[PROCESS] %s: not an MZ image\n", host);
+            g_last_error = 193; return 0;   /* ERROR_BAD_EXE_FORMAT */
+        }
     }
 
     char command[8192];

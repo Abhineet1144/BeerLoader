@@ -331,11 +331,116 @@ static void library_reset(void)
     pthread_mutex_unlock(&g.lock);
 }
 
+/* ---------------------------------------------------------------- friends
+ * Steam pushes CMsgClientFriendsList (EMsg 767: bincremental = 1, friends = 2 { fixed64 ulfriendid = 1;
+ * uint32 efriendrelationship = 2 }) after logon and on every change. Names and status come from
+ * CMsgClientPersonaState (766: friends = 2 { fixed64 friendid = 1; uint32 persona_state = 2;
+ * uint32 game_played_app_id = 3; string player_name = 15 }), which Steam sends for the friends named in a
+ * CMsgClientRequestFriendData (815: persona_state_requested = 1, repeated fixed64 friends = 2). */
+#define EMSG_CLIENT_PERSONA_STATE 766u
+#define EMSG_CLIENT_FRIENDS_LIST 767u
+#define EMSG_CLIENT_REQUEST_FRIEND_DATA 815u
+#define MAX_FRIENDS 2048
+enum { FRIEND_RELATIONSHIP_FRIEND = 3 };
+static struct { uint64_t id; uint32_t state, appid; char name[96]; } g_friends[MAX_FRIENDS];
+static int g_friend_count;
+static pthread_mutex_t g_friends_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int friend_index_locked(uint64_t id)
+{
+    for (int i = 0; i < g_friend_count; i++) if (g_friends[i].id == id) return i;
+    return -1;
+}
+
+static void request_friend_data(const uint64_t *ids, int count)
+{
+    if (count <= 0) return;
+    PbBuf msg = {0};
+    /* PlayerName | Presence | GameExtraInfo | Status (EClientPersonaStateFlag) */
+    pb_u64(&msg, 1, 2u | 16u | 256u | 1u);
+    for (int i = 0; i < count; i++) pb_fixed64(&msg, 2, ids[i]);
+    cm_send(g.cm, EMSG_CLIENT_REQUEST_FRIEND_DATA, &msg);
+    pb_free(&msg);
+}
+
+static void on_friends_list(const uint8_t *body, size_t len)
+{
+    PbReader r = { body, body + len };
+    PbField f;
+    int incremental = 0;
+    static uint64_t added[MAX_FRIENDS];
+    int added_count = 0;
+    if (pb_find(body, len, 1, &f) && f.type == PB_VARINT) incremental = f.value != 0;
+    pthread_mutex_lock(&g_friends_lock);
+    if (!incremental) g_friend_count = 0;
+    while (pb_next(&r, &f) == 1) {
+        if (f.field != 2 || f.type != PB_BYTES) continue;
+        uint64_t id = 0;
+        uint32_t relationship = 0;
+        PbReader e = { f.data, f.data + f.len };
+        PbField ef;
+        while (pb_next(&e, &ef) == 1) {
+            if (ef.field == 1) id = ef.value;
+            else if (ef.field == 2) relationship = (uint32_t)ef.value;
+        }
+        if (((id >> 52) & 0xF) != 1) continue;               /* individual accounts only (not groups) */
+        int index = friend_index_locked(id);
+        if (relationship != FRIEND_RELATIONSHIP_FRIEND) {
+            if (index >= 0) g_friends[index] = g_friends[--g_friend_count];
+            continue;
+        }
+        if (index < 0 && g_friend_count < MAX_FRIENDS) {
+            g_friends[g_friend_count] = (typeof(g_friends[0])){ .id = id };
+            g_friend_count++;
+            if (added_count < MAX_FRIENDS) added[added_count++] = id;
+        }
+    }
+    const int total = g_friend_count;
+    pthread_mutex_unlock(&g_friends_lock);
+    if (g.terminal) printf("friends list: %d friends (%d new)\n", total, added_count);
+    for (int i = 0; i < added_count; i += 256) request_friend_data(added + i, added_count - i < 256 ? added_count - i : 256);
+}
+
+static void on_persona_state(const uint8_t *body, size_t len)
+{
+    PbReader r = { body, body + len };
+    PbField f;
+    pthread_mutex_lock(&g_friends_lock);
+    while (pb_next(&r, &f) == 1) {
+        if (f.field != 2 || f.type != PB_BYTES) continue;
+        uint64_t id = 0;
+        int has_state = 0, has_app = 0;
+        uint32_t state = 0, appid = 0;
+        const uint8_t *name = NULL;
+        size_t name_len = 0;
+        PbReader e = { f.data, f.data + f.len };
+        PbField ef;
+        while (pb_next(&e, &ef) == 1) {
+            if (ef.field == 1) id = ef.value;
+            else if (ef.field == 2 && ef.type == PB_VARINT) { state = (uint32_t)ef.value; has_state = 1; }
+            else if (ef.field == 3 && ef.type == PB_VARINT) { appid = (uint32_t)ef.value; has_app = 1; }
+            else if (ef.field == 15 && ef.type == PB_BYTES) { name = ef.data; name_len = ef.len; }
+        }
+        const int index = friend_index_locked(id);
+        if (index < 0) continue;
+        if (has_state) g_friends[index].state = state;
+        if (has_app) g_friends[index].appid = appid;
+        if (name) {
+            const size_t n = name_len < sizeof(g_friends[0].name) - 1 ? name_len : sizeof(g_friends[0].name) - 1;
+            memcpy(g_friends[index].name, name, n);
+            g_friends[index].name[n] = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_friends_lock);
+}
+
 static void broadcast_mms_event(uint32_t emsg, const uint8_t *body, size_t len);
 static void broadcast_p2p_event(uint32_t emsg, const uint8_t *body, size_t len);
 static void on_message(void *context, uint32_t emsg, const uint8_t *body, size_t len)
 {
     (void)context;
+    if (emsg == EMSG_CLIENT_FRIENDS_LIST) { on_friends_list(body, len); return; }
+    if (emsg == EMSG_CLIENT_PERSONA_STATE) { on_persona_state(body, len); return; }
     if (emsg >= 6601u && emsg <= 6627u) { broadcast_mms_event(emsg, body, len); return; }
     if (emsg == 5434u || emsg == 5435u) { broadcast_p2p_event(emsg, body, len); return; }
     if (emsg == EMSG_CLIENT_GAME_CONNECT_TOKENS) {
@@ -1385,6 +1490,81 @@ static void handle_p2p_send(const char *op, const char *id, const char *line)
     emit("{\"event\":\"p2p_send\",\"id\":\"%s\",\"ok\":true}", idj);
 }
 
+/* ---------------------------------------------------------------- friends and invites */
+
+/* {"event":"friends","id":..,"ok":true,"friends":[{"steamid":"..","name":"..","state":n,"appid":n},..]} */
+static void emit_friends(const char *id)
+{
+    char idj[140];
+    json_escape(idj, sizeof(idj), id);
+    pthread_mutex_lock(&g.lock);
+    const int signed_in = g.state == STATE_SIGNED_IN;
+    pthread_mutex_unlock(&g.lock);
+    if (!signed_in) { game_error("friends", id, "not signed in to Steam"); return; }
+    pthread_mutex_lock(&g_friends_lock);
+    size_t cap = 64 + (size_t)g_friend_count * 400, n = 0;
+    char *list = malloc(cap);
+    if (!list) { pthread_mutex_unlock(&g_friends_lock); game_error("friends", id, "out of memory"); return; }
+    list[0] = 0;
+    for (int i = 0; i < g_friend_count; i++) {
+        char name[300];
+        json_escape(name, sizeof(name), g_friends[i].name);
+        n += (size_t)snprintf(list + n, cap - n, "%s{\"steamid\":\"%llu\",\"name\":\"%s\",\"state\":%u,\"appid\":%u}",
+                              i ? "," : "", (unsigned long long)g_friends[i].id, name, g_friends[i].state,
+                              g_friends[i].appid);
+    }
+    pthread_mutex_unlock(&g_friends_lock);
+    emit("{\"event\":\"friends\",\"id\":\"%s\",\"ok\":true,\"friends\":[%s]}", idj, list);
+    free(list);
+}
+
+/* A lobby invite as the Steam client sends it for ISteamMatchmaking::InviteUserToLobby: the matchmaking server is
+ * told (CMsgClientMMSInviteToLobby, EMsg 6621: uint32 app_id = 1; fixed64 steam_id_user_invited = 2;
+ * fixed64 steam_id_lobby = 3), and the friend gets a chat message with a [lobbyinvite] tag, which their Steam
+ * shows as an invite with a Join button (FriendMessages.SendMessage: fixed64 steamid = 1; int32 chat_entry_type
+ * = 2 (ChatMsg); string message = 3; bool contains_bbcode = 4). */
+static void handle_invite_lobby(const char *op, const char *id, const char *line)
+{
+    char appid_text[16] = "", lobby_text[32] = "", friend_text[32] = "", idj[140];
+    json_get(line, "appid", appid_text, sizeof(appid_text));
+    json_get(line, "lobby", lobby_text, sizeof(lobby_text));
+    json_get(line, "friend", friend_text, sizeof(friend_text));
+    const uint32_t appid = (uint32_t)strtoul(appid_text, NULL, 10);
+    const uint64_t lobby = strtoull(lobby_text, NULL, 10), friend_id = strtoull(friend_text, NULL, 10);
+    json_escape(idj, sizeof(idj), id);
+    if (!session_app_allowed(op, id, appid)) return;
+    if (!lobby || !friend_id) { game_error(op, id, "a lobby and a friend are required"); return; }
+
+    PbBuf mms = {0};
+    pb_u64(&mms, 1, appid);
+    pb_fixed64(&mms, 2, friend_id);
+    pb_fixed64(&mms, 3, lobby);
+    const int mms_sent = cm_send_routed(g.cm, 6621u, &mms, appid);
+    pb_free(&mms);
+
+    char text[160];
+    snprintf(text, sizeof(text), "[lobbyinvite appid=\"%u\" lobbyid=\"%llu\"][/lobbyinvite]", appid,
+             (unsigned long long)lobby);
+    PbBuf request = {0}, response = {0};
+    pb_fixed64(&request, 1, friend_id);
+    pb_i32(&request, 2, 1);
+    pb_string(&request, 3, text);
+    pb_u64(&request, 4, 1);
+    int eresult = 0;
+    const int answered = cm_call(g.cm, "FriendMessages.SendMessage#1", &request, 1, 15000, &response, &eresult);
+    pb_free(&request);
+    pb_free(&response);
+    if (!answered || eresult != ERESULT_OK) {
+        char error[160];
+        snprintf(error, sizeof(error), "Steam did not deliver the invite message (%s)",
+                 answered ? cm_eresult_name(eresult) : "no answer");
+        game_error(op, id, error);
+        return;
+    }
+    emit("{\"event\":\"invite_lobby\",\"id\":\"%s\",\"ok\":true,\"matchmaking\":%s}", idj,
+         mms_sent ? "true" : "false");
+}
+
 /* Signaling that arrives for this account goes to every game client; each keeps what is for its own app. */
 static void broadcast_p2p_event(uint32_t emsg, const uint8_t *body, size_t len)
 {
@@ -1441,6 +1621,10 @@ static void handle_request(char *line)
         handle_game_request(op, id, line);
     } else if (!strcmp(op, "mms_request") || !strcmp(op, "mms_send") || !strcmp(op, "games_played")) {
         handle_mms_request(op, id, line);
+    } else if (!strcmp(op, "friends")) {
+        emit_friends(id);
+    } else if (!strcmp(op, "invite_lobby")) {
+        handle_invite_lobby(op, id, line);
     } else if (!strcmp(op, "p2p_send")) {
         handle_p2p_send(op, id, line);
     } else if (!strcmp(op, "networking_certificate")) {

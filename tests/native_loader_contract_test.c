@@ -1895,7 +1895,7 @@ static void etw_provider_contract_test(void)
     assert(!impl_EventRegister(provider, NULL, NULL, &first) && first);
     assert(!impl_EventRegister(provider, NULL, NULL, &second) && second && second != first);
     assert(impl_EventSetInformation(first, 2, NULL, 1) == 87);
-    assert(impl_EventSetInformation(first, 2, provider, sizeof(provider)) == 50);
+    assert(impl_EventSetInformation(first, 2, provider, sizeof(provider)) == 0);
     assert(!impl_EventUnregister(first));
     assert(impl_EventSetInformation(first, 2, provider, sizeof(provider)) == 6);
     assert(impl_EventUnregister(first) == 6);

@@ -4153,8 +4153,16 @@ impl_GetProcAddress(u64 hmod, const char *procname)
      * export (or a shared import) also has a diagnostic label, but no thunk
      * emitted at its index. Only reuse slots with an implementation target;
      * zero-return placeholders must not invent dynamically available APIs. */
+    /* Exception: a Kernel32/KernelBase routine the program imported statically exists on every Windows, so asking the
+     * module for it by name finds it there too, even while Beer only has a placeholder for it. RE4's protection looks
+     * up Beep, HeapValidate, SignalObjectAndWait, ... in KernelBase/Kernel32 and crashed on NULL right after it
+     * created its window. */
+    int real_kernel32_export = 0;
+    if (hmod == HMOD_K32 || hmod == HMOD_KBASE)
+        for (size_t k = 0; k < sizeof(g_kernel32_export_names) / sizeof(*g_kernel32_export_names) && !real_kernel32_export; ++k)
+            real_kernel32_export = g_kernel32_export_names[k] && !strcmp(g_kernel32_export_names[k], procname);
     for (int i = 0; i < g_nstubs; i++) {
-        if (!g_snames[i] || !g_impl_real[i]) continue;
+        if (!g_snames[i] || (!g_impl_real[i] && !real_kernel32_export)) continue;
         const char *bang = strchr(g_snames[i], '!');
         const char *fn   = bang ? bang + 1 : g_snames[i];
         if (strcmp(fn, procname) == 0) {
@@ -7281,6 +7289,7 @@ static u64 __attribute__((ms_abi)) steam_input_offline_motion(u64 self, u8 *out,
     }
     return (u64)(uintptr_t)out;
 }
+static void steam_vtab_unique_slots(u64 *vtab, size_t count);   /* XMM-preserving per-slot entries */
 static u64 steam_input_offline_interface(void)
 {
     /* SteamInput006 and the legacy SteamController008 share the lifecycle and
@@ -7298,6 +7307,7 @@ static u64 steam_input_offline_interface(void)
         vtable[17] = (u64)(uintptr_t)steam_input_offline_digital;   /* GetDigitalActionData */
         vtable[21] = (u64)(uintptr_t)steam_input_offline_analog;    /* GetAnalogActionData */
         vtable[29] = (u64)(uintptr_t)steam_input_offline_motion;    /* GetMotionData */
+        steam_vtab_unique_slots(vtable, sizeof(vtable) / sizeof(*vtable));
         object = (u64)(uintptr_t)vtable;
     }
     return (u64)(uintptr_t)&object;
@@ -8711,6 +8721,7 @@ static u64 steam_user_interface(const char *lower_version)
         } else {
             fprintf(stderr, "[STEAM] SteamUser%03d: session tickets are not mapped for this version\n", version);
         }
+        steam_vtab_unique_slots(cache[i].vtab, STEAM_VTAB_SZ);
         cache[i].object = (u64)cache[i].vtab;
         result = (u64)&cache[i].object;
     }
@@ -8722,18 +8733,45 @@ static u64 steam_user_interface(const char *lower_version)
  * implementation (steam_vfn_false, ...), so a wrapper that hooks one method by patching its code (unsteam uses
  * funchook on ISteamRemoteStorage) also captured every other slot sharing it: ISteamUtils::RunFrame, called each
  * frame by SteamAPI_RunCallbacks, ran unsteam's GetFileNameAndSize with garbage arguments and crashed as soon as a
- * cloud save existed (Chained Together). Each slot therefore gets its own entry: a 5-byte nop (room for a hook's
- * jump) and an indirect jump to the slot's implementation. */
-#define BEER_STEAM_SLOT_THUNKS 2048
+ * cloud save existed (Chained Together). Each slot therefore gets its own 16-byte entry: a 5-byte nop (room for a
+ * hook's jump), the slot number in R10 and a jump to beer_steam_slot_call.
+ *
+ * beer_steam_slot_call keeps the Windows x64 nonvolatile XMM6-XMM15 across the implementation. The guest calls these
+ * methods directly (not through the dispatch trampoline), and Beer's C code, built without SSE, cannot save them
+ * itself, while the libraries it calls (libc's vector memcpy, libopus, PulseAudio, GameNetworkingSockets) freely
+ * use them. Opus-encoding microphone audio inside ISteamUser::GetAvailableVoice wiped XMM registers the game's
+ * physics step kept values in: in a Pratfall hosted session the player hung in mid-air for as long as the
+ * microphone picked up sound. Stack-passed arguments (fifth and later, up to ten) are copied to the new frame;
+ * RAX and XMM0 carry the result back untouched. */
+#define BEER_STEAM_SLOT_THUNKS 8192
 u64 beer_steam_slot_targets[BEER_STEAM_SLOT_THUNKS];
 extern const u8 beer_steam_slot_thunks[];
 __asm__(".pushsection .text.beer_steam_slots,\"ax\",@progbits\n"
         ".balign 16\n"
+        "beer_steam_slot_call:\n"
+        "    sub $0x118, %rsp\n"                       /* entry RSP = 8 mod 16: the call below is 16-aligned */
+        ".irp reg,6,7,8,9,10,11,12,13,14,15\n"
+        "    movaps %xmm\\reg, (0x70+(\\reg-6)*0x10)(%rsp)\n"
+        ".endr\n"
+        ".irp off,0,8,16,24,32,40,48,56,64,72\n"
+        "    mov (0x118+0x28+\\off)(%rsp), %r11\n"     /* the caller's stack arguments */
+        "    mov %r11, (0x20+\\off)(%rsp)\n"
+        ".endr\n"
+        "    lea beer_steam_slot_targets(%rip), %r11\n"
+        "    call *(%r11,%r10,8)\n"
+        ".irp reg,6,7,8,9,10,11,12,13,14,15\n"
+        "    movaps (0x70+(\\reg-6)*0x10)(%rsp), %xmm\\reg\n"
+        ".endr\n"
+        "    add $0x118, %rsp\n"
+        "    ret\n"
+        ".balign 16\n"
         "beer_steam_slot_thunks:\n"
         ".set beer_steam_slot_index, 0\n"
-        ".rept 2048\n"
-        ".byte 0x0f, 0x1f, 0x44, 0x00, 0x00\n"
-        "jmp *beer_steam_slot_targets+8*beer_steam_slot_index(%rip)\n"
+        ".rept 8192\n"
+        ".byte 0x0f, 0x1f, 0x44, 0x00, 0x00\n"        /* 5-byte nop */
+        "mov $beer_steam_slot_index, %r10d\n"          /* 6 bytes */
+        ".byte 0xe9\n"                                 /* jmp rel32 beer_steam_slot_call */
+        ".long beer_steam_slot_call - (. + 4)\n"
         ".balign 16, 0xcc\n"
         ".set beer_steam_slot_index, beer_steam_slot_index + 1\n"
         ".endr\n"
@@ -8847,6 +8885,7 @@ static void init_steam_fake(void) {
     /* ISteamFriends vtable[0]=GetPersonaName. */
     g_steam_friends_vtab[0] = (u64)steam_friends_get_persona_name;
     g_steam_friends_vtab[7] = (u64)steam_friends_friend_persona_name;   /* GetFriendPersonaName */
+    g_steam_friends_vtab[33] = (u64)steam_friends_invite_dialog;       /* ActivateGameOverlayInviteDialog */
     /* BLoggedOn is true only with a signed-in session (official mode); offline, a stable local
      * CSteamID still keys per-user saves. */
     g_steam_user_vtab[1] = (u64)steam_user_logged_on;     /* false unless official mode has a session */
@@ -21885,6 +21924,7 @@ static u32 __attribute__((ms_abi)) impl_EventRegister(const void *provider, void
         break;
     }
     pthread_mutex_unlock(&g_etw_lock);
+    if (getenv("BEER_ETW_LOG")) fprintf(stderr, "[ETW] EventRegister -> handle 0x%llx\n", (unsigned long long)*handle);
     return *handle ? 0 : 8; /* ERROR_NOT_ENOUGH_MEMORY */
 }
 
@@ -21905,10 +21945,15 @@ static u32 beer_etw_registration_status(u64 handle, int remove)
 
 static u32 __attribute__((ms_abi)) impl_EventSetInformation(u64 handle, u32 info_class, const void *info, u32 size)
 {
-    (void)info_class;
     if (size && !info) return 87;
+    /* Windows accepts provider traits and the other information classes for any registered handle whether or not a
+     * trace session listens. ERROR_NOT_SUPPORTED sent Onimusha (TraceLogging provider setup) into a null-pointer
+     * crash right after its intro video. */
     const u32 status = beer_etw_registration_status(handle, 0);
-    return status ? status : 50; /* ERROR_NOT_SUPPORTED: no controller to receive metadata */
+    if (getenv("BEER_ETW_LOG"))
+        fprintf(stderr, "[ETW] EventSetInformation(handle 0x%llx, class %u, %u bytes) -> %u\n", (unsigned long long)handle,
+                info_class, size, status);
+    return status;
 }
 
 static u32 __attribute__((ms_abi)) impl_EventUnregister(u64 handle)
@@ -24478,6 +24523,7 @@ static void collect_native_window_events(void)
             case XWAYLAND_EVENT_KEY_DOWN:
             case XWAYLAND_EVENT_KEY_UP: {
                 int down = event.type == XWAYLAND_EVENT_KEY_DOWN;
+                if (down && beer_hitch_enabled()) beer_hitch_note("key down keysym 0x%lx", (unsigned long)event.keysym);
                 /* The overlay hotkey (set in the manager) toggles the overlay and never reaches the game. */
                 if (beer_overlay_hotkey_event(event.keysym, event.state, down)) break;
                 if (beer_post_hotkey_event(event.keysym, event.state, down)) break;
@@ -26698,7 +26744,14 @@ static u64 __attribute__((ms_abi))
 impl_EventWriteTransfer(u64 handle, const void *descriptor, const void *activity, const void *related, u32 count,
                         const void *data)
 {
-    (void)handle; (void)descriptor; (void)activity; (void)related; (void)count; (void)data;
+    (void)activity; (void)related; (void)data;
+    if (getenv("BEER_ETW_LOG")) {
+        static _Atomic(u32) logs;
+        if (atomic_fetch_add(&logs, 1) < 20)
+            fprintf(stderr, "[ETW] EventWriteTransfer(handle 0x%llx, id %u, %u fields) caller=0x%llx\n",
+                    (unsigned long long)handle, descriptor ? *(const u16 *)descriptor : 0, count,
+                    (unsigned long long)g_dispatch_incoming_return);
+    }
     return 0;   /* ERROR_SUCCESS */
 }
 
@@ -32290,8 +32343,26 @@ static u64 *beer_sspi_table(int wide)
 static u64 __attribute__((ms_abi)) impl_InitSecurityInterfaceA(void) { return (u64)(uintptr_t)beer_sspi_table(0); }
 static u64 __attribute__((ms_abi)) impl_InitSecurityInterfaceW(void) { return (u64)(uintptr_t)beer_sspi_table(1); }
 
+/* BEER_NO_IMPL=Name,Name (diagnostic): treat these exports as unimplemented, to bisect which implementation a
+ * program misbehaves with. */
+static int beer_impl_disabled(const char *fn_name)
+{
+    const char *list = getenv("BEER_NO_IMPL");
+    if (!list || !*list || !fn_name) return 0;
+    const size_t n = strlen(fn_name);
+    for (const char *p = list; *p;) {
+        const char *end = strchr(p, ',');
+        const size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == n && !strncmp(p, fn_name, n)) return 1;
+        if (!end) break;
+        p = end + 1;
+    }
+    return 0;
+}
+
 static ImplFn find_impl(const char *fn_name)
 {
+    if (beer_impl_disabled(fn_name)) return NULL;
     for (int i = 0; g_impls[i].name; i++)
         if (strcmp(g_impls[i].name, fn_name) == 0)
             return g_impls[i].fn;
@@ -32841,6 +32912,22 @@ static void fake_pe_exports_build(void)
         if (!fake_pe_native_export_name(name)) fake_pe_add_export(kernelbase_module, name, capacity);
     }
 
+    {   /* BEER_PAD_FAKE_THUNKS=N (diagnostic): N unused thunk slots before the synthetic modules' export thunks. */
+        const char *pad = getenv("BEER_PAD_FAKE_THUNKS");
+        for (int i = pad ? atoi(pad) : 0; i > 0 && g_nstubs < MAX_STUBS; --i) g_snames[g_nstubs++] = "(padding)";
+    }
+    {   /* BEER_FAKE_EXTRA_EXPORT=module.dll:Name (diagnostic): one more export in a synthetic module. */
+        static char extra[256];
+        const char *v = getenv("BEER_FAKE_EXTRA_EXPORT");
+        if (v && strchr(v, ':')) {
+            snprintf(extra, sizeof(extra), "%s", v);
+            char *colon = strchr(extra, ':');
+            *colon = 0;
+            FakePeModule *owner = fake_pe_module_for_import(extra);
+            const int added = owner && fake_pe_add_export(owner, colon + 1, capacity);
+            fprintf(stderr, "[PE] extra export %s!%s: %s\n", extra, colon + 1, added ? "added" : "module not found");
+        }
+    }
     for (size_t m = 0; m < sizeof(g_fake_pe_modules) / sizeof(*g_fake_pe_modules); ++m) {
         FakePeModule *module = &g_fake_pe_modules[m];
         qsort(module->exports, module->export_count, sizeof(*module->exports), fake_pe_name_cmp);

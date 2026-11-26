@@ -535,3 +535,20 @@ long beer_steam_session_next_mms_event(uint32_t *emsg, uint8_t *out, size_t cap)
     pthread_mutex_unlock(&g.lock);
     return len;
 }
+
+int beer_steam_session_invite_lobby(uint32_t appid, uint64_t lobby, uint64_t friend_id)
+{
+    char fields[160];
+    snprintf(fields, sizeof(fields), "\"appid\":\"%u\",\"lobby\":\"%llu\",\"friend\":\"%llu\"", appid,
+             (unsigned long long)lobby, (unsigned long long)friend_id);
+    pthread_mutex_lock(&g.lock);
+    char *reply = g.active ? request("invite_lobby", fields) : NULL;
+    pthread_mutex_unlock(&g.lock);
+    char err[256];
+    const int ok = reply_ok(reply, err, sizeof(err));
+    if (!ok) fprintf(stderr, "[STEAM] invite of %llu to lobby %llu failed: %s\n", (unsigned long long)friend_id,
+                     (unsigned long long)lobby, reply ? err : "no Steam session is open");
+    else fprintf(stderr, "[STEAM] invited %llu to lobby %llu\n", (unsigned long long)friend_id, (unsigned long long)lobby);
+    free(reply);
+    return ok;
+}

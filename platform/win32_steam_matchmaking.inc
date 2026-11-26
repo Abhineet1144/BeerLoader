@@ -82,7 +82,32 @@ MMS_FN mm_create_lobby(u64 self, s32 type, s32 max)
 }
 MMS_FN mm_join_lobby(u64 self, u64 lobby) { (void)self; return beer_mms_join_lobby(lobby); }
 MMS_FN mm_leave_lobby(u64 self, u64 lobby) { (void)self; beer_mms_leave_lobby(lobby); return 0; }
-MMS_FN mm_invite(u64 self, u64 lobby, u64 user) { (void)self; return (u64)beer_mms_invite(lobby, user); }
+/* InviteUserToLobby: with a signed-in session the provider sends it as the Steam client does (matchmaking message and
+ * a chat invite with a Join button), off the game thread; the result is whether the invite could be started. */
+struct steam_invite_job { u32 appid; u64 lobby, user; };
+static void *steam_invite_thread(void *arg)
+{
+    struct steam_invite_job *job = arg;
+    beer_steam_session_invite_lobby(job->appid, job->lobby, job->user);
+    free(job);
+    return NULL;
+}
+static int steam_invite_async(u64 lobby, u64 user)
+{
+    struct steam_invite_job *job = malloc(sizeof(*job));
+    pthread_t thread;
+    if (!job) return 0;
+    *job = (struct steam_invite_job){ g_steam_own_appid, lobby, user };
+    if (pthread_create(&thread, NULL, steam_invite_thread, job)) { free(job); return 0; }
+    pthread_detach(thread);
+    return 1;
+}
+MMS_FN mm_invite(u64 self, u64 lobby, u64 user)
+{
+    (void)self;
+    if (g_steam_api_official && beer_steam_session_active() && lobby && user) return (u64)steam_invite_async(lobby, user);
+    return (u64)beer_mms_invite(lobby, user);
+}
 MMS_FN mm_member_count(u64 self, u64 lobby) { (void)self; return (u64)(s64)beer_mms_member_count(lobby); }
 MMS_FN mm_member_by_index(u64 self, u64 *ret, u64 lobby, s32 index)
     { (void)self; if (ret) *ret = beer_mms_member_by_index(lobby, index); return (u64)(uintptr_t)ret; }
@@ -179,6 +204,7 @@ static u64 steam_matchmaking_interface(void)
         vtable[35] = (u64)(uintptr_t)mm_owner;
         vtable[36] = (u64)(uintptr_t)mm_set_owner;
         /* 37 SetLinkedLobby: false */
+        steam_vtab_unique_slots(vtable, sizeof(vtable) / sizeof(*vtable));   /* XMM6-15 kept */
         object = (u64)(uintptr_t)vtable;
     }
     return (u64)(uintptr_t)&object;
@@ -191,6 +217,72 @@ MMS_FN steam_friends_friend_persona_name(u64 self, u64 user)
     if (g_steam_api_official && user == beer_steam_session_steamid()) return (u64)(uintptr_t)beer_steam_session_persona();
     const char *name = beer_mms_persona(user);
     return (u64)(uintptr_t)(name ? name : "[unknown]");
+}
+
+/* ISteamFriends::ActivateGameOverlayInviteDialog(lobby): Steam's overlay is not available, so Beer opens its own
+ * friend picker (manager/invite_picker.py, which asks the Steam provider for the friends list and sends the invites).
+ * The game is told the overlay opened and closed (GameOverlayActivated_t, callback 331), as with Steam's overlay, so
+ * it frees the mouse and pauses input meanwhile. */
+static void steam_overlay_activated(int active)
+{
+    struct { u8 active, user_initiated, pad[2]; u32 appid, overlay_pid; } event = {
+        (u8)(active != 0), 1, { 0, 0 }, g_steam_own_appid, (u32)getpid() };
+    steam_callback_post(331, &event, sizeof(event));
+}
+static _Atomic(int) g_steam_invite_picker_open;
+static void *steam_invite_picker_thread(void *arg)
+{
+    const u64 lobby = (u64)(uintptr_t)arg;
+    char exe[4096], script[4200], appid[16], lobby_text[32];
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    exe[n > 0 ? n : 0] = 0;
+    char *slash = strrchr(exe, '/');
+    if (slash) *slash = 0;
+    snprintf(script, sizeof(script), "%s/manager/invite_picker.py", exe);
+    snprintf(appid, sizeof(appid), "%u", g_steam_own_appid);
+    snprintf(lobby_text, sizeof(lobby_text), "%llu", (unsigned long long)lobby);
+    steam_overlay_activated(1);
+    char *argv[] = { "python3", script, "--appid", appid, "--lobby", lobby_text, NULL };
+    size_t count = 0;
+    while (environ && environ[count]) ++count;
+    char **env = calloc(count + 1, sizeof(char *));
+    for (size_t i = 0, k = 0; env && i < count; ++i)
+        if (strncmp(environ[i], "LD_PRELOAD=", 11)) env[k++] = environ[i];   /* the game's preloads are not for it */
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    sigset_t none, defaults;
+    sigemptyset(&none);
+    sigfillset(&defaults);
+    sigdelset(&defaults, SIGKILL);
+    sigdelset(&defaults, SIGSTOP);
+    posix_spawnattr_setsigmask(&attr, &none);
+    posix_spawnattr_setsigdefault(&attr, &defaults);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    pid_t child = -1;
+    if (posix_spawnp(&child, "python3", NULL, &attr, argv, env ? env : environ)) child = -1;
+    posix_spawnattr_destroy(&attr);
+    free(env);
+    int status = 0;
+    if (child > 0) while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    fprintf(stderr, "[STEAM] invite picker for lobby %s closed (%s)\n", lobby_text,
+            child < 0 ? "could not start" : WIFEXITED(status) && !WEXITSTATUS(status) ? "ok" : "failed");
+    steam_overlay_activated(0);
+    atomic_store(&g_steam_invite_picker_open, 0);
+    return NULL;
+}
+MMS_FN steam_friends_invite_dialog(u64 self, u64 lobby)
+{
+    (void)self;
+    fprintf(stderr, "[STEAM] ActivateGameOverlayInviteDialog(lobby %llu)\n", (unsigned long long)lobby);
+    if (!g_steam_api_official || !beer_steam_session_active() || !lobby) return 0;
+    if (atomic_exchange(&g_steam_invite_picker_open, 1)) return 0;          /* already open */
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, steam_invite_picker_thread, (void *)(uintptr_t)lobby)) {
+        atomic_store(&g_steam_invite_picker_open, 0);
+        return 0;
+    }
+    pthread_detach(thread);
+    return 0;
 }
 
 /* ---- callback channel used by Valve's steam_api64 (CallbackMsg_t: user, id, param, size) ---- */

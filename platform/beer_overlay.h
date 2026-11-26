@@ -20,6 +20,11 @@ typedef struct {
 
 /* Returns the number of visible boxes, filling rects[0..n). */
 int beer_overlay_frame(int out_w, int out_h, BeerOverlayRect rects[BEER_OVERLAY_SLOTS]);
+/* BEER_HITCH_LOG=1: timestamped "[HITCH]" lines for frame-to-frame spikes (checked once per presented frame) and for
+ * events other code reports (key presses, thread suspensions), to line a visible hitch up with its cause. */
+int beer_hitch_enabled(void);
+long long beer_hitch_now_us(void);
+void beer_hitch_note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* 1 while the overlay is shown with opacity below 100%: the presenter must blend it (post pass), not copy it. */
 int beer_overlay_translucent(void);

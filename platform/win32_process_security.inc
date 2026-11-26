@@ -112,7 +112,10 @@ static int beer_security_image_level(const u8 *image, size_t size, int mapped)
             SecHdr section; memcpy(&section, image + table + i * sizeof(section), sizeof(section));
             if (resource.rva < section.vrva || resource.rva - section.vrva > section.raw_sz) continue;
             u32 delta = resource.rva - section.vrva;
-            if (resource.size > section.raw_sz - delta) return -1;
+            /* The directory may extend past the section's file data (the loader zero-fills the rest: Stellar
+             * Blade's shipping executable); only what the file holds can be parsed. */
+            if (resource.size > section.raw_sz - delta) resource.size = section.raw_sz - delta;
+            if (!resource.size) return 0;
             at = (size_t)section.raw_off + delta;
             found = 1;
             break;
