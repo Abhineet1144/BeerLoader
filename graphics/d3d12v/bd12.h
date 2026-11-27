@@ -198,6 +198,7 @@ typedef struct BD12AccelStruct {
      * titles may pass a different VertexCount when they update (RE8 does). */
     uint32_t *max_vertex;
     uint32_t geometry_count;
+    uint32_t built;               /* diagnostic BEER_BD12_AS_FREEZE: built at least once */
 } BD12AccelStruct;
 
 typedef struct BD12SamplerEntry {
@@ -694,6 +695,9 @@ typedef struct {
 } BD12FlightOp;
 
 typedef struct BD12CmdList {
+    /* Diagnostic (multi-queue): the lane timeline and serial of the newest submission that used this list. */
+    BD12Fence *inflight_fence;
+    uint64_t inflight_serial;
     BD12Device *device;
     BD12CmdAllocator *allocator;
     VkCommandBuffer command_buffer; /* current recording segment */
@@ -1154,6 +1158,9 @@ int bd12_image_requirements(BD12Device *device, const BD12ImageDesc *desc,
                             VkDeviceSize *size, VkDeviceSize *alignment);
 /* Full memory dependency (UAV barrier on all resources, aliasing barriers). */
 void bd12_cmd_global_barrier(BD12CmdList *list);
+/* D3D12 aliasing barrier: earlier writes made available before the aliased memory is reused; for an image being
+ * activated no visibility is needed (its first use initialises it). */
+void bd12_cmd_alias_barrier(BD12CmdList *list, int after_is_image);
 int bd12_debug_sync_all(void);
 void bd12_trace_frame_advance(void);
 int bd12_trace_active(void);
@@ -1191,17 +1198,34 @@ enum { BD12_PROF_EXECUTE, BD12_PROF_SUBMIT, BD12_PROF_PSO, BD12_PROF_RESOLVE,
        BD12_PROF_RESOURCE, BD12_PROF_VIEW, BD12_PROF_DESC_COPY, BD12_PROF_PSO_VK, BD12_PROF_COUNT };
 extern uint64_t g_bd12_prof_ns[BD12_PROF_COUNT];
 extern uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
+/* The same counters for the calling thread only (the hitch lines show what the presenting thread itself did). */
+extern __thread uint64_t g_bd12_tprof_ns[BD12_PROF_COUNT];
+extern __thread uint64_t g_bd12_tprof_calls[BD12_PROF_COUNT];
+/* Per-draw timing is only read with BEER_BD12_PROF or BEER_BD12_HITCH. This runs for every descriptor copy and view
+ * (tens of thousands per frame): the answer is one cached load, and no counter is written when profiling is off. */
+static inline int bd12_prof_enabled(void)
+{
+    static int on = -1;
+    int v = on;
+    if (v < 0) {
+        v = getenv("BEER_BD12_PROF") || getenv("BEER_BD12_HITCH") ? 1 : 0;
+        on = v;
+    }
+    return v;
+}
 static inline uint64_t bd12_prof_now(void)
 {
-    /* Per-draw timing is only read with BEER_BD12_PROF or BEER_BD12_HITCH; skip the clock read otherwise. */
-    if (!getenv("BEER_BD12_PROF") && !getenv("BEER_BD12_HITCH")) return 0;
+    if (!bd12_prof_enabled()) return 0;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 #define BD12_PROF_BEGIN() const uint64_t bd12_prof_t0_ = bd12_prof_now()
-#define BD12_PROF_END(id) do { g_bd12_prof_ns[id] += bd12_prof_now() - bd12_prof_t0_; \
-                               ++g_bd12_prof_calls[id]; } while (0)
+/* The counters are shared by every thread: do not touch their cache line when profiling is off. */
+#define BD12_PROF_END(id) BD12_PROF_ADD(id, bd12_prof_t0_)
+#define BD12_PROF_ADD(id, t0) do { if (bd12_prof_enabled()) { const uint64_t d_ = bd12_prof_now() - (t0); \
+                               g_bd12_prof_ns[id] += d_; ++g_bd12_prof_calls[id]; \
+                               g_bd12_tprof_ns[id] += d_; ++g_bd12_tprof_calls[id]; } } while (0)
 void bd12_prof_report(void);
 /* BEER_BD12_HITCH=<ms>: for every frame (present to present) slower than that, print what BD12 did in it. */
 void bd12_hitch_present(void);

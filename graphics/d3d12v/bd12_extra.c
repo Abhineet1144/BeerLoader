@@ -12,13 +12,50 @@
  * UAV clear/resolve is ordered against shader accesses by the application's
  * UAV barriers, which carry no Vulkan stage information on their own. */
 
-static void global_barrier(BD12CmdList *list, VkPipelineStageFlags2 src_stage,
+/* BEER_BD12_FULL_SITES=1 (diagnostic): full barriers counted per calling code address, printed with BEER_BD12_PROF's
+ * window as module offsets (addr2line -e loader <offset>). */
+#define FULL_SITES 64
+extern uint64_t g_bd12_alias_barriers[2];
+static struct { void *site; uint64_t count; } g_full_sites[FULL_SITES];
+static int full_sites_on(void) { static int on = -1; if (on < 0) on = getenv("BEER_BD12_FULL_SITES") != NULL; return on; }
+static void full_site_note(void *site)
+{
+    for (int i = 0; i < FULL_SITES; ++i) {
+        void *cur = __atomic_load_n(&g_full_sites[i].site, __ATOMIC_RELAXED);
+        if (!cur) {
+            void *expected = NULL;
+            if (!__atomic_compare_exchange_n(&g_full_sites[i].site, &expected, site, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) &&
+                expected != site) continue;
+            cur = site;
+        }
+        if (cur == site) { __atomic_add_fetch(&g_full_sites[i].count, 1, __ATOMIC_RELAXED); return; }
+    }
+}
+void bd12_full_sites_report(void)
+{
+    if (!full_sites_on()) return;
+    extern char __executable_start;
+    fprintf(stderr, "[BD12 FULL]");
+    for (int i = 0; i < FULL_SITES && g_full_sites[i].site; ++i) {
+        const uint64_t n = __atomic_exchange_n(&g_full_sites[i].count, 0, __ATOMIC_RELAXED);
+        if (n) fprintf(stderr, " 0x%lx=%llu", (unsigned long)((char *)g_full_sites[i].site - &__executable_start),
+                       (unsigned long long)n);
+    }
+    fprintf(stderr, " alias-barriers issued=%llu skipped=%llu",
+            (unsigned long long)__atomic_exchange_n(&g_bd12_alias_barriers[0], 0, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_exchange_n(&g_bd12_alias_barriers[1], 0, __ATOMIC_RELAXED));
+    fputc('\n', stderr);
+}
+
+static void __attribute__((noinline)) global_barrier_at(BD12CmdList *list, VkPipelineStageFlags2 src_stage,
                            VkAccessFlags2 src_access,
                            VkPipelineStageFlags2 dst_stage,
-                           VkAccessFlags2 dst_access)
+                           VkAccessFlags2 dst_access, void *site)
 {
-    if (src_stage == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT && dst_stage == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT)
+    if (src_stage == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT && dst_stage == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT) {
         g_bd12_cmd_counts[3]++;   /* full ALL_COMMANDS -> ALL_COMMANDS dependencies (BEER_BD12_PROF) */
+        if (full_sites_on()) full_site_note(site);
+    }
     if (list->barrier_batching) {
         bd12_cmd_add_memory_barrier(list, src_stage, src_access, dst_stage, dst_access);
         return;
@@ -38,6 +75,7 @@ static void global_barrier(BD12CmdList *list, VkPipelineStageFlags2 src_stage,
     g_bd12_cmd_counts[BD12_COUNT_BARRIER]++;
     list->device->vk.CmdPipelineBarrier2(list->command_buffer, &dependency);
 }
+#define global_barrier(list, ss, sa, ds, da) global_barrier_at((list), (ss), (sa), (ds), (da), __builtin_return_address(0))
 
 static const VkAccessFlags2 k_all_access =
     VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -87,11 +125,19 @@ int bd12_debug_sync_all(void)
     return value;
 }
 
-void bd12_cmd_global_barrier(BD12CmdList *list)
+uint64_t g_bd12_alias_barriers[2];   /* [0] issued, [1] skipped (a committed resource cannot alias): BEER_BD12_FULL_SITES */
+void __attribute__((noinline)) bd12_cmd_alias_barrier(BD12CmdList *list, int after_is_image)
+{
+    bd12_cmd_end_rendering(list);
+    global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                   after_is_image ? 0 : VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+}
+void __attribute__((noinline)) bd12_cmd_global_barrier(BD12CmdList *list)
 {
     bd12_cmd_end_rendering(list);
     global_barrier(list, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access,
-                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access);
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, k_all_access);   /* site = bd12_cmd_global_barrier's caller */
 }
 
 /* A UAV clear is ordered against earlier work by the application's transition or UAV barrier, as on D3D12 (both cover

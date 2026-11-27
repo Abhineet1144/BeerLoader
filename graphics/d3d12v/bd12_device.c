@@ -16,6 +16,8 @@ void bd12_heap_reaper_drain(void);
 #include <errno.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <fcntl.h>
+#include <stdatomic.h>
 
 static BD12Device *g_pc_device;
 static uint64_t pc_now_ms(void);
@@ -126,6 +128,9 @@ BD12Device *bd12_device_create(void)
     pthread_mutex_init(&device->submit_barrier_lock, NULL);
     pthread_mutex_init(&device->view_lock, NULL);
     pthread_mutex_init(&device->zero_lock, NULL);
+    if (getenv("BEER_BD12_HITCH_SYSCALL"))
+        fprintf(stderr, "[LOCKS] bd12 device: submit_barrier=%p view=%p zero=%p\n", (void *)&device->submit_barrier_lock,
+                (void *)&device->view_lock, (void *)&device->zero_lock);
 
     PFN_vkGetDeviceProcAddr get_device = beer_vulkan_get_device_proc_addr();
     PFN_vkGetInstanceProcAddr get_instance = beer_vulkan_get_instance_proc_addr();
@@ -990,7 +995,9 @@ void bd12_zero_flush(BD12Device *device)
         VkSubmitInfo2 submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cb_info,
                                  .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &signal };
         beer_vulkan_queue_lock();
-        VkResult result = device->vk.QueueSubmit2(device->queue, 1, &submit, VK_NULL_HANDLE);
+        beer_vulkan_queue_trace_enter(device->queue, "bd12 zero fill");
+    VkResult result = device->vk.QueueSubmit2(device->queue, 1, &submit, VK_NULL_HANDLE);
+    beer_vulkan_queue_trace_leave(device->queue);
         beer_vulkan_queue_unlock();
         beer_vulkan_record_result(result, "BD12 heap zero fill");
         device->zero_submitted = device->zero_recorded;
@@ -1713,8 +1720,10 @@ VkResult bd12_queue_submit(BD12Queue *queue, BD12CmdList *const *lists,
         .pSignalSemaphoreInfos = signal_infos
     };
     beer_vulkan_queue_lock_at(queue->index);
+    beer_vulkan_queue_trace_enter(queue->queue, "bd12 lane submit");
     VkResult result = device->vk.QueueSubmit2(queue->queue, 1, &submit,
                                               VK_NULL_HANDLE);
+    beer_vulkan_queue_trace_leave(queue->queue);
     beer_vulkan_queue_unlock_at(queue->index);
     __atomic_add_fetch(&queue->submit_count, 1, __ATOMIC_RELAXED);
     beer_vulkan_record_result(result, "BD12 queue submit");
@@ -1863,6 +1872,8 @@ static void bd12_report_drops(void)
 
 uint64_t g_bd12_prof_ns[BD12_PROF_COUNT];
 uint64_t g_bd12_prof_calls[BD12_PROF_COUNT];
+__thread uint64_t g_bd12_tprof_ns[BD12_PROF_COUNT];
+__thread uint64_t g_bd12_tprof_calls[BD12_PROF_COUNT];
 
 uint64_t g_bd12_cmd_counts[4];
 
@@ -1907,6 +1918,114 @@ static void thread_counters(uint64_t out[6])
 
 extern uint64_t beer_thread_wait_stats(uint64_t *max_ns, uint64_t *max_handle, uint64_t *max_caller)
     __attribute__((weak));
+extern uint32_t beer_thread_wait_kind(void) __attribute__((weak));
+extern unsigned long long beer_futex_handle(unsigned long long addr) __attribute__((weak));
+/* " futex@0x..." plus " (handle 0x...)" when the address is a guest wait object's condition variable. */
+static void hs_print_futex(const char *label, unsigned long long addr)
+{
+    const unsigned long long h = beer_futex_handle ? beer_futex_handle(addr) : 0;
+    if (h) fprintf(stderr, "%s0x%llx(handle %llx)", label, addr, h);
+    else fprintf(stderr, "%s0x%llx", label, addr);
+}
+
+/* BEER_BD12_HITCH_SYSCALL=1: a thread reads /proc/self/task/<presenting tid>/syscall every ~0.5 ms (no signals, so
+ * no SIGPROF-style crashes) and histograms what the thread was doing: a syscall (ioctl = GPU driver, futex = lock or
+ * wait, ...) or "running". A hitch line then lists the top states of its frame, which pins time that is neither CPU
+ * nor a counted guest wait. Keys: 0..511 syscall number, 512 running, 513 unreadable, 1024+n ioctl request nr n. */
+#define HS_KEYS 1536
+static _Atomic uint32_t g_hs_hist[HS_KEYS];
+static _Atomic long g_hs_tid;
+/* The futex word addresses seen while the thread was in futex (a lock or condvar: native address = a Beer mutex,
+ * 0x7fff.../0x14... = a guest object), so a hitch line can name the one it blocked on. */
+#define HS_ADDRS 64
+static struct { _Atomic uint64_t addr; _Atomic uint32_t count; } g_hs_addr[HS_ADDRS];
+static void hs_note_futex(uint64_t addr)
+{
+    for (int i = 0; i < HS_ADDRS; ++i) {
+        uint64_t a = atomic_load_explicit(&g_hs_addr[i].addr, memory_order_relaxed);
+        if (!a) { atomic_store_explicit(&g_hs_addr[i].addr, addr, memory_order_relaxed); a = addr; }
+        if (a == addr) { atomic_fetch_add_explicit(&g_hs_addr[i].count, 1, memory_order_relaxed); return; }
+    }
+}
+static _Atomic long g_hs_owner;               /* host tid of the critical-section owner being waited for, or 0 */
+static _Atomic uint32_t g_hs_owner_hist[HS_KEYS];
+static _Atomic unsigned long long g_hs_owner_rip;
+static _Atomic long g_hs_owner_last_tid;
+static _Atomic unsigned long long g_hs_owner_futex;
+void bd12_hitch_owner(long waiter_host_tid, long owner_host_tid, unsigned long long owner_rip)
+{
+    if (waiter_host_tid != atomic_load(&g_hs_tid)) return;   /* only the presenting thread's waits matter */
+    atomic_store(&g_hs_owner, owner_host_tid);
+    if (owner_host_tid) atomic_store(&g_hs_owner_last_tid, owner_host_tid);
+    if (owner_rip) atomic_store(&g_hs_owner_rip, owner_rip);
+}
+static unsigned hs_key(const char *buf, ssize_t n, int primary)
+{
+    unsigned key = 513;
+    if (n <= 0) return key;
+    if (!strncmp(buf, "running", 7)) return 512;
+    char *end;
+    const long nr = strtol(buf, &end, 10);
+    key = nr >= 0 && nr < 512 ? (unsigned)nr : 513;
+    if (nr == 202 && primary) hs_note_futex(strtoull(end, NULL, 16));
+    if (nr == 16 && key < 512) {   /* ioctl(fd, request, ...): the second argument */
+        char *e2;
+        strtoull(end, &e2, 16);
+        const unsigned long long req = strtoull(e2, NULL, 16);
+        key = 1024 + (unsigned)(req & 0xff);
+    }
+    return key;
+}
+static void *hitch_sampler(void *arg)
+{
+    (void)arg;
+    char path[64], buf[160];
+    long tid = 0, otid = 0;
+    int fd = -1, ofd = -1;
+    for (;;) {
+        usleep(500);
+        const long want_owner = atomic_load(&g_hs_owner);
+        if (want_owner != otid) {
+            if (ofd >= 0) close(ofd);
+            otid = want_owner;
+            ofd = -1;
+            if (otid) {
+                snprintf(path, sizeof(path), "/proc/self/task/%ld/syscall", otid);
+                ofd = open(path, O_RDONLY);
+            }
+        }
+        if (ofd >= 0) {
+            const ssize_t on = pread(ofd, buf, sizeof(buf) - 1, 0);
+            if (on > 0) buf[on] = 0;
+            atomic_fetch_add_explicit(&g_hs_owner_hist[hs_key(buf, on, 0)], 1, memory_order_relaxed);
+            if (on > 4 && !strncmp(buf, "202 ", 4)) atomic_store(&g_hs_owner_futex, strtoull(buf + 4, NULL, 16));
+        }
+        const long now_tid = atomic_load(&g_hs_tid);
+        if (now_tid != tid) {
+            if (fd >= 0) close(fd);
+            tid = now_tid;
+            snprintf(path, sizeof(path), "/proc/self/task/%ld/syscall", tid);
+            fd = open(path, O_RDONLY);
+        }
+        if (fd < 0) continue;
+        const ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+        if (n > 0) buf[n] = 0;
+        atomic_fetch_add_explicit(&g_hs_hist[hs_key(buf, n, 1)], 1, memory_order_relaxed);
+    }
+    return NULL;
+}
+static const char *hs_name(unsigned key, char *tmp, size_t n)
+{
+    switch (key) {
+    case 0: return "read"; case 1: return "write"; case 7: return "poll"; case 17: return "pread";
+    case 35: return "nanosleep"; case 202: return "futex"; case 230: return "clock_nanosleep";
+    case 232: return "epoll_wait"; case 271: return "ppoll"; case 9: return "mmap"; case 11: return "munmap";
+    case 28: return "madvise"; case 24: return "sched_yield"; case 512: return "running"; case 513: return "?";
+    default:
+        if (key >= 1024) snprintf(tmp, n, "ioctl:0x%x", key - 1024); else snprintf(tmp, n, "sys%u", key);
+        return tmp;
+    }
+}
 
 void bd12_hitch_present(void)
 {
@@ -1916,14 +2035,28 @@ void bd12_hitch_present(void)
         threshold_ns = v && *v ? (int64_t)strtol(v, NULL, 10) * 1000000 : 0;
     }
     if (!threshold_ns) return;
+    static int sampler_on = -1;
+    static uint32_t hs_last[HS_KEYS], hs_addr_last[HS_ADDRS], hs_owner_last[HS_KEYS];
+    if (sampler_on < 0) {
+        sampler_on = getenv("BEER_BD12_HITCH_SYSCALL") != NULL;
+        pthread_t t;
+        if (sampler_on && pthread_create(&t, NULL, hitch_sampler, NULL) == 0) pthread_detach(t); else sampler_on = 0;
+    }
+    if (sampler_on) atomic_store(&g_hs_tid, (long)syscall(SYS_gettid));
     static uint64_t last, frame, ns[BD12_PROF_COUNT], calls[BD12_PROF_COUNT], read_bytes;
     const uint64_t now = bd12_prof_now();
     const uint64_t io = self_read_bytes();
     uint64_t wait_max = 0, wait_handle = 0, wait_caller = 0;
     const uint64_t waited = beer_thread_wait_stats ? beer_thread_wait_stats(&wait_max, &wait_handle, &wait_caller) : 0;
-    static uint64_t counters[6];
+    static uint64_t counters[6], tns[BD12_PROF_COUNT], tcalls[BD12_PROF_COUNT], tcpu;
     uint64_t now_counters[6];
     thread_counters(now_counters);
+    uint64_t cpu_now;
+    {   /* this thread's exact CPU time (the /proc tick counters are 10 ms steps) */
+        struct timespec cts;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cts);
+        cpu_now = (uint64_t)cts.tv_sec * 1000000000ull + (uint64_t)cts.tv_nsec;
+    }
     ++frame;
     if (last && (int64_t)(now - last) > threshold_ns) {
         static const char *names[] = { "execute", "submit", "pso", "resolve", "fence-wait", "finish", "present",
@@ -1941,18 +2074,76 @@ void bd12_hitch_present(void)
                 (i == BD12_PROF_RESOURCE && dc))
                 fprintf(stderr, " %s=%.1fms/%llu", names[i], dn / 1e6, (unsigned long long)dc);
         }
-        fprintf(stderr, " waited=%.1fms (longest %.1fms on %llx from 0x%llx)", waited / 1e6, wait_max / 1e6,
-                (unsigned long long)wait_handle, (unsigned long long)wait_caller);
+        {   static const char *const kinds[] = { "?", "handle", "multi", "sleep", "cv", "cs", "srw-ex", "srw-sh",
+                                                "address", "iocp", "delay" };
+            const uint32_t k = beer_thread_wait_kind ? beer_thread_wait_kind() : 0;
+            fprintf(stderr, " waited=%.1fms (longest %.1fms %s on %llx from 0x%llx)", waited / 1e6, wait_max / 1e6,
+                    kinds[k < sizeof(kinds) / sizeof(*kinds) ? k : 0], (unsigned long long)wait_handle,
+                    (unsigned long long)wait_caller);
+        }
         fprintf(stderr, " thread: user=%llums sys=%llums minflt=%llu majflt=%llu csw=%llu/%llu",
                 (unsigned long long)((now_counters[2] - counters[2]) * 10), (unsigned long long)((now_counters[3] - counters[3]) * 10),
                 (unsigned long long)(now_counters[0] - counters[0]), (unsigned long long)(now_counters[1] - counters[1]),
                 (unsigned long long)(now_counters[4] - counters[4]), (unsigned long long)(now_counters[5] - counters[5]));
-        fprintf(stderr, " heaps-live=%llu/%llu/%llu read=%lluKB\n",
+        fprintf(stderr, " heaps-live=%llu/%llu/%llu read=%lluKB",
                 (unsigned long long)g_bd12_heap_live[BD12_HEAP_DEFAULT], (unsigned long long)g_bd12_heap_live[BD12_HEAP_UPLOAD],
                 (unsigned long long)g_bd12_heap_live[BD12_HEAP_READBACK],
                 (unsigned long long)((io >= read_bytes ? io - read_bytes : 0) >> 10));
+        /* What this thread itself did: CPU time, and the BD12 sections it ran (the lists above cover every thread). */
+        fprintf(stderr, " | this thread: cpu=%.1fms", (cpu_now - tcpu) / 1e6);
+        for (int i = 0; i < BD12_PROF_COUNT; ++i) {
+            const uint64_t dn = g_bd12_tprof_ns[i] - tns[i];
+            if (dn >= 500000) fprintf(stderr, " %s=%.1fms/%llu", names[i], dn / 1e6,
+                                      (unsigned long long)(g_bd12_tprof_calls[i] - tcalls[i]));
+        }
+        if (sampler_on) {   /* top sampled states of this frame (0.5 ms per sample) */
+            fprintf(stderr, " | sampled:");
+            uint32_t d[HS_KEYS];
+            for (unsigned k = 0; k < HS_KEYS; ++k) d[k] = atomic_load(&g_hs_hist[k]) - hs_last[k];
+            for (int top = 0; top < 4; ++top) {
+                unsigned best = 0;
+                for (unsigned k = 1; k < HS_KEYS; ++k) if (d[k] > d[best]) best = k;
+                if (d[best] < 3) break;
+                char tmp[24];
+                fprintf(stderr, " %s=%.1fms", hs_name(best, tmp, sizeof(tmp)), d[best] * 0.5);
+                d[best] = 0;
+            }
+            unsigned bi = HS_ADDRS;
+            uint32_t bc = 2;
+            for (unsigned i = 0; i < HS_ADDRS; ++i) {
+                const uint32_t c = atomic_load(&g_hs_addr[i].count) - hs_addr_last[i];
+                if (c > bc) { bc = c; bi = i; }
+            }
+            if (bi < HS_ADDRS) {
+                hs_print_futex(" futex@", (unsigned long long)atomic_load(&g_hs_addr[bi].addr));
+                fprintf(stderr, "=%.1fms", bc * 0.5);
+            }
+            uint32_t od[HS_KEYS], osum = 0;
+            for (unsigned k = 0; k < HS_KEYS; ++k) { od[k] = atomic_load(&g_hs_owner_hist[k]) - hs_owner_last[k]; osum += od[k]; }
+            if (osum >= 3) {   /* what the critical-section owner was doing while this thread waited for it */
+                fprintf(stderr, " | cs-owner(tid=%ld rip=0x%llx", atomic_load(&g_hs_owner_last_tid),
+                        atomic_load(&g_hs_owner_rip));
+                hs_print_futex(" futex=", (unsigned long long)atomic_load(&g_hs_owner_futex));
+                fprintf(stderr, "):");
+                for (int top = 0; top < 3; ++top) {
+                    unsigned best = 0;
+                    for (unsigned k = 1; k < HS_KEYS; ++k) if (od[k] > od[best]) best = k;
+                    if (od[best] < 2) break;
+                    char tmp[24];
+                    fprintf(stderr, " %s=%.1fms", hs_name(best, tmp, sizeof(tmp)), od[best] * 0.5);
+                    od[best] = 0;
+                }
+            }
+        }
+        fputc('\n', stderr);
     }
+    if (sampler_on) for (unsigned k = 0; k < HS_KEYS; ++k) hs_last[k] = atomic_load(&g_hs_hist[k]);
+    if (sampler_on) for (unsigned k = 0; k < HS_KEYS; ++k) hs_owner_last[k] = atomic_load(&g_hs_owner_hist[k]);
+    if (sampler_on) for (unsigned i = 0; i < HS_ADDRS; ++i) hs_addr_last[i] = atomic_load(&g_hs_addr[i].count);
     last = now;
+    tcpu = cpu_now;
+    memcpy(tns, g_bd12_tprof_ns, sizeof(tns));
+    memcpy(tcalls, g_bd12_tprof_calls, sizeof(tcalls));
     memcpy(counters, now_counters, sizeof(counters));
     memcpy(ns, g_bd12_prof_ns, sizeof(ns));
     memcpy(calls, g_bd12_prof_calls, sizeof(calls));
@@ -1988,6 +2179,7 @@ void bd12_prof_report(void)
             (unsigned long long)g_bd12_cmd_counts[BD12_COUNT_BARRIER], (unsigned long long)g_bd12_cmd_counts[3],
             (unsigned long long)g_bd12_cmd_counts[BD12_COUNT_RENDER_PASS]);
     g_bd12_cmd_counts[BD12_COUNT_BARRIER] = g_bd12_cmd_counts[3] = g_bd12_cmd_counts[BD12_COUNT_RENDER_PASS] = 0;
+    { extern void bd12_full_sites_report(void); bd12_full_sites_report(); }
     fprintf(stderr, " heaps(default/upload/readback)=%llu/%llu/%llu live, %llu/%llu/%llu MiB",
             (unsigned long long)g_bd12_heap_live[BD12_HEAP_DEFAULT], (unsigned long long)g_bd12_heap_live[BD12_HEAP_UPLOAD],
             (unsigned long long)g_bd12_heap_live[BD12_HEAP_READBACK],

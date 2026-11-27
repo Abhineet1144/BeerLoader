@@ -263,6 +263,15 @@ BD12CmdList *bd12_cmd_list_create(BD12CmdAllocator *allocator)
 void bd12_cmd_list_destroy(BD12CmdList *list, BD12CmdAllocator *allocator)
 {
     if (!list) return;
+    static int inflight_check = -1;   /* BEER_BD12_INFLIGHT_CHECK=1 (diagnostic): lists freed before the GPU finished */
+    if (inflight_check < 0) inflight_check = getenv("BEER_BD12_INFLIGHT_CHECK") != NULL;
+    if (inflight_check && list->inflight_fence && bd12_fence_completed(list->inflight_fence) < list->inflight_serial) {
+        static unsigned reports;
+        if (reports++ < 32)
+            fprintf(stderr, "[BD12 MQ] command list %p freed while its submission %llu is not finished (lane timeline at %llu)\n",
+                    (void *)list, (unsigned long long)list->inflight_serial,
+                    (unsigned long long)bd12_fence_completed(list->inflight_fence));
+    }
     bd12_gpuprof_list_destroy(list);
     if (list->command_buffer_allocated)
         list->device->vk.FreeCommandBuffers(list->device->device,

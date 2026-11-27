@@ -4,6 +4,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 /* SPIR-V opcodes used by the bounded dispatch flight recorder. */
 #define BD12_SPV_OP_CONTROL_BARRIER 224u
@@ -77,10 +79,12 @@ BD12ComputePipeline *bd12_compute_pipeline_create_dxbc_rs(
 static BD12ComputePipeline *create_dxbc(BD12Device *device, const uint8_t *dxbc, size_t dxbc_size, uint64_t hash,
                                         const BD12RootSignature *rs)
 {
+    const uint64_t t_begin = bd12_prof_now();   /* 0 unless BEER_BD12_PROF / BEER_BD12_HITCH */
     const BeerD3D12TranslatedShader *shader = rs ?
         beer_d3d12_translate_shader_rs(dxbc, dxbc_size, hash, rs->root_layout) :
         beer_d3d12_translate_shader(dxbc, dxbc_size, hash);
     if (!shader) return NULL;
+    const uint64_t t_translated = bd12_prof_now();
     BD12ShaderBinding bindings[BEER_D3D12_MAX_SHADER_DESCRIPTORS];
     for (uint32_t i = 0; i < shader->descriptor_count; ++i) {
         const BeerD3D12ShaderDescriptor *d = &shader->descriptors[i];
@@ -113,6 +117,10 @@ static BD12ComputePipeline *create_dxbc(BD12Device *device, const uint8_t *dxbc,
         if (pipeline && rs) pipeline->root_layout_hash = rs->root_layout->hash;
     }
     if (!pipeline) return NULL;
+    if (t_begin && bd12_prof_now() - t_begin > 100000000ull)
+        fprintf(stderr, "[SLOWPSO] compute %016llx dxbc=%zuB spirv=%zuB: translate %.0f ms, vulkan %.0f ms, tid %ld\n",
+                (unsigned long long)hash, dxbc_size, (size_t)shader->spirv_size, (t_translated - t_begin) / 1e6,
+                (bd12_prof_now() - t_translated) / 1e6, (long)syscall(SYS_gettid));
     pipeline->shader_hash = shader->shader_hash;
     const char *dump_dir = getenv("BEER_BD12_DUMP_SPIRV");
     if (dump_dir && *dump_dir) {

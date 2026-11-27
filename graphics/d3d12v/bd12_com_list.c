@@ -94,6 +94,9 @@ static void pso_compile(ComPso *p)
             p->desc.root_signature ? ((ComRootSig *)p->desc.root_signature)->rs : NULL);
     else
         p->gfx = bd12_pso_create_graphics(bd, &p->desc);
+    if (bd12_prof_t0_ && bd12_prof_now() - bd12_prof_t0_ > 100000000ull && !p->compute)
+        fprintf(stderr, "[SLOWPSO] graphics vs=%zuB ps=%zuB: %.0f ms\n", p->desc.vs_size, p->desc.ps_size,
+                (bd12_prof_now() - bd12_prof_t0_) / 1e6);
     bd12_pso_release(&p->desc);
     pthread_mutex_lock(&p->lock);
     p->state = (p->gfx || p->cmp) ? 2 : 3;
@@ -1244,6 +1247,12 @@ static void MS cl_set_pso(ComList *l, ComPso *p)
     list_set_pso(l, p);
 }
 
+/* A resource whose memory other resources can share: placed (on a heap), reserved (tile mappings), or NULL ("any"). */
+static int res_may_alias(const ComResource *r)
+{
+    return !r || r->heap || r->reserved;
+}
+
 static void MS cl_barrier(ComList *l, uint32_t n, const uint8_t *barriers)
 {
     LIST_CUR(l);
@@ -1263,9 +1272,34 @@ static void MS cl_barrier(ComList *l, uint32_t n, const uint8_t *barriers)
             else if (r->image)
                 bd12_cmd_transition_image(c, r->image, sub, before, after);
         } else if (type == 1) {
-            ComResource *after = rdptr(b + 16);
-            bd12_cmd_global_barrier(c);
-            if (after && after->image) {
+            /* Aliasing barrier: a full drain. BEER_BD12_ALIAS_BARRIER=narrow (diagnostic) does what vkd3d-proton does: none
+             * when either side is a committed resource, only earlier writes made available for an activated image;
+             * =none drops them (unsafe, measurement only). RE9 issues ~84 per frame (99% of its full barriers), yet
+             * dropping them all changed nothing (75 fps, GPU-bound): not a cost worth the risk, so the default stays. */
+            ComResource *before = rdptr(b + 8), *after = rdptr(b + 16);
+            static int alias_mode = -1;   /* 0 full, 1 narrow, 2 none */
+            if (alias_mode < 0) {
+                const char *v = getenv("BEER_BD12_ALIAS_BARRIER");
+                alias_mode = v && !strcmp(v, "narrow") ? 1 : v && !strcmp(v, "none") ? 2 : 0;
+            }
+            extern uint64_t g_bd12_alias_barriers[2];
+            if (alias_mode == 2) continue;
+            if (alias_mode == 0) bd12_cmd_global_barrier(c);
+            else if (!res_may_alias(before) || !res_may_alias(after)) {
+                __atomic_add_fetch(&g_bd12_alias_barriers[1], 1, __ATOMIC_RELAXED);
+                continue;
+            } else {
+                __atomic_add_fetch(&g_bd12_alias_barriers[0], 1, __ATOMIC_RELAXED);
+                bd12_cmd_alias_barrier(c, after && after->image);
+            }
+            /* The activated image used to be marked uninitialized, so its next use (in whichever list records it
+             * next, not in execution order) transitions it from UNDEFINED, which lets the driver discard its contents.
+             * vkd3d-proton deliberately does not: titles keep data in aliased images, and the discard can land after
+             * another list already wrote it. BEER_BD12_ALIAS_DISCARD=0 keeps the contents (diagnostic for RE9's
+             * path-tracing noise around smoke, rain and hair). */
+            static int alias_discard = -1;
+            if (alias_discard < 0) { const char *v = getenv("BEER_BD12_ALIAS_DISCARD"); alias_discard = !(v && !strcmp(v, "0")); }
+            if (alias_discard && after && after->image) {
                 pthread_mutex_lock(&c->device->view_lock);
                 after->image->initialized = 0;
                 pthread_mutex_unlock(&c->device->view_lock);

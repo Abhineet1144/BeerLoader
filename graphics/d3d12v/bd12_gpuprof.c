@@ -34,7 +34,7 @@ typedef struct { uint64_t tag; uint64_t ns; uint64_t calls; } Entry;
 /* BEER_BD12_GPU_PROF_FRAME=<ms>: GPU time summed per frame (recordings grouped by the present epoch they were closed
  * in); frames above the threshold are printed with their five most expensive operations. */
 #define FRAME_RING 512
-#define FRAME_TAGS 48
+#define FRAME_TAGS 512   /* distinct operations per frame before the rest are lumped as ~0 (RE9 frames use hundreds) */
 typedef struct { uint64_t frame, ns, lists; uint32_t tag_count; Entry tags[FRAME_TAGS]; int printed; } FrameAgg;
 static FrameAgg g_frames[FRAME_RING];
 static uint64_t frame_threshold_ns(void)
@@ -218,10 +218,11 @@ void bd12_gpuprof_report(void)
             qsort(f->tags, f->tag_count, sizeof(Entry), by_time);
             fprintf(stderr, "[GPU FRAME] frame %llu: %.1f ms GPU in %llu lists:", (unsigned long long)f->frame,
                     f->ns / 1e6, (unsigned long long)f->lists);
-            for (uint32_t t = 0; t < f->tag_count && t < 5; ++t) {
+            for (uint32_t t = 0; t < f->tag_count && t < 8; ++t) {
                 const uint32_t kind = (uint32_t)(f->tags[t].tag >> 56);
                 fprintf(stderr, " %s %014llx %.2fms/%llu", kind < 10 ? names[kind] : kind == 100 ? "dispatch" :
-                        kind == 101 ? "dispatch-ind" : kind == 102 ? "cuda" : "other", (unsigned long long)(f->tags[t].tag & 0x00ffffffffffffffull),
+                        kind == 101 ? "dispatch-ind" : kind == 102 ? "cuda" : kind == 200 ? "as-build" : kind == 201 ? "as-copy" :
+                        f->tags[t].tag == ~0ull ? "rest" : "other", (unsigned long long)(f->tags[t].tag & 0x00ffffffffffffffull),
                         f->tags[t].ns / 1e6, (unsigned long long)f->tags[t].calls);
             }
             fputc('\n', stderr);

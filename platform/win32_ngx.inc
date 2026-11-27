@@ -263,6 +263,22 @@ static u32 (__attribute__((ms_abi)) *const g_ngx_param_wrappers[NGX_PARAM_EXPORT
  * (the game passes the render size it got from the optimal-settings callback as Width/Height). */
 static void ngx_before_create(u64 feature, u64 params)
 {
+    /* BEER_NGX_RR_PRESET=<n>: Ray Reconstruction's model preset (DLSSD.Hint.Render.Preset.*; 0 = the DLL's default,
+     * 4 = D, 5 = E, ...). On Windows the driver's per-game profile or the NVIDIA app's "latest model" override can pick a
+     * newer model than the game asks for; under Beer no profile matches the process, so the DLL default always runs. */
+    if (feature == 13 && params) {
+        const char *v = getenv("BEER_NGX_RR_PRESET");
+        if (v && *v) {
+            static const char *const rr_keys[] = {
+                "DLSSD.Hint.Render.Preset.DLAA", "DLSSD.Hint.Render.Preset.Quality", "DLSSD.Hint.Render.Preset.Balanced",
+                "DLSSD.Hint.Render.Preset.Performance", "DLSSD.Hint.Render.Preset.UltraPerformance",
+                "DLSSD.Hint.Render.Preset.UltraQuality",
+            };
+            const u32 preset = (u32)strtoul(v, NULL, 0);
+            for (size_t i = 0; i < sizeof(rr_keys) / sizeof(*rr_keys); ++i) ngx_set_u32(params, rr_keys[i], preset);
+            fprintf(stderr, "[NGX] Ray Reconstruction preset hint set to %u (BEER_NGX_RR_PRESET)\n", preset);
+        }
+    }
     if (feature != NGX_FEATURE_SUPER_SAMPLING || !params) return;
     ngx_read_config();
     ngx_hook_params(params);
@@ -433,7 +449,7 @@ static void ngx_count_evaluation(u64 handle)
     for (int i = 0; i < 32 && g_ngx_features[i].handle; ++i)
         if (g_ngx_features[i].handle == handle) {
             const u64 n = ++g_ngx_features[i].evaluations;
-            if (n == 1 || n % 3000 == 0)
+            if (n == 1 || n % 600 == 0)   /* every ~10 s at 60 fps: frame generation should track the upscaler 1:1 */
                 fprintf(stderr, "[NGX] EvaluateFeature %llu (%s): %llu evaluations\n", (unsigned long long)g_ngx_features[i].feature,
                         ngx_feature_name(g_ngx_features[i].feature), (unsigned long long)n);
             return;
@@ -530,6 +546,9 @@ static u32 __attribute__((ms_abi)) ngx_evaluate(u64 cmd, u64 handle, u64 params,
     };
     if (dump)
         for (size_t i = 0; i < sizeof(inputs) / sizeof(*inputs); ++i) {
+            /* Depth (D32S8) is skipped unless BEER_NGX_DUMP_DEPTH=1: its capture coincided with an Xid 31 MMU fault on
+             * the copy engine (device lost) on RE9, 2026-11-28. */
+            if (!strcmp(inputs[i], "Depth") && !getenv("BEER_NGX_DUMP_DEPTH")) continue;
             const u64 r = ngx_get_resource(params, inputs[i]);
             char name[96];
             snprintf(name, sizeof(name), "ngx%llu_%s_in", (unsigned long long)n, inputs[i]);

@@ -900,8 +900,7 @@ static VkDescriptorSet resolve_set_impl(
         device->vk.UpdateDescriptorSets(device->device, write_count, writes, 0,
                                         NULL);
     }
-    g_bd12_prof_ns[BD12_PROF_UPDATE_SETS] += bd12_prof_now() - t_update;
-    ++g_bd12_prof_calls[BD12_PROF_UPDATE_SETS];
+    BD12_PROF_ADD(BD12_PROF_UPDATE_SETS, t_update);
     return set;
 }
 

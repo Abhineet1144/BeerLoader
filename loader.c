@@ -2072,6 +2072,7 @@ static CsBackend g_fallback_cs;             /* shared by sections at impossible 
 static pthread_once_t g_fallback_cs_once = PTHREAD_ONCE_INIT;
 static void fallback_cs_init(void) { sem_init(&g_fallback_cs.lock, 0, 1); }
 __thread u64 g_cached_windows_thread_id;   /* also read by beer_fast_get_current_thread_id */
+extern void bd12_hitch_owner(long waiter_host_tid, long owner_host_tid, unsigned long long owner_rip) __attribute__((weak));
 /* Host thread id for lock diagnostics fields, without a gettid system call per lock operation. */
 static long srw_host_tid(void)
 {
@@ -2284,16 +2285,23 @@ static int wlog_enabled(void)
             pthread_t thread;
             if (ok && pthread_create(&thread, NULL, wlog_thread, (void *)trigger) == 0) pthread_detach(thread);
             else ok = 0;
-            on = ok;
+            on = ok || getenv("BEER_BD12_HITCH") != NULL;   /* the hitch lines also total these waits */
         }
         pthread_mutex_unlock(&lock);
     }
     return on;
 }
+/* BEER_BD12_HITCH: per-thread time blocked in waits and sleeps since the last query, and the longest single wait
+ * (handle, guest caller), so a slow frame can be pinned on what its presenting thread waited for. Every timed wait
+ * (handle, sleep, critical section, SRW, condition variable, address) is added here by wlog_add. */
+static __thread u64 g_wacc_total, g_wacc_max, g_wacc_max_handle, g_wacc_max_caller;
+static __thread u32 g_wacc_max_kind, g_wacc_ret_kind;
 static inline void wlog_add(u32 kind, u64 t0, u64 obj, u64 caller)
 {
-    if (!atomic_load_explicit(&g_wlog_active, memory_order_relaxed)) return;
     const u64 d = wlog_now() - t0;
+    g_wacc_total += d;
+    if (d > g_wacc_max) { g_wacc_max = d; g_wacc_max_handle = obj; g_wacc_max_caller = caller; g_wacc_max_kind = kind; }
+    if (!atomic_load_explicit(&g_wlog_active, memory_order_relaxed)) return;
     if (d < g_wlog_min_ns) return;
     const u64 i = atomic_fetch_add_explicit(&g_wlog_count, 1, memory_order_relaxed);
     if (i >= WLOG_CAP) return;
@@ -2326,7 +2334,10 @@ impl_EnterCriticalSection(WIN_CS *cs)
         }
         g_dbg_cs_wait = cs;
         const u64 wlog_t0 = wlog_enabled() ? wlog_now() : 0;
+        const long wait_tid = wlog_t0 && bd12_hitch_owner ? (long)syscall(SYS_gettid) : 0;
+        if (wait_tid) bd12_hitch_owner(wait_tid, (long)b->owner_tid, (unsigned long long)b->owner_rip);
         while (sem_wait(&b->lock) != 0 && errno == EINTR) {}
+        if (wait_tid) bd12_hitch_owner(wait_tid, 0, 0);
         if (wlog_t0) wlog_add(WLOG_CS, wlog_t0, (u64)(uintptr_t)cs, g_dispatch_incoming_return);
         g_dbg_cs_wait = NULL;
     }
@@ -2937,6 +2948,13 @@ static void beer_driver_shader_cache_env(const char *exe)
     setenv("MESA_SHADER_CACHE_DIR", dir, 0);                /* Mesa (RADV, ANV, Turnip, ...) */
     setenv("MESA_SHADER_CACHE_MAX_SIZE", "10G", 0);
     fprintf(stderr, "[LOADER] driver shader cache: %s\n", getenv("__GL_SHADER_DISK_CACHE_PATH"));
+    /* A cache on an NTFS drive that Windows left dirty/hibernated gets mounted read-only: existing entries still load,
+     * but nothing compiled this session is kept, so the same stutters return next time. Kept (not moved elsewhere):
+     * an empty writable cache would compile everything again. */
+    if (access(dir, W_OK) != 0)
+        fprintf(stderr, "[LOADER] WARNING: shader cache %s is not writable (%s): pipelines compiled in this session "
+                        "will not be saved and will compile again next launch. Remount the drive read-write.\n",
+                dir, strerror(errno));
 }
 
 
@@ -4726,7 +4744,20 @@ static u64 __attribute__((ms_abi)) impl_GetCurrentProcessorNumberEx(u8 *number)
 static u64 __attribute__((ms_abi))
 impl_VirtualFree(void *addr, u64 size, u32 type)
 {
-    return (u64)beer_virtual_free(addr, (size_t)size, type);
+    const u64 result = beer_virtual_free(addr, (size_t)size, type);
+    if (!result && getenv("BEER_VM_FREE_DIAGNOSTICS")) {
+        const int native_error = errno;
+        BeerMemoryBasicInformation info;
+        const size_t queried = beer_virtual_query(addr, &info, sizeof(info));
+        fprintf(stderr, "[VM FREE FAILED] address=%p size=%#lx type=%#x caller=%#lx "
+            "allocation=%#lx region=%#lx..%#lx state=%#x protect=%#x errno=%d\n",
+                addr, (unsigned long)size, type, (unsigned long)g_dispatch_incoming_return,
+                queried ? (unsigned long)info.allocation_base : 0,
+                queried ? (unsigned long)info.base_address : 0,
+                queried ? (unsigned long)(info.base_address + info.region_size) : 0,
+                queried ? info.state : 0, queried ? info.protect : 0, native_error);
+    }
+    return result;
 }
 
 static u64 __attribute__((ms_abi))
@@ -11341,9 +11372,10 @@ static ID3D11DeviceContext *g_d3d11_context  = NULL;
 static IDXGISwapChain *g_dxgi_swapchain = NULL;
 /* BD11: D3D11 on the BD12 core (graphics/d3d11v). BEER_D3D11_LEGACY=1 selects the old path. */
 extern int32_t b11_device_create_for_loader(void **device, void **context);
+extern int32_t b11_device_create_for_loader_config(u32 flags, u32 level,
+                                                  void **device, void **context);
 extern int32_t b11_swapchain_create_for_loader(void *device, const void *desc, void **out);
 extern int b11_is_device(const void *object);
-extern void b11_device_set_feature_level(void *device, u32 level);
 /* BD11 grants 11_0. With BEER_FAKE_CAPS it grants the highest requested level up to 12_1 (default list: 12_1). */
 static u32 d3d11_granted_feature_level(const u32 *levels, u32 count)
 {
@@ -11404,6 +11436,13 @@ static void d3d11_retain_com_output(void *object)
     ((AddRefFn)vtable[1])(object);
 }
 
+static void d3d11_release_com_output(void *object)
+{
+    if (!object) return;
+    typedef u32 __attribute__((ms_abi)) (*ReleaseFn)(void *);
+    ((ReleaseFn)(*(void ***)object)[2])(object);
+}
+
 /*
  * D3D11CreateDevice(pAdapter, DriverType, Software, Flags,
  *                  pFeatureLevels, FeatureLevels, SDKVersion,
@@ -11424,12 +11463,13 @@ impl_D3D11CreateDevice(u64 adapter, u32 driver_type, u64 software,
     if (ppContext) *ppContext = NULL;
     if (beer_use_bd11()) {
         void *device = NULL, *context = NULL;
-        if (b11_device_create_for_loader(&device, &context) != 0) return (u64)0x80004005;
-        g_api_createdevice = 1;
         u32 level = d3d11_granted_feature_level(feature_levels, n_levels);
-        b11_device_set_feature_level(device, level);
+        int32_t hr = b11_device_create_for_loader_config(flags, level,
+            ppDevice ? &device : NULL, ppContext ? &context : NULL);
+        if (hr != 0) return (u64)(uint32_t)hr;
+        g_api_createdevice = 1;
         fprintf(stderr, "[D3D11] CreateDevice -> BD11 device=%p context=%p\n", device, context);
-        if (ppDevice) *ppDevice = (u64 *)device; else d3d11_retain_com_output(NULL);
+        if (ppDevice) *ppDevice = (u64 *)device;
         if (pFeatureLevel) *pFeatureLevel = level;
         if (ppContext) *ppContext = (u64 *)context;
         return S_OK;
@@ -11464,14 +11504,22 @@ impl_D3D11CreateDeviceAndSwapChain(u64 adapter, u32 dtype, u64 sw, u32 flags,
     if (ppDevice) *ppDevice = NULL;
     if (ppCtx) *ppCtx = NULL;
     if (ppSwap) *ppSwap = NULL;
-    if (beer_use_bd11() && swdesc && ppSwap) {
+    if (beer_use_bd11()) {
+        if (!swdesc || !ppSwap) return (u64)0x80070057;
         void *device = NULL, *context = NULL, *swap = NULL;
-        if (b11_device_create_for_loader(&device, &context) != 0) return (u64)0x80004005;
         u32 level = d3d11_granted_feature_level(fls, nfl);
-        b11_device_set_feature_level(device, level);
-        int32_t hr = b11_swapchain_create_for_loader(device, swdesc, &swap);
+        int32_t hr = b11_device_create_for_loader_config(flags, level,
+            &device, ppCtx ? &context : NULL);
         if (hr != 0) return (u64)(uint32_t)hr;
+        hr = b11_swapchain_create_for_loader(device, swdesc, &swap);
+        if (hr != 0) {
+            d3d11_release_com_output(context);
+            d3d11_release_com_output(device);
+            return (u64)(uint32_t)hr;
+        }
         if (ppDevice) *ppDevice = (u64 *)device;
+        else d3d11_release_com_output(device);
+        g_api_createdevice = 1;
         if (pFL) *pFL = level;
         if (ppCtx) *ppCtx = (u64 *)context;
         *ppSwap = (u64 *)swap;
@@ -13730,6 +13778,19 @@ impl_CancelWaitableTimer(u64 h)
 #define MAX_WIN_MUTEXES 65536
 typedef struct { int used; u32 owner; u32 count; pthread_mutex_t mtx; pthread_cond_t cv; int sync_ready; } WinMutex;
 static WinMutex g_win_mutexes[MAX_WIN_MUTEXES];
+/* Diagnostics (BEER_BD12_HITCH_SYSCALL): the guest handle whose host wait object contains a sampled futex address,
+ * or 0. Events, semaphores and mutexes block in pthread_cond_wait on a slot of these static tables. */
+unsigned long long beer_futex_handle(unsigned long long addr)
+{
+    const uintptr_t a = (uintptr_t)addr;
+    if (a >= (uintptr_t)g_events && a < (uintptr_t)(g_events + MAX_EVENTS))
+        return 0x60000000u + (unsigned)((a - (uintptr_t)g_events) / sizeof(g_events[0]));
+    if (a >= (uintptr_t)g_sem_cv && a < (uintptr_t)(g_sem_cv + MAX_SEMS))
+        return SEM_HANDLE_BASE + (unsigned)((a - (uintptr_t)g_sem_cv) / sizeof(g_sem_cv[0]));
+    if (a >= (uintptr_t)g_win_mutexes && a < (uintptr_t)(g_win_mutexes + MAX_WIN_MUTEXES))
+        return MUTEX_HANDLE_BASE + (unsigned)((a - (uintptr_t)g_win_mutexes) / sizeof(g_win_mutexes[0]));
+    return 0;
+}
 static int g_win_mutex_cnt = 1;
 static int g_win_mutex_free;          /* most recently closed slot, reused first */
 static pthread_mutex_t g_win_mutex_table = PTHREAD_MUTEX_INITIALIZER;
@@ -13946,9 +14007,7 @@ static u64 beer_wait_now_ms(void)
     return (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
 }
 
-/* BEER_BD12_HITCH: per-thread time blocked in waits and sleeps since the last query, and the longest single wait
- * (handle, guest caller), so a slow frame can be pinned on what its presenting thread waited for. */
-static __thread u64 g_wacc_total, g_wacc_max, g_wacc_max_handle, g_wacc_max_caller;
+/* BEER_BD12_HITCH: see g_wacc_total above. */
 static int wacc_on(void)
 {
     static int on = -1;
@@ -13964,9 +14023,6 @@ static inline u64 wacc_now(void)
 static inline void wacc_add_kind(u32 kind, u64 t0, u64 handle, u64 caller)
 {
     wlog_add(kind, t0, handle, caller);
-    const u64 d = wacc_now() - t0;
-    g_wacc_total += d;
-    if (d > g_wacc_max) { g_wacc_max = d; g_wacc_max_handle = handle; g_wacc_max_caller = caller; }
 }
 u64 beer_thread_wait_stats(u64 *max_ns, u64 *max_handle, u64 *max_caller)
 {
@@ -13974,8 +14030,14 @@ u64 beer_thread_wait_stats(u64 *max_ns, u64 *max_handle, u64 *max_caller)
     if (max_ns) *max_ns = g_wacc_max;
     if (max_handle) *max_handle = g_wacc_max_handle;
     if (max_caller) *max_caller = g_wacc_max_caller;
+    g_wacc_ret_kind = g_wacc_max_kind;
     g_wacc_total = g_wacc_max = g_wacc_max_handle = g_wacc_max_caller = 0;
     return total;
+}
+/* Kind of the longest wait reported by the last beer_thread_wait_stats call (the WLOG_* number). */
+u32 beer_thread_wait_kind(void)
+{
+    return g_wacc_ret_kind;
 }
 
 static int wait_log_thread(void);
@@ -17586,12 +17648,14 @@ static int thread_reserve_stack(WinThread *t)
         if (stack == MAP_FAILED) stack = NULL;
         else mprotect(stack, 0x1000, PROT_NONE);
     } else {
-        /* Linux VMAs split at the hard guard and may merge with adjacent mappings.
-         * Keep all regions under a single Win32 allocation base. The extra granule
-         * provides inaccessible reserve without reducing the existing usable stack.
-         * Like the previous stack, this has a fixed hard guard, not demand growth. */
+        /* Low to high: inaccessible reserve, committed hard overflow page, writable
+         * stack. Keep all regions under one Win32 allocation base despite Linux VMA
+         * splits/merges. The overflow page must border the writable interval, not
+         * precede the reserve. Like the previous stack, this is fixed protection,
+         * not PAGE_GUARD demand growth. */
         stack = beer_virtual_alloc(NULL, stack_size, BEER_MEM_RESERVE, BEER_PAGE_READWRITE);
-        if (stack && (!beer_virtual_alloc(stack, BEER_WORKER_STACK_HARD_PAGE,
+        if (stack && (!beer_virtual_alloc((u8 *)stack + BEER_WORKER_STACK_EXTRA_RESERVE,
+                         BEER_WORKER_STACK_HARD_PAGE,
                                          BEER_MEM_COMMIT, BEER_PAGE_NOACCESS) ||
                   !beer_virtual_alloc((u8 *)stack + BEER_WORKER_STACK_WRITABLE_OFFSET,
                          stack_size - BEER_WORKER_STACK_WRITABLE_OFFSET,
@@ -27343,6 +27407,83 @@ typedef struct BeerUserWorkItem {
     u64 context;
 } BeerUserWorkItem;
 
+/* Shared worker pool for QueueUserWorkItem and the Vista thread pool's PTP_WORK (default; BEER_WORK_POOL=0 = one new
+ * host thread per submission, the old behaviour). RE9 submits ~200 items a second: a thread each meant thread
+ * creation, a TEB setup and a DLL_THREAD_ATTACH to every guest DLL per item. Workers start on demand (a submission
+ * with no idle worker starts one, so an item waiting on another queued item cannot deadlock the pool, up to
+ * WORK_POOL_MAX) and then stay, as Windows' pool threads do. */
+#define WORK_POOL_MAX 128
+typedef struct BeerPoolItem {
+    struct BeerPoolItem *next;
+    int kind;               /* 0 QueueUserWorkItem callback(context); 1 PTP_WORK callback(instance, context, work) */
+    u64 callback, context;
+    void *work;             /* kind 1: the WinTPWork whose pending count drops afterwards */
+} BeerPoolItem;
+static BeerPoolItem *g_pool_head, *g_pool_tail;
+static pthread_mutex_t g_pool_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pool_cv = PTHREAD_COND_INITIALIZER;
+static int g_pool_workers, g_pool_idle, g_pool_queued;
+_Atomic u64 g_beer_pool_items;   /* diagnostics */
+static void pool_run_tp_work(BeerPoolItem *item);   /* defined with PTP_WORK below */
+static int work_pool_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("BEER_WORK_POOL"); on = !(v && !strcmp(v, "0")); }
+    return on;
+}
+static void *pool_worker_main(void *arg)
+{
+    (void)arg;
+    void *teb = alloc_teb_for_thread();
+    if (teb && syscall(SYS_arch_prctl, ARCH_SET_GS, (u64)teb) != 0)
+        fprintf(stderr, "[GS] work pool: arch_prctl failed\n");
+    guest_dll_notify_thread(2 /* DLL_THREAD_ATTACH */);
+    for (;;) {
+        pthread_mutex_lock(&g_pool_mtx);
+        ++g_pool_idle;
+        while (!g_pool_head) pthread_cond_wait(&g_pool_cv, &g_pool_mtx);
+        --g_pool_idle;
+        BeerPoolItem *item = g_pool_head;
+        g_pool_head = item->next;
+        if (!g_pool_head) g_pool_tail = NULL;
+        --g_pool_queued;
+        pthread_mutex_unlock(&g_pool_mtx);
+        atomic_fetch_add(&g_beer_pool_items, 1);
+        if (item->kind == 0) beer_call_thread_entry(item->callback, item->context, 0);
+        else pool_run_tp_work(item);
+        free(item);
+    }
+    return NULL;
+}
+/* Queues an item; 0 when the pool cannot take it (the caller falls back to a thread of its own). */
+static int pool_submit(int kind, u64 callback, u64 context, void *work)
+{
+    BeerPoolItem *item = malloc(sizeof(*item));
+    if (!item) return 0;
+    *item = (BeerPoolItem){ NULL, kind, callback, context, work };
+    pthread_mutex_lock(&g_pool_mtx);
+    if (g_pool_tail) g_pool_tail->next = item; else g_pool_head = item;
+    g_pool_tail = item;
+    ++g_pool_queued;
+    if (g_pool_idle < g_pool_queued && g_pool_workers < WORK_POOL_MAX) {
+        pthread_t thread;
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&thread, &attributes, pool_worker_main, NULL) == 0) ++g_pool_workers;
+        pthread_attr_destroy(&attributes);
+    }
+    const int have_worker = g_pool_workers > 0;
+    if (!have_worker) {   /* no worker could start: take the item back */
+        g_pool_head = g_pool_tail = NULL;
+        g_pool_queued = 0;
+    }
+    pthread_cond_signal(&g_pool_cv);
+    pthread_mutex_unlock(&g_pool_mtx);
+    if (!have_worker) { free(item); return 0; }
+    return 1;
+}
+
 static void *user_work_item_thread(void *argument)
 {
     BeerUserWorkItem *work = (BeerUserWorkItem *)argument;
@@ -27364,6 +27505,7 @@ impl_QueueUserWorkItem(u64 callback, u64 context, u32 flags)
 {
     (void)flags;
     if (!callback) { g_last_error = 87; return 0; }
+    if (work_pool_enabled() && pool_submit(0, callback, context, NULL)) { g_last_error = 0; return 1; }
 
     BeerUserWorkItem *work = malloc(sizeof(*work));
     if (!work) { g_last_error = 8; return 0; }
@@ -27400,7 +27542,23 @@ typedef struct WinTPWork {
     volatile int    pending;  /* in-flight submission count        */
     pthread_mutex_t mtx;
     pthread_cond_t  cv;
+    int             oneshot;  /* TrySubmitThreadpoolCallback: freed after its callback */
 } WinTPWork;
+static void pool_run_tp_work(BeerPoolItem *item)
+{
+    WinTPWork *w = item->work;
+    typedef void __attribute__((ms_abi)) (*PoolWorkCB)(u64,u64,u64);
+    ((PoolWorkCB)w->cb)(0 /*instance*/, w->ctx, (u64)w);
+    if (w->oneshot) {
+        pthread_mutex_destroy(&w->mtx);
+        pthread_cond_destroy(&w->cv);
+        free(w);
+        return;
+    }
+    pthread_mutex_lock(&w->mtx);
+    if (--w->pending == 0) pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mtx);
+}
 
 static void *tp_work_thread(void *arg)
 {
@@ -27437,6 +27595,7 @@ impl_SubmitThreadpoolWork(WinTPWork *w)
 {
     if (!w) return 0;
     pthread_mutex_lock(&w->mtx); w->pending++; pthread_mutex_unlock(&w->mtx);
+    if (work_pool_enabled() && pool_submit(1, 0, 0, w)) return 0;
     pthread_t t; pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
@@ -27455,7 +27614,8 @@ impl_TrySubmitThreadpoolCallback(u64 cb, u64 ctx, u64 env)
     if (!cb) { g_last_error = 87; return 0; }
     u64 w = impl_CreateThreadpoolWork(cb, ctx, env);
     if (!w) { g_last_error = 8; return 0; }
-    impl_SubmitThreadpoolWork((WinTPWork *)w);   /* the item stays allocated; it is tiny */
+    if (work_pool_enabled()) ((WinTPWork *)w)->oneshot = 1;   /* freed by the pool worker after the callback */
+    impl_SubmitThreadpoolWork((WinTPWork *)w);   /* without the pool the item stays allocated; it is tiny */
     g_last_error = 0;
     return 1;
 }
@@ -35108,13 +35268,93 @@ static u64 beer_nt_query_information_process(u64 process, u32 info_class, void *
  * the process-wide PEB once it exists. Does NOT call arch_prctl; the caller
  * installs the returned TEB as the thread's GS base.
  */
+/* Per-thread host blocks (host call stack, signal stack, TEB, implicit-TLS array, EXE TLS data) used to be mapped for
+ * every thread and never released. QueueUserWorkItem starts a host thread per work item, so RE9 leaked ~1.3 MB of
+ * mappings per work item: ~9,000 mappings and ~0.5 GB of RAM a minute until the system ran out of memory. Now a
+ * thread's block returns to a pool when it exits (pthread key destructor) and a later thread reuses it, as Windows
+ * reuses TEB memory. A released block is reused only after 2 s: other exit-time code of that thread may still touch
+ * its TEB. Memory is bounded by the peak number of live threads instead of the number ever created. */
+typedef struct BeerThreadBlock {
+    struct BeerThreadBlock *next;
+    void *host_stack, *alt_stack;
+    WinTEB *teb;
+    u64 *tls_array;
+    u8 *exe_tls;
+    u64 exe_tls_size;
+    u64 released_ns;
+} BeerThreadBlock;
+static BeerThreadBlock *g_thread_block_free;   /* oldest first */
+static BeerThreadBlock **g_thread_block_free_tail = &g_thread_block_free;
+static pthread_mutex_t g_thread_block_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_key_t g_thread_block_key;
+static pthread_once_t g_thread_block_once = PTHREAD_ONCE_INIT;
+_Atomic u64 g_beer_thread_blocks_created, g_beer_thread_blocks_reused, g_beer_thread_blocks_live;
+static u64 thread_block_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+static void thread_block_release(void *p)
+{
+    BeerThreadBlock *b = p;
+    if (!b) return;
+    pthread_mutex_lock(&g_tls_array_mtx);   /* the array leaves the "every thread's TLS" list */
+    for (int i = 0; i < g_tls_array_count; ++i)
+        if (g_tls_arrays[i] == b->tls_array) { g_tls_arrays[i] = g_tls_arrays[--g_tls_array_count]; break; }
+    pthread_mutex_unlock(&g_tls_array_mtx);
+    for (int i = 0; i < TLS_SLOTS; ++i) {   /* guest DLL TLS blocks are calloc'd per thread; the EXE's is the block's */
+        void *slot = (void *)(uintptr_t)b->tls_array[i];
+        if (slot && slot != b->exe_tls) free(slot);
+        b->tls_array[i] = 0;
+    }
+    stack_t off = { .ss_flags = SS_DISABLE };
+    sigaltstack(&off, NULL);
+    b->released_ns = thread_block_now_ns();
+    b->next = NULL;
+    pthread_mutex_lock(&g_thread_block_mtx);
+    *g_thread_block_free_tail = b;
+    g_thread_block_free_tail = &b->next;
+    pthread_mutex_unlock(&g_thread_block_mtx);
+    atomic_fetch_sub(&g_beer_thread_blocks_live, 1);
+}
+static void thread_block_key_init(void) { pthread_key_create(&g_thread_block_key, thread_block_release); }
+static BeerThreadBlock *thread_block_take(void)
+{
+    pthread_once(&g_thread_block_once, thread_block_key_init);
+    static int pool = -1;   /* BEER_THREAD_BLOCK_POOL=0: map fresh blocks every time (old behaviour, leaks) */
+    if (pool < 0) { const char *v = getenv("BEER_THREAD_BLOCK_POOL"); pool = !(v && !strcmp(v, "0")); }
+    BeerThreadBlock *b = NULL;
+    if (pool) {
+        const u64 now = thread_block_now_ns();
+        pthread_mutex_lock(&g_thread_block_mtx);
+        if (g_thread_block_free && now - g_thread_block_free->released_ns >= 2000000000ull) {
+            b = g_thread_block_free;
+            g_thread_block_free = b->next;
+            if (!g_thread_block_free) g_thread_block_free_tail = &g_thread_block_free;
+        }
+        pthread_mutex_unlock(&g_thread_block_mtx);
+    }
+    if (b) atomic_fetch_add(&g_beer_thread_blocks_reused, 1);
+    else {
+        b = calloc(1, sizeof(*b));
+        if (!b) die("calloc(thread block): %s", strerror(errno));
+        atomic_fetch_add(&g_beer_thread_blocks_created, 1);
+    }
+    atomic_fetch_add(&g_beer_thread_blocks_live, 1);
+    if (pool) pthread_setspecific(g_thread_block_key, b);
+    return b;
+}
+
 static void *alloc_teb_for_thread(void)
 {
     beer_win32_syscall_thread_init();   /* this thread will run guest code */
+    BeerThreadBlock *block = thread_block_take();
     /* Allocate per-thread host call stack first, capturing bounds locally */
-    void *host_stack = mmap(NULL, HOST_CALL_STACK_SIZE, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *host_stack = block->host_stack ? block->host_stack : mmap(NULL, HOST_CALL_STACK_SIZE, PROT_READ | PROT_WRITE,
+                                                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (host_stack == MAP_FAILED) { perror("mmap(host_call_stack)"); _exit(2); }
+    block->host_stack = host_stack;
     u64 host_stack_base = (u64)host_stack;
     u64 host_stack_top = ((u64)host_stack + HOST_CALL_STACK_SIZE - 256) & ~0xFULL;
 
@@ -35122,17 +35362,20 @@ static void *alloc_teb_for_thread(void)
     {
         stack_t current;
         if (sigaltstack(NULL, &current) == 0 && (current.ss_flags & SS_DISABLE)) {
-            void *alt = mmap(NULL, 256 << 10, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            void *alt = block->alt_stack ? block->alt_stack
+                                         : mmap(NULL, 256 << 10, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (alt != MAP_FAILED) {
+                block->alt_stack = alt;
                 stack_t ss = { .ss_sp = alt, .ss_size = 256 << 10, .ss_flags = 0 };
                 sigaltstack(&ss, NULL);
             }
         }
     }
 
-    WinTEB *teb = mmap(NULL, sizeof(WinTEB), PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    WinTEB *teb = block->teb ? block->teb : mmap(NULL, sizeof(WinTEB), PROT_READ | PROT_WRITE,
+                                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (teb == MAP_FAILED) die("mmap(worker TEB): %s", strerror(errno));
+    block->teb = teb;
     memset(teb, 0, sizeof(*teb));
     teb->Self = (u64)teb;
     teb->ProcEnvBlk = (u64)g_process_peb;
@@ -35157,10 +35400,11 @@ static void *alloc_teb_for_thread(void)
     g_host_call_stack_real_top = host_stack_top;
 
     /* Per-thread TLS slot array (gs:[0x58]) */
-    u64 *tls_array = mmap(NULL, (size_t)TLS_SLOTS * sizeof(u64),
-                          PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    u64 *tls_array = block->tls_array ? block->tls_array : mmap(NULL, (size_t)TLS_SLOTS * sizeof(u64),
+                                                                PROT_READ | PROT_WRITE,
+                                                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (tls_array == MAP_FAILED) die("mmap(worker tls_array): %s", strerror(errno));
+    block->tls_array = tls_array;
     memset(tls_array, 0, (size_t)TLS_SLOTS * sizeof(u64));
 
     /* Copy the executable's implicit TLS initializer data (slot 0). */
@@ -35172,9 +35416,15 @@ static void *alloc_teb_for_thread(void)
         u64 raw_sz = td->EndAddr - td->StartAddr;
         u64 total_sz = raw_sz + td->SizeOfZeroFill;
         if (total_sz > 0) {
-            u8 *tls_data = mmap(NULL, total_sz, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (block->exe_tls && block->exe_tls_size != total_sz) {
+                munmap(block->exe_tls, block->exe_tls_size);
+                block->exe_tls = NULL;
+            }
+            u8 *tls_data = block->exe_tls ? block->exe_tls : mmap(NULL, total_sz, PROT_READ | PROT_WRITE,
+                                                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (tls_data != MAP_FAILED) {
+                block->exe_tls = tls_data;
+                block->exe_tls_size = total_sz;
                 memset(tls_data, 0, total_sz);
                 if (raw_sz > 0) memcpy(tls_data, (void *)td->StartAddr, (size_t)raw_sz);
                 tls_array[0] = (u64)tls_data;
@@ -41532,6 +41782,84 @@ static void on_host_abort(int sig)
     raise(sig);
 }
 
+/* BEER_MEM_PROF=1 (diagnostic): every 10 s one [MEM] line splitting the process's RAM: resident / anonymous / file /
+ * swap / page tables (kernel), Beer's own allocator in use (glibc mallinfo2), the game's HeapAlloc blocks, the D3D12
+ * heaps BD12 allocated by type, and every 60 s the resident size of the NVIDIA driver's mappings. Whatever keeps
+ * growing is the leak. */
+extern uint64_t g_bd12_heap_bytes[4] __attribute__((weak));
+extern uint64_t g_beer_vm_live_bytes;
+extern _Atomic u64 g_beer_thread_blocks_created, g_beer_thread_blocks_reused, g_beer_thread_blocks_live;
+extern _Atomic u64 g_beer_pool_items;
+size_t beer_virtual_live_count(void);
+/* Number of mappings in the process (lines of /proc/self/maps). */
+static size_t mem_map_count(void)
+{
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return 0;
+    char chunk[65536];
+    size_t lines = 0;
+    ssize_t n;
+    while ((n = read(fd, chunk, sizeof(chunk))) > 0)
+        for (ssize_t i = 0; i < n; ++i) lines += chunk[i] == '\n';
+    close(fd);
+    return lines;
+}
+static u64 mem_status_kb(const char *text, const char *key)
+{
+    const char *p = strstr(text, key);
+    return p ? strtoull(p + strlen(key), NULL, 10) : 0;
+}
+static void *mem_prof_main(void *arg)
+{
+    (void)arg;
+    for (unsigned tick = 0;; ++tick) {
+        sleep(10);
+        char buf[8192];
+        int fd = open("/proc/self/status", O_RDONLY);
+        ssize_t n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+        if (fd >= 0) close(fd);
+        if (n <= 0) continue;
+        buf[n] = 0;
+        const struct mallinfo2 mi = mallinfo2();
+        char driver[64] = "";
+        if (tick % 6 == 5) {   /* NVIDIA driver mappings: resident and swapped, from smaps (slow: once a minute) */
+            FILE *f = fopen("/proc/self/smaps", "r");
+            u64 rss = 0, swap = 0;
+            int nv = 0;
+            char line[512];
+            while (f && fgets(line, sizeof(line), f)) {
+                if ((line[0] >= '0' && line[0] <= '9') || (line[0] >= 'a' && line[0] <= 'f'))
+                    nv = strstr(line, "nvidia") != NULL;
+                else if (nv && !strncmp(line, "Rss:", 4)) rss += strtoull(line + 4, NULL, 10);
+                else if (nv && !strncmp(line, "Swap:", 5)) swap += strtoull(line + 5, NULL, 10);
+            }
+            if (f) fclose(f);
+            snprintf(driver, sizeof(driver), " nvidia-maps=%llu/%lluMB", (unsigned long long)(rss >> 10),
+                     (unsigned long long)(swap >> 10));
+        }
+        fprintf(stderr, "[MEM] t=%us maps=%zu vm=%lluMB/%zu reservations threads=%llu live/%llu blocks/%llu reused pool-items=%llu | ",
+                (tick + 1) * 10, mem_map_count(),
+                (unsigned long long)(__atomic_load_n(&g_beer_vm_live_bytes, __ATOMIC_RELAXED) >> 20), beer_virtual_live_count(),
+                (unsigned long long)atomic_load(&g_beer_thread_blocks_live), (unsigned long long)atomic_load(&g_beer_thread_blocks_created),
+                (unsigned long long)atomic_load(&g_beer_thread_blocks_reused), (unsigned long long)atomic_load(&g_beer_pool_items));
+        fprintf(stderr, "rss=%lluMB anon=%llu file=%llu swap=%llu pte=%llu | beer-malloc=%zuMB (mmap %zu) "
+                "guest-heap=%zuMB/%zu blocks | d3d12-heaps default(VRAM)/upload/readback=%llu/%llu/%lluMB%s\n",
+                (unsigned long long)(mem_status_kb(buf, "VmRSS:") >> 10),
+                (unsigned long long)(mem_status_kb(buf, "RssAnon:") >> 10),
+                (unsigned long long)(mem_status_kb(buf, "RssFile:") >> 10),
+                (unsigned long long)(mem_status_kb(buf, "VmSwap:") >> 10),
+                (unsigned long long)(mem_status_kb(buf, "VmPTE:") >> 10),
+                (mi.uordblks + mi.hblkhd) >> 20, mi.hblkhd >> 20,
+                __atomic_load_n(&g_heap_guard_live_bytes, __ATOMIC_RELAXED) >> 20,
+                __atomic_load_n(&g_heap_guard_live_count, __ATOMIC_RELAXED),
+                (unsigned long long)(&g_bd12_heap_bytes ? g_bd12_heap_bytes[1] >> 20 : 0),   /* BD12_HEAP_DEFAULT */
+                (unsigned long long)(&g_bd12_heap_bytes ? g_bd12_heap_bytes[2] >> 20 : 0),   /* UPLOAD */
+                (unsigned long long)(&g_bd12_heap_bytes ? g_bd12_heap_bytes[3] >> 20 : 0),   /* READBACK */
+                driver);
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     /* Standard output belongs to the program when it is a pipe its parent reads (unarc feeding an external decoder
@@ -41860,6 +42188,10 @@ int main(int argc, char **argv)
     beer_post_init(exe_arg);
     beer_capture_init(exe_arg);
     beer_control_start(exe_arg);
+    if (getenv("BEER_MEM_PROF")) {
+        pthread_t mem_thread;
+        if (pthread_create(&mem_thread, NULL, mem_prof_main, NULL) == 0) pthread_detach(mem_thread);
+    }
     if (getenv("BEER_PROF_SAMPLE")) prof_start();
 
     sigaction(SIGSEGV, &sa, NULL);

@@ -80,8 +80,8 @@ LAUNCH_FLAGS = [
      "Build descriptor sets per draw instead of the default root push + descriptor buffers. Much slower in SM 6 games (RE8: 148 -> 67 fps); for comparison when a game renders wrongly"),
     ("bd12_no_ssbo", "Texel-buffer descriptors (old path)", "BEER_BD12_SSBO", "0",
      "Raw/structured buffers as texel buffers instead of the default storage buffers (no UAV counters or 64-bit loads)"),
-    ("bd12_multi_queue", "Separate Vulkan queues (experimental)", "BEER_BD12_MULTI_QUEUE", "1",
-     "Compute and copy queues on their own Vulkan queues so they can overlap with graphics"),
+    ("bd12_single_queue", "Single Vulkan queue", "BEER_BD12_MULTI_QUEUE", "0",
+     "Run D3D12 compute and copy queues on the graphics queue (fallback; by default they get their own Vulkan queues)"),
     ("bd12_no_mesh", "Disable mesh shaders", "BEER_BD12_MESH", "0", "Hide D3D12 mesh/amplification shaders (on by default where the GPU has VK_EXT_mesh_shader)"),
     ("bd12_no_vrs", "Disable variable-rate shading", "BEER_BD12_VRS", "0", "Hide D3D12 VRS (on by default where the GPU has VK_KHR_fragment_shading_rate)"),
     ("no_dxr", "Hide DXR ray tracing", "BEER_DXR", "0", "Report no D3D12 ray tracing to the game (on by default where the GPU supports it); also hides DirectX 12 Ultimate"),
@@ -1710,6 +1710,10 @@ class Manager(Adw.Application):
         cache_dir = self.lib.settings.get("shader_cache_dir") or storage.CACHE_DIR
         storage.migrate_cache(cache_dir)
         env["BEER_CACHE_DIR"] = cache_dir
+        # A Windows drive left dirty/hibernated mounts read-only: old shaders still load, new compiles are lost and the
+        # same stutters come back every session.
+        if os.path.isdir(cache_dir) and not os.access(cache_dir, os.W_OK):
+            self.toast("Shader cache is read-only (%s): new shaders won't be saved. Remount the drive." % cache_dir)
         scale = float(game.get("time_scale", 1.0))
         if abs(scale - 1.0) > 1e-6:
             env["BEER_TIME_SCALE"] = "%g" % scale

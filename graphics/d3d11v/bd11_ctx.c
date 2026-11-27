@@ -4,6 +4,7 @@
  * (deferred). ExecuteCommandList replays the recorded ops through the immediate path. */
 
 #include "bd11.h"
+#include "bd11_context_state.h"
 #include <sys/mman.h>
 #include <stdatomic.h>
 
@@ -21,6 +22,26 @@ typedef struct {
     uint32_t uav_initial[B11_MAX_UAV];
 } RtOp;
 
+/* Scoped C guards keep typed Win64 entry points (including float arguments)
+ * intact, and release on every early return. Changing protection mode while
+ * other threads make unprotected calls requires caller synchronization, just
+ * as using the context with protection disabled does. */
+typedef struct { pthread_mutex_t *lock; } B11ContextGuard;
+static B11ContextGuard context_guard(B11Context *c)
+{
+    B11ContextGuard g = { NULL };
+    if (c->type == 0 && atomic_load(&c->multithread_protected)) {
+        g.lock = &c->obj.dev->lock;
+        pthread_mutex_lock(g.lock);
+    }
+    return g;
+}
+static void context_guard_leave(B11ContextGuard *g)
+{
+    if (g->lock) pthread_mutex_unlock(g->lock);
+}
+#define CTX_GUARD(c) B11ContextGuard guard __attribute__((cleanup(context_guard_leave))) = context_guard(c)
+
 /* ---- shadow state ------------------------------------------------------------------------- */
 
 static void set_obj(B11Obj **slot, B11Obj *obj)
@@ -34,27 +55,41 @@ static void set_obj(B11Obj **slot, B11Obj *obj)
 
 void b11_state_clear(B11Context *ctx)
 {
-    B11PipelineState *s = &ctx->st;
-    for (int st = 0; st < B11_STAGE_COUNT; ++st) {
-        set_obj(&s->shader[st], NULL);
-        for (int i = 0; i < B11_MAX_CBV; ++i) set_obj(&s->cb[st][i], NULL);
-        for (uint32_t i = 0; i < s->srv_end[st]; ++i) set_obj(&s->srv[st][i], NULL);
-        for (int i = 0; i < B11_MAX_SAMPLER; ++i) set_obj(&s->sampler[st][i], NULL);
-        for (int i = 0; i < B11_MAX_UAV; ++i) set_obj(&s->uav[st][i], NULL);
+    CTX_GUARD(ctx);
+    b11_pipeline_state_reset(&ctx->st);
+    b11_context_state_invalidate(ctx);
+}
+
+B11HR b11_context_state_swap(B11Context *ctx, B11ContextState *state, B11ContextState **previous)
+{
+    if (!ctx) return B11_E_INVALIDARG;
+    CTX_GUARD(ctx);
+    if (!state) return B11_S_OK;
+    if (ctx->type != 0 || state->dev != ctx->obj.dev ||
+        state->feature_level != ctx->obj.dev->feature_level) return B11_E_INVALIDARG;
+    if (ctx->active_state == state) {
+        if (previous) { b11_context_state_retain(state); *previous = state; }
+        return B11_S_OK;
     }
-    for (int i = 0; i < B11_MAX_VB; ++i) set_obj(&s->vb[i], NULL);
-    set_obj(&s->ib, NULL);
-    set_obj(&s->layout, NULL);
-    for (int i = 0; i < B11_MAX_RT; ++i) set_obj(&s->rtv[i], NULL);
-    set_obj(&s->dsv, NULL);
-    set_obj(&s->blend, NULL);
-    set_obj(&s->depth, NULL);
-    set_obj(&s->raster, NULL);
-    set_obj(&s->predicate, NULL);
-    memset(s, 0, sizeof(*s));
-    for (int i = 0; i < 4; ++i) s->blend_factor[i] = 1.0f;
-    s->sample_mask = 0xffffffffu;
-    ctx->dirty = B11_DIRTY_ALL;
+    /* All fallible work precedes mutation. Materialize the original default
+     * only on the first switch, preserving the then-current application state. */
+    if (!ctx->default_state) {
+        B11ContextState *initial;
+        B11HR hr = b11_context_state_create(ctx->obj.dev, ctx->obj.dev->feature_level, &initial);
+        if (hr != B11_S_OK) return hr;
+        ctx->default_state = initial;
+        b11_context_state_retain(initial);
+        ctx->active_state = initial;
+    }
+    B11ContextState *outgoing = ctx->active_state;
+    b11_pipeline_state_copy(&outgoing->st, &ctx->st);
+    b11_context_state_retain(state);
+    b11_pipeline_state_copy(&ctx->st, &state->st);
+    ctx->active_state = state;
+    b11_context_state_invalidate(ctx);
+    if (previous) { b11_context_state_retain(outgoing); *previous = outgoing; }
+    b11_context_state_release(outgoing);
+    return B11_S_OK;
 }
 
 static B11Obj *view_resource(B11Obj *view) { return view ? ((B11View *)view)->resource : NULL; }
@@ -194,6 +229,7 @@ static int bd12_format_has_stencil(uint32_t dxgi)
 
 void b11_texture_use(B11Context *ctx, B11Texture *t, uint32_t state)
 {
+    CTX_GUARD(ctx);
     if (!t->image || t->state == state) return;
     BD12CmdList *cmd = b11_cmd(ctx->obj.dev);
     bd12_cmd_transition_image(cmd, t->image, BD12_ALL_SUBRESOURCES, t->state, state);
@@ -326,6 +362,7 @@ VkDescriptorSet b11_resolve_hook(BD12CmdList *list, void *user, const BD12Shader
 {
     (void)compute;
     B11Context *ctx = user;
+    CTX_GUARD(ctx);
     B11Device *dev = ctx->obj.dev;
     BD12Device *bd = list->device;
     /* Allocated here only if the writes overflow the arrays; otherwise BD12's set cache reuses an identical set. */
@@ -1395,6 +1432,7 @@ static void retain_op_refs(B11Op *op)
 
 static void ctx_emit(B11Context *ctx, B11Op *op)
 {
+    CTX_GUARD(ctx);
     B11Device *dev = ctx->obj.dev;
     if (ctx->type == 1) {                       /* deferred: shadow + record */
         apply_state(ctx, op);
@@ -1416,6 +1454,7 @@ static void ctx_emit(B11Context *ctx, B11Op *op)
 
 void b11_context_replay(B11Context *imm, B11CmdList *list)
 {
+    CTX_GUARD(imm);
     B11Device *dev = imm->obj.dev;
     pthread_mutex_lock(&dev->lock);
     g_b11_stats[ST_LISTS]++;
@@ -1427,9 +1466,11 @@ void b11_context_replay(B11Context *imm, B11CmdList *list)
 static void cmdlist_destroy(B11Obj *o)
 {
     B11CmdList *l = (B11CmdList *)o;
+    B11Device *dev = o->dev;
     for (size_t i = 0; i < l->count; ++i) op_release(&l->ops[i]);
     free(l->ops);
     free(l);
+    b11_release(&dev->obj);
 }
 
 /* ---- ID3D11DeviceContext methods ------------------------------------------------------------ */
@@ -1442,11 +1483,11 @@ static uint32_t B11_MS ctx_addref(B11Obj *self) { return b11_add_ref(self); }
 static uint32_t B11_MS ctx_release(B11Obj *self) { return b11_release(self); }
 static void B11_MS ctx_get_device(B11Context *self, void **dev)
 {
+    CTX_GUARD(self);
     if (!dev) return;
     *dev = self->obj.dev;
     b11_add_ref(&self->obj.dev->obj);
 }
-static B11HR B11_MS ctx_private(void) { return B11_S_OK; }
 
 static B11Op op_new(B11OpType t) { B11Op op; memset(&op, 0, sizeof(op)); op.type = t; return op; }
 
@@ -1480,10 +1521,10 @@ static void stage_set_shader(B11Context *c, uint32_t stage, B11Obj *shader)
 }
 
 #define STAGE_FUNCS(NAME, STAGE) \
-static void B11_MS ctx_##NAME##_cb(B11Context *c, uint32_t s, uint32_t n, B11Obj *const *o) { stage_set_cb(c, STAGE, s, n, o); } \
-static void B11_MS ctx_##NAME##_srv(B11Context *c, uint32_t s, uint32_t n, B11Obj *const *o) { stage_set_srv(c, STAGE, s, n, o); } \
-static void B11_MS ctx_##NAME##_samp(B11Context *c, uint32_t s, uint32_t n, B11Obj *const *o) { stage_set_sampler(c, STAGE, s, n, o); } \
-static void B11_MS ctx_##NAME##_shader(B11Context *c, B11Obj *sh, void *ci, uint32_t n) { (void)ci; (void)n; stage_set_shader(c, STAGE, sh); }
+static void B11_MS ctx_##NAME##_cb(B11Context *c, uint32_t s, uint32_t n, B11Obj *const *o) { CTX_GUARD(c); stage_set_cb(c, STAGE, s, n, o); } \
+static void B11_MS ctx_##NAME##_srv(B11Context *c, uint32_t s, uint32_t n, B11Obj *const *o) { CTX_GUARD(c); stage_set_srv(c, STAGE, s, n, o); } \
+static void B11_MS ctx_##NAME##_samp(B11Context *c, uint32_t s, uint32_t n, B11Obj *const *o) { CTX_GUARD(c); stage_set_sampler(c, STAGE, s, n, o); } \
+static void B11_MS ctx_##NAME##_shader(B11Context *c, B11Obj *sh, void *ci, uint32_t n) { CTX_GUARD(c); (void)ci; (void)n; stage_set_shader(c, STAGE, sh); }
 STAGE_FUNCS(vs, B11_STAGE_VS)
 STAGE_FUNCS(hs, B11_STAGE_HS)
 STAGE_FUNCS(ds, B11_STAGE_DS)
@@ -1492,36 +1533,39 @@ STAGE_FUNCS(ps, B11_STAGE_PS)
 STAGE_FUNCS(cs, B11_STAGE_CS)
 
 static void B11_MS ctx_draw_indexed(B11Context *c, uint32_t count, uint32_t start, int32_t base)
-{ B11Op op = op_new(B11_OP_DRAW_INDEXED); op.a = count; op.b = start; op.c = (uint32_t)base; ctx_emit(c, &op); }
+{ CTX_GUARD(c); B11Op op = op_new(B11_OP_DRAW_INDEXED); op.a = count; op.b = start; op.c = (uint32_t)base; ctx_emit(c, &op); }
 static void B11_MS ctx_draw(B11Context *c, uint32_t count, uint32_t start)
-{ B11Op op = op_new(B11_OP_DRAW); op.a = count; op.b = start; ctx_emit(c, &op); }
+{ CTX_GUARD(c); B11Op op = op_new(B11_OP_DRAW); op.a = count; op.b = start; ctx_emit(c, &op); }
 static void B11_MS ctx_draw_indexed_instanced(B11Context *c, uint32_t count, uint32_t inst, uint32_t start, int32_t base, uint32_t sinst)
-{ B11Op op = op_new(B11_OP_DRAW_INDEXED_INSTANCED); op.a = count; op.b = inst; op.c = start; op.d = (uint32_t)base; op.e = sinst; ctx_emit(c, &op); }
+{ CTX_GUARD(c); B11Op op = op_new(B11_OP_DRAW_INDEXED_INSTANCED); op.a = count; op.b = inst; op.c = start; op.d = (uint32_t)base; op.e = sinst; ctx_emit(c, &op); }
 static void B11_MS ctx_draw_instanced(B11Context *c, uint32_t count, uint32_t inst, uint32_t start, uint32_t sinst)
-{ B11Op op = op_new(B11_OP_DRAW_INSTANCED); op.a = count; op.b = inst; op.c = start; op.d = sinst; ctx_emit(c, &op); }
+{ CTX_GUARD(c); B11Op op = op_new(B11_OP_DRAW_INSTANCED); op.a = count; op.b = inst; op.c = start; op.d = sinst; ctx_emit(c, &op); }
 static void B11_MS ctx_dispatch(B11Context *c, uint32_t x, uint32_t y, uint32_t z)
-{ B11Op op = op_new(B11_OP_DISPATCH); op.a = x; op.b = y; op.c = z; ctx_emit(c, &op); }
+{ CTX_GUARD(c); B11Op op = op_new(B11_OP_DISPATCH); op.a = x; op.b = y; op.c = z; ctx_emit(c, &op); }
 static void B11_MS ctx_draw_indexed_instanced_indirect(B11Context *c, B11Obj *args, uint32_t offset)
-{ if (!args) return; B11Op op = op_new(B11_OP_DRAW_INDEXED_INDIRECT); op.obj[0] = args; op.a = offset; ctx_emit(c, &op); }
+{ CTX_GUARD(c); if (!args) return; B11Op op = op_new(B11_OP_DRAW_INDEXED_INDIRECT); op.obj[0] = args; op.a = offset; ctx_emit(c, &op); }
 static void B11_MS ctx_draw_instanced_indirect(B11Context *c, B11Obj *args, uint32_t offset)
-{ if (!args) return; B11Op op = op_new(B11_OP_DRAW_INSTANCED_INDIRECT); op.obj[0] = args; op.a = offset; ctx_emit(c, &op); }
+{ CTX_GUARD(c); if (!args) return; B11Op op = op_new(B11_OP_DRAW_INSTANCED_INDIRECT); op.obj[0] = args; op.a = offset; ctx_emit(c, &op); }
 static void B11_MS ctx_dispatch_indirect(B11Context *c, B11Obj *args, uint32_t offset)
-{ if (!args) return; B11Op op = op_new(B11_OP_DISPATCH_INDIRECT); op.obj[0] = args; op.a = offset; ctx_emit(c, &op); }
+{ CTX_GUARD(c); if (!args) return; B11Op op = op_new(B11_OP_DISPATCH_INDIRECT); op.obj[0] = args; op.a = offset; ctx_emit(c, &op); }
 /* Not implemented yet: report which ones a game uses (once each). */
 static void B11_MS ctx_copy_structure_count(B11Context *c, B11Obj *dst, uint32_t offset, B11Obj *uav)
 {
+    CTX_GUARD(c);
     (void)c; (void)dst; (void)offset; (void)uav;
     static int warned;
     if (!warned++) fprintf(stderr, "[BD11] CopyStructureCount not implemented (UAV counters)\n");
 }
 static void B11_MS ctx_so_targets(B11Context *c, uint32_t n, B11Obj *const *t, const uint32_t *o)
 {
+    CTX_GUARD(c);
     (void)c; (void)t; (void)o;
     static int warned;
     if (n && !warned++) fprintf(stderr, "[BD11] SOSetTargets (stream output) not implemented\n");
 }
 static void B11_MS ctx_draw_auto(B11Context *c)
 {
+    CTX_GUARD(c);
     (void)c;
     static int warned;
     if (!warned++) fprintf(stderr, "[BD11] DrawAuto (stream output) not implemented\n");
@@ -1529,11 +1573,13 @@ static void B11_MS ctx_draw_auto(B11Context *c)
 
 static void B11_MS ctx_ia_layout(B11Context *c, B11Obj *layout)
 {
+    CTX_GUARD(c);
     if (c->st.layout == layout) return;
     B11Op op = op_new(B11_OP_SET_IA_LAYOUT); op.obj[0] = layout; ctx_emit(c, &op);
 }
 static void B11_MS ctx_ia_vb(B11Context *c, uint32_t start, uint32_t num, B11Obj *const *bufs, const uint32_t *strides, const uint32_t *offsets)
 {
+    CTX_GUARD(c);
     VbEnt *e = calloc(num ? num : 1, sizeof(*e));
     if (!e) return;
     for (uint32_t i = 0; i < num; ++i) {
@@ -1545,16 +1591,19 @@ static void B11_MS ctx_ia_vb(B11Context *c, uint32_t start, uint32_t num, B11Obj
 }
 static void B11_MS ctx_ia_ib(B11Context *c, B11Obj *buf, uint32_t format, uint32_t offset)
 {
+    CTX_GUARD(c);
     B11Op op = op_new(B11_OP_SET_IA_IB); op.obj[0] = buf; op.a = format; op.b = offset; ctx_emit(c, &op);
 }
 static void B11_MS ctx_ia_topology(B11Context *c, uint32_t topology)
 {
+    CTX_GUARD(c);
     if (c->st.topology == topology) return;
     B11Op op = op_new(B11_OP_SET_TOPOLOGY); op.a = topology; ctx_emit(c, &op);
 }
 
 static void B11_MS ctx_om_rt(B11Context *c, uint32_t num, B11Obj *const *rtvs, B11Obj *dsv)
 {
+    CTX_GUARD(c);
     RtOp *r = calloc(1, sizeof(*r));
     if (!r) return;
     r->rtv_count = num > B11_MAX_RT ? B11_MAX_RT : num;
@@ -1566,6 +1615,7 @@ static void B11_MS ctx_om_rt(B11Context *c, uint32_t num, B11Obj *const *rtvs, B
 static void B11_MS ctx_om_rt_uav(B11Context *c, uint32_t num, B11Obj *const *rtvs, B11Obj *dsv,
                                  uint32_t uav_start, uint32_t uav_count, B11Obj *const *uavs, const uint32_t *initial)
 {
+    CTX_GUARD(c);
     RtOp *r = calloc(1, sizeof(*r));
     if (!r) return;
     const int keep_rt = num == 0xffffffffu;
@@ -1582,6 +1632,7 @@ static void B11_MS ctx_om_rt_uav(B11Context *c, uint32_t num, B11Obj *const *rtv
 }
 static void B11_MS ctx_om_blend(B11Context *c, B11Obj *state, const float *factor, uint32_t mask)
 {
+    CTX_GUARD(c);
     static const float ones[4] = { 1, 1, 1, 1 };
     if (!factor) factor = ones;
     B11Op op = op_new(B11_OP_SET_BLEND); op.obj[0] = state; op.a = mask;
@@ -1590,32 +1641,38 @@ static void B11_MS ctx_om_blend(B11Context *c, B11Obj *state, const float *facto
 }
 static void B11_MS ctx_om_depth(B11Context *c, B11Obj *state, uint32_t ref)
 {
+    CTX_GUARD(c);
     if (c->st.depth == state && c->st.stencil_ref == ref) return;
     B11Op op = op_new(B11_OP_SET_DEPTH); op.obj[0] = state; op.a = ref; ctx_emit(c, &op);
 }
 static void B11_MS ctx_rs_state(B11Context *c, B11Obj *state)
 {
+    CTX_GUARD(c);
     if (c->st.raster == state) return;
     B11Op op = op_new(B11_OP_SET_RASTER); op.obj[0] = state; ctx_emit(c, &op);
 }
 static void B11_MS ctx_rs_viewports(B11Context *c, uint32_t num, const float *vp)
 {
+    CTX_GUARD(c);
     B11Op op = op_new(B11_OP_SET_VIEWPORTS); op.a = num;
     if (vp && num) { op.data = malloc((size_t)num * 24); if (op.data) memcpy(op.data, vp, (size_t)num * 24); }
     ctx_emit(c, &op);
 }
 static void B11_MS ctx_rs_scissors(B11Context *c, uint32_t num, const int32_t *rects)
 {
+    CTX_GUARD(c);
     B11Op op = op_new(B11_OP_SET_SCISSORS); op.a = num;
     if (rects && num) { op.data = malloc((size_t)num * 16); if (op.data) memcpy(op.data, rects, (size_t)num * 16); }
     ctx_emit(c, &op);
 }
 static void B11_MS ctx_set_predication(B11Context *c, B11Obj *pred, int value)
 {
+    CTX_GUARD(c);
     B11Op op = op_new(B11_OP_SET_PREDICATION); op.obj[0] = pred; op.a = value != 0; ctx_emit(c, &op);
 }
 static void B11_MS ctx_cs_uav(B11Context *c, uint32_t start, uint32_t num, B11Obj *const *uavs, const uint32_t *initial)
 {
+    CTX_GUARD(c);
     struct { B11Obj *obj; uint32_t initial; } *e = calloc(num ? num : 1, sizeof(*e));
     if (!e) return;
     for (uint32_t i = 0; i < num; ++i) { e[i].obj = uavs ? uavs[i] : NULL; e[i].initial = initial ? initial[i] : 0xffffffffu; }
@@ -1624,6 +1681,7 @@ static void B11_MS ctx_cs_uav(B11Context *c, uint32_t start, uint32_t num, B11Ob
 
 static void B11_MS ctx_clear_rtv(B11Context *c, B11Obj *rtv, const float *color)
 {
+    CTX_GUARD(c);
     B11Op op = op_new(B11_OP_CLEAR_RTV); op.obj[0] = rtv;
     op.data = malloc(16);
     if (!op.data) return;
@@ -1632,11 +1690,13 @@ static void B11_MS ctx_clear_rtv(B11Context *c, B11Obj *rtv, const float *color)
 }
 static void B11_MS ctx_clear_dsv(B11Context *c, B11Obj *dsv, uint32_t flags, float depth, uint8_t stencil)
 {
+    CTX_GUARD(c);
     B11Op op = op_new(B11_OP_CLEAR_DSV); op.obj[0] = dsv; op.a = flags; memcpy(&op.b, &depth, 4); op.c = stencil;
     ctx_emit(c, &op);
 }
 static void B11_MS ctx_clear_uav_uint(B11Context *c, B11Obj *uav, const uint32_t *values)
 {
+    CTX_GUARD(c);
     if (!uav || !values) return;
     B11Op op = op_new(B11_OP_CLEAR_UAV_UINT); op.obj[0] = uav; op.data = malloc(16);
     if (!op.data) return;
@@ -1645,6 +1705,7 @@ static void B11_MS ctx_clear_uav_uint(B11Context *c, B11Obj *uav, const uint32_t
 }
 static void B11_MS ctx_clear_uav_float(B11Context *c, B11Obj *uav, const float *values)
 {
+    CTX_GUARD(c);
     if (!uav || !values) return;
     B11Op op = op_new(B11_OP_CLEAR_UAV_FLOAT); op.obj[0] = uav; op.data = malloc(16);
     if (!op.data) return;
@@ -1654,11 +1715,13 @@ static void B11_MS ctx_clear_uav_float(B11Context *c, B11Obj *uav, const float *
 
 static void B11_MS ctx_copy_resource(B11Context *c, B11Obj *dst, B11Obj *src)
 {
+    CTX_GUARD(c);
     B11Op op = op_new(B11_OP_COPY_RESOURCE); op.obj[0] = dst; op.obj[1] = src; ctx_emit(c, &op);
 }
 static void B11_MS ctx_copy_region(B11Context *c, B11Obj *dst, uint32_t dsub, uint32_t dx, uint32_t dy, uint32_t dz,
                                    B11Obj *src, uint32_t ssub, const uint32_t *box)
 {
+    CTX_GUARD(c);
     B11Op op = op_new(B11_OP_COPY_REGION); op.obj[0] = dst; op.obj[1] = src;
     op.a = dsub; op.b = dx; op.c = dy; op.d = dz; op.e = ssub; op.f = box != NULL;
     if (box) { op.data = malloc(24); if (!op.data) return; memcpy(op.data, box, 24); }
@@ -1667,6 +1730,7 @@ static void B11_MS ctx_copy_region(B11Context *c, B11Obj *dst, uint32_t dsub, ui
 static void B11_MS ctx_update(B11Context *c, B11Obj *dst, uint32_t sub, const uint32_t *box, const void *data,
                               uint32_t row_pitch, uint32_t slice_pitch)
 {
+    CTX_GUARD(c);
     if (!dst || !data) return;
     size_t size = 0;
     if (dst->kind == B11_BUFFER) {
@@ -1701,14 +1765,16 @@ static void B11_MS ctx_update(B11Context *c, B11Obj *dst, uint32_t sub, const ui
 }
 static void B11_MS ctx_generate_mips(B11Context *c, B11Obj *srv)
 {
+    CTX_GUARD(c);
     (void)c; (void)srv;
     static int warned;
     if (!warned++) fprintf(stderr, "[BD11] GenerateMips not implemented yet\n");
 }
-static void B11_MS ctx_set_min_lod(B11Context *c, B11Obj *res, float lod) { (void)c; (void)res; (void)lod; }
-static float B11_MS ctx_get_min_lod(B11Context *c, B11Obj *res) { (void)c; (void)res; return 0.0f; }
+static void B11_MS ctx_set_min_lod(B11Context *c, B11Obj *res, float lod) { CTX_GUARD(c); (void)res; (void)lod; }
+static float B11_MS ctx_get_min_lod(B11Context *c, B11Obj *res) { CTX_GUARD(c); (void)res; return 0.0f; }
 static void B11_MS ctx_resolve(B11Context *c, B11Obj *dst, uint32_t dsub, B11Obj *src, uint32_t ssub, uint32_t fmt)
 {
+    CTX_GUARD(c);
     (void)c; (void)dst; (void)dsub; (void)src; (void)ssub; (void)fmt;
     static int warned;
     if (!warned++) fprintf(stderr, "[BD11] ResolveSubresource not implemented yet\n");
@@ -1872,6 +1938,7 @@ static void b11_lazy_emit(B11Context *c, B11Obj *res, int slot, int discard, siz
 
 static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t type, uint32_t flags, uint8_t *mapped)
 {
+    CTX_GUARD(c);
     (void)flags;
     B11Device *dev = c->obj.dev;
     if (!res || !mapped) return B11_E_INVALIDARG;
@@ -1996,6 +2063,7 @@ static B11HR B11_MS ctx_map(B11Context *c, B11Obj *res, uint32_t sub, uint32_t t
 
 static void B11_MS ctx_unmap(B11Context *c, B11Obj *res, uint32_t sub)
 {
+    CTX_GUARD(c);
     for (int i = 0; i < 64; ++i) {
         if (c->mapped[i].resource != res || c->mapped[i].subresource != sub) continue;
         if (c->type == 1 && res->kind == B11_BUFFER && (c->mapped[i].map_type & (B11_MAP_WRITE | B11_MAP_WRITE_DISCARD | B11_MAP_WRITE_NO_OVERWRITE))) {
@@ -2069,9 +2137,10 @@ static void B11_MS ctx_unmap(B11Context *c, B11Obj *res, uint32_t sub)
 
 /* Queries (M1: results are immediately available) ---------------------------------------------- */
 
-static void B11_MS ctx_begin(B11Context *c, B11Obj *q) { (void)c; if (q) ((B11Query *)q)->issued = 1; }
+static void B11_MS ctx_begin(B11Context *c, B11Obj *q) { CTX_GUARD(c); if (q) ((B11Query *)q)->issued = 1; }
 static void B11_MS ctx_end(B11Context *c, B11Obj *q)
 {
+    CTX_GUARD(c);
     (void)c;
     if (!q) return;
     B11Query *query = (B11Query *)q;
@@ -2094,6 +2163,7 @@ static uint64_t b11_occlusion_samples(void)
 
 static B11HR B11_MS ctx_get_data(B11Context *c, B11Obj *q, void *data, uint32_t size, uint32_t flags)
 {
+    CTX_GUARD(c);
     (void)c; (void)flags;
     if (!q) return B11_E_INVALIDARG;
     B11Query *query = (B11Query *)q;
@@ -2115,31 +2185,43 @@ static B11HR B11_MS ctx_get_data(B11Context *c, B11Obj *q, void *data, uint32_t 
 
 /* Misc ---------------------------------------------------------------------------------- */
 
-static void B11_MS ctx_clear_state(B11Context *c) { B11Op op = op_new(B11_OP_CLEAR_STATE); ctx_emit(c, &op); }
+static void B11_MS ctx_clear_state(B11Context *c) { CTX_GUARD(c); B11Op op = op_new(B11_OP_CLEAR_STATE); ctx_emit(c, &op); }
 static void B11_MS ctx_flush(B11Context *c)
 {
+    CTX_GUARD(c);
     if (c->type == 0) b11_flush(c->obj.dev, 0);
 }
-static uint32_t B11_MS ctx_get_type(B11Context *c) { return c->type; }
-static uint32_t B11_MS ctx_get_flags(B11Context *c) { return c->flags; }
+static uint32_t B11_MS ctx_get_type(B11Context *c) { CTX_GUARD(c); return c->type; }
+static uint32_t B11_MS ctx_get_flags(B11Context *c) { CTX_GUARD(c); return c->flags; }
 
 static void B11_MS ctx_execute_list(B11Context *c, B11Obj *list, uint32_t restore)
 {
-    if (!list || list->kind != B11_CMDLIST || c->type != 0) return;
+    CTX_GUARD(c);
+    if (!list || list->kind != B11_CMDLIST || c->type != 0 || list->dev != c->obj.dev) return;
     B11CmdList *l = (B11CmdList *)list;
-    if (!restore) b11_state_clear(c);
+    B11PipelineState saved;
+    if (restore) b11_pipeline_state_capture(&saved, &c->st);
+    /* A command list always starts from defaults, never the caller's state. */
+    b11_state_clear(c);
     b11_context_replay(c, l);
-    if (!restore) b11_state_clear(c);
+    if (restore) {
+        b11_pipeline_state_copy(&c->st, &saved);
+        b11_pipeline_state_dispose(&saved);
+        b11_context_state_invalidate(c);
+    } else b11_state_clear(c);
 }
 
 static B11HR B11_MS ctx_finish_list(B11Context *c, uint32_t restore, void **out)
 {
+    CTX_GUARD(c);
     if (c->type != 1) return B11_E_FAIL;
     B11CmdList *l = b11_obj_new(c->obj.dev, B11_CMDLIST, sizeof(*l), vt_cmdlist, cmdlist_destroy);
     if (!l) return B11_E_OUTOFMEMORY;
+    b11_retain(&c->obj.dev->obj);
     l->ops = c->ops;
     l->count = c->op_count;
     l->restore_state = restore;
+    l->context_flags = c->flags;
     c->ops = NULL; c->op_count = c->op_capacity = 0;
     if (!restore) b11_state_clear(c);
     for (int i = 0; i < 64; ++i) {                       /* unmatched deferred maps are dropped */
@@ -2157,33 +2239,66 @@ static B11HR B11_MS ctx_finish_list(B11Context *c, uint32_t restore, void **out)
 
 static void B11_MS ctx_get_om_rt(B11Context *c, uint32_t num, B11Obj **rtvs, B11Obj **dsv)
 {
+    CTX_GUARD(c);
     for (uint32_t i = 0; rtvs && i < num; ++i) {
         rtvs[i] = i < B11_MAX_RT ? c->st.rtv[i] : NULL;
         b11_retain(rtvs[i]);
     }
     if (dsv) { *dsv = c->st.dsv; b11_retain(*dsv); }
 }
-static void B11_MS ctx_get_noop(void) {}
+static void B11_MS ctx_get_noop(B11Context *c) { CTX_GUARD(c); }
 
-static void ctx_destroy(B11Obj *o) { (void)o; }
+static void ctx_destroy(B11Obj *o)
+{
+    B11Context *c = (B11Context *)o;
+    B11Device *dev = o->dev;
+    b11_state_clear(c);
+    b11_context_state_release(c->active_state);
+    b11_context_state_release(c->default_state);
+    for (size_t i = 0; i < c->op_count; ++i) op_release(&c->ops[i]);
+    free(c->ops);
+    for (int i = 0; i < 64; ++i) {
+        if (c->type != 1 || !c->mapped[i].resource || c->mapped[i].resource->kind != B11_BUFFER) continue;
+        if (c->mapped[i].slice) b11_slice_retire(dev, c->mapped[i].slice);
+        else if (c->mapped[i].lazy_slot) b11_lazy_free(c->mapped[i].lazy_slot);
+        else if (!c->mapped[i].direct) free(c->mapped[i].data);
+    }
+    free(c);
+    b11_release(&dev->obj);
+}
 
 B11Context *b11_context_create(B11Device *dev, uint32_t type, uint32_t flags)
 {
+    if (!dev || type > 1) return NULL;
     b11_init_vtables();
     B11Context *c = b11_obj_new(dev, B11_CONTEXT, sizeof(*c), g_ctx_vtable, ctx_destroy);
     if (!c) return NULL;
     c->type = type;
     c->flags = flags;
+    atomic_init(&c->multithread_protected, 0);
+    b11_multithread_init(&c->multithread, &c->obj);
+    b11_retain(&dev->obj);
     b11_state_clear(c);
     return c;
 }
+
+/* Command lists are not contexts: do not reinterpret their payload as the
+ * context's guard/flags. They retain the existing DeviceChild semantics. */
+static void B11_MS cmdlist_get_device(B11Obj *o, void **out)
+{
+    if (out) { *out = o->dev; b11_add_ref(&o->dev->obj); }
+}
+static uint32_t B11_MS cmdlist_get_flags(B11Obj *o) { return ((B11CmdList *)o)->context_flags; }
 
 void b11_context_init_vtable(void)
 {
     void **v = g_ctx_vtable;
     for (int i = 0; i < 115; ++i) v[i] = (void *)ctx_get_noop;
     v[0] = (void *)ctx_qi; v[1] = (void *)ctx_addref; v[2] = (void *)ctx_release;
-    v[3] = (void *)ctx_get_device; v[4] = (void *)ctx_private; v[5] = (void *)ctx_private; v[6] = (void *)ctx_private;
+    /* Private storage synchronizes independently, without a context guard:
+     * foreign IUnknown callbacks must run with no BD11 lock held here. */
+    v[3] = (void *)ctx_get_device; v[4] = (void *)b11_get_private_data;
+    v[5] = (void *)b11_set_private_data; v[6] = (void *)b11_set_private_data_interface;
     v[7] = (void *)ctx_vs_cb; v[8] = (void *)ctx_ps_srv; v[9] = (void *)ctx_ps_shader; v[10] = (void *)ctx_ps_samp;
     v[11] = (void *)ctx_vs_shader; v[12] = (void *)ctx_draw_indexed; v[13] = (void *)ctx_draw;
     v[14] = (void *)ctx_map; v[15] = (void *)ctx_unmap; v[16] = (void *)ctx_ps_cb;
@@ -2211,6 +2326,7 @@ void b11_context_init_vtable(void)
     v[113] = (void *)ctx_get_flags; v[114] = (void *)ctx_finish_list;
     /* ID3D11CommandList */
     vt_cmdlist[0] = (void *)ctx_qi; vt_cmdlist[1] = (void *)ctx_addref; vt_cmdlist[2] = (void *)ctx_release;
-    vt_cmdlist[3] = (void *)ctx_get_device; vt_cmdlist[4] = (void *)ctx_private; vt_cmdlist[5] = (void *)ctx_private;
-    vt_cmdlist[6] = (void *)ctx_private; vt_cmdlist[7] = (void *)ctx_get_flags;
+    vt_cmdlist[3] = (void *)cmdlist_get_device; vt_cmdlist[4] = (void *)b11_get_private_data;
+    vt_cmdlist[5] = (void *)b11_set_private_data; vt_cmdlist[6] = (void *)b11_set_private_data_interface;
+    vt_cmdlist[7] = (void *)cmdlist_get_flags;
 }

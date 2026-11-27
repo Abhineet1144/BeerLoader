@@ -119,6 +119,15 @@ void beer_vulkan_device_wait_idle(VkDevice device, PFN_vkDeviceWaitIdle wait_idl
 void beer_vulkan_queue_unlock(void);
 /* Per-queue locks; index 0 (or an index past the count) is the same lock as beer_vulkan_queue_lock. */
 void beer_vulkan_queue_lock_at(uint32_t index);
+/* Around vkQueuePresentKHR. Overlay layers (MangoHud, OBS vkcapture, Steam overlay) submit their own drawing inside
+ * the present call on a queue of their choosing, outside Beer's queue locks. With several queues (BEER_BD12_MULTI_QUEUE)
+ * that raced BD12's copy-queue submissions (MangoHud: Xid 32 / device lost on RE9), so then every queue is locked. */
+void beer_vulkan_queue_lock_present(void);
+void beer_vulkan_queue_unlock_present(void);
+/* BEER_VK_QUEUE_TRACE=1 (diagnostic): every Beer call that uses a VkQueue brackets itself with these; a second thread
+ * entering the same queue meanwhile prints both call sites and a host backtrace (a queue is externally synchronized). */
+void beer_vulkan_queue_trace_enter(void *queue, const char *who);
+void beer_vulkan_queue_trace_leave(void *queue);
 void beer_vulkan_queue_unlock_at(uint32_t index);
 
 /* Shared timeline used by the command-list compiler. Submissions are

@@ -80,6 +80,41 @@ static void test_allocate_query_protect_release(void)
     assert(info.state == BEER_MEM_FREE);
 }
 
+static void test_decommit_validation(void)
+{
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char *memory = beer_virtual_alloc(NULL, 65536,
+        BEER_MEM_RESERVE | BEER_MEM_COMMIT, BEER_PAGE_READWRITE);
+    assert(memory);
+    BeerMemoryBasicInformation info;
+    memory[0] = 0x7a;
+    errno = EDOM;
+    assert(!beer_virtual_free(memory + page, 0, BEER_MEM_DECOMMIT) && errno == EINVAL);
+    errno = EDOM;
+    assert(!beer_virtual_free(memory + 65536 - page, 2 * page, BEER_MEM_DECOMMIT) && errno == EINVAL);
+    errno = EDOM;
+    assert(!beer_virtual_free(memory + 1, SIZE_MAX, BEER_MEM_DECOMMIT) && errno == EINVAL);
+    assert(memory[0] == 0x7a);
+    assert(beer_virtual_free(memory, 0, BEER_MEM_DECOMMIT));
+    assert(beer_virtual_query(memory, &info, sizeof(info)));
+    assert(info.state == BEER_MEM_RESERVE && info.region_size == 65536 &&
+        info.allocation_base == (uintptr_t)memory);
+    assert(beer_virtual_free(memory + page, page, BEER_MEM_DECOMMIT)); /* Already reserved is legal. */
+    assert(beer_virtual_alloc(memory, page, BEER_MEM_COMMIT, BEER_PAGE_READWRITE) == memory);
+    assert(memory[0] == 0);
+    /* Force a host mapping failure, distinct from invalid Win32 ownership. */
+    assert(munmap(memory, page) == 0);
+    errno = EDOM;
+    assert(!beer_virtual_free(memory, page, BEER_MEM_DECOMMIT) && errno == ENOMEM);
+    assert(beer_virtual_free(memory, 0, BEER_MEM_RELEASE));
+    errno = EDOM;
+    assert(!beer_virtual_free(memory, page, BEER_MEM_DECOMMIT) && errno == EINVAL);
+    errno = EDOM;
+    assert(!beer_virtual_free(NULL, page, BEER_MEM_DECOMMIT) && errno == EINVAL);
+    errno = EDOM;
+    assert(!beer_virtual_free(memory, 0, 0) && errno == EINVAL);
+}
+
 static void test_reserve_and_validation(void)
 {
     void *memory = beer_virtual_alloc(NULL, 4096, BEER_MEM_RESERVE,
@@ -231,6 +266,7 @@ int main(void)
     assert(info.state == BEER_MEM_COMMIT && info.protect == BEER_PAGE_EXECUTE);
     assert(beer_virtual_free(memory, 0, BEER_MEM_RELEASE));
     test_allocate_query_protect_release();
+    test_decommit_validation();
     test_reserve_and_validation();
     test_string_pointer_probes();
     test_image_pages();

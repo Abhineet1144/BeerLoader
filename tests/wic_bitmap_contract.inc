@@ -1,0 +1,110 @@
+/* Real in-memory WIC bitmap contracts through the guest COM ABI. */
+static void __attribute__((target("sse2"))) wic_bitmap_contract_test(void)
+{
+    const u8 clsid[16] = {0x62,0xf2,0xca,0xca,0x70,0x93,0x15,0x46,0xa1,0x3b,0x9f,0x55,0x39,0xda,0x4c,0x0a};
+    const u8 factory_iid[16] = {0xa9,0xc8,0x5e,0xec,0x95,0xc3,0x14,0x43,0x9c,0x77,0x54,0xd7,0xa9,0x35,0xff,0x70};
+    const u8 bitmap_iid[16] = {0x21,1,0,0,0xf2,0xa8,0x77,0x48,0xba,0x0a,0xfd,0x2b,0x66,0x45,0xfb,0x94};
+    const u8 source_iid[16] = {0x20,1,0,0,0xf2,0xa8,0x77,0x48,0xba,0x0a,0xfd,0x2b,0x66,0x45,0xfb,0x94};
+    const u8 lock_iid[16] = {0x23,1,0,0,0xf2,0xa8,0x77,0x48,0xba,0x0a,0xfd,0x2b,0x66,0x45,0xfb,0x94};
+    typedef u64 (__attribute__((ms_abi)) *Create)(WicObject *, u32, u32, const u8 *, u32, void **);
+    typedef u64 (__attribute__((ms_abi)) *Lock)(WicObject *, const s32 *, u32, void **);
+    typedef u64 (__attribute__((ms_abi)) *Copy)(WicObject *, const s32 *, u32, u32, u8 *);
+    typedef u64 (__attribute__((ms_abi)) *Size)(WicObject *, u32 *, u32 *);
+    typedef u64 (__attribute__((ms_abi)) *Format)(WicObject *, u8 *);
+    typedef u64 (__attribute__((ms_abi)) *Stride)(WicObject *, u32 *);
+    typedef u64 (__attribute__((ms_abi)) *Data)(WicObject *, u32 *, u8 **);
+    typedef u64 (__attribute__((ms_abi)) *SetDpi)(WicObject *, double, double);
+    typedef u64 (__attribute__((ms_abi)) *GetDpi)(WicObject *, double *, double *);
+    WicObject *factory = NULL;
+    assert(!impl_CoCreateInstance(clsid, 0, 1, factory_iid, (void **)&factory) && factory);
+    Create create = (Create)factory->vtbl[17];
+    u8 format[16], returned[16];
+    wic_set_native_format(format, 0x0f);
+    void *invalid = (void *)1;
+    assert(create(factory, 0, 3, format, 1, &invalid) == WIC_E_INVALIDARG && !invalid);
+    assert(create(factory, 4, 3, format, 0, &invalid) == WIC_E_INVALIDARG && !invalid);
+    assert(create(factory, 4, 3, format, 1, NULL) == WIC_E_POINTER);
+    assert(create(factory, INT32_MAX, INT32_MAX, format, 1, &invalid) == WIC_E_OUTOFMEMORY && !invalid);
+    wic_set_native_format(format, 0x0c);
+    assert(create(factory, 4, 3, format, 1, &invalid) == WIC_E_UNSUPPORTEDFORMAT && !invalid);
+    for (u8 native = 0x0e; native <= 0x10; ++native) {
+        wic_set_native_format(format, native);
+        WicObject *bitmap = NULL, *lock = NULL;
+        assert(!create(factory, 4, 3, format, 1 + (native & 1), (void **)&bitmap));
+        void *queried = NULL;
+        assert(!wic_QI(bitmap, bitmap_iid, &queried) && queried == bitmap);
+        wic_Release(queried);
+        assert(!wic_QI(bitmap, source_iid, &queried) && queried == bitmap);
+        wic_Release(queried);
+        assert(wic_QI(bitmap, lock_iid, &queried) == WIC_E_NOINTERFACE && !queried);
+        u32 width, height;
+        assert(!((Size)bitmap->vtbl[3])(bitmap, &width, &height) && width == 4 && height == 3);
+        assert(!((Format)bitmap->vtbl[4])(bitmap, returned) && !memcmp(format, returned, 16));
+        double x, y;
+        assert(!((GetDpi)bitmap->vtbl[5])(bitmap, &x, &y) && x == 96 && y == 96);
+        assert(!((SetDpi)bitmap->vtbl[10])(bitmap, 144, 120));
+        assert(!((GetDpi)bitmap->vtbl[5])(bitmap, &x, &y) && x == 144 && y == 120);
+        assert(((SetDpi)bitmap->vtbl[10])(bitmap, -1, 120) == WIC_E_INVALIDARG);
+        assert(((SetDpi)bitmap->vtbl[10])(bitmap, __builtin_inf(), 120) == WIC_E_INVALIDARG);
+        Lock get_lock = (Lock)bitmap->vtbl[8];
+        Copy copy = (Copy)bitmap->vtbl[7];
+        const s32 bad[4] = {INT32_MAX, 0, INT32_MAX, 1};
+        assert(get_lock(bitmap, bad, 2, &invalid) == WIC_E_INVALIDARG && !invalid);
+        assert(get_lock(bitmap, NULL, 0, &invalid) == WIC_E_INVALIDARG && !invalid);
+        const s32 rect[4] = {1, 1, 2, 2};
+        assert(!get_lock(bitmap, rect, 3, (void **)&lock));
+        assert(!((Size)lock->vtbl[3])(lock, &width, &height) && width == 2 && height == 2);
+        u32 stride, size;
+        u8 *pixels;
+        assert(!((Stride)lock->vtbl[4])(lock, &stride) && stride == 16);
+        assert(!((Data)lock->vtbl[5])(lock, &size, &pixels) && size == 24);
+        assert(pixels == bitmap->image->bgra + 20);
+        assert(!((Format)lock->vtbl[6])(lock, returned) && !memcmp(format, returned, 16));
+        assert(!wic_QI(lock, lock_iid, &queried) && queried == lock);
+        wic_Release(queried);
+        assert(wic_QI(lock, source_iid, &queried) == WIC_E_NOINTERFACE && !queried);
+        u8 out[48]; memset(out, 0xa5, sizeof(out));
+        assert(copy(bitmap, NULL, 16, sizeof(out), out) == WIC_E_ALREADYLOCKED);
+        assert(get_lock(bitmap, NULL, 1, &invalid) == WIC_E_ALREADYLOCKED && !invalid);
+        /* Keep alpha at 128: PBGRA readback must not premultiply these bytes again. */
+        const u8 row[] = {20,40,60,128, 80,100,120,128};
+        memcpy(pixels, row, 8); memcpy(pixels + stride, row, 8);
+        assert(!wic_Release(lock));
+        assert(!copy(bitmap, rect, 12, 20, out));
+        assert(!memcmp(out, row, 8) && !memcmp(out + 12, row, 8) && out[8] == 0xa5);
+        assert(copy(bitmap, rect, 12, 19, out) == WIC_E_INSUFFICIENTBUFFER);
+        assert(copy(bitmap, rect, 7, sizeof(out), out) == WIC_E_INVALIDARG);
+        WicObject *read1, *read2;
+        assert(!get_lock(bitmap, NULL, 1, (void **)&read1));
+        assert(!get_lock(bitmap, NULL, 1, (void **)&read2));
+        assert(get_lock(bitmap, NULL, 2, &invalid) == WIC_E_ALREADYLOCKED && !invalid);
+        assert(!copy(bitmap, NULL, 16, sizeof(out), out));
+        assert(out[0] == 0 && !memcmp(out + 20, row, 8));
+        assert(wic_Release(bitmap) == 2); /* Locks retain the actual pixel owner. */
+        assert(!wic_Release(read1));
+        assert(!((Data)read2->vtbl[5])(read2, &size, &pixels) && size == 48);
+        assert(!memcmp(pixels + 20, row, 8));
+        assert(!wic_Release(read2));
+    }
+    /* Existing BMP decode/conversion must still produce straight/premultiplied
+     * BGRA rather than adopting mutable bitmap byte semantics accidentally. */
+    u8 bmp[62] = {0};
+    bmp[0] = 'B'; bmp[1] = 'M'; bmp[2] = sizeof(bmp); bmp[10] = 54;
+    bmp[14] = 40; bmp[18] = 2; bmp[22] = 1; bmp[26] = 1; bmp[28] = 24;
+    bmp[54] = 10; bmp[55] = 20; bmp[56] = 30;
+    bmp[57] = 40; bmp[58] = 50; bmp[59] = 60;
+    WicImage *decoded = NULL;
+    assert(!wic_decode_bmp(bmp, sizeof(bmp), &decoded) && decoded);
+    WicObject *frame = wic_new(WIC_FRAME, g_wic_frame_vtbl, decoded);
+    wic_image_release(decoded);
+    WicObject *converter = wic_new(WIC_CONVERTER, g_wic_converter_vtbl, NULL);
+    wic_set_native_format(format, 0x10);
+    assert(!wic_converter_Initialize(converter, frame, format, 0, NULL, 0, 0));
+    const u8 expected[] = {10,20,30,255,40,50,60,255};
+    u8 converted[8];
+    assert(!wic_CopyPixels(converter, NULL, 8, sizeof(converted), converted));
+    assert(!memcmp(converted, expected, sizeof(expected)));
+    assert(!wic_Release(frame));
+    assert(!wic_Release(converter));
+    assert(!wic_Release(factory));
+}

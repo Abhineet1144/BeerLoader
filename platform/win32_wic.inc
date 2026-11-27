@@ -7,7 +7,16 @@
  * Decoders: BMP (1/4/8-bit palette, 16-bit 5-5-5, 24-bit, 32-bit; bottom-up or top-down; BI_RGB/BI_BITFIELDS).
  * Other containers answer WINCODEC_ERR_COMPONENTNOTFOUND, as Windows does without a codec for them.
  * Every frame is decoded to 32-bit BGRA; the converter writes 32bpp BGR/BGRA/PBGRA/RGBA/PRGBA and 24bpp BGR/RGB.
+ * Writable bitmaps: CreateBitmap with 32bpp BGR/BGRA/PBGRA, owned native pixels,
+ * IWICBitmapSource readback, resolution metadata and shared-read/exclusive-write locks.
+ * Other writable formats, palettes and bitmap-source converter input remain unsupported.
  * Included after platform/win32_wmi.inc (GUID helper, E_NOTIMPL slot). */
+
+/* These vtables are called directly by guest code, without an import bridge.
+ * GCC needs SSE enabled to preserve Win64 nonvolatile XMM6-XMM15 when a COM
+ * method calls SysV libc. Restore the loader's options after this include. */
+#pragma GCC push_options
+#pragma GCC target("sse2")
 
 #define WIC_E_NOINTERFACE        UINT64_C(0x80004002)
 #define WIC_E_POINTER            UINT64_C(0x80004003)
@@ -19,15 +28,22 @@
 #define WIC_E_BADIMAGE           UINT64_C(0x88982f60)
 #define WIC_E_UNSUPPORTEDFORMAT  UINT64_C(0x88982f80)
 #define WIC_E_INSUFFICIENTBUFFER UINT64_C(0x88982f8c)
+#define WIC_E_ALREADYLOCKED      UINT64_C(0x88982f0d)
 
 typedef struct { _Atomic(u32) refs; u32 width, height; u8 *bgra; } WicImage;      /* top-down, 4 bytes/pixel */
-enum { WIC_FACTORY, WIC_DECODER, WIC_FRAME, WIC_CONVERTER };
-typedef struct {
+enum { WIC_FACTORY, WIC_DECODER, WIC_FRAME, WIC_CONVERTER, WIC_BITMAP, WIC_LOCK };
+typedef struct WicObject {
     void **vtbl;
     _Atomic(u32) refs;
     int kind;
-    WicImage *image;               /* decoder, frame, initialised converter */
-    u8 format[16];                 /* converter output format */
+    WicImage *image;               /* decoded BGRA or mutable bitmap's native BGR(A) bytes */
+    u8 format[16];                 /* converter output or mutable bitmap's native format */
+    pthread_mutex_t bitmap_mutex;  /* mutable bitmap access; never held for a lock's lifetime */
+    u32 readers, writer;
+    double dpi_x, dpi_y;
+    struct WicObject *parent;      /* lock retains the owning bitmap */
+    s32 rect[4];                   /* locked rectangle */
+    u32 lock_flags;
 } WicObject;
 
 static void wic_image_release(WicImage *image)
@@ -130,6 +146,8 @@ static void *g_wic_factory_vtbl[28];
 static void *g_wic_decoder_vtbl[14];
 static void *g_wic_frame_vtbl[11];
 static void *g_wic_converter_vtbl[10];
+static void *g_wic_bitmap_vtbl[11];
+static void *g_wic_lock_vtbl[7];
 
 static WicObject *wic_new(int kind, void **vtbl, WicImage *image)
 {
@@ -143,7 +161,19 @@ static u64 __attribute__((ms_abi)) wic_AddRef(WicObject *o) { return ++o->refs; 
 static u64 __attribute__((ms_abi)) wic_Release(WicObject *o)
 {
     const u32 left = --o->refs;
-    if (!left) { wic_image_release(o->image); free(o); }
+    if (!left) {
+        if (o->kind == WIC_LOCK) {
+            WicObject *parent = o->parent;
+            pthread_mutex_lock(&parent->bitmap_mutex);
+            if (o->lock_flags & 2) parent->writer = 0;
+            else --parent->readers;
+            pthread_mutex_unlock(&parent->bitmap_mutex);
+            wic_Release(parent);
+        }
+        if (o->kind == WIC_BITMAP) pthread_mutex_destroy(&o->bitmap_mutex);
+        wic_image_release(o->image);
+        free(o);
+    }
     return left;
 }
 static int wic_iid_is_unknown(const u8 *iid) { return beer_wmi_guid_is(iid, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46); }
@@ -172,6 +202,13 @@ static u64 __attribute__((ms_abi)) wic_QI(WicObject *o, const u8 *iid, void **ou
         ok |= wic_iid_is_source(iid) ||
               beer_wmi_guid_is(iid, 0x00000301, 0xa8f2, 0x4877, 0xba, 0x0a, 0xfd, 0x2b, 0x66, 0x45, 0xfb, 0x94);
         break;
+    case WIC_BITMAP:       /* IWICBitmap also inherits IWICBitmapSource */
+        ok |= wic_iid_is_source(iid) ||
+              beer_wmi_guid_is(iid, 0x00000121, 0xa8f2, 0x4877, 0xba, 0x0a, 0xfd, 0x2b, 0x66, 0x45, 0xfb, 0x94);
+        break;
+    case WIC_LOCK:         /* IWICBitmapLock is not a bitmap source */
+        ok |= beer_wmi_guid_is(iid, 0x00000123, 0xa8f2, 0x4877, 0xba, 0x0a, 0xfd, 0x2b, 0x66, 0x45, 0xfb, 0x94);
+        break;
     }
     if (!ok) return WIC_E_NOINTERFACE;
     wic_AddRef(o);
@@ -191,15 +228,18 @@ static u64 __attribute__((ms_abi)) wic_GetPixelFormat(WicObject *o, u8 *format)
 {
     if (!format) return WIC_E_INVALIDARG;
     if (!o->image) return WIC_E_NOTINITIALIZED;
-    if (o->kind == WIC_CONVERTER) memcpy(format, o->format, 16);
+    if (o->kind == WIC_CONVERTER || o->kind == WIC_BITMAP) memcpy(format, o->format, 16);
     else wic_set_native_format(format, 0x0f);                         /* frames decode to 32bppBGRA */
     return 0;
 }
 static u64 __attribute__((ms_abi)) wic_GetResolution(WicObject *o, double *x, double *y)
 {
-    (void)o;
     if (!x || !y) return WIC_E_INVALIDARG;
-    *x = 96.0; *y = 96.0;
+    if (o->kind == WIC_BITMAP) {
+        pthread_mutex_lock(&o->bitmap_mutex);
+        memcpy(x, &o->dpi_x, sizeof(*x)); memcpy(y, &o->dpi_y, sizeof(*y));
+        pthread_mutex_unlock(&o->bitmap_mutex);
+    } else { *x = 96.0; *y = 96.0; }
     return 0;
 }
 static u64 __attribute__((ms_abi)) wic_CopyPalette(void) { return UINT64_C(0x88982f45); }   /* PALETTEUNAVAILABLE */
@@ -228,6 +268,106 @@ static u64 __attribute__((ms_abi)) wic_CopyPixels(WicObject *o, const s32 *rect,
             if (layout.bytes == 4) dst[3] = a;
         }
     }
+    return 0;
+}
+
+/* Writable bitmaps keep native BGR/BGRA/PBGRA bytes, including premultiplied
+ * alpha, rather than applying the decoded-frame converter a second time. */
+static int wic_bitmap_rect(WicObject *o, const s32 *rect, s32 out[4])
+{
+    out[0] = out[1] = 0;
+    out[2] = (s32)o->image->width; out[3] = (s32)o->image->height;
+    if (rect) memcpy(out, rect, 4 * sizeof(*out));
+    return out[0] >= 0 && out[1] >= 0 && out[2] > 0 && out[3] > 0 &&
+        (u64)(u32)out[0] + (u32)out[2] <= o->image->width &&
+        (u64)(u32)out[1] + (u32)out[3] <= o->image->height;
+}
+static u64 __attribute__((ms_abi))
+wic_bitmap_CopyPixels(WicObject *o, const s32 *rect, u32 stride, u32 size, u8 *buffer)
+{
+    s32 r[4];
+    if (!buffer || !wic_bitmap_rect(o, rect, r)) return WIC_E_INVALIDARG;
+    const u64 row = (u64)(u32)r[2] * 4;
+    if (stride < row) return WIC_E_INVALIDARG;
+    if ((u64)stride * (u32)(r[3] - 1) + row > size) return WIC_E_INSUFFICIENTBUFFER;
+    pthread_mutex_lock(&o->bitmap_mutex);
+    if (o->writer) { pthread_mutex_unlock(&o->bitmap_mutex); return WIC_E_ALREADYLOCKED; }
+    const size_t source_stride = (size_t)o->image->width * 4;
+    for (s32 y = 0; y < r[3]; ++y)
+        memcpy(buffer + (size_t)y * stride,
+               o->image->bgra + (size_t)(r[1] + y) * source_stride + (size_t)r[0] * 4,
+               (size_t)row);
+    pthread_mutex_unlock(&o->bitmap_mutex);
+    return 0;
+}
+static u64 __attribute__((ms_abi))
+wic_bitmap_Lock(WicObject *o, const s32 *rect, u32 flags, void **out)
+{
+    if (!out) return WIC_E_POINTER;
+    *out = NULL;
+    s32 r[4];
+    const int valid_rect = wic_bitmap_rect(o, rect, r);
+    if (!flags || (flags & ~3u) || !valid_rect) {
+        if (getenv("BEER_WIC_DIAGNOSTICS"))
+            fprintf(stderr, "[WIC LOCK INVALID] bitmap=%p flags=%#x rect=%d,%d,%d,%d image=%ux%u\n",
+                    o, flags, r[0], r[1], r[2], r[3], o->image->width, o->image->height);
+        return WIC_E_INVALIDARG;
+    }
+    WicObject *lock = wic_new(WIC_LOCK, g_wic_lock_vtbl, NULL);
+    if (!lock) return WIC_E_OUTOFMEMORY;
+    pthread_mutex_lock(&o->bitmap_mutex);
+    if (o->writer || ((flags & 2) && o->readers)) {
+        if (getenv("BEER_WIC_DIAGNOSTICS"))
+            fprintf(stderr, "[WIC LOCK BUSY] bitmap=%p flags=%#x readers=%u writer=%u\n",
+                o, flags, o->readers, o->writer);
+        pthread_mutex_unlock(&o->bitmap_mutex);
+        free(lock);
+        return WIC_E_ALREADYLOCKED;
+    }
+    if (flags & 2) o->writer = 1; else ++o->readers;
+    wic_AddRef(o);
+    lock->parent = o; lock->lock_flags = flags;
+    memcpy(lock->rect, r, sizeof(r));
+    pthread_mutex_unlock(&o->bitmap_mutex);
+    *out = lock;
+    if (getenv("BEER_WIC_DIAGNOSTICS"))
+        fprintf(stderr, "[WIC LOCK] bitmap=%p flags=%#x rect=%d,%d,%d,%d\n",
+                o, flags, r[0], r[1], r[2], r[3]);
+    return 0;
+}
+static u64 __attribute__((ms_abi)) wic_lock_GetSize(WicObject *o, u32 *width, u32 *height)
+{
+    if (!width || !height) return WIC_E_INVALIDARG;
+    *width = (u32)o->rect[2]; *height = (u32)o->rect[3];
+    return 0;
+}
+static u64 __attribute__((ms_abi)) wic_lock_GetStride(WicObject *o, u32 *stride)
+{
+    if (!stride) return WIC_E_INVALIDARG;
+    *stride = o->parent->image->width * 4;
+    return 0;
+}
+static u64 __attribute__((ms_abi)) wic_lock_GetDataPointer(WicObject *o, u32 *size, u8 **data)
+{
+    if (!size || !data) return WIC_E_INVALIDARG;
+    const size_t stride = (size_t)o->parent->image->width * 4;
+    *data = o->parent->image->bgra + (size_t)o->rect[1] * stride + (size_t)o->rect[0] * 4;
+    *size = (u32)((size_t)(o->rect[3] - 1) * stride + (size_t)o->rect[2] * 4);
+    return 0;
+}
+static u64 __attribute__((ms_abi)) wic_lock_GetPixelFormat(WicObject *o, u8 *format)
+{
+    if (!format) return WIC_E_INVALIDARG;
+    memcpy(format, o->parent->format, 16);
+    return 0;
+}
+static u64 __attribute__((ms_abi, target("sse2")))
+wic_bitmap_SetResolution(WicObject *o, double x, double y)
+{
+    if (!(x > 0 && y > 0) || !__builtin_isfinite(x) || !__builtin_isfinite(y)) return WIC_E_INVALIDARG;
+    pthread_mutex_lock(&o->bitmap_mutex);
+    o->dpi_x = x; o->dpi_y = y;
+    pthread_mutex_unlock(&o->bitmap_mutex);
     return 0;
 }
 
@@ -337,30 +477,72 @@ static u64 __attribute__((ms_abi)) wic_factory_CreateFormatConverter(WicObject *
     return *converter ? 0 : WIC_E_OUTOFMEMORY;
 }
 
-static void wic_vtables_init(void)
+static u64 __attribute__((ms_abi))
+wic_factory_CreateBitmap(WicObject *o, u32 width, u32 height, const u8 *format, u32 option, void **out)
 {
-    static int ready;
-    if (ready) return;
-    void **tables[] = { g_wic_factory_vtbl, g_wic_decoder_vtbl, g_wic_frame_vtbl, g_wic_converter_vtbl };
-    const size_t sizes[] = { 28, 14, 11, 10 };
-    for (size_t t = 0; t < 4; ++t) {
+    (void)o;
+    if (!out) return WIC_E_POINTER;
+    *out = NULL;
+    if (!format || !width || !height || width > INT32_MAX || height > INT32_MAX ||
+        (option != 1 && option != 2)) return WIC_E_INVALIDARG;
+    const int native = wic_native_format(format);
+    if (getenv("BEER_WIC_DIAGNOSTICS"))
+        fprintf(stderr, "[WIC BITMAP] size=%ux%u native-format=%#x option=%u\n", width, height, native, option);
+    if (native != 0x0e && native != 0x0f && native != 0x10) return WIC_E_UNSUPPORTEDFORMAT;
+    const u64 bytes = (u64)width * height * 4;
+    if (bytes > UINT32_MAX) return WIC_E_OUTOFMEMORY;
+    WicImage *image = calloc(1, sizeof(*image));
+    if (!image) return WIC_E_OUTOFMEMORY;
+    image->refs = 1; image->width = width; image->height = height;
+    image->bgra = calloc(1, (size_t)bytes);
+    if (!image->bgra) { wic_image_release(image); return WIC_E_OUTOFMEMORY; }
+    WicObject *bitmap = wic_new(WIC_BITMAP, g_wic_bitmap_vtbl, image);
+    wic_image_release(image);
+    if (!bitmap) return WIC_E_OUTOFMEMORY;
+    if (pthread_mutex_init(&bitmap->bitmap_mutex, NULL) != 0) {
+        wic_image_release(bitmap->image); free(bitmap); return WIC_E_OUTOFMEMORY;
+    }
+    memcpy(bitmap->format, format, 16);
+    bitmap->dpi_x = bitmap->dpi_y = 96.0;
+    *out = bitmap;
+    return 0;
+}
+
+static void wic_vtables_init_once(void)
+{
+    void **tables[] = { g_wic_factory_vtbl, g_wic_decoder_vtbl, g_wic_frame_vtbl, g_wic_converter_vtbl,
+                       g_wic_bitmap_vtbl, g_wic_lock_vtbl };
+    const size_t sizes[] = { 28, 14, 11, 10, 11, 7 };
+    for (size_t t = 0; t < 6; ++t) {
         for (size_t i = 0; i < sizes[t]; ++i) tables[t][i] = (void *)wmi_NotImpl;
         tables[t][0] = (void *)wic_QI; tables[t][1] = (void *)wic_AddRef; tables[t][2] = (void *)wic_Release;
     }
     g_wic_factory_vtbl[3] = (void *)wic_factory_CreateDecoderFromFilename;
     g_wic_factory_vtbl[10] = (void *)wic_factory_CreateFormatConverter;
+    g_wic_factory_vtbl[17] = (void *)wic_factory_CreateBitmap;
     g_wic_decoder_vtbl[5] = (void *)wic_decoder_GetContainerFormat;
     g_wic_decoder_vtbl[12] = (void *)wic_decoder_GetFrameCount;
     g_wic_decoder_vtbl[13] = (void *)wic_decoder_GetFrame;
-    void **sources[] = { g_wic_frame_vtbl, g_wic_converter_vtbl };
-    for (size_t s = 0; s < 2; ++s) {
+    void **sources[] = { g_wic_frame_vtbl, g_wic_converter_vtbl, g_wic_bitmap_vtbl };
+    for (size_t s = 0; s < 3; ++s) {
         sources[s][3] = (void *)wic_GetSize; sources[s][4] = (void *)wic_GetPixelFormat;
         sources[s][5] = (void *)wic_GetResolution; sources[s][6] = (void *)wic_CopyPalette;
         sources[s][7] = (void *)wic_CopyPixels;
     }
     g_wic_converter_vtbl[8] = (void *)wic_converter_Initialize;
     g_wic_converter_vtbl[9] = (void *)wic_converter_CanConvert;
-    ready = 1;
+    g_wic_bitmap_vtbl[7] = (void *)wic_bitmap_CopyPixels;
+    g_wic_bitmap_vtbl[8] = (void *)wic_bitmap_Lock;
+    g_wic_bitmap_vtbl[10] = (void *)wic_bitmap_SetResolution;
+    g_wic_lock_vtbl[3] = (void *)wic_lock_GetSize;
+    g_wic_lock_vtbl[4] = (void *)wic_lock_GetStride;
+    g_wic_lock_vtbl[5] = (void *)wic_lock_GetDataPointer;
+    g_wic_lock_vtbl[6] = (void *)wic_lock_GetPixelFormat;
+}
+static void wic_vtables_init(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, wic_vtables_init_once);
 }
 
 /* CoCreateInstance hook: CLSID_WICImagingFactory {cacaf262-9370-4615-a13b-9f5539da4c0a} and
@@ -378,3 +560,4 @@ static u64 beer_wic_create_instance(const u8 *clsid, const u8 *iid, void **out)
     wic_Release(factory);
     return hr;
 }
+#pragma GCC pop_options

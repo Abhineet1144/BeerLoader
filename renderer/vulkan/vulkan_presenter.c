@@ -275,6 +275,7 @@ static int initialize(void *display, unsigned long window)
     g_vk.physical_device = beer_vulkan_physical_device();
     g_vk.device = beer_vulkan_device();
     g_vk.queue = beer_vulkan_queue();
+    fprintf(stderr, "[PRESENTER] uses VkQueue %p\n", (void *)g_vk.queue);
     g_vk.queue_family = beer_vulkan_queue_family();
     g_vk.GetInstanceProcAddr = beer_vulkan_get_instance_proc_addr();
     g_vk.GetDeviceProcAddr = beer_vulkan_get_device_proc_addr();
@@ -1090,8 +1091,10 @@ static int present_rgba8_staging(void *display, unsigned long window,
     if (g_vk.ResetFences(g_vk.device, 1, &g_vk.submit_fence) != VK_SUCCESS)
         return 0;
     beer_vulkan_queue_lock();
+    beer_vulkan_queue_trace_enter(g_vk.queue, "presenter submit ");
     VkResult submit_result = g_vk.QueueSubmit(g_vk.queue, 1, &submit,
                                                g_vk.submit_fence);
+    beer_vulkan_queue_trace_leave(g_vk.queue);
     beer_vulkan_queue_unlock();
     PT_MARK(3, pt);
     if (submit_result != VK_SUCCESS) {
@@ -1116,9 +1119,11 @@ static int present_rgba8_staging(void *display, unsigned long window,
      * submissions for tens of milliseconds. The render-finished semaphore
      * preserves the submit->present dependency even when another queue call is
      * interleaved between these two API calls. */
-    beer_vulkan_queue_lock();
+    beer_vulkan_queue_lock_present();
+    beer_vulkan_queue_trace_enter(g_vk.queue, "presenter present");
     result = g_vk.QueuePresentKHR(g_vk.queue, &present);
-    beer_vulkan_queue_unlock();
+    beer_vulkan_queue_trace_leave(g_vk.queue);
+    beer_vulkan_queue_unlock_present();
     PT_MARK(4, pt);
     beer_vulkan_record_result(result, "queue presentation");
     g_vk.upload_initialized = 1;
@@ -1367,8 +1372,10 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
     if (g_vk.ResetFences(g_vk.device, 1, &g_vk.submit_fence) != VK_SUCCESS)
         return 0;
     beer_vulkan_queue_lock();
+    beer_vulkan_queue_trace_enter(g_vk.queue, "presenter submit ");
     VkResult submit_result = g_vk.QueueSubmit(g_vk.queue, 1, &submit,
                                                g_vk.submit_fence);
+    beer_vulkan_queue_trace_leave(g_vk.queue);
     beer_vulkan_queue_unlock();
     record_direct_present(sequence, "submitted", source_image, source_layout,
                           width, height, output_width, output_height,
@@ -1392,10 +1399,12 @@ int vulkan_presenter_present_image(void *display, unsigned long window,
     VkPresentIdKHR present_id_info;
     uint64_t present_id = 0;
     present.pNext = ll_present_id_chain(&present_id_info, &present_id);
-    beer_vulkan_queue_lock();
+    beer_vulkan_queue_lock_present();
+    beer_vulkan_queue_trace_enter(g_vk.queue, "presenter direct present");
     result = getenv("BEER_PRESENT_SKIP_FLIP") ? VK_SUCCESS :
              g_vk.QueuePresentKHR(g_vk.queue, &present);
-    beer_vulkan_queue_unlock();
+    beer_vulkan_queue_trace_leave(g_vk.queue);
+    beer_vulkan_queue_unlock_present();
     record_direct_present(sequence, "presented", source_image, source_layout,
                           width, height, output_width, output_height,
                           (int)image_index, result);

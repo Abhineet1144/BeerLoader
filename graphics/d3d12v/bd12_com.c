@@ -8,6 +8,7 @@
 int beer_fake_caps_state;
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <signal.h>
 #include "bd12_formats.h"
 #include "d3d12_dxil_translator.h"
 #include "bd12_cuda.h"
@@ -482,8 +483,7 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
     {
         const uint64_t t_lock = bd12_prof_now();
         pthread_mutex_lock(&dev->submit_lock);
-        g_bd12_prof_ns[BD12_PROF_SUBMIT_LOCK] += bd12_prof_now() - t_lock;
-        ++g_bd12_prof_calls[BD12_PROF_SUBMIT_LOCK];
+        BD12_PROF_ADD(BD12_PROF_SUBMIT_LOCK, t_lock);
     }
     total_signals = 0;
     for (uint32_t i = 0; i < signal_count; ++i)
@@ -502,8 +502,9 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
         all_waits[total_waits++] = (BD12FenceOp){ l->retire, l->submitted };
     /* Sparse binds are not ordered with command buffers by submission order: wait for the lane's last one. */
     if (l->sparse_wait) {
-        all_waits[total_waits++] = (BD12FenceOp){ l->retire, l->sparse_wait };
+        all_waits[total_waits++] = (BD12FenceOp){ l->sparse_fence ? l->sparse_fence : l->retire, l->sparse_wait };
         l->sparse_wait = 0;
+        l->sparse_fence = NULL;
     }
     all_signals[total_signals++] = (BD12FenceOp){ l->retire, serial };
     for (uint32_t i = 0; i < total_waits; ++i) __atomic_store_n(&all_waits[i].fence->last_use, serial, __ATOMIC_RELEASE);
@@ -513,9 +514,10 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
     VkResult result = bd12_queue_submit(l->queue, lists, count, all_waits,
                                         total_waits, all_signals,
                                         total_signals);
-    g_bd12_prof_ns[BD12_PROF_VK_SUBMIT] += bd12_prof_now() - t_vk;
-    ++g_bd12_prof_calls[BD12_PROF_VK_SUBMIT];
+    BD12_PROF_ADD(BD12_PROF_VK_SUBMIT, t_vk);
     if (result == VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; ++i)
+            if (lists[i]) { lists[i]->inflight_fence = l->retire; lists[i]->inflight_serial = serial; }
         __atomic_store_n(&l->submitted, serial, __ATOMIC_RELEASE);   /* before the serial: see com_completed */
         __atomic_store_n(&dev->serial, serial, __ATOMIC_RELEASE);
     }
@@ -528,8 +530,7 @@ VkResult com_submit(ComDevice *dev, uint32_t lane, BD12CmdList *const *lists, ui
     {
         const uint64_t t_reap = bd12_prof_now();
         com_reap(dev);
-        g_bd12_prof_ns[BD12_PROF_REAP] += bd12_prof_now() - t_reap;
-        ++g_bd12_prof_calls[BD12_PROF_REAP];
+        BD12_PROF_ADD(BD12_PROF_REAP, t_reap);
     }
     BD12_PROF_END(BD12_PROF_SUBMIT);
     return result;
@@ -542,31 +543,46 @@ static VkResult com_bind_sparse(ComDevice *dev, uint32_t lane, VkImage image, co
                                 VkBuffer buffer, const VkSparseMemoryBind *buffer_binds, uint32_t count)
 {
     if (lane >= dev->lane_count) lane = 0;
+    /* BEER_BD12_SPARSE_LANE=<n> (diagnostic, multi-queue): run the bind on lane n instead. It then also waits for the
+     * owning lane's previous submission, and the owning lane's next submission waits for the bind. */
+    static int sparse_lane = -2;
+    if (sparse_lane == -2) { const char *v = getenv("BEER_BD12_SPARSE_LANE"); sparse_lane = v && *v ? atoi(v) : -1; }
+    const uint32_t owner = lane;
+    if (sparse_lane >= 0 && (uint32_t)sparse_lane < dev->lane_count) lane = (uint32_t)sparse_lane;
     ComLane *const l = &dev->lanes[lane];
+    ComLane *const o = &dev->lanes[owner];
     BD12Device *bd = dev->bd;
     pthread_mutex_lock(&dev->submit_lock);
     const uint64_t serial = dev->serial + 1;
-    const uint64_t wait_value = l->submitted;
+    uint64_t wait_values[2];
+    VkSemaphore wait_sems[2];
+    uint32_t wait_n = 0;
+    if (l->submitted) { wait_sems[wait_n] = l->retire->semaphore; wait_values[wait_n++] = l->submitted; }
+    if (o != l && o->submitted) { wait_sems[wait_n] = o->retire->semaphore; wait_values[wait_n++] = o->submitted; }
     const VkTimelineSemaphoreSubmitInfo timeline = {
         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-        .waitSemaphoreValueCount = wait_value ? 1u : 0u, .pWaitSemaphoreValues = &wait_value,
+        .waitSemaphoreValueCount = wait_n, .pWaitSemaphoreValues = wait_values,
         .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &serial
     };
     const VkSparseImageMemoryBindInfo image_binds = { .image = image, .bindCount = count, .pBinds = binds };
     const VkSparseBufferMemoryBindInfo buffer_bind_info = { .buffer = buffer, .bindCount = count, .pBinds = buffer_binds };
     const VkBindSparseInfo info = {
         .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, .pNext = &timeline,
-        .waitSemaphoreCount = wait_value ? 1u : 0u, .pWaitSemaphores = &l->retire->semaphore,
+        .waitSemaphoreCount = wait_n, .pWaitSemaphores = wait_sems,
         .bufferBindCount = buffer ? 1u : 0u, .pBufferBinds = &buffer_bind_info,
         .imageBindCount = image ? 1u : 0u, .pImageBinds = &image_binds,
         .signalSemaphoreCount = 1, .pSignalSemaphores = &l->retire->semaphore
     };
     __atomic_store_n(&l->retire->last_use, serial, __ATOMIC_RELEASE);
     beer_vulkan_queue_lock_at(l->queue->index);
+    beer_vulkan_queue_trace_enter(l->queue->queue, "bd12 sparse bind");
     const VkResult result = bd->vk.QueueBindSparse(l->queue->queue, 1, &info, VK_NULL_HANDLE);
+    beer_vulkan_queue_trace_leave(l->queue->queue);
     beer_vulkan_queue_unlock_at(l->queue->index);
     if (result == VK_SUCCESS) {
         l->sparse_wait = serial;
+        l->sparse_fence = NULL;
+        if (o != l) { o->sparse_wait = serial; o->sparse_fence = l->retire; }
         __atomic_store_n(&l->submitted, serial, __ATOMIC_RELEASE);
         __atomic_store_n(&dev->serial, serial, __ATOMIC_RELEASE);
     } else {
@@ -639,8 +655,10 @@ static void fence_latency_report(const ComWaiter *w)
     if (f->sig_value[i] == w->value) {
         const int64_t late = (int64_t)(f->sig_ns[i] - w->start_ns);
         fprintf(stderr, "[FENCE LATENCY] %.6f s: waited %.1f ms for value %llu: Signal submitted %+.1f ms after the wait "
-                "began, GPU finished %.1f ms after that\n", now / 1e9, waited / 1e6, (unsigned long long)w->value,
-                late / 1e6, (now - f->sig_ns[i]) / 1e6);
+                "began, GPU finished %.1f ms after that (game called Signal %+.1f ms after the wait began, held %.1f ms) "
+                "event=0x%llx\n", now / 1e9, waited / 1e6, (unsigned long long)w->value,
+                late / 1e6, (now - f->sig_ns[i]) / 1e6, ((int64_t)(f->sig_call_ns[i] - w->start_ns)) / 1e6,
+                (f->sig_ns[i] - f->sig_call_ns[i]) / 1e6, (unsigned long long)w->event);
     } else {
         fprintf(stderr, "[FENCE LATENCY] %.6f s: waited %.1f ms for value %llu (not a queue Signal / not recorded)\n",
                 now / 1e9, waited / 1e6, (unsigned long long)w->value);
@@ -883,6 +901,7 @@ static HR MS fence_signal(ComFence *f, uint64_t value)
     if (fence_diag())
         fprintf(stderr, "[FENCE] CPU Signal fence=%p value=%llu\n", (void *)f, (unsigned long long)value);
     f->last_signal = value;
+    if (fence_latency_ns()) { f->claim_value = value; f->claim_ns = mono_ns(); f->claim_by = -1; f->claim_tid = (long)syscall(SYS_gettid); }
     const int ok = bd12_fence_signal_cpu(f->fence, value);
     if (ok && f->obj.dev) queue_flush_deferred(f->obj.dev);   /* a held queue Wait may now be satisfiable */
     return ok ? HR_OK : HR_E_FAIL;
@@ -913,6 +932,8 @@ typedef struct QueueOp {
     ComFence *fence;              /* QUEUE_OP_SIGNAL / QUEUE_OP_WAIT (referenced while held) */
     uint64_t value;
     ComResource *texture;         /* QUEUE_OP_PRESENT (referenced while held) */
+    uint64_t call_ns;             /* BEER_FENCE_LATENCY: when the game called Signal */
+    long call_tid;                /* BEER_FENCE_LATENCY: host thread that called it */
 } QueueOp;
 enum { QUEUE_OP_EXECUTE, QUEUE_OP_SIGNAL, QUEUE_OP_WAIT, QUEUE_OP_PRESENT };
 
@@ -989,7 +1010,9 @@ static HR queue_run_op(ComQueue *q, QueueOp *op)
         if (fence_latency_ns()) {
             const uint32_t i = (uint32_t)(op->value & 15);
             op->fence->sig_ns[i] = mono_ns();
+            op->fence->sig_call_ns[i] = op->call_ns ? op->call_ns : op->fence->sig_ns[i];
             op->fence->sig_value[i] = op->value;
+            op->fence->claim_value = op->value; op->fence->claim_ns = op->fence->sig_ns[i]; op->fence->claim_by = (int)q->desc[0]; op->fence->claim_tid = op->call_tid;
         }
         BD12FenceOp signal = { op->fence->fence, op->value };
         return com_submit(dev, q->lane, NULL, 0, NULL, 0, &signal, 1) == VK_SUCCESS ? HR_OK : HR_E_FAIL;
@@ -1016,6 +1039,17 @@ static void queue_flush_deferred_locked(ComDevice *dev)
             while (ran < q->held_count) {
                 QueueOp *op = &q->held[ran];
                 if (op->kind == QUEUE_OP_WAIT && !queue_wait_ready(op)) break;
+                if (op->kind == QUEUE_OP_WAIT && op->call_ns) {   /* BEER_FENCE_LATENCY: a Wait that held its queue */
+                    const uint64_t now = mono_ns();
+                    const ComFence *f = op->fence;
+                    if (now - op->call_ns >= fence_latency_ns())
+                        fprintf(stderr, "[FENCE HOLD] %.6f s: queue type %u held %.1f ms (%u ops) by Wait value %llu; "
+                                "fence's last Signal value %llu by %s %d (tid %ld), %.1f ms after the Wait, released %.1f ms after it\n",
+                                now / 1e9, q->desc[0], (now - op->call_ns) / 1e6, q->held_count,
+                                (unsigned long long)op->value, (unsigned long long)f->claim_value,
+                                f->claim_by < 0 ? "CPU" : "queue type", f->claim_by, f->claim_tid,
+                                ((int64_t)(f->claim_ns - op->call_ns)) / 1e6, ((int64_t)(now - f->claim_ns)) / 1e6);
+                }
                 queue_run_op(q, op);
                 queue_release_op(op);
                 ++ran;
@@ -1090,8 +1124,7 @@ static void MS queue_execute(ComQueue *q, uint32_t count, ComObj *const *lists)
     for (uint32_t i = 0; op.lists && i < count; ++i) {
         const uint64_t t_finish = bd12_prof_now();
         BD12CmdList *recorded = lists[i] ? com_list_finish(lists[i]) : NULL;
-        g_bd12_prof_ns[BD12_PROF_LIST_FINISH] += bd12_prof_now() - t_finish;
-        ++g_bd12_prof_calls[BD12_PROF_LIST_FINISH];
+        BD12_PROF_ADD(BD12_PROF_LIST_FINISH, t_finish);
         if (recorded) { bd12_rp_trace_submit(recorded); op.lists[op.count++] = recorded; }
     }
     if (bd12_trace_active()) {   /* submission order of the traced frame (recording order is in the dispatch lines) */
@@ -1121,7 +1154,8 @@ static HR MS queue_signal(ComQueue *q, ComFence *f, uint64_t value)
                 (unsigned long long)value);
     com_add_ref(&f->obj);
     f->last_signal = value;
-    QueueOp op = { .kind = QUEUE_OP_SIGNAL, .fence = f, .value = value };
+    QueueOp op = { .kind = QUEUE_OP_SIGNAL, .fence = f, .value = value, .call_ns = fence_latency_ns() ? mono_ns() : 0,
+                   .call_tid = fence_latency_ns() ? (long)syscall(SYS_gettid) : 0 };
     return queue_push(q, &op);
 }
 static HR MS queue_wait(ComQueue *q, ComFence *f, uint64_t value)
@@ -1134,7 +1168,7 @@ static HR MS queue_wait(ComQueue *q, ComFence *f, uint64_t value)
                 (void *)f, (unsigned long long)value,
                 (unsigned long long)__atomic_load_n(&f->fence->signaled, __ATOMIC_ACQUIRE));
     com_add_ref(&f->obj);
-    QueueOp op = { .kind = QUEUE_OP_WAIT, .fence = f, .value = value };
+    QueueOp op = { .kind = QUEUE_OP_WAIT, .fence = f, .value = value, .call_ns = fence_latency_ns() ? mono_ns() : 0 };
     return queue_push(q, &op);
 }
 static HR MS queue_frequency(ComQueue *q, uint64_t *freq)
@@ -2202,6 +2236,14 @@ static HR MS dev_create_queue(ComDevice *self, const uint32_t *desc,
     if (type == 2 && self->lane_count > 1) q->lane = 1;
     else if (type == 3 && self->lane_count > 2) q->lane = 2;
     else if (type == 3 && self->lane_count > 1) q->lane = 1;
+    {   /* BEER_BD12_MQ_LANES=<compute>,<copy>: which Vulkan queue each type uses (diagnostic, multi-queue only) */
+        const char *v = getenv("BEER_BD12_MQ_LANES");
+        unsigned c = 0, p = 0;
+        if (v && sscanf(v, "%u,%u", &c, &p) == 2) {
+            if (type == 2) q->lane = c < self->lane_count ? c : 0;
+            else if (type == 3) q->lane = p < self->lane_count ? p : 0;
+        }
+    }
     fprintf(stderr, "[BD12] CreateCommandQueue type=%u priority=%u flags=0x%x -> Vulkan queue %u\n", type,
             desc ? desc[1] : 0, desc ? desc[2] : 0, q->lane);
     *out = q;
@@ -4461,6 +4503,34 @@ uint64_t bd12_com_create_swapchain(void *queue_object, const uint8_t *desc, void
     return HR_OK;
 }
 
+/* GPU watchdog (default on; BEER_GPU_WATCHDOG=0 off, =<seconds> threshold, default 5): once a second, a lane with
+ * unfinished work whose completed serial has not moved for the threshold is a GPU hang (or device loss). The first
+ * time, the full hang dump is requested (SIGUSR1: every thread's guest stack and wait, the BD12 queues and lanes,
+ * GPU checkpoints with BEER_VK_CHECKPOINTS=1), so a random in-game hang leaves its evidence in the normal log. */
+static void *gpu_watchdog_main(void *arg)
+{
+    ComDevice *dev = arg;
+    const char *v = getenv("BEER_GPU_WATCHDOG");
+    const unsigned threshold = v && atoi(v) > 1 ? (unsigned)atoi(v) : 5;
+    uint64_t last_done[COM_MAX_LANES] = { 0 };
+    unsigned still[COM_MAX_LANES] = { 0 };
+    int reported = 0;
+    for (;;) {
+        sleep(1);
+        for (uint32_t l = 0; l < dev->lane_count; ++l) {
+            const uint64_t submitted = __atomic_load_n(&dev->lanes[l].submitted, __ATOMIC_ACQUIRE);
+            const uint64_t done = dev->lanes[l].retire ? bd12_fence_completed(dev->lanes[l].retire) : submitted;
+            if (done >= submitted || done != last_done[l]) { still[l] = 0; last_done[l] = done; continue; }
+            if (++still[l] < threshold || reported) continue;
+            reported = 1;
+            fprintf(stderr, "[GPU WATCHDOG] lane %u has made no progress for %u s (completed %llu, submitted %llu): GPU hang "
+                    "or device lost; dumping state\n", l, still[l], (unsigned long long)done, (unsigned long long)submitted);
+            kill(getpid(), SIGUSR1);
+        }
+    }
+    return NULL;
+}
+
 uint64_t MS beer_bd12_create_device(const uint8_t *riid, void **out)
 {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -4493,9 +4563,18 @@ uint64_t MS beer_bd12_create_device(const uint8_t *riid, void **out)
                 dev = NULL;
             } else {
                 pthread_mutex_init(&dev->submit_lock, NULL);
+                {
+                    const char *wd = getenv("BEER_GPU_WATCHDOG");
+                    pthread_t watchdog;
+                    if (!(wd && !strcmp(wd, "0")) && pthread_create(&watchdog, NULL, gpu_watchdog_main, dev) == 0)
+                        pthread_detach(watchdog);
+                }
                 pthread_mutex_init(&dev->defer_lock, NULL);
                 pthread_mutex_init(&dev->grave_lock, NULL);
                 pthread_mutex_init(&dev->wait_lock, NULL);
+                if (getenv("BEER_BD12_HITCH_SYSCALL"))
+                    fprintf(stderr, "[LOCKS] com device: submit=%p defer=%p grave=%p wait=%p\n", (void *)&dev->submit_lock,
+                            (void *)&dev->defer_lock, (void *)&dev->grave_lock, (void *)&dev->wait_lock);
                 pthread_cond_init(&dev->wait_cond, NULL);
                 com_obj_init(&dev->obj, COM_DEVICE, device_vtable, dev, NULL);
                 g_com_device = dev;
@@ -4524,6 +4603,49 @@ void bd12_com_debug_dump(void)
         fprintf(stderr, "[STACKS] bd12 lane %u submitted=%llu retired=%llu\n", l,
                 (unsigned long long)__atomic_load_n(&dev->lanes[l].submitted, __ATOMIC_ACQUIRE),
                 (unsigned long long)(dev->lanes[l].retire ? bd12_fence_completed(dev->lanes[l].retire) : 0));
+    /* BEER_BD12_FLIGHT_RECORDER: live timeline values of the fences in the recorded submissions (a GPU signal that does
+     * not raise its timeline is invalid and can stall the queue). */
+    for (uint32_t k = 0; k < COM_FLIGHT_SUBMISSIONS; ++k) {
+        const ComFlightSubmission *sub = &dev->flight[k];
+        if (!sub->serial) continue;
+        for (uint32_t w = 0; w < sub->wait_count + sub->signal_count; ++w) {
+            const BD12FenceOp *op = w < sub->wait_count ? &sub->waits[w] : &sub->signals[w - sub->wait_count];
+            if (!op->fence) continue;
+            fprintf(stderr, "[STACKS] bd12 flight submit=%llu %s fence=%p value=%llu: timeline=%llu claimed=%llu\n",
+                    (unsigned long long)sub->serial, w < sub->wait_count ? "wait" : "signal", (void *)op->fence,
+                    (unsigned long long)op->value, (unsigned long long)bd12_fence_completed(op->fence),
+                    (unsigned long long)__atomic_load_n(&op->fence->signaled, __ATOMIC_ACQUIRE));
+        }
+    }
+    /* BEER_BD12_HANG_KICK=1 (diagnostic): an empty submission to every lane that has unfinished work, then the retire
+     * values again. A stuck submission that completes after the kick was never started by the driver. */
+    if (getenv("BEER_BD12_HANG_KICK") && dev->bd) {
+        int kicked = 0;
+        for (uint32_t l = 0; l < dev->lane_count; ++l) {
+            ComLane *ln = &dev->lanes[l];
+            if (!ln->retire || bd12_fence_completed(ln->retire) >= __atomic_load_n(&ln->submitted, __ATOMIC_ACQUIRE)) continue;
+            VkSubmitInfo2 empty = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            beer_vulkan_queue_lock_at(ln->queue->index);
+            const VkResult r = dev->bd->vk.QueueSubmit2(ln->queue->queue, 1, &empty, VK_NULL_HANDLE);
+            beer_vulkan_queue_unlock_at(ln->queue->index);
+            fprintf(stderr, "[STACKS] bd12 kick lane %u: empty submit -> %d\n", l, (int)r);
+            kicked = 1;
+        }
+        if (kicked) {
+            usleep(200000);
+            for (uint32_t l = 0; l < dev->lane_count; ++l)
+                fprintf(stderr, "[STACKS] bd12 after kick lane %u submitted=%llu retired=%llu\n", l,
+                        (unsigned long long)__atomic_load_n(&dev->lanes[l].submitted, __ATOMIC_ACQUIRE),
+                        (unsigned long long)(dev->lanes[l].retire ? bd12_fence_completed(dev->lanes[l].retire) : 0));
+        }
+    }
+    if (dev->bd && dev->bd->zero_sem) {   /* non-main lanes wait for this (bd12_queue_submit); not in the flight log */
+        uint64_t zero_done = 0;
+        dev->bd->vk.GetSemaphoreCounterValue(dev->bd->device, dev->bd->zero_sem, &zero_done);
+        fprintf(stderr, "[STACKS] bd12 heap zero fill: recorded=%llu submitted=%llu completed=%llu\n",
+                (unsigned long long)dev->bd->zero_recorded, (unsigned long long)dev->bd->zero_submitted,
+                (unsigned long long)zero_done);
+    }
     if (pthread_mutex_trylock(&dev->defer_lock) != 0) {
         fprintf(stderr, "[STACKS] bd12 queues: defer_lock busy\n");
         return;

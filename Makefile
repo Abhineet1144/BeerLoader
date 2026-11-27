@@ -39,7 +39,7 @@ GRAPHICS_SRCS = graphics/d3d11/d3d11_impl.c \
                 graphics/d3d12v/bd12_raytracing.c graphics/d3d12v/bd12_mirror.c graphics/d3d12v/bd12_rtpipe.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_gpuprof.c graphics/d3d12v/bd12_live.c \
                 graphics/d3d12v/bd12_capture.c graphics/d3d12v/bd12_cbtweak.c graphics/d3d12v/bd12_feedback.c \
                 graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c \
-                graphics/d3d11v/bd11_swap.c
+				graphics/d3d11v/bd11_swap.c graphics/d3d11v/bd11_context_state.c
 SRCS = loader.c $(AUDIO_SRCS) $(MEDIA_SRCS) $(PLATFORM_SRCS) $(VULKAN_SRCS) $(GRAPHICS_SRCS) steam/pb.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
@@ -235,6 +235,62 @@ test-native-loader: $(filter-out loader.o,$(OBJS))
 	rm -f /tmp/beer-win32-native-heap-test /tmp/beer-win32-static-tls-test
 
 .PHONY: test-native-loader
+
+test-d3d11-multithread:
+	$(CC) $(D3D12_ABI_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections -Igraphics/d3d11v -idirafter $(VULKAN_HEADERS) \
+		graphics/d3d11v/bd11_multithread_test.c graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c graphics/d3d11v/bd11_swap.c graphics/d3d11v/bd11_context_state.c \
+		$(D3D12V_SRCS) graphics/d3d12v/bd12_formats.c graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c \
+		graphics/d3d12v/bd12_live.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_gpuprof.c graphics/d3d12v/bd12_cbtweak.c graphics/d3d12v/bd12_com.c \
+		graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_dxil_translator.c renderer/vulkan/vulkan_context.c platform/beer_env.c \
+		-Wl,--wrap=pthread_mutexattr_init,--wrap=pthread_mutexattr_settype,--wrap=pthread_mutexattr_destroy,--wrap=pthread_mutex_init,--wrap=calloc \
+		$(LDFLAGS) -o /tmp/beer-bd11-multithread-test
+	/tmp/beer-bd11-multithread-test
+
+.PHONY: test-d3d11-multithread
+
+test-d3d11-context-state:
+	$(CC) $(D3D12_ABI_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections -Igraphics/d3d11v -idirafter $(VULKAN_HEADERS) \
+		graphics/d3d11v/bd11_context_state_test.c graphics/d3d11v/bd11_context_state.c graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c graphics/d3d11v/bd11_swap.c \
+		$(D3D12V_SRCS) graphics/d3d12v/bd12_formats.c graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c \
+		graphics/d3d12v/bd12_live.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_gpuprof.c graphics/d3d12v/bd12_cbtweak.c graphics/d3d12v/bd12_com.c \
+		graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_dxil_translator.c renderer/vulkan/vulkan_context.c platform/beer_env.c \
+		-Wl,--wrap=calloc,--wrap=b11_retain $(LDFLAGS) -o /tmp/beer-bd11-context-state-test
+	/tmp/beer-bd11-context-state-test
+
+.PHONY: test-d3d11-context-state
+
+BD11_EXT_TEST_EXTRA_CFLAGS ?=
+test-d3d11-extended-objects:
+	$(CC) $(D3D12_ABI_CFLAGS) $(BD11_EXT_TEST_EXTRA_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections -Igraphics/d3d11v -idirafter $(VULKAN_HEADERS) \
+		graphics/d3d11v/bd11_extended_objects_test.c graphics/d3d11v/bd11_context_state.c graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c graphics/d3d11v/bd11_swap.c \
+		$(D3D12V_SRCS) graphics/d3d12v/bd12_formats.c graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c \
+		graphics/d3d12v/bd12_live.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_gpuprof.c graphics/d3d12v/bd12_cbtweak.c graphics/d3d12v/bd12_com.c \
+		graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_dxil_translator.c renderer/vulkan/vulkan_context.c platform/beer_env.c \
+		-Wl,--wrap=calloc,--wrap=bd12_descriptor_heap_create,--wrap=bd12_descriptor_heap_destroy,--wrap=bd12_image_create_committed,--wrap=bd12_image_destroy,--wrap=bd12_fence_completed \
+		-Wl,--wrap=bd12_descriptor_write_image_srv_mapped,--wrap=bd12_descriptor_write_image_srv_aspect,--wrap=bd12_buffer_create_committed,--wrap=bd12_buffer_destroy,--wrap=bd12_descriptor_write_buffer_srv \
+		$(LDFLAGS) -o /tmp/beer-bd11-extended-objects-test
+	/tmp/beer-bd11-extended-objects-test
+
+.PHONY: test-d3d11-extended-objects
+
+BD11_PRIVATE_TEST_EXTRA_CFLAGS ?=
+test-d3d11-private-data:
+	$(CC) $(D3D12_ABI_CFLAGS) $(BD11_PRIVATE_TEST_EXTRA_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections -Igraphics/d3d11v -idirafter $(VULKAN_HEADERS) \
+		graphics/d3d11v/bd11_private_data_test.c graphics/d3d11v/bd11_context_state.c graphics/d3d11v/bd11_obj.c graphics/d3d11v/bd11_dev.c graphics/d3d11v/bd11_ctx.c graphics/d3d11v/bd11_swap.c \
+		$(D3D12V_SRCS) graphics/d3d12v/bd12_formats.c graphics/d3d12v/bd12_pso.c graphics/d3d12v/bd12_translate.c \
+		graphics/d3d12v/bd12_live.c graphics/d3d12v/bd12_ckpt.c graphics/d3d12v/bd12_gpuprof.c graphics/d3d12v/bd12_cbtweak.c graphics/d3d12v/bd12_com.c \
+		graphics/d3d12/d3d12_shader_translator.c graphics/d3d12/d3d12_dxil_translator.c renderer/vulkan/vulkan_context.c platform/beer_env.c \
+		-Wl,--wrap=malloc $(LDFLAGS) -o /tmp/beer-bd11-private-data-test
+	/tmp/beer-bd11-private-data-test
+
+.PHONY: test-d3d11-private-data
+
+test-d3d11-creation: $(filter-out loader.o,$(OBJS))
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections -idirafter $(VULKAN_HEADERS) tests/native_d3d11_creation_test.c $(filter-out loader.o,$(OBJS)) $(LDFLAGS) \
+		-Wl,--wrap=b11_device_create_for_loader_config,--wrap=b11_swapchain_create_for_loader,--wrap=bd12_device_create -o /tmp/beer-native-d3d11-creation-test
+	/tmp/beer-native-d3d11-creation-test
+
+.PHONY: test-d3d11-creation
 
 test-native-sync: $(filter-out loader.o,$(OBJS))
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections tests/native_sync_contract_test.c $(filter-out loader.o,$(OBJS)) $(LDFLAGS) -o /tmp/beer-native-sync-contract-test

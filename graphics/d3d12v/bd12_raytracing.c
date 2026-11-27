@@ -295,6 +295,14 @@ void bd12_cmd_build_as(BD12CmdList *list, const void *desc)
     BD12AccelStruct *dst = get_accel(device, d->dest, type, update ? 0 : sizes[0]);
     BD12AccelStruct *src = update ? get_accel(device, d->source, type, 0) : NULL;
     if (!dst) dst = get_accel(device, d->dest, type, sizes[0]);
+    /* BEER_BD12_AS_FREEZE=1 (diagnostic only, renders animated geometry wrong): every BLAS is built once and then
+     * never rebuilt or refitted. Measures the most that faster BLAS work could gain. */
+    static int freeze = -1;
+    if (freeze < 0) freeze = getenv("BEER_BD12_AS_FREEZE") != NULL;
+    if (freeze && dst && in->type != RT_TLAS) {
+        if (dst->built) return;
+        dst->built = 1;
+    }
     if (getenv("BEER_DXR_PROBE")) {
         static unsigned blas, tlas;
         unsigned *counter = in->type == RT_TLAS ? &tlas : &blas;

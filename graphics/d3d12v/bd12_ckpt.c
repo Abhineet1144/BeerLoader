@@ -75,6 +75,21 @@ void bd12_ckpt_dump(void)
     if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) return;
     VkCheckpointDataNV data[16];
     uint32_t count = 16;
+    /* Multi-queue (BEER_BD12_MULTI_QUEUE): the other queues' last checkpoints, one line each. */
+    for (uint32_t q = 1; q < beer_vulkan_queue_count(); ++q) {
+        count = 16;
+        for (uint32_t i = 0; i < 16; ++i) data[i] = (VkCheckpointDataNV){ .sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV };
+        g_get(beer_vulkan_queue_at(q), &count, data);
+        for (uint32_t i = 0; i < count && i < 16; ++i) {
+            const uint64_t seq = (uint64_t)(uintptr_t)data[i].pCheckpointMarker;
+            const Entry *e = &g_ring[seq % RING];
+            fprintf(stderr, "[CKPT] queue %u stage=0x%x seq=%llu %s", q, (unsigned)data[i].stage, (unsigned long long)seq,
+                    e->seq == seq ? "" : "(overwritten) ");
+            if (e->seq == seq) print_entry(e);
+            fprintf(stderr, "\n");
+        }
+    }
+    count = 16;
     for (uint32_t i = 0; i < 16; ++i) data[i] = (VkCheckpointDataNV){ .sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV };
     g_get(g_device->queue, &count, data);
     fprintf(stderr, "[CKPT] %u checkpoint record(s); last recorded sequence %llu\n", count, (unsigned long long)g_seq);

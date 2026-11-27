@@ -2,6 +2,7 @@
 /* BD11 part 2: device creation, command-list rotation and submission. */
 
 #include "bd11.h"
+#include "bd11_device_cache.h"
 #include <time.h>
 
 #include <stdio.h>
@@ -13,40 +14,64 @@ static void device_destroy(B11Obj *o)
     (void)o;   /* the device lives for the whole process */
 }
 
-B11Device *b11_device_create(void)
+B11Device *b11_device_create_configured(uint32_t flags, uint32_t level)
 {
+    if (b11_device_validate_creation_flags(flags) != B11_S_OK) return NULL;
     b11_init_vtables();
     B11Device *dev = calloc(1, sizeof(*dev));
     if (!dev) return NULL;
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr)) { free(dev); return NULL; }
+    int err = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    if (!err) err = pthread_mutex_init(&dev->lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+    if (err) { free(dev); return NULL; }
+    if (pthread_mutex_init(&dev->grave_lock, NULL)) {
+        pthread_mutex_destroy(&dev->lock);
+        free(dev);
+        return NULL;
+    }
     dev->bd = bd12_device_create();
-    if (!dev->bd) { free(dev); return NULL; }
+    if (!dev->bd) goto fail;
     dev->queue = bd12_queue_create(dev->bd);
     dev->retire = bd12_fence_create(dev->bd, 0);
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&dev->lock, &attr);
-    pthread_mutex_init(&dev->grave_lock, NULL);
     for (int i = 0; i < B11_ALLOCATORS; ++i) {
         dev->allocators[i] = bd12_cmd_allocator_create(dev->bd);
         if (dev->allocators[i]) dev->lists[i] = bd12_cmd_list_create(dev->allocators[i]);
+        if (!dev->allocators[i] || !dev->lists[i]) goto fail;
     }
     if (!dev->queue || !dev->retire || !dev->allocators[0] || !dev->lists[0]) {
         fprintf(stderr, "[BD11] device creation failed\n");
-        free(dev);
-        return NULL;
+        goto fail;
     }
     dev->obj.vtable = g_b11_device_vtable;
     atomic_init(&dev->obj.refs, 1);
     dev->obj.kind = B11_DEVICE;
     dev->obj.dev = dev;
     dev->obj.destroy = device_destroy;
-    dev->feature_level = 0xb000;
+    b11_multithread_init(&dev->multithread, &dev->obj);
+    dev->feature_level = level;
+    dev->flags = flags;
     dev->null_buffer = bd12_buffer_create_committed(dev->bd, BD12_HEAP_UPLOAD, 65536);
     if (dev->null_buffer && dev->null_buffer->cpu) memset(dev->null_buffer->cpu, 0, 65536);
     dev->immediate = b11_context_create(dev, 0, 0);
+    if (!dev->immediate) goto fail;
     fprintf(stderr, "[BD11] device ready (%s)\n", dev->bd->device_name);
     return dev;
+fail:
+    /* Nothing has been submitted and no context/tear-off was published. */
+    if (dev->null_buffer) bd12_buffer_destroy(dev->null_buffer);
+    for (int i = 0; i < B11_ALLOCATORS; ++i) {
+        if (dev->lists[i]) bd12_cmd_list_destroy(dev->lists[i], dev->allocators[i]);
+        if (dev->allocators[i]) bd12_cmd_allocator_destroy(dev->allocators[i]);
+    }
+    if (dev->retire) bd12_fence_destroy(dev->retire);
+    if (dev->queue) bd12_queue_destroy(dev->queue);
+    if (dev->bd) bd12_device_destroy(dev->bd);
+    pthread_mutex_destroy(&dev->grave_lock);
+    pthread_mutex_destroy(&dev->lock);
+    free(dev);
+    return NULL;
 }
 
 uint64_t g_b11_wait_ns;              /* time spent blocked on the GPU, reported by BEER_BD11_FPS */
@@ -116,24 +141,23 @@ void b11_flush(B11Device *dev, int wait)
     b11_reap(dev);
 }
 
-/* Entry used by the loader's D3D11CreateDevice: one process-wide device and immediate context. */
-B11HR b11_device_create_for_loader(void **device, void **context)
+/* Uncached convenience constructor retains the original default configuration. */
+B11Device *b11_device_create(void)
 {
-    static B11Device *dev;
-    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_lock(&lock);
-    if (!dev) dev = b11_device_create();
-    pthread_mutex_unlock(&lock);
-    if (!dev || !dev->immediate) return B11_E_FAIL;
-    if (device) { b11_add_ref(&dev->obj); *device = dev; }
-    if (context) { b11_add_ref(&dev->immediate->obj); *context = dev->immediate; }
-    return B11_S_OK;
+    return b11_device_create_configured(0, 0xb000);
 }
 
-/* The feature level D3D11CreateDevice granted (reported again by ID3D11Device::GetFeatureLevel). */
-void b11_device_set_feature_level(void *device, uint32_t level)
+B11HR b11_device_create_for_loader_config(uint32_t flags, uint32_t level,
+                                         void **device, void **context)
 {
-    if (device && level) ((B11Device *)device)->feature_level = level;
+    static B11DeviceCache cache = B11_DEVICE_CACHE_INIT;
+    return b11_device_cache_get(&cache, flags, level, b11_device_create_configured,
+                                device, context);
+}
+
+B11HR b11_device_create_for_loader(void **device, void **context)
+{
+    return b11_device_create_for_loader_config(0, 0xb000, device, context);
 }
 
 /* Upload slices ------------------------------------------------------------------------------- */

@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+
+static void *vt_raster1[9], *vt_srv1[10];
 
 int g_b11_trace;
 long g_b11_trace_frame = -1;
@@ -19,6 +22,9 @@ typedef struct { uint8_t b[16]; } Guid;
         (b) & 0xff, ((b) >> 8) & 0xff, (c) & 0xff, ((c) >> 8) & 0xff, \
         d0, d1, d2, d3, d4, d5, d6, d7 } }
 static const Guid k_unknown = GUID(0u, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46);
+static const Guid k_multithread = GUID(0x9b7e4e00u, 0x342c, 0x4106, 0xa1, 0x9f, 0x4f, 0x27, 0x04, 0xf6, 0x89, 0xf0);
+static const Guid k_raster1 = GUID(0x1217d7a6u, 0x5039, 0x418c, 0xb0, 0x42, 0x9c, 0xbe, 0x25, 0x6a, 0xfd, 0x6e);
+static const Guid k_srv1 = GUID(0x91308b87u, 0x9040, 0x411d, 0x8c, 0x67, 0xc3, 0x92, 0x53, 0xce, 0x38, 0x02);
 
 /* Every D3D11 interface BD11 objects answer to (IID -> allowed kinds, kind = ~0 for any). The
  * lookup is deliberately lenient: asking a texture for ID3D11Resource or ID3D11Texture2D works,
@@ -74,7 +80,24 @@ B11HR b11_query_interface(B11Obj *obj, const uint8_t *riid, void **out)
     if (!out) return B11_E_INVALIDARG;
     *out = NULL;
     if (!riid || !obj) return B11_E_NOINTERFACE;
+    if (!memcmp(riid, k_multithread.b, 16)) {
+        B11Multithread *mt = NULL;
+        if (obj->kind == B11_CONTEXT && ((B11Context *)obj)->type == 0)
+            mt = &((B11Context *)obj)->multithread;
+        else if (obj->kind == B11_DEVICE && ((B11Device *)obj)->immediate)
+            mt = &((B11Device *)obj)->multithread;
+        if (!mt || !mt->vtable) return B11_E_NOINTERFACE;
+        b11_add_ref(obj);
+        *out = mt;
+        return B11_S_OK;
+    }
     int ok = memcmp(riid, k_unknown.b, 16) == 0;
+    /* Only these vtables have both the complete inherited contract and DESC1 storage.
+     * Base raster/SRV and the shared RTV/DSV/UAV vtable must not expose extensions. */
+    if (!memcmp(riid, k_raster1.b, 16))
+        ok = obj->kind == B11_RASTER && obj->vtable == vt_raster1;
+    if (!memcmp(riid, k_srv1.b, 16))
+        ok = obj->kind == B11_SRV && obj->vtable == vt_srv1;
     for (size_t i = 0; !ok && i < sizeof(g_iids) / sizeof(*g_iids); ++i)
         if (memcmp(riid, g_iids[i].guid.b, 16) == 0 && (g_iids[i].kinds & K(obj->kind)))
             ok = 1;
@@ -116,17 +139,189 @@ uint32_t B11_MS b11_add_ref(B11Obj *obj)
     return obj ? atomic_fetch_add(&obj->refs, 1) + 1 : 0;
 }
 
+/* Immutable entries own copied bytes or one real IUnknown reference. A pin
+ * delays that reference's Release while Get calls foreign AddRef unlocked.
+ * All list operations share this stable lock; NEVER call COM under it (or the
+ * context guard). Callers must hold an ordinary owner reference during calls. */
+typedef struct B11PrivateEntry {
+    struct B11PrivateEntry *next;
+    _Atomic uint32_t pins;
+    uint8_t guid[16];
+    uint32_t size;
+    int is_interface;
+    const void *iface;
+    uint8_t bytes[];
+} B11PrivateEntry;
+static pthread_mutex_t private_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void private_com_ref(const void *iface, unsigned slot)
+{
+    typedef uint32_t (B11_MS *RefFn)(const void *);
+    void *const *vt = *(void *const *const *)iface;
+    ((RefFn)vt[slot])(iface);
+}
+
+static void private_drop(B11PrivateEntry *entry)
+{
+    if (!entry || atomic_fetch_sub(&entry->pins, 1) != 1) return;
+    if (entry->is_interface && entry->iface) private_com_ref(entry->iface, 2);
+    free(entry);
+}
+
+static B11PrivateEntry **private_find(B11Obj *obj, const uint8_t *guid)
+{
+    B11PrivateEntry **p = &obj->private_data;
+    while (*p && memcmp((*p)->guid, guid, 16)) p = &(*p)->next;
+    return p;
+}
+
+static int private_live(B11Obj *obj)
+{
+    return !obj->private_dead && atomic_load(&obj->refs) != 0;
+}
+
+static void private_cleanup(B11Obj *obj)
+{
+    pthread_mutex_lock(&private_lock);
+    obj->private_dead = 1;
+    B11PrivateEntry *entry = obj->private_data;
+    obj->private_data = NULL;
+    pthread_mutex_unlock(&private_lock);
+    while (entry) {
+        B11PrivateEntry *next = entry->next;
+        private_drop(entry);
+        entry = next;
+    }
+}
+
+B11HR B11_MS b11_get_private_data(B11Obj *obj, const uint8_t *guid, uint32_t *size, void *data)
+{
+    if (!obj || !guid || !size) return B11_E_INVALIDARG;
+    pthread_mutex_lock(&private_lock);
+    if (!private_live(obj)) { pthread_mutex_unlock(&private_lock); return B11_E_INVALIDARG; }
+    B11PrivateEntry *entry = *private_find(obj, guid);
+    uint32_t capacity = *size;
+    *size = entry ? entry->size : 0;
+    B11HR hr = !entry ? B11_DXGI_ERROR_NOT_FOUND :
+        data && capacity < entry->size ? B11_DXGI_ERROR_MORE_DATA : B11_S_OK;
+    if (hr != B11_S_OK || !data) { pthread_mutex_unlock(&private_lock); return hr; }
+    if (!entry->is_interface) {
+        if (entry->size) memcpy(data, entry->bytes, entry->size);
+        pthread_mutex_unlock(&private_lock);
+        return B11_S_OK;
+    }
+    atomic_fetch_add(&entry->pins, 1);
+    pthread_mutex_unlock(&private_lock);
+    const void *iface = entry->iface;
+    if (iface) private_com_ref(iface, 1);
+    memcpy(data, &iface, sizeof(iface));
+    private_drop(entry);
+    return B11_S_OK;
+}
+
+static B11HR private_publish(B11Obj *obj, const uint8_t *guid, B11PrivateEntry *replacement)
+{
+    pthread_mutex_lock(&private_lock);
+    if (!private_live(obj)) {
+        pthread_mutex_unlock(&private_lock);
+        private_drop(replacement);
+        return B11_E_INVALIDARG;
+    }
+    B11PrivateEntry **p = private_find(obj, guid), *old = *p;
+    if (replacement) { replacement->next = old ? old->next : NULL; *p = replacement; }
+    else if (old) *p = old->next;
+    B11HR hr = replacement || old ? B11_S_OK : B11_S_FALSE;
+    pthread_mutex_unlock(&private_lock);
+    private_drop(old);
+    return hr;
+}
+
+static B11HR private_set(B11Obj *obj, const uint8_t *guid, uint32_t size,
+                         const void *data, int is_interface)
+{
+    if (!obj || !guid || (!is_interface && size && !data)) return B11_E_INVALIDARG;
+    /* Reject tombstoned owners before allocating or entering foreign code. */
+    pthread_mutex_lock(&private_lock);
+    int live = private_live(obj);
+    pthread_mutex_unlock(&private_lock);
+    if (!live) return B11_E_INVALIDARG;
+    if (!is_interface && !data) return private_publish(obj, guid, NULL);
+    size_t bytes = is_interface ? 0 : size;
+    if (bytes > SIZE_MAX - sizeof(B11PrivateEntry)) return B11_E_OUTOFMEMORY;
+    B11PrivateEntry *entry = malloc(sizeof(*entry) + bytes);
+    if (!entry) return B11_E_OUTOFMEMORY;
+    entry->next = NULL;
+    atomic_init(&entry->pins, 1);
+    memcpy(entry->guid, guid, 16);
+    entry->size = size;
+    entry->is_interface = is_interface;
+    entry->iface = is_interface ? data : NULL;
+    if (!is_interface && size) memcpy(entry->bytes, data, size);
+    if (is_interface && data) private_com_ref(data, 1);
+    return private_publish(obj, entry->guid, entry);
+}
+
+B11HR B11_MS b11_set_private_data(B11Obj *obj, const uint8_t *guid, uint32_t size, const void *data)
+{
+    return private_set(obj, guid, size, data, 0);
+}
+
+B11HR B11_MS b11_set_private_data_interface(B11Obj *obj, const uint8_t *guid, const void *iface)
+{
+    return private_set(obj, guid, sizeof(iface), iface, 1);
+}
+
 uint32_t B11_MS b11_release(B11Obj *obj)
 {
     if (!obj) return 0;
     uint32_t refs = atomic_fetch_sub(&obj->refs, 1) - 1;
-    if (!refs && obj->destroy) obj->destroy(obj);
+    if (!refs) {
+        private_cleanup(obj);
+        if (obj->destroy) obj->destroy(obj);
+    }
     return refs;
 }
 
 void b11_retain(B11Obj *obj)
 {
     if (obj) atomic_fetch_add(&obj->refs, 1);
+}
+
+/* ID3D11Multithread, seven Win64 slots. The existing backend mutex is recursive
+ * and also protects automatic context calls; no second lock/order inversion. */
+static B11Context *mt_context(B11Multithread *mt)
+{
+    return mt->owner->kind == B11_CONTEXT ? (B11Context *)mt->owner : mt->owner->dev->immediate;
+}
+static B11HR B11_MS mt_qi(B11Multithread *mt, const uint8_t *iid, void **out)
+{
+    /* Use the owner's actual QI, including device-specific DXGI forwarding. */
+    typedef B11HR (B11_MS *QIFn)(B11Obj *, const uint8_t *, void **);
+    return ((QIFn)mt->owner->vtable[0])(mt->owner, iid, out);
+}
+static uint32_t B11_MS mt_addref(B11Multithread *mt) { return b11_add_ref(mt->owner); }
+static uint32_t B11_MS mt_release(B11Multithread *mt) { return b11_release(mt->owner); }
+static void B11_MS mt_enter(B11Multithread *mt) { pthread_mutex_lock(&mt->owner->dev->lock); }
+static void B11_MS mt_leave(B11Multithread *mt) { pthread_mutex_unlock(&mt->owner->dev->lock); }
+static int32_t B11_MS mt_set(B11Multithread *mt, int32_t enable)
+{
+    pthread_mutex_lock(&mt->owner->dev->lock);
+    int32_t previous = atomic_exchange(&mt_context(mt)->multithread_protected, enable != 0);
+    pthread_mutex_unlock(&mt->owner->dev->lock);
+    return previous;
+}
+static int32_t B11_MS mt_get(B11Multithread *mt)
+{
+    return atomic_load(&mt_context(mt)->multithread_protected);
+}
+static void *mt_vtable[7] = {
+    (void *)mt_qi, (void *)mt_addref, (void *)mt_release,
+    (void *)mt_enter, (void *)mt_leave, (void *)mt_set, (void *)mt_get
+};
+void b11_multithread_init(B11Multithread *mt, B11Obj *owner)
+{
+    mt->owner = owner;
+    mt->vtable = mt_vtable;
 }
 
 /* Deferred destruction ------------------------------------------------------------------ */
@@ -175,17 +370,10 @@ static void B11_MS child_get_device(B11Obj *self, void **device)
     *device = self->dev;
     b11_add_ref(&self->dev->obj);
 }
-static B11HR B11_MS child_get_private(B11Obj *self, const uint8_t *guid, uint32_t *size, void *data)
-{ (void)self; (void)guid; (void)data; if (size) *size = 0; return B11_S_OK; }
-static B11HR B11_MS child_set_private(B11Obj *self, const uint8_t *guid, uint32_t size, const void *data)
-{ (void)self; (void)guid; (void)size; (void)data; return B11_S_OK; }
-static B11HR B11_MS child_set_private_iface(B11Obj *self, const uint8_t *guid, void *iface)
-{ (void)self; (void)guid; (void)iface; return B11_S_OK; }
-
 #define CHILD_SLOTS(vt) do { \
     (vt)[0] = (void *)child_qi; (vt)[1] = (void *)child_addref; (vt)[2] = (void *)child_release; \
-    (vt)[3] = (void *)child_get_device; (vt)[4] = (void *)child_get_private; \
-    (vt)[5] = (void *)child_set_private; (vt)[6] = (void *)child_set_private_iface; } while (0)
+    (vt)[3] = (void *)child_get_device; (vt)[4] = (void *)b11_get_private_data; \
+    (vt)[5] = (void *)b11_set_private_data; (vt)[6] = (void *)b11_set_private_data_interface; } while (0)
 
 /* Formats --------------------------------------------------------------------------------- */
 
@@ -599,6 +787,7 @@ static void view_destroy(B11Obj *o)
     B11View *v = (B11View *)o;
     if (v->heap) b11_defer(o->dev, free_heap_fn, v->heap);
     if (v->resource) b11_release(v->resource);
+    if (o->vtable == vt_srv1) b11_release(&o->dev->obj);
     free(v);
 }
 static void B11_MS view_get_resource(B11Obj *self, void **res)
@@ -611,7 +800,15 @@ static void B11_MS view_get_resource(B11Obj *self, void **res)
 static void B11_MS view_get_desc(B11Obj *self, uint32_t *desc)
 {
     B11View *v = (B11View *)self;
-    if (desc) memcpy(desc, v->desc_bytes, sizeof(v->desc_bytes));
+    if (desc) {
+        /* Legacy SRV_DESC is 24, not the 32-byte internal storage. */
+        memcpy(desc, v->desc_bytes, self->kind == B11_SRV ? 24 : sizeof(v->desc_bytes));
+        if (self->vtable == vt_srv1 && v->dimension == 4) desc[4] = 0;
+    }
+}
+static void B11_MS srv_get_desc1(B11Obj *self, B11ShaderResourceViewDesc1 *desc)
+{
+    if (desc) memcpy(desc, ((B11View *)self)->desc_bytes, 28);
 }
 
 enum { VIEW_DESC_NONE = 0 };
@@ -785,6 +982,137 @@ static B11HR B11_MS dev_create_rtv(B11Device *dev, B11Obj *res, const uint32_t *
 static B11HR B11_MS dev_create_dsv(B11Device *dev, B11Obj *res, const uint32_t *d, void **out)
 { return create_view(dev, B11_DSV, res, d, out); }
 
+/* A conservative typed-color compatibility table, not the backend's typeless
+ * representative mapping (which is not sufficient to validate a D3D view). */
+static uint32_t srv_typeless_end(uint32_t f)
+{
+    switch (f) {
+    case 1: return 4; case 5: return 8; case 9: return 14; case 15: return 18;
+    case 23: return 25; case 27: return 32; case 33: return 38;
+    case 39: return 43; case 48: return 52; case 53: return 59; case 60: return 64;
+    case 70: return 72; case 73: return 75; case 76: return 78;
+    case 79: return 81; case 82: return 84; case 90: return 91;
+    case 92: return 93; case 94: return 96; case 97: return 99;
+    default: return 0;
+    }
+}
+static int srv_depth_format(uint32_t f)
+{
+    return (f >= 19 && f <= 22) || (f >= 44 && f <= 47) || f == 40 || f == 55;
+}
+static B11HR srv_color_format(uint32_t resource, uint32_t view)
+{
+    if (srv_depth_format(resource) || srv_depth_format(view)) return B11_E_NOTIMPL;
+    /* Video/planar/packed formats have no proven single-plane backend contract. */
+    if (resource >= 100 || view >= 100) return B11_E_NOTIMPL;
+    if (!view || srv_typeless_end(view)) return B11_E_INVALIDARG;
+    uint32_t end = srv_typeless_end(resource);
+    int compatible = end ? view > resource && view <= end : resource == view;
+    /* BGRA/BGRX families have their typed UNORM member before the typeless value. */
+    if (resource == 90) compatible = view == 87 || view == 91;
+    if (resource == 92) compatible = view == 88 || view == 93;
+    if (!compatible) return B11_E_INVALIDARG;
+    if (b11_vk_format(view) == VK_FORMAT_UNDEFINED) return B11_E_NOTIMPL;
+    return B11_S_OK;
+}
+static int srv_range(uint32_t first, uint32_t *count, uint32_t total)
+{
+    if (first >= total) return 0;
+    if (*count == UINT32_MAX) *count = total - first;
+    return *count && *count <= total - first;
+}
+
+B11HR B11_MS b11_create_shader_resource_view1(B11Device *dev, B11Obj *res,
+                                             const B11ShaderResourceViewDesc1 *desc, void **out)
+{
+    if (out) *out = NULL;
+    b11_init_vtables();
+    if (!dev || !res || res->dev != dev) return B11_E_INVALIDARG;
+    if (!((res->kind == B11_BUFFER && res->vtable == vt_buffer) ||
+          (res->kind == B11_TEXTURE && res->vtable == vt_texture))) return B11_E_INVALIDARG;
+    uint32_t d[7] = {0};
+    if (desc) memcpy(d, desc, sizeof(d)); /* Never read DESC1 through legacy24. */
+    if (res->kind == B11_BUFFER) {
+        B11Buffer *b = (B11Buffer *)res;
+        if (!(b->desc.bind & B11_BIND_SRV)) return B11_E_INVALIDARG;
+        if (!desc) {
+            if (!(b->desc.misc & B11_MISC_STRUCTURED) || !b->desc.stride) return B11_E_INVALIDARG;
+            d[1] = 1; d[3] = b->desc.byte_width / b->desc.stride;
+        }
+        if (d[1] != 1 && d[1] != 11) return B11_E_INVALIDARG;
+        if (d[1] == 11 && (d[4] & ~1u)) return B11_E_INVALIDARG;
+        int raw = d[1] == 11 && (d[4] & 1);
+        int structured = (b->desc.misc & B11_MISC_STRUCTURED) != 0;
+        uint32_t elem;
+        if (raw) {
+            if (!(b->desc.misc & B11_MISC_RAW) || structured || d[0] != 39) return B11_E_INVALIDARG;
+            elem = 4;
+        } else if (structured) {
+            if (d[0] || !b->desc.stride) return B11_E_INVALIDARG;
+            elem = b->desc.stride;
+        } else {
+            B11HR hr = srv_color_format(d[0], d[0]);
+            if (hr != B11_S_OK) return hr;
+            if (bd12_dxgi_is_compressed(d[0])) return B11_E_INVALIDARG;
+            elem = bd12_dxgi_bytes(d[0]);
+        }
+        if (!elem || !d[3] || d[2] >= b->desc.byte_width / elem ||
+            d[3] > b->desc.byte_width / elem - d[2]) return B11_E_INVALIDARG;
+        if (!b11_buffer_current(b)) return B11_E_INVALIDARG;
+        /* Do not inherit the old padded-size/clamping or untyped texel fallback. */
+        if (raw || structured || b->desc.byte_width > UINT32_MAX - 255u) return B11_E_NOTIMPL;
+    } else {
+        B11Texture *t = (B11Texture *)res;
+        if (!(t->desc.bind & B11_BIND_SRV) || !t->image || !t->desc.mips ||
+            !t->desc.array_size || t->desc.dimension < 1 || t->desc.dimension > 3)
+            return B11_E_INVALIDARG;
+        if (!desc) {
+            d[0] = t->desc.format; d[1] = default_dim(t, 1);
+            if (d[1] != 6 && d[1] != 7) d[3] = t->desc.mips;
+            if (d[1] == 3 || d[1] == 5) d[5] = t->desc.array_size;
+            if (d[1] == 7) d[3] = t->desc.array_size;
+            if (d[1] == 10) d[5] = t->desc.array_size / 6;
+        }
+        if (!d[0]) d[0] = t->desc.format;
+        uint32_t dim = d[1];
+        int valid_dim = t->desc.dimension == 1 ? dim == 2 || dim == 3 :
+                        t->desc.dimension == 3 ? dim == 8 :
+                        t->desc.samples > 1 ? dim == 6 || dim == 7 :
+                        dim == 4 || dim == 5 || dim == 9 || dim == 10;
+        if (!valid_dim) return B11_E_INVALIDARG;
+        if ((dim == 2 || dim == 4 || dim == 6) && t->desc.array_size != 1)
+            return B11_E_INVALIDARG;
+        if ((dim == 9 || dim == 10) && (!(t->desc.misc & B11_MISC_CUBE) ||
+            t->desc.array_size < 6 || t->desc.array_size % 6)) return B11_E_INVALIDARG;
+        if (dim != 6 && dim != 7 && !srv_range(d[2], &d[3], t->desc.mips))
+            return B11_E_INVALIDARG;
+        if ((dim == 3 || dim == 5) && !srv_range(d[4], &d[5], t->desc.array_size))
+            return B11_E_INVALIDARG;
+        if (dim == 7 && !srv_range(d[2], &d[3], t->desc.array_size)) return B11_E_INVALIDARG;
+        if (dim == 10) {
+            if (d[4] % 6 || d[4] >= t->desc.array_size) return B11_E_INVALIDARG;
+            if (d[5] == UINT32_MAX) d[5] = (t->desc.array_size - d[4]) / 6;
+            if (!d[5] || d[5] > (t->desc.array_size - d[4]) / 6) return B11_E_INVALIDARG;
+        }
+        if ((dim == 4 && d[4]) || (dim == 5 && d[6])) return B11_E_NOTIMPL;
+        B11HR hr = srv_color_format(t->desc.format, d[0]);
+        if (hr != B11_S_OK) return hr;
+        if (t->image->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return B11_E_NOTIMPL;
+    }
+    if (!out) return B11_S_FALSE; /* Documented validation-only, no allocation/backend call. */
+    uint32_t legacy[6]; memcpy(legacy, d, sizeof(legacy));
+    if (d[1] == 4) legacy[4] = 0; /* PlaneSlice is not in the base union. */
+    if (d[1] == 6) { legacy[2] = 0; legacy[3] = 1; } /* MS union has no mip fields. */
+    B11HR hr = create_view(dev, B11_SRV, res, legacy, out);
+    if (hr == B11_S_OK) {
+        B11View *v = *out;
+        v->obj.vtable = vt_srv1;
+        b11_retain(&dev->obj);
+        memcpy(v->desc_bytes, d, sizeof(d));
+    }
+    return hr;
+}
+
 /* Shaders, input layouts, states ---------------------------------------------------------- */
 
 static void *vt_child[7];
@@ -873,7 +1201,11 @@ static B11HR B11_MS dev_create_input_layout(B11Device *dev, const uint8_t *eleme
     return B11_S_OK;
 }
 
-static void state_destroy(B11Obj *o) { free(o); }
+static void state_destroy(B11Obj *o)
+{
+    if (o->vtable == vt_raster1) b11_release(&o->dev->obj);
+    free(o);
+}
 static void *vt_state[8];
 static void B11_MS state_get_desc(B11Obj *self, void *desc)
 {
@@ -899,6 +1231,37 @@ static B11HR B11_MS dev_create_blend(B11Device *d, const void *desc, void **o) {
 static B11HR B11_MS dev_create_depth(B11Device *d, const void *desc, void **o) { return create_state(d, B11_DEPTH, desc, 52, o); }
 static B11HR B11_MS dev_create_raster(B11Device *d, const void *desc, void **o) { return create_state(d, B11_RASTER, desc, 40, o); }
 static B11HR B11_MS dev_create_sampler(B11Device *d, const void *desc, void **o) { return create_state(d, B11_SAMPLER, desc, 52, o); }
+
+static void B11_MS raster_get_desc1(B11Obj *self, B11RasterizerDesc1 *desc)
+{
+    if (desc) memcpy(desc, ((B11State *)self)->desc, 44);
+}
+B11HR B11_MS b11_create_rasterizer_state1(B11Device *dev, const B11RasterizerDesc1 *desc, void **out)
+{
+    if (out) *out = NULL;
+    if (!dev || !desc) return B11_E_INVALIDARG;
+    B11RasterizerDesc1 d; memcpy(&d, desc, sizeof(d));
+    if ((d.fill_mode != 2 && d.fill_mode != 3) || d.cull_mode < 1 || d.cull_mode > 3 ||
+        (uint32_t)d.front_ccw > 1 || (uint32_t)d.depth_clip > 1 || (uint32_t)d.scissor > 1 ||
+        (uint32_t)d.multisample > 1 || (uint32_t)d.antialiased_line > 1 ||
+        !isfinite(d.depth_bias_clamp) || !isfinite(d.slope_scaled_depth_bias)) return B11_E_INVALIDARG;
+    uint32_t force = d.forced_sample_count;
+    if (force != 0 && force != 1 && force != 2 && force != 4 && force != 8 && force != 16)
+        return B11_E_INVALIDARG;
+    /* BD11 never forwards legacy MultisampleEnable/AntialiasedLineEnable to
+     * the backend. Preserve legacy policy; don't pretend the new path does. */
+    if (force || d.multisample || d.antialiased_line) return B11_E_NOTIMPL;
+    if (!out) return B11_S_FALSE; /* Optional output: validation-only prerequisite. */
+    b11_init_vtables();
+    B11State *s = b11_obj_new(dev, B11_RASTER, sizeof(*s), vt_raster1, state_destroy);
+    if (!s) return B11_E_OUTOFMEMORY;
+    b11_retain(&dev->obj);
+    memcpy(s->desc, &d, sizeof(d));
+    /* ForcedSampleCount==0 must use the same pipeline-cache key as legacy. */
+    s->hash = b11_hash(&d, 40);
+    *out = s;
+    return B11_S_OK;
+}
 
 static VkSamplerAddressMode address_mode(uint32_t m)
 {
@@ -1094,16 +1457,15 @@ static void B11_MS dev_get_immediate(B11Device *dev, void **ctx)
 static B11HR B11_MS dev_set_exception_mode(B11Device *dev, uint32_t flags) { (void)dev; (void)flags; return B11_S_OK; }
 static uint32_t B11_MS dev_get_exception_mode(B11Device *dev) { (void)dev; return 0; }
 
-void b11_init_vtables(void)
+static void init_vtables_once(void)
 {
-    static int done;
-    if (done) return;
-    done = 1;
     g_b11_trace = getenv("BEER_BD11_TRACE") != NULL || getenv("BEER_BD11_TRACE_FILE") != NULL;
     if (getenv("BEER_BD11_TRACE")) g_b11_trace_frame = strtol(getenv("BEER_BD11_TRACE"), NULL, 10);
     CHILD_SLOTS(vt_child);
     CHILD_SLOTS(vt_state);
     vt_state[7] = (void *)state_get_desc;
+    CHILD_SLOTS(vt_raster1);
+    vt_raster1[7] = (void *)state_get_desc; vt_raster1[8] = (void *)raster_get_desc1;
     CHILD_SLOTS(vt_buffer);
     vt_buffer[7] = (void *)buffer_get_type; vt_buffer[8] = (void *)resource_set_priority;
     vt_buffer[9] = (void *)resource_get_priority; vt_buffer[10] = (void *)buffer_get_desc;
@@ -1112,6 +1474,9 @@ void b11_init_vtables(void)
     vt_texture[9] = (void *)resource_get_priority; vt_texture[10] = (void *)texture_get_desc;
     CHILD_SLOTS(vt_view);
     vt_view[7] = (void *)view_get_resource; vt_view[8] = (void *)view_get_desc;
+    CHILD_SLOTS(vt_srv1);
+    vt_srv1[7] = (void *)view_get_resource; vt_srv1[8] = (void *)view_get_desc;
+    vt_srv1[9] = (void *)srv_get_desc1;
     CHILD_SLOTS(vt_query);
     vt_query[7] = (void *)query_get_data_size; vt_query[8] = (void *)query_get_desc;
 
@@ -1130,10 +1495,16 @@ void b11_init_vtables(void)
     d[27] = (void *)dev_create_deferred; d[28] = (void *)dev_open_shared_resource;
     d[29] = (void *)dev_check_format_support; d[30] = (void *)dev_check_ms_quality;
     d[31] = (void *)dev_check_counter_info; d[33] = (void *)dev_check_feature_support;
-    d[34] = (void *)child_get_private; d[35] = (void *)child_set_private; d[36] = (void *)child_set_private_iface;
+    d[34] = (void *)b11_get_private_data; d[35] = (void *)b11_set_private_data; d[36] = (void *)b11_set_private_data_interface;
     d[37] = (void *)dev_get_feature_level; d[38] = (void *)dev_get_creation_flags;
     d[39] = (void *)dev_get_removed_reason; d[40] = (void *)dev_get_immediate;
     d[41] = (void *)dev_set_exception_mode; d[42] = (void *)dev_get_exception_mode;
     b11_context_init_vtable();
+}
+
+void b11_init_vtables(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, init_vtables_once);
 }
 

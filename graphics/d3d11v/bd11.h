@@ -20,6 +20,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define B11_MS __attribute__((ms_abi))
@@ -33,6 +34,10 @@ typedef int32_t B11HR;
 #define B11_E_OUTOFMEMORY ((B11HR)0x8007000e)
 #define B11_DXGI_ERROR_WAS_STILL_DRAWING ((B11HR)0x887a000a)
 #define B11_DXGI_ERROR_NOT_FOUND ((B11HR)0x887a0002)
+#define B11_DXGI_ERROR_MORE_DATA ((B11HR)0x887a0003)
+#define B11_DXGI_ERROR_SDK_COMPONENT_MISSING ((B11HR)0x887a002d)
+/* Only usage-contract SINGLETHREADED and backend-supported BGRA are accepted. */
+#define B11_CREATE_SUPPORTED_FLAGS (0x1u | 0x20u)
 
 /* D3D11_USAGE */
 enum { B11_USAGE_DEFAULT = 0, B11_USAGE_IMMUTABLE = 1, B11_USAGE_DYNAMIC = 2, B11_USAGE_STAGING = 3 };
@@ -68,6 +73,7 @@ enum {
 
 typedef struct B11Device B11Device;
 typedef struct B11Context B11Context;
+typedef struct B11ContextState B11ContextState;
 
 typedef struct B11Obj {
     void **vtable;
@@ -75,7 +81,19 @@ typedef struct B11Obj {
     uint32_t kind;
     B11Device *dev;
     void (*destroy)(struct B11Obj *);
+    /* Zero-initialized lazy ownership; protected by the private-store lock,
+     * not dev->lock. No per-object mutex initialization (including fixtures). */
+    struct B11PrivateEntry *private_data;
+    int private_dead;
 } B11Obj;
+
+/* Owned tear-off: IUnknown delegates to owner, never to an incompatible vtable.
+ * Device and immediate-context identities are distinct; both use the same lock
+ * and protection state. The device owns its immediate context for process life. */
+typedef struct {
+    void **vtable;
+    B11Obj *owner;
+} B11Multithread;
 
 /* Deferred destruction: freed once the retire timeline passes `serial`. */
 typedef struct B11Grave {
@@ -94,6 +112,32 @@ typedef struct {
     uint32_t width, height, depth, mips, array_size, format, samples, quality;
     uint32_t usage, bind, cpu, misc;
 } B11TextureDesc;
+
+/* Guest layouts verified against mingw d3d11_1.h / d3d11_3.h. No host pointers. */
+typedef struct {
+    uint32_t fill_mode, cull_mode;
+    int32_t front_ccw, depth_bias;
+    float depth_bias_clamp, slope_scaled_depth_bias;
+    int32_t depth_clip, scissor, multisample, antialiased_line;
+    uint32_t forced_sample_count;
+} B11RasterizerDesc1;
+typedef struct {
+    uint32_t format, dimension;
+    union {
+        uint32_t words[5];
+        struct { uint32_t mip, mips, plane; } texture2d;
+        struct { uint32_t mip, mips, first_layer, layers, plane; } texture2d_array;
+    } u;
+} B11ShaderResourceViewDesc1;
+_Static_assert(sizeof(B11RasterizerDesc1) == 44, "raster DESC1 ABI");
+_Static_assert(offsetof(B11RasterizerDesc1, forced_sample_count) == 40, "forced sample ABI");
+_Static_assert(sizeof(B11ShaderResourceViewDesc1) == 28, "SRV DESC1 ABI");
+_Static_assert(offsetof(B11ShaderResourceViewDesc1, u.texture2d.plane) == 16, "2D plane ABI");
+_Static_assert(offsetof(B11ShaderResourceViewDesc1, u.texture2d_array.plane) == 24, "array plane ABI");
+
+/* Future Device1 slot46 / Device3 slot57 prerequisites, NOT installed in device43. */
+B11HR B11_MS b11_create_rasterizer_state1(B11Device *, const B11RasterizerDesc1 *, void **);
+B11HR B11_MS b11_create_shader_resource_view1(B11Device *, B11Obj *, const B11ShaderResourceViewDesc1 *, void **);
 
 /* Command lists in flight. Presents no longer wait for the GPU and games Flush() several times a frame,
  * so the ring must outlast a few frames of submissions or recording would stall on the oldest one. */
@@ -205,6 +249,7 @@ typedef struct B11CmdList {
     B11Op *ops;
     size_t count;
     uint32_t restore_state;
+    uint32_t context_flags;
 } B11CmdList;
 
 /* ---- pipeline state shadow ---------------------------------------------------------- */
@@ -216,7 +261,7 @@ typedef struct {
     B11Obj *srv[B11_STAGE_COUNT][B11_MAX_SRV];
     /* The resource of each bound SRV and one past the highest slot ever bound since the last clear, so the
      * per-draw and per-render-target scans touch only used slots and never chase view pointers. */
-    B11Obj *srv_res[B11_STAGE_COUNT][B11_MAX_SRV];
+    B11Obj *srv_res[B11_STAGE_COUNT][B11_MAX_SRV]; /* borrowed aliases, owned through srv views */
     uint32_t srv_end[B11_STAGE_COUNT];
     B11Obj *sampler[B11_STAGE_COUNT][B11_MAX_SAMPLER];
     B11Obj *uav[B11_STAGE_COUNT][B11_MAX_UAV];       /* PS slots follow the RTV count; CS slots 0..7 */
@@ -242,9 +287,14 @@ typedef struct {
 
 struct B11Context {
     B11Obj obj;
+    B11Multithread multithread;
+    _Atomic int multithread_protected;
     uint32_t type;                /* 0 immediate, 1 deferred (D3D11_DEVICE_CONTEXT_TYPE) */
     uint32_t flags;
     B11PipelineState st;
+    /* Internal banks only, NOT COM interfaces. Each pointer owns a reference.
+     * NULL active means the original default bank has not yet been materialized. */
+    B11ContextState *default_state, *active_state;
     /* deferred recording */
     B11Op *ops;
     size_t op_count, op_capacity;
@@ -298,6 +348,7 @@ typedef struct B11RootEntry {
 
 struct B11Device {
     B11Obj obj;
+    B11Multithread multithread;
     BD12Device *bd;
     BD12Queue *queue;
     BD12Fence *retire;
@@ -321,10 +372,10 @@ struct B11Device {
     B11RootEntry *roots;
     VkQueryPool occlusion_pool;
     uint32_t occlusion_next;
-    uint32_t feature_level;
+    uint32_t feature_level;       /* immutable after construction */
     uint64_t frame;
     BD12Buffer *null_buffer;       /* bound for NULL constant buffers */
-    uint32_t flags;
+    uint32_t flags;               /* creation flags, immutable after construction */
     struct B11SlicePool *slices;   /* recycled host-visible upload slices */
 };
 
@@ -334,6 +385,9 @@ void *b11_obj_new(B11Device *dev, uint32_t kind, size_t size, void **vtable,
                   void (*destroy)(B11Obj *));
 uint32_t B11_MS b11_add_ref(B11Obj *obj);
 uint32_t B11_MS b11_release(B11Obj *obj);
+B11HR B11_MS b11_get_private_data(B11Obj *, const uint8_t *, uint32_t *, void *);
+B11HR B11_MS b11_set_private_data(B11Obj *, const uint8_t *, uint32_t, const void *);
+B11HR B11_MS b11_set_private_data_interface(B11Obj *, const uint8_t *, const void *);
 B11HR b11_query_interface(B11Obj *obj, const uint8_t *riid, void **out);
 void b11_retain(B11Obj *obj);
 void b11_defer(B11Device *dev, void (*fn)(B11Device *, void *), void *ptr);
@@ -342,6 +396,7 @@ void b11_reap(B11Device *dev);
 
 /* device (bd11_dev.c) */
 B11Device *b11_device_create(void);
+B11Device *b11_device_create_configured(uint32_t flags, uint32_t level);
 B11Context *b11_context_create(B11Device *dev, uint32_t type, uint32_t flags);
 void b11_flush(B11Device *dev, int wait);
 BD12CmdList *b11_cmd(B11Device *dev);        /* the open immediate list, creating it on demand */
@@ -363,10 +418,12 @@ BD12Buffer *b11_buffer_current(B11Buffer *b);
 BD12Buffer *b11_buffer_write_backing(B11Buffer *b, int discard);
 extern void *g_b11_device_vtable[43];
 B11HR b11_device_create_for_loader(void **device, void **context);
-void b11_device_set_feature_level(void *device, uint32_t level);
+B11HR b11_device_create_for_loader_config(uint32_t flags, uint32_t level,
+                                         void **device, void **context);
 
 /* context (bd11_ctx.c) */
 void b11_context_init_vtable(void);
+void b11_multithread_init(B11Multithread *mt, B11Obj *owner);
 void b11_context_replay(B11Context *immediate, B11CmdList *list);
 void b11_state_clear(B11Context *ctx);
 void b11_texture_use(B11Context *ctx, B11Texture *tex, uint32_t state);

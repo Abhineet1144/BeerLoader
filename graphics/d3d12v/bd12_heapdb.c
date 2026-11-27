@@ -278,7 +278,7 @@ BD12DescriptorHeap *bd12_descriptor_heap_create_ex(BD12Device *device, uint32_t 
     BD12DescriptorHeap *heap = descriptor_heap_create(device, type, count, flags);
     __atomic_add_fetch(&g_bd12_dheap_stats[0], 1, __ATOMIC_RELAXED);
     if (flags & BD12_HEAP_FLAG_SHADER_VISIBLE) __atomic_add_fetch(&g_bd12_dheap_stats[1], 1, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&g_bd12_dheap_stats[3], bd12_prof_now() - t0, __ATOMIC_RELAXED);
+    if (bd12_prof_enabled()) __atomic_add_fetch(&g_bd12_dheap_stats[3], bd12_prof_now() - t0, __ATOMIC_RELAXED);
     return heap;
 }
 
@@ -900,6 +900,8 @@ void bd12_db_init(BD12Device *device)
         db->push_stages |= VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
     pthread_mutex_init(&db->lock, NULL);
     pthread_mutex_init(&db->pending_lock, NULL);
+    if (getenv("BEER_BD12_HITCH_SYSCALL"))
+        fprintf(stderr, "[LOCKS] heapdb: lock=%p pending=%p\n", (void *)&db->lock, (void *)&db->pending_lock);
     device->db = db;   /* heap_set_layout and the dummy heaps read it */
     db->resource_layout = heap_set_layout(device, 0, HEAP_SLOTS);
     if (!db->resource_layout && db->mutable_count == T_COUNT) {   /* the driver refuses AS in a mutable list */

@@ -135,7 +135,7 @@ generic, loader.c):
     friends list. (Rejected for now: copying a steam://joinlobby/480/<lobby>/<host> link.)
   - `BEER_STEAM_DIAGNOSTICS` now also prints per-connection traffic every 5 s and CreateSocketPair calls.
 - **FIXED (2026-11-26, late): hosted-session jump hang = Steam vtable calls clobbering XMM6-XMM15.** Found with a
-  decompile of Pratfall.dll (tools in /mnt/hdd2/tools: dotnet, ilspycmd, ilverify, pratfall-probe = Mono.Cecil
+  decompile of Pratfall.dll (tools in /mnt/hdd2/beer-tools/tools: dotnet, ilspycmd, ilverify, pratfall-probe = Mono.Cecil
   patcher + BeerProbe.dll per-physics-step logger; original game files backed up in pratfall-probe/original). The
   player body's y/vy stayed identical for 3-11 physics ticks after a jump; only with the microphone picking up sound
   (BEER_STEAM_VOICE=0 cured it; BEER_STEAM_VOICE_GATE=open reproduces it without talking - the key click opened
@@ -1293,6 +1293,167 @@ Proton, DLSS, DLSS FG + Reflex (XMM6 fix), RE9 DX12U mesh path (barycentrics). U
     Separately, JavaFX text rendering still fails at
      CreateWicBitmapRenderTarget; Beer's WIC factory lacks writable bitmap creation. Do not use a
      launcher-specific bypass for either issue. Minecraft has not launched.
+   - 2026-11-27: corrected worker-stack region order to reserved space, committed hard
+     NOACCESS overflow page, then writable stack, all under one allocation base. The hard
+     page now directly borders the writable interval. Protection remains fixed; this is not
+     PAGE_GUARD or demand stack growth. Updated native stack-layout regression; build,
+     test-input (including native ABI and SEH tests), and diff-check passed.
+   - Exact bundled 8u281 independent local WebView probe reproduced the blank JSException
+     before this change (/tmp/beer-fx-current-baseline.log), then evaluated 42, 6*7, a string,
+     and document.body.textContent successfully (/tmp/beer-fx-current-layout.log). Expanded
+     tests passed 200 depth-100 recursive evaluations and propagated an intentional Error
+     with its message intact. Two reruns completed a 30-second post-evaluation interval
+     (/tmp/beer-fx-current-vmtrace.log, /tmp/beer-fx-current-vmretry.log), but an earlier
+     expanded run aborted during that interval (/tmp/beer-fx-current-soak.log).
+   - Original launcher retries (120 s and 100 s whole-cgroup caps, 6 GiB memory cap) loaded
+     the page and reached "finished listens into server_choose" without the previous
+     JSException. The JVM subsequently exited 3: exact WebKit disassembly at RVA 0x16f48b9
+     calls abort after VirtualFree(MEM_DECOMMIT) fails. Opt-in BEER_VM_FREE_DIAGNOSTICS
+     captured a 16 KiB decommit failure in both local and launcher tests. Native errno in
+     this wrapper is only a snapshot and can be stale on validation failure; no syscall
+     cause or stack-overflow cause is established. The straced local rerun did not reproduce
+     the failure. Logs: /tmp/beer-tl-layout.log and /tmp/beer-tl-vmretry.log. Next: trace
+     reservation ownership of the failed address and distinguish lookup/range failure from
+     mprotect failure. WIC-backed glyph rendering remains separately incomplete. No
+     launcher/JVM binary changes, fabricated success, usable-launcher or Minecraft claim.
+   - 2026-11-28: VirtualFree's native implementation now sets deterministic EINVAL on
+     ownership/range/argument failures and preserves the real mprotect errno. Optional
+     decommit-range logging captures the allocation base and size while holding the
+     registry lock; the wrapper's errno snapshot is no longer stale for these failures.
+     Also implemented the documented zero-size MEM_DECOMMIT contract at the exact
+     allocation base: decommit all pages but retain reservation ownership. Native tests
+     cover whole-reservation decommit, rejected interior zero-size requests, overflow,
+     crossing allocation bounds, already-reserved pages, zero-filled recommit, and an
+     intentionally missing host page (ENOMEM distinguished from EINVAL). Build, full
+     test-input/native ABI/SEH suite, editor diagnostics, and diff-check passed.
+   - Today's 100 s and 160 s original-launcher retries reached browser listeners without
+     reproducing the prior decommit abort; both ended at their whole-cgroup time caps.
+     Three 30-second local script soak probes passed, as did two expanded probes creating
+     2.5 million temporary JavaScript objects followed by a 30-second interval. Logs:
+     /tmp/beer-tl-decommit.log, /tmp/beer-tl-decommit-long.log, /tmp/beer-fx-decommit-1.log
+     through -3.log, /tmp/beer-fx-heap.log and /tmp/beer-fx-heap-fast.log. These retries
+     preceded the zero-size contract change. The known WebKit failure uses a nonzero
+     16 KiB size, so the zero-size fix does NOT establish its resolution. No replacement
+     failure cause captured yet; retain the intermittent failure as unresolved. WIC
+     writable bitmap/rendering implementation remains pending; Minecraft not launched.
+   - 2026-11-28 WIC increment: implemented IWICImagingFactory::CreateBitmap (slot 17)
+     for 32bpp BGR/BGRA/PBGRA with actual zero-initialized owned pixel storage, source
+     readback and resolution metadata. IWICBitmap::Lock and IWICBitmapLock expose actual
+     rectangle pixels, parent stride, bounded data span, format and size. Locks retain
+     the bitmap; readers share, writers exclude both other locks and CopyPixels.
+     Unsupported formats/palettes/converter inputs still fail; no fabricated render target.
+   - Direct WIC COM methods now compile with local SSE2 options so GCC preserves Win64
+     XMM6-XMM15 across SysV libc calls (verified in generated Lock prologue); loader
+     compilation options outside this include are restored. Vtable publication uses
+     pthread_once. New tests/wic_bitmap_contract.inc exercises actual guest COM slots,
+     format/readback, nonzero subrect offsets, premultiplied-byte preservation, lock
+     exclusion, reference lifetime, DPI, invalid/overflow inputs, and existing BMP
+     decoder/converter behavior. Final build, full input/native ABI/SEH suite, editor
+     diagnostics and diff-check passed (/tmp/beer-wic-final2-input.log).
+   - Independent exact-8u281 WicRenderProbe creates and locks a real 16x12 PBGRA bitmap
+     (768 bytes, stride 64). Genuine Direct2D still returns a null render target for both
+     default and software options; the JNI wrapper hides its failure HRESULT. Logs:
+     /tmp/beer-wic-render.log. Local WebView script/allocation/30-second soak still passed,
+     but text now reports STRIDE * HEIGHT exceeds length of data downstream in Pisces
+     (/tmp/beer-fx-wictrace.log); no WIC lock was requested by that glyph path, so do not
+     infer an undersized lock buffer from this message. Direct2D creation/GPU dependency
+     diagnosis remains next, not fabricated bitmap pixels or suppressed rendering errors.
+   - Original launcher 120 s / 6 GiB capped retry loaded the page and completed browser
+     listeners without a captured decommit abort (/tmp/beer-tl-wic.log); ended at the time
+     cap. Neither a usable launcher, complete text rendering nor Minecraft is established.
+   - 2026-11-28 Direct2D diagnosis: a bounded debugger probe inspected the real JavaFX
+     JNI wrapper after genuine CreateWicBitmapRenderTarget. Both default and software
+     options return 0x8899000b (D2DERR_NO_HARDWARE_DEVICE). BD11 refuses IID
+     a05c8c37-d2c6-4732-b3a0-9ce0b0dc9ae6, which public headers identify as
+     ID3D11Device3, NOT ID3D11Multithread. Actual multithread IID is
+     9b7e4e00-342c-4106-a19f-4f2704f689f0. Logs: /tmp/beer-d2d-wicbreak.log.
+     Genuine D2D factory creation already works; missing Beer CoCreateInstance D2D
+     routing is not the cause. Next inspect Device3 dependency and real supported
+     fallback behavior; do not expose a Device3 GUID with a base/wrong vtable.
+   - A generic BD11 ID3D11Multithread implementation was added: owned tear-offs,
+     proper IUnknown identity/refcounts, previous-state SetMultithreadProtected BOOL,
+     recursive Enter/Leave on the device mutex, and enabled immediate-context scoped
+     guards using that same lock (typed float entry points retained). Defaults off;
+     deferred contexts reject it. Context and initialization cleanup improved.
+     Initial diagnosis incorrectly supplied the Device3 GUID to this implementation;
+     corrected before final validation and added a negative Device3 QI regression with
+     an initialized immediate context. The transient wrong-vtable probe result is NOT
+     rendering progress. Final genuine probe again refuses Device3 and returns the
+     hardware-device error; no application-specific success/bypass retained.
+   - make test-d3d11-multithread verifies real Win64 slots, identity, lifetime, toggle,
+     recursion, cross-thread blocking and automatic-context exclusion without sleeps;
+     final build, this regression, full test-input/native ABI/SEH, diagnostics and
+     diff-check passed (/tmp/beer-mt-final-test.log, /tmp/beer-mt-final-input.log).
+     Device lifetime retains the existing process-owned policy; toggling protection
+     while other calls are unprotected requires caller synchronization. Text/launcher/
+     Minecraft remain incomplete; this contract addition does not resolve Device3.
+   - 2026-11-28 creation configuration: BD11 now caches by exact flags and granted
+     feature level, configured before publication; later calls cannot mutate an earlier
+     device. Both loader creation wrappers fix optional-output and swap-failure reference
+     ownership. Accepted flags: 0, SINGLETHREADED (1), BGRA_SUPPORT (0x20), or 0x21.
+     DEBUG returns SDK_COMPONENT_MISSING; other bits return E_INVALIDARG. This tightens
+     previously ignored flags and retains more process-owned GPU memory per configuration.
+     Driver/adapter/software selection, legacy path and feature-level policy are unchanged.
+     CPU-only make test-d3d11-creation, multithread, full test-input, build, diagnostics
+     and diff-check pass (/tmp/beer-config-test.log, /tmp/beer-config-mt.log,
+     /tmp/beer-config-input.log). Existing test-d3d11 still has unrelated link failures.
+   - Two genuine Direct2D retries confirm WIC storage/lock success, but no render target.
+     Debugger capture at D2D caller RVA 0x6335e observes flags 0x21 and level 0xb000,
+     then refused Device3 and HRESULT 0x8899000b for default/software options
+     (/tmp/beer-d2d-config-inspect.log). Read-only DLL analysis establishes mandatory
+     Device3 then Context3 queries with no older-interface fallback; further contracts
+     include context-state swapping, extended rasterizer/SRV methods and DXGI Device2/3.
+     These interfaces remain unexposed until their typed ABI and semantics are implemented.
+     No rendered pixels/glyphs, usable launcher or Minecraft success is established.
+   - 2026-11-28 state foundation: owned pipeline capture/copy/reset/dispose retains
+     each binding (including aliases), but not borrowed SRV-resource pointers. Fixed
+     existing ExecuteCommandList(TRUE): start replay from defaults, restore the caller's
+     owned snapshot afterward and invalidate all backend binding shadows; FALSE ends
+     at defaults. Internal mutable banks save outgoing state and restore incoming state,
+     retain default/active/previous owners, reject foreign devices/deferred contexts and
+     allocate before mutation. NULL swap has no effect. No COM factory/interface is
+     exposed: stream output, class instances, lower-feature/interface emulation and
+     backend constant-buffer ranges remain incomplete. Details: docs/bd11-context-state.md.
+     Public-header audit confirms 77db970f is IDXGIDevice1, NOT ID3D11Device1; actual
+     Device1 IID is a04bfb29-08ef-43d6-a49c-a9bdbdcbe686. Negative QI regressions cover
+     Device1/2/3 and Context1/2/3. Build, state/multithread/creation tests, full input,
+     editor diagnostics and diff-check pass (/tmp/beer-state-main-*.log); CPU state and
+     multithread fixtures additionally pass O0/O2/ASan+UBSan with leak checks.
+     Genuine 8u281/WIC/Direct2D retry still refuses Device3 with flags21/levelb000 and
+     HRESULT8899000b (/tmp/beer-d2d-state.log). This fixes a reusable existing contract,
+     not text rendering or launcher readiness. No guest binaries or loader shortcuts changed.
+   - 2026-11-28 extended object prerequisites: typed internal RasterizerState1 and SRV1
+     creation paths, complete 9/10-slot child ABI tables, verified GUIDs and exact
+     40/44-byte raster and 24/28-byte SRV getters. Fixed legacy SRV GetDesc's 32-byte
+     overwrite of a 24-byte Windows structure. New objects retain device/resource owners;
+     private-data methods truthfully return E_NOTIMPL, not legacy no-op success.
+     Unforced raster state and compatible typed single-color-plane SRVs use existing
+     backend paths. Nonzero forced samples, MS/line-AA raster modes, planar/depth/stencil
+     extended SRVs, nonzero planes and raw/structured extended buffers remain unsupported.
+     Dimension/format/ownership/bind/range validation precedes allocation; invalid ranges
+     are not clamped into success. Device/context tables remain 43/115 and extended
+     creation is NOT installed in them. Details: docs/bd11-extended-objects.md.
+     Main all-source O2/O0/ASan+UBSan leak tests pass, including typed private-data failures,
+     guard-page descriptors/getter canaries, actual base SRV regression and rollback.
+     Build, state/multithread/creation/full input, editor and diff checks also pass
+     (/tmp/beer-ext-main-*.log). Genuine Direct2D retry remains at Device3 refusal and
+     HRESULT8899000b default/software (/tmp/beer-d2d-ext.log); no rendering success.
+   - 2026-11-28 real private data: existing D3D11 device slots34..36 and all child,
+     context/command-list slots4..6 now use typed GUID-keyed copied storage and actual
+     foreign IUnknown AddRef/Release, replacing no-op success and extended-child NOTIMPL.
+     Missing/undersized gets return NOT_FOUND/MORE_DATA with required size and no writes;
+     size queries do not AddRef. Getters pin entries across unlocked COM callbacks;
+     replacement is failure-atomic, removal/destruction releases outside the store mutex.
+     Final Release tombstones and detaches storage before callbacks/destruction. Tests cover
+     full keys/object isolation, blobs versus interfaces, empty versus absent keys, NULL
+     interface values, failure rollback, reentrant callbacks, concurrent replacement/getters
+     and final cleanup. Ordinary self-reference cycles remain caller responsibility.
+     DXGI forwarding ownership is still unsafe to share and is deliberately not wired.
+     Details: docs/bd11-private-data.md. Main O2/O0/ASan+UBSan leak tests, build,
+     extended/state/multithread/creation/full input, editor and diff checks pass
+     (/tmp/beer-private-main-*.log). No loader, VM or BD12 source edits by this task.
+     Genuine D2D probe still refuses Device3 at6335e with flags21/levelb000 and returns
+     HRESULT8899000b (/tmp/beer-d2d-private.log); this is not a rendering fix.
 
 Others not to forget:
 - RE9: run ended with ExitProcess(-1) at re9.exe+0x9ea20ce (ask whether user-initiated); exit crash after
@@ -1355,7 +1516,7 @@ with own glslc compute shaders (MinMip / MipRegionUsed R8 layouts); (6) clears/b
    (`BEER_BD12_LIST_BARRIER=list`), clear pre-drain (`CLEAR_SYNC=full`), every draw/dispatch serialized
    (`BEER_BD12_SYNC_ALL=1`), no driver disk cache (`__GL_SHADER_DISK_CACHE=0`), texel path (`BEER_BD12_SSBO=0`),
    per-draw binding (`BEER_BD12_ROOT_PUSH=0`), no scalar layout (`BEER_DXIL_SCALAR_LAYOUT=0`, new switch), newer
-   dxil-spirv 31871f3 (vkd3d HEAD pin; /mnt/hdd2/dxil-spirv-new), legacy structurizer (`BEER_DXIL_LEGACY_STRUCTURIZER=1`,
+   dxil-spirv 31871f3 (vkd3d HEAD pin; /mnt/hdd2/beer-tools/dxil-spirv-new), legacy structurizer (`BEER_DXIL_LEGACY_STRUCTURIZER=1`,
    new switch; output then matches vkd3d's dump 5590605fbcc2577a.spv: 9 loops, 193 phis), and the PRE-SESSION build
    (4556c21 worktree /mnt/hdd2/beer-prev) => not a BD12Perf regression; the old "RE8 RT hangs in 1-5 min" bug.
    GPU-side root-CBV snapshots (`BEER_BD12_SNAP_CS=1` + `BEER_BD12_TRACE_CS=<hash>`, dumped on SIGUSR1): the hung
@@ -1458,10 +1619,10 @@ placement, barriers, shader translation), then fix that. No per-game hacks, caps
 **Rule 3: measured against Proton.** Each game has a fixed save/spot with Proton numbers (fps, GPU W/load, RAM, VRAM).
 Claims of "faster" or "fixed" need those numbers.
 
-0. **Session start:** keep a read-only reference clone of vkd3d-proton at `/mnt/hdd2/ref/vkd3d-proton` (outside the Beer
+0. **Session start:** keep a read-only reference clone of vkd3d-proton at `/mnt/hdd2/beer-tools/ref/vkd3d-proton` (outside the Beer
    tree). It is a guide for design and behaviour only: never copy its code into Beer (user's rule; LGPL). Before any perf
    change, compare how vkd3d-proton handles that case structurally.
-1. **Finish the base:** dxil-spirv 2.78 in third_party (built at /mnt/hdd2/dxil-spirv-new) + storage-buffer mode default.
+1. **Finish the base:** dxil-spirv 2.78 in third_party (built at /mnt/hdd2/beer-tools/dxil-spirv-new) + storage-buffer mode default.
    Done = RE8, RE9, RE4, PRAGMATA, GoT title render correctly, no Xid. Then commit.
    - 2026-11-11 evening: third_party/dxil-spirv is now 7506dc1 (2.78.0; old 2.75.0 .so kept beside it, old revision
      8434b06). SSBO mode is the default (`BEER_BD12_SSBO=0` = old texel path). Policy (layout hash ssbo_heap=3): every
@@ -6543,7 +6704,7 @@ Other findings:
 - **RE9 with SSBO mode crashed in dxil-spirv:** `[DXIL] Fatal, detected infinite loop.` then abort() (cfg_structurizer
   `process_switch_blocks`). Shaders with 64-bit raw loads now convert fully and reach the structurizer for the first time.
   - Upstream dxil-spirv master (7506dc1, 2.78.0, 66 commits after Beer's 8434b06 / 2.75.0) built at
-    `/mnt/hdd2/dxil-spirv-new/build/libdxil-spirv-c-shared.so.2.78.0` (git worktree of third_party/dxil-spirv). With
+    `/mnt/hdd2/beer-tools/dxil-spirv-new/build/libdxil-spirv-c-shared.so.2.78.0` (git worktree of third_party/dxil-spirv). With
     `BEER_DXIL_SPIRV_LIBRARY=<that>` RE9 runs in SSBO mode: no structurizer abort, root push 600/600 compute
     pipelines, no Xid; user: "works fine". In-game fps vs the 62 fps baseline not measured yet.
   - Safety net (d3d12_dxil_translator.c): conversions run with a per-thread SIGABRT jump (`guarded_converter_run`), so

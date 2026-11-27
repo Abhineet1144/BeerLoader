@@ -418,7 +418,9 @@ BD12Image *bd12_image_create_sparse(BD12Device *device, const BD12ImageDesc *des
             VkResult result = device->vk.CreateFence(device->device, &fence_info, NULL, &fence);
             if (result == VK_SUCCESS) {
                 beer_vulkan_queue_lock();
-                result = device->vk.QueueBindSparse(device->queue, 1, &bind, fence);
+                beer_vulkan_queue_trace_enter(device->queue, "bd12 opaque sparse bind");
+    result = device->vk.QueueBindSparse(device->queue, 1, &bind, fence);
+    beer_vulkan_queue_trace_leave(device->queue);
                 beer_vulkan_queue_unlock();
                 if (result == VK_SUCCESS)
                     result = device->vk.WaitForFences(device->device, 1, &fence, VK_TRUE, UINT64_MAX);

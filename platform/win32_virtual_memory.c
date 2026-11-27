@@ -449,13 +449,14 @@ void *beer_virtual_alloc_aligned(size_t size, size_t alignment, uint32_t allocat
 
 int beer_virtual_free(void *address, size_t size, uint32_t free_type)
 {
-    if (!address) return 0;
+    if (!address) { errno = EINVAL; return 0; }
     if (free_type == BEER_MEM_RELEASE) {
-        if (size != 0) return 0;
+        if (size != 0) { errno = EINVAL; return 0; }
         pthread_mutex_lock(&g_allocation_mutex);
         BeerAllocation *allocation = find_allocation_locked(address);
         if (!allocation || allocation->base != address) {
             pthread_mutex_unlock(&g_allocation_mutex);
+            errno = EINVAL;
             return 0;
         }
         void *base = allocation->base;
@@ -467,18 +468,38 @@ int beer_virtual_free(void *address, size_t size, uint32_t free_type)
         beer_vm_unmap_bottom_up(base, allocation_size);
         return 1;
     }
-    if (free_type == BEER_MEM_DECOMMIT && size) {
+    if (free_type == BEER_MEM_DECOMMIT) {
         size_t page = page_size();
         uintptr_t base = align_down((uintptr_t)address, page);
         size_t prefix = (uintptr_t)address - base;
-        if (size > SIZE_MAX - prefix) return 0;
+        if (size > SIZE_MAX - prefix) { errno = EINVAL; return 0; }
         size_t length = align_up_size(prefix + size, page);
-        if (!length) return 0;
+        if (size && !length) { errno = EINVAL; return 0; }
         pthread_mutex_lock(&g_allocation_mutex);
         BeerAllocation *allocation = find_allocation_locked((void *)base);
-        if (!allocation || length > allocation->size - (base - (uintptr_t)allocation->base) ||
-            mprotect((void *)base, length, PROT_NONE) != 0) {
+        /* A zero size decommits the entire reservation only when the caller
+         * supplies its exact allocation base. The reservation remains owned. */
+        if (!size) {
+            if (!allocation || allocation->base != address) {
+                pthread_mutex_unlock(&g_allocation_mutex);
+                errno = EINVAL;
+                return 0;
+            }
+            length = allocation->size;
+        }
+        if (!allocation || length > allocation->size - (base - (uintptr_t)allocation->base)) {
+            if (getenv("BEER_VM_FREE_DIAGNOSTICS"))
+                fprintf(stderr, "[VM DECOMMIT RANGE] address=%p length=%#zx allocation=%p size=%#zx\n",
+                        (void *)base, length, allocation ? allocation->base : NULL,
+                        allocation ? allocation->size : 0);
             pthread_mutex_unlock(&g_allocation_mutex);
+            errno = EINVAL;
+            return 0;
+        }
+        if (mprotect((void *)base, length, PROT_NONE) != 0) {
+            const int error = errno;
+            pthread_mutex_unlock(&g_allocation_mutex);
+            errno = error;
             return 0;
         }
         (void)madvise((void *)base, length, MADV_DONTNEED);
@@ -487,6 +508,7 @@ int beer_virtual_free(void *address, size_t size, uint32_t free_type)
         pthread_mutex_unlock(&g_allocation_mutex);
         return 1;
     }
+    errno = EINVAL;
     return 0;
 }
 
@@ -675,4 +697,13 @@ void beer_virtual_memory_reset(void)
     g_allocation_count = 0;
     g_beer_vm_live_bytes = 0;
     pthread_mutex_unlock(&g_allocation_mutex);
+}
+
+/* Diagnostics (BEER_MEM_PROF): live VirtualAlloc reservations and their mapped bytes. */
+size_t beer_virtual_live_count(void)
+{
+    pthread_mutex_lock(&g_allocation_mutex);
+    const size_t n = g_allocation_count;
+    pthread_mutex_unlock(&g_allocation_mutex);
+    return n;
 }

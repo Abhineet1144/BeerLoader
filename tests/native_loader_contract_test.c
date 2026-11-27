@@ -6,6 +6,7 @@
 #include <assert.h>
 #include "pe_version_fixture.h"
 #include "wow32_dll_contract.inc"
+#include "wic_bitmap_contract.inc"
 
 static int native_veh_calls;
 static void crypt_binary_to_string_contract_test(void)
@@ -607,10 +608,11 @@ static void worker_stack_reservation_test(void)
     assert(!thread_reserve_stack(&t) && t.stack && t.guest_stack_own);
     u8 *base = t.stack, *top = base + t.stack_size;
     BeerMemoryBasicInformation info;
-    assert(beer_virtual_query(base, &info, sizeof(info)) && info.state == BEER_MEM_COMMIT &&
-        info.protect == BEER_PAGE_NOACCESS && info.region_size == 0x1000);
-    assert(beer_virtual_query(base + 0x1000, &info, sizeof(info)) && info.state == BEER_MEM_RESERVE &&
+    assert(beer_virtual_query(base, &info, sizeof(info)) && info.state == BEER_MEM_RESERVE &&
         info.allocation_base == (u64)(uintptr_t)base && info.region_size == 0x10000);
+    assert(beer_virtual_query(base + 0x10000, &info, sizeof(info)) && info.state == BEER_MEM_COMMIT &&
+        info.protect == BEER_PAGE_NOACCESS && info.region_size == 0x1000 &&
+        info.allocation_base == (u64)(uintptr_t)base);
     assert(beer_virtual_query(base + 0x11000, &info, sizeof(info)) && info.state == BEER_MEM_COMMIT &&
         info.allocation_base == (u64)(uintptr_t)base && info.protect == BEER_PAGE_READWRITE &&
         info.base_address + info.region_size == (u64)(uintptr_t)top);
@@ -2313,6 +2315,7 @@ int main(void)
     window_property_contract_test();
     gdi_icon_contract_test();
     gdi_readback_contract_test();
+    wic_bitmap_contract_test();
     wow32_dib_contract_test();
     process_security_contract_test();
     wow32_named_resource_contract_test();

@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #include "vulkan_context.h"
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <stdatomic.h>
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -412,14 +415,16 @@ int beer_vulkan_context_initialize(void)
     if (!g_context.physical_device) goto fail;
 
     stage = "shared logical device";
-    /* BEER_BD12_MULTI_QUEUE=1: extra queues of the same family so D3D12 compute and copy queues run beside the
+    /* Multi-queue (default; BEER_BD12_MULTI_QUEUE=0 turns it off): extra queues of the same family so D3D12 compute and copy queues run beside the
      * direct queue (vkd3d-proton gives each D3D12 queue its own VkQueue). Same family: command pools, resource
      * sharing and barrier stages stay valid on every queue. */
     static const float priorities[BEER_VULKAN_MAX_QUEUES] = { 1.0f, 1.0f, 1.0f };
     uint32_t want_queues = 1;
     {
+        /* Default on since 2026-11-28 (RE9, RE8, Onimusha, Ghost of Tsushima tested); BEER_BD12_MULTI_QUEUE=0 restores one
+         * queue for everything. */
         const char *multi = getenv("BEER_BD12_MULTI_QUEUE");
-        if (multi && *multi && *multi != '0') want_queues = BEER_VULKAN_MAX_QUEUES;
+        if (!(multi && *multi == '0')) want_queues = BEER_VULKAN_MAX_QUEUES;
         if (want_queues > g_context.queue_family_size) want_queues = g_context.queue_family_size;
         if (!want_queues) want_queues = 1;
     }
@@ -1005,6 +1010,8 @@ int beer_vulkan_context_initialize(void)
     g_context.queues[0] = g_context.queue;
     for (uint32_t i = 1; i < want_queues; ++i)
         g_context.GetDeviceQueue(g_context.device, g_context.queue_family, i, &g_context.queues[i]);
+    for (uint32_t i = 0; i < want_queues; ++i)
+        fprintf(stderr, "[VULKAN] queue %u = VkQueue %p (family %u)\n", i, (void *)g_context.queues[i], g_context.queue_family);
     g_context.queue_count = want_queues;
     if (g_context.timeline_semaphore) {
         VkSemaphoreTypeCreateInfo timeline_type = {
@@ -1173,8 +1180,81 @@ PFN_vkGetDeviceProcAddr beer_vulkan_get_device_proc_addr(void)
 {
     return g_context.GetDeviceProcAddr;
 }
+#include <execinfo.h>
+static struct { void *queue; _Atomic long tid; const char *_Atomic who; } g_qtrace[16];
+static int qtrace_on(void) { static int on = -1; if (on < 0) on = getenv("BEER_VK_QUEUE_TRACE") != NULL; return on; }
+static int qtrace_slot(void *queue)
+{
+    for (int i = 0; i < 16; ++i) {
+        void *cur = __atomic_load_n(&g_qtrace[i].queue, __ATOMIC_ACQUIRE);
+        if (cur == queue) return i;
+        if (!cur) {
+            void *expected = NULL;
+            if (__atomic_compare_exchange_n(&g_qtrace[i].queue, &expected, queue, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ||
+                expected == queue) return i;
+        }
+    }
+    return -1;
+}
+void beer_vulkan_queue_trace_enter(void *queue, const char *who)
+{
+    if (!qtrace_on() || !queue) return;
+    const int i = qtrace_slot(queue);
+    if (i < 0) return;
+    const long me = (long)syscall(SYS_gettid);
+    long expected = 0;
+    if (atomic_compare_exchange_strong(&g_qtrace[i].tid, &expected, me)) { atomic_store(&g_qtrace[i].who, who); return; }
+    static _Atomic unsigned reports;
+    if (atomic_fetch_add(&reports, 1) < 16) {
+        fprintf(stderr, "[QUEUE RACE] VkQueue %p: %s (tid %ld) entered while %s (tid %ld) is inside\n", queue, who, me,
+                atomic_load(&g_qtrace[i].who) ? atomic_load(&g_qtrace[i].who) : "?", expected);
+        void *frames[16];
+        backtrace_symbols_fd(frames, backtrace(frames, 16), 2);
+    }
+    while (!atomic_compare_exchange_weak(&g_qtrace[i].tid, &(long){0}, me)) {}   /* then wait our turn */
+    atomic_store(&g_qtrace[i].who, who);
+}
+void beer_vulkan_queue_trace_leave(void *queue)
+{
+    if (!qtrace_on() || !queue) return;
+    const int i = qtrace_slot(queue);
+    if (i >= 0) atomic_store(&g_qtrace[i].tid, 0);
+}
 void beer_vulkan_queue_lock(void) { pthread_mutex_lock(&g_queue_lock); }
 void beer_vulkan_queue_unlock(void) { pthread_mutex_unlock(&g_queue_lock); }
+/* 1 when every queue must be held across a present: more than one queue and an overlay layer in the process.
+ * BEER_PRESENT_LOCK_ALL=1/0 forces it on/off. */
+static int present_locks_all(void)
+{
+    static int all = -1;
+    if (all >= 0) return all;
+    const char *v = getenv("BEER_PRESENT_LOCK_ALL");
+    if (v && *v) all = *v != '0';
+    else {
+        static const char *const overlays[] = { "libMangoHud.so", "libMangoHud_shim.so", "libVkLayer_obs_vkcapture.so",
+                                                "libobs_vkcapture.so", "gameoverlayrenderer.so" };
+        all = 0;
+        for (size_t i = 0; i < sizeof(overlays) / sizeof(overlays[0]) && !all; ++i) {
+            void *h = dlopen(overlays[i], RTLD_NOW | RTLD_NOLOAD);
+            if (h) { all = 1; dlclose(h); fprintf(stderr, "[VULKAN] overlay layer %s loaded: presents hold every queue\n", overlays[i]); }
+        }
+    }
+    return all;
+}
+void beer_vulkan_queue_lock_present(void)
+{
+    const uint32_t count = beer_vulkan_queue_count();
+    pthread_mutex_lock(&g_queue_lock);
+    if (count > 1 && present_locks_all())
+        for (uint32_t i = 1; i < count; ++i) pthread_mutex_lock(&g_queue_locks[i]);
+}
+void beer_vulkan_queue_unlock_present(void)
+{
+    const uint32_t count = beer_vulkan_queue_count();
+    if (count > 1 && present_locks_all())
+        for (uint32_t i = count; i-- > 1;) pthread_mutex_unlock(&g_queue_locks[i]);
+    pthread_mutex_unlock(&g_queue_lock);
+}
 uint32_t beer_vulkan_queue_count(void) { return g_context.queue_count ? g_context.queue_count : 1; }
 
 /* vkDeviceWaitIdle needs host access to every queue of the device (external synchronization): BD12 submits on
@@ -1236,8 +1316,10 @@ uint64_t beer_vulkan_timeline_submit(const VkCommandBuffer *commands,
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &g_context.timeline
     };
+    beer_vulkan_queue_trace_enter(g_context.queue, "context timeline submit");
     VkResult result = g_context.QueueSubmit(g_context.queue, 1, &submit,
                                              VK_NULL_HANDLE);
+    beer_vulkan_queue_trace_leave(g_context.queue);
     beer_vulkan_queue_unlock();
     beer_vulkan_record_result(result, "timeline queue submission");
     return result == VK_SUCCESS ? value : 0;

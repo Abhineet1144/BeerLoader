@@ -85,6 +85,7 @@ typedef struct ComLane {
     BD12Fence *retire;
     uint64_t submitted;           /* serial of the lane's newest submission (atomic) */
     uint64_t sparse_wait;         /* a sparse bind's serial the lane's next submission must wait for (submit_lock) */
+    BD12Fence *sparse_fence;      /* the timeline that serial is on (NULL: this lane's retire) */
 } ComLane;
 
 struct ComDevice {
@@ -205,7 +206,10 @@ typedef struct ComFence {
     BD12Fence *fence;
     uint32_t polls;              /* diagnostic (BEER_FENCE_DIAGNOSTICS): GetCompletedValue calls */
     uint64_t last_signal;        /* diagnostic: the last value a queue or the CPU signalled */
-    uint64_t sig_value[16], sig_ns[16];   /* diagnostic (BEER_FENCE_LATENCY): when queue Signals went to the GPU */
+    uint64_t sig_value[16], sig_ns[16], sig_call_ns[16];   /* diagnostic (BEER_FENCE_LATENCY): when queue Signals went to the GPU */
+    uint64_t claim_value, claim_ns;   /* diagnostic (BEER_FENCE_LATENCY): last Signal that reached Beer's submit */
+    int claim_by;                 /* -1 CPU Signal, else the D3D12 queue type that signalled */
+    long claim_tid;               /* host thread that called that Signal */
 } ComFence;
 
 /* ID3D12StateObject (+ ID3D12StateObjectProperties as an embedded second interface). */
