@@ -177,6 +177,12 @@ generic, loader.c):
   and opens manager/invite_prompt.py; Join posts GameLobbyJoinRequested_t (333), which Pratfall handles
   (SteamNetworkLobbyManager.OnGameLobbyJoinRequested). Not yet: an invite while the game is closed (Pratfall also
   accepts "+connect_lobby <id>" at launch - the manager could offer that). Untested with a real invite.
+- **Invite accepted end to end (2026-11-28)**: friend's invite (MMS, correct field order) -> provider -> Join window ->
+  joined the lobby. Then "Stack overflow." (0xc0000409) on a CoreCLR worker: VERSION.dll!GetFileVersionInfoSizeExW
+  missing -> delay-load exception -> during its dispatch RSP was on the guest stack while the TEB stack bounds still
+  described the host call stack ("RSP outside!"), so CoreCLR saw an overflow. Added GetFileVersionInfo(Size)Ex(A|W).
+  OPEN: the TEB-bounds mismatch during RaiseException dispatch itself (any other delay-load miss can hit it; suspect
+  seh_call_handler_on_guest_stack's "too close to the guest stack limit" branch or VEH run on the host stack).
 - Friend invites (2026-11-26): provider keeps the friends list (EMsg 767/766, requests 815), ops `friends` and
   `invite_lobby` (MMS 6621 + FriendMessages.SendMessage "[lobbyinvite appid=.. lobbyid=..][/lobbyinvite]");
   ISteamFriends slot 33 ActivateGameOverlayInviteDialog opens manager/invite_picker.py (GTK) and posts

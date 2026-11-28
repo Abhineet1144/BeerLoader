@@ -21600,6 +21600,23 @@ impl_GetFileVersionInfoA(const char *path, u32 handle, u32 length, u8 *buffer)
     return impl_GetFileVersionInfoW(wide, handle, length, buffer);
 }
 
+/* The Ex forms (Vista+) add flags first: FILE_VER_GET_LOCALISED / _NEUTRAL / _PREFETCHED only select which resource
+ * language and how the file is read, and Beer returns the one version resource the file has. .NET's FileVersionInfo
+ * calls GetFileVersionInfoSizeExW through a delay-load import; the missing export raised the delay-load exception in
+ * Pratfall after joining a lobby, and its dispatch ended in "Stack overflow". */
+static u64 __attribute__((ms_abi))
+impl_GetFileVersionInfoSizeExW(u32 flags, const u16 *path, u32 *handle)
+    { (void)flags; return impl_GetFileVersionInfoSizeW(path, handle); }
+static u64 __attribute__((ms_abi))
+impl_GetFileVersionInfoSizeExA(u32 flags, const char *path, u32 *handle)
+    { (void)flags; return impl_GetFileVersionInfoSizeA(path, handle); }
+static u64 __attribute__((ms_abi))
+impl_GetFileVersionInfoExW(u32 flags, const u16 *path, u32 handle, u32 length, u8 *buffer)
+    { (void)flags; return impl_GetFileVersionInfoW(path, handle, length, buffer); }
+static u64 __attribute__((ms_abi))
+impl_GetFileVersionInfoExA(u32 flags, const char *path, u32 handle, u32 length, u8 *buffer)
+    { (void)flags; return impl_GetFileVersionInfoA(path, handle, length, buffer); }
+
 static u64 __attribute__((ms_abi))
 impl_VerQueryValueW(const u8 *block, const u16 *sub_block, const void **value, u32 *length)
 {
@@ -32075,6 +32092,10 @@ static ImplEntry g_impls[] = {
     {"GetFileVersionInfoSizeA",               (ImplFn)impl_GetFileVersionInfoSizeA},
     {"GetFileVersionInfoW",                   (ImplFn)impl_GetFileVersionInfoW},
     {"GetFileVersionInfoA",                   (ImplFn)impl_GetFileVersionInfoA},
+    {"GetFileVersionInfoSizeExW",             (ImplFn)impl_GetFileVersionInfoSizeExW},
+    {"GetFileVersionInfoSizeExA",             (ImplFn)impl_GetFileVersionInfoSizeExA},
+    {"GetFileVersionInfoExW",                 (ImplFn)impl_GetFileVersionInfoExW},
+    {"GetFileVersionInfoExA",                 (ImplFn)impl_GetFileVersionInfoExA},
     {"VerQueryValueW",                        (ImplFn)impl_VerQueryValueW},
     {"VerQueryValueA",                        (ImplFn)impl_VerQueryValueA},
     {"PathFileExistsA",                       (ImplFn)impl_PathFileExistsA},
