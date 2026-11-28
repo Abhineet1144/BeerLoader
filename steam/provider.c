@@ -482,6 +482,8 @@ static void on_friend_message(uint64_t from, const uint8_t *text, size_t len)
 
 static void on_incoming_chat(uint32_t emsg, const uint8_t *body, size_t len)
 {
+    /* Which notifications reach this session (names only), to see how a friend's invite arrives. */
+    fprintf(stderr, "[STEAM] incoming %s (%zu bytes)\n", emsg == EMSG_SERVICE_METHOD ? cm_job_name() : "ClientFriendMsgIncoming", len);
     if (emsg == EMSG_SERVICE_METHOD && strcmp(cm_job_name(), "FriendMessagesClient.IncomingMessage#1")) return;
     PbReader r = { body, body + len };
     PbField f;
@@ -494,6 +496,12 @@ static void on_incoming_chat(uint32_t emsg, const uint8_t *body, size_t len)
         else if (f.field == 4 && f.type == PB_BYTES) { text = f.data; text_len = f.len; }
         else if (f.field == 7 && emsg == EMSG_SERVICE_METHOD) echo = f.value != 0;
     }
+    int type = 0;
+    PbField t;
+    if (pb_find(body, len, 2, &t)) type = (int)(int32_t)t.value;
+    fprintf(stderr, "[STEAM] friend message from %llu: entry type %d, %zu chars, echo %d, lobby invite tag %s\n",
+            (unsigned long long)from, type, text_len, echo,
+            text && memmem(text, text_len, "[lobbyinvite", 12) ? "yes" : "no");
     if (from && text && !echo) on_friend_message(from, text, text_len);
 }
 
@@ -505,7 +513,13 @@ static void on_message(void *context, uint32_t emsg, const uint8_t *body, size_t
     if (emsg == EMSG_SERVICE_METHOD || emsg == EMSG_CLIENT_FRIEND_MSG_INCOMING) { on_incoming_chat(emsg, body, len); return; }
     if (emsg == EMSG_CLIENT_FRIENDS_LIST) { on_friends_list(body, len); return; }
     if (emsg == EMSG_CLIENT_PERSONA_STATE) { on_persona_state(body, len); return; }
-    if (emsg >= 6601u && emsg <= 6627u) { broadcast_mms_event(emsg, body, len); return; }
+    if (emsg >= 6601u && emsg <= 6627u) {
+        if (emsg == 6621u) fprintf(stderr, "[STEAM] matchmaking invite message received (%zu bytes)\n", len);
+        broadcast_mms_event(emsg, body, len);
+        return;
+    }
+    if (emsg != 5434u && emsg != 5435u && emsg != EMSG_CLIENT_PERSONA_STATE && emsg != EMSG_CLIENT_FRIENDS_LIST)
+        fprintf(stderr, "[STEAM] unsolicited EMsg %u (%zu bytes)\n", emsg, len);
     if (emsg == 5434u || emsg == 5435u) { broadcast_p2p_event(emsg, body, len); return; }
     if (emsg == EMSG_CLIENT_GAME_CONNECT_TOKENS) {
         PbReader r = { body, body + len };
@@ -1582,11 +1596,11 @@ static void emit_friends(const char *id)
     free(list);
 }
 
-/* A lobby invite as the Steam client sends it for ISteamMatchmaking::InviteUserToLobby: the matchmaking server is
- * told (CMsgClientMMSInviteToLobby, EMsg 6621: uint32 app_id = 1; fixed64 steam_id_user_invited = 2;
- * fixed64 steam_id_lobby = 3), and the friend gets a chat message with a [lobbyinvite] tag, which their Steam
- * shows as an invite with a Join button (FriendMessages.SendMessage: fixed64 steamid = 1; int32 chat_entry_type
- * = 2 (ChatMsg); string message = 3; bool contains_bbcode = 4). */
+/* A lobby invite as the Steam client sends it for ISteamMatchmaking::InviteUserToLobby: CMsgClientMMSInviteToLobby
+ * (EMsg 6621: uint32 app_id = 1; fixed64 steam_id_lobby = 2; fixed64 steam_id_user_invited = 3) to the matchmaking
+ * server, which checks the sender is in the lobby and delivers the invite to the friend itself (their Steam shows it
+ * with a Join button). A "[lobbyinvite ...]" chat message sent by a client is not an invite: Steam strips the tag and
+ * delivers an empty message. */
 static void handle_invite_lobby(const char *op, const char *id, const char *line)
 {
     char appid_text[16] = "", lobby_text[32] = "", friend_text[32] = "", idj[140];
@@ -1598,35 +1612,16 @@ static void handle_invite_lobby(const char *op, const char *id, const char *line
     json_escape(idj, sizeof(idj), id);
     if (!session_app_allowed(op, id, appid)) return;
     if (!lobby || !friend_id) { game_error(op, id, "a lobby and a friend are required"); return; }
-
     PbBuf mms = {0};
     pb_u64(&mms, 1, appid);
-    pb_fixed64(&mms, 2, friend_id);
-    pb_fixed64(&mms, 3, lobby);
-    const int mms_sent = cm_send_routed(g.cm, 6621u, &mms, appid);
+    pb_fixed64(&mms, 2, lobby);
+    pb_fixed64(&mms, 3, friend_id);
+    const int sent = cm_send_routed(g.cm, 6621u, &mms, appid);
     pb_free(&mms);
-
-    char text[160];
-    snprintf(text, sizeof(text), "[lobbyinvite appid=\"%u\" lobbyid=\"%llu\"][/lobbyinvite]", appid,
-             (unsigned long long)lobby);
-    PbBuf request = {0}, response = {0};
-    pb_fixed64(&request, 1, friend_id);
-    pb_i32(&request, 2, 1);
-    pb_string(&request, 3, text);
-    pb_u64(&request, 4, 1);
-    int eresult = 0;
-    const int answered = cm_call(g.cm, "FriendMessages.SendMessage#1", &request, 1, 15000, &response, &eresult);
-    pb_free(&request);
-    pb_free(&response);
-    if (!answered || eresult != ERESULT_OK) {
-        char error[160];
-        snprintf(error, sizeof(error), "Steam did not deliver the invite message (%s)",
-                 answered ? cm_eresult_name(eresult) : "no answer");
-        game_error(op, id, error);
-        return;
-    }
-    emit("{\"event\":\"invite_lobby\",\"id\":\"%s\",\"ok\":true,\"matchmaking\":%s}", idj,
-         mms_sent ? "true" : "false");
+    if (!sent) { game_error(op, id, "not connected to Steam"); return; }
+    fprintf(stderr, "[STEAM] lobby invite sent: app %u lobby %llu friend %llu\n", appid, (unsigned long long)lobby,
+            (unsigned long long)friend_id);
+    emit("{\"event\":\"invite_lobby\",\"id\":\"%s\",\"ok\":true}", idj);
 }
 
 /* Signaling that arrives for this account goes to every game client; each keeps what is for its own app. */

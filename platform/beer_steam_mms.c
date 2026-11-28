@@ -985,8 +985,8 @@ int beer_mms_invite(uint64_t lobby, uint64_t user)
     if (!beer_mms_ready() || !lobby || !user) return 0;
     Pb body = { 0 };
     pb_u(&body, 1, g.appid);
-    pb_f64(&body, 2, user);    /* steam_id_user_invited */
-    pb_f64(&body, 3, lobby);   /* steam_id_lobby */
+    pb_f64(&body, 2, lobby);   /* steam_id_lobby */
+    pb_f64(&body, 3, user);    /* steam_id_user_invited */
     int ok = g.io.send(g.appid, MMS_INVITE_TO_LOBBY, body.d, body.n);
     free(body.d);
     return ok;

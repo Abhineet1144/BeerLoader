@@ -180,8 +180,11 @@ generic, loader.c):
 - Friend invites (2026-11-26): provider keeps the friends list (EMsg 767/766, requests 815), ops `friends` and
   `invite_lobby` (MMS 6621 + FriendMessages.SendMessage "[lobbyinvite appid=.. lobbyid=..][/lobbyinvite]");
   ISteamFriends slot 33 ActivateGameOverlayInviteDialog opens manager/invite_picker.py (GTK) and posts
-  GameOverlayActivated (331) open/close; InviteUserToLobby goes through the provider too. Fixed beer_mms_invite
-  field order (2 = invited user, 3 = lobby). Picker opens (user-confirmed); delivery to a friend not yet verified.
+  GameOverlayActivated (331) open/close; InviteUserToLobby goes through the provider too. CORRECTION 2026-11-28:
+  CMsgClientMMSInviteToLobby is app_id = 1, steam_id_lobby = 2, steam_id_user_invited = 3 (checked against
+  steam-user's protobufs) - the original order was right and my "fix" broke it; restored. The provider no longer
+  sends a "[lobbyinvite]" chat message: Steam strips client-written invite tags and delivers an EMPTY message (seen
+  on the receiving side), so invites rely on the MMS server.
 - (superseded) Manager entry must use prefix `pratfall` (the `default` prefix lacks the GameOverlayRenderer64.dll link ->
   "Failed to load steam overlay dll"). Tests: test-input, test-native-loader, test-steam pass.
 
