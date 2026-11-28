@@ -127,6 +127,8 @@
     {"MessageBoxA", (ImplFn)beer_MessageBoxA},
     {"MessageBoxExA", (ImplFn)beer_MessageBoxExA},
     {"MessageBoxExW", (ImplFn)beer_MessageBoxExW},
+    {"MessageBoxTimeoutA", (ImplFn)beer_MessageBoxTimeoutA},
+    {"MessageBoxTimeoutW", (ImplFn)beer_MessageBoxTimeoutW},
     {"FindWindowW", (ImplFn)stub_FindWindowW},
     {"GetClassNameW", (ImplFn)stub_GetClassNameW},
     {"DefFrameProcW", (ImplFn)stub_DefFrameProcW},

@@ -2275,6 +2275,8 @@ int main(void)
     assert(!impl_GetProcAddress(HMOD_USER32, "BeerAbsentExportTest") && g_last_error == 127);
     assert(fake_pe_export_address(HMOD_USER32, "MessageBoxA"));
     assert(fake_pe_export_address(HMOD_USER32, "MessageBoxW"));
+    assert(fake_pe_export_address(HMOD_USER32, "MessageBoxTimeoutA"));
+    assert(fake_pe_export_address(HMOD_USER32, "MessageBoxTimeoutW"));
     assert(g_nstubs == before_missing_lookup);
     FakePeModule *native = fake_pe_module_from_base(HMOD_NTDLL);
     assert(fake_pe_export_address(HMOD_NTDLL, "RtlAddVectoredExceptionHandler"));

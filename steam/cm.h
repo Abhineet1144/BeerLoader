@@ -87,6 +87,9 @@ uint32_t cm_cell_id(Cm *cm);
 uint32_t cm_public_ip(Cm *cm);
 /* Seconds since the current logon. */
 uint32_t cm_logon_age(Cm *cm);
+/* Inside a CmHandler call: the service method a notification is for (EMsg 146, for example
+ * "FriendMessagesClient.IncomingMessage#1"), "" otherwise. */
+const char *cm_job_name(void);
 /* Sends a message without waiting for a reply. */
 int cm_send(Cm *cm, uint32_t emsg, const PbBuf *body);
 /* As cm_request / cm_send, with CMsgProtoBufHeader.routing_appid set (app-scoped services such as

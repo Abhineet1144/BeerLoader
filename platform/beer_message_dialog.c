@@ -1,10 +1,15 @@
 #include "beer_message_dialog.h"
 
 #include <dlfcn.h>
+#include <errno.h>
+#include <limits.h>
+#include <poll.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Xlib is loaded at run time, as in xwayland_backend.c, so the loader neither
  * links libX11 nor needs its headers. Only the 64-bit Xlib ABI pieces used here
@@ -48,6 +53,8 @@ static struct {
     int (*SelectInput)(Display *, Window, long);
     int (*MapRaised)(Display *, Window);
     int (*NextEvent)(Display *, XEvent *);
+    int (*Pending)(Display *);
+    int (*ConnectionNumber)(Display *);
     GC (*CreateGC)(Display *, Window, unsigned long, void *);
     int (*FreeGC)(Display *, GC);
     int (*SetForeground)(Display *, GC, unsigned long);
@@ -90,6 +97,8 @@ static int dialog_load(void)
     LOAD(SelectInput, "XSelectInput");
     LOAD(MapRaised, "XMapRaised");
     LOAD(NextEvent, "XNextEvent");
+    LOAD(Pending, "XPending");
+    LOAD(ConnectionNumber, "XConnectionNumber");
     LOAD(CreateGC, "XCreateGC");
     LOAD(FreeGC, "XFreeGC");
     LOAD(SetForeground, "XSetForeground");
@@ -181,9 +190,30 @@ static void draw_buttons(const DialogLayout *d)
     x.Flush(d->display);
 }
 
-int beer_message_dialog(const char *title, const char *text, const int *ids,
+static uint64_t dialog_now_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static int dialog_wait_event(Display *display, uint64_t deadline)
+{
+    struct pollfd fd = { .fd = x.ConnectionNumber(display), .events = POLLIN };
+    for (;;) {
+        uint64_t now = dialog_now_ms();
+        if (now >= deadline) return 0;
+        if (x.Pending(display)) return 1;
+        uint64_t remaining = deadline - now;
+        int rc = poll(&fd, 1, remaining > INT_MAX ? INT_MAX : (int)remaining);
+        if (rc < 0 && errno != EINTR) return -1;
+        if (rc > 0 && (fd.revents & (POLLERR | POLLHUP | POLLNVAL))) return -1;
+    }
+}
+
+static int message_dialog(const char *title, const char *text, const int *ids,
                         const char *const *labels, int count, int default_index,
-                        int cancel_index)
+                        int cancel_index, unsigned timeout_ms)
 {
     if (count <= 0 || count > 8) return -1;
     pthread_mutex_lock(&g_dialog_lock);
@@ -251,7 +281,16 @@ int beer_message_dialog(const char *title, const char *text, const int *ids,
         }
     }
     int chosen = -1;
+    int result = -1;
+    const uint64_t deadline = timeout_ms == UINT32_MAX ? 0 : dialog_now_ms() + timeout_ms;
     while (chosen < 0) {
+        if (deadline) {
+            int ready = dialog_wait_event(display, deadline);
+            if (ready <= 0) {
+                result = ready == 0 ? 32000 /* IDTIMEOUT */ : -1;
+                break;
+            }
+        }
         XEvent event;
         x.NextEvent(display, &event);
         const char *e = (const char *)event.pad;
@@ -285,10 +324,18 @@ int beer_message_dialog(const char *title, const char *text, const int *ids,
     x.DestroyWindow(display, window);
     x.CloseDisplay(display);
     pthread_mutex_unlock(&g_dialog_lock);
-    return ids[chosen];
+    return chosen >= 0 ? ids[chosen] : result;
 }
 
-int beer_message_box_dialog(const char *title, const char *text, unsigned type)
+int beer_message_dialog(const char *title, const char *text, const int *ids,
+                        const char *const *labels, int count, int default_index,
+                        int cancel_index)
+{
+    return message_dialog(title, text, ids, labels, count, default_index, cancel_index, UINT32_MAX);
+}
+
+int beer_message_box_dialog_timeout(const char *title, const char *text, unsigned type,
+                                    unsigned timeout_ms)
 {
     /* BEER_NO_DIALOGS=1 (diagnostic, unattended runs): show nothing; callers fall back to the type's default.
      * BEER_NO_DIALOGS=default: show nothing and answer with the dialog's default button, as pressing Enter would. */
@@ -314,6 +361,11 @@ int beer_message_box_dialog(const char *title, const char *text, unsigned type)
     int default_index = (int)((type >> 8) & 0xf);   /* MB_DEFBUTTON1..4 = 0x000, 0x100, 0x200, 0x300 */
     if (default_index >= sets[kind].count) default_index = 0;
     if (quiet == 2) return sets[kind].ids[default_index];
-    return beer_message_dialog(title, text, sets[kind].ids, sets[kind].labels, sets[kind].count,
-                               default_index, sets[kind].cancel);
+    return message_dialog(title, text, sets[kind].ids, sets[kind].labels, sets[kind].count,
+                          default_index, sets[kind].cancel, timeout_ms);
+}
+
+int beer_message_box_dialog(const char *title, const char *text, unsigned type)
+{
+    return beer_message_box_dialog_timeout(title, text, type, UINT32_MAX);
 }

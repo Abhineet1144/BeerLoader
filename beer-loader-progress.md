@@ -170,6 +170,13 @@ generic, loader.c):
   via thunk ordering or GetProcAddress results; mechanism not found. Fixed on the way: normaliz.dll now exports
   IdnToAscii/IdnToUnicode (_nvngx imports IdnToAscii), EventSetInformation returns success for registered
   handles (was ERROR_NOT_SUPPORTED). Test runner: scratchpad onitest.sh (log-based, 150 s).
+- **Accepting invites (2026-11-28):** provider logs on with chat_mode 2 (CMsgClientLogon field 33) and reads incoming
+  friend messages (FriendMessagesClient.IncomingMessage#1 notification, EMsg 146 with target_job_name now exposed
+  by cm_job_name(); legacy CMsgClientFriendMsgIncoming 5427); a "[lobbyinvite appid lobbyid]" message is broadcast
+  as {"event":"lobby_invite",...}. The loader (steam_invites_poll from the callback pumps) posts LobbyInvite_t (503)
+  and opens manager/invite_prompt.py; Join posts GameLobbyJoinRequested_t (333), which Pratfall handles
+  (SteamNetworkLobbyManager.OnGameLobbyJoinRequested). Not yet: an invite while the game is closed (Pratfall also
+  accepts "+connect_lobby <id>" at launch - the manager could offer that). Untested with a real invite.
 - Friend invites (2026-11-26): provider keeps the friends list (EMsg 767/766, requests 815), ops `friends` and
   `invite_lobby` (MMS 6621 + FriendMessages.SendMessage "[lobbyinvite appid=.. lobbyid=..][/lobbyinvite]");
   ISteamFriends slot 33 ActivateGameOverlayInviteDialog opens manager/invite_picker.py (GTK) and posts

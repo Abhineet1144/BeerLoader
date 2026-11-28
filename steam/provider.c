@@ -434,11 +434,75 @@ static void on_persona_state(const uint8_t *body, size_t len)
     pthread_mutex_unlock(&g_friends_lock);
 }
 
+/* ---------------------------------------------------------------- incoming invites
+ * A friend's lobby invite is a chat message carrying "[lobbyinvite appid="N" lobbyid="N"][/lobbyinvite]": as a
+ * FriendMessagesClient.IncomingMessage#1 notification (EMsg 146: fixed64 steamid_friend = 1; int32 chat_entry_type
+ * = 2; string message = 4; bool local_echo = 7) with chat_mode 2, or the legacy CMsgClientFriendMsgIncoming (5427:
+ * fixed64 steamid_from = 1; int32 chat_entry_type = 2; bytes message = 4). Each one is broadcast to the games as
+ * {"event":"lobby_invite","from":"..","name":"..","appid":N,"lobby":".."}; the game for that app offers to join. */
+#define EMSG_SERVICE_METHOD 146u
+#define EMSG_CLIENT_FRIEND_MSG_INCOMING 5427u
+
+static void emit(const char *fmt, ...);
+static void json_escape(char *out, size_t cap, const char *s);
+
+static int bbcode_number(const char *tag, const char *end, const char *name, unsigned long long *value)
+{
+    char key[32];
+    snprintf(key, sizeof(key), "%s=\"", name);
+    const char *p = strstr(tag, key);
+    if (!p || p > end) return 0;
+    char *stop;
+    *value = strtoull(p + strlen(key), &stop, 10);
+    return stop != p + strlen(key) && *stop == '"';
+}
+
+static void on_friend_message(uint64_t from, const uint8_t *text, size_t len)
+{
+    char message[1024];
+    const size_t n = len < sizeof(message) - 1 ? len : sizeof(message) - 1;
+    memcpy(message, text, n);
+    message[n] = 0;
+    const char *tag = strstr(message, "[lobbyinvite");
+    if (!tag) return;
+    const char *end = strchr(tag, ']');
+    unsigned long long appid = 0, lobby = 0;
+    if (!end || !bbcode_number(tag, end, "appid", &appid) || !bbcode_number(tag, end, "lobbyid", &lobby) || !lobby)
+        return;
+    char name[96] = "", namej[300];
+    pthread_mutex_lock(&g_friends_lock);
+    const int index = friend_index_locked(from);
+    if (index >= 0) snprintf(name, sizeof(name), "%s", g_friends[index].name);
+    pthread_mutex_unlock(&g_friends_lock);
+    json_escape(namej, sizeof(namej), name);
+    if (g.terminal) printf("lobby invite from %llu (%s): app %llu lobby %llu\n", (unsigned long long)from, name, appid, lobby);
+    emit("{\"event\":\"lobby_invite\",\"from\":\"%llu\",\"name\":\"%s\",\"appid\":%llu,\"lobby\":\"%llu\"}",
+         (unsigned long long)from, namej, appid, lobby);
+}
+
+static void on_incoming_chat(uint32_t emsg, const uint8_t *body, size_t len)
+{
+    if (emsg == EMSG_SERVICE_METHOD && strcmp(cm_job_name(), "FriendMessagesClient.IncomingMessage#1")) return;
+    PbReader r = { body, body + len };
+    PbField f;
+    uint64_t from = 0;
+    const uint8_t *text = NULL;
+    size_t text_len = 0;
+    int echo = 0;
+    while (pb_next(&r, &f) == 1) {
+        if (f.field == 1) from = f.value;
+        else if (f.field == 4 && f.type == PB_BYTES) { text = f.data; text_len = f.len; }
+        else if (f.field == 7 && emsg == EMSG_SERVICE_METHOD) echo = f.value != 0;
+    }
+    if (from && text && !echo) on_friend_message(from, text, text_len);
+}
+
 static void broadcast_mms_event(uint32_t emsg, const uint8_t *body, size_t len);
 static void broadcast_p2p_event(uint32_t emsg, const uint8_t *body, size_t len);
 static void on_message(void *context, uint32_t emsg, const uint8_t *body, size_t len)
 {
     (void)context;
+    if (emsg == EMSG_SERVICE_METHOD || emsg == EMSG_CLIENT_FRIEND_MSG_INCOMING) { on_incoming_chat(emsg, body, len); return; }
     if (emsg == EMSG_CLIENT_FRIENDS_LIST) { on_friends_list(body, len); return; }
     if (emsg == EMSG_CLIENT_PERSONA_STATE) { on_persona_state(body, len); return; }
     if (emsg >= 6601u && emsg <= 6627u) { broadcast_mms_event(emsg, body, len); return; }

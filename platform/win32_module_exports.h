@@ -2305,6 +2305,8 @@ static const char *const beer_module_exports[][2] = {
     { "user32.dll", "MessageBoxA" },
     { "user32.dll", "MessageBoxExA" },
     { "user32.dll", "MessageBoxExW" },
+    { "user32.dll", "MessageBoxTimeoutA" },
+    { "user32.dll", "MessageBoxTimeoutW" },
     { "user32.dll", "MessageBoxW" },
     { "user32.dll", "MonitorFromPoint" },
     { "user32.dll", "MonitorFromRect" },

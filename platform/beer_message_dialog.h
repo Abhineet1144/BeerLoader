@@ -17,5 +17,8 @@ int beer_message_dialog(const char *title, const char *text, const int *ids,
  * MB_RETRYCANCEL, MB_CANCELTRYCONTINUE) and the default from MB_DEFBUTTONn.
  * Returns the IDOK/IDCANCEL/... value, or -1 when no dialog can be shown. */
 int beer_message_box_dialog(const char *title, const char *text, unsigned type);
+/* UINT32_MAX means no deadline; a displayed dialog that expires returns 32000. */
+int beer_message_box_dialog_timeout(const char *title, const char *text, unsigned type,
+                                    unsigned timeout_ms);
 
 #endif

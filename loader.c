@@ -7625,6 +7625,7 @@ static __thread struct { u32 id, size; u8 data[sizeof(g_steam_events[0].data)]; 
 static int steam_event_next_callback(void *message)
 {
     if (!message) return 0;
+    steam_invites_poll();
     if (!t_steam_event_pending) {
         pthread_mutex_lock(&g_steam_listener_lock);
         if (!g_steam_event_count) { pthread_mutex_unlock(&g_steam_listener_lock); return 0; }
@@ -24857,9 +24858,26 @@ static void collect_native_window_events(void)
                     g_window_focused = 1;
                 }
                 break;
-            case XWAYLAND_EVENT_FOCUS_OUT:
+            case XWAYLAND_EVENT_FOCUS_OUT: {
                 if (getenv("BEER_INPUT_DIAGNOSTICS"))
-                    fprintf(stderr, "[INPUT] native focus out (was %d)\n", g_window_focused);
+                    fprintf(stderr, "[INPUT] native focus out (was %d)%s\n", g_window_focused,
+                            getenv("BEER_KEEP_FOCUS") ? " (BEER_KEEP_FOCUS: not reported to the game)" : "");
+                /* BEER_KEEP_FOCUS=1: switching to another window is not reported to the game (no WM_KILLFOCUS /
+                 * WM_ACTIVATE(inactive) / WM_ACTIVATEAPP(false), and it stays the active window), so it does not
+                 * pause, open its menu or move the camera. Held keys and buttons are still released, so nothing
+                 * stays pressed; the window gets no input while another one has focus anyway. */
+                static int keep_focus = -1;
+                if (keep_focus < 0) { const char *v = getenv("BEER_KEEP_FOCUS"); keep_focus = v && *v && *v != '0'; }
+                if (keep_focus && top_level) {
+                    beer_release_held_keys_on_focus_out(top_level);
+                    pthread_mutex_lock(&g_input_mutex);
+                    memset(g_input.keys, 0, sizeof(g_input.keys));
+                    memset(g_input.dik, 0, sizeof(g_input.dik));
+                    memset(g_input.mouse_buttons, 0, sizeof(g_input.mouse_buttons));
+                    g_input.pointer_position_valid = 0;
+                    pthread_mutex_unlock(&g_input_mutex);
+                    break;
+                }
                 g_window_focused = 0;
                 g_window_activated = 0;
                 beer_release_held_keys_on_focus_out(top_level);
@@ -24875,6 +24893,7 @@ static void collect_native_window_events(void)
                     queue_window_message(0x001c, 0, 0);
                 }
                 break;
+            }
             case XWAYLAND_EVENT_CONFIGURE:
                 if (top_level) {
                     /* event.x/y is the client area's screen origin (also WM_MOVE's lParam); the Win32 window

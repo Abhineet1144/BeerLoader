@@ -1108,6 +1108,13 @@ class GameDialog(Adw.Dialog):
         adv.add(self.game_args)
         adv.add(self.args)
         adv.add(self.env)
+        # Saved with the other flags (self.flag_rows), mapped to BEER_KEEP_FOCUS in launch().
+        keep_focus = Adw.SwitchRow(title="Keep focus when switching away",
+                                   subtitle="The game is not told when another window takes focus, so it does not pause, "
+                                            "open its menu or move the camera while you use another window")
+        keep_focus.set_active(bool(saved_flags.get("keep_focus", False)))
+        self.flag_rows["keep_focus"] = keep_focus
+        adv.add(keep_focus)
         page.add(adv)
         view.set_content(page)
         self.set_child(view)
@@ -1732,6 +1739,8 @@ class Manager(Adw.Application):
         env["BEER_POST_JSON"] = json.dumps(post_message(load_display_config()))
         cmd = [loader, "--audio=%s" % game.get("audio", "fmod"), "--prefix=%s" % prefix_path(game.get("prefix", "default"))]
         flags = game.get("flags", {})
+        if flags.get("keep_focus"):
+            env["BEER_KEEP_FOCUS"] = "1"
         for key, _label, variable, value, _description in LAUNCH_FLAGS:
             if not flags.get(key):
                 continue

@@ -965,6 +965,27 @@ static u64 __attribute__((ms_abi)) beer_MessageBoxExW(u64 owner, const u16 *text
     return beer_MessageBoxW(owner, text, title, type);
 }
 
+static u64 __attribute__((ms_abi)) beer_MessageBoxTimeoutA(u64 owner, const char *text, const char *title,
+                                                         u32 type, u16 language, u32 timeout_ms)
+{
+    (void)owner;
+    (void)language;
+    touch_trace_disarm();
+    fprintf(stderr, "[MSGBOX] \"%s\": %s\n", title ? title : "", text ? text : "");
+    u64 automatic;
+    if (beer_message_box_auto(type, &automatic)) return automatic;
+    int chosen = beer_message_box_dialog_timeout(title, text, type, timeout_ms);
+    return chosen >= 0 ? (u64)chosen : beer_message_box_result(type);
+}
+
+static u64 __attribute__((ms_abi)) beer_MessageBoxTimeoutW(u64 owner, const u16 *text, const u16 *title,
+                                                         u32 type, u16 language, u32 timeout_ms)
+{
+    char t[512], c[1024];
+    reg_narrow(title, t, sizeof(t)); reg_narrow(text, c, sizeof(c));
+    return beer_MessageBoxTimeoutA(owner, c, t, type, language, timeout_ms);
+}
+
 /* ---- NtQueryAttributesFile / NtQueryFullAttributesFile (existence probes of NT-level VFS layers) ---- */
 static int nt_object_path(const u8 *attributes, u16 *path, size_t capacity)
 {

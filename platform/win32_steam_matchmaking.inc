@@ -285,6 +285,88 @@ MMS_FN steam_friends_invite_dialog(u64 self, u64 lobby)
     return 0;
 }
 
+/* ---- accepting a friend's invite ----
+ * An invite that reached the account (beer_steam_session_next_invite) is posted as LobbyInvite_t (503: inviter,
+ * lobby, game ID) and offered in a small window (manager/invite_prompt.py), standing in for Steam's notification and
+ * its Join button. Join posts GameLobbyJoinRequested_t (333: lobby, friend), what Steam sends when the invite is
+ * accepted while the game runs; the game then joins the lobby itself. */
+struct steam_invite_offer { u64 from, lobby; char name[96]; };
+static _Atomic(int) g_steam_invite_prompt_open;
+static void *steam_invite_prompt_thread(void *arg)
+{
+    struct steam_invite_offer *offer = arg;
+    char exe[4096], script[4200], from_text[32];
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    exe[n > 0 ? n : 0] = 0;
+    char *slash = strrchr(exe, '/');
+    if (slash) *slash = 0;
+    snprintf(script, sizeof(script), "%s/manager/invite_prompt.py", exe);
+    snprintf(from_text, sizeof(from_text), "%llu", (unsigned long long)offer->from);
+    char *argv[] = { "python3", script, "--name", offer->name[0] ? offer->name : from_text, NULL };
+    size_t count = 0;
+    while (environ && environ[count]) ++count;
+    char **env = calloc(count + 1, sizeof(char *));
+    for (size_t i = 0, k = 0; env && i < count; ++i)
+        if (strncmp(environ[i], "LD_PRELOAD=", 11)) env[k++] = environ[i];
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    sigset_t none, defaults;
+    sigemptyset(&none);
+    sigfillset(&defaults);
+    sigdelset(&defaults, SIGKILL);
+    sigdelset(&defaults, SIGSTOP);
+    posix_spawnattr_setsigmask(&attr, &none);
+    posix_spawnattr_setsigdefault(&attr, &defaults);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    pid_t child = -1;
+    if (posix_spawnp(&child, "python3", NULL, &attr, argv, env ? env : environ)) child = -1;
+    posix_spawnattr_destroy(&attr);
+    free(env);
+    int status = 1 << 8;
+    if (child > 0) while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    const int join = child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    fprintf(stderr, "[STEAM] invite to lobby %llu from %s: %s\n", (unsigned long long)offer->lobby, from_text,
+            join ? "accepted" : "not accepted");
+    if (join) {
+        const u64 request[2] = { offer->lobby, offer->from };          /* GameLobbyJoinRequested_t */
+        steam_callback_post(333, request, sizeof(request));
+    }
+    free(offer);
+    atomic_store(&g_steam_invite_prompt_open, 0);
+    return NULL;
+}
+static void steam_invites_poll(void)
+{
+    if (!g_steam_api_official || !beer_steam_session_active()) return;
+    static _Atomic(u64) last_ms;
+    const u64 now = beer_time_monotonic_ns_for(BEER_CLOCK_TICK) / 1000000u;
+    if (now - atomic_load(&last_ms) < 250) return;
+    atomic_store(&last_ms, now);
+    u64 from = 0, lobby = 0;
+    u32 appid = 0;
+    char name[96];
+    while (beer_steam_session_next_invite(&from, &appid, &lobby, name, sizeof(name))) {
+        if (appid != g_steam_own_appid) continue;
+        fprintf(stderr, "[STEAM] lobby invite from %llu (%s) to lobby %llu\n", (unsigned long long)from, name,
+                (unsigned long long)lobby);
+        const u64 invite[3] = { from, lobby, appid };                     /* LobbyInvite_t */
+        steam_callback_post(503, invite, sizeof(invite));
+        if (atomic_exchange(&g_steam_invite_prompt_open, 1)) continue;   /* one prompt at a time */
+        struct steam_invite_offer *offer = calloc(1, sizeof(*offer));
+        pthread_t thread;
+        if (!offer) { atomic_store(&g_steam_invite_prompt_open, 0); continue; }
+        offer->from = from;
+        offer->lobby = lobby;
+        snprintf(offer->name, sizeof(offer->name), "%s", name);
+        if (pthread_create(&thread, NULL, steam_invite_prompt_thread, offer)) {
+            free(offer);
+            atomic_store(&g_steam_invite_prompt_open, 0);
+        } else {
+            pthread_detach(thread);
+        }
+    }
+}
+
 /* ---- callback channel used by Valve's steam_api64 (CallbackMsg_t: user, id, param, size) ---- */
 static __thread u8 t_steam_callback_param[64];
 
@@ -336,6 +418,7 @@ static int steam_mms_unregister_call_result(u64 call)
 /* From SteamAPI_RunCallbacks: queue broadcast callbacks for CCallback listeners and run CCallResults. */
 static void steam_mms_facade_pump(void)
 {
+    steam_invites_poll();
     if (!atomic_load(&g_steam_mms_started)) return;
     beer_mms_pump();
     BeerMmsCallback cb;

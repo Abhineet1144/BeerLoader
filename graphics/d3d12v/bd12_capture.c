@@ -325,7 +325,10 @@ static void capture_color(BD12CmdList *list, const BD12Image *im, uint32_t mip, 
                           const char *prefix, uint64_t hash)
 {
     BD12Device *device = list->device;
-    if (!im || im->desc.samples > 1 || im->desc.type == VK_IMAGE_TYPE_3D) return;
+    if (!im || im->desc.samples > 1) return;
+    /* 3D images (e.g. froxel fog volumes): `layer` is the depth slice, copied at full size (no blit reduction). */
+    const int is_3d = im->desc.type == VK_IMAGE_TYPE_3D;
+    if (is_3d) down = 1;
     uint32_t block = 0;
     bd12_format_block(im->desc.format, VK_IMAGE_ASPECT_COLOR_BIT, NULL, NULL, &block);
     const uint32_t w = im->desc.width >> mip ? im->desc.width >> mip : 1;
@@ -392,7 +395,8 @@ static void capture_color(BD12CmdList *list, const BD12Image *im, uint32_t mip, 
                                            .imageExtent = { ow, oh, 1 } };
         device->vk.CmdCopyImageToBuffer(list->command_buffer, tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb->buffer, 1, &region);
     } else {
-        const VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+        const VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, is_3d ? 0 : layer, 1 },
+                                           .imageOffset = { 0, 0, is_3d ? (int32_t)layer : 0 },
                                            .imageExtent = { w, h, 1 } };
         device->vk.CmdCopyImageToBuffer(list->command_buffer, im->image, VK_IMAGE_LAYOUT_GENERAL, rb->buffer, 1, &region);
     }
@@ -458,6 +462,16 @@ void bd12_capture_dispatch_step(BD12CmdList *list, const BD12BindState *state, u
         const uint32_t h = im->desc.height >> found[i].mip ? im->desc.height >> found[i].mip : 1;
         (void)w; (void)h;
         char prefix[64];
+        if (im->desc.type == VK_IMAGE_TYPE_3D) {   /* up to 8 evenly spaced depth slices */
+            const uint32_t depth = im->desc.depth_or_layers >> found[i].mip ? im->desc.depth_or_layers >> found[i].mip : 1;
+            const uint32_t slices = depth < 8 ? depth : 8;
+            for (uint32_t z = 0; z < slices; ++z) {
+                const uint32_t slice = slices > 1 ? z * (depth - 1) / (slices - 1) : 0;
+                snprintf(prefix, sizeof(prefix), "cs%04u_u%u_z%02u", step, found[i].reg, slice);
+                capture_color(list, im, found[i].mip, slice, 1, prefix, hash);
+            }
+            continue;
+        }
         snprintf(prefix, sizeof(prefix), "cs%04u_u%u", step, found[i].reg);
         capture_color(list, im, found[i].mip, found[i].layer, g_frame_mode >= 2 ? 4 : 2, prefix, hash);
     }

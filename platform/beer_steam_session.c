@@ -32,11 +32,22 @@ static struct {
     unsigned event_count;
     char *p2p[256];              /* peer-to-peer signaling lines (p2p_event, p2p_fail), oldest first */
     unsigned p2p_count;
-} g = { PTHREAD_MUTEX_INITIALIZER, -1, 0, 0, 0, "", NULL, 0, 1, NULL, 0, { NULL }, 0, { NULL }, 0 };
+    char *invites[16];           /* lobby_invite lines, oldest first */
+    unsigned invite_count;
+} g = { PTHREAD_MUTEX_INITIALIZER, -1, 0, 0, 0, "", NULL, 0, 1, NULL, 0, { NULL }, 0, { NULL }, 0, { NULL }, 0 };
 
 /* Keeps a broadcast line the game must see later (matchmaking events); others are dropped. Takes the line. */
 static void keep_event_line(char *line)
 {
+    if (strstr(line, "\"event\":\"lobby_invite\"")) {
+        if (g.invite_count == sizeof(g.invites) / sizeof(*g.invites)) {
+            free(g.invites[0]);
+            memmove(g.invites, g.invites + 1, sizeof(g.invites) - sizeof(*g.invites));
+            g.invite_count--;
+        }
+        g.invites[g.invite_count++] = line;
+        return;
+    }
     if (strstr(line, "\"event\":\"p2p_event\"") || strstr(line, "\"event\":\"p2p_fail\"")) {
         if (g.p2p_count == sizeof(g.p2p) / sizeof(*g.p2p)) {
             free(g.p2p[0]);
@@ -551,4 +562,28 @@ int beer_steam_session_invite_lobby(uint32_t appid, uint64_t lobby, uint64_t fri
     else fprintf(stderr, "[STEAM] invited %llu to lobby %llu\n", (unsigned long long)friend_id, (unsigned long long)lobby);
     free(reply);
     return ok;
+}
+
+int beer_steam_session_next_invite(uint64_t *from, uint32_t *appid, uint64_t *lobby, char *name, size_t name_cap)
+{
+    if (pthread_mutex_trylock(&g.lock)) return 0;
+    if (g.fd >= 0) collect_pending_locked();
+    int found = 0;
+    if (g.invite_count) {
+        char *line = g.invites[0];
+        memmove(g.invites, g.invites + 1, (g.invite_count - 1) * sizeof(*g.invites));
+        g.invite_count--;
+        char text[32] = "";
+        json_value(line, "from", text, sizeof(text));
+        *from = strtoull(text, NULL, 10);
+        json_value(line, "appid", text, sizeof(text));
+        *appid = (uint32_t)strtoul(text, NULL, 10);
+        json_value(line, "lobby", text, sizeof(text));
+        *lobby = strtoull(text, NULL, 10);
+        if (name && name_cap && !json_value(line, "name", name, name_cap)) name[0] = 0;
+        free(line);
+        found = *lobby != 0;
+    }
+    pthread_mutex_unlock(&g.lock);
+    return found;
 }

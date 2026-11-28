@@ -170,7 +170,11 @@ typedef struct {
     int32_t session_id;
     uint64_t job_target;
     int eresult;
+    char job_name[128];          /* target_job_name: the service method of a notification */
 } Header;
+
+static __thread const char *t_job_name = "";
+const char *cm_job_name(void) { return t_job_name ? t_job_name : ""; }
 
 static void parse_header(const uint8_t *data, size_t len, Header *h)
 {
@@ -184,6 +188,11 @@ static void parse_header(const uint8_t *data, size_t len, Header *h)
         else if (f.field == 2) h->session_id = (int32_t)f.value;
         else if (f.field == 11) h->job_target = f.value;
         else if (f.field == 13) h->eresult = (int)(int32_t)f.value;
+        else if (f.field == 12 && f.type == PB_BYTES) {
+            const size_t n = f.len < sizeof(h->job_name) - 1 ? f.len : sizeof(h->job_name) - 1;
+            memcpy(h->job_name, f.data, n);
+            h->job_name[n] = 0;
+        }
     }
 }
 
@@ -282,7 +291,9 @@ static void dispatch(Cm *cm, const uint8_t *packet, size_t len)
         pthread_cond_broadcast(&cm->changed);
     }
     pthread_mutex_unlock(&cm->lock);
+    t_job_name = h.job_name;
     if (cm->handler) cm->handler(cm->context, emsg, body, body_len);
+    t_job_name = "";
 }
 
 static void *io_thread(void *arg)
@@ -518,6 +529,7 @@ int cm_logon(Cm *cm, const char *account, const char *refresh_token, int timeout
     pb_string(&logon, 6, "english");
     pb_i32(&logon, 7, EOS_LINUX_UNKNOWN);
     pb_u64(&logon, 8, 1);                  /* should_remember_password */
+    pb_u64(&logon, 33, 2);                 /* chat_mode: friend messages arrive as FriendMessagesClient notifications */
     pb_string(&logon, 50, account);
     pb_string(&logon, 96, machine);
     pb_u64(&logon, 102, 1);                /* supports_rate_limit_response */

@@ -60,6 +60,10 @@ long beer_steam_session_next_p2p_event(uint64_t *src, uint64_t *dest, uint32_t *
  * gets a Steam chat invite with a Join button. Returns 1 when Steam accepted the invite message. */
 int beer_steam_session_invite_lobby(uint32_t appid, uint64_t lobby, uint64_t friend_id);
 
+/* A friend's lobby invite that reached the signed-in account (provider event lobby_invite), oldest first: 1 with its
+ * sender, app and lobby (name: the sender's persona name, may be empty), 0 when none is waiting. Never blocks. */
+int beer_steam_session_next_invite(uint64_t *from, uint32_t *appid, uint64_t *lobby, char *name, size_t name_cap);
+
 /* Socket path used by the provider; exposed for tests. */
 int beer_steam_session_socket_path(char *out, size_t cap);
 
